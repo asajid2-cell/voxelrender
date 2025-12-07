@@ -126,6 +126,14 @@ public:
         uint32_t frameIndex
     );
 
+    // GPU brush raycasting (NEW - replaces CPU-side DDA)
+    void DispatchBrushRaycast(
+        ID3D12GraphicsCommandList* cmdList,
+        VoxelWorld& world,
+        const glm::vec3& rayOrigin,
+        const glm::vec3& rayDirection
+    );
+
     // Get command signature for indirect dispatch
     ID3D12CommandSignature* GetCommandSignature() const { return m_commandSignature.Get(); }
 
@@ -166,6 +174,12 @@ private:
         const std::filesystem::path& shaderPath
     );
 
+    Result<void> CreateBrushRaycastPipeline(
+        ID3D12Device* device,
+        Graphics::ShaderCompiler& shaderCompiler,
+        const std::filesystem::path& shaderPath
+    );
+
     Result<void> CreateCommandSignature(ID3D12Device* device);
 
     // Compute pipelines
@@ -175,6 +189,7 @@ private:
     Graphics::DX12ComputePipeline m_chunkScanPipeline;
     Graphics::DX12ComputePipeline m_prepareIndirectPipeline;
     Graphics::DX12ComputePipeline m_gravityChunkPipeline;
+    Graphics::DX12ComputePipeline m_brushRaycastPipeline;
 
     // Command signature for indirect dispatch
     ComPtr<ID3D12CommandSignature> m_commandSignature;

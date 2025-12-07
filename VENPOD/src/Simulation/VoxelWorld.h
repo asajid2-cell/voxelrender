@@ -95,14 +95,23 @@ public:
     void TransitionReadBufferTo(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_STATES state);
     void TransitionWriteBufferTo(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_STATES state);
 
-    // CPU readback for brush raycasting
-    // Request a copy of the read buffer to CPU memory (async)
-    void RequestReadback(ID3D12GraphicsCommandList* cmdList);
+    // GPU brush raycasting (NEW - replaces CPU readback)
+    // Get the GPU buffer that stores brush raycast results (16 bytes)
+    Graphics::GPUBuffer& GetBrushRaycastResultBuffer() { return m_brushRaycastResult; }
+    const Graphics::GPUBuffer& GetBrushRaycastResultBuffer() const { return m_brushRaycastResult; }
 
-    // Get CPU-accessible voxel data (nullptr if not ready)
-    // Must call RequestReadback first and wait for GPU to finish
-    const uint32_t* GetCPUVoxelData() const { return m_cpuVoxelData; }
-    size_t GetCPUVoxelDataSize() const { return GetTotalVoxels(); }
+    // CPU readback for brush raycasting result (16 bytes only!)
+    struct BrushRaycastResult {
+        float posX, posY, posZ;
+        uint32_t normalPacked;  // Packed normal + valid flag
+        bool hasValidPosition;
+    };
+
+    // Request tiny readback of brush raycast result (16 bytes vs 32 MB!)
+    void RequestBrushRaycastReadback(ID3D12GraphicsCommandList* cmdList);
+
+    // Get CPU-side brush raycast result (updated after RequestBrushRaycastReadback)
+    BrushRaycastResult GetBrushRaycastResult() const { return m_brushRaycastCPU; }
 
 private:
     Result<void> CreateVoxelBuffers(ID3D12Device* device, Graphics::DescriptorHeapManager& heapManager);
@@ -127,9 +136,10 @@ private:
     // Heap manager reference for cleanup
     Graphics::DescriptorHeapManager* m_heapManager = nullptr;
 
-    // CPU readback buffer for brush raycasting
-    ComPtr<ID3D12Resource> m_readbackBuffer;
-    uint32_t* m_cpuVoxelData = nullptr;  // Mapped readback buffer
+    // GPU brush raycasting (NEW - 16 bytes vs 32 MB!)
+    Graphics::GPUBuffer m_brushRaycastResult;  // 16-byte buffer for raycast result
+    ComPtr<ID3D12Resource> m_brushRaycastReadback;  // 16-byte CPU readback
+    BrushRaycastResult m_brushRaycastCPU;  // CPU copy of result
 };
 
 } // namespace VENPOD::Simulation

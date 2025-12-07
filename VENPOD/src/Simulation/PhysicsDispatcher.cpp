@@ -54,6 +54,12 @@ Result<void> PhysicsDispatcher::Initialize(
         spdlog::warn("Gravity chunk pipeline not created: {}", result.error());
     }
 
+    // Create brush raycast pipeline (NEW - GPU raycasting)
+    result = CreateBrushRaycastPipeline(device, shaderCompiler, shaderPath);
+    if (!result) {
+        spdlog::warn("Brush raycast pipeline not created: {}", result.error());
+    }
+
     // Create command signature for indirect dispatch
     result = CreateCommandSignature(device);
     if (!result) {
@@ -71,6 +77,7 @@ void PhysicsDispatcher::Shutdown() {
     m_chunkScanPipeline.Shutdown();
     m_prepareIndirectPipeline.Shutdown();
     m_gravityChunkPipeline.Shutdown();
+    m_brushRaycastPipeline.Shutdown();
     m_commandSignature.Reset();
     m_heapManager = nullptr;
     m_device = nullptr;
@@ -841,6 +848,124 @@ void PhysicsDispatcher::DispatchPhysicsIndirect(
     world.SwapBuffers();
 
     spdlog::debug("DispatchPhysicsIndirect: Indirect physics dispatch complete");
+}
+
+void PhysicsDispatcher::DispatchBrushRaycast(
+    ID3D12GraphicsCommandList* cmdList,
+    VoxelWorld& world,
+    const glm::vec3& rayOrigin,
+    const glm::vec3& rayDirection)
+{
+    if (!cmdList || !m_brushRaycastPipeline.IsValid()) {
+        return;
+    }
+
+    // Transition voxel read buffer to SRV state for compute shader read
+    world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    // Set descriptor heaps
+    ID3D12DescriptorHeap* heaps[] = { m_heapManager->GetShaderVisibleCbvSrvUavHeap() };
+    cmdList->SetDescriptorHeaps(1, heaps);
+
+    // Bind brush raycast pipeline
+    m_brushRaycastPipeline.Bind(cmdList);
+
+    // Brush raycast constants (16 DWORDs = 64 bytes)
+    struct BrushRaycastConstants {
+        float rayOriginX, rayOriginY, rayOriginZ, rayOriginW;
+        float rayDirX, rayDirY, rayDirZ, rayDirW;
+        uint32_t gridSizeX, gridSizeY, gridSizeZ, padding;
+    } constants = {};
+
+    constants.rayOriginX = rayOrigin.x;
+    constants.rayOriginY = rayOrigin.y;
+    constants.rayOriginZ = rayOrigin.z;
+    constants.rayOriginW = 0.0f;
+
+    constants.rayDirX = rayDirection.x;
+    constants.rayDirY = rayDirection.y;
+    constants.rayDirZ = rayDirection.z;
+    constants.rayDirW = 0.0f;
+
+    constants.gridSizeX = world.GetGridSizeX();
+    constants.gridSizeY = world.GetGridSizeY();
+    constants.gridSizeZ = world.GetGridSizeZ();
+    constants.padding = 0;
+
+    m_brushRaycastPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
+
+    // Set descriptors: t0 = voxel grid SRV, u0 = result UAV
+    m_brushRaycastPipeline.SetRootDescriptorTable(cmdList, 1, world.GetReadBufferSRV().gpu);
+    m_brushRaycastPipeline.SetRootDescriptorTable(cmdList, 2, world.GetBrushRaycastResultBuffer().GetShaderVisibleUAV().gpu);
+
+    // Dispatch single thread (1x1x1)
+    cmdList->Dispatch(1, 1, 1);
+
+    // UAV barrier to ensure result is ready
+    D3D12_RESOURCE_BARRIER uavBarrier = {};
+    uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uavBarrier.UAV.pResource = world.GetBrushRaycastResultBuffer().GetResource();
+    cmdList->ResourceBarrier(1, &uavBarrier);
+}
+
+Result<void> PhysicsDispatcher::CreateBrushRaycastPipeline(
+    ID3D12Device* device,
+    Graphics::ShaderCompiler& shaderCompiler,
+    const std::filesystem::path& shaderPath)
+{
+    std::filesystem::path csPath = shaderPath / "Compute" / "CS_BrushRaycast.hlsl";
+
+    auto csResult = shaderCompiler.CompileComputeShader(csPath, L"main", true);
+    if (!csResult) {
+        return Error("Failed to compile CS_BrushRaycast.hlsl: {}", csResult.error());
+    }
+
+    Graphics::CompiledShader cs = csResult.value();
+    if (!cs.IsValid()) {
+        return Error("CS_BrushRaycast shader compilation failed: {}", cs.errors);
+    }
+
+    // Root signature:
+    // b0: BrushRaycastConstants (12 DWORDs)
+    // t0: VoxelGrid SRV (descriptor table)
+    // u0: BrushRaycastResult UAV (descriptor table)
+    Graphics::ComputePipelineDesc pipelineDesc;
+    pipelineDesc.computeShader = cs;
+    pipelineDesc.debugName = "BrushRaycastPipeline";
+
+    // b0: Brush raycast constants (inline)
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::Constants32Bit,
+        0,  // register b0
+        0,  // space 0
+        12  // 12 uint32s (BrushRaycastConstants)
+    });
+
+    // t0: Voxel grid SRV
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        0,  // register t0
+        0,  // space 0
+        1,  // 1 descriptor
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+
+    // u0: Brush raycast result UAV
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        0,  // register u0
+        0,  // space 0
+        1,  // 1 descriptor
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+    });
+
+    auto result = m_brushRaycastPipeline.Initialize(device, pipelineDesc);
+    if (!result) {
+        return Error("Failed to create brush raycast pipeline: {}", result.error());
+    }
+
+    spdlog::info("Brush raycast pipeline created successfully (GPU raycasting enabled)");
+    return {};
 }
 
 } // namespace VENPOD::Simulation

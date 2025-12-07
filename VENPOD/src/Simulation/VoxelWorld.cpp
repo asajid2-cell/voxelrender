@@ -30,9 +30,35 @@ Result<void> VoxelWorld::Initialize(
         return Error("Failed to create material palette: {}", result.error());
     }
 
+    // Create brush raycast result buffer (16 bytes GPU + 16 bytes CPU readback)
+    result = m_brushRaycastResult.Initialize(
+        device,
+        16,  // 4 floats = 16 bytes (posX, posY, posZ, normalPacked)
+        Graphics::BufferUsage::StructuredBuffer | Graphics::BufferUsage::UnorderedAccess,
+        16,  // stride = 16 bytes (entire structure)
+        "BrushRaycastResult"
+    );
+    if (!result) {
+        return Error("Failed to create brush raycast result buffer: {}", result.error());
+    }
+
+    // Create UAV for brush raycast result
+    result = m_brushRaycastResult.CreateUAV(device, heapManager);
+    if (!result) {
+        return Error("Failed to create UAV for brush raycast result: {}", result.error());
+    }
+
+    // Initialize CPU-side result to invalid
+    m_brushRaycastCPU.posX = 0.0f;
+    m_brushRaycastCPU.posY = 0.0f;
+    m_brushRaycastCPU.posZ = 0.0f;
+    m_brushRaycastCPU.normalPacked = 0;
+    m_brushRaycastCPU.hasValidPosition = false;
+
     uint64_t totalMemoryMB = (GetTotalVoxels() * sizeof(uint32_t) * 2) / (1024 * 1024);
     spdlog::info("VoxelWorld initialized: {}x{}x{} grid ({} MB)",
         m_config.gridSizeX, m_config.gridSizeY, m_config.gridSizeZ, totalMemoryMB);
+    spdlog::info("GPU brush raycasting enabled (16 bytes readback vs 32 MB!)");
 
     return {};
 }
@@ -61,13 +87,9 @@ void VoxelWorld::Shutdown() {
         }
     }
 
-    // Cleanup readback buffer
-    if (m_cpuVoxelData) {
-        D3D12_RANGE emptyRange = {0, 0};
-        m_readbackBuffer->Unmap(0, &emptyRange);
-        m_cpuVoxelData = nullptr;
-    }
-    m_readbackBuffer.Reset();
+    // Cleanup brush raycast buffers
+    m_brushRaycastResult.Shutdown();
+    m_brushRaycastReadback.Reset();
 
     m_materialPalette.Reset();
     m_paletteUpload.Reset();
@@ -312,16 +334,16 @@ Result<void> VoxelWorld::CreateMaterialPalette(
     return {};
 }
 
-void VoxelWorld::RequestReadback(ID3D12GraphicsCommandList* cmdList) {
+void VoxelWorld::RequestBrushRaycastReadback(ID3D12GraphicsCommandList* cmdList) {
     if (!cmdList) return;
 
     ID3D12Device* device = nullptr;
-    m_voxelBuffers[m_readBufferIndex].GetResource()->GetDevice(IID_PPV_ARGS(&device));
+    m_brushRaycastResult.GetResource()->GetDevice(IID_PPV_ARGS(&device));
     if (!device) return;
 
-    // Create readback buffer if it doesn't exist
-    if (!m_readbackBuffer) {
-        uint64_t bufferSize = static_cast<uint64_t>(GetTotalVoxels()) * sizeof(uint32_t);
+    // Create tiny 16-byte readback buffer if it doesn't exist
+    if (!m_brushRaycastReadback) {
+        constexpr uint64_t bufferSize = 16;  // 4 floats = 16 bytes (vs 32 MB!)
 
         D3D12_HEAP_PROPERTIES readbackHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
         D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(bufferSize);
@@ -332,56 +354,62 @@ void VoxelWorld::RequestReadback(ID3D12GraphicsCommandList* cmdList) {
             &bufferDesc,
             D3D12_RESOURCE_STATE_COPY_DEST,
             nullptr,
-            IID_PPV_ARGS(&m_readbackBuffer)
+            IID_PPV_ARGS(&m_brushRaycastReadback)
         );
 
         if (FAILED(hr)) {
-            spdlog::error("Failed to create readback buffer: 0x{:08X}", hr);
+            spdlog::error("Failed to create brush raycast readback buffer: 0x{:08X}", hr);
             device->Release();
             return;
         }
 
-        m_readbackBuffer->SetName(L"VoxelReadbackBuffer");
-
-        // Map the readback buffer (stays mapped for lifetime)
-        D3D12_RANGE readRange = {0, 0};  // Don't read on CPU yet
-        hr = m_readbackBuffer->Map(0, &readRange, reinterpret_cast<void**>(&m_cpuVoxelData));
-        if (FAILED(hr)) {
-            spdlog::error("Failed to map readback buffer: 0x{:08X}", hr);
-            m_readbackBuffer.Reset();
-            m_cpuVoxelData = nullptr;
-            device->Release();
-            return;
-        }
-
-        spdlog::debug("Created CPU readback buffer for brush raycasting ({} MB)",
-            bufferSize / (1024 * 1024));
+        m_brushRaycastReadback->SetName(L"BrushRaycastReadback");
+        spdlog::debug("Created brush raycast readback buffer (16 bytes - 2,000,000x smaller!)");
     }
 
     device->Release();
 
-    // Transition read buffer to copy source
-    D3D12_RESOURCE_STATES currentState = m_voxelBuffers[m_readBufferIndex].GetCurrentState();
+    // Transition brush result buffer to copy source
+    D3D12_RESOURCE_STATES currentState = m_brushRaycastResult.GetCurrentState();
     if (currentState != D3D12_RESOURCE_STATE_COPY_SOURCE) {
         D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-            m_voxelBuffers[m_readBufferIndex].GetResource(),
+            m_brushRaycastResult.GetResource(),
             currentState,
             D3D12_RESOURCE_STATE_COPY_SOURCE
         );
         cmdList->ResourceBarrier(1, &barrier);
     }
 
-    // Copy GPU buffer to CPU readback buffer
-    cmdList->CopyResource(m_readbackBuffer.Get(), m_voxelBuffers[m_readBufferIndex].GetResource());
+    // Copy tiny 16-byte GPU buffer to CPU readback buffer
+    cmdList->CopyResource(m_brushRaycastReadback.Get(), m_brushRaycastResult.GetResource());
 
-    // Transition back to original state
+    // Transition back to UAV state for next raycast
     if (currentState != D3D12_RESOURCE_STATE_COPY_SOURCE) {
         D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-            m_voxelBuffers[m_readBufferIndex].GetResource(),
+            m_brushRaycastResult.GetResource(),
             D3D12_RESOURCE_STATE_COPY_SOURCE,
             currentState
         );
         cmdList->ResourceBarrier(1, &barrier);
+    }
+
+    // Map and read the result immediately (safe because readback is tiny)
+    void* mappedData = nullptr;
+    D3D12_RANGE readRange = {0, 16};
+    HRESULT hr = m_brushRaycastReadback->Map(0, &readRange, &mappedData);
+    if (SUCCEEDED(hr)) {
+        float* data = static_cast<float*>(mappedData);
+        m_brushRaycastCPU.posX = data[0];
+        m_brushRaycastCPU.posY = data[1];
+        m_brushRaycastCPU.posZ = data[2];
+
+        // Unpack normal and validity flag
+        uint32_t packed = *reinterpret_cast<uint32_t*>(&data[3]);
+        m_brushRaycastCPU.normalPacked = packed;
+        m_brushRaycastCPU.hasValidPosition = (packed >> 6) & 1;
+
+        D3D12_RANGE writeRange = {0, 0};
+        m_brushRaycastReadback->Unmap(0, &writeRange);
     }
 }
 
