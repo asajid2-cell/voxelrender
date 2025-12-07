@@ -144,7 +144,8 @@ void Renderer::RenderVoxels(
     uint32_t gridSizeX,
     uint32_t gridSizeY,
     uint32_t gridSizeZ,
-    const CameraParams& camera)
+    const CameraParams& camera,
+    const BrushPreview* brushPreview)
 {
     if (!cmdList) return;
 
@@ -156,7 +157,7 @@ void Renderer::RenderVoxels(
     m_fullscreenPipeline.Bind(cmdList);
 
     // Create frame constants on stack (will be passed as root constants)
-    // Must match SharedTypes.hlsli FrameConstants exactly - 28 DWORDs
+    // Must match SharedTypes.hlsli FrameConstants exactly - 36 DWORDs (added 8 for brush)
     struct FrameConstants {
         float cameraPosition[4];      // xyz = pos, w = fov
         float cameraForward[4];       // xyz = forward, w = aspectRatio
@@ -171,6 +172,8 @@ void Renderer::RenderVoxels(
         float viewportHeight;
         uint32_t frameIndex;
         uint32_t debugMode;
+        float brushPosition[4];       // xyz = position, w = radius
+        float brushParams[4];         // x = material, y = shape, z = hasValidPosition, w = unused
     } constants = {};
 
     // Fill in camera data
@@ -209,6 +212,27 @@ void Renderer::RenderVoxels(
     constants.viewportHeight = static_cast<float>(m_height);
     constants.frameIndex = 0;
     constants.debugMode = 0;
+
+    // Fill in brush preview data (if provided)
+    if (brushPreview && brushPreview->hasValidPosition) {
+        constants.brushPosition[0] = brushPreview->posX;
+        constants.brushPosition[1] = brushPreview->posY;
+        constants.brushPosition[2] = brushPreview->posZ;
+        constants.brushPosition[3] = brushPreview->radius;
+        constants.brushParams[0] = static_cast<float>(brushPreview->material);
+        constants.brushParams[1] = static_cast<float>(brushPreview->shape);
+        constants.brushParams[2] = 1.0f;  // hasValidPosition = true
+        constants.brushParams[3] = 0.0f;
+    } else {
+        constants.brushPosition[0] = 0.0f;
+        constants.brushPosition[1] = 0.0f;
+        constants.brushPosition[2] = 0.0f;
+        constants.brushPosition[3] = 0.0f;
+        constants.brushParams[0] = 0.0f;
+        constants.brushParams[1] = 0.0f;
+        constants.brushParams[2] = 0.0f;  // hasValidPosition = false
+        constants.brushParams[3] = 0.0f;
+    }
 
     // Set root constants (b0)
     cmdList->SetGraphicsRoot32BitConstants(0, sizeof(constants) / 4, &constants, 0);
@@ -321,13 +345,13 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
 
     // Root signature parameters (for voxel rendering)
     // b0: FrameConstants (inline 32-bit constants)
-    // Layout: camPos(4) + camFwd(4) + camRight(4) + camUp(4) + sunDir(4) + grid(4) + viewport(4) = 28 DWORDs
+    // Layout: camPos(4) + camFwd(4) + camRight(4) + camUp(4) + sunDir(4) + grid(4) + viewport(4) + brushPos(4) + brushParams(4) = 36 DWORDs
     RootParameter frameConstantsParam;
     frameConstantsParam.type = RootParamType::Constants32Bit;
     frameConstantsParam.shaderRegister = 0;  // register b0
     frameConstantsParam.registerSpace = 0;   // space 0
     frameConstantsParam.visibility = D3D12_SHADER_VISIBILITY_ALL;
-    frameConstantsParam.num32BitValues = 28;  // sizeof(FrameConstants) / 4
+    frameConstantsParam.num32BitValues = 36;  // sizeof(FrameConstants) / 4 (updated for brush preview)
     pipelineDesc.rootParams.push_back(frameConstantsParam);
 
     // t0: VoxelGrid SRV (descriptor table for structured buffer)

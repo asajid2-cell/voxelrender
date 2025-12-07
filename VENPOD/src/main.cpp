@@ -376,7 +376,8 @@ int main(int argc, char* argv[]) {
             cameraPos -= glm::vec3(0, 1, 0) * moveSpeed;
         }
 
-        // Update brush controller
+        // Update brush controller with CPU voxel data for DDA raycasting
+        // The voxel data is from the previous frame's readback (1 frame latency is acceptable)
         // When mouse is captured (FPS mode), always use screen center for crosshair
         // When mouse is free, use actual mouse position
         glm::vec2 brushNDC = inputManager.IsMouseCaptured()
@@ -393,7 +394,9 @@ int main(int argc, char* argv[]) {
             aspectRatio,
             inputManager.IsMouseButtonDown(Input::MouseButton::Left),
             inputManager.IsMouseButtonDown(Input::MouseButton::Right),
-            inputManager.GetScrollDelta()
+            inputManager.GetScrollDelta(),
+            voxelWorld->GetCPUVoxelData(),
+            voxelWorld->GetCPUVoxelDataSize()
         );
 
         // Get current frame context
@@ -464,7 +467,23 @@ int main(int argc, char* argv[]) {
         cameraParams.fov = fov;
         cameraParams.aspectRatio = aspectRatio;
 
+        // Build brush preview params (if brush has valid position)
+        Graphics::Renderer::BrushPreview brushPreview = {};
+        if (brushController.HasValidPosition()) {
+            auto brushPos = brushController.GetBrushPosition();
+            brushPreview.posX = brushPos.x;
+            brushPreview.posY = brushPos.y;
+            brushPreview.posZ = brushPos.z;
+            brushPreview.radius = brushController.GetRadius();
+            brushPreview.material = brushController.GetMaterial();
+            brushPreview.shape = static_cast<uint32_t>(brushController.GetShape());
+            brushPreview.hasValidPosition = true;
+        } else {
+            brushPreview.hasValidPosition = false;
+        }
+
         // Render voxels with raymarch shader (using persistent shader-visible descriptors)
+        // Brush preview now uses proper DDA raycasting!
         renderer->RenderVoxels(
             commandList.Get(),
             voxelWorld->GetReadBufferSRV(),
@@ -472,11 +491,16 @@ int main(int argc, char* argv[]) {
             voxelWorld->GetGridSizeX(),
             voxelWorld->GetGridSizeY(),
             voxelWorld->GetGridSizeZ(),
-            cameraParams
+            cameraParams,
+            brushController.HasValidPosition() ? &brushPreview : nullptr
         );
 
         // Render crosshair at screen center
         renderer->RenderCrosshair(commandList.Get());
+
+        // Request GPU->CPU readback for next frame's brush raycasting (async)
+        // This copy will be ready by the next frame for CPU-side DDA raycasting
+        voxelWorld->RequestReadback(commandList.Get());
 
         // End frame - transitions back buffer to present state
         renderer->EndFrame(commandList.Get(), frameIndex);

@@ -61,6 +61,14 @@ void VoxelWorld::Shutdown() {
         }
     }
 
+    // Cleanup readback buffer
+    if (m_cpuVoxelData) {
+        D3D12_RANGE emptyRange = {0, 0};
+        m_readbackBuffer->Unmap(0, &emptyRange);
+        m_cpuVoxelData = nullptr;
+    }
+    m_readbackBuffer.Reset();
+
     m_materialPalette.Reset();
     m_paletteUpload.Reset();
     m_heapManager = nullptr;
@@ -302,6 +310,79 @@ Result<void> VoxelWorld::CreateMaterialPalette(
 
     spdlog::debug("Material palette created with 256 colors (shader-visible descriptor allocated)");
     return {};
+}
+
+void VoxelWorld::RequestReadback(ID3D12GraphicsCommandList* cmdList) {
+    if (!cmdList) return;
+
+    ID3D12Device* device = nullptr;
+    m_voxelBuffers[m_readBufferIndex].GetResource()->GetDevice(IID_PPV_ARGS(&device));
+    if (!device) return;
+
+    // Create readback buffer if it doesn't exist
+    if (!m_readbackBuffer) {
+        uint64_t bufferSize = static_cast<uint64_t>(GetTotalVoxels()) * sizeof(uint32_t);
+
+        D3D12_HEAP_PROPERTIES readbackHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
+        D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(bufferSize);
+
+        HRESULT hr = device->CreateCommittedResource(
+            &readbackHeap,
+            D3D12_HEAP_FLAG_NONE,
+            &bufferDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,
+            IID_PPV_ARGS(&m_readbackBuffer)
+        );
+
+        if (FAILED(hr)) {
+            spdlog::error("Failed to create readback buffer: 0x{:08X}", hr);
+            device->Release();
+            return;
+        }
+
+        m_readbackBuffer->SetName(L"VoxelReadbackBuffer");
+
+        // Map the readback buffer (stays mapped for lifetime)
+        D3D12_RANGE readRange = {0, 0};  // Don't read on CPU yet
+        hr = m_readbackBuffer->Map(0, &readRange, reinterpret_cast<void**>(&m_cpuVoxelData));
+        if (FAILED(hr)) {
+            spdlog::error("Failed to map readback buffer: 0x{:08X}", hr);
+            m_readbackBuffer.Reset();
+            m_cpuVoxelData = nullptr;
+            device->Release();
+            return;
+        }
+
+        spdlog::debug("Created CPU readback buffer for brush raycasting ({} MB)",
+            bufferSize / (1024 * 1024));
+    }
+
+    device->Release();
+
+    // Transition read buffer to copy source
+    D3D12_RESOURCE_STATES currentState = m_voxelBuffers[m_readBufferIndex].GetCurrentState();
+    if (currentState != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_voxelBuffers[m_readBufferIndex].GetResource(),
+            currentState,
+            D3D12_RESOURCE_STATE_COPY_SOURCE
+        );
+        cmdList->ResourceBarrier(1, &barrier);
+    }
+
+    // Copy GPU buffer to CPU readback buffer
+    cmdList->CopyResource(m_readbackBuffer.Get(), m_voxelBuffers[m_readBufferIndex].GetResource());
+
+    // Transition back to original state
+    if (currentState != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_voxelBuffers[m_readBufferIndex].GetResource(),
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            currentState
+        );
+        cmdList->ResourceBarrier(1, &barrier);
+    }
 }
 
 } // namespace VENPOD::Simulation

@@ -1,0 +1,3 @@
+Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/VENPOD.dir
+Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/edit_cache.dir
+Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/rebuild_cache.dir

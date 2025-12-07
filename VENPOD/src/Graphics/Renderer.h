@@ -64,6 +64,15 @@ public:
         float aspectRatio;
     };
 
+    // Brush preview parameters for rendering
+    struct BrushPreview {
+        float posX, posY, posZ;
+        float radius;
+        uint32_t material;
+        uint32_t shape;
+        bool hasValidPosition;
+    };
+
     // Render voxels with raymarch shader (binds voxel resources)
     void RenderVoxels(
         ID3D12GraphicsCommandList* cmdList,
@@ -72,7 +81,8 @@ public:
         uint32_t gridSizeX,
         uint32_t gridSizeY,
         uint32_t gridSizeZ,
-        const CameraParams& camera
+        const CameraParams& camera,
+        const BrushPreview* brushPreview = nullptr
     );
 
     // Render crosshair at screen center

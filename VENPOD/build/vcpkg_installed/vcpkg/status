@@ -1,0 +1,70 @@
+Package: vcpkg-cmake-config
+Version: 2024-05-23
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 4d75d6b1fef2392fe0bef85796c295bda5363876e4162546e1b7974d55dfc74c
+Status: install ok installed
+
+Package: vcpkg-cmake
+Version: 2024-04-23
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 84011756e153979d9f7f6c5c99e2c5a26929a98e52b9e40ce4f3aef100122523
+Status: install ok installed
+
+Package: directx-headers
+Version: 1.618.2
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 95e86a4b060c69a5a4d498f39f9227a1910ec3c54257e03e7b011d2a93dda7f3
+Description: Official DirectX 12 Headers
+Status: install ok installed
+
+Package: glm
+Version: 1.0.2
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 3fc28443fc4b3c7fcc9c1e52c8f50617463ef91d25277d4a081679643db19a26
+Description: OpenGL Mathematics (GLM)
+Status: install ok installed
+
+Package: nlohmann-json
+Version: 3.12.0
+Port-Version: 1
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: ff26db108c999a20911c7b0b6ee597c523cb34e21b98957ae87e6f7b0e48d391
+Description: JSON for Modern C++
+Status: install ok installed
+
+Package: sdl3
+Version: 3.2.26
+Port-Version: 1
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 2dd5adc62e3b0e84d8cd798e39f4b008143f4927179e5427a401a7598086a889
+Description: Simple DirectMedia Layer is a cross-platform development library designed to provide low level access to audio, keyboard, mouse, joystick, and graphics hardware via OpenGL and Direct3D.
+Status: install ok installed
+
+Package: fmt
+Version: 12.1.0
+Depends: vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 1500ed52a772ae004326c070eebb62a527dcc4276dd3756cefc6bb4a1ab18d9a
+Description: {fmt} is an open-source formatting library providing a fast and safe alternative to C stdio and C++ iostreams.
+Status: install ok installed
+
+Package: spdlog
+Version: 1.16.0
+Depends: fmt, vcpkg-cmake, vcpkg-cmake-config
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 5d8406feabe81199116a056879d535f0986f27875c636dd9c5be51aea91a3be1
+Description: Very fast, header-only/compiled, C++ logging library.
+Status: install ok installed
+

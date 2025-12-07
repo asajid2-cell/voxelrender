@@ -95,6 +95,15 @@ public:
     void TransitionReadBufferTo(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_STATES state);
     void TransitionWriteBufferTo(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_STATES state);
 
+    // CPU readback for brush raycasting
+    // Request a copy of the read buffer to CPU memory (async)
+    void RequestReadback(ID3D12GraphicsCommandList* cmdList);
+
+    // Get CPU-accessible voxel data (nullptr if not ready)
+    // Must call RequestReadback first and wait for GPU to finish
+    const uint32_t* GetCPUVoxelData() const { return m_cpuVoxelData; }
+    size_t GetCPUVoxelDataSize() const { return GetTotalVoxels(); }
+
 private:
     Result<void> CreateVoxelBuffers(ID3D12Device* device, Graphics::DescriptorHeapManager& heapManager);
     Result<void> CreateMaterialPalette(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, Graphics::DescriptorHeapManager& heapManager);
@@ -117,6 +126,10 @@ private:
 
     // Heap manager reference for cleanup
     Graphics::DescriptorHeapManager* m_heapManager = nullptr;
+
+    // CPU readback buffer for brush raycasting
+    ComPtr<ID3D12Resource> m_readbackBuffer;
+    uint32_t* m_cpuVoxelData = nullptr;  // Mapped readback buffer
 };
 
 } // namespace VENPOD::Simulation

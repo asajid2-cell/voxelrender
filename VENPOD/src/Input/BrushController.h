@@ -54,7 +54,9 @@ public:
     // Initialize with default settings
     void Initialize();
 
-    // Update brush position from screen coordinates
+    // Update brush position from screen coordinates using DDA raycasting
+    // voxelGridData: pointer to voxel data (can be nullptr for preview-only mode)
+    // voxelGridSize: total number of voxels in the grid
     // Returns true if brush should paint this frame
     void UpdateFromMouse(
         const glm::vec2& mouseNDC,
@@ -66,7 +68,9 @@ public:
         float aspectRatio,
         bool leftButtonDown,
         bool rightButtonDown,
-        float scrollDelta
+        float scrollDelta,
+        const uint32_t* voxelGridData = nullptr,
+        size_t voxelGridSize = 0
     );
 
     // Get brush constants for shader
@@ -118,6 +122,29 @@ private:
         float& tMin,
         float& tMax
     ) const;
+
+    // DDA Raycasting through voxel grid to find first solid voxel
+    // Returns true if a solid voxel was hit
+    bool DDAVoxelRaycast(
+        const glm::vec3& rayOrigin,
+        const glm::vec3& rayDir,
+        const uint32_t* voxelGridData,
+        size_t voxelGridSize,
+        glm::ivec3& hitVoxel,
+        glm::ivec3& hitNormal
+    ) const;
+
+    // Get voxel at position (returns 0 for air/out of bounds)
+    uint32_t GetVoxelAt(
+        const glm::ivec3& pos,
+        const uint32_t* voxelGridData,
+        size_t voxelGridSize
+    ) const;
+
+    // Extract material ID from packed voxel data
+    static uint32_t GetMaterialFromVoxel(uint32_t voxel) {
+        return voxel & 0xFF;  // Material is in lower 8 bits
+    }
 
     // Current brush state
     glm::vec3 m_brushPosition{0.0f};
