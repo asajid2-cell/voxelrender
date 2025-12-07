@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "venpod",
+  "version": "0.1.0",
+  "description": "VENPOD - High-Performance Voxel Physics Engine targeting 100M+ active voxels @ 60 FPS",
+  "dependencies": [
+    "sdl3",
+    "nlohmann-json",
+    "spdlog",
+    "directx-headers",
+    "glm"
+  ]
+}

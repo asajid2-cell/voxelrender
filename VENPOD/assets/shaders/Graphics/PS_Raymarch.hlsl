@@ -1,0 +1,185 @@
+// =============================================================================
+// VENPOD Voxel Raymarcher Pixel Shader
+// DDA algorithm for stepping through voxel grid
+// =============================================================================
+
+#include "../Common/SharedTypes.hlsli"
+#include "../Common/MortonCode.hlsli"
+#include "../Common/BitPacking.hlsli"
+
+// Constant buffer
+cbuffer FrameConstantsCB : register(b0) {
+    FrameConstants frame;
+}
+
+// Voxel grid (read-only for rendering)
+StructuredBuffer<uint> VoxelGrid : register(t0);
+
+// Material palette
+Texture1D<float4> MaterialPalette : register(t1);
+SamplerState PaletteSampler : register(s0);
+
+struct PSInput {
+    float4 position : SV_Position;
+    float2 uv : TEXCOORD0;
+};
+
+// Sample voxel from grid
+uint GetVoxel(int3 pos) {
+    // Bounds check
+    if (pos.x < 0 || pos.x >= (int)frame.gridSizeX ||
+        pos.y < 0 || pos.y >= (int)frame.gridSizeY ||
+        pos.z < 0 || pos.z >= (int)frame.gridSizeZ) {
+        return PackVoxel(MAT_AIR, 0, 0, 0);
+    }
+
+    uint3 gridSize = uint3(frame.gridSizeX, frame.gridSizeY, frame.gridSizeZ);
+    uint idx = LinearIndex3D(uint3(pos), gridSize);
+    return VoxelGrid[idx];
+}
+
+// Box intersection test (AABB ray intersection)
+bool IntersectBox(float3 rayOrigin, float3 rayDir, float3 boxMin, float3 boxMax, out float tMin, out float tMax) {
+    float3 invDir = 1.0f / rayDir;
+    float3 t0 = (boxMin - rayOrigin) * invDir;
+    float3 t1 = (boxMax - rayOrigin) * invDir;
+
+    float3 tNear = min(t0, t1);
+    float3 tFar = max(t0, t1);
+
+    tMin = max(max(tNear.x, tNear.y), tNear.z);
+    tMax = min(min(tFar.x, tFar.y), tFar.z);
+
+    return tMax >= tMin && tMax >= 0.0f;
+}
+
+// DDA Raymarcher
+float4 Raymarch(float3 rayOrigin, float3 rayDir) {
+    const float maxDist = 1024.0f;  // Increased for larger worlds
+    const int maxSteps = 512;       // More steps for distant voxels
+
+    // Grid bounds (voxel coordinates)
+    float3 gridMin = float3(0.0f, 0.0f, 0.0f);
+    float3 gridMax = float3(frame.gridSizeX, frame.gridSizeY, frame.gridSizeZ);
+
+    // Find ray entry point into grid
+    float tMin, tMax;
+    if (!IntersectBox(rayOrigin, rayDir, gridMin, gridMax, tMin, tMax)) {
+        // Ray doesn't intersect grid - show sky
+        float skyFactor = saturate(rayDir.y * 0.5f + 0.5f);
+        float3 skyTop = float3(0.3f, 0.5f, 0.8f);
+        float3 skyBottom = float3(0.8f, 0.9f, 1.0f);
+        float3 skyColor = lerp(skyBottom, skyTop, skyFactor);
+        return float4(skyColor, 1.0f);
+    }
+
+    // Start raymarching from grid entry point (or ray origin if inside grid)
+    float3 startPos = rayOrigin + rayDir * max(tMin, 0.0f);
+
+    // Start position in voxel grid
+    int3 voxelPos = int3(floor(startPos));
+
+    // DDA setup
+    float3 deltaDist = abs(1.0f / rayDir);
+    int3 step = int3(sign(rayDir));
+
+    float3 sideDist;
+    sideDist.x = (rayDir.x > 0.0f) ? (voxelPos.x + 1.0f - startPos.x) : (startPos.x - voxelPos.x);
+    sideDist.y = (rayDir.y > 0.0f) ? (voxelPos.y + 1.0f - startPos.y) : (startPos.y - voxelPos.y);
+    sideDist.z = (rayDir.z > 0.0f) ? (voxelPos.z + 1.0f - startPos.z) : (startPos.z - voxelPos.z);
+    sideDist *= deltaDist;
+
+    float3 normal = float3(0, 1, 0);
+    float dist = 0.0f;
+
+    // DDA traversal
+    for (int i = 0; i < maxSteps; i++) {
+        uint voxel = GetVoxel(voxelPos);
+        uint material = GetMaterial(voxel);
+
+        // Hit non-air voxel?
+        if (material != MAT_AIR) {
+            // Sample material color from palette
+            float u = (material + 0.5f) / 256.0f;
+            float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, u, 0);
+
+            // Simple diffuse lighting
+            float3 lightDir = normalize(float3(0.5f, 1.0f, 0.3f));
+            float ndotl = max(dot(normal, lightDir), 0.1f);  // Ambient = 0.1
+
+            // Add slight variant-based color variation
+            uint variant = GetVariant(voxel);
+            float variantNoise = (variant / 255.0f) * 0.1f - 0.05f;  // +/- 5%
+
+            float3 finalColor = baseColor.rgb * ndotl * (1.0f + variantNoise);
+
+            // Depth fog
+            float fogFactor = saturate(dist / maxDist);
+            float3 fogColor = float3(0.5f, 0.6f, 0.7f);  // Sky blue
+            finalColor = lerp(finalColor, fogColor, fogFactor * 0.5f);
+
+            return float4(finalColor, 1.0f);
+        }
+
+        // Step to next voxel boundary
+        if (sideDist.x < sideDist.y) {
+            if (sideDist.x < sideDist.z) {
+                sideDist.x += deltaDist.x;
+                voxelPos.x += step.x;
+                normal = float3(-step.x, 0, 0);
+                dist = sideDist.x;
+            } else {
+                sideDist.z += deltaDist.z;
+                voxelPos.z += step.z;
+                normal = float3(0, 0, -step.z);
+                dist = sideDist.z;
+            }
+        } else {
+            if (sideDist.y < sideDist.z) {
+                sideDist.y += deltaDist.y;
+                voxelPos.y += step.y;
+                normal = float3(0, -step.y, 0);
+                dist = sideDist.y;
+            } else {
+                sideDist.z += deltaDist.z;
+                voxelPos.z += step.z;
+                normal = float3(0, 0, -step.z);
+                dist = sideDist.z;
+            }
+        }
+
+        if (dist > maxDist) break;
+    }
+
+    // Sky gradient
+    float skyFactor = saturate(rayDir.y * 0.5f + 0.5f);
+    float3 skyTop = float3(0.3f, 0.5f, 0.8f);
+    float3 skyBottom = float3(0.8f, 0.9f, 1.0f);
+    float3 skyColor = lerp(skyBottom, skyTop, skyFactor);
+
+    return float4(skyColor, 1.0f);
+}
+
+float4 main(PSInput input) : SV_Target {
+    // Camera data from constant buffer
+    float3 cameraPos = frame.cameraPosition.xyz;
+    float3 forward = frame.cameraForward.xyz;
+    float3 right = frame.cameraRight.xyz;
+    float3 up = frame.cameraUp.xyz;
+    float fov = frame.cameraPosition.w;
+    float aspectRatio = frame.cameraForward.w;
+
+    // Ray direction from UV
+    float2 ndc = input.uv * 2.0f - 1.0f;
+    ndc.y = -ndc.y;  // Flip Y
+
+    float tanHalfFov = tan(fov * 0.5f);
+
+    float3 rayDir = normalize(
+        forward +
+        right * ndc.x * tanHalfFov * aspectRatio +
+        up * ndc.y * tanHalfFov
+    );
+
+    return Raymarch(cameraPos, rayDir);
+}
