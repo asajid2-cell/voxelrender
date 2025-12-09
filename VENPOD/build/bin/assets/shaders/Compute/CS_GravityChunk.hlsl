@@ -187,7 +187,7 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                     }
 
                     // Liquids: horizontal spread (simplified)
-                    if (IsLiquid(material)) {
+                    if (IsLiquid(currentVoxel)) {
                         uint rng = PCGHash(pos.x + pos.y * 1000 + pos.z * 1000000 + frameIndex);
                         int dir = (rng & 1) ? 1 : -1;
 

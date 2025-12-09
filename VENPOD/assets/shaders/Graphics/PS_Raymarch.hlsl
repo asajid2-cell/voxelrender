@@ -118,7 +118,8 @@ float4 Raymarch(float3 rayOrigin, float3 rayDir) {
             float3 fogColor = float3(0.5f, 0.6f, 0.7f);  // Sky blue
             finalColor = lerp(finalColor, fogColor, fogFactor * 0.5f);
 
-            return float4(finalColor, 1.0f);
+            // Use material's alpha from palette (enables transparency for water, glass, etc.)
+            return float4(finalColor, baseColor.a);
         }
 
         // Step to next voxel boundary
