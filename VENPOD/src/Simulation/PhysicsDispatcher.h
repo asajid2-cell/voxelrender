@@ -46,9 +46,10 @@ struct ChunkScanConstants {
     uint32_t chunkSize;
 
     uint32_t sleepThreshold;
-    uint32_t padding0;
-    uint32_t padding1;
-    uint32_t padding2;
+    // PRIORITY 3: Active region offset for 4×4×4 optimization
+    int32_t activeRegionOffsetX;  // Camera chunk X - 1 (start of active region)
+    int32_t activeRegionOffsetY;  // Camera chunk Y - 1
+    int32_t activeRegionOffsetZ;  // Camera chunk Z - 1
 };
 
 // Chunk-based physics constants

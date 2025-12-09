@@ -59,8 +59,6 @@ public:
     void Render(ID3D12GraphicsCommandList* cmdList, DX12GraphicsPipeline& pipeline);
 
     // Accessors
-    GPUBuffer& GetVoxelBufferA() { return m_voxelBufferA; }
-    GPUBuffer& GetVoxelBufferB() { return m_voxelBufferB; }
     ConstantBuffer& GetFrameConstantBuffer() { return m_frameConstantBuffer; }
 
     uint32_t GetGridSizeX() const { return m_config.gridSizeX; }
@@ -73,12 +71,10 @@ public:
     }
 
 private:
-    Result<void> CreateVoxelBuffers(ID3D12Device* device, DescriptorHeapManager& heapManager);
     Result<void> CreateMaterialPalette(ID3D12Device* device, DescriptorHeapManager& heapManager);
 
-    // Ping-pong voxel buffers (for physics simulation)
-    GPUBuffer m_voxelBufferA;  // Current state
-    GPUBuffer m_voxelBufferB;  // Next state
+    // NOTE: Voxel buffers removed - VoxelWorld manages buffers now (256³ ping-pong)
+    // This saves 32MB+ of unused GPU memory
 
     // Material palette texture
     ComPtr<ID3D12Resource> m_materialPalette;

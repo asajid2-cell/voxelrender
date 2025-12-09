@@ -20,9 +20,10 @@ cbuffer ChunkScanConstants : register(b0) {
     uint chunkSize;     // CHUNK_SIZE (16)
 
     uint sleepThreshold; // Frames before chunk goes to sleep
-    uint padding0;
-    uint padding1;
-    uint padding2;
+    // PRIORITY 3: Active region offset for 4×4×4 optimization
+    int activeRegionOffsetX;  // Camera chunk X - 1 (start of active region)
+    int activeRegionOffsetY;  // Camera chunk Y - 1
+    int activeRegionOffsetZ;  // Camera chunk Z - 1
 };
 
 // Input voxel grid (read-only)
@@ -72,12 +73,19 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID, ui
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // Calculate chunk index
-    uint chunkIndex = groupId.x + groupId.y * chunkCountX + groupId.z * chunkCountX * chunkCountY;
+    // PRIORITY 3: Calculate world chunk coordinate
+    // groupId is local (0-3 for 4×4×4 region, 0-15 for full grid)
+    // worldChunkId adds the activeRegionOffset to get actual world chunk coordinate
+    int3 worldChunkId = int3(groupId) + int3(activeRegionOffsetX, activeRegionOffsetY, activeRegionOffsetZ);
+
+    // Calculate chunk index in chunk control buffer (still using world coordinates)
+    // For infinite chunks: chunks are positioned at their world coordinates
+    // For static grid: offset is 0, so worldChunkId == groupId
+    uint chunkIndex = worldChunkId.x + worldChunkId.y * chunkCountX + worldChunkId.z * chunkCountX * chunkCountY;
 
     // Each thread handles a 2x2x2 region within the chunk
     uint3 baseVoxelInChunk = groupThreadId * 2;
-    uint3 chunkBase = groupId * chunkSize;
+    uint3 chunkBase = uint3(worldChunkId) * chunkSize;
 
     uint localActive = 0;
     uint localParticles = 0;

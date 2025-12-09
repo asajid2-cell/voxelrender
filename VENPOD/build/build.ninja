@@ -247,6 +247,50 @@ build CMakeFiles\VENPOD.dir\src\Simulation\PhysicsDispatcher.cpp.obj: CXX_COMPIL
   TARGET_PDB = bin\VENPOD.pdb
   TARGET_SUPPORT_DIR = CMakeFiles\VENPOD.dir
 
+build CMakeFiles\VENPOD.dir\src\Simulation\Chunk.cpp.obj: CXX_COMPILER__VENPOD_unscanned_Release Z$:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src\Simulation\Chunk.cpp || cmake_object_order_depends_target_VENPOD
+  CONFIG = Release
+  DEFINES = -DFMT_SHARED -DNOMINMAX -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -DUNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -D_UNICODE
+  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD /W4 /WX- /permissive- /Zc:__cplusplus /wd4251 /wd4275 /utf-8
+  INCLUDES = -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui -external:IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\build\vcpkg_installed\x64-windows\include -external:W0
+  OBJECT_DIR = CMakeFiles\VENPOD.dir
+  OBJECT_FILE_DIR = CMakeFiles\VENPOD.dir\src\Simulation
+  TARGET_COMPILE_PDB = CMakeFiles\VENPOD.dir\
+  TARGET_PDB = bin\VENPOD.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\VENPOD.dir
+
+build CMakeFiles\VENPOD.dir\src\Simulation\InfiniteChunkManager.cpp.obj: CXX_COMPILER__VENPOD_unscanned_Release Z$:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src\Simulation\InfiniteChunkManager.cpp || cmake_object_order_depends_target_VENPOD
+  CONFIG = Release
+  DEFINES = -DFMT_SHARED -DNOMINMAX -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -DUNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -D_UNICODE
+  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD /W4 /WX- /permissive- /Zc:__cplusplus /wd4251 /wd4275 /utf-8
+  INCLUDES = -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui -external:IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\build\vcpkg_installed\x64-windows\include -external:W0
+  OBJECT_DIR = CMakeFiles\VENPOD.dir
+  OBJECT_FILE_DIR = CMakeFiles\VENPOD.dir\src\Simulation
+  TARGET_COMPILE_PDB = CMakeFiles\VENPOD.dir\
+  TARGET_PDB = bin\VENPOD.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\VENPOD.dir
+
+build CMakeFiles\VENPOD.dir\src\Simulation\ChunkGenerationTest.cpp.obj: CXX_COMPILER__VENPOD_unscanned_Release Z$:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src\Simulation\ChunkGenerationTest.cpp || cmake_object_order_depends_target_VENPOD
+  CONFIG = Release
+  DEFINES = -DFMT_SHARED -DNOMINMAX -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -DUNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -D_UNICODE
+  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD /W4 /WX- /permissive- /Zc:__cplusplus /wd4251 /wd4275 /utf-8
+  INCLUDES = -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui -external:IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\build\vcpkg_installed\x64-windows\include -external:W0
+  OBJECT_DIR = CMakeFiles\VENPOD.dir
+  OBJECT_FILE_DIR = CMakeFiles\VENPOD.dir\src\Simulation
+  TARGET_COMPILE_PDB = CMakeFiles\VENPOD.dir\
+  TARGET_PDB = bin\VENPOD.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\VENPOD.dir
+
+build CMakeFiles\VENPOD.dir\src\Simulation\ChunkStressTest.cpp.obj: CXX_COMPILER__VENPOD_unscanned_Release Z$:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src\Simulation\ChunkStressTest.cpp || cmake_object_order_depends_target_VENPOD
+  CONFIG = Release
+  DEFINES = -DFMT_SHARED -DNOMINMAX -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -DUNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -D_UNICODE
+  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD /W4 /WX- /permissive- /Zc:__cplusplus /wd4251 /wd4275 /utf-8
+  INCLUDES = -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui -external:IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\build\vcpkg_installed\x64-windows\include -external:W0
+  OBJECT_DIR = CMakeFiles\VENPOD.dir
+  OBJECT_FILE_DIR = CMakeFiles\VENPOD.dir\src\Simulation
+  TARGET_COMPILE_PDB = CMakeFiles\VENPOD.dir\
+  TARGET_PDB = bin\VENPOD.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\VENPOD.dir
+
 build CMakeFiles\VENPOD.dir\src\Input\InputManager.cpp.obj: CXX_COMPILER__VENPOD_unscanned_Release Z$:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src\Input\InputManager.cpp || cmake_object_order_depends_target_VENPOD
   CONFIG = Release
   DEFINES = -DFMT_SHARED -DNOMINMAX -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -DUNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -D_UNICODE
@@ -313,6 +357,17 @@ build CMakeFiles\VENPOD.dir\src\UI\BrushPanel.cpp.obj: CXX_COMPILER__VENPOD_unsc
   TARGET_PDB = bin\VENPOD.pdb
   TARGET_SUPPORT_DIR = CMakeFiles\VENPOD.dir
 
+build CMakeFiles\VENPOD.dir\src\UI\PauseMenu.cpp.obj: CXX_COMPILER__VENPOD_unscanned_Release Z$:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src\UI\PauseMenu.cpp || cmake_object_order_depends_target_VENPOD
+  CONFIG = Release
+  DEFINES = -DFMT_SHARED -DNOMINMAX -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -DUNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -D_UNICODE
+  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD /W4 /WX- /permissive- /Zc:__cplusplus /wd4251 /wd4275 /utf-8
+  INCLUDES = -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui -external:IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\build\vcpkg_installed\x64-windows\include -external:W0
+  OBJECT_DIR = CMakeFiles\VENPOD.dir
+  OBJECT_FILE_DIR = CMakeFiles\VENPOD.dir\src\UI
+  TARGET_COMPILE_PDB = CMakeFiles\VENPOD.dir\
+  TARGET_PDB = bin\VENPOD.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\VENPOD.dir
+
 build CMakeFiles\VENPOD.dir\src\Utils\FileUtils.cpp.obj: CXX_COMPILER__VENPOD_unscanned_Release Z$:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src\Utils\FileUtils.cpp || cmake_object_order_depends_target_VENPOD
   CONFIG = Release
   DEFINES = -DFMT_SHARED -DNOMINMAX -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -DUNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -D_UNICODE
@@ -320,6 +375,83 @@ build CMakeFiles\VENPOD.dir\src\Utils\FileUtils.cpp.obj: CXX_COMPILER__VENPOD_un
   INCLUDES = -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui -external:IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\build\vcpkg_installed\x64-windows\include -external:W0
   OBJECT_DIR = CMakeFiles\VENPOD.dir
   OBJECT_FILE_DIR = CMakeFiles\VENPOD.dir\src\Utils
+  TARGET_COMPILE_PDB = CMakeFiles\VENPOD.dir\
+  TARGET_PDB = bin\VENPOD.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\VENPOD.dir
+
+build CMakeFiles\VENPOD.dir\vendor\imgui\imgui.cpp.obj: CXX_COMPILER__VENPOD_unscanned_Release Z$:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui\imgui.cpp || cmake_object_order_depends_target_VENPOD
+  CONFIG = Release
+  DEFINES = -DFMT_SHARED -DNOMINMAX -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -DUNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -D_UNICODE
+  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD /W4 /WX- /permissive- /Zc:__cplusplus /wd4251 /wd4275 /utf-8
+  INCLUDES = -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui -external:IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\build\vcpkg_installed\x64-windows\include -external:W0
+  OBJECT_DIR = CMakeFiles\VENPOD.dir
+  OBJECT_FILE_DIR = CMakeFiles\VENPOD.dir\vendor\imgui
+  TARGET_COMPILE_PDB = CMakeFiles\VENPOD.dir\
+  TARGET_PDB = bin\VENPOD.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\VENPOD.dir
+
+build CMakeFiles\VENPOD.dir\vendor\imgui\imgui_draw.cpp.obj: CXX_COMPILER__VENPOD_unscanned_Release Z$:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui\imgui_draw.cpp || cmake_object_order_depends_target_VENPOD
+  CONFIG = Release
+  DEFINES = -DFMT_SHARED -DNOMINMAX -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -DUNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -D_UNICODE
+  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD /W4 /WX- /permissive- /Zc:__cplusplus /wd4251 /wd4275 /utf-8
+  INCLUDES = -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui -external:IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\build\vcpkg_installed\x64-windows\include -external:W0
+  OBJECT_DIR = CMakeFiles\VENPOD.dir
+  OBJECT_FILE_DIR = CMakeFiles\VENPOD.dir\vendor\imgui
+  TARGET_COMPILE_PDB = CMakeFiles\VENPOD.dir\
+  TARGET_PDB = bin\VENPOD.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\VENPOD.dir
+
+build CMakeFiles\VENPOD.dir\vendor\imgui\imgui_tables.cpp.obj: CXX_COMPILER__VENPOD_unscanned_Release Z$:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui\imgui_tables.cpp || cmake_object_order_depends_target_VENPOD
+  CONFIG = Release
+  DEFINES = -DFMT_SHARED -DNOMINMAX -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -DUNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -D_UNICODE
+  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD /W4 /WX- /permissive- /Zc:__cplusplus /wd4251 /wd4275 /utf-8
+  INCLUDES = -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui -external:IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\build\vcpkg_installed\x64-windows\include -external:W0
+  OBJECT_DIR = CMakeFiles\VENPOD.dir
+  OBJECT_FILE_DIR = CMakeFiles\VENPOD.dir\vendor\imgui
+  TARGET_COMPILE_PDB = CMakeFiles\VENPOD.dir\
+  TARGET_PDB = bin\VENPOD.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\VENPOD.dir
+
+build CMakeFiles\VENPOD.dir\vendor\imgui\imgui_widgets.cpp.obj: CXX_COMPILER__VENPOD_unscanned_Release Z$:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui\imgui_widgets.cpp || cmake_object_order_depends_target_VENPOD
+  CONFIG = Release
+  DEFINES = -DFMT_SHARED -DNOMINMAX -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -DUNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -D_UNICODE
+  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD /W4 /WX- /permissive- /Zc:__cplusplus /wd4251 /wd4275 /utf-8
+  INCLUDES = -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui -external:IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\build\vcpkg_installed\x64-windows\include -external:W0
+  OBJECT_DIR = CMakeFiles\VENPOD.dir
+  OBJECT_FILE_DIR = CMakeFiles\VENPOD.dir\vendor\imgui
+  TARGET_COMPILE_PDB = CMakeFiles\VENPOD.dir\
+  TARGET_PDB = bin\VENPOD.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\VENPOD.dir
+
+build CMakeFiles\VENPOD.dir\vendor\imgui\imgui_demo.cpp.obj: CXX_COMPILER__VENPOD_unscanned_Release Z$:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui\imgui_demo.cpp || cmake_object_order_depends_target_VENPOD
+  CONFIG = Release
+  DEFINES = -DFMT_SHARED -DNOMINMAX -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -DUNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -D_UNICODE
+  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD /W4 /WX- /permissive- /Zc:__cplusplus /wd4251 /wd4275 /utf-8
+  INCLUDES = -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui -external:IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\build\vcpkg_installed\x64-windows\include -external:W0
+  OBJECT_DIR = CMakeFiles\VENPOD.dir
+  OBJECT_FILE_DIR = CMakeFiles\VENPOD.dir\vendor\imgui
+  TARGET_COMPILE_PDB = CMakeFiles\VENPOD.dir\
+  TARGET_PDB = bin\VENPOD.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\VENPOD.dir
+
+build CMakeFiles\VENPOD.dir\vendor\imgui\backends\imgui_impl_sdl3.cpp.obj: CXX_COMPILER__VENPOD_unscanned_Release Z$:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui\backends\imgui_impl_sdl3.cpp || cmake_object_order_depends_target_VENPOD
+  CONFIG = Release
+  DEFINES = -DFMT_SHARED -DNOMINMAX -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -DUNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -D_UNICODE
+  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD /W4 /WX- /permissive- /Zc:__cplusplus /wd4251 /wd4275 /utf-8
+  INCLUDES = -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui -external:IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\build\vcpkg_installed\x64-windows\include -external:W0
+  OBJECT_DIR = CMakeFiles\VENPOD.dir
+  OBJECT_FILE_DIR = CMakeFiles\VENPOD.dir\vendor\imgui\backends
+  TARGET_COMPILE_PDB = CMakeFiles\VENPOD.dir\
+  TARGET_PDB = bin\VENPOD.pdb
+  TARGET_SUPPORT_DIR = CMakeFiles\VENPOD.dir
+
+build CMakeFiles\VENPOD.dir\vendor\imgui\backends\imgui_impl_dx12.cpp.obj: CXX_COMPILER__VENPOD_unscanned_Release Z$:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui\backends\imgui_impl_dx12.cpp || cmake_object_order_depends_target_VENPOD
+  CONFIG = Release
+  DEFINES = -DFMT_SHARED -DNOMINMAX -DSPDLOG_COMPILED_LIB -DSPDLOG_FMT_EXTERNAL -DSPDLOG_SHARED_LIB -DUNICODE -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -D_UNICODE
+  FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -std:c++20 -MD /W4 /WX- /permissive- /Zc:__cplusplus /wd4251 /wd4275 /utf-8
+  INCLUDES = -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\src -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor -IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\vendor\imgui -external:IZ:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\build\vcpkg_installed\x64-windows\include -external:W0
+  OBJECT_DIR = CMakeFiles\VENPOD.dir
+  OBJECT_FILE_DIR = CMakeFiles\VENPOD.dir\vendor\imgui\backends
   TARGET_COMPILE_PDB = CMakeFiles\VENPOD.dir\
   TARGET_PDB = bin\VENPOD.pdb
   TARGET_SUPPORT_DIR = CMakeFiles\VENPOD.dir
@@ -332,7 +464,7 @@ build CMakeFiles\VENPOD.dir\src\Utils\FileUtils.cpp.obj: CXX_COMPILER__VENPOD_un
 #############################################
 # Link the executable bin\VENPOD.exe
 
-build bin\VENPOD.exe: CXX_EXECUTABLE_LINKER__VENPOD_Release CMakeFiles\VENPOD.dir\src\main.cpp.obj CMakeFiles\VENPOD.dir\src\Core\Engine.cpp.obj CMakeFiles\VENPOD.dir\src\Core\Window.cpp.obj CMakeFiles\VENPOD.dir\src\Core\Timer.cpp.obj CMakeFiles\VENPOD.dir\src\Core\ServiceLocator.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\RHI\DX12Device.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\RHI\DX12CommandQueue.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\RHI\DX12ComputePipeline.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\RHI\DX12GraphicsPipeline.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\RHI\DescriptorHeap.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\RHI\GPUBuffer.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\RHI\GPUTexture.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\RHI\ShaderCompiler.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\Renderer.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\VoxelRenderer.cpp.obj CMakeFiles\VENPOD.dir\src\Simulation\VoxelWorld.cpp.obj CMakeFiles\VENPOD.dir\src\Simulation\ChunkManager.cpp.obj CMakeFiles\VENPOD.dir\src\Simulation\PhysicsDispatcher.cpp.obj CMakeFiles\VENPOD.dir\src\Input\InputManager.cpp.obj CMakeFiles\VENPOD.dir\src\Input\BrushController.cpp.obj CMakeFiles\VENPOD.dir\src\UI\ImGuiBackend.cpp.obj CMakeFiles\VENPOD.dir\src\UI\DebugOverlay.cpp.obj CMakeFiles\VENPOD.dir\src\UI\MaterialPalette.cpp.obj CMakeFiles\VENPOD.dir\src\UI\BrushPanel.cpp.obj CMakeFiles\VENPOD.dir\src\Utils\FileUtils.cpp.obj | vcpkg_installed\x64-windows\lib\SDL3.lib vcpkg_installed\x64-windows\lib\spdlog.lib vcpkg_installed\x64-windows\lib\DirectX-Headers.lib vcpkg_installed\x64-windows\lib\DirectX-Guids.lib vcpkg_installed\x64-windows\lib\glm.lib vcpkg_installed\x64-windows\lib\fmt.lib vcpkg_installed\x64-windows\lib\DirectX-Headers.lib
+build bin\VENPOD.exe: CXX_EXECUTABLE_LINKER__VENPOD_Release CMakeFiles\VENPOD.dir\src\main.cpp.obj CMakeFiles\VENPOD.dir\src\Core\Engine.cpp.obj CMakeFiles\VENPOD.dir\src\Core\Window.cpp.obj CMakeFiles\VENPOD.dir\src\Core\Timer.cpp.obj CMakeFiles\VENPOD.dir\src\Core\ServiceLocator.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\RHI\DX12Device.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\RHI\DX12CommandQueue.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\RHI\DX12ComputePipeline.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\RHI\DX12GraphicsPipeline.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\RHI\DescriptorHeap.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\RHI\GPUBuffer.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\RHI\GPUTexture.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\RHI\ShaderCompiler.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\Renderer.cpp.obj CMakeFiles\VENPOD.dir\src\Graphics\VoxelRenderer.cpp.obj CMakeFiles\VENPOD.dir\src\Simulation\VoxelWorld.cpp.obj CMakeFiles\VENPOD.dir\src\Simulation\ChunkManager.cpp.obj CMakeFiles\VENPOD.dir\src\Simulation\PhysicsDispatcher.cpp.obj CMakeFiles\VENPOD.dir\src\Simulation\Chunk.cpp.obj CMakeFiles\VENPOD.dir\src\Simulation\InfiniteChunkManager.cpp.obj CMakeFiles\VENPOD.dir\src\Simulation\ChunkGenerationTest.cpp.obj CMakeFiles\VENPOD.dir\src\Simulation\ChunkStressTest.cpp.obj CMakeFiles\VENPOD.dir\src\Input\InputManager.cpp.obj CMakeFiles\VENPOD.dir\src\Input\BrushController.cpp.obj CMakeFiles\VENPOD.dir\src\UI\ImGuiBackend.cpp.obj CMakeFiles\VENPOD.dir\src\UI\DebugOverlay.cpp.obj CMakeFiles\VENPOD.dir\src\UI\MaterialPalette.cpp.obj CMakeFiles\VENPOD.dir\src\UI\BrushPanel.cpp.obj CMakeFiles\VENPOD.dir\src\UI\PauseMenu.cpp.obj CMakeFiles\VENPOD.dir\src\Utils\FileUtils.cpp.obj CMakeFiles\VENPOD.dir\vendor\imgui\imgui.cpp.obj CMakeFiles\VENPOD.dir\vendor\imgui\imgui_draw.cpp.obj CMakeFiles\VENPOD.dir\vendor\imgui\imgui_tables.cpp.obj CMakeFiles\VENPOD.dir\vendor\imgui\imgui_widgets.cpp.obj CMakeFiles\VENPOD.dir\vendor\imgui\imgui_demo.cpp.obj CMakeFiles\VENPOD.dir\vendor\imgui\backends\imgui_impl_sdl3.cpp.obj CMakeFiles\VENPOD.dir\vendor\imgui\backends\imgui_impl_dx12.cpp.obj | vcpkg_installed\x64-windows\lib\SDL3.lib vcpkg_installed\x64-windows\lib\spdlog.lib vcpkg_installed\x64-windows\lib\DirectX-Headers.lib vcpkg_installed\x64-windows\lib\DirectX-Guids.lib vcpkg_installed\x64-windows\lib\glm.lib vcpkg_installed\x64-windows\lib\fmt.lib vcpkg_installed\x64-windows\lib\DirectX-Headers.lib
   CONFIG = Release
   FLAGS = /DWIN32 /D_WINDOWS /EHsc /O2 /Ob2 /DNDEBUG -MD
   LINK_FLAGS = /machine:x64 /INCREMENTAL:NO /subsystem:console

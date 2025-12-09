@@ -19,17 +19,21 @@ static constexpr uint32_t INFINITE_CHUNK_SIZE = 64;
 
 // Chunk generation state
 enum class ChunkState {
-    Ungenerated,    // Chunk allocated but not generated yet
-    Generating,     // Currently being generated on GPU
-    Generated,      // Generation complete, ready for rendering
-    Dirty           // Needs physics update or regeneration
+    Ungenerated,         // Chunk allocated but not generated yet
+    GenerationSubmitted, // GPU commands submitted, waiting for completion
+    Generated,           // Generation complete, ready for rendering
+    Dirty                // Needs physics update or regeneration
 };
 
 // Individual chunk in infinite world
 class Chunk {
 public:
     Chunk() = default;
-    ~Chunk() = default;
+
+    // CRITICAL FIX: Explicit destructor to ensure descriptors are always freed
+    // This prevents descriptor leaks when Initialize() fails partway through
+    // or when chunks are deleted without calling Shutdown() explicitly
+    ~Chunk() { Shutdown(); }
 
     // Non-copyable
     Chunk(const Chunk&) = delete;
@@ -51,21 +55,31 @@ public:
 
     // Generate chunk using compute shader
     // This dispatches CS_GenerateChunk.hlsl with world offset
+    // OPTIMIZATION: Uses shared constant buffer instead of creating one per chunk
     Result<void> Generate(
         ID3D12Device* device,
         ID3D12GraphicsCommandList* cmdList,
         ID3D12PipelineState* generationPSO,
         ID3D12RootSignature* rootSignature,
+        ID3D12Resource* sharedConstantBuffer,
+        void* sharedConstantBufferMappedPtr,
         uint32_t worldSeed
     );
 
     // Mark chunk as needing physics update
     void MarkDirty() { m_state = ChunkState::Dirty; }
 
+    // Mark chunk as generated (called after GPU fence signals completion)
+    void MarkGenerated() { m_state = ChunkState::Generated; }
+
+    // Mark chunk as submitted (GPU work in flight)
+    void MarkSubmitted() { m_state = ChunkState::GenerationSubmitted; }
+
     // Getters
     const ChunkCoord& GetCoord() const { return m_coord; }
     ChunkState GetState() const { return m_state; }
     bool IsGenerated() const { return m_state == ChunkState::Generated || m_state == ChunkState::Dirty; }
+    bool IsSubmitted() const { return m_state == ChunkState::GenerationSubmitted; }
     bool IsDirty() const { return m_state == ChunkState::Dirty; }
 
     // Get world origin position (in voxel coordinates)
@@ -76,6 +90,9 @@ public:
     // GPU buffer access
     Graphics::GPUBuffer& GetVoxelBuffer() { return m_voxelBuffer; }
     const Graphics::GPUBuffer& GetVoxelBuffer() const { return m_voxelBuffer; }
+
+    // Transition chunk buffer to specified state (updates internal tracking)
+    void TransitionBufferTo(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_STATES newState);
 
     // Shader-visible descriptors for rendering/compute
     const Graphics::DescriptorHandle& GetVoxelSRV() const { return m_voxelSRV; }
@@ -101,6 +118,9 @@ private:
     // Shader-visible descriptors (for rendering and compute access)
     Graphics::DescriptorHandle m_voxelSRV;  // For reading in shaders
     Graphics::DescriptorHandle m_voxelUAV;  // For writing in compute shaders
+
+    // Resource state tracking (prevents invalid transitions that cause device removal)
+    D3D12_RESOURCE_STATES m_currentVoxelState = D3D12_RESOURCE_STATE_COMMON;
 
     Graphics::DescriptorHeapManager* m_heapManager = nullptr;
 };

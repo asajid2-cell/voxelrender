@@ -37,7 +37,7 @@ RWStructuredBuffer<uint> VoxelGridOut : register(u0);
 
 // Material properties lookup (helpers for physics)
 bool IsMovable(uint material) {
-    return material == MAT_SAND || material == MAT_WATER || material == MAT_LAVA || material == MAT_OIL ||
+    return material == MAT_SAND || material == MAT_DIRT || material == MAT_WATER || material == MAT_LAVA || material == MAT_OIL ||
            material == MAT_SMOKE || material == MAT_FIRE || material == MAT_ACID || material == MAT_HONEY ||
            material == MAT_CONCRETE || material == MAT_GUNPOWDER || material == MAT_STEAM;
 }
@@ -224,6 +224,8 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
 
                     // Young smoke (high life) rises vigorously
                     // Old smoke (low life) spreads horizontally and billows
+                    bool moved = false;
+
                     if (currentLife > 8) {
                         // === VIGOROUS RISING (young smoke) ===
                         int3 abovePos = pos + int3(0, 1, 0);
@@ -232,33 +234,42 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                             if (IsEmpty(GetMaterial(aboveVoxel))) {
                                 SetVoxel(uint3(pos), PackVoxel(MAT_AIR, 0, 0, 0));
                                 SetVoxel(uint3(abovePos), PackVoxel(material, GetVariant(currentVoxel), 0, newState));
-                                continue;
+                                moved = true;
                             }
                         }
-                    } else {
-                        // === BILLOWING (old smoke) - spreads in all directions ===
-                        int3 expansions[8];
-                        expansions[0] = pos + int3(1, 0, 0);
-                        expansions[1] = pos + int3(-1, 0, 0);
-                        expansions[2] = pos + int3(0, 0, 1);
-                        expansions[3] = pos + int3(0, 0, -1);
-                        expansions[4] = pos + int3(0, 1, 0);
-                        expansions[5] = pos + int3(1, 1, 0);
-                        expansions[6] = pos + int3(-1, 1, 0);
-                        expansions[7] = pos + int3(0, 1, 1);
+                    }
 
-                        int startIdx = (rng >> 4) & 0x7;
-                        for (int i = 0; i < 4; i++) {
-                            int idx = (startIdx + i) % 8;
+                    // === BILLOWING - spreads in all directions ===
+                    // Both young (if blocked) and old smoke billow
+                    if (!moved) {
+                        // Only billow if we have enough life remaining (prevents infinite spread)
+                        if (newLife > 3) {
+                            int3 expansions[8];
+                            expansions[0] = pos + int3(1, 0, 0);
+                            expansions[1] = pos + int3(-1, 0, 0);
+                            expansions[2] = pos + int3(0, 0, 1);
+                            expansions[3] = pos + int3(0, 0, -1);
+                            expansions[4] = pos + int3(0, 1, 0);  // Still try up
+                            expansions[5] = pos + int3(1, 1, 0);  // Diagonal up
+                            expansions[6] = pos + int3(-1, 1, 0); // Diagonal up
+                            expansions[7] = pos + int3(0, 1, 1);  // Diagonal up
+
+                            int startIdx = (rng >> 4) & 0x7;
+                            // Only try one random direction per frame (prevents tsunami)
+                            int idx = startIdx;
                             int3 expandPos = expansions[idx];
                             uint expandVoxel = GetVoxelSafe(expandPos);
                             if (IsEmpty(GetMaterial(expandVoxel))) {
-                                uint cloneLife = newLife > 0 ? newLife - 1 : 0;
+                                // Clone smoke with REDUCED life (prevents infinite spread)
+                                uint cloneLife = newLife - 2;  // Significant life reduction
                                 uint cloneState = (newState & ~STATE_LIFE_MASK) | (cloneLife & STATE_LIFE_MASK);
                                 SetVoxel(uint3(expandPos), PackVoxel(material, (rng >> 8) & 0xFF, 0, cloneState));
-                                break;
                             }
                         }
+                    }
+
+                    if (moved) {
+                        continue;  // Already moved smoke upward
                     }
 
                     SetVoxel(uint3(pos), PackVoxel(material, GetVariant(currentVoxel), 0, newState));
@@ -374,6 +385,13 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                         uint neighborVoxel = GetVoxelSafe(neighborPos);
                         uint neighborMat = GetMaterial(neighborVoxel);
 
+                        // Water extinguishes fire → creates steam
+                        if (neighborMat == MAT_WATER) {
+                            SetVoxel(uint3(pos), PackVoxel(MAT_STEAM, GetVariant(currentVoxel), 0, 12));
+                            SetVoxel(uint3(neighborPos), PackVoxel(MAT_STEAM, GetVariant(neighborVoxel), 0, 12));
+                            continue;
+                        }
+
                         if (IsFlammable(neighborMat)) {
                             // 1 in 4 chance to ignite
                             uint spreadChance = (rng >> (i * 2)) & 0x3;
@@ -395,24 +413,27 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                         }
                     }
 
-                    // === FIRE SPARKS - Drop burning particles that ignite materials ===
-                    // 1 in 16 chance to spawn a spark that falls and ignites
-                    uint sparkChance = (rng >> 10) & 0xF;
-                    if (sparkChance == 0) {
-                        // Spawn spark below fire (falls like napalm)
-                        int3 belowPos = pos + int3(0, -1, 0);
-                        if (belowPos.y >= 0) {
-                            uint belowVoxel = GetVoxelSafe(belowPos);
-                            uint belowMat = GetMaterial(belowVoxel);
+                    // === NAPALM DROPLETS - Drop burning oil that sticks and ignites ===
+                    // Only spawn napalm from fires with high life (sustained fires)
+                    if (currentLife > 30) {
+                        // 1 in 16 chance to spawn a napalm droplet
+                        uint napalmChance = (rng >> 10) & 0xF;
+                        if (napalmChance == 0) {
+                            int3 belowPos = pos + int3(0, -1, 0);
+                            if (belowPos.y >= 0) {
+                                uint belowVoxel = GetVoxelSafe(belowPos);
+                                uint belowMat = GetMaterial(belowVoxel);
 
-                            // If space below is empty, spawn a falling fire spark
-                            if (IsEmpty(belowMat)) {
-                                // Spark has short life (8 frames) - burns out quickly
-                                SetVoxel(uint3(belowPos), PackVoxel(MAT_FIRE, (rng >> 16) & 0xFF, 0, 8));
-                            }
-                            // If flammable material below, ignite it
-                            else if (IsFlammable(belowMat)) {
-                                SetVoxel(uint3(belowPos), PackVoxel(MAT_FIRE, GetVariant(belowVoxel), 0, 60));
+                                // Spawn burning oil droplet that will fall
+                                if (IsEmpty(belowMat)) {
+                                    // Create oil droplet that's already ignited
+                                    uint napalmState = STATE_IS_IGNITED;  // Mark as ignited oil
+                                    SetVoxel(uint3(belowPos), PackVoxel(MAT_OIL, (rng >> 16) & 0xFF, 0, napalmState));
+                                }
+                                // If flammable material below, ignite it immediately
+                                else if (IsFlammable(belowMat)) {
+                                    SetVoxel(uint3(belowPos), PackVoxel(MAT_FIRE, GetVariant(belowVoxel), 0, 60));
+                                }
                             }
                         }
                     }
@@ -494,20 +515,28 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                                 uint neighborVoxel = GetVoxelSafe(neighbors[i]);
                                 uint neighborMat = GetMaterial(neighborVoxel);
 
-                                // Water touching lava turns to stone and creates steam
+                                // Water touching lava turns to stone and creates steam burst
                                 if (neighborMat == MAT_LAVA) {
                                     SetVoxel(uint3(pos), PackVoxel(MAT_STONE, GetVariant(currentVoxel), 0, STATE_IS_STATIC));
-                                    // Spawn steam above the stone
+                                    // Create steam burst above (more dramatic effect)
                                     int3 abovePos = pos + int3(0, 1, 0);
                                     if (IsEmpty(GetMaterial(GetVoxelSafe(abovePos)))) {
-                                        SetVoxel(uint3(abovePos), PackVoxel(MAT_STEAM, GetVariant(currentVoxel), 0, 10));
+                                        SetVoxel(uint3(abovePos), PackVoxel(MAT_STEAM, GetVariant(currentVoxel), 0, 15));
+                                    }
+                                    // Additional steam in random adjacent directions
+                                    uint rng = PCGHash(pos.x * 7 + pos.y * 13 + pos.z * 31 + frameIndex);
+                                    if ((rng & 0x1) == 0) {
+                                        int3 steamPos = pos + int3((rng & 0x2) ? 1 : -1, 1, 0);
+                                        if (IsEmpty(GetMaterial(GetVoxelSafe(steamPos)))) {
+                                            SetVoxel(uint3(steamPos), PackVoxel(MAT_STEAM, (rng >> 8) & 0xFF, 0, 12));
+                                        }
                                     }
                                     continue;  // Skip to next voxel in outer loop
                                 }
-                                // Water touching fire → extinguishes fire, creates steam
+                                // Water touching fire → both become steam
                                 else if (neighborMat == MAT_FIRE) {
-                                    SetVoxel(uint3(pos), PackVoxel(MAT_AIR, 0, 0, 0));  // Water evaporates
-                                    SetVoxel(uint3(neighbors[i]), PackVoxel(MAT_STEAM, GetVariant(neighborVoxel), 0, 10));  // Fire becomes steam
+                                    SetVoxel(uint3(pos), PackVoxel(MAT_STEAM, GetVariant(currentVoxel), 0, 12));  // Water becomes steam
+                                    SetVoxel(uint3(neighbors[i]), PackVoxel(MAT_STEAM, GetVariant(neighborVoxel), 0, 12));  // Fire becomes steam
                                     continue;  // Skip to next voxel
                                 }
                                 // Count ice neighbors for freezing
@@ -709,6 +738,26 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                     // Oil: like water but floats on water
                     if (material == MAT_OIL) {
                         uint rng = PCGHash(pos.x + pos.y * 1000 + pos.z * 1000000 + frameIndex);
+                        uint currentState = GetState(currentVoxel);
+                        bool isIgnited = (currentState & STATE_IS_IGNITED) != 0;
+
+                        // === NAPALM BEHAVIOR ===
+                        // If oil is ignited (napalm droplet), check if it should burst into fire
+                        if (isIgnited) {
+                            uint belowVoxel = GetVoxelSafe(belowPos);
+                            uint belowMaterial = GetMaterial(belowVoxel);
+
+                            // Turn into fire when hitting ground or any non-air material
+                            if (!IsEmpty(belowMaterial)) {
+                                SetVoxel(uint3(pos), PackVoxel(MAT_FIRE, GetVariant(currentVoxel), 0, 45));
+                                // Also ignite the surface below if flammable
+                                if (IsFlammable(belowMaterial)) {
+                                    SetVoxel(uint3(belowPos), PackVoxel(MAT_FIRE, GetVariant(belowVoxel), 0, 60));
+                                }
+                                continue;
+                            }
+                            // Keep falling as burning oil (napalm droplet will ignite on landing)
+                        }
 
                         // === OIL IGNITION ===
                         // Oil ignites when touching fire or lava

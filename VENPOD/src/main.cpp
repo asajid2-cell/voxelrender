@@ -10,14 +10,23 @@
 #include "Simulation/VoxelWorld.h"
 #include "Simulation/PhysicsDispatcher.h"
 #include "Simulation/ChunkManager.h"
+#include "Simulation/ChunkGenerationTest.h"  // INFINITE CHUNK TEST HARNESS
+#include "Simulation/ChunkStressTest.h"      // STRESS TESTING FRAMEWORK
 #include "Input/InputManager.h"
 #include "Input/BrushController.h"
+#include "UI/ImGuiBackend.h"
+#include "UI/MaterialPalette.h"
+#include "UI/BrushPanel.h"
+#include "UI/PauseMenu.h"
+#include <imgui.h>
 #include <spdlog/spdlog.h>
 #include <SDL3/SDL.h>
 #include <glm/glm.hpp>
 #include <memory>
 #include <filesystem>
 #include <cmath>
+#include <cstring>
+#include <iostream>
 
 using namespace VENPOD;
 using namespace VENPOD::Graphics;
@@ -46,7 +55,8 @@ int main(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
 
-    spdlog::set_level(spdlog::level::info);
+    // DEBUGGING: Enable debug level to see synchronization logs
+    spdlog::set_level(spdlog::level::debug);
     spdlog::info("===========================================");
     spdlog::info("  VENPOD - Voxel Physics Engine v0.1.0");
     spdlog::info("  Target: 100M+ Active Voxels @ 60 FPS");
@@ -72,6 +82,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // =============================================================================
+    // Continue with normal initialization
+    // =============================================================================
+
     // Initialize Window
     auto window = std::make_unique<Window>();
     WindowConfig windowConfig;
@@ -95,7 +109,7 @@ int main(int argc, char* argv[]) {
     // Initialize Renderer
     auto renderer = std::make_unique<Renderer>();
     RendererConfig rendererConfig;
-    rendererConfig.cbvSrvUavDescriptorCount = 4096;
+    rendererConfig.cbvSrvUavDescriptorCount = 8192;  // DOUBLED: Increased from 4096 to handle 100+ chunks safely
     rendererConfig.rtvDescriptorCount = 32;
     rendererConfig.dsvDescriptorCount = 8;
     rendererConfig.debugShaders = true;  // Enable debug info for development
@@ -124,6 +138,84 @@ int main(int argc, char* argv[]) {
         spdlog::critical("Failed to initialize renderer: {}", rendererResult.error());
         return 1;
     }
+
+    // =============================================================================
+    // 🧪 CHUNK GENERATION TESTS (DISABLED - causes descriptor heap conflicts)
+    // =============================================================================
+    // CRITICAL FIX: Tests allocate/free descriptors that get recycled by main app,
+    // causing descriptor handle collisions (TEXTURE2D vs BUFFER mismatch errors).
+    // The tests work fine in isolation but pollute the heap for production use.
+    //
+    // To re-enable tests (for development only), set runTests = true
+    // =============================================================================
+    bool runTests = false;  // DISABLED by default to prevent descriptor corruption
+
+    if (runTests) {
+        spdlog::info("\n");
+        spdlog::info("╔══════════════════════════════════════════════════════════════╗");
+        spdlog::info("║  🧪 RUNNING INFINITE CHUNK GENERATION TESTS                 ║");
+        spdlog::info("╚══════════════════════════════════════════════════════════════╝");
+        spdlog::info("");
+
+        bool testsPass = Simulation::ChunkGenerationTest::RunAllTests(*device, *commandQueue, renderer->GetHeapManager());
+
+        if (!testsPass) {
+            spdlog::critical("❌ CHUNK GENERATION TESTS FAILED!");
+            spdlog::critical("   Fix the issues above before proceeding.");
+            spdlog::critical("   Press ENTER to exit...");
+            std::cin.get();
+            return 1;
+        }
+
+        spdlog::info("");
+        spdlog::info("All chunk tests passed! Continuing with stress tests...");
+        spdlog::info("");
+    } else {
+        spdlog::info("Skipping chunk generation tests (disabled to prevent descriptor conflicts)");
+    }
+
+    // =============================================================================
+    // STRESS TESTS (Optional - run with command line flag --stress-test)
+    // =============================================================================
+    bool runStressTests = false;
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--stress-test") == 0 || strcmp(argv[i], "-s") == 0) {
+            runStressTests = true;
+            break;
+        }
+    }
+
+    if (runStressTests) {
+        spdlog::info("");
+        spdlog::info("========================================================");
+        spdlog::info("       RUNNING STRESS TESTS (--stress-test flag)");
+        spdlog::info("========================================================");
+        spdlog::info("");
+
+        Simulation::StressTestConfig stressConfig;
+        stressConfig.intensity = 2;        // Normal intensity
+        stressConfig.maxDurationMs = 30000; // 30 second max per test
+        stressConfig.cycleIterations = 100; // Reduced for faster testing
+        stressConfig.verbose = true;
+
+        bool stressTestsPass = Simulation::ChunkStressTest::RunAllStressTests(
+            *device, *commandQueue, renderer->GetHeapManager(), stressConfig);
+
+        if (!stressTestsPass) {
+            spdlog::warn("Some stress tests failed - check logs above");
+            spdlog::info("Press ENTER to continue anyway, or Ctrl+C to exit...");
+            std::cin.get();
+        } else {
+            spdlog::info("All stress tests passed!");
+        }
+    } else {
+        spdlog::info("Skipping stress tests (use --stress-test or -s flag to run)");
+    }
+
+    spdlog::info("");
+    spdlog::info("Continuing with normal initialization...");
+    spdlog::info("");
+    // =============================================================================
 
     // Create per-frame resources (triple buffering) - MUST BE BEFORE VOXEL INIT
     FrameContext frameContexts[kFrameCount];
@@ -197,13 +289,19 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Initialize voxels with test pattern
-    physicsDispatcher->DispatchInitialize(initCommandList.Get(), *voxelWorld, 12345);
+    // Initialize voxels with test pattern (ONLY if NOT using infinite chunks)
+    // When using infinite chunks, the chunk system manages terrain generation
+    if (!voxelWorld->IsUsingInfiniteChunks()) {
+        physicsDispatcher->DispatchInitialize(initCommandList.Get(), *voxelWorld, 12345);
 
-    // CRITICAL: Swap buffers so the initialized data becomes the "read" buffer
-    // DispatchInitialize writes to the WRITE buffer, so we need to swap
-    // to make that data available as the READ buffer for rendering
-    voxelWorld->SwapBuffers();
+        // CRITICAL: Swap buffers so the initialized data becomes the "read" buffer
+        // DispatchInitialize writes to the WRITE buffer, so we need to swap
+        // to make that data available as the READ buffer for rendering
+        voxelWorld->SwapBuffers();
+        spdlog::info("Initialized 256³ voxel grid with procedural terrain (CS_Initialize)");
+    } else {
+        spdlog::info("Skipping CS_Initialize - using infinite chunk system for terrain generation");
+    }
 
     initCommandList->Close();
     commandQueue->ExecuteCommandList(initCommandList.Get());
@@ -237,8 +335,32 @@ int main(int argc, char* argv[]) {
         static_cast<float>(voxelWorld->GetGridSizeZ())
     );
 
+    // =============================================================================
+    // Initialize ImGui UI
+    // =============================================================================
+    UI::ImGuiBackend imguiBackend;
+    if (!imguiBackend.Initialize(
+        window->GetSDLWindow(),
+        device->GetDevice(),
+        kFrameCount,
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        renderer->GetShaderVisibleHeap()
+    )) {
+        spdlog::critical("Failed to initialize ImGui");
+        return 1;
+    }
+
+    UI::MaterialPalette materialPalette;
+    materialPalette.Initialize();
+
+    UI::BrushPanel brushPanel;
+    brushPanel.Initialize();
+
+    UI::PauseMenu pauseMenu;
+    pauseMenu.Initialize();
+
     spdlog::info("Initialization complete. Entering main loop...");
-    spdlog::info("Controls: WASD=Move, Mouse=Look, Space/Shift=Up/Down, Tab=Toggle Mouse, LMB=Paint, RMB=Erase, Q/E=Material, P=Pause");
+    spdlog::info("Controls: ESC=Pause Menu, WASD=Move, Mouse=Look, Space/Shift=Up/Down, Tab=Toggle Mouse, LMB=Paint, RMB=Erase");
 
     // Camera setup with pitch/yaw for mouse look
     const float fov = 60.0f * 3.14159f / 180.0f;
@@ -250,11 +372,15 @@ int main(int argc, char* argv[]) {
     float gridSizeXInit = static_cast<float>(voxelWorld->GetGridSizeX());
     float gridSizeYInit = static_cast<float>(voxelWorld->GetGridSizeY());
     float gridSizeZInit = static_cast<float>(voxelWorld->GetGridSizeZ());
-    glm::vec3 cameraPos = glm::vec3(gridSizeXInit * 1.2f, gridSizeYInit * 0.7f, gridSizeZInit * 1.2f);
+
+    // FIXED: Spawn camera at realistic terrain height for infinite chunks
+    // Terrain ranges from Y=5 to Y=200, with average around Y=60-80
+    // Start at Y=95 (15 units above sea level at 80) to see terrain clearly
+    glm::vec3 cameraPos = glm::vec3(gridSizeXInit / 2.0f, 95.0f, gridSizeZInit / 2.0f);
 
     // Camera rotation (pitch and yaw)
-    float cameraPitch = -0.3f;  // Look down slightly
-    float cameraYaw = -2.356f;  // Look toward center (approximately -3*PI/4)
+    float cameraPitch = -0.5f;  // Look down more to see terrain below
+    float cameraYaw = 0.0f;  // Look straight ahead (north)
 
     // Main loop
     bool running = true;
@@ -266,7 +392,10 @@ int main(int argc, char* argv[]) {
         // Process SDL events FIRST to update mouse/keyboard state
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
-            // Pass event to input manager
+            // Pass event to ImGui FIRST (captures mouse/keyboard when hovering UI)
+            imguiBackend.ProcessEvent(event);
+
+            // Then pass event to input manager
             inputManager.ProcessEvent(event);
 
             switch (event.type) {
@@ -276,7 +405,10 @@ int main(int argc, char* argv[]) {
 
                 case SDL_EVENT_KEY_DOWN:
                     if (event.key.key == SDLK_ESCAPE) {
-                        running = false;
+                        // Toggle pause menu instead of quitting
+                        pauseMenu.Toggle();
+                        // Release/capture mouse based on pause menu state
+                        inputManager.SetMouseCaptured(!pauseMenu.IsVisible());
                     }
                     else if (event.key.key == SDLK_TAB) {
                         // Toggle mouse capture
@@ -418,6 +550,17 @@ int main(int argc, char* argv[]) {
         ctx.commandAllocator->Reset();
         commandList->Reset(ctx.commandAllocator.Get(), nullptr);
 
+        // ===== UPDATE INFINITE CHUNK SYSTEM (NEW) =====
+        // Update chunk loading/unloading based on camera position
+        // CRITICAL: Now uses internal command list for immediate execution (doesn't touch frame cmdList!)
+        if (voxelWorld->IsUsingInfiniteChunks()) {
+            voxelWorld->UpdateChunks(
+                device->GetDevice(),
+                commandQueue->GetCommandQueue(),  // CHANGED: Pass queue instead of cmdList
+                cameraPos
+            );
+        }
+
         // === GPU BRUSH RAYCASTING (NEW - 2,000,000x FASTER!) ===
         // Dispatch single-thread GPU compute to find brush position
         // This replaces the 32MB CPU readback with 16 bytes!
@@ -425,6 +568,14 @@ int main(int argc, char* argv[]) {
 
         // Begin frame - transitions back buffer, sets render target, viewport, etc.
         renderer->BeginFrame(commandList.Get(), frameIndex);
+
+        // =============================================================================
+        // Render ImGui UI (Pause Menu System)
+        // =============================================================================
+        imguiBackend.NewFrame();
+
+        // Render pause menu and all UI panels (only when pause menu is open)
+        pauseMenu.Render(paused, frameCount, cameraPos, materialPalette, brushPanel, brushController);
 
         // Debug logging removed to reduce spam
 
@@ -548,6 +699,9 @@ int main(int argc, char* argv[]) {
 
         // Render crosshair at screen center
         renderer->RenderCrosshair(commandList.Get());
+
+        // Render ImGui draw data to command list
+        imguiBackend.Render(commandList.Get());
 
         // Request tiny 16-byte GPU->CPU readback for next frame's brush preview
         // 2,000,000x smaller than old 32MB readback!
