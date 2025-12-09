@@ -468,7 +468,7 @@ int main(int argc, char* argv[]) {
             brushConstants.positionZ = brushPos.z;
             brushConstants.radius = brushController.GetRadius();
             brushConstants.material = brushController.IsErasing() ? 0 : brushController.GetMaterial();
-            brushConstants.mode = static_cast<uint32_t>(brushController.GetMode());
+            brushConstants.mode = static_cast<uint32_t>(brushController.IsErasing() ? Input::BrushMode::Erase : brushController.GetMode());
             brushConstants.shape = static_cast<uint32_t>(brushController.GetShape());
             brushConstants.strength = 1.0f;
             brushConstants.gridSizeX = voxelWorld->GetGridSizeX();

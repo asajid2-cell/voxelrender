@@ -216,6 +216,27 @@ Result<void> VoxelWorld::CreateMaterialPalette(
     // MAT_GLASS (10) - Transparent white
     setMaterial(10, 0.9f, 0.95f, 1.0f, 0.3f);
 
+    // MAT_SMOKE (11) - Gray semi-transparent
+    setMaterial(11, 0.3f, 0.3f, 0.35f, 0.4f);
+
+    // MAT_ACID (12) - Toxic green semi-transparent
+    setMaterial(12, 0.2f, 0.9f, 0.2f, 0.6f);
+
+    // MAT_HONEY (13) - Golden amber
+    setMaterial(13, 0.95f, 0.75f, 0.2f, 0.8f);
+
+    // MAT_CONCRETE (14) - Gray (starts flowing, hardens to stone-like)
+    setMaterial(14, 0.6f, 0.6f, 0.65f, 1.0f);
+
+    // MAT_GUNPOWDER (15) - Dark gray/black powder
+    setMaterial(15, 0.2f, 0.2f, 0.25f, 1.0f);
+
+    // MAT_CRYSTAL (16) - Purple crystalline
+    setMaterial(16, 0.7f, 0.3f, 0.9f, 0.7f);
+
+    // MAT_STEAM (17) - White/light gray transparent
+    setMaterial(17, 0.9f, 0.95f, 1.0f, 0.3f);
+
     // MAT_BEDROCK (255) - Dark gray
     setMaterial(255, 0.2f, 0.2f, 0.2f);
 

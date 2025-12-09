@@ -54,12 +54,20 @@ void BrushController::UpdateFromMouse(
 
         // Perform DDA raycasting to find first solid voxel
         if (DDAVoxelRaycast(cameraPos, rayDir, voxelGridData, voxelGridSize, hitVoxel, hitNormal)) {
-            // Place brush at the adjacent empty voxel (on the face we hit)
-            // This is where the user wants to place a new voxel
-            glm::vec3 adjacentVoxel = glm::vec3(hitVoxel) + glm::vec3(hitNormal);
+            glm::vec3 targetVoxel;
 
-            // Set brush position to center of the adjacent voxel
-            m_brushPosition = adjacentVoxel + glm::vec3(0.5f);
+            // ERASE: Place brush ON the voxel we hit (to erase it)
+            // PAINT: Place brush ADJACENT to the voxel (to add new voxels)
+            if (rightButtonDown) {
+                // Erasing - target the hit voxel itself
+                targetVoxel = glm::vec3(hitVoxel);
+            } else {
+                // Painting - target the adjacent empty voxel
+                targetVoxel = glm::vec3(hitVoxel) + glm::vec3(hitNormal);
+            }
+
+            // Set brush position to center of the target voxel
+            m_brushPosition = targetVoxel + glm::vec3(0.5f);
 
             // Clamp to grid bounds
             m_brushPosition = glm::clamp(m_brushPosition,

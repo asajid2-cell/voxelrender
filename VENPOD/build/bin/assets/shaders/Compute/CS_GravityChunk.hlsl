@@ -37,11 +37,29 @@ RWStructuredBuffer<uint> VoxelGridOut : register(u0);
 
 // Material properties lookup (helpers for physics)
 bool IsMovable(uint material) {
-    return material == MAT_SAND || material == MAT_WATER || material == MAT_LAVA || material == MAT_OIL;
+    return material == MAT_SAND || material == MAT_WATER || material == MAT_LAVA || material == MAT_OIL ||
+           material == MAT_SMOKE || material == MAT_FIRE || material == MAT_ACID || material == MAT_HONEY ||
+           material == MAT_CONCRETE || material == MAT_GUNPOWDER || material == MAT_STEAM;
 }
 
 bool IsEmpty(uint material) {
     return material == MAT_AIR;
+}
+
+bool IsFlammable(uint material) {
+    return material == MAT_WOOD || material == MAT_OIL || material == MAT_GUNPOWDER;
+}
+
+bool IsDissolvable(uint material) {
+    // Materials that acid can dissolve
+    return material == MAT_STONE || material == MAT_DIRT || material == MAT_WOOD ||
+           material == MAT_SAND || material == MAT_ICE || material == MAT_CONCRETE;
+}
+
+bool IsLiquidOrGas(uint material) {
+    return material == MAT_WATER || material == MAT_LAVA || material == MAT_OIL ||
+           material == MAT_ACID || material == MAT_HONEY || material == MAT_CONCRETE ||
+           material == MAT_SMOKE || material == MAT_STEAM;
 }
 
 // Decompose chunk index to 3D position
@@ -76,6 +94,30 @@ uint PCGHash(uint seed) {
     uint state = seed * 747796405u + 2891336453u;
     uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
     return (word >> 22u) ^ word;
+}
+
+// Count liquid depth at a given XZ position
+// Returns the Y-height of the liquid surface (or 0 if no liquid)
+// Works for all liquid materials
+int GetLiquidColumnHeight(int3 pos) {
+    // Start from current position and scan upward to find liquid surface
+    int surfaceY = pos.y;
+
+    // Scan up to find the top of liquid column
+    for (int checkY = pos.y; checkY < (int)gridSizeY; checkY++) {
+        int3 checkPos = int3(pos.x, checkY, pos.z);
+        uint voxel = GetVoxelSafe(checkPos);
+        uint mat = GetMaterial(voxel);
+
+        if (mat == MAT_WATER || mat == MAT_OIL || mat == MAT_LAVA ||
+            mat == MAT_ACID || mat == MAT_HONEY || mat == MAT_CONCRETE) {
+            surfaceY = checkY;  // Update surface height
+        } else if (!IsEmpty(mat)) {
+            break;  // Hit solid - stop scanning
+        }
+    }
+
+    return surfaceY;
 }
 
 // Each thread group handles one active chunk
@@ -130,9 +172,186 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                     continue;
                 }
 
-                // Skip static/non-movable materials
+                // Process static/non-movable materials
                 if (!IsMovable(material)) {
+                    // === ICE MELTING ===
+                    // Ice melts when near fire or lava
+                    if (material == MAT_ICE) {
+                        int3 neighbors[6];
+                        neighbors[0] = pos + int3(1, 0, 0);
+                        neighbors[1] = pos + int3(-1, 0, 0);
+                        neighbors[2] = pos + int3(0, 1, 0);
+                        neighbors[3] = pos + int3(0, -1, 0);
+                        neighbors[4] = pos + int3(0, 0, 1);
+                        neighbors[5] = pos + int3(0, 0, -1);
+
+                        for (int i = 0; i < 6; i++) {
+                            uint neighborVoxel = GetVoxelSafe(neighbors[i]);
+                            uint neighborMat = GetMaterial(neighborVoxel);
+
+                            // Ice melts near heat sources
+                            if (neighborMat == MAT_FIRE || neighborMat == MAT_LAVA) {
+                                // Ice melts into water (non-static)
+                                SetVoxel(uint3(pos), PackVoxel(MAT_WATER, GetVariant(currentVoxel), 0, 0));
+                                continue;  // Skip to next voxel
+                            }
+                        }
+                    }
+
                     SetVoxel(uint3(pos), outputVoxel);
+                    continue;
+                }
+
+                // =====================================================================
+                // SMOKE PHYSICS - Handle smoke BEFORE falling physics (smoke rises!)
+                // =====================================================================
+                if (material == MAT_SMOKE) {
+                    // Get current life counter (bits 0-3 of state byte)
+                    uint currentLife = GetLife(currentVoxel);
+
+                    // Dissipate smoke over time - each frame decrements life
+                    if (currentLife == 0) {
+                        // Smoke has dissipated - turn into air
+                        SetVoxel(uint3(pos), PackVoxel(MAT_AIR, 0, 0, 0));
+                        continue;
+                    }
+
+                    // Decrement life counter
+                    uint newLife = currentLife - 1;
+                    uint newState = (GetState(currentVoxel) & ~STATE_LIFE_MASK) | (newLife & STATE_LIFE_MASK);
+
+                    uint rng = PCGHash(pos.x + pos.y * 1000 + pos.z * 1000000 + frameIndex);
+                    bool moved = false;
+
+                    // === PRIORITY 1: RISE (inverse of falling) ===
+                    int3 abovePos = pos + int3(0, 1, 0);
+                    if (abovePos.y < (int)gridSizeY) {
+                        uint aboveVoxel = GetVoxelSafe(abovePos);
+                        uint aboveMaterial = GetMaterial(aboveVoxel);
+
+                        // Rise straight up if space above is empty
+                        if (IsEmpty(aboveMaterial)) {
+                            outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, newState);
+                            SetVoxel(uint3(pos), PackVoxel(MAT_AIR, 0, 0, 0));
+                            SetVoxel(uint3(abovePos), outputVoxel);
+                            continue;
+                        }
+
+                        // === PRIORITY 2: DIAGONAL UP (rise diagonally if blocked above) ===
+                        if (!IsEmpty(aboveMaterial)) {
+                            int3 diagonals[4];
+                            diagonals[0] = pos + int3(1, 1, 0);   // +X up
+                            diagonals[1] = pos + int3(-1, 1, 0);  // -X up
+                            diagonals[2] = pos + int3(0, 1, 1);   // +Z up
+                            diagonals[3] = pos + int3(0, 1, -1);  // -Z up
+
+                            int startIdx = (rng >> 2) & 0x3;
+
+                            for (int i = 0; i < 4; i++) {
+                                int idx = (startIdx + i) % 4;
+                                int3 diagPos = diagonals[idx];
+                                uint diagVoxel = GetVoxelSafe(diagPos);
+                                if (IsEmpty(GetMaterial(diagVoxel))) {
+                                    outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, newState);
+                                    SetVoxel(uint3(pos), PackVoxel(MAT_AIR, 0, 0, 0));
+                                    SetVoxel(uint3(diagPos), outputVoxel);
+                                    moved = true;
+                                    break;
+                                }
+                            }
+
+                            if (moved) {
+                                continue;
+                            }
+                        }
+                    }
+
+                    // === PRIORITY 3: HORIZONTAL DIFFUSION ===
+                    // Smoke spreads horizontally as it rises (creates cloud effect)
+                    int3 horizontals[4];
+                    horizontals[0] = pos + int3(1, 0, 0);
+                    horizontals[1] = pos + int3(-1, 0, 0);
+                    horizontals[2] = pos + int3(0, 0, 1);
+                    horizontals[3] = pos + int3(0, 0, -1);
+
+                    int startIdx = (rng >> 4) & 0x3;
+
+                    for (int i = 0; i < 4; i++) {
+                        int idx = (startIdx + i) % 4;
+                        int3 sidePos = horizontals[idx];
+                        uint sideVoxel = GetVoxelSafe(sidePos);
+                        if (IsEmpty(GetMaterial(sideVoxel))) {
+                            outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, newState);
+                            SetVoxel(uint3(pos), PackVoxel(MAT_AIR, 0, 0, 0));
+                            SetVoxel(uint3(sidePos), outputVoxel);
+                            moved = true;
+                            break;
+                        }
+                    }
+
+                    if (moved) {
+                        continue;
+                    }
+
+                    // Couldn't move - just update life counter
+                    SetVoxel(uint3(pos), PackVoxel(material, GetVariant(currentVoxel), 0, newState));
+                    continue;
+                }
+
+                // =====================================================================
+                // FIRE PHYSICS - Handle fire BEFORE falling physics (fire stays put!)
+                // =====================================================================
+                if (material == MAT_FIRE) {
+                    uint rng = PCGHash(pos.x + pos.y * 1000 + pos.z * 1000000 + frameIndex);
+
+                    // Decrement life counter
+                    uint currentLife = GetLife(currentVoxel);
+                    if (currentLife == 0) {
+                        // Fire burns out → becomes smoke
+                        SetVoxel(uint3(pos), PackVoxel(MAT_SMOKE, GetVariant(currentVoxel), 0, 15));
+                        continue;
+                    }
+
+                    uint newLife = currentLife - 1;
+                    uint newState = (GetState(currentVoxel) & 0xF0) | (newLife & 0x0F);
+
+                    // Try to spread to adjacent flammable voxels
+                    int3 neighbors[6];
+                    neighbors[0] = pos + int3(1, 0, 0);
+                    neighbors[1] = pos + int3(-1, 0, 0);
+                    neighbors[2] = pos + int3(0, 1, 0);
+                    neighbors[3] = pos + int3(0, -1, 0);
+                    neighbors[4] = pos + int3(0, 0, 1);
+                    neighbors[5] = pos + int3(0, 0, -1);
+
+                    for (int i = 0; i < 6; i++) {
+                        int3 neighborPos = neighbors[i];
+                        uint neighborVoxel = GetVoxelSafe(neighborPos);
+                        uint neighborMat = GetMaterial(neighborVoxel);
+
+                        if (IsFlammable(neighborMat)) {
+                            // 1 in 4 chance to ignite
+                            uint spreadChance = (rng >> (i * 2)) & 0x3;
+                            if (spreadChance == 0) {
+                                // Ignite the flammable material
+                                // Wood and oil burn for 60 frames
+                                SetVoxel(uint3(neighborPos), PackVoxel(MAT_FIRE, GetVariant(neighborVoxel), 0, 60));
+                            }
+                        }
+                    }
+
+                    // Randomly spawn smoke above fire
+                    int3 abovePos = pos + int3(0, 1, 0);
+                    uint aboveVoxel = GetVoxelSafe(abovePos);
+                    if (IsEmpty(GetMaterial(aboveVoxel))) {
+                        uint smokeChance = rng & 0x7; // 1 in 8 chance
+                        if (smokeChance == 0) {
+                            SetVoxel(uint3(abovePos), PackVoxel(MAT_SMOKE, (rng >> 8) & 0xFF, 0, 15));
+                        }
+                    }
+
+                    // Update fire with decremented life
+                    SetVoxel(uint3(pos), PackVoxel(material, GetVariant(currentVoxel), 0, newState));
                     continue;
                 }
 
@@ -186,22 +405,325 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                         }
                     }
 
-                    // Liquids: horizontal spread (simplified)
+                    // Liquids: comprehensive 4-directional flow with unbiased spreading
                     if (IsLiquid(currentVoxel)) {
                         uint rng = PCGHash(pos.x + pos.y * 1000 + pos.z * 1000000 + frameIndex);
-                        int dir = (rng & 1) ? 1 : -1;
 
-                        int3 sidePos = pos + int3(dir, 0, 0);
+                        // === CHECK FOR WATER INTERACTIONS ===
+                        if (material == MAT_WATER) {
+                            // Check all 6 adjacent voxels for interactions
+                            int3 neighbors[6];
+                            neighbors[0] = pos + int3(1, 0, 0);
+                            neighbors[1] = pos + int3(-1, 0, 0);
+                            neighbors[2] = pos + int3(0, 1, 0);
+                            neighbors[3] = pos + int3(0, -1, 0);
+                            neighbors[4] = pos + int3(0, 0, 1);
+                            neighbors[5] = pos + int3(0, 0, -1);
 
-                        if (sidePos.x >= 0 && sidePos.x < (int)gridSizeX) {
-                            uint sideVoxel = GetVoxelSafe(sidePos);
-                            if (IsEmpty(GetMaterial(sideVoxel))) {
-                                // Spread horizontally
-                                outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, 0);
-                                SetVoxel(uint3(pos), PackVoxel(MAT_AIR, 0, 0, 0));
-                                SetVoxel(uint3(sidePos), outputVoxel);
-                                continue;
+                            bool hasIceNeighbor = false;
+                            int iceNeighborCount = 0;
+
+                            for (int i = 0; i < 6; i++) {
+                                uint neighborVoxel = GetVoxelSafe(neighbors[i]);
+                                uint neighborMat = GetMaterial(neighborVoxel);
+
+                                // Water touching lava turns to stone
+                                if (neighborMat == MAT_LAVA) {
+                                    SetVoxel(uint3(pos), PackVoxel(MAT_STONE, GetVariant(currentVoxel), 0, STATE_IS_STATIC));
+                                    continue;  // Skip to next voxel in outer loop
+                                }
+                                // Count ice neighbors for freezing
+                                else if (neighborMat == MAT_ICE) {
+                                    hasIceNeighbor = true;
+                                    iceNeighborCount++;
+                                }
                             }
+
+                            // Water freezes if surrounded by ice (3+ ice neighbors)
+                            if (hasIceNeighbor && iceNeighborCount >= 3) {
+                                SetVoxel(uint3(pos), PackVoxel(MAT_ICE, GetVariant(currentVoxel), 0, STATE_IS_STATIC));
+                                continue;  // Skip to next voxel
+                            }
+                        }
+
+                        // === PRIORITY 2: DIAGONAL DOWN FLOW (slope flow) ===
+                        // Flow diagonally down slopes
+
+                        uint belowVoxel = GetVoxelSafe(belowPos);
+                        uint belowMaterial = GetMaterial(belowVoxel);
+
+                        bool moved = false;  // Track if voxel moved this frame
+
+                        // Try diagonal flow if on solid ground OR if surrounded by water
+                        // This allows water to flow down slopes AND escape from pools
+                        if (!IsEmpty(belowMaterial)) {
+                            // Try all 4 diagonal directions in random order
+                            int3 diagonals[4];
+                            diagonals[0] = pos + int3(1, -1, 0);   // +X diagonal
+                            diagonals[1] = pos + int3(-1, -1, 0);  // -X diagonal
+                            diagonals[2] = pos + int3(0, -1, 1);   // +Z diagonal
+                            diagonals[3] = pos + int3(0, -1, -1);  // -Z diagonal
+
+                            // Shuffle based on RNG to avoid bias
+                            int startIdx = (rng >> 2) & 0x3;  // Random start point (0-3)
+
+                            for (int i = 0; i < 4; i++) {
+                                int idx = (startIdx + i) % 4;
+                                int3 diagPos = diagonals[idx];
+                                uint diagVoxel = GetVoxelSafe(diagPos);
+                                if (IsEmpty(GetMaterial(diagVoxel))) {
+                                    outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, 0);
+                                    SetVoxel(uint3(pos), PackVoxel(MAT_AIR, 0, 0, 0));
+                                    SetVoxel(uint3(diagPos), outputVoxel);
+                                    moved = true;
+                                    break;  // Exit loop immediately after moving
+                                }
+                            }
+                        }
+
+                        // === PRIORITY 3: HORIZONTAL SPREAD (puddle leveling) ===
+                        // Only spread if destination water column is LOWER (pressure-based flow)
+
+                        if (!moved) {  // Only spread horizontally if we didn't move diagonally
+                            // Get current water column height
+                            int myHeight = GetLiquidColumnHeight(pos);
+
+                            // Shuffle to try directions in random order
+                            int startIdx = (rng >> 4) & 0x3;
+
+                            int3 horizontals[4];
+                            horizontals[0] = pos + int3(1, 0, 0);   // +X
+                            horizontals[1] = pos + int3(-1, 0, 0);  // -X
+                            horizontals[2] = pos + int3(0, 0, 1);   // +Z
+                            horizontals[3] = pos + int3(0, 0, -1);  // -Z
+
+                            for (int i = 0; i < 4; i++) {
+                                int idx = (startIdx + i) % 4;
+                                int3 sidePos = horizontals[idx];
+                                uint sideVoxel = GetVoxelSafe(sidePos);
+
+                                if (IsEmpty(GetMaterial(sideVoxel))) {
+                                    // Check if neighbor water column is lower than ours
+                                    int neighborHeight = GetLiquidColumnHeight(sidePos);
+
+                                    // Only spread if we're leveling out (neighbor is at least 1 block lower)
+                                    // The "1" prevents single-voxel jittering while allowing natural leveling
+                                    if (neighborHeight < myHeight - 1) {
+                                        outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, 0);
+                                        SetVoxel(uint3(pos), PackVoxel(MAT_AIR, 0, 0, 0));
+                                        SetVoxel(uint3(sidePos), outputVoxel);
+                                        moved = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        // If voxel moved, we're done - skip the "stay put" write below
+                        if (moved) {
+                            continue;  // Now this correctly skips to next voxel
+                        }
+                    }
+
+                    // Lava: slower liquid physics (spreads 1 direction at a time)
+                    if (material == MAT_LAVA) {
+                        uint rng = PCGHash(pos.x + pos.y * 1000 + pos.z * 1000000 + frameIndex);
+
+                        // === LAVA INTERACTIONS ===
+                        // Check all 6 adjacent voxels for interactions
+                        int3 neighbors[6];
+                        neighbors[0] = pos + int3(1, 0, 0);
+                        neighbors[1] = pos + int3(-1, 0, 0);
+                        neighbors[2] = pos + int3(0, 1, 0);
+                        neighbors[3] = pos + int3(0, -1, 0);
+                        neighbors[4] = pos + int3(0, 0, 1);
+                        neighbors[5] = pos + int3(0, 0, -1);
+
+                        for (int i = 0; i < 6; i++) {
+                            int3 neighborPos = neighbors[i];
+                            uint neighborVoxel = GetVoxelSafe(neighborPos);
+                            uint neighborMat = GetMaterial(neighborVoxel);
+
+                            // Lava + Water → turn water to stone
+                            if (neighborMat == MAT_WATER) {
+                                SetVoxel(uint3(neighborPos), PackVoxel(MAT_STONE, GetVariant(neighborVoxel), 0, STATE_IS_STATIC));
+                            }
+                            // Lava ignites flammable materials (wood, oil)
+                            else if (IsFlammable(neighborMat)) {
+                                // 1 in 2 chance to ignite (faster than fire spreading)
+                                uint igniteChance = (rng >> (i * 2)) & 0x1;
+                                if (igniteChance == 0) {
+                                    SetVoxel(uint3(neighborPos), PackVoxel(MAT_FIRE, GetVariant(neighborVoxel), 0, 60));
+                                }
+                            }
+                        }
+
+                        uint belowVoxel = GetVoxelSafe(belowPos);
+                        uint belowMaterial = GetMaterial(belowVoxel);
+
+                        bool moved = false;
+
+                        // Diagonal flow when on solid ground
+                        if (!IsEmpty(belowMaterial)) {
+                            int3 diagonals[4];
+                            diagonals[0] = pos + int3(1, -1, 0);
+                            diagonals[1] = pos + int3(-1, -1, 0);
+                            diagonals[2] = pos + int3(0, -1, 1);
+                            diagonals[3] = pos + int3(0, -1, -1);
+
+                            int startIdx = (rng >> 2) & 0x3;
+
+                            for (int i = 0; i < 4; i++) {
+                                int idx = (startIdx + i) % 4;
+                                int3 diagPos = diagonals[idx];
+                                uint diagVoxel = GetVoxelSafe(diagPos);
+                                if (IsEmpty(GetMaterial(diagVoxel))) {
+                                    outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, 0);
+                                    SetVoxel(uint3(pos), PackVoxel(MAT_AIR, 0, 0, 0));
+                                    SetVoxel(uint3(diagPos), outputVoxel);
+                                    moved = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Horizontal spread - SLOWER than water but still pressure-based
+                        // Only try 2 random directions instead of all 4 (compromise between speed and pooling)
+                        if (!moved) {
+                            int myHeight = GetLiquidColumnHeight(pos);
+
+                            // Pick 2 random directions to try (slower than water's 4)
+                            int startIdx = (rng >> 4) & 0x3;
+                            int tryCount = 2;  // Only try 2 directions (slower than water)
+
+                            int3 horizontals[4];
+                            horizontals[0] = pos + int3(1, 0, 0);
+                            horizontals[1] = pos + int3(-1, 0, 0);
+                            horizontals[2] = pos + int3(0, 0, 1);
+                            horizontals[3] = pos + int3(0, 0, -1);
+
+                            for (int i = 0; i < tryCount; i++) {
+                                int idx = (startIdx + i) % 4;
+                                int3 sidePos = horizontals[idx];
+                                uint sideVoxel = GetVoxelSafe(sidePos);
+
+                                if (IsEmpty(GetMaterial(sideVoxel))) {
+                                    int neighborHeight = GetLiquidColumnHeight(sidePos);
+
+                                    // Lava spreads to lower areas (pressure-based like water)
+                                    // Use threshold of 2 blocks instead of 1 for slower pooling
+                                    if (neighborHeight < myHeight - 2) {
+                                        outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, 0);
+                                        SetVoxel(uint3(pos), PackVoxel(MAT_AIR, 0, 0, 0));
+                                        SetVoxel(uint3(sidePos), outputVoxel);
+                                        moved = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (moved) {
+                            continue;
+                        }
+                    }
+
+                    // Oil: like water but floats on water
+                    if (material == MAT_OIL) {
+                        uint rng = PCGHash(pos.x + pos.y * 1000 + pos.z * 1000000 + frameIndex);
+
+                        // === OIL IGNITION ===
+                        // Oil ignites when touching fire or lava
+                        int3 neighbors[6];
+                        neighbors[0] = pos + int3(1, 0, 0);
+                        neighbors[1] = pos + int3(-1, 0, 0);
+                        neighbors[2] = pos + int3(0, 1, 0);
+                        neighbors[3] = pos + int3(0, -1, 0);
+                        neighbors[4] = pos + int3(0, 0, 1);
+                        neighbors[5] = pos + int3(0, 0, -1);
+
+                        for (int i = 0; i < 6; i++) {
+                            uint neighborVoxel = GetVoxelSafe(neighbors[i]);
+                            uint neighborMat = GetMaterial(neighborVoxel);
+
+                            // Oil catches fire from fire or lava
+                            if (neighborMat == MAT_FIRE || neighborMat == MAT_LAVA) {
+                                // Instant ignition (oil is highly flammable)
+                                SetVoxel(uint3(pos), PackVoxel(MAT_FIRE, GetVariant(currentVoxel), 0, 60));
+                                continue;  // Skip to next voxel in outer loop
+                            }
+                        }
+
+                        uint belowVoxel = GetVoxelSafe(belowPos);
+                        uint belowMaterial = GetMaterial(belowVoxel);
+
+                        bool moved = false;
+
+                        // Oil floats on water - swap positions if oil is above water
+                        if (belowMaterial == MAT_WATER) {
+                            // Swap: oil goes up, water goes down
+                            outputVoxel = PackVoxel(MAT_WATER, GetVariant(belowVoxel), 0, 0);  // Water moves up
+                            SetVoxel(uint3(pos), outputVoxel);
+                            SetVoxel(uint3(belowPos), PackVoxel(MAT_OIL, GetVariant(currentVoxel), 0, 0));  // Oil stays below
+                            continue;  // Done processing this voxel
+                        }
+
+                        // Diagonal flow (only if not on water)
+                        if (!moved && !IsEmpty(belowMaterial)) {
+                            int3 diagonals[4];
+                            diagonals[0] = pos + int3(1, -1, 0);
+                            diagonals[1] = pos + int3(-1, -1, 0);
+                            diagonals[2] = pos + int3(0, -1, 1);
+                            diagonals[3] = pos + int3(0, -1, -1);
+
+                            int startIdx = (rng >> 2) & 0x3;
+
+                            for (int i = 0; i < 4; i++) {
+                                int idx = (startIdx + i) % 4;
+                                int3 diagPos = diagonals[idx];
+                                uint diagVoxel = GetVoxelSafe(diagPos);
+                                if (IsEmpty(GetMaterial(diagVoxel))) {
+                                    outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, 0);
+                                    SetVoxel(uint3(pos), PackVoxel(MAT_AIR, 0, 0, 0));
+                                    SetVoxel(uint3(diagPos), outputVoxel);
+                                    moved = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Horizontal spread (same as water - pressure-based)
+                        if (!moved) {
+                            int myHeight = GetLiquidColumnHeight(pos);
+                            int startIdx = (rng >> 4) & 0x3;
+
+                            int3 horizontals[4];
+                            horizontals[0] = pos + int3(1, 0, 0);
+                            horizontals[1] = pos + int3(-1, 0, 0);
+                            horizontals[2] = pos + int3(0, 0, 1);
+                            horizontals[3] = pos + int3(0, 0, -1);
+
+                            for (int i = 0; i < 4; i++) {
+                                int idx = (startIdx + i) % 4;
+                                int3 sidePos = horizontals[idx];
+                                uint sideVoxel = GetVoxelSafe(sidePos);
+
+                                if (IsEmpty(GetMaterial(sideVoxel))) {
+                                    int neighborHeight = GetLiquidColumnHeight(sidePos);
+
+                                    if (neighborHeight < myHeight - 1) {
+                                        outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, 0);
+                                        SetVoxel(uint3(pos), PackVoxel(MAT_AIR, 0, 0, 0));
+                                        SetVoxel(uint3(sidePos), outputVoxel);
+                                        moved = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (moved) {
+                            continue;
                         }
                     }
                 }

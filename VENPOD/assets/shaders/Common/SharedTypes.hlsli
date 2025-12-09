@@ -22,8 +22,15 @@
 #define MAT_LAVA    7
 #define MAT_ICE     8
 #define MAT_OIL     9
-#define MAT_GLASS   10
-#define MAT_BEDROCK 255
+#define MAT_GLASS      10
+#define MAT_SMOKE      11
+#define MAT_ACID       12
+#define MAT_HONEY      13
+#define MAT_CONCRETE   14
+#define MAT_GUNPOWDER  15
+#define MAT_CRYSTAL    16
+#define MAT_STEAM      17
+#define MAT_BEDROCK    255
 
 // State flags (in high byte)
 #define STATE_IS_STATIC  0x80

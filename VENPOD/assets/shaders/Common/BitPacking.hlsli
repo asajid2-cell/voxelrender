@@ -124,7 +124,8 @@ bool IsSolid(uint voxel) {
 
 bool IsLiquid(uint voxel) {
     uint mat = GetMaterial(voxel);
-    return mat == MAT_WATER || mat == MAT_LAVA || mat == MAT_OIL;
+    return mat == MAT_WATER || mat == MAT_LAVA || mat == MAT_OIL ||
+           mat == MAT_ACID || mat == MAT_HONEY || mat == MAT_CONCRETE;
 }
 
 bool IsPowder(uint voxel) {

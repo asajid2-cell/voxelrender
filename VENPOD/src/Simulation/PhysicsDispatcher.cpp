@@ -774,14 +774,16 @@ void PhysicsDispatcher::DispatchPhysicsIndirect(
         return;
     }
 
-    // === Step 0: Copy READ to WRITE to initialize non-active chunks ===
-    // CRITICAL: This must happen BEFORE physics but AFTER painting!
-    // Painting writes to WRITE buffer, but non-active chunks won't be touched by physics.
-    // We copy READ to WRITE to fill in non-active chunks, but this will overwrite painted voxels.
-    // Solution: We'll copy first, then re-run ChunkScanner to detect painted voxels.
-    // Actually NO - the painting already happened in main.cpp BEFORE this function!
-    // So WRITE buffer has painted voxels, and we DON'T want to overwrite them.
-    // Skip the copy - instead modify main.cpp to run ChunkScanner AFTER painting.
+    // === Step 0: Copy READ to WRITE to initialize the output buffer ===
+    // CRITICAL: The WRITE buffer must start as a copy of READ so that:
+    // 1. Non-active chunks (not simulated) preserve their state
+    // 2. Static voxels that don't move keep their data
+    // 3. Moved voxels can overwrite their destinations properly
+    // Note: This happens AFTER ChunkScan which already copied WRITE→READ,
+    // so newly painted voxels are in READ and will be copied here
+    world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_COPY_DEST);
+    cmdList->CopyResource(world.GetWriteBuffer().GetResource(), world.GetReadBuffer().GetResource());
 
     // === Step 1: Prepare indirect dispatch arguments ===
     // Set descriptor heaps

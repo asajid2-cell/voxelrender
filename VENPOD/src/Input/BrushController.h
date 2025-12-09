@@ -163,7 +163,7 @@ private:
     static constexpr float m_minRadius = 1.0f;
     static constexpr float m_maxRadius = 32.0f;
     static constexpr uint32_t m_minMaterial = 1;  // 0 is air
-    static constexpr uint32_t m_maxMaterial = 10; // Up to glass
+    static constexpr uint32_t m_maxMaterial = 17; // Up to steam
 
     // Grid bounds (updated each frame)
     glm::vec3 m_gridMin{0.0f};
