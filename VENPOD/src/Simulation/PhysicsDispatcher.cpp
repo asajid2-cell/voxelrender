@@ -421,25 +421,10 @@ void PhysicsDispatcher::DispatchBrush(
 
     auto dispatchSize = world.GetDispatchSize(8);
 
-    // Paint to WRITE buffer first (so it persists after physics swap)
-    world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    m_brushPipeline.SetRootDescriptorTable(cmdList, 1, world.GetWriteBufferUAV().gpu);
-    m_brushPipeline.Dispatch(cmdList, dispatchSize.x, dispatchSize.y, dispatchSize.z);
-
-    // UAV barrier on WRITE buffer
-    {
-        auto& writeBuffer = world.GetWriteBuffer();
-        ID3D12Resource* resource = writeBuffer.GetResource();
-        if (resource) {
-            D3D12_RESOURCE_BARRIER barrier = {};
-            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-            barrier.UAV.pResource = resource;
-            cmdList->ResourceBarrier(1, &barrier);
-        }
-    }
-
-    // Also paint to READ buffer (so chunk scanner sees new voxels this frame)
+    // CRITICAL FIX: Paint to READ buffer!
+    // Physics will copy READ->WRITE (including painted voxels), then process active chunks.
+    // This ensures painted voxels in non-active chunks are preserved.
+    // Order: Paint to READ -> Physics copies READ to WRITE -> Physics modifies active chunks in WRITE -> Swap
     world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_brushPipeline.SetRootDescriptorTable(cmdList, 1, world.GetReadBufferUAV().gpu);
     m_brushPipeline.Dispatch(cmdList, dispatchSize.x, dispatchSize.y, dispatchSize.z);
@@ -795,8 +780,17 @@ void PhysicsDispatcher::DispatchPhysicsIndirect(
     // Transition indirect args buffer for indirect dispatch
     chunkManager.TransitionBuffersForIndirect(cmdList);
 
-    // === Step 2: Execute indirect dispatch for chunk-based physics ===
-    // Transition voxel buffers
+    // === Step 2: Copy READ buffer to WRITE buffer ===
+    // CRITICAL FIX: Physics only processes active chunks. Non-active chunks would have
+    // uninitialized/garbage data in WRITE buffer unless we copy the entire READ buffer first.
+    // This copy preserves all existing voxels (including newly painted ones in READ buffer)
+    // before physics modifies active chunks in WRITE buffer.
+    world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    cmdList->CopyResource(world.GetWriteBuffer().GetResource(), world.GetReadBuffer().GetResource());
+
+    // Transition for physics execution
     world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 

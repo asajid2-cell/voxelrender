@@ -187,10 +187,14 @@ bool BrushController::DDAVoxelRaycast(
     }
 
     // Start raymarching from grid entry point (or ray origin if inside grid)
-    glm::vec3 startPos = rayOrigin + rayDir * std::max(tMin, 0.0f);
+    // Add small epsilon to ensure we're inside the grid when entering from outside
+    float entryT = std::max(tMin, 0.0f);
+    if (tMin > 0.0f) entryT += 0.001f;  // Move slightly inside grid boundary
+    glm::vec3 startPos = rayOrigin + rayDir * entryT;
 
     // Start position in voxel grid (integer coordinates)
-    glm::ivec3 voxelPos = glm::ivec3(glm::floor(startPos));
+    // Add small epsilon to floor to avoid precision issues at boundaries
+    glm::ivec3 voxelPos = glm::ivec3(glm::floor(startPos + glm::vec3(1e-4f)));
 
     // DDA setup - matches GPU implementation in PS_Raymarch.hlsl
     glm::vec3 deltaDist = glm::abs(1.0f / rayDir);

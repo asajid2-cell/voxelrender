@@ -98,11 +98,20 @@ void main(uint3 DTid : SV_DispatchThreadID) {
 
         // Can fall straight down?
         if (IsEmpty(belowMaterial)) {
-            // Move down
-            outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, 0);
-            SetVoxel(DTid, PackVoxel(MAT_AIR, 0, 0, 0));  // Clear current
-            SetVoxel(uint3(belowPos), outputVoxel);        // Fill below
-            return;
+            // Try to claim the destination voxel atomically
+            uint3 gridSize = uint3(gridSizeX, gridSizeY, gridSizeZ);
+            uint belowIdx = LinearIndex3D(uint3(belowPos), gridSize);
+
+            uint originalValue;
+            InterlockedCompareExchange(VoxelGridOut[belowIdx], PackVoxel(MAT_AIR, 0, 0, 0),
+                                       PackVoxel(material, GetVariant(currentVoxel), 0, 0),
+                                       originalValue);
+
+            // Only clear current position if we successfully claimed the destination
+            if (originalValue == PackVoxel(MAT_AIR, 0, 0, 0)) {
+                SetVoxel(DTid, PackVoxel(MAT_AIR, 0, 0, 0));
+                return;
+            }
         }
 
         // Sand: try diagonal down (slide)
@@ -118,10 +127,18 @@ void main(uint3 DTid : SV_DispatchThreadID) {
             if (diagPos1.x >= 0 && diagPos1.x < (int)gridSizeX) {
                 uint diagVoxel = GetVoxelSafe(diagPos1);
                 if (IsEmpty(GetMaterial(diagVoxel))) {
-                    outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, 0);
-                    SetVoxel(DTid, PackVoxel(MAT_AIR, 0, 0, 0));
-                    SetVoxel(uint3(diagPos1), outputVoxel);
-                    return;
+                    uint3 gridSize = uint3(gridSizeX, gridSizeY, gridSizeZ);
+                    uint diagIdx = LinearIndex3D(uint3(diagPos1), gridSize);
+
+                    uint originalValue;
+                    InterlockedCompareExchange(VoxelGridOut[diagIdx], PackVoxel(MAT_AIR, 0, 0, 0),
+                                               PackVoxel(material, GetVariant(currentVoxel), 0, 0),
+                                               originalValue);
+
+                    if (originalValue == PackVoxel(MAT_AIR, 0, 0, 0)) {
+                        SetVoxel(DTid, PackVoxel(MAT_AIR, 0, 0, 0));
+                        return;
+                    }
                 }
             }
 
@@ -129,10 +146,18 @@ void main(uint3 DTid : SV_DispatchThreadID) {
             if (diagPos2.x >= 0 && diagPos2.x < (int)gridSizeX) {
                 uint diagVoxel = GetVoxelSafe(diagPos2);
                 if (IsEmpty(GetMaterial(diagVoxel))) {
-                    outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, 0);
-                    SetVoxel(DTid, PackVoxel(MAT_AIR, 0, 0, 0));
-                    SetVoxel(uint3(diagPos2), outputVoxel);
-                    return;
+                    uint3 gridSize = uint3(gridSizeX, gridSizeY, gridSizeZ);
+                    uint diagIdx = LinearIndex3D(uint3(diagPos2), gridSize);
+
+                    uint originalValue;
+                    InterlockedCompareExchange(VoxelGridOut[diagIdx], PackVoxel(MAT_AIR, 0, 0, 0),
+                                               PackVoxel(material, GetVariant(currentVoxel), 0, 0),
+                                               originalValue);
+
+                    if (originalValue == PackVoxel(MAT_AIR, 0, 0, 0)) {
+                        SetVoxel(DTid, PackVoxel(MAT_AIR, 0, 0, 0));
+                        return;
+                    }
                 }
             }
         }
@@ -147,11 +172,18 @@ void main(uint3 DTid : SV_DispatchThreadID) {
             if (sidePos.x >= 0 && sidePos.x < (int)gridSizeX) {
                 uint sideVoxel = GetVoxelSafe(sidePos);
                 if (IsEmpty(GetMaterial(sideVoxel))) {
-                    // Spread horizontally
-                    outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, 0);
-                    SetVoxel(DTid, PackVoxel(MAT_AIR, 0, 0, 0));
-                    SetVoxel(uint3(sidePos), outputVoxel);
-                    return;
+                    uint3 gridSize = uint3(gridSizeX, gridSizeY, gridSizeZ);
+                    uint sideIdx = LinearIndex3D(uint3(sidePos), gridSize);
+
+                    uint originalValue;
+                    InterlockedCompareExchange(VoxelGridOut[sideIdx], PackVoxel(MAT_AIR, 0, 0, 0),
+                                               PackVoxel(material, GetVariant(currentVoxel), 0, 0),
+                                               originalValue);
+
+                    if (originalValue == PackVoxel(MAT_AIR, 0, 0, 0)) {
+                        SetVoxel(DTid, PackVoxel(MAT_AIR, 0, 0, 0));
+                        return;
+                    }
                 }
             }
         }

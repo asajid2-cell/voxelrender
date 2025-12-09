@@ -123,28 +123,28 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID, ui
 
         ctrl.particleCount = gs_particleCount;
 
+        // ALWAYS add chunks with any voxels to active list
+        // This ensures they get copied from READ to WRITE buffer
+        // even if they're not actively simulating physics
+        if (gs_particleCount > 0) {
+            // Chunk has voxels - add to active list for copying
+            uint listIndex;
+            InterlockedAdd(ActiveChunkCount[0], 1, listIndex);
+            ActiveChunkList[listIndex] = chunkIndex;
+        }
+
+        // Track active vs sleeping state for optimization
         if (gs_hasActiveVoxel > 0) {
             // Chunk has active voxels - wake it up
             ctrl.isActive = 1; // Active
             ctrl.sleepTimer = 0;
-
-            // Add to active list
-            uint listIndex;
-            InterlockedAdd(ActiveChunkCount[0], 1, listIndex);
-            ActiveChunkList[listIndex] = chunkIndex;
         } else if (ctrl.isActive == 1) {
             // Was active, now idle - increment sleep timer
             ctrl.sleepTimer++;
             if (ctrl.sleepTimer >= sleepThreshold) {
                 ctrl.isActive = 0; // Sleeping
-            } else {
-                // Still warming down - keep in active list
-                uint listIndex;
-                InterlockedAdd(ActiveChunkCount[0], 1, listIndex);
-                ActiveChunkList[listIndex] = chunkIndex;
             }
         }
-        // Sleeping chunks stay sleeping
 
         ChunkControlBuffer[chunkIndex] = ctrl;
     }

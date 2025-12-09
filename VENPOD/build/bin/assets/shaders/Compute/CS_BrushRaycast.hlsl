@@ -90,10 +90,14 @@ void main(uint3 DTid : SV_DispatchThreadID) {
     }
 
     // Start raymarching from grid entry point (or ray origin if inside grid)
-    float3 startPos = origin + dir * max(tMin, 0.0f);
+    // Add small epsilon to ensure we're inside the grid when entering from outside
+    float entryT = max(tMin, 0.0f);
+    if (tMin > 0.0f) entryT += 0.001f;  // Move slightly inside grid boundary
+    float3 startPos = origin + dir * entryT;
 
     // DDA setup (same as PS_Raymarch.hlsl and CPU BrushController)
-    int3 voxelPos = int3(floor(startPos));
+    // Add small epsilon to floor to avoid precision issues at boundaries
+    int3 voxelPos = int3(floor(startPos + float3(1e-4f, 1e-4f, 1e-4f)));
     float3 deltaDist = abs(1.0f / dir);
     int3 step = int3(sign(dir));
 

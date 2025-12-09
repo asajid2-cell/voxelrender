@@ -432,12 +432,40 @@ int main(int argc, char* argv[]) {
         auto gpuRaycastResult = voxelWorld->GetBrushRaycastResult();
 
         // Apply brush painting FIRST (so chunk scanner can detect new voxels)
-        // Use GPU raycast position instead of CPU calculation!
-        if ((brushController.IsPainting() || brushController.IsErasing()) && gpuRaycastResult.hasValidPosition) {
+        // Use GPU raycast position, or fallback to fixed distance in empty air
+        if (brushController.IsPainting() || brushController.IsErasing()) {
+            glm::vec3 brushPos;
+
+            if (gpuRaycastResult.hasValidPosition) {
+                // Use GPU raycast hit position (on solid voxel face)
+                brushPos = glm::vec3(gpuRaycastResult.posX, gpuRaycastResult.posY, gpuRaycastResult.posZ);
+                static int logCounter = 0;
+                if (logCounter++ % 60 == 0) {  // Log once per second
+                    spdlog::info("Painting at raycast pos: ({:.1f}, {:.1f}, {:.1f}), material={}",
+                        brushPos.x, brushPos.y, brushPos.z, brushController.GetMaterial());
+                }
+            } else {
+                // Fallback: place at fixed distance in empty air (10 voxels ahead)
+                brushPos = cameraPos + rayDir * 10.0f;
+
+                // Clamp to grid bounds
+                brushPos = glm::clamp(brushPos,
+                    glm::vec3(0.5f),
+                    glm::vec3(voxelWorld->GetGridSizeX() - 0.5f,
+                             voxelWorld->GetGridSizeY() - 0.5f,
+                             voxelWorld->GetGridSizeZ() - 0.5f));
+
+                static int logCounter = 0;
+                if (logCounter++ % 60 == 0) {  // Log once per second
+                    spdlog::info("Painting in air at: ({:.1f}, {:.1f}, {:.1f}), material={}",
+                        brushPos.x, brushPos.y, brushPos.z, brushController.GetMaterial());
+                }
+            }
+
             Input::BrushConstants brushConstants;
-            brushConstants.positionX = gpuRaycastResult.posX;
-            brushConstants.positionY = gpuRaycastResult.posY;
-            brushConstants.positionZ = gpuRaycastResult.posZ;
+            brushConstants.positionX = brushPos.x;
+            brushConstants.positionY = brushPos.y;
+            brushConstants.positionZ = brushPos.z;
             brushConstants.radius = brushController.GetRadius();
             brushConstants.material = brushController.IsErasing() ? 0 : brushController.GetMaterial();
             brushConstants.mode = static_cast<uint32_t>(brushController.GetMode());
