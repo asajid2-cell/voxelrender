@@ -154,6 +154,12 @@ void PhysicsDispatcher::DispatchInitialize(
         spdlog::warn("DispatchInitialize: Write buffer resource is null!");
     }
 
+    // CRITICAL: Copy WRITE → READ after initialization so rendering sees terrain on Frame 0
+    world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_COPY_DEST);
+    cmdList->CopyResource(world.GetReadBuffer().GetResource(), world.GetWriteBuffer().GetResource());
+    spdlog::info("DispatchInitialize: Copied WRITE → READ for Frame 0 rendering");
+
     spdlog::debug("Dispatched voxel initialization: {}x{}x{} thread groups",
         dispatchSize.x, dispatchSize.y, dispatchSize.z);
 }
@@ -421,18 +427,15 @@ void PhysicsDispatcher::DispatchBrush(
 
     auto dispatchSize = world.GetDispatchSize(8);
 
-    // CRITICAL FIX: Paint to READ buffer!
-    // Physics will copy READ->WRITE (including painted voxels), then process active chunks.
-    // This ensures painted voxels in non-active chunks are preserved.
-    // Order: Paint to READ -> Physics copies READ to WRITE -> Physics modifies active chunks in WRITE -> Swap
-    world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    m_brushPipeline.SetRootDescriptorTable(cmdList, 1, world.GetReadBufferUAV().gpu);
+    // Paint to WRITE buffer
+    world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_brushPipeline.SetRootDescriptorTable(cmdList, 1, world.GetWriteBufferUAV().gpu);
     m_brushPipeline.Dispatch(cmdList, dispatchSize.x, dispatchSize.y, dispatchSize.z);
 
-    // UAV barrier on READ buffer
+    // UAV barrier on WRITE buffer
     {
-        auto& readBuffer = world.GetReadBuffer();
-        ID3D12Resource* resource = readBuffer.GetResource();
+        auto& writeBuffer = world.GetWriteBuffer();
+        ID3D12Resource* resource = writeBuffer.GetResource();
         if (resource) {
             D3D12_RESOURCE_BARRIER barrier = {};
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
@@ -559,10 +562,25 @@ void PhysicsDispatcher::DispatchChunkScan(
         return;
     }
 
+    // === PROPER PING-PONG ARCHITECTURE ===
+    // Step 1: Scan WRITE buffer (where painted voxels are) to build active chunk list
+    // Step 2: Copy WRITE → READ (preserve current frame state before physics modifies it)
+    // Step 3: Physics reads READ, writes to WRITE (only processes active chunks)
+    // Non-active chunks in WRITE remain unchanged from previous frame
+
     // Reset active chunk count to zero before scanning
     chunkManager.ResetActiveCount(cmdList);
 
-    // Transition voxel grid to SRV for reading
+    // CRITICAL: Scan WRITE buffer to detect newly painted voxels!
+    // We need to transition WRITE to SRV, but it might not have an SRV view.
+    // For now, we'll use a workaround: Copy WRITE → READ first, then scan READ.
+
+    // Copy WRITE → READ BEFORE scanning (so scanner sees painted voxels)
+    world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_COPY_DEST);
+    cmdList->CopyResource(world.GetReadBuffer().GetResource(), world.GetWriteBuffer().GetResource());
+
+    // Now scan READ buffer (which has the latest state including painted voxels)
     world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     // Transition chunk buffers to UAV for writing
@@ -592,7 +610,7 @@ void PhysicsDispatcher::DispatchChunkScan(
 
     m_chunkScanPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
 
-    // Set descriptors
+    // Set descriptors - scan READ (which now has WRITE's data)
     m_chunkScanPipeline.SetRootDescriptorTable(cmdList, 1, world.GetReadBufferSRV().gpu);
     m_chunkScanPipeline.SetRootDescriptorTable(cmdList, 2, chunkManager.GetChunkControlUAV().gpu);
     m_chunkScanPipeline.SetRootDescriptorTable(cmdList, 3, chunkManager.GetActiveListUAV().gpu);
@@ -756,6 +774,15 @@ void PhysicsDispatcher::DispatchPhysicsIndirect(
         return;
     }
 
+    // === Step 0: Copy READ to WRITE to initialize non-active chunks ===
+    // CRITICAL: This must happen BEFORE physics but AFTER painting!
+    // Painting writes to WRITE buffer, but non-active chunks won't be touched by physics.
+    // We copy READ to WRITE to fill in non-active chunks, but this will overwrite painted voxels.
+    // Solution: We'll copy first, then re-run ChunkScanner to detect painted voxels.
+    // Actually NO - the painting already happened in main.cpp BEFORE this function!
+    // So WRITE buffer has painted voxels, and we DON'T want to overwrite them.
+    // Skip the copy - instead modify main.cpp to run ChunkScanner AFTER painting.
+
     // === Step 1: Prepare indirect dispatch arguments ===
     // Set descriptor heaps
     ID3D12DescriptorHeap* heaps[] = { m_heapManager->GetShaderVisibleCbvSrvUavHeap() };
@@ -780,17 +807,8 @@ void PhysicsDispatcher::DispatchPhysicsIndirect(
     // Transition indirect args buffer for indirect dispatch
     chunkManager.TransitionBuffersForIndirect(cmdList);
 
-    // === Step 2: Copy READ buffer to WRITE buffer ===
-    // CRITICAL FIX: Physics only processes active chunks. Non-active chunks would have
-    // uninitialized/garbage data in WRITE buffer unless we copy the entire READ buffer first.
-    // This copy preserves all existing voxels (including newly painted ones in READ buffer)
-    // before physics modifies active chunks in WRITE buffer.
-    world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_COPY_DEST);
-
-    cmdList->CopyResource(world.GetWriteBuffer().GetResource(), world.GetReadBuffer().GetResource());
-
-    // Transition for physics execution
+    // === Step 2: Execute indirect dispatch for chunk-based physics ===
+    // Transition voxel buffers
     world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
@@ -838,8 +856,9 @@ void PhysicsDispatcher::DispatchPhysicsIndirect(
     uavBarrier.UAV.pResource = world.GetWriteBuffer().GetResource();
     cmdList->ResourceBarrier(1, &uavBarrier);
 
-    // Swap buffers for next frame
-    world.SwapBuffers();
+    // NO COPY NEEDED HERE - we already copied WRITE → READ at the start of DispatchChunkScan
+    // Rendering will read from READ buffer which has the PREVIOUS frame's physics results
+    // Next frame's ChunkScan will copy the current WRITE state to READ
 
     spdlog::debug("DispatchPhysicsIndirect: Indirect physics dispatch complete");
 }

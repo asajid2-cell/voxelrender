@@ -119,8 +119,13 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                 // Default: copy voxel unchanged
                 uint outputVoxel = currentVoxel;
 
-                // Skip air and bedrock
-                if (material == MAT_AIR || material == MAT_BEDROCK) {
+                // Skip air (don't copy it - prevents overwriting painted voxels in WRITE buffer)
+                if (material == MAT_AIR) {
+                    continue;  // Don't write anything for AIR voxels
+                }
+
+                // Bedrock stays in place
+                if (material == MAT_BEDROCK) {
                     SetVoxel(uint3(pos), outputVoxel);
                     continue;
                 }

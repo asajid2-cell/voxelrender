@@ -7441,8 +7441,8 @@ events:
     checks:
       - "Detecting CXX compiler ABI info"
     directories:
-      source: "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-h06xuc"
-      binary: "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-h06xuc"
+      source: "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-z2dvja"
+      binary: "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-z2dvja"
     cmakeVariables:
       CMAKE_CXX_FLAGS: "/DWIN32 /D_WINDOWS /EHsc"
       CMAKE_CXX_FLAGS_DEBUG: "/Zi /Ob0 /Od /RTC1"
@@ -7456,11 +7456,11 @@ events:
       variable: "CMAKE_CXX_ABI_COMPILED"
       cached: true
       stdout: |
-        Change Dir: 'Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-h06xuc'
+        Change Dir: 'Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-z2dvja'
         
-        Run Build Command(s): "C:/Program Files/Ninja/ninja.exe" -v cmTC_5fe08
-        [1/2] C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\cl.exe  /nologo /TP -D_MBCS  /DWIN32 /D_WINDOWS /EHsc  /Zi /Ob0 /Od /RTC1 -MDd /showIncludes /FoCMakeFiles\\cmTC_5fe08.dir\\CMakeCXXCompilerABI.cpp.obj /FdCMakeFiles\\cmTC_5fe08.dir\\ /FS -c "C:\\Program Files\\CMake\\share\\cmake-4.2\\Modules\\CMakeCXXCompilerABI.cpp"
-        [2/2] C:\\WINDOWS\\system32\\cmd.exe /C "cd . && "C:\\Program Files\\CMake\\bin\\cmake.exe" -E vs_link_exe --msvc-ver=1950 --intdir=CMakeFiles\\cmTC_5fe08.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_5fe08.dir\\CMakeCXXCompilerABI.cpp.obj  /out:cmTC_5fe08.exe /implib:cmTC_5fe08.lib /pdb:cmTC_5fe08.pdb /version:0.0 /machine:x64 /debug /INCREMENTAL /subsystem:console  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib && cd ."
+        Run Build Command(s): "C:/Program Files/Ninja/ninja.exe" -v cmTC_997e5
+        [1/2] C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\cl.exe  /nologo /TP -D_MBCS  /DWIN32 /D_WINDOWS /EHsc  /Zi /Ob0 /Od /RTC1 -MDd /showIncludes /FoCMakeFiles\\cmTC_997e5.dir\\CMakeCXXCompilerABI.cpp.obj /FdCMakeFiles\\cmTC_997e5.dir\\ /FS -c "C:\\Program Files\\CMake\\share\\cmake-4.2\\Modules\\CMakeCXXCompilerABI.cpp"
+        [2/2] C:\\WINDOWS\\system32\\cmd.exe /C "cd . && "C:\\Program Files\\CMake\\bin\\cmake.exe" -E vs_link_exe --msvc-ver=1950 --intdir=CMakeFiles\\cmTC_997e5.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_997e5.dir\\CMakeCXXCompilerABI.cpp.obj  /out:cmTC_997e5.exe /implib:cmTC_997e5.lib /pdb:cmTC_997e5.pdb /version:0.0 /machine:x64 /debug /INCREMENTAL /subsystem:console  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib && cd ."
         
       exitCode: 0
   -
@@ -7823,8 +7823,8 @@ events:
     checks:
       - "Performing Test CMAKE_HAVE_LIBC_PTHREAD"
     directories:
-      source: "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-qo6qh6"
-      binary: "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-qo6qh6"
+      source: "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-822r6m"
+      binary: "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-822r6m"
     cmakeVariables:
       CMAKE_CXX_FLAGS: "/DWIN32 /D_WINDOWS /EHsc"
       CMAKE_CXX_FLAGS_DEBUG: "/Zi /Ob0 /Od /RTC1"
@@ -7837,13 +7837,13 @@ events:
       variable: "CMAKE_HAVE_LIBC_PTHREAD"
       cached: true
       stdout: |
-        Change Dir: 'Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-qo6qh6'
+        Change Dir: 'Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-822r6m'
         
-        Run Build Command(s): "C:/Program Files/Ninja/ninja.exe" -v cmTC_3c667
-        [1/4] C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\cl.exe -DCMAKE_HAVE_LIBC_PTHREAD -D_MBCS  /DWIN32 /D_WINDOWS /EHsc  /Zi /Ob0 /Od /RTC1 -std:c++20 -MDd Z:\\328\\CMPUT328-A2\\codexworks\\301\\3d\\VENPOD\\build\\CMakeFiles\\CMakeScratch\\TryCompile-qo6qh6\\src.cxx -nologo -TP -showIncludes -scanDependencies CMakeFiles\\cmTC_3c667.dir\\src.cxx.obj.ddi -FoCMakeFiles\\cmTC_3c667.dir\\src.cxx.obj
-        FAILED: CMakeFiles/cmTC_3c667.dir/src.cxx.obj.ddi 
-        C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\cl.exe -DCMAKE_HAVE_LIBC_PTHREAD -D_MBCS  /DWIN32 /D_WINDOWS /EHsc  /Zi /Ob0 /Od /RTC1 -std:c++20 -MDd Z:\\328\\CMPUT328-A2\\codexworks\\301\\3d\\VENPOD\\build\\CMakeFiles\\CMakeScratch\\TryCompile-qo6qh6\\src.cxx -nologo -TP -showIncludes -scanDependencies CMakeFiles\\cmTC_3c667.dir\\src.cxx.obj.ddi -FoCMakeFiles\\cmTC_3c667.dir\\src.cxx.obj
-        Z:\\328\\CMPUT328-A2\\codexworks\\301\\3d\\VENPOD\\build\\CMakeFiles\\CMakeScratch\\TryCompile-qo6qh6\\src.cxx(1): fatal error C1083: Cannot open include file: 'pthread.h': No such file or directory
+        Run Build Command(s): "C:/Program Files/Ninja/ninja.exe" -v cmTC_673f6
+        [1/4] C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\cl.exe -DCMAKE_HAVE_LIBC_PTHREAD -D_MBCS  /DWIN32 /D_WINDOWS /EHsc  /Zi /Ob0 /Od /RTC1 -std:c++20 -MDd Z:\\328\\CMPUT328-A2\\codexworks\\301\\3d\\VENPOD\\build\\CMakeFiles\\CMakeScratch\\TryCompile-822r6m\\src.cxx -nologo -TP -showIncludes -scanDependencies CMakeFiles\\cmTC_673f6.dir\\src.cxx.obj.ddi -FoCMakeFiles\\cmTC_673f6.dir\\src.cxx.obj
+        FAILED: CMakeFiles/cmTC_673f6.dir/src.cxx.obj.ddi 
+        C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\cl.exe -DCMAKE_HAVE_LIBC_PTHREAD -D_MBCS  /DWIN32 /D_WINDOWS /EHsc  /Zi /Ob0 /Od /RTC1 -std:c++20 -MDd Z:\\328\\CMPUT328-A2\\codexworks\\301\\3d\\VENPOD\\build\\CMakeFiles\\CMakeScratch\\TryCompile-822r6m\\src.cxx -nologo -TP -showIncludes -scanDependencies CMakeFiles\\cmTC_673f6.dir\\src.cxx.obj.ddi -FoCMakeFiles\\cmTC_673f6.dir\\src.cxx.obj
+        Z:\\328\\CMPUT328-A2\\codexworks\\301\\3d\\VENPOD\\build\\CMakeFiles\\CMakeScratch\\TryCompile-822r6m\\src.cxx(1): fatal error C1083: Cannot open include file: 'pthread.h': No such file or directory
         ninja: build stopped: subcommand failed.
         
       exitCode: 1
@@ -7860,8 +7860,8 @@ events:
     checks:
       - "Looking for pthread_create in pthreads"
     directories:
-      source: "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-wtf2ql"
-      binary: "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-wtf2ql"
+      source: "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-8cx56z"
+      binary: "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-8cx56z"
     cmakeVariables:
       CMAKE_CXX_FLAGS: "/DWIN32 /D_WINDOWS /EHsc"
       CMAKE_CXX_FLAGS_DEBUG: "/Zi /Ob0 /Od /RTC1"
@@ -7874,16 +7874,16 @@ events:
       variable: "CMAKE_HAVE_PTHREADS_CREATE"
       cached: true
       stdout: |
-        Change Dir: 'Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-wtf2ql'
+        Change Dir: 'Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-8cx56z'
         
-        Run Build Command(s): "C:/Program Files/Ninja/ninja.exe" -v cmTC_01b20
-        [1/4] C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\cl.exe -D_MBCS  /DWIN32 /D_WINDOWS /EHsc -DCHECK_FUNCTION_EXISTS=pthread_create /Zi /Ob0 /Od /RTC1 -std:c++20 -MDd Z:\\328\\CMPUT328-A2\\codexworks\\301\\3d\\VENPOD\\build\\CMakeFiles\\CMakeScratch\\TryCompile-wtf2ql\\CheckFunctionExists.cxx -nologo -TP -showIncludes -scanDependencies CMakeFiles\\cmTC_01b20.dir\\CheckFunctionExists.cxx.obj.ddi -FoCMakeFiles\\cmTC_01b20.dir\\CheckFunctionExists.cxx.obj
-        [2/4] "C:\\Program Files\\CMake\\bin\\cmake.exe" -E cmake_ninja_dyndep --tdi=CMakeFiles\\cmTC_01b20.dir\\CXXDependInfo.json --lang=CXX --modmapfmt=msvc --dd=CMakeFiles\\cmTC_01b20.dir\\CXX.dd @CMakeFiles\\cmTC_01b20.dir\\CXX.dd.rsp
-        [3/4] C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\cl.exe  /nologo /TP -D_MBCS  /DWIN32 /D_WINDOWS /EHsc -DCHECK_FUNCTION_EXISTS=pthread_create /Zi /Ob0 /Od /RTC1 -std:c++20 -MDd /showIncludes @CMakeFiles\\cmTC_01b20.dir\\CheckFunctionExists.cxx.obj.modmap /FoCMakeFiles\\cmTC_01b20.dir\\CheckFunctionExists.cxx.obj /FdCMakeFiles\\cmTC_01b20.dir\\ /FS -c Z:\\328\\CMPUT328-A2\\codexworks\\301\\3d\\VENPOD\\build\\CMakeFiles\\CMakeScratch\\TryCompile-wtf2ql\\CheckFunctionExists.cxx
-        [4/4] C:\\WINDOWS\\system32\\cmd.exe /C "cd . && "C:\\Program Files\\CMake\\bin\\cmake.exe" -E vs_link_exe --msvc-ver=1950 --intdir=CMakeFiles\\cmTC_01b20.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_01b20.dir\\CheckFunctionExists.cxx.obj  /out:cmTC_01b20.exe /implib:cmTC_01b20.lib /pdb:cmTC_01b20.pdb /version:0.0 /machine:x64 /debug /INCREMENTAL /subsystem:console  pthreads.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib && cd ."
-        FAILED: cmTC_01b20.exe 
-        C:\\WINDOWS\\system32\\cmd.exe /C "cd . && "C:\\Program Files\\CMake\\bin\\cmake.exe" -E vs_link_exe --msvc-ver=1950 --intdir=CMakeFiles\\cmTC_01b20.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_01b20.dir\\CheckFunctionExists.cxx.obj  /out:cmTC_01b20.exe /implib:cmTC_01b20.lib /pdb:cmTC_01b20.pdb /version:0.0 /machine:x64 /debug /INCREMENTAL /subsystem:console  pthreads.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib && cd ."
-        LINK Pass 1: command "C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_01b20.dir\\CheckFunctionExists.cxx.obj /out:cmTC_01b20.exe /implib:cmTC_01b20.lib /pdb:cmTC_01b20.pdb /version:0.0 /machine:x64 /debug /INCREMENTAL /subsystem:console pthreads.lib kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib /MANIFEST /MANIFESTFILE:CMakeFiles\\cmTC_01b20.dir/intermediate.manifest CMakeFiles\\cmTC_01b20.dir/manifest.res" failed (exit code 1104) with the following output:\x0d
+        Run Build Command(s): "C:/Program Files/Ninja/ninja.exe" -v cmTC_c6702
+        [1/4] C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\cl.exe -D_MBCS  /DWIN32 /D_WINDOWS /EHsc -DCHECK_FUNCTION_EXISTS=pthread_create /Zi /Ob0 /Od /RTC1 -std:c++20 -MDd Z:\\328\\CMPUT328-A2\\codexworks\\301\\3d\\VENPOD\\build\\CMakeFiles\\CMakeScratch\\TryCompile-8cx56z\\CheckFunctionExists.cxx -nologo -TP -showIncludes -scanDependencies CMakeFiles\\cmTC_c6702.dir\\CheckFunctionExists.cxx.obj.ddi -FoCMakeFiles\\cmTC_c6702.dir\\CheckFunctionExists.cxx.obj
+        [2/4] "C:\\Program Files\\CMake\\bin\\cmake.exe" -E cmake_ninja_dyndep --tdi=CMakeFiles\\cmTC_c6702.dir\\CXXDependInfo.json --lang=CXX --modmapfmt=msvc --dd=CMakeFiles\\cmTC_c6702.dir\\CXX.dd @CMakeFiles\\cmTC_c6702.dir\\CXX.dd.rsp
+        [3/4] C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\cl.exe  /nologo /TP -D_MBCS  /DWIN32 /D_WINDOWS /EHsc -DCHECK_FUNCTION_EXISTS=pthread_create /Zi /Ob0 /Od /RTC1 -std:c++20 -MDd /showIncludes @CMakeFiles\\cmTC_c6702.dir\\CheckFunctionExists.cxx.obj.modmap /FoCMakeFiles\\cmTC_c6702.dir\\CheckFunctionExists.cxx.obj /FdCMakeFiles\\cmTC_c6702.dir\\ /FS -c Z:\\328\\CMPUT328-A2\\codexworks\\301\\3d\\VENPOD\\build\\CMakeFiles\\CMakeScratch\\TryCompile-8cx56z\\CheckFunctionExists.cxx
+        [4/4] C:\\WINDOWS\\system32\\cmd.exe /C "cd . && "C:\\Program Files\\CMake\\bin\\cmake.exe" -E vs_link_exe --msvc-ver=1950 --intdir=CMakeFiles\\cmTC_c6702.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_c6702.dir\\CheckFunctionExists.cxx.obj  /out:cmTC_c6702.exe /implib:cmTC_c6702.lib /pdb:cmTC_c6702.pdb /version:0.0 /machine:x64 /debug /INCREMENTAL /subsystem:console  pthreads.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib && cd ."
+        FAILED: cmTC_c6702.exe 
+        C:\\WINDOWS\\system32\\cmd.exe /C "cd . && "C:\\Program Files\\CMake\\bin\\cmake.exe" -E vs_link_exe --msvc-ver=1950 --intdir=CMakeFiles\\cmTC_c6702.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_c6702.dir\\CheckFunctionExists.cxx.obj  /out:cmTC_c6702.exe /implib:cmTC_c6702.lib /pdb:cmTC_c6702.pdb /version:0.0 /machine:x64 /debug /INCREMENTAL /subsystem:console  pthreads.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib && cd ."
+        LINK Pass 1: command "C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_c6702.dir\\CheckFunctionExists.cxx.obj /out:cmTC_c6702.exe /implib:cmTC_c6702.lib /pdb:cmTC_c6702.pdb /version:0.0 /machine:x64 /debug /INCREMENTAL /subsystem:console pthreads.lib kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib /MANIFEST /MANIFESTFILE:CMakeFiles\\cmTC_c6702.dir/intermediate.manifest CMakeFiles\\cmTC_c6702.dir/manifest.res" failed (exit code 1104) with the following output:\x0d
         LINK : fatal error LNK1104: cannot open file 'pthreads.lib'\x0d\x0d
         ninja: build stopped: subcommand failed.
         
@@ -7901,8 +7901,8 @@ events:
     checks:
       - "Looking for pthread_create in pthread"
     directories:
-      source: "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-79cr0d"
-      binary: "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-79cr0d"
+      source: "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-40d07s"
+      binary: "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-40d07s"
     cmakeVariables:
       CMAKE_CXX_FLAGS: "/DWIN32 /D_WINDOWS /EHsc"
       CMAKE_CXX_FLAGS_DEBUG: "/Zi /Ob0 /Od /RTC1"
@@ -7915,16 +7915,16 @@ events:
       variable: "CMAKE_HAVE_PTHREAD_CREATE"
       cached: true
       stdout: |
-        Change Dir: 'Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-79cr0d'
+        Change Dir: 'Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build/CMakeFiles/CMakeScratch/TryCompile-40d07s'
         
-        Run Build Command(s): "C:/Program Files/Ninja/ninja.exe" -v cmTC_74497
-        [1/4] C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\cl.exe -D_MBCS  /DWIN32 /D_WINDOWS /EHsc -DCHECK_FUNCTION_EXISTS=pthread_create /Zi /Ob0 /Od /RTC1 -std:c++20 -MDd Z:\\328\\CMPUT328-A2\\codexworks\\301\\3d\\VENPOD\\build\\CMakeFiles\\CMakeScratch\\TryCompile-79cr0d\\CheckFunctionExists.cxx -nologo -TP -showIncludes -scanDependencies CMakeFiles\\cmTC_74497.dir\\CheckFunctionExists.cxx.obj.ddi -FoCMakeFiles\\cmTC_74497.dir\\CheckFunctionExists.cxx.obj
-        [2/4] "C:\\Program Files\\CMake\\bin\\cmake.exe" -E cmake_ninja_dyndep --tdi=CMakeFiles\\cmTC_74497.dir\\CXXDependInfo.json --lang=CXX --modmapfmt=msvc --dd=CMakeFiles\\cmTC_74497.dir\\CXX.dd @CMakeFiles\\cmTC_74497.dir\\CXX.dd.rsp
-        [3/4] C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\cl.exe  /nologo /TP -D_MBCS  /DWIN32 /D_WINDOWS /EHsc -DCHECK_FUNCTION_EXISTS=pthread_create /Zi /Ob0 /Od /RTC1 -std:c++20 -MDd /showIncludes @CMakeFiles\\cmTC_74497.dir\\CheckFunctionExists.cxx.obj.modmap /FoCMakeFiles\\cmTC_74497.dir\\CheckFunctionExists.cxx.obj /FdCMakeFiles\\cmTC_74497.dir\\ /FS -c Z:\\328\\CMPUT328-A2\\codexworks\\301\\3d\\VENPOD\\build\\CMakeFiles\\CMakeScratch\\TryCompile-79cr0d\\CheckFunctionExists.cxx
-        [4/4] C:\\WINDOWS\\system32\\cmd.exe /C "cd . && "C:\\Program Files\\CMake\\bin\\cmake.exe" -E vs_link_exe --msvc-ver=1950 --intdir=CMakeFiles\\cmTC_74497.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_74497.dir\\CheckFunctionExists.cxx.obj  /out:cmTC_74497.exe /implib:cmTC_74497.lib /pdb:cmTC_74497.pdb /version:0.0 /machine:x64 /debug /INCREMENTAL /subsystem:console  pthread.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib && cd ."
-        FAILED: cmTC_74497.exe 
-        C:\\WINDOWS\\system32\\cmd.exe /C "cd . && "C:\\Program Files\\CMake\\bin\\cmake.exe" -E vs_link_exe --msvc-ver=1950 --intdir=CMakeFiles\\cmTC_74497.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_74497.dir\\CheckFunctionExists.cxx.obj  /out:cmTC_74497.exe /implib:cmTC_74497.lib /pdb:cmTC_74497.pdb /version:0.0 /machine:x64 /debug /INCREMENTAL /subsystem:console  pthread.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib && cd ."
-        LINK Pass 1: command "C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_74497.dir\\CheckFunctionExists.cxx.obj /out:cmTC_74497.exe /implib:cmTC_74497.lib /pdb:cmTC_74497.pdb /version:0.0 /machine:x64 /debug /INCREMENTAL /subsystem:console pthread.lib kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib /MANIFEST /MANIFESTFILE:CMakeFiles\\cmTC_74497.dir/intermediate.manifest CMakeFiles\\cmTC_74497.dir/manifest.res" failed (exit code 1104) with the following output:\x0d
+        Run Build Command(s): "C:/Program Files/Ninja/ninja.exe" -v cmTC_66cb7
+        [1/4] C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\cl.exe -D_MBCS  /DWIN32 /D_WINDOWS /EHsc -DCHECK_FUNCTION_EXISTS=pthread_create /Zi /Ob0 /Od /RTC1 -std:c++20 -MDd Z:\\328\\CMPUT328-A2\\codexworks\\301\\3d\\VENPOD\\build\\CMakeFiles\\CMakeScratch\\TryCompile-40d07s\\CheckFunctionExists.cxx -nologo -TP -showIncludes -scanDependencies CMakeFiles\\cmTC_66cb7.dir\\CheckFunctionExists.cxx.obj.ddi -FoCMakeFiles\\cmTC_66cb7.dir\\CheckFunctionExists.cxx.obj
+        [2/4] "C:\\Program Files\\CMake\\bin\\cmake.exe" -E cmake_ninja_dyndep --tdi=CMakeFiles\\cmTC_66cb7.dir\\CXXDependInfo.json --lang=CXX --modmapfmt=msvc --dd=CMakeFiles\\cmTC_66cb7.dir\\CXX.dd @CMakeFiles\\cmTC_66cb7.dir\\CXX.dd.rsp
+        [3/4] C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\cl.exe  /nologo /TP -D_MBCS  /DWIN32 /D_WINDOWS /EHsc -DCHECK_FUNCTION_EXISTS=pthread_create /Zi /Ob0 /Od /RTC1 -std:c++20 -MDd /showIncludes @CMakeFiles\\cmTC_66cb7.dir\\CheckFunctionExists.cxx.obj.modmap /FoCMakeFiles\\cmTC_66cb7.dir\\CheckFunctionExists.cxx.obj /FdCMakeFiles\\cmTC_66cb7.dir\\ /FS -c Z:\\328\\CMPUT328-A2\\codexworks\\301\\3d\\VENPOD\\build\\CMakeFiles\\CMakeScratch\\TryCompile-40d07s\\CheckFunctionExists.cxx
+        [4/4] C:\\WINDOWS\\system32\\cmd.exe /C "cd . && "C:\\Program Files\\CMake\\bin\\cmake.exe" -E vs_link_exe --msvc-ver=1950 --intdir=CMakeFiles\\cmTC_66cb7.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_66cb7.dir\\CheckFunctionExists.cxx.obj  /out:cmTC_66cb7.exe /implib:cmTC_66cb7.lib /pdb:cmTC_66cb7.pdb /version:0.0 /machine:x64 /debug /INCREMENTAL /subsystem:console  pthread.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib && cd ."
+        FAILED: cmTC_66cb7.exe 
+        C:\\WINDOWS\\system32\\cmd.exe /C "cd . && "C:\\Program Files\\CMake\\bin\\cmake.exe" -E vs_link_exe --msvc-ver=1950 --intdir=CMakeFiles\\cmTC_66cb7.dir --rc=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\rc.exe --mt=C:\\PROGRA~2\\WI3CF2~1\\10\\bin\\100261~1.0\\x64\\mt.exe --manifests  -- C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_66cb7.dir\\CheckFunctionExists.cxx.obj  /out:cmTC_66cb7.exe /implib:cmTC_66cb7.lib /pdb:cmTC_66cb7.pdb /version:0.0 /machine:x64 /debug /INCREMENTAL /subsystem:console  pthread.lib  kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib && cd ."
+        LINK Pass 1: command "C:\\PROGRA~1\\MIB055~1\\18\\COMMUN~1\\VC\\Tools\\MSVC\\1450~1.357\\bin\\Hostx64\\x64\\link.exe /nologo CMakeFiles\\cmTC_66cb7.dir\\CheckFunctionExists.cxx.obj /out:cmTC_66cb7.exe /implib:cmTC_66cb7.lib /pdb:cmTC_66cb7.pdb /version:0.0 /machine:x64 /debug /INCREMENTAL /subsystem:console pthread.lib kernel32.lib user32.lib gdi32.lib winspool.lib shell32.lib ole32.lib oleaut32.lib uuid.lib comdlg32.lib advapi32.lib /MANIFEST /MANIFESTFILE:CMakeFiles\\cmTC_66cb7.dir/intermediate.manifest CMakeFiles\\cmTC_66cb7.dir/manifest.res" failed (exit code 1104) with the following output:\x0d
         LINK : fatal error LNK1104: cannot open file 'pthread.lib'\x0d\x0d
         ninja: build stopped: subcommand failed.
         
