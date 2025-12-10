@@ -443,7 +443,7 @@ int main(int argc, char* argv[]) {
     pauseMenu.Initialize();
 
     spdlog::info("Initialization complete. Entering main loop...");
-    spdlog::info("Controls: ESC=Pause Menu, WASD=Move, Mouse=Look, Space/Shift=Up/Down, Tab=Toggle Mouse, LMB=Paint, RMB=Erase");
+    spdlog::info("Controls: ESC=Pause, WASD=Move, Mouse=Look, Space=Jump/Fly, Double-Space=Toggle Flight, Tab=Toggle Mouse, LMB=Paint, RMB=Erase");
 
     // Camera setup with pitch/yaw for mouse look
     const float fov = 60.0f * 3.14159f / 180.0f;
@@ -472,6 +472,9 @@ int main(int argc, char* argv[]) {
     const float playerHeight = 3.0f;  // Player eye height above ground (voxels)
     const float stepHeight = 1.5f;  // Max step height for climbing (voxels)
     const float playerRadius = 0.4f;  // Player collision radius (voxels)
+
+    // Flight mode toggle (double-click Space to enable/disable)
+    bool flightMode = false;
 
     // Player position represents feet/collision point
     // Camera rendering position is offset upward by playerHeight for natural eye-level view
@@ -602,8 +605,21 @@ int main(int argc, char* argv[]) {
             cameraPos += horizontalRight * moveSpeed;
         }
 
-        // Apply gravity to vertical velocity
-        cameraVelocityY += gravity * dt;
+        // Check for double-click on Space to toggle flight mode
+        if (inputManager.IsActionDoubleClicked(Input::KeyAction::CameraUp)) {
+            flightMode = !flightMode;
+            if (flightMode) {
+                cameraVelocityY = 0.0f;  // Cancel gravity when entering flight mode
+                spdlog::info("Flight mode ENABLED - gravity disabled");
+            } else {
+                spdlog::info("Flight mode DISABLED - gravity enabled");
+            }
+        }
+
+        // Apply gravity to vertical velocity (only when not in flight mode)
+        if (!flightMode) {
+            cameraVelocityY += gravity * dt;
+        }
 
         // Apply vertical velocity to camera position
         cameraPos.y += cameraVelocityY * dt;
@@ -720,52 +736,42 @@ int main(int argc, char* argv[]) {
         auto groundRaycastResult = voxelWorld->GetGroundRaycastResult();
 
         // === COLLISION DETECTION ===
-        // Ground raycast hit detection
-        if (groundRaycastResult.hasValidPosition) {
-            // Ground raycast hit something - use it for collision
-            float groundLocalY = groundRaycastResult.posY;
-            float groundWorldY = groundLocalY + regionOriginWorld.y;
-
-            // Player feet position in world space
-            float playerFeetWorldY = cameraPos.y - playerHeight;
-
-            // Check if we're on or near the ground
-            bool onGround = playerFeetWorldY <= groundWorldY + 0.5f;
-
-            // If we've fallen through ground, snap feet to ground surface
-            if (playerFeetWorldY < groundWorldY) {
-                cameraPos.y = groundWorldY + playerHeight;  // Camera at eye level above ground
-                cameraVelocityY = 0.0f;  // Stop falling
-                onGround = true;
+        if (flightMode) {
+            // Flight mode - manual vertical control, no gravity or collision
+            if (inputManager.IsActionDown(Input::KeyAction::CameraUp)) {
+                cameraPos.y += moveSpeed * 2.0f;  // Fly up
             }
-
-            // Space to jump (if on ground)
-            if (inputManager.IsActionPressed(Input::KeyAction::CameraUp) && onGround) {
-                cameraVelocityY = 20.0f;  // Jump velocity
-            }
-
-            // Optional: Holding shift for creative flight (overrides collision)
             if (inputManager.IsActionDown(Input::KeyAction::CameraDown)) {
                 cameraPos.y -= moveSpeed * 2.0f;  // Fly down
-                cameraVelocityY = 0.0f;  // Cancel gravity while flying
             }
-            if (inputManager.IsActionDown(Input::KeyAction::CameraUp) && !inputManager.IsActionPressed(Input::KeyAction::CameraUp)) {
-                cameraPos.y += moveSpeed * 2.0f;  // Fly up (hold space without jumping)
-                cameraVelocityY = 0.0f;  // Cancel gravity while flying
+        } else {
+            // Normal mode - ground collision and gravity
+            // Ground raycast hit detection
+            if (groundRaycastResult.hasValidPosition) {
+                // Ground raycast hit something - use it for collision
+                float groundLocalY = groundRaycastResult.posY;
+                float groundWorldY = groundLocalY + regionOriginWorld.y;
+
+                // Player feet position in world space
+                float playerFeetWorldY = cameraPos.y - playerHeight;
+
+                // Check if we're on or near the ground
+                bool onGround = playerFeetWorldY <= groundWorldY + 0.5f;
+
+                // If we've fallen through ground, snap feet to ground surface
+                if (playerFeetWorldY < groundWorldY) {
+                    cameraPos.y = groundWorldY + playerHeight;  // Camera at eye level above ground
+                    cameraVelocityY = 0.0f;  // Stop falling
+                    onGround = true;
+                }
+
+                // Space to jump (if on ground and not double-click)
+                if (inputManager.IsActionPressed(Input::KeyAction::CameraUp) && onGround &&
+                    !inputManager.IsActionDoubleClicked(Input::KeyAction::CameraUp)) {
+                    cameraVelocityY = 20.0f;  // Jump velocity
+                }
             }
-        }
-        // No ground detected - free fall or in air
-        else {
-            // Allow free fall - gravity continues to apply
-            // Player can still fly with shift+space
-            if (inputManager.IsActionDown(Input::KeyAction::CameraDown)) {
-                cameraPos.y -= moveSpeed * 2.0f;
-                cameraVelocityY = 0.0f;
-            }
-            if (inputManager.IsActionDown(Input::KeyAction::CameraUp)) {
-                cameraPos.y += moveSpeed * 2.0f;
-                cameraVelocityY = 0.0f;
-            }
+            // No ground detected - free fall in air
         }
 
         // === HORIZONTAL COLLISION (Cave/Wall Detection) ===
