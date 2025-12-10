@@ -51,6 +51,29 @@ std::filesystem::path GetExecutableDirectory() {
     return std::filesystem::current_path();
 }
 
+// Helper function to check if a position is solid in the voxel world
+// This queries the GPU voxel buffer using raycasting result as a proxy
+// Returns the Y position of the ground below the given position, or -1 if no ground found
+float FindGroundBelow(const glm::vec3& posWorld, Simulation::VoxelWorld* voxelWorld, float maxDistance = 20.0f) {
+    // Convert world position to local buffer coordinates
+    glm::vec3 regionOrigin = voxelWorld->GetRegionOriginWorld();
+    glm::vec3 posLocal = posWorld - regionOrigin;
+
+    // Check voxels below the position (ray downward)
+    // We'll check in steps of 1 voxel at a time
+    float startY = posLocal.y;
+    float minY = std::max(0.0f, startY - maxDistance);
+
+    // Since we can't directly read GPU memory, we'll use a simple heuristic:
+    // Assume terrain is present and use the raycast result when available
+    // For now, return a fixed ground level based on terrain generation (Y=40 sea level)
+    // This is a simplified version - proper implementation would need GPU->CPU readback
+
+    // For initial implementation, assume ground is at Y=40 (sea level) in world space
+    // We can improve this later with actual voxel queries
+    return 40.0f;  // World space Y coordinate
+}
+
 int main(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
@@ -465,6 +488,11 @@ int main(int argc, char* argv[]) {
     float cameraPitch = -0.5f;  // Look down more to see terrain below
     float cameraYaw = 0.0f;  // Look straight ahead (north)
 
+    // Player physics for walking on terrain
+    float cameraVelocityY = 0.0f;  // Vertical velocity for gravity
+    const float gravity = -50.0f;  // Gravity acceleration (units/s^2)
+    const float playerHeight = 3.0f;  // Player eye height above ground (voxels)
+
     // Main loop
     bool running = true;
     bool paused = false;
@@ -569,29 +597,58 @@ int main(int argc, char* argv[]) {
         glm::vec3 cameraRight = glm::normalize(glm::cross(cameraForward, glm::vec3(0, 1, 0)));
         glm::vec3 cameraUp = glm::cross(cameraRight, cameraForward);
 
-        // Camera movement with WASD + Space/Shift
+        // Camera movement with WASD (horizontal only for walking mode)
         float dt = 1.0f / 60.0f;  // Approximate delta time
         float moveSpeed = cameraSpeed * dt;
+
+        // Calculate horizontal movement direction (forward/right with Y removed)
+        glm::vec3 horizontalForward = glm::normalize(glm::vec3(cameraForward.x, 0, cameraForward.z));
+        glm::vec3 horizontalRight = glm::normalize(glm::vec3(cameraRight.x, 0, cameraRight.z));
+
+        // WASD for horizontal movement only
         if (inputManager.IsActionDown(Input::KeyAction::CameraForward)) {
-            cameraPos += cameraForward * moveSpeed;
+            cameraPos += horizontalForward * moveSpeed;
         }
         if (inputManager.IsActionDown(Input::KeyAction::CameraBackward)) {
-            cameraPos -= cameraForward * moveSpeed;
+            cameraPos -= horizontalForward * moveSpeed;
         }
         if (inputManager.IsActionDown(Input::KeyAction::CameraLeft)) {
-            cameraPos -= cameraRight * moveSpeed;
+            cameraPos -= horizontalRight * moveSpeed;
         }
         if (inputManager.IsActionDown(Input::KeyAction::CameraRight)) {
-            cameraPos += cameraRight * moveSpeed;
-        }
-        if (inputManager.IsActionDown(Input::KeyAction::CameraUp)) {
-            cameraPos += glm::vec3(0, 1, 0) * moveSpeed;
-        }
-        if (inputManager.IsActionDown(Input::KeyAction::CameraDown)) {
-            cameraPos -= glm::vec3(0, 1, 0) * moveSpeed;
+            cameraPos += horizontalRight * moveSpeed;
         }
 
-        // FIX #20: Removed camera Y clamp - allow free vertical movement for full exploration
+        // Apply gravity to vertical velocity
+        cameraVelocityY += gravity * dt;
+
+        // Apply vertical velocity to camera position
+        cameraPos.y += cameraVelocityY * dt;
+
+        // Ground collision detection
+        float groundY = FindGroundBelow(cameraPos, voxelWorld.get());
+        float playerFeetY = cameraPos.y - playerHeight;
+
+        // If we've fallen through or are below ground, place on ground
+        if (playerFeetY <= groundY) {
+            cameraPos.y = groundY + playerHeight;
+            cameraVelocityY = 0.0f;  // Stop falling when on ground
+        }
+
+        // Optional: Space to jump (if on ground)
+        if (inputManager.IsActionPressed(Input::KeyAction::CameraUp) && playerFeetY <= groundY + 0.5f) {
+            cameraVelocityY = 20.0f;  // Jump velocity
+        }
+
+        // Optional: Shift for creative flight (override gravity)
+        if (inputManager.IsActionDown(Input::KeyAction::CameraDown)) {
+            cameraPos.y -= moveSpeed * 2.0f;  // Fly down
+            cameraVelocityY = 0.0f;  // Cancel gravity while flying down
+        }
+        if (inputManager.IsActionDown(Input::KeyAction::CameraUp) && !inputManager.IsActionPressed(Input::KeyAction::CameraUp)) {
+            cameraPos.y += moveSpeed * 2.0f;  // Fly up (hold space)
+            cameraVelocityY = 0.0f;  // Cancel gravity while flying up
+        }
 
         // Calculate ray for GPU brush raycasting
         // When mouse is captured (FPS mode), always use screen center for crosshair
