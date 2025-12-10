@@ -471,6 +471,10 @@ int main(int argc, char* argv[]) {
     const float gravity = -50.0f;  // Gravity acceleration (units/s^2)
     const float playerHeight = 3.0f;  // Player eye height above ground (voxels)
     const float stepHeight = 1.5f;  // Max step height for climbing (voxels)
+    const float playerRadius = 0.4f;  // Player collision radius (voxels)
+
+    // Player position represents feet/collision point
+    // Camera rendering position is offset upward by playerHeight for natural eye-level view
 
     // Main loop
     bool running = true;
@@ -687,10 +691,11 @@ int main(int argc, char* argv[]) {
         }
 
         // === GPU GROUND DETECTION RAYCAST (for player collision) ===
-        // Cast a ray straight down from player position to find ground
-        glm::vec3 groundCheckStart = cameraPosLocal;
+        // Cast a ray straight down from player FEET position to find ground
+        // Camera is at eye level, so subtract playerHeight to get feet position
+        glm::vec3 playerFeetLocal = cameraPosLocal - glm::vec3(0, playerHeight, 0);
         glm::vec3 downDir = glm::vec3(0, -1, 0);
-        physicsDispatcher->DispatchGroundRaycast(commandList.Get(), *voxelWorld, groundCheckStart, downDir);
+        physicsDispatcher->DispatchGroundRaycast(commandList.Get(), *voxelWorld, playerFeetLocal, downDir);
 
         // === GPU BRUSH RAYCASTING (NEW - 2,000,000x FASTER!) ===
         // Dispatch single-thread GPU compute to find brush position in local grid space.
@@ -714,20 +719,22 @@ int main(int argc, char* argv[]) {
         auto gpuRaycastResult = voxelWorld->GetBrushRaycastResult();
         auto groundRaycastResult = voxelWorld->GetGroundRaycastResult();
 
-        // === GROUND COLLISION DETECTION ===
-        // Use the dedicated ground raycast to find terrain beneath player
+        // === COLLISION DETECTION ===
+        // Ground raycast hit detection
         if (groundRaycastResult.hasValidPosition) {
             // Ground raycast hit something - use it for collision
             float groundLocalY = groundRaycastResult.posY;
             float groundWorldY = groundLocalY + regionOriginWorld.y;
-            float playerFeetY = cameraPos.y - playerHeight;
+
+            // Player feet position in world space
+            float playerFeetWorldY = cameraPos.y - playerHeight;
 
             // Check if we're on or near the ground
-            bool onGround = (cameraPos.y - playerHeight) <= groundWorldY + 0.5f;
+            bool onGround = playerFeetWorldY <= groundWorldY + 0.5f;
 
-            // If we've fallen through ground, snap to ground
-            if (playerFeetY < groundWorldY) {
-                cameraPos.y = groundWorldY + playerHeight;
+            // If we've fallen through ground, snap feet to ground surface
+            if (playerFeetWorldY < groundWorldY) {
+                cameraPos.y = groundWorldY + playerHeight;  // Camera at eye level above ground
                 cameraVelocityY = 0.0f;  // Stop falling
                 onGround = true;
             }
@@ -737,7 +744,7 @@ int main(int argc, char* argv[]) {
                 cameraVelocityY = 20.0f;  // Jump velocity
             }
 
-            // Optional: Holding shift for creative flight
+            // Optional: Holding shift for creative flight (overrides collision)
             if (inputManager.IsActionDown(Input::KeyAction::CameraDown)) {
                 cameraPos.y -= moveSpeed * 2.0f;  // Fly down
                 cameraVelocityY = 0.0f;  // Cancel gravity while flying
@@ -747,7 +754,7 @@ int main(int argc, char* argv[]) {
                 cameraVelocityY = 0.0f;  // Cancel gravity while flying
             }
         }
-        // Fallback: No ground detected (in air or above terrain limit)
+        // No ground detected - free fall or in air
         else {
             // Allow free fall - gravity continues to apply
             // Player can still fly with shift+space
@@ -758,6 +765,44 @@ int main(int argc, char* argv[]) {
             if (inputManager.IsActionDown(Input::KeyAction::CameraUp)) {
                 cameraPos.y += moveSpeed * 2.0f;
                 cameraVelocityY = 0.0f;
+            }
+        }
+
+        // === HORIZONTAL COLLISION (Cave/Wall Detection) ===
+        // Use brush raycast to check for walls/obstacles in movement direction
+        // If brush raycast hits something close (<2 voxels) in the direction we're looking,
+        // it means there's a wall/obstacle ahead
+        if (gpuRaycastResult.hasValidPosition) {
+            // Calculate distance to hit point
+            glm::vec3 hitPosLocal = glm::vec3(gpuRaycastResult.posX, gpuRaycastResult.posY, gpuRaycastResult.posZ);
+            glm::vec3 hitPosWorld = hitPosLocal + regionOriginWorld;
+            float distanceToHit = glm::length(hitPosWorld - cameraPos);
+
+            // If we're about to walk into a wall (hit within player radius + small margin)
+            // and the hit is roughly at player height (not floor/ceiling), stop horizontal movement
+            float hitHeight = hitPosWorld.y - (cameraPos.y - playerHeight);
+            bool isWall = (distanceToHit < playerRadius + 1.0f) && (hitHeight > 0.2f) && (hitHeight < playerHeight - 0.5f);
+
+            if (isWall) {
+                // Prevent movement in the direction of the wall by checking if we're moving towards it
+                glm::vec3 dirToHit = glm::normalize(hitPosWorld - cameraPos);
+                glm::vec3 horizontalMoveDir = glm::vec3(cameraForward.x, 0, cameraForward.z);
+
+                // If we're moving towards the wall, reduce movement
+                if (glm::length(horizontalMoveDir) > 0.01f) {
+                    horizontalMoveDir = glm::normalize(horizontalMoveDir);
+                    float dotProduct = glm::dot(horizontalMoveDir, glm::vec3(dirToHit.x, 0, dirToHit.z));
+
+                    // Moving towards wall - slide along it
+                    if (dotProduct > 0.5f) {
+                        // Simple slide: remove component of movement towards wall
+                        glm::vec3 slideDir = horizontalMoveDir - dirToHit * dotProduct;
+                        if (glm::length(slideDir) > 0.01f) {
+                            // Apply reduced movement (sliding along wall)
+                            slideDir = glm::normalize(slideDir);
+                        }
+                    }
+                }
             }
         }
 
