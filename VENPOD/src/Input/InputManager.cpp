@@ -20,6 +20,7 @@ void InputManager::Initialize(uint32_t windowWidth, uint32_t windowHeight, SDL_W
     m_mouseButtonsPrev.fill(false);
     m_keysJustPressed.fill(false);
     m_keysDown.fill(false);
+    m_lastKeyPressTimes.fill(0);
 
     spdlog::info("InputManager initialized: {}x{}", windowWidth, windowHeight);
 }
@@ -223,6 +224,26 @@ bool InputManager::IsActionDown(KeyAction action) const {
 
 bool InputManager::IsActionPressed(KeyAction action) const {
     return IsKeyPressed(GetKeyForAction(action));
+}
+
+bool InputManager::IsActionDoubleClicked(KeyAction action) const {
+    if (!IsActionPressed(action)) {
+        return false;
+    }
+
+    // Check if this press happened within double-click time window
+    size_t actionIdx = static_cast<size_t>(action);
+    uint64_t currentTime = SDL_GetTicks();
+    uint64_t lastPressTime = m_lastKeyPressTimes[actionIdx];
+
+    // Calculate time since last press
+    uint64_t timeSinceLastPress = currentTime - lastPressTime;
+
+    // Update last press time
+    const_cast<InputManager*>(this)->m_lastKeyPressTimes[actionIdx] = currentTime;
+
+    // Double-click detected if within time window
+    return timeSinceLastPress <= DOUBLE_CLICK_TIME_MS;
 }
 
 } // namespace VENPOD::Input
