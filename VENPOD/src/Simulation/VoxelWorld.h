@@ -153,13 +153,23 @@ public:
     }
     int GetReadBufferIndex() const { return m_readBufferIndex; }
 
+    // Origin of the 256^3 render buffer in world voxel coordinates.
+    // In finite 256^3 mode this remains (0,0,0) to preserve behavior.
+    glm::vec3 GetRegionOriginWorld() const { return m_regionOriginWorld; }
+
+    // DEBUG SUPPORT: Copy a fixed 2x2 layout of infinite chunks at coordinates
+    // (0,0,0), (1,0,0), (0,0,1), (1,0,1) into the WRITE 256x128x256 buffer.
+    // This uses the same chunk copy pipeline as UpdateActiveRegion but bypasses
+    // streaming logic entirely so copy/origin issues can be debugged in isolation.
+    void CopyStatic2x2Chunks(ID3D12CommandQueue* cmdQueue);
+
 private:
     Result<void> CreateVoxelBuffers(ID3D12Device* device, Graphics::DescriptorHeapManager& heapManager);
     Result<void> CreateMaterialPalette(ID3D12Device* device, ID3D12GraphicsCommandList* cmdList, Graphics::DescriptorHeapManager& heapManager);
     Result<void> CreateChunkCopyPipeline(ID3D12Device* device);
 
-    // Update active region by copying nearby chunks into 256³ render buffer
-    void UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cmdQueue);
+    // Update active region by copying nearby chunks into 256^3 render buffer
+    void UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cmdQueue, bool chunkChanged = false);
 
     VoxelWorldConfig m_config;
 
@@ -187,11 +197,16 @@ private:
 
     // ===== INFINITE CHUNK SYSTEM (NEW) =====
     std::unique_ptr<InfiniteChunkManager> m_chunkManager;
-    bool m_useInfiniteChunks = true;  // Toggle for testing (set false to use old 256³ system)
+    bool m_useInfiniteChunks = true;  // Toggle for testing (set false to use old 256^3 system)
 
     // Active region tracking (which chunk is at center of render buffer)
     ChunkCoord m_activeRegionCenter;
     bool m_activeRegionNeedsUpdate = true;
+
+    // World-space origin (in voxel coordinates) that maps to (0,0,0) in the 256^3 buffer
+    // when using infinite chunks. This is derived from m_activeRegionCenter and the
+    // chunk layout in UpdateActiveRegion. In non-infinite mode it stays at (0,0,0).
+    glm::vec3 m_regionOriginWorld = glm::vec3(0.0f);
 
     // PERFORMANCE OPTIMIZATION: Double-buffered chunk tracking
     // Each buffer has its own cache of which chunks are already copied

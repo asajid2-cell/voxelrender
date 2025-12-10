@@ -1,4 +1,5 @@
 #include "InfiniteChunkManager.h"
+#include "TerrainConstants.h"
 #include <d3d12.h>
 #include "../Graphics/RHI/d3dx12.h"
 #include "../Graphics/RHI/ShaderCompiler.h"
@@ -79,10 +80,13 @@ Result<void> InfiniteChunkManager::Initialize(
         m_allocatorFenceValues[i] = 0;  // 0 = ready for immediate use (never used)
     }
 
-    spdlog::info("InfiniteChunkManager initialized - render distance: {}×{} (horiz×vert), seed: {}",
+    spdlog::info("InfiniteChunkManager initialized - render distance: {} horiz (FIXED Y={},{} layers), seed: {}",
         m_config.renderDistanceHorizontal,
-        m_config.renderDistanceVertical,
+        TERRAIN_CHUNK_MIN_Y, TERRAIN_CHUNK_MIN_Y + TERRAIN_NUM_CHUNKS_Y - 1,
         m_config.worldSeed);
+    spdlog::info("Terrain generation: INDEPENDENT of camera Y - always at world Y={}-{} (chunks {},{})",
+        TERRAIN_MIN_Y, TERRAIN_MIN_Y + (TERRAIN_NUM_CHUNKS_Y * CHUNK_SIZE_VOXELS) - 1,
+        TERRAIN_CHUNK_MIN_Y, TERRAIN_CHUNK_MIN_Y + TERRAIN_NUM_CHUNKS_Y - 1);
 
     return {};
 }
@@ -169,13 +173,21 @@ void InfiniteChunkManager::Update(
         return;
     }
 
-    // ===== STEP 0: FIX #1/#3 - Verify completed chunks and mark as Generated =====
+    // ===== STEP 0a: FIX #19 - Process deferred chunk deletes =====
+    // Must happen FIRST to free chunks (buffers + descriptors) from old chunks before allocating new ones
+    ProcessDeferredChunkDeletes();
+
+    // ===== STEP 0b: FIX #1/#3 - Verify completed chunks and mark as Generated =====
     VerifyGeneratedChunks();
 
-    // ===== STEP 1: Calculate camera's chunk coordinate =====
+    // ===== STEP 1: Calculate camera's chunk coordinate (HORIZONTAL ONLY) =====
+    // FIX: Terrain generation should be INDEPENDENT of camera Y position!
+    // The terrain exists at Y=5 to Y=60, which spans chunks Y=0 and Y=64.
+    // We should ALWAYS load those chunks, regardless of camera altitude.
+    // Only use camera X/Z to determine horizontal chunk position.
     ChunkCoord cameraChunk = ChunkCoord::FromWorldPosition(
         static_cast<int32_t>(cameraWorldPos.x),
-        static_cast<int32_t>(cameraWorldPos.y),
+        0,  // FIX: Always use Y=0 as reference (terrain is at Y=0-64 chunk range)
         static_cast<int32_t>(cameraWorldPos.z),
         INFINITE_CHUNK_SIZE
     );
@@ -211,9 +223,14 @@ void InfiniteChunkManager::Update(
 
     m_lastCameraChunk = cameraChunk;
 
-    spdlog::debug("Camera chunk: [{},{},{}] - world pos: ({:.1f},{:.1f},{:.1f})",
-        cameraChunk.x, cameraChunk.y, cameraChunk.z,
-        cameraWorldPos.x, cameraWorldPos.y, cameraWorldPos.z);
+    // Log only when camera chunk changes (not every frame)
+    static ChunkCoord lastLoggedChunk = {INT32_MAX, INT32_MAX, INT32_MAX};
+    if (cameraChunk != lastLoggedChunk) {
+        spdlog::debug("Camera chunk: [{},{},{}] - world pos: ({:.1f},{:.1f},{:.1f})",
+            cameraChunk.x, cameraChunk.y, cameraChunk.z,
+            cameraWorldPos.x, cameraWorldPos.y, cameraWorldPos.z);
+        lastLoggedChunk = cameraChunk;
+    }
 
     // ===== STEP 2: Queue chunks within cylindrical render distance =====
     auto queueResult = QueueChunksAroundCamera(cameraChunk);
@@ -233,9 +250,13 @@ void InfiniteChunkManager::Update(
     // ===== STEP 4: Unload distant chunks =====
     UnloadDistantChunks(cameraChunk);
 
-    spdlog::debug("Chunks loaded: {}, queued: {}",
-        m_loadedChunks.size(),
-        m_generationQueue.size());
+    // Log only once per second to avoid spam
+    static int chunkStatsThrottle = 0;
+    if (++chunkStatsThrottle % 60 == 1) {
+        spdlog::debug("Chunks loaded: {}, queued: {}",
+            m_loadedChunks.size(),
+            m_generationQueue.size());
+    }
 }
 
 Chunk* InfiniteChunkManager::GetChunk(const ChunkCoord& coord) {
@@ -317,9 +338,11 @@ Result<void> InfiniteChunkManager::QueueChunksAroundCamera(const ChunkCoord& cam
     // FIX #1: Calculate remaining queue capacity BEFORE loop
     size_t remainingCapacity = m_config.maxQueuedChunks - m_generationQueue.size();
 
-    // ===== CYLINDRICAL LOADING PATTERN (Horizontal × Vertical) =====
-    // Iterate through cylindrical volume centered on camera chunk
-    for (int32_t dy = -m_config.renderDistanceVertical; dy <= m_config.renderDistanceVertical; ++dy) {
+    // ===== FIXED VERTICAL LAYERS + HORIZONTAL LOADING =====
+    // FIX: Terrain is at Y=TERRAIN_MIN_Y to Y=TERRAIN_MAX_Y, which spans chunks Y=0 and Y=1
+    // We ALWAYS load these TERRAIN_NUM_CHUNKS_Y vertical layers, regardless of camera altitude.
+    // Only horizontal (X/Z) position varies based on camera.
+    for (int32_t dy = TERRAIN_CHUNK_MIN_Y; dy < TERRAIN_CHUNK_MIN_Y + TERRAIN_NUM_CHUNKS_Y; ++dy) {
         for (int32_t dx = -m_config.renderDistanceHorizontal; dx <= m_config.renderDistanceHorizontal; ++dx) {
             for (int32_t dz = -m_config.renderDistanceHorizontal; dz <= m_config.renderDistanceHorizontal; ++dz) {
                 // FIX #1: Stop if we've already collected enough chunks
@@ -327,18 +350,23 @@ Result<void> InfiniteChunkManager::QueueChunksAroundCamera(const ChunkCoord& cam
                     goto done_collecting;  // Break all loops
                 }
 
-                // OPTIMIZATION: Use circular horizontal pattern (not square)
-                // Only load chunks within horizontal radius
-                int32_t horizontalDistSq = dx * dx + dz * dz;
-                int32_t maxHorizDistSq = m_config.renderDistanceHorizontal * m_config.renderDistanceHorizontal;
-
-                if (horizontalDistSq > maxHorizDistSq) {
-                    continue;  // Skip corner chunks (outside circular radius)
-                }
+                // FIX: Use SQUARE pattern to match VoxelWorld renderer expectations
+                // The renderer scans a square grid (25x25), so we must load chunks in a square pattern
+                // Previously used circular radius which skipped corners → 124 missing chunks → holes
+                // Now using Chebyshev distance (max of abs(dx), abs(dz)) for square coverage
+                //
+                // Example with renderDistance=12:
+                // - Square: loads all chunks where |dx| <= 12 AND |dz| <= 12 → 25×25 = 625 chunks
+                // - Circle: loads chunks where dx²+dz² <= 144 → ~501 chunks (misses 124 corners!)
+                //
+                // No distance check needed - the loop bounds already define the square:
+                // for dx in [-renderDistance, +renderDistance]
+                // for dz in [-renderDistance, +renderDistance]
+                // All chunks within this square are needed by the renderer
 
                 ChunkCoord coord = {
                     cameraChunk.x + dx,
-                    cameraChunk.y + dy,
+                    dy,  // FIX: Absolute Y coordinate (0 or 1), not relative to camera
                     cameraChunk.z + dz
                 };
 
@@ -364,8 +392,21 @@ Result<void> InfiniteChunkManager::QueueChunksAroundCamera(const ChunkCoord& cam
     }
 
     if (chunksToLoad.size() > 0) {
-        spdlog::debug("Queued {} new chunks for generation (queue size: {}/{})",
+        spdlog::debug("Queued {} new chunks for generation at Y=0,1 (queue size: {}/{})",
             chunksToLoad.size(), m_generationQueue.size(), m_config.maxQueuedChunks);
+
+        // Log first few chunks being queued for verification
+        static bool firstLog = true;
+        if (firstLog && chunksToLoad.size() > 0) {
+            spdlog::info("First chunks queued (all at Y=0 or Y=1):");
+            int count = 0;
+            for (const auto& coord : chunksToLoad) {
+                if (count++ < 5) {
+                    spdlog::info("  Chunk [{},{},{}]", coord.x, coord.y, coord.z);
+                }
+            }
+            firstLog = false;
+        }
     }
     return {};
 }
@@ -587,20 +628,21 @@ void InfiniteChunkManager::UnloadDistantChunks(const ChunkCoord& cameraChunk) {
     for (auto it = m_loadedChunks.begin(); it != m_loadedChunks.end(); ) {
         const ChunkCoord& coord = it->first;
 
-        // Calculate distance from camera chunk (separate horizontal/vertical)
-        int32_t dx = std::abs(coord.x - cameraChunk.x);
-        int32_t dy = std::abs(coord.y - cameraChunk.y);
-        int32_t dz = std::abs(coord.z - cameraChunk.z);
+        // FIX: Only check horizontal distance, keep terrain layers always loaded
+        // Unload chunks that are outside the terrain vertical range OR too far horizontally
+        bool outsideTerrainLayers = (coord.y < TERRAIN_CHUNK_MIN_Y ||
+                                      coord.y >= TERRAIN_CHUNK_MIN_Y + TERRAIN_NUM_CHUNKS_Y);
 
-        // Calculate horizontal distance (XZ plane)
-        int32_t horizontalDistSq = dx * dx + dz * dz;
-        int32_t maxHorizDistSq = m_config.unloadDistanceHorizontal * m_config.unloadDistanceHorizontal;
+        // FIX: Calculate horizontal distance using SQUARE (Chebyshev) metric
+        // Must match the square loading pattern, not circular
+        int32_t dx = coord.x - cameraChunk.x;
+        int32_t dz = coord.z - cameraChunk.z;
+        int32_t horizontalDist = std::max(std::abs(dx), std::abs(dz));  // Chebyshev distance
 
-        // Unload if beyond horizontal OR vertical distance
-        bool beyondHorizontal = horizontalDistSq > maxHorizDistSq;
-        bool beyondVertical = dy > m_config.unloadDistanceVertical;
+        bool beyondHorizontal = horizontalDist > m_config.unloadDistanceHorizontal;
 
-        if (beyondHorizontal || beyondVertical) {
+        // Unload if outside terrain layers OR beyond horizontal distance
+        if (outsideTerrainLayers || beyondHorizontal) {
             // CRITICAL FIX #7: Don't unload chunks that are still generating!
             // This prevents CPU-GPU deadlock when trying to unload mid-generation chunks
             Chunk* chunk = it->second;
@@ -651,10 +693,23 @@ void InfiniteChunkManager::UnloadDistantChunks(const ChunkCoord& cameraChunk) {
                 m_unloadCallback(coord);
             }
 
-            // FIX #2: CRITICAL - Free GPU memory AND remove from pending generation map
+            // FIX #19: CRITICAL - Queue ENTIRE chunk for deferred delete to prevent GPU crash
+            // The bug: Deleting chunks immediately while GPU might still be using buffers from
+            // previous frames causes D3D12 ERROR: OBJECT_DELETED_WHILE_STILL_IN_USE crash
+            // Solution: Queue entire chunk for deferred delete, will delete 10 frames later when GPU is done
             if (it->second) {
-                it->second->Shutdown();
-                delete it->second;
+                Chunk* chunk = it->second;
+
+                // Queue entire chunk for deferred deletion (includes buffers AND descriptors)
+                DeferredChunkDelete deferredDelete;
+                deferredDelete.chunk = chunk;
+                // Delete 10 frames later - ensures GPU has finished using chunk buffers
+                // (3 frame ring buffer × 3 = 9 frames safety margin, rounded to 10)
+                deferredDelete.fenceValue = m_chunkFenceValue + 10;
+
+                m_deferredChunkDeletes.push_back(deferredDelete);
+                spdlog::debug("Chunk [{},{},{}] queued for deferred delete (fence {})",
+                    coord.x, coord.y, coord.z, deferredDelete.fenceValue);
             }
 
             // FIX #2: Remove from pending generation fences to prevent stale entries
@@ -663,8 +718,8 @@ void InfiniteChunkManager::UnloadDistantChunks(const ChunkCoord& cameraChunk) {
             // Clear re-queue counter for unloaded chunks
             m_chunkRequeueCount.erase(coord);
 
-            spdlog::debug("Unloaded chunk [{},{},{}] - distance: horiz²={}, vert={}",
-                coord.x, coord.y, coord.z, horizontalDistSq, dy);
+            spdlog::debug("Unloaded chunk [{},{},{}] - distance: horiz={} (outsideTerrainLayers={})",
+                coord.x, coord.y, coord.z, horizontalDist, outsideTerrainLayers);
 
             it = m_loadedChunks.erase(it);
         } else {
@@ -790,6 +845,44 @@ Result<void> InfiniteChunkManager::CreateGenerationPipeline(ID3D12Device* device
     return {};
 }
 
+// FIX #19: Process deferred chunk deletions
+// This deletes chunks (buffers + descriptors) after GPU is guaranteed to be done using them
+void InfiniteChunkManager::ProcessDeferredChunkDeletes() {
+    if (!m_chunkFence) {
+        return;  // No fence available
+    }
+
+    // Get current GPU fence value (what GPU has completed)
+    uint64_t completedFenceValue = m_chunkFence->GetCompletedValue();
+
+    // Process all deferred deletes that are now safe
+    for (auto it = m_deferredChunkDeletes.begin(); it != m_deferredChunkDeletes.end(); ) {
+        if (completedFenceValue >= it->fenceValue) {
+            // Safe to delete now - GPU has finished with this chunk's buffers and descriptors
+            if (it->chunk) {
+                it->chunk->Shutdown();  // Frees GPU buffers and descriptors
+                delete it->chunk;
+            }
+
+            spdlog::debug("Deferred chunk delete complete (fence {} >= {})",
+                completedFenceValue, it->fenceValue);
+
+            // Remove from deferred list
+            it = m_deferredChunkDeletes.erase(it);
+        } else {
+            // Not ready yet, keep waiting
+            ++it;
+        }
+    }
+
+    // Log if we have pending deferred deletes
+    if (!m_deferredChunkDeletes.empty()) {
+        spdlog::trace("{} deferred chunk deletes pending (GPU fence: {}, oldest waiting for: {})",
+            m_deferredChunkDeletes.size(), completedFenceValue,
+            m_deferredChunkDeletes.front().fenceValue);
+    }
+}
+
 // CRITICAL FIX: Public wrapper for VerifyGeneratedChunks
 // Call this before UpdateActiveRegion to catch chunks that just finished generating
 void InfiniteChunkManager::PollCompletedChunks() {
@@ -805,6 +898,10 @@ void InfiniteChunkManager::VerifyGeneratedChunks() {
     // Get current GPU fence value (what has completed)
     uint64_t completedFenceValue = m_chunkFence->GetCompletedValue();
 
+    // DIAGNOSTIC: Track verification results
+    int chunksCompleted = 0;
+    int chunksStillPending = 0;
+
     // Iterate through all chunks waiting for generation to complete
     for (auto it = m_chunkGenerationFences.begin(); it != m_chunkGenerationFences.end(); ) {
         const ChunkCoord& coord = it->first;
@@ -819,6 +916,7 @@ void InfiniteChunkManager::VerifyGeneratedChunks() {
 
                 // Mark chunk as Generated (now safe to copy/render)
                 chunk->MarkGenerated();
+                chunksCompleted++;
 
                 spdlog::debug("Chunk [{},{},{}] generation COMPLETED (fence {} signaled)",
                     coord.x, coord.y, coord.z, chunkFenceValue);
@@ -828,7 +926,18 @@ void InfiniteChunkManager::VerifyGeneratedChunks() {
             it = m_chunkGenerationFences.erase(it);
         } else {
             // Still waiting for GPU
+            chunksStillPending++;
             ++it;
+        }
+    }
+
+    // DIAGNOSTIC: Log if we have chunks stuck in pending state
+    if (chunksStillPending > 100) {
+        static int logThrottle = 0;
+        if (++logThrottle % 60 == 1) {  // Log once per second
+            spdlog::warn("VerifyGeneratedChunks: {} chunks still pending GPU (completed={}, oldest fence={})",
+                chunksStillPending, completedFenceValue,
+                m_chunkGenerationFences.empty() ? 0 : m_chunkGenerationFences.begin()->second);
         }
     }
 }

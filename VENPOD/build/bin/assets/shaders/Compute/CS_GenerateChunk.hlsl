@@ -37,27 +37,28 @@ float GenerateTerrainHeight(float2 xz, uint seed) {
     // Add seed offset for variation
     pos += float3(seed * 0.01, 0, seed * 0.01);
 
-    // Base continent shape (very low frequency) - reduced from 2 to 1 octave
-    float continents = SimplexNoise3D(pos * 0.0008);
+    // FIX: Use more continuous noise for connected terrain
+    // Base terrain (low frequency for gentle rolling landscape)
+    float base = FBM3D(pos * 0.002, 3, 0.5, 2.0);
 
-    // Rolling hills (medium frequency) - reduced from 4 to 2 octaves
-    float hills = FBM3D(pos * 0.003, 2, 0.6, 2.0);
+    // Medium detail (hills and valleys)
+    float detail = FBM3D(pos * 0.008, 2, 0.5, 2.0);
 
-    // Mountains (single octave for performance)
-    float mountains = abs(SimplexNoise3D(pos * 0.002)) * 2.0 - 1.0;  // Ridged effect
+    // Fine detail (small bumps)
+    float fine = SimplexNoise3D(pos * 0.02);
 
-    // Combine layers
+    // Combine layers for continuous terrain
     float height = 0.0;
-    height += continents * 40.0;         // Large-scale elevation changes
-    height += hills * 25.0;              // Rolling terrain
-    height += max(0, mountains) * 50.0;  // Sharp mountain peaks (only positive)
+    height += base * 20.0;      // Base elevation (±20 voxels)
+    height += detail * 10.0;    // Medium features (±10 voxels)
+    height += fine * 3.0;       // Small details (±3 voxels)
 
-    // FIX: Reduced base level from 60.0 to 30.0 to generate more air
+    // Base elevation at Y=30
     height += 30.0;
 
-    // FIX: Clamp to lower max height (was 200.0, now 60.0) to ensure air above terrain
-    // This prevents 100% solid chunks - terrain tops out at Y=60, chunks go to Y=64
-    return clamp(height, 5.0, 60.0);
+    // Clamp to keep terrain between Y=5 and Y=55
+    // This ensures: ocean floor at Y=5, surface at ~Y=30, peaks at Y=55
+    return clamp(height, 5.0, 55.0);
 }
 
 // Select surface material based on biome

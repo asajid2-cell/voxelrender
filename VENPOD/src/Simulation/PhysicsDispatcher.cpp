@@ -1,4 +1,5 @@
 #include "PhysicsDispatcher.h"
+#include "TerrainConstants.h"
 #include "../Graphics/RHI/d3dx12.h"
 #include <spdlog/spdlog.h>
 
@@ -451,12 +452,27 @@ void PhysicsDispatcher::DispatchBrush(
 
     // CRITICAL FIX: Invalidate chunk copy cache for the painted region
     // Without this, the chunk won't be re-copied and painted voxels may be lost
-    // on subsequent frames when the render buffer gets refreshed
+    // on subsequent frames when the render buffer gets refreshed.
+    //
+    // NOTE: For infinite chunks, brushConstants positions are in LOCAL 256^3 grid
+    // space, so we must convert them back to world voxel coordinates using the
+    // region origin provided by VoxelWorld.
     if (world.IsUsingInfiniteChunks()) {
+        glm::vec3 regionOriginWorld = world.GetRegionOriginWorld();
+        auto toWorld = [&](float x, float y, float z) -> glm::vec3 {
+            return glm::vec3(x, y, z) + regionOriginWorld;
+        };
+
+        glm::vec3 paintedWorld = toWorld(
+            brushConstants.positionX,
+            brushConstants.positionY,
+            brushConstants.positionZ
+        );
+
         ChunkCoord paintedChunk = ChunkCoord::FromWorldPosition(
-            static_cast<int32_t>(brushConstants.positionX),
-            static_cast<int32_t>(brushConstants.positionY),
-            static_cast<int32_t>(brushConstants.positionZ),
+            static_cast<int32_t>(paintedWorld.x),
+            static_cast<int32_t>(paintedWorld.y),
+            static_cast<int32_t>(paintedWorld.z),
             INFINITE_CHUNK_SIZE
         );
         world.InvalidateCopiedChunk(paintedChunk);
@@ -466,27 +482,54 @@ void PhysicsDispatcher::DispatchBrush(
         float radius = brushConstants.radius;
         if (radius > 1.0f) {
             // Check +/- X direction
-            world.InvalidateCopiedChunk(ChunkCoord::FromWorldPosition(
-                static_cast<int32_t>(brushConstants.positionX + radius),
-                static_cast<int32_t>(brushConstants.positionY),
-                static_cast<int32_t>(brushConstants.positionZ),
-                INFINITE_CHUNK_SIZE));
-            world.InvalidateCopiedChunk(ChunkCoord::FromWorldPosition(
-                static_cast<int32_t>(brushConstants.positionX - radius),
-                static_cast<int32_t>(brushConstants.positionY),
-                static_cast<int32_t>(brushConstants.positionZ),
-                INFINITE_CHUNK_SIZE));
+            {
+                glm::vec3 worldPosPlusX = toWorld(
+                    brushConstants.positionX + radius,
+                    brushConstants.positionY,
+                    brushConstants.positionZ
+                );
+                world.InvalidateCopiedChunk(ChunkCoord::FromWorldPosition(
+                    static_cast<int32_t>(worldPosPlusX.x),
+                    static_cast<int32_t>(worldPosPlusX.y),
+                    static_cast<int32_t>(worldPosPlusX.z),
+                    INFINITE_CHUNK_SIZE));
+
+                glm::vec3 worldPosMinusX = toWorld(
+                    brushConstants.positionX - radius,
+                    brushConstants.positionY,
+                    brushConstants.positionZ
+                );
+                world.InvalidateCopiedChunk(ChunkCoord::FromWorldPosition(
+                    static_cast<int32_t>(worldPosMinusX.x),
+                    static_cast<int32_t>(worldPosMinusX.y),
+                    static_cast<int32_t>(worldPosMinusX.z),
+                    INFINITE_CHUNK_SIZE));
+            }
+
             // Check +/- Z direction
-            world.InvalidateCopiedChunk(ChunkCoord::FromWorldPosition(
-                static_cast<int32_t>(brushConstants.positionX),
-                static_cast<int32_t>(brushConstants.positionY),
-                static_cast<int32_t>(brushConstants.positionZ + radius),
-                INFINITE_CHUNK_SIZE));
-            world.InvalidateCopiedChunk(ChunkCoord::FromWorldPosition(
-                static_cast<int32_t>(brushConstants.positionX),
-                static_cast<int32_t>(brushConstants.positionY),
-                static_cast<int32_t>(brushConstants.positionZ - radius),
-                INFINITE_CHUNK_SIZE));
+            {
+                glm::vec3 worldPosPlusZ = toWorld(
+                    brushConstants.positionX,
+                    brushConstants.positionY,
+                    brushConstants.positionZ + radius
+                );
+                world.InvalidateCopiedChunk(ChunkCoord::FromWorldPosition(
+                    static_cast<int32_t>(worldPosPlusZ.x),
+                    static_cast<int32_t>(worldPosPlusZ.y),
+                    static_cast<int32_t>(worldPosPlusZ.z),
+                    INFINITE_CHUNK_SIZE));
+
+                glm::vec3 worldPosMinusZ = toWorld(
+                    brushConstants.positionX,
+                    brushConstants.positionY,
+                    brushConstants.positionZ - radius
+                );
+                world.InvalidateCopiedChunk(ChunkCoord::FromWorldPosition(
+                    static_cast<int32_t>(worldPosMinusZ.x),
+                    static_cast<int32_t>(worldPosMinusZ.y),
+                    static_cast<int32_t>(worldPosMinusZ.z),
+                    INFINITE_CHUNK_SIZE));
+            }
         }
     }
 }
@@ -648,11 +691,11 @@ void PhysicsDispatcher::DispatchChunkScan(
     uint32_t dispatchX, dispatchY, dispatchZ;
 
     if (world.IsUsingInfiniteChunks()) {
-        // INFINITE CHUNKS: Only scan 4×4×4 active region (64 chunks)
-        // This is 64x faster than scanning the full 16×16×16 grid (4,096 chunks)!
-        dispatchX = 4;
-        dispatchY = 4;
-        dispatchZ = 4;
+        // INFINITE CHUNKS: Scan active region matching render buffer size
+        // FIX: Use TerrainConstants to match 1600×128×1600 buffer (25×2×25 chunks)
+        dispatchX = RENDER_BUFFER_CHUNKS_X;  // 25 chunks
+        dispatchY = RENDER_BUFFER_CHUNKS_Y;  // 2 chunks
+        dispatchZ = RENDER_BUFFER_CHUNKS_Z;  // 25 chunks
 
         // Get camera chunk coordinate from infinite chunk manager
         auto* infiniteChunkManager = world.GetChunkManager();
@@ -661,13 +704,23 @@ void PhysicsDispatcher::DispatchChunkScan(
             cameraChunk = infiniteChunkManager->GetCameraChunk();
         }
 
-        // Active region starts at (cameraChunk - 1) for a 4×4×4 region
-        constants.activeRegionOffsetX = cameraChunk.x - 1;
-        constants.activeRegionOffsetY = cameraChunk.y - 1;
-        constants.activeRegionOffsetZ = cameraChunk.z - 1;
+        // Active region starts at (cameraChunk - RENDER_DISTANCE_HORIZONTAL)
+        // This matches UpdateActiveRegion's coordinate calculation in VoxelWorld.cpp
+        // Horizontal: [cameraChunk.x-12 to cameraChunk.x+12] (25 chunks)
+        // Vertical:   [0 to 1] (2 chunks - ALWAYS Y=0,1 regardless of camera)
+        // Horizontal: [cameraChunk.z-12 to cameraChunk.z+12] (25 chunks)
+        constants.activeRegionOffsetX = cameraChunk.x - RENDER_DISTANCE_HORIZONTAL;
+        constants.activeRegionOffsetY = TERRAIN_CHUNK_MIN_Y;  // Always 0 (terrain layers)
+        constants.activeRegionOffsetZ = cameraChunk.z - RENDER_DISTANCE_HORIZONTAL;
 
-        spdlog::debug("DispatchChunkScan: Scanning 4×4×4 active region at offset [{},{},{}] (64 chunks)",
-            constants.activeRegionOffsetX, constants.activeRegionOffsetY, constants.activeRegionOffsetZ);
+        // Log only once per second to avoid spam
+        static int activeRegionLogThrottle = 0;
+        if (++activeRegionLogThrottle % 60 == 1) {
+            spdlog::debug("DispatchChunkScan: Scanning {}×{}×{} active region at offset [{},{},{}] ({} chunks)",
+                dispatchX, dispatchY, dispatchZ,
+                constants.activeRegionOffsetX, constants.activeRegionOffsetY, constants.activeRegionOffsetZ,
+                dispatchX * dispatchY * dispatchZ);
+        }
     } else {
         // STATIC GRID: Scan full 16×16×16 grid (4,096 chunks)
         dispatchX = chunkManager.GetChunkCountX();
@@ -691,7 +744,7 @@ void PhysicsDispatcher::DispatchChunkScan(
     m_chunkScanPipeline.SetRootDescriptorTable(cmdList, 3, chunkManager.GetActiveListUAV().gpu);
     m_chunkScanPipeline.SetRootDescriptorTable(cmdList, 4, chunkManager.GetActiveCountUAV().gpu);
 
-    // PRIORITY 3: Dispatch optimized 4×4×4 region for infinite chunks, full grid for static
+    // PRIORITY 3: Dispatch optimized 25×2×25 region for infinite chunks, full grid for static
     m_chunkScanPipeline.Dispatch(cmdList, dispatchX, dispatchY, dispatchZ);
 
     // UAV barrier to ensure writes complete
@@ -704,8 +757,13 @@ void PhysicsDispatcher::DispatchChunkScan(
     barriers[2].UAV.pResource = chunkManager.GetActiveChunkCountBuffer().GetResource();
     cmdList->ResourceBarrier(3, barriers);
 
-    spdlog::debug("DispatchChunkScan: Scanned {}x{}x{} chunks",
-        chunkManager.GetChunkCountX(), chunkManager.GetChunkCountY(), chunkManager.GetChunkCountZ());
+    // Log only once per second to avoid spam
+    static int logThrottle = 0;
+    if (++logThrottle % 60 == 1) {
+        spdlog::debug("DispatchChunkScan: Dispatched {}×{}×{} chunks (ChunkManager grid: {}×{}×{})",
+            dispatchX, dispatchY, dispatchZ,
+            chunkManager.GetChunkCountX(), chunkManager.GetChunkCountY(), chunkManager.GetChunkCountZ());
+    }
 }
 
 Result<void> PhysicsDispatcher::CreatePrepareIndirectPipeline(
@@ -938,13 +996,16 @@ void PhysicsDispatcher::DispatchPhysicsIndirect(
     uavBarrier.UAV.pResource = world.GetWriteBuffer().GetResource();
     cmdList->ResourceBarrier(1, &uavBarrier);
 
-    // CRITICAL FIX: Swap buffers for infinite chunks!
-    // Physics writes to WRITE buffer → swap → WRITE becomes READ for rendering
-    // Chunks write directly to READ buffer (no swap needed there)
-    // This single swap per frame is correct!
-    world.SwapBuffers();
+    // REMOVED DUPLICATE: SwapBuffers() is called in main loop after physics!
+    // Double-swapping was causing READ and WRITE buffers to point to same buffer,
+    // preventing chunk copy logic from working (cache thought all chunks were already copied).
+    // world.SwapBuffers();  // <-- REMOVED - main.cpp calls this after physics
 
-    spdlog::debug("DispatchPhysicsIndirect: Indirect physics dispatch complete");
+    // Log only once per second to avoid spam
+    static int physicsLogThrottle = 0;
+    if (++physicsLogThrottle % 60 == 1) {
+        spdlog::debug("DispatchPhysicsIndirect: Indirect physics dispatch complete (60 FPS)");
+    }
 }
 
 void PhysicsDispatcher::DispatchBrushRaycast(

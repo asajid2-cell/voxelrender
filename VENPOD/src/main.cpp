@@ -55,6 +55,11 @@ int main(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
 
+    // DEBUG MODE: When true, bypass streaming and use a fixed 2x2 static
+    // chunk layout copied into the 256x128x256 voxel buffer each frame.
+    // This isolates copy/origin bugs from the infinite chunk streaming logic.
+    const bool useStaticChunkLayout = false;
+
     // DEBUGGING: Enable debug level to see synchronization logs
     spdlog::set_level(spdlog::level::debug);
     spdlog::info("===========================================");
@@ -148,7 +153,7 @@ int main(int argc, char* argv[]) {
     //
     // To re-enable tests (for development only), set runTests = true
     // =============================================================================
-    bool runTests = false;  // DISABLED by default to prevent descriptor corruption
+    bool runTests = false;  // Disabled by default to avoid descriptor conflicts
 
     if (runTests) {
         spdlog::info("\n");
@@ -170,6 +175,9 @@ int main(int argc, char* argv[]) {
         spdlog::info("");
         spdlog::info("All chunk tests passed! Continuing with stress tests...");
         spdlog::info("");
+        // TEST-ONLY MODE: Exit after generation tests to avoid descriptor reuse
+        // interfering with the main game runtime.
+        return 0;
     } else {
         spdlog::info("Skipping chunk generation tests (disabled to prevent descriptor conflicts)");
     }
@@ -233,9 +241,14 @@ int main(int argc, char* argv[]) {
     // Initialize VoxelWorld
     auto voxelWorld = std::make_unique<Simulation::VoxelWorld>();
     Simulation::VoxelWorldConfig voxelConfig;
-    voxelConfig.gridSizeX = 256;  // Larger world for more playable area
-    voxelConfig.gridSizeY = 128;  // Keep height smaller for faster sim
-    voxelConfig.gridSizeZ = 256;
+    // RTX 3070 Ti (8GB) MAXED OUT: Render buffer sized for massive world
+    // Terrain exists at Y=5-60 (spans chunks Y=0,1 only = 128 voxels)
+    // Horizontal: 25×25 chunks (render distance 12 = camera ±12 chunks)
+    voxelConfig.gridSizeX = 1600;  // 25 chunks wide (64 * 25)
+    voxelConfig.gridSizeY = 128;   // 2 chunks tall (64 * 2) - exactly terrain height
+    voxelConfig.gridSizeZ = 1600;  // 25 chunks deep (64 * 25)
+    // Total: 25×2×25 = 1,250 chunks × 262KB = ~52 MB render buffer (×2 for ping-pong = 104 MB)
+    // With 8GB VRAM, this is trivial! Leaves 7.9GB for chunks + rendering
 
     // Need a one-time command list for upload
     ComPtr<ID3D12GraphicsCommandList> initCommandList;
@@ -307,6 +320,75 @@ int main(int argc, char* argv[]) {
     commandQueue->ExecuteCommandList(initCommandList.Get());
     commandQueue->Flush();  // Wait for initialization to complete
 
+    // =============================================================================
+    // STATIC 2x2 CHUNK LAYOUT (DEBUG MODE)
+    // Pre-generate four fixed infinite chunks at coordinates (0,0,0), (1,0,0),
+    // (0,0,1), (1,0,1) using the infinite chunk manager inside VoxelWorld.
+    // These will be copied into the 256x128x256 voxel buffer each frame when
+    // useStaticChunkLayout is enabled, bypassing streaming logic entirely.
+    // =============================================================================
+    if (useStaticChunkLayout) {
+        auto* infiniteChunkManager = voxelWorld->GetChunkManager();
+        if (!infiniteChunkManager) {
+            spdlog::critical("Static chunk layout enabled but VoxelWorld has no InfiniteChunkManager");
+            return 1;
+        }
+
+        ComPtr<ID3D12CommandAllocator> staticCmdAllocator;
+        HRESULT staticHr = device->GetDevice()->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&staticCmdAllocator)
+        );
+        if (FAILED(staticHr)) {
+            spdlog::critical("Failed to create command allocator for static chunk layout");
+            return 1;
+        }
+
+        ComPtr<ID3D12GraphicsCommandList> staticCmdList;
+        staticHr = device->GetDevice()->CreateCommandList(
+            0,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            staticCmdAllocator.Get(),
+            nullptr,
+            IID_PPV_ARGS(&staticCmdList)
+        );
+        if (FAILED(staticHr)) {
+            spdlog::critical("Failed to create command list for static chunk layout");
+            return 1;
+        }
+
+        Simulation::ChunkCoord staticCoords[] = {
+            {0, 0, 0},
+            {1, 0, 0},
+            {0, 0, 1},
+            {1, 0, 1},
+        };
+
+        for (const auto& coord : staticCoords) {
+            auto genResult = infiniteChunkManager->ForceGenerateChunk(
+                device->GetDevice(),
+                staticCmdList.Get(),
+                coord
+            );
+            if (!genResult) {
+                spdlog::critical("Static chunk layout: failed to generate chunk [{},{},{}]: {}",
+                    coord.x, coord.y, coord.z, genResult.error());
+                return 1;
+            }
+        }
+
+        staticCmdList->Close();
+        ID3D12CommandList* staticLists[] = { staticCmdList.Get() };
+        commandQueue->GetCommandQueue()->ExecuteCommandLists(1, staticLists);
+        commandQueue->Flush();
+
+        spdlog::info("Static chunk layout: pre-generated 2x2 chunk patch at origin");
+
+        // Treat world as a static 256^3 grid for the rest of the runtime so physics
+        // and chunk scan use the non-infinite path while we debug copy/origin.
+        voxelWorld->SetUseInfiniteChunks(false);
+    }
+
     // Create command list
     ComPtr<ID3D12GraphicsCommandList> commandList;
     HRESULT hr = device->GetDevice()->CreateCommandList(
@@ -373,10 +455,11 @@ int main(int argc, char* argv[]) {
     float gridSizeYInit = static_cast<float>(voxelWorld->GetGridSizeY());
     float gridSizeZInit = static_cast<float>(voxelWorld->GetGridSizeZ());
 
-    // FIXED: Spawn camera at realistic terrain height for infinite chunks
-    // Terrain ranges from Y=5 to Y=200, with average around Y=60-80
-    // Start at Y=95 (15 units above sea level at 80) to see terrain clearly
-    glm::vec3 cameraPos = glm::vec3(gridSizeXInit / 2.0f, 95.0f, gridSizeZInit / 2.0f);
+    // FIX: Spawn camera at world origin with proper terrain height
+    // Terrain generates around world origin (0,0,0) at heights Y=5 to Y=60
+    // Sea level is at Y=40, so spawn slightly above at Y=50 to see the terrain
+    // Camera horizontal position doesn't matter much since chunks load around it
+    glm::vec3 cameraPos = glm::vec3(128.0f, 50.0f, 128.0f);  // Start near world origin
 
     // Camera rotation (pitch and yaw)
     float cameraPitch = -0.5f;  // Look down more to see terrain below
@@ -508,6 +591,8 @@ int main(int argc, char* argv[]) {
             cameraPos -= glm::vec3(0, 1, 0) * moveSpeed;
         }
 
+        // FIX #20: Removed camera Y clamp - allow free vertical movement for full exploration
+
         // Calculate ray for GPU brush raycasting
         // When mouse is captured (FPS mode), always use screen center for crosshair
         // When mouse is free, use actual mouse position
@@ -550,21 +635,49 @@ int main(int argc, char* argv[]) {
         ctx.commandAllocator->Reset();
         commandList->Reset(ctx.commandAllocator.Get(), nullptr);
 
-        // ===== UPDATE INFINITE CHUNK SYSTEM (NEW) =====
-        // Update chunk loading/unloading based on camera position
-        // CRITICAL: Now uses internal command list for immediate execution (doesn't touch frame cmdList!)
-        if (voxelWorld->IsUsingInfiniteChunks()) {
+        // ===== UPDATE VOXEL DATA SOURCE =====
+        // In static layout mode, copy a fixed 2x2 patch of pre-generated chunks
+        // into the 256x128x256 buffer each frame. This bypasses streaming so we
+        // can validate copy/origin and rendering in isolation. Otherwise, use the
+        // normal infinite chunk streaming path.
+        if (useStaticChunkLayout) {
+            voxelWorld->CopyStatic2x2Chunks(commandQueue->GetCommandQueue());
+        } else if (voxelWorld->IsUsingInfiniteChunks()) {
             voxelWorld->UpdateChunks(
                 device->GetDevice(),
-                commandQueue->GetCommandQueue(),  // CHANGED: Pass queue instead of cmdList
+                commandQueue->GetCommandQueue(),  // Uses internal cmd list, not frame cmdList
                 cameraPos
             );
+
+            // DEBUG: Track how many chunks have been copied into each buffer so far.
+            // This should climb toward ~32 (4x2x4) and then stabilize when standing still.
+            if (frameCount % 60 == 0) {
+                int readIdx = voxelWorld->GetReadBufferIndex();
+                size_t copiedRead  = voxelWorld->GetCopiedChunkCount(readIdx);
+                size_t copiedWrite = voxelWorld->GetCopiedChunkCount(1 - readIdx);
+                spdlog::info("Copied chunks: READ={} WRITE={} (readIdx={})",
+                    copiedRead, copiedWrite, readIdx);
+            }
+        }
+
+        // Convert camera position into local 256^3-buffer coordinates. In static
+        // 2x2 layout mode, the grid is fixed at world origin so local==world.
+        // With streaming enabled, the voxel grid is a moving window around the
+        // camera, so we subtract the region origin.
+        glm::vec3 regionOriginWorld;
+        glm::vec3 cameraPosLocal;
+        if (useStaticChunkLayout) {
+            regionOriginWorld = glm::vec3(0.0f);
+            cameraPosLocal = cameraPos;
+        } else {
+            regionOriginWorld = voxelWorld->GetRegionOriginWorld();
+            cameraPosLocal = cameraPos - regionOriginWorld;
         }
 
         // === GPU BRUSH RAYCASTING (NEW - 2,000,000x FASTER!) ===
-        // Dispatch single-thread GPU compute to find brush position
+        // Dispatch single-thread GPU compute to find brush position in local grid space.
         // This replaces the 32MB CPU readback with 16 bytes!
-        physicsDispatcher->DispatchBrushRaycast(commandList.Get(), *voxelWorld, cameraPos, rayDir);
+        physicsDispatcher->DispatchBrushRaycast(commandList.Get(), *voxelWorld, cameraPosLocal, rayDir);
 
         // Begin frame - transitions back buffer, sets render target, viewport, etc.
         renderer->BeginFrame(commandList.Get(), frameIndex);
@@ -588,7 +701,8 @@ int main(int argc, char* argv[]) {
             glm::vec3 brushPos;
 
             if (gpuRaycastResult.hasValidPosition) {
-                // Use GPU raycast hit position (on solid voxel face)
+                // Use GPU raycast hit position (on solid voxel face).
+                // This is already in local 256^3 grid space.
                 brushPos = glm::vec3(gpuRaycastResult.posX, gpuRaycastResult.posY, gpuRaycastResult.posZ);
                 static int logCounter = 0;
                 if (logCounter++ % 60 == 0) {  // Log once per second
@@ -597,7 +711,8 @@ int main(int argc, char* argv[]) {
                 }
             } else {
                 // Fallback: place at fixed distance in empty air (10 voxels ahead)
-                brushPos = cameraPos + rayDir * 10.0f;
+                // in LOCAL 256^3 grid space around the camera.
+                brushPos = cameraPosLocal + rayDir * 10.0f;
 
                 // Clamp to grid bounds
                 brushPos = glm::clamp(brushPos,
@@ -653,11 +768,11 @@ int main(int argc, char* argv[]) {
         // Transition read buffer to pixel shader resource for rendering
         voxelWorld->TransitionReadBufferTo(commandList.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-        // Build camera params for shader
+        // Build camera params for shader (camera in LOCAL grid space)
         Graphics::Renderer::CameraParams cameraParams;
-        cameraParams.posX = cameraPos.x;
-        cameraParams.posY = cameraPos.y;
-        cameraParams.posZ = cameraPos.z;
+        cameraParams.posX = cameraPosLocal.x;
+        cameraParams.posY = cameraPosLocal.y;
+        cameraParams.posZ = cameraPosLocal.z;
         cameraParams.forwardX = cameraForward.x;
         cameraParams.forwardY = cameraForward.y;
         cameraParams.forwardZ = cameraForward.z;
@@ -673,6 +788,8 @@ int main(int argc, char* argv[]) {
         // Build brush preview params from GPU raycast result (NEW!)
         Graphics::Renderer::BrushPreview brushPreview = {};
         if (gpuRaycastResult.hasValidPosition) {
+            // GPU raycast outputs local 256^3 grid coordinates; renderer expects the
+            // same space as the camera, so we pass them through directly.
             brushPreview.posX = gpuRaycastResult.posX;
             brushPreview.posY = gpuRaycastResult.posY;
             brushPreview.posZ = gpuRaycastResult.posZ;
@@ -713,6 +830,17 @@ int main(int argc, char* argv[]) {
         // Close and execute command list
         commandList->Close();
         commandQueue->ExecuteCommandList(commandList.Get());
+
+        // FIX #17: CRITICAL - Swap read/write buffers for next frame
+        // The bug: Without this swap, chunks are copied to WRITE buffer every frame,
+        // but READ buffer (used by renderer) stays empty forever → no terrain visible!
+        // UpdateChunks and physics wrote to WRITE buffer this frame.
+        // Swap makes it the READ buffer so renderer can see new chunk data next frame.
+        // Sequence:
+        //   Frame N: chunks copied to WRITE (buffer 1), physics writes to buffer 1, render reads buffer 0
+        //   Swap → buffer 1 becomes READ, buffer 0 becomes WRITE
+        //   Frame N+1: chunks copied to WRITE (now buffer 0), physics writes to buffer 0, render reads buffer 1 ← sees chunks from frame N!
+        voxelWorld->SwapBuffers();
 
         // Present
         window->Present();

@@ -75,6 +75,13 @@ public:
     // Mark chunk as submitted (GPU work in flight)
     void MarkSubmitted() { m_state = ChunkState::GenerationSubmitted; }
 
+    // FIX #16: Invalidate descriptors without freeing (used for deferred descriptor freeing)
+    // This prevents Shutdown() from freeing descriptors that will be freed later
+    void InvalidateDescriptors() {
+        m_voxelSRV.Invalidate();
+        m_voxelUAV.Invalidate();
+    }
+
     // Getters
     const ChunkCoord& GetCoord() const { return m_coord; }
     ChunkState GetState() const { return m_state; }

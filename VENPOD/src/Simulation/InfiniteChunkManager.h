@@ -174,6 +174,19 @@ private:
     // FIX: Track re-queue attempts to prevent infinite loops when allocators are busy
     std::unordered_map<ChunkCoord, uint32_t> m_chunkRequeueCount;
 
+    // FIX #16/#19: Deferred chunk deletion to prevent GPU accessing freed buffers
+    // The bug: Chunks (including GPU buffers) were freed immediately on unload, but GPU
+    // might still be using them → OBJECT_DELETED_WHILE_STILL_IN_USE crash
+    // Solution: Queue entire chunk for deferred delete, only free after GPU finishes using it
+    struct DeferredChunkDelete {
+        Chunk* chunk;            // Chunk to delete (includes buffers AND descriptors)
+        uint64_t fenceValue;     // Delete when GPU reaches this fence value
+    };
+    std::vector<DeferredChunkDelete> m_deferredChunkDeletes;
+
+    // Process deferred chunk deletions (call each frame)
+    void ProcessDeferredChunkDeletes();
+
     // Helper to verify completed chunks and mark them as Generated
     void VerifyGeneratedChunks();
 
