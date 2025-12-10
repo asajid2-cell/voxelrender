@@ -200,6 +200,10 @@ void VoxelWorld::Shutdown() {
     m_brushRaycastResult.Shutdown();
     m_brushRaycastReadback.Reset();
 
+    // Cleanup ground raycast buffers
+    m_groundRaycastResult.Shutdown();
+    m_groundRaycastReadback.Reset();
+
     m_materialPalette.Reset();
     m_paletteUpload.Reset();
     m_heapManager = nullptr;
