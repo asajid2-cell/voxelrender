@@ -119,7 +119,9 @@ public:
 
     // ===== INFINITE CHUNK SYSTEM (NEW) =====
     // Update chunk loading and active region (call every frame)
-    void UpdateChunks(
+    // RETURNS: Origin shift delta (how much regionOrigin changed this frame)
+    //          Caller MUST adjust camera position by -originShiftDelta to prevent teleportation!
+    glm::vec3 UpdateChunks(
         ID3D12Device* device,
         ID3D12CommandQueue* cmdQueue,  // CHANGED: Uses internal cmdList for immediate execution
         const glm::vec3& cameraPos

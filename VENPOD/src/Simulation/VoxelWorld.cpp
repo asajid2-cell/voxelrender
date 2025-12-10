@@ -567,13 +567,13 @@ void VoxelWorld::RequestBrushRaycastReadback(ID3D12GraphicsCommandList* cmdList)
     }
 }
 
-void VoxelWorld::UpdateChunks(
+glm::vec3 VoxelWorld::UpdateChunks(
     ID3D12Device* device,
     ID3D12CommandQueue* cmdQueue,  // CHANGED: Pass queue instead of cmdList
     const glm::vec3& cameraPos)
 {
     if (!m_chunkManager || !m_useInfiniteChunks) {
-        return;  // Chunk system disabled
+        return glm::vec3(0.0f, 0.0f, 0.0f);  // Chunk system disabled, no origin shift
     }
 
     // Update chunk loading/unloading based on camera position
@@ -639,31 +639,16 @@ void VoxelWorld::UpdateChunks(
     }
 
     // ============================================================================
-    // CRITICAL FIX: Compute region origin EVERY FRAME (not just on chunk changes)!
-    // The shader MUST have an up-to-date regionOrigin to correctly map world
-    // coordinates to buffer coordinates. If we only update on chunk boundaries,
-    // the camera can move 0-63 voxels with a stale regionOrigin, causing the
-    // treadmill effect where terrain appears to slide backwards.
+    // CRITICAL FIX: DISABLE ORIGIN SHIFTING COMPLETELY!
+    //
+    // Setting regionOrigin to (0,0,0) means the shader receives absolute world coordinates.
+    // The buffer still contains chunks relative to the camera, but we need the shader to
+    // convert world pos → buffer pos using the camera chunk coordinate, not regionOrigin.
+    //
+    // This prevents ALL teleportation because the coordinate system never resets!
     // ============================================================================
-
-    // Compute world-space origin (in voxel coordinates) of the 1600×128×1600 buffer.
-    // FIX: UpdateActiveRegion copies chunks in the range:
-    //   dx,dz ∈ [-12..12] (25 horizontal chunks) - relative to camera
-    //   y ∈ [0..1]        (2 vertical chunks, ABSOLUTE terrain layers)
-    // into the buffer at offsets (dx+12, y, dz+12)*64.
-    // That means voxel (0,0,0) in the buffer corresponds to chunk
-    // (camera.x-12, 0, camera.z-12) * INFINITE_CHUNK_SIZE in world space.
-    {
-        int32_t baseChunkX = m_activeRegionCenter.x - RENDER_DISTANCE_HORIZONTAL;
-        int32_t baseChunkY = 0;  // FIX: Always Y=0 (terrain starts at chunk Y=0)
-        int32_t baseChunkZ = m_activeRegionCenter.z - RENDER_DISTANCE_HORIZONTAL;
-        constexpr int32_t chunkSize = INFINITE_CHUNK_SIZE;
-
-        m_regionOriginWorld = glm::vec3(
-            static_cast<float>(baseChunkX * chunkSize),
-            static_cast<float>(baseChunkY * chunkSize),
-            static_cast<float>(baseChunkZ * chunkSize));
-    }
+    m_regionOriginWorld = glm::vec3(0.0f, 0.0f, 0.0f);  // ALWAYS zero - no shifting!
+    glm::vec3 originShiftDelta = glm::vec3(0.0f, 0.0f, 0.0f);  // No shift ever
 
     // Log when region origin shifts (only when buffer actually shifts, not every chunk change)
     if (bufferNeedsShift) {
@@ -740,6 +725,16 @@ void VoxelWorld::UpdateChunks(
             loadedChunks.size());
         lastLoggedChunk = cameraChunk;
     }
+
+    // CRITICAL FIX: Return origin shift delta so caller can adjust camera!
+    // If regionOrigin shifted by (+64, 0, +64), caller must adjust camera by (-64, 0, -64)
+    // to prevent teleportation.
+    if (glm::length(originShiftDelta) > 0.01f) {
+        spdlog::info("Origin shifted by ({:.1f}, {:.1f}, {:.1f}) - caller must adjust camera by ({:.1f}, {:.1f}, {:.1f})",
+            originShiftDelta.x, originShiftDelta.y, originShiftDelta.z,
+            -originShiftDelta.x, -originShiftDelta.y, -originShiftDelta.z);
+    }
+    return originShiftDelta;
 }
 
 void VoxelWorld::OnChunkUnloaded(const ChunkCoord& coord) {

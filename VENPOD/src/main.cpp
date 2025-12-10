@@ -643,6 +643,7 @@ int main(int argc, char* argv[]) {
         if (useStaticChunkLayout) {
             voxelWorld->CopyStatic2x2Chunks(commandQueue->GetCommandQueue());
         } else if (voxelWorld->IsUsingInfiniteChunks()) {
+            // regionOrigin is now always (0,0,0) - no camera adjustment needed!
             voxelWorld->UpdateChunks(
                 device->GetDevice(),
                 commandQueue->GetCommandQueue(),  // Uses internal cmd list, not frame cmdList
