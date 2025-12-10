@@ -10,30 +10,30 @@ The following packages will be built and installed:
   * vcpkg-cmake:x64-windows@2024-04-23
   * vcpkg-cmake-config:x64-windows@2024-05-23
 Additional packages (*) will be modified to complete this operation.
-Restored 8 package(s) from C:\Users\Ahmed\AppData\Local\vcpkg\archives in 1.1 s. Use --debug to see more details.
+Restored 8 package(s) from C:\Users\Ahmed\AppData\Local\vcpkg\archives in 1.6 s. Use --debug to see more details.
 Installing 1/8 vcpkg-cmake-config:x64-windows@2024-05-23...
-Elapsed time to handle vcpkg-cmake-config:x64-windows: 7.32 ms
+Elapsed time to handle vcpkg-cmake-config:x64-windows: 14.3 ms
 vcpkg-cmake-config:x64-windows package ABI: 4d75d6b1fef2392fe0bef85796c295bda5363876e4162546e1b7974d55dfc74c
 Installing 2/8 vcpkg-cmake:x64-windows@2024-04-23...
-Elapsed time to handle vcpkg-cmake:x64-windows: 16 ms
+Elapsed time to handle vcpkg-cmake:x64-windows: 20.7 ms
 vcpkg-cmake:x64-windows package ABI: 84011756e153979d9f7f6c5c99e2c5a26929a98e52b9e40ce4f3aef100122523
 Installing 3/8 directx-headers:x64-windows@1.618.2...
-Elapsed time to handle directx-headers:x64-windows: 207 ms
+Elapsed time to handle directx-headers:x64-windows: 58.6 ms
 directx-headers:x64-windows package ABI: 95e86a4b060c69a5a4d498f39f9227a1910ec3c54257e03e7b011d2a93dda7f3
 Installing 4/8 glm:x64-windows@1.0.2...
-Elapsed time to handle glm:x64-windows: 501 ms
+Elapsed time to handle glm:x64-windows: 375 ms
 glm:x64-windows package ABI: 3fc28443fc4b3c7fcc9c1e52c8f50617463ef91d25277d4a081679643db19a26
 Installing 5/8 nlohmann-json:x64-windows@3.12.0#1...
-Elapsed time to handle nlohmann-json:x64-windows: 67.7 ms
+Elapsed time to handle nlohmann-json:x64-windows: 59.4 ms
 nlohmann-json:x64-windows package ABI: ff26db108c999a20911c7b0b6ee597c523cb34e21b98957ae87e6f7b0e48d391
 Installing 6/8 sdl3:x64-windows@3.2.26#1...
-Elapsed time to handle sdl3:x64-windows: 101 ms
+Elapsed time to handle sdl3:x64-windows: 91 ms
 sdl3:x64-windows package ABI: 2dd5adc62e3b0e84d8cd798e39f4b008143f4927179e5427a401a7598086a889
 Installing 7/8 fmt:x64-windows@12.1.0...
-Elapsed time to handle fmt:x64-windows: 46.8 ms
+Elapsed time to handle fmt:x64-windows: 37.8 ms
 fmt:x64-windows package ABI: 1500ed52a772ae004326c070eebb62a527dcc4276dd3756cefc6bb4a1ab18d9a
 Installing 8/8 spdlog:x64-windows@1.16.0...
-Elapsed time to handle spdlog:x64-windows: 102 ms
+Elapsed time to handle spdlog:x64-windows: 104 ms
 spdlog:x64-windows package ABI: 5d8406feabe81199116a056879d535f0986f27875c636dd9c5be51aea91a3be1
 Installed contents are licensed to you by owners. Microsoft is not responsible for, nor does it grant any licenses to, third-party packages.
 Packages installed in this vcpkg installation declare the following licenses:
@@ -81,4 +81,4 @@ The package spdlog provides CMake targets:
     find_package(spdlog CONFIG REQUIRED)
     target_link_libraries(main PRIVATE spdlog::spdlog_header_only)
 
-All requested installations completed successfully in: 1.1 s
+All requested installations completed successfully in: 921 ms
