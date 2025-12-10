@@ -51,28 +51,6 @@ std::filesystem::path GetExecutableDirectory() {
     return std::filesystem::current_path();
 }
 
-// Helper function to check if a position is solid in the voxel world
-// This queries the GPU voxel buffer using raycasting result as a proxy
-// Returns the Y position of the ground below the given position, or -1 if no ground found
-float FindGroundBelow(const glm::vec3& posWorld, Simulation::VoxelWorld* voxelWorld, float maxDistance = 20.0f) {
-    // Convert world position to local buffer coordinates
-    glm::vec3 regionOrigin = voxelWorld->GetRegionOriginWorld();
-    glm::vec3 posLocal = posWorld - regionOrigin;
-
-    // Check voxels below the position (ray downward)
-    // We'll check in steps of 1 voxel at a time
-    float startY = posLocal.y;
-    float minY = std::max(0.0f, startY - maxDistance);
-
-    // Since we can't directly read GPU memory, we'll use a simple heuristic:
-    // Assume terrain is present and use the raycast result when available
-    // For now, return a fixed ground level based on terrain generation (Y=40 sea level)
-    // This is a simplified version - proper implementation would need GPU->CPU readback
-
-    // For initial implementation, assume ground is at Y=40 (sea level) in world space
-    // We can improve this later with actual voxel queries
-    return 40.0f;  // World space Y coordinate
-}
 
 int main(int argc, char* argv[]) {
     (void)argc;
@@ -492,6 +470,7 @@ int main(int argc, char* argv[]) {
     float cameraVelocityY = 0.0f;  // Vertical velocity for gravity
     const float gravity = -50.0f;  // Gravity acceleration (units/s^2)
     const float playerHeight = 3.0f;  // Player eye height above ground (voxels)
+    const float stepHeight = 1.5f;  // Max step height for climbing (voxels)
 
     // Main loop
     bool running = true;
@@ -625,31 +604,6 @@ int main(int argc, char* argv[]) {
         // Apply vertical velocity to camera position
         cameraPos.y += cameraVelocityY * dt;
 
-        // Ground collision detection
-        float groundY = FindGroundBelow(cameraPos, voxelWorld.get());
-        float playerFeetY = cameraPos.y - playerHeight;
-
-        // If we've fallen through or are below ground, place on ground
-        if (playerFeetY <= groundY) {
-            cameraPos.y = groundY + playerHeight;
-            cameraVelocityY = 0.0f;  // Stop falling when on ground
-        }
-
-        // Optional: Space to jump (if on ground)
-        if (inputManager.IsActionPressed(Input::KeyAction::CameraUp) && playerFeetY <= groundY + 0.5f) {
-            cameraVelocityY = 20.0f;  // Jump velocity
-        }
-
-        // Optional: Shift for creative flight (override gravity)
-        if (inputManager.IsActionDown(Input::KeyAction::CameraDown)) {
-            cameraPos.y -= moveSpeed * 2.0f;  // Fly down
-            cameraVelocityY = 0.0f;  // Cancel gravity while flying down
-        }
-        if (inputManager.IsActionDown(Input::KeyAction::CameraUp) && !inputManager.IsActionPressed(Input::KeyAction::CameraUp)) {
-            cameraPos.y += moveSpeed * 2.0f;  // Fly up (hold space)
-            cameraVelocityY = 0.0f;  // Cancel gravity while flying up
-        }
-
         // Calculate ray for GPU brush raycasting
         // When mouse is captured (FPS mode), always use screen center for crosshair
         // When mouse is free, use actual mouse position
@@ -732,6 +686,12 @@ int main(int argc, char* argv[]) {
             cameraPosLocal = cameraPos - regionOriginWorld;
         }
 
+        // === GPU GROUND DETECTION RAYCAST (for player collision) ===
+        // Cast a ray straight down from player position to find ground
+        glm::vec3 groundCheckStart = cameraPosLocal;
+        glm::vec3 downDir = glm::vec3(0, -1, 0);
+        physicsDispatcher->DispatchGroundRaycast(commandList.Get(), *voxelWorld, groundCheckStart, downDir);
+
         // === GPU BRUSH RAYCASTING (NEW - 2,000,000x FASTER!) ===
         // Dispatch single-thread GPU compute to find brush position in local grid space.
         // This replaces the 32MB CPU readback with 16 bytes!
@@ -750,8 +710,56 @@ int main(int argc, char* argv[]) {
 
         // Debug logging removed to reduce spam
 
-        // Get GPU raycast result (16 bytes from previous frame)
+        // Get GPU raycast results (16 bytes from previous frame)
         auto gpuRaycastResult = voxelWorld->GetBrushRaycastResult();
+        auto groundRaycastResult = voxelWorld->GetGroundRaycastResult();
+
+        // === GROUND COLLISION DETECTION ===
+        // Use the dedicated ground raycast to find terrain beneath player
+        if (groundRaycastResult.hasValidPosition) {
+            // Ground raycast hit something - use it for collision
+            float groundLocalY = groundRaycastResult.posY;
+            float groundWorldY = groundLocalY + regionOriginWorld.y;
+            float playerFeetY = cameraPos.y - playerHeight;
+
+            // Check if we're on or near the ground
+            bool onGround = (cameraPos.y - playerHeight) <= groundWorldY + 0.5f;
+
+            // If we've fallen through ground, snap to ground
+            if (playerFeetY < groundWorldY) {
+                cameraPos.y = groundWorldY + playerHeight;
+                cameraVelocityY = 0.0f;  // Stop falling
+                onGround = true;
+            }
+
+            // Space to jump (if on ground)
+            if (inputManager.IsActionPressed(Input::KeyAction::CameraUp) && onGround) {
+                cameraVelocityY = 20.0f;  // Jump velocity
+            }
+
+            // Optional: Holding shift for creative flight
+            if (inputManager.IsActionDown(Input::KeyAction::CameraDown)) {
+                cameraPos.y -= moveSpeed * 2.0f;  // Fly down
+                cameraVelocityY = 0.0f;  // Cancel gravity while flying
+            }
+            if (inputManager.IsActionDown(Input::KeyAction::CameraUp) && !inputManager.IsActionPressed(Input::KeyAction::CameraUp)) {
+                cameraPos.y += moveSpeed * 2.0f;  // Fly up (hold space without jumping)
+                cameraVelocityY = 0.0f;  // Cancel gravity while flying
+            }
+        }
+        // Fallback: No ground detected (in air or above terrain limit)
+        else {
+            // Allow free fall - gravity continues to apply
+            // Player can still fly with shift+space
+            if (inputManager.IsActionDown(Input::KeyAction::CameraDown)) {
+                cameraPos.y -= moveSpeed * 2.0f;
+                cameraVelocityY = 0.0f;
+            }
+            if (inputManager.IsActionDown(Input::KeyAction::CameraUp)) {
+                cameraPos.y += moveSpeed * 2.0f;
+                cameraVelocityY = 0.0f;
+            }
+        }
 
         // Apply brush painting FIRST (so chunk scanner can detect new voxels)
         // Use GPU raycast position, or fallback to fixed distance in empty air
@@ -885,6 +893,9 @@ int main(int argc, char* argv[]) {
         // Request tiny 16-byte GPU->CPU readback for next frame's brush preview
         // 2,000,000x smaller than old 32MB readback!
         voxelWorld->RequestBrushRaycastReadback(commandList.Get());
+
+        // Request ground raycast readback for next frame's collision detection
+        voxelWorld->RequestGroundRaycastReadback(commandList.Get());
 
         // End frame - transitions back buffer to present state
         renderer->EndFrame(commandList.Get(), frameIndex);

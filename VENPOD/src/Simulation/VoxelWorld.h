@@ -104,6 +104,10 @@ public:
     Graphics::GPUBuffer& GetBrushRaycastResultBuffer() { return m_brushRaycastResult; }
     const Graphics::GPUBuffer& GetBrushRaycastResultBuffer() const { return m_brushRaycastResult; }
 
+    // GPU ground detection raycasting (for player collision)
+    Graphics::GPUBuffer& GetGroundRaycastResultBuffer() { return m_groundRaycastResult; }
+    const Graphics::GPUBuffer& GetGroundRaycastResultBuffer() const { return m_groundRaycastResult; }
+
     // CPU readback for brush raycasting result (16 bytes only!)
     struct BrushRaycastResult {
         float posX, posY, posZ;
@@ -116,6 +120,19 @@ public:
 
     // Get CPU-side brush raycast result (updated after RequestBrushRaycastReadback)
     BrushRaycastResult GetBrushRaycastResult() const { return m_brushRaycastCPU; }
+
+    // Ground detection raycast (separate from brush)
+    struct GroundRaycastResult {
+        float posX, posY, posZ;
+        uint32_t normalPacked;
+        bool hasValidPosition;
+    };
+
+    // Request ground raycast readback (16 bytes)
+    void RequestGroundRaycastReadback(ID3D12GraphicsCommandList* cmdList);
+
+    // Get CPU-side ground raycast result
+    GroundRaycastResult GetGroundRaycastResult() const { return m_groundRaycastCPU; }
 
     // ===== INFINITE CHUNK SYSTEM (NEW) =====
     // Update chunk loading and active region (call every frame)
@@ -196,6 +213,11 @@ private:
     Graphics::GPUBuffer m_brushRaycastResult;  // 16-byte buffer for raycast result
     ComPtr<ID3D12Resource> m_brushRaycastReadback;  // 16-byte CPU readback
     BrushRaycastResult m_brushRaycastCPU;  // CPU copy of result
+
+    // GPU ground detection raycasting (for player collision)
+    Graphics::GPUBuffer m_groundRaycastResult;  // 16-byte buffer for ground raycast
+    ComPtr<ID3D12Resource> m_groundRaycastReadback;  // 16-byte CPU readback
+    GroundRaycastResult m_groundRaycastCPU;  // CPU copy of result
 
     // ===== INFINITE CHUNK SYSTEM (NEW) =====
     std::unique_ptr<InfiniteChunkManager> m_chunkManager;

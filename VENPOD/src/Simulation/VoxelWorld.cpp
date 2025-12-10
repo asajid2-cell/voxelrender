@@ -60,10 +60,36 @@ Result<void> VoxelWorld::Initialize(
     m_brushRaycastCPU.normalPacked = 0;
     m_brushRaycastCPU.hasValidPosition = false;
 
+    // Create ground raycast result buffer (16 bytes GPU + 16 bytes CPU readback)
+    result = m_groundRaycastResult.Initialize(
+        device,
+        16,  // 4 floats = 16 bytes (posX, posY, posZ, normalPacked)
+        Graphics::BufferUsage::StructuredBuffer | Graphics::BufferUsage::UnorderedAccess,
+        16,  // stride = 16 bytes (entire structure)
+        "GroundRaycastResult"
+    );
+    if (!result) {
+        return Error("Failed to create ground raycast result buffer: {}", result.error());
+    }
+
+    // Create UAV for ground raycast result
+    result = m_groundRaycastResult.CreateUAV(device, heapManager);
+    if (!result) {
+        return Error("Failed to create UAV for ground raycast result: {}", result.error());
+    }
+
+    // Initialize CPU-side ground result to invalid
+    m_groundRaycastCPU.posX = 0.0f;
+    m_groundRaycastCPU.posY = 40.0f;  // Default to sea level
+    m_groundRaycastCPU.posZ = 0.0f;
+    m_groundRaycastCPU.normalPacked = 0;
+    m_groundRaycastCPU.hasValidPosition = false;
+
     uint64_t totalMemoryMB = (GetTotalVoxels() * sizeof(uint32_t) * 2) / (1024 * 1024);
     spdlog::info("VoxelWorld initialized: {}x{}x{} grid ({} MB)",
         m_config.gridSizeX, m_config.gridSizeY, m_config.gridSizeZ, totalMemoryMB);
     spdlog::info("GPU brush raycasting enabled (16 bytes readback vs 32 MB!)");
+    spdlog::info("GPU ground detection enabled for player collision");
 
     // ===== INITIALIZE INFINITE CHUNK SYSTEM =====
     if (m_useInfiniteChunks) {
@@ -564,6 +590,85 @@ void VoxelWorld::RequestBrushRaycastReadback(ID3D12GraphicsCommandList* cmdList)
 
         D3D12_RANGE writeRange = {0, 0};
         m_brushRaycastReadback->Unmap(0, &writeRange);
+    }
+}
+
+void VoxelWorld::RequestGroundRaycastReadback(ID3D12GraphicsCommandList* cmdList) {
+    if (!cmdList) return;
+
+    ID3D12Device* device = nullptr;
+    m_groundRaycastResult.GetResource()->GetDevice(IID_PPV_ARGS(&device));
+    if (!device) return;
+
+    // Create tiny 16-byte readback buffer if it doesn't exist
+    if (!m_groundRaycastReadback) {
+        constexpr uint64_t bufferSize = 16;  // 4 floats = 16 bytes
+
+        D3D12_HEAP_PROPERTIES readbackHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
+        D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(bufferSize);
+
+        HRESULT hr = device->CreateCommittedResource(
+            &readbackHeap,
+            D3D12_HEAP_FLAG_NONE,
+            &bufferDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,
+            IID_PPV_ARGS(&m_groundRaycastReadback)
+        );
+
+        if (FAILED(hr)) {
+            spdlog::error("Failed to create ground raycast readback buffer: 0x{:08X}", hr);
+            device->Release();
+            return;
+        }
+
+        m_groundRaycastReadback->SetName(L"GroundRaycastReadback");
+        spdlog::debug("Created ground raycast readback buffer (16 bytes)");
+    }
+
+    device->Release();
+
+    // Transition ground result buffer to copy source
+    D3D12_RESOURCE_STATES currentState = m_groundRaycastResult.GetCurrentState();
+    if (currentState != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_groundRaycastResult.GetResource(),
+            currentState,
+            D3D12_RESOURCE_STATE_COPY_SOURCE
+        );
+        cmdList->ResourceBarrier(1, &barrier);
+    }
+
+    // Copy tiny 16-byte GPU buffer to CPU readback buffer
+    cmdList->CopyResource(m_groundRaycastReadback.Get(), m_groundRaycastResult.GetResource());
+
+    // Transition back to UAV state for next raycast
+    if (currentState != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_groundRaycastResult.GetResource(),
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            currentState
+        );
+        cmdList->ResourceBarrier(1, &barrier);
+    }
+
+    // Map and read the result immediately
+    void* mappedData = nullptr;
+    D3D12_RANGE readRange = {0, 16};
+    HRESULT hr = m_groundRaycastReadback->Map(0, &readRange, &mappedData);
+    if (SUCCEEDED(hr)) {
+        float* data = static_cast<float*>(mappedData);
+        m_groundRaycastCPU.posX = data[0];
+        m_groundRaycastCPU.posY = data[1];
+        m_groundRaycastCPU.posZ = data[2];
+
+        // Unpack normal and validity flag
+        uint32_t packed = *reinterpret_cast<uint32_t*>(&data[3]);
+        m_groundRaycastCPU.normalPacked = packed;
+        m_groundRaycastCPU.hasValidPosition = (packed >> 6) & 1;
+
+        D3D12_RANGE writeRange = {0, 0};
+        m_groundRaycastReadback->Unmap(0, &writeRange);
     }
 }
 

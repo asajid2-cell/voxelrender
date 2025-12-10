@@ -135,6 +135,14 @@ public:
         const glm::vec3& rayDirection
     );
 
+    // GPU ground detection raycasting (for player collision)
+    void DispatchGroundRaycast(
+        ID3D12GraphicsCommandList* cmdList,
+        VoxelWorld& world,
+        const glm::vec3& rayOrigin,
+        const glm::vec3& rayDirection
+    );
+
     // Get command signature for indirect dispatch
     ID3D12CommandSignature* GetCommandSignature() const { return m_commandSignature.Get(); }
 

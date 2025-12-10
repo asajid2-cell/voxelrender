@@ -1066,6 +1066,64 @@ void PhysicsDispatcher::DispatchBrushRaycast(
     cmdList->ResourceBarrier(1, &uavBarrier);
 }
 
+void PhysicsDispatcher::DispatchGroundRaycast(
+    ID3D12GraphicsCommandList* cmdList,
+    VoxelWorld& world,
+    const glm::vec3& rayOrigin,
+    const glm::vec3& rayDirection)
+{
+    if (!cmdList || !m_brushRaycastPipeline.IsValid()) {
+        return;
+    }
+
+    // Transition voxel read buffer to SRV state for compute shader read
+    world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    // Set descriptor heaps
+    ID3D12DescriptorHeap* heaps[] = { m_heapManager->GetShaderVisibleCbvSrvUavHeap() };
+    cmdList->SetDescriptorHeaps(1, heaps);
+
+    // Bind brush raycast pipeline (reuse same shader, different output buffer)
+    m_brushRaycastPipeline.Bind(cmdList);
+
+    // Ground raycast constants (same structure as brush raycast)
+    struct GroundRaycastConstants {
+        float rayOriginX, rayOriginY, rayOriginZ, rayOriginW;
+        float rayDirX, rayDirY, rayDirZ, rayDirW;
+        uint32_t gridSizeX, gridSizeY, gridSizeZ, padding;
+    } constants = {};
+
+    constants.rayOriginX = rayOrigin.x;
+    constants.rayOriginY = rayOrigin.y;
+    constants.rayOriginZ = rayOrigin.z;
+    constants.rayOriginW = 0.0f;
+
+    constants.rayDirX = rayDirection.x;
+    constants.rayDirY = rayDirection.y;
+    constants.rayDirZ = rayDirection.z;
+    constants.rayDirW = 0.0f;
+
+    constants.gridSizeX = world.GetGridSizeX();
+    constants.gridSizeY = world.GetGridSizeY();
+    constants.gridSizeZ = world.GetGridSizeZ();
+    constants.padding = 0;
+
+    m_brushRaycastPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
+
+    // Set descriptors: t0 = voxel grid SRV, u0 = GROUND result UAV (different from brush!)
+    m_brushRaycastPipeline.SetRootDescriptorTable(cmdList, 1, world.GetReadBufferSRV().gpu);
+    m_brushRaycastPipeline.SetRootDescriptorTable(cmdList, 2, world.GetGroundRaycastResultBuffer().GetShaderVisibleUAV().gpu);
+
+    // Dispatch single thread (1x1x1)
+    cmdList->Dispatch(1, 1, 1);
+
+    // UAV barrier to ensure result is ready
+    D3D12_RESOURCE_BARRIER uavBarrier = {};
+    uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uavBarrier.UAV.pResource = world.GetGroundRaycastResultBuffer().GetResource();
+    cmdList->ResourceBarrier(1, &uavBarrier);
+}
+
 Result<void> PhysicsDispatcher::CreateBrushRaycastPipeline(
     ID3D12Device* device,
     Graphics::ShaderCompiler& shaderCompiler,
