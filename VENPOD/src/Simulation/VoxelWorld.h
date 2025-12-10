@@ -213,6 +213,11 @@ private:
     // This prevents re-copying ALL chunks every frame (only copy missing/changed ones)
     std::unordered_set<ChunkCoord> m_copiedChunksPerBuffer[2];
 
+    // Cache invalidation tracking - used to boost chunk copy speed after cache clear
+    // When cache is invalidated (camera moves to new chunk), we need to aggressively
+    // refill BOTH buffers to prevent holes/missing chunks during the refill period
+    int32_t m_framesAfterCacheInvalidation = 0;
+
     // Chunk copy pipeline (for UpdateActiveRegion)
     ComPtr<ID3D12PipelineState> m_chunkCopyPSO;
     ComPtr<ID3D12RootSignature> m_chunkCopyRootSignature;

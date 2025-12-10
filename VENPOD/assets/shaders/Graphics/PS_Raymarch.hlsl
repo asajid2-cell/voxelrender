@@ -25,16 +25,22 @@ struct PSInput {
 };
 
 // Sample voxel from grid
-uint GetVoxel(int3 pos) {
-    // Bounds check
-    if (pos.x < 0 || pos.x >= (int)frame.gridSizeX ||
-        pos.y < 0 || pos.y >= (int)frame.gridSizeY ||
-        pos.z < 0 || pos.z >= (int)frame.gridSizeZ) {
+uint GetVoxel(int3 worldPos) {
+    // CRITICAL FIX: Convert world position to buffer-local position
+    // The render buffer is a "moving window" that follows the camera.
+    // When camera moves, chunks are copied to different buffer positions,
+    // so we must subtract the region origin to get the correct buffer index.
+    int3 bufferPos = worldPos - int3(frame.regionOrigin.xyz);
+
+    // Bounds check (buffer-local coordinates)
+    if (bufferPos.x < 0 || bufferPos.x >= (int)frame.gridSizeX ||
+        bufferPos.y < 0 || bufferPos.y >= (int)frame.gridSizeY ||
+        bufferPos.z < 0 || bufferPos.z >= (int)frame.gridSizeZ) {
         return PackVoxel(MAT_AIR, 0, 0, 0);
     }
 
     uint3 gridSize = uint3(frame.gridSizeX, frame.gridSizeY, frame.gridSizeZ);
-    uint idx = LinearIndex3D(uint3(pos), gridSize);
+    uint idx = LinearIndex3D(uint3(bufferPos), gridSize);
     return VoxelGrid[idx];
 }
 
@@ -58,9 +64,10 @@ float4 Raymarch(float3 rayOrigin, float3 rayDir) {
     const float maxDist = 1024.0f;  // Increased for larger worlds
     const int maxSteps = 512;       // More steps for distant voxels
 
-    // Grid bounds (voxel coordinates)
-    float3 gridMin = float3(0.0f, 0.0f, 0.0f);
-    float3 gridMax = float3(frame.gridSizeX, frame.gridSizeY, frame.gridSizeZ);
+    // CRITICAL FIX: Grid bounds in WORLD coordinates (not buffer coordinates)
+    // The buffer is a moving window, so grid bounds = regionOrigin + bufferSize
+    float3 gridMin = frame.regionOrigin.xyz;
+    float3 gridMax = frame.regionOrigin.xyz + float3(frame.gridSizeX, frame.gridSizeY, frame.gridSizeZ);
 
     // Find ray entry point into grid
     float tMin, tMax;

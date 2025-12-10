@@ -126,9 +126,9 @@ Result<void> Chunk::Initialize(
         m_voxelSRV.cpu
     );
 
-    spdlog::debug("Chunk[{},{},{}] initialized - {} MB",
-        coord.x, coord.y, coord.z,
-        GetBufferSize() / (1024.0f * 1024.0f));
+    // spdlog::debug("Chunk[{},{},{}] initialized - {} MB",
+    //     coord.x, coord.y, coord.z,
+    //     GetBufferSize() / (1024.0f * 1024.0f));
 
     return {};
 }
@@ -244,9 +244,9 @@ Result<void> Chunk::Generate(
     // The InfiniteChunkManager will mark as Generated after the GPU fence signals
     m_state = ChunkState::GenerationSubmitted;
 
-    spdlog::debug("Chunk[{},{},{}] generation submitted - world offset ({},{},{})",
-        m_coord.x, m_coord.y, m_coord.z,
-        worldOffsetX, worldOffsetY, worldOffsetZ);
+    // spdlog::debug("Chunk[{},{},{}] generation submitted - world offset ({},{},{})",
+    //     m_coord.x, m_coord.y, m_coord.z,
+    //     worldOffsetX, worldOffsetY, worldOffsetZ);
 
     return {};
 }

@@ -145,6 +145,9 @@ void Renderer::RenderVoxels(
     uint32_t gridSizeY,
     uint32_t gridSizeZ,
     const CameraParams& camera,
+    float regionOriginX,
+    float regionOriginY,
+    float regionOriginZ,
     const BrushPreview* brushPreview)
 {
     if (!cmdList) return;
@@ -157,7 +160,7 @@ void Renderer::RenderVoxels(
     m_fullscreenPipeline.Bind(cmdList);
 
     // Create frame constants on stack (will be passed as root constants)
-    // Must match SharedTypes.hlsli FrameConstants exactly - 36 DWORDs (added 8 for brush)
+    // Must match SharedTypes.hlsli FrameConstants exactly - 40 DWORDs (added 4 for regionOrigin)
     struct FrameConstants {
         float cameraPosition[4];      // xyz = pos, w = fov
         float cameraForward[4];       // xyz = forward, w = aspectRatio
@@ -172,6 +175,7 @@ void Renderer::RenderVoxels(
         float viewportHeight;
         uint32_t frameIndex;
         uint32_t debugMode;
+        float regionOrigin[4];        // xyz = world origin, w = unused - CRITICAL FOR INFINITE WORLD!
         float brushPosition[4];       // xyz = position, w = radius
         float brushParams[4];         // x = material, y = shape, z = hasValidPosition, w = unused
     } constants = {};
@@ -212,6 +216,13 @@ void Renderer::RenderVoxels(
     constants.viewportHeight = static_cast<float>(m_height);
     constants.frameIndex = 0;
     constants.debugMode = 0;
+
+    // CRITICAL FIX: Fill in region origin for infinite world
+    // Shader MUST subtract this from world coords to sample correct buffer location
+    constants.regionOrigin[0] = regionOriginX;
+    constants.regionOrigin[1] = regionOriginY;
+    constants.regionOrigin[2] = regionOriginZ;
+    constants.regionOrigin[3] = 0.0f;  // unused
 
     // Fill in brush preview data (if provided)
     if (brushPreview && brushPreview->hasValidPosition) {
@@ -345,13 +356,13 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
 
     // Root signature parameters (for voxel rendering)
     // b0: FrameConstants (inline 32-bit constants)
-    // Layout: camPos(4) + camFwd(4) + camRight(4) + camUp(4) + sunDir(4) + grid(4) + viewport(4) + brushPos(4) + brushParams(4) = 36 DWORDs
+    // Layout: camPos(4) + camFwd(4) + camRight(4) + camUp(4) + sunDir(4) + grid(4) + viewport(4) + regionOrigin(4) + brushPos(4) + brushParams(4) = 40 DWORDs
     RootParameter frameConstantsParam;
     frameConstantsParam.type = RootParamType::Constants32Bit;
     frameConstantsParam.shaderRegister = 0;  // register b0
     frameConstantsParam.registerSpace = 0;   // space 0
     frameConstantsParam.visibility = D3D12_SHADER_VISIBILITY_ALL;
-    frameConstantsParam.num32BitValues = 36;  // sizeof(FrameConstants) / 4 (updated for brush preview)
+    frameConstantsParam.num32BitValues = 40;  // sizeof(FrameConstants) / 4 - UPDATED for regionOrigin!
     pipelineDesc.rootParams.push_back(frameConstantsParam);
 
     // t0: VoxelGrid SRV (descriptor table for structured buffer)

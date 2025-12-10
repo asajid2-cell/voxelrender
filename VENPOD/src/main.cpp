@@ -803,6 +803,7 @@ int main(int argc, char* argv[]) {
 
         // Render voxels with raymarch shader (using persistent shader-visible descriptors)
         // Brush preview now uses GPU raycasting (2,000,000x less bandwidth!)
+        glm::vec3 regionOrigin = voxelWorld->GetRegionOriginWorld();
         renderer->RenderVoxels(
             commandList.Get(),
             voxelWorld->GetReadBufferSRV(),
@@ -811,6 +812,9 @@ int main(int argc, char* argv[]) {
             voxelWorld->GetGridSizeY(),
             voxelWorld->GetGridSizeZ(),
             cameraParams,
+            regionOrigin.x,
+            regionOrigin.y,
+            regionOrigin.z,
             &brushPreview  // GPU result handles validity internally
         );
 
@@ -854,9 +858,9 @@ int main(int argc, char* argv[]) {
         frameCount++;
 
         // Log FPS every 100 frames
-        if (frameCount % 100 == 0) {
-            spdlog::debug("Frame {}", frameCount);
-        }
+        // if (frameCount % 100 == 0) {
+        //     spdlog::debug("Frame {}", frameCount);
+        // }
     }
 
     spdlog::info("Shutting down...");

@@ -487,7 +487,7 @@ Result<void> InfiniteChunkManager::GenerateNextChunk(
     uint32_t currentDescriptors = m_heapManager->GetShaderVisibleCbvSrvUavAllocatedCount();
     uint32_t maxDescriptors = heap->GetDesc().NumDescriptors;
 
-    spdlog::debug("HEAP CHECK: {}/{} descriptors allocated", currentDescriptors, maxDescriptors);
+    // spdlog::debug("HEAP CHECK: {}/{} descriptors allocated", currentDescriptors, maxDescriptors);
 
     if (currentDescriptors + DESCRIPTORS_PER_CHUNK + SAFETY_MARGIN > maxDescriptors) {
         // CRITICAL FIX: Apply re-queue limit to prevent infinite loops when heap is full
@@ -515,8 +515,8 @@ Result<void> InfiniteChunkManager::GenerateNextChunk(
 
     // NOW safe to reset this allocator (GPU has finished with it)
     // FIX #7: Check HRESULT - if Reset() fails, re-queue chunk and skip this frame
-    spdlog::debug("SYNC CHECK: About to reset allocator {} (fence value: {}, GPU completed: {})",
-        allocatorIndex, allocatorFenceValue, m_chunkFence->GetCompletedValue());
+    // spdlog::debug("SYNC CHECK: About to reset allocator {} (fence value: {}, GPU completed: {})",
+    //     allocatorIndex, allocatorFenceValue, m_chunkFence->GetCompletedValue());
 
     // CRITICAL ASSERTION: Verify allocator is not nullptr before reset
     if (!m_chunkCmdAllocators[allocatorIndex]) {
@@ -531,7 +531,7 @@ Result<void> InfiniteChunkManager::GenerateNextChunk(
             allocatorIndex, static_cast<uint32_t>(hr), coord.x, coord.y, coord.z);
         return Error("Command allocator Reset() failed");
     }
-    spdlog::debug("SYNC CHECK: Allocator {} reset successful", allocatorIndex);
+    // spdlog::debug("SYNC CHECK: Allocator {} reset successful", allocatorIndex);
 
     hr = m_chunkCmdList->Reset(m_chunkCmdAllocators[allocatorIndex].Get(), nullptr);
     if (FAILED(hr)) {
@@ -605,8 +605,8 @@ Result<void> InfiniteChunkManager::GenerateNextChunk(
         }
     }
 
-    spdlog::debug("Chunk [{},{},{}] generation submitted (fence {}), {} chunks loaded, next allocator: {}",
-        coord.x, coord.y, coord.z, m_chunkFenceValue, m_loadedChunks.size(), m_currentAllocatorIndex);
+    // spdlog::debug("Chunk [{},{},{}] generation submitted (fence {}), {} chunks loaded, next allocator: {}",
+    //     coord.x, coord.y, coord.z, m_chunkFenceValue, m_loadedChunks.size(), m_currentAllocatorIndex);
 
     return {};
 }
@@ -918,8 +918,8 @@ void InfiniteChunkManager::VerifyGeneratedChunks() {
                 chunk->MarkGenerated();
                 chunksCompleted++;
 
-                spdlog::debug("Chunk [{},{},{}] generation COMPLETED (fence {} signaled)",
-                    coord.x, coord.y, coord.z, chunkFenceValue);
+                // spdlog::debug("Chunk [{},{},{}] generation COMPLETED (fence {} signaled)",
+                //     coord.x, coord.y, coord.z, chunkFenceValue);
             }
 
             // Remove from pending list

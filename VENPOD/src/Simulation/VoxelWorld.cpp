@@ -605,108 +605,130 @@ void VoxelWorld::UpdateChunks(
     }
     bool newChunksGenerated = (currentGeneratedCount != lastGeneratedCount);
 
-    // Update if camera moved OR if new chunks were generated
-    if (chunkChanged || newChunksGenerated) {
-        // CACHE CLEANUP: When camera moves, remove chunks outside the new active region
-        // from the cache. Otherwise, old chunk coordinates accumulate forever and could
-        // cause stale cache hits when the player returns to a previously visited area
-        // (the buffer was overwritten with new chunks while they were away).
-        if (chunkChanged) {
-            for (int bufIdx = 0; bufIdx < 2; ++bufIdx) {
-                auto& cache = m_copiedChunksPerBuffer[bufIdx];
-                for (auto it = cache.begin(); it != cache.end(); ) {
-                    const ChunkCoord& coord = *it;
-                    // FIX: Check if chunk is within new 9×2×9 active region
-                    // Horizontal: dx,dz ∈ [-4..4] relative to camera (9 chunks)
-                    // Vertical:   y must be in terrain chunk range (absolute coords Y=0,1)
-                    int32_t dx = coord.x - cameraChunk.x;
-                    int32_t dz = coord.z - cameraChunk.z;
-                    bool inVerticalRange = (coord.y >= TERRAIN_CHUNK_MIN_Y &&
-                                             coord.y < TERRAIN_CHUNK_MIN_Y + TERRAIN_NUM_CHUNKS_Y);
-                    if (dx < -RENDER_DISTANCE_HORIZONTAL || dx > RENDER_DISTANCE_HORIZONTAL ||
-                        dz < -RENDER_DISTANCE_HORIZONTAL || dz > RENDER_DISTANCE_HORIZONTAL ||
-                        !inVerticalRange) {
-                        it = cache.erase(it);  // Outside active region, remove
-                    } else {
-                        ++it;
-                    }
-                }
-            }
-        }
+    // ============================================================================
+    // CRITICAL FIX: Update activeRegionCenter with HYSTERESIS to prevent constant stuttering!
+    //
+    // Problem: Updating m_activeRegionCenter every chunk boundary (every 64 voxels) causes:
+    // 1. RegionOrigin shifts by 64 voxels
+    // 2. Cache invalidation forces re-copying ALL 1,250 chunks
+    // 3. For 2-3 frames, buffer has mismatched data/origin → flickering and visual jump
+    // 4. This happens every 64 voxels → constant stuttering
+    //
+    // Solution: Only shift the render buffer when camera gets FAR from center (e.g., 8+ chunks).
+    // This reduces buffer shifts from every 64 voxels to every ~512 voxels (8 chunks * 64).
+    // ============================================================================
+    bool bufferNeedsShift = false;
+    if (chunkChanged) {
+        // Calculate distance from camera to current buffer center
+        int dx = abs(cameraChunk.x - m_activeRegionCenter.x);
+        int dz = abs(cameraChunk.z - m_activeRegionCenter.z);
 
-        // CRITICAL FIX: When camera moves to new chunk, buffer layout shifts!
+        // Only shift buffer if camera is more than 8 chunks from current center
+        // (12 chunk radius - 4 chunk margin = 8 chunk threshold)
+        constexpr int SHIFT_THRESHOLD = 8;
+        if (dx > SHIFT_THRESHOLD || dz > SHIFT_THRESHOLD) {
+            m_activeRegionCenter = cameraChunk;
+            bufferNeedsShift = true;
+            spdlog::info("Buffer center shifted from chunk [{},{},{}] to [{},{},{}] (distance: dx={}, dz={})",
+                m_activeRegionCenter.x - (cameraChunk.x - m_activeRegionCenter.x),
+                m_activeRegionCenter.y,
+                m_activeRegionCenter.z - (cameraChunk.z - m_activeRegionCenter.z),
+                cameraChunk.x, cameraChunk.y, cameraChunk.z,
+                dx, dz);
+        }
+    }
+
+    // ============================================================================
+    // CRITICAL FIX: Compute region origin EVERY FRAME (not just on chunk changes)!
+    // The shader MUST have an up-to-date regionOrigin to correctly map world
+    // coordinates to buffer coordinates. If we only update on chunk boundaries,
+    // the camera can move 0-63 voxels with a stale regionOrigin, causing the
+    // treadmill effect where terrain appears to slide backwards.
+    // ============================================================================
+
+    // Compute world-space origin (in voxel coordinates) of the 1600×128×1600 buffer.
+    // FIX: UpdateActiveRegion copies chunks in the range:
+    //   dx,dz ∈ [-12..12] (25 horizontal chunks) - relative to camera
+    //   y ∈ [0..1]        (2 vertical chunks, ABSOLUTE terrain layers)
+    // into the buffer at offsets (dx+12, y, dz+12)*64.
+    // That means voxel (0,0,0) in the buffer corresponds to chunk
+    // (camera.x-12, 0, camera.z-12) * INFINITE_CHUNK_SIZE in world space.
+    {
+        int32_t baseChunkX = m_activeRegionCenter.x - RENDER_DISTANCE_HORIZONTAL;
+        int32_t baseChunkY = 0;  // FIX: Always Y=0 (terrain starts at chunk Y=0)
+        int32_t baseChunkZ = m_activeRegionCenter.z - RENDER_DISTANCE_HORIZONTAL;
+        constexpr int32_t chunkSize = INFINITE_CHUNK_SIZE;
+
+        m_regionOriginWorld = glm::vec3(
+            static_cast<float>(baseChunkX * chunkSize),
+            static_cast<float>(baseChunkY * chunkSize),
+            static_cast<float>(baseChunkZ * chunkSize));
+    }
+
+    // Log when region origin shifts (only when buffer actually shifts, not every chunk change)
+    if (bufferNeedsShift) {
+        spdlog::info("Region origin shifted to world voxel ({},{},{}) - Cache invalidated",
+            static_cast<int>(m_regionOriginWorld.x),
+            static_cast<int>(m_regionOriginWorld.y),
+            static_cast<int>(m_regionOriginWorld.z));
+    }
+
+    // DIAGNOSTIC: Log camera position and chunk periodically
+    static int diagFrameCount = 0;
+    static bool firstFrameLogged = false;
+    if (++diagFrameCount >= 60 || !firstFrameLogged) {
+        // Calculate what the shader will compute
+        glm::vec3 bufferPos = cameraPos - m_regionOriginWorld;
+        spdlog::info("[CAMERA DIAG] Pos=({:.1f},{:.1f},{:.1f}) Chunk=[{},{},{}] RegionOrigin=({:.0f},{:.0f},{:.0f}) BufferPos=({:.1f},{:.1f},{:.1f})",
+            cameraPos.x, cameraPos.y, cameraPos.z,
+            cameraChunk.x, cameraChunk.y, cameraChunk.z,
+            m_regionOriginWorld.x, m_regionOriginWorld.y, m_regionOriginWorld.z,
+            bufferPos.x, bufferPos.y, bufferPos.z);
+        diagFrameCount = 0;
+        firstFrameLogged = true;
+    }
+
+    // Update if buffer needs shift OR if new chunks were generated
+    if (bufferNeedsShift || newChunksGenerated) {
+        // CRITICAL FIX: When buffer center shifts, buffer layout changes!
         // All cached chunk positions become INVALID because destX/Y/Z calculations
         // depend on m_activeRegionCenter. Example:
         //   Frame 1 (camera chunk 0): chunk (5,0,5) → destX = (5-0+12)*64 = 1088
-        //   Frame 2 (camera chunk 1): chunk (5,0,5) → destX = (5-1+12)*64 = 1024
-        // Cache says "chunk already copied" but it's at WRONG offset (1088 not 1024)!
+        //   Frame 2 (camera chunk 8): chunk (5,0,5) → destX = (5-8+12)*64 = 576
+        // Cache says "chunk already copied" but it's at WRONG offset (1088 not 576)!
         // This causes persistent flickering holes in terrain.
-        if (cameraChunk != m_activeRegionCenter) {
-            spdlog::info("Camera moved to new chunk [{},{},{}] - Invalidating GPU buffer cache (window shifted)",
-                        cameraChunk.x, cameraChunk.y, cameraChunk.z);
+        //
+        // NOTE: With hysteresis, this only happens when camera moves 8+ chunks from
+        // current buffer center (every ~512 voxels), not every chunk boundary (64 voxels).
+        if (bufferNeedsShift) {
             m_copiedChunksPerBuffer[0].clear();
             m_copiedChunksPerBuffer[1].clear();
+
+            // FIX #2: Reset frame counter to trigger aggressive chunk copying
+            // After cache invalidation, we need to refill BOTH buffers ASAP to prevent
+            // holes and floating chunks. This flag is checked in UpdateActiveRegion to
+            // temporarily disable the dual-buffer skip optimization.
+            m_framesAfterCacheInvalidation = 0;
         }
 
-        m_activeRegionCenter = cameraChunk;
         lastProcessedChunk = cameraChunk;
         lastGeneratedCount = currentGeneratedCount;
-
-        // Compute world-space origin (in voxel coordinates) of the 1600×128×1600 buffer.
-        // FIX: UpdateActiveRegion copies chunks in the range:
-        //   dx,dz ∈ [-12..12] (25 horizontal chunks) - relative to camera
-        //   y ∈ [0..1]        (2 vertical chunks, ABSOLUTE terrain layers)
-        // into the buffer at offsets (dx+12, y, dz+12)*64.
-        // That means voxel (0,0,0) in the buffer corresponds to chunk
-        // (camera.x-12, 0, camera.z-12) * INFINITE_CHUNK_SIZE in world space.
-        glm::vec3 oldRegionOrigin = m_regionOriginWorld;
-        {
-            int32_t baseChunkX = m_activeRegionCenter.x - RENDER_DISTANCE_HORIZONTAL;
-            int32_t baseChunkY = 0;  // FIX: Always Y=0 (terrain starts at chunk Y=0)
-            int32_t baseChunkZ = m_activeRegionCenter.z - RENDER_DISTANCE_HORIZONTAL;
-            constexpr int32_t chunkSize = INFINITE_CHUNK_SIZE;
-
-            m_regionOriginWorld = glm::vec3(
-                static_cast<float>(baseChunkX * chunkSize),
-                static_cast<float>(baseChunkY * chunkSize),
-                static_cast<float>(baseChunkZ * chunkSize));
-
-            // DIAGNOSTIC: Log region setup only once
-            static bool regionLogged = false;
-            if (!regionLogged) {
-                spdlog::info("[REGION] Camera chunk [{},{},{}], base chunk [{},{},{}], region origin world [{},{},{}]",
-                    m_activeRegionCenter.x, m_activeRegionCenter.y, m_activeRegionCenter.z,
-                    baseChunkX, baseChunkY, baseChunkZ,
-                    static_cast<int>(m_regionOriginWorld.x),
-                    static_cast<int>(m_regionOriginWorld.y),
-                    static_cast<int>(m_regionOriginWorld.z));
-                regionLogged = true;
-            }
-        }
-
-        // Log when region origin shifts (helps correlate flicker with coordinate changes)
-        if (chunkChanged) {
-            spdlog::debug("Region origin shifted to world voxel ({},{},{})",
-                static_cast<int>(m_regionOriginWorld.x),
-                static_cast<int>(m_regionOriginWorld.y),
-                static_cast<int>(m_regionOriginWorld.z));
-        }
 
         // CRITICAL FIX: Poll for completed chunks RIGHT BEFORE UpdateActiveRegion
         // This catches chunks that JUST finished generating in this frame's Update() call
         // Without this, UpdateActiveRegion won't see newly completed chunks until next frame
         m_chunkManager->PollCompletedChunks();
 
-        UpdateActiveRegion(device, cmdQueue, chunkChanged);
+        UpdateActiveRegion(device, cmdQueue, bufferNeedsShift);
 
-        if (chunkChanged) {
-            spdlog::debug("Camera at chunk [{},{},{}] - updating active region",
+        if (bufferNeedsShift) {
+            spdlog::debug("Camera at chunk [{},{},{}] - updating active region (buffer shifted)",
                 cameraChunk.x, cameraChunk.y, cameraChunk.z);
         }
-        if (newChunksGenerated) {
-            spdlog::debug("New chunks generated ({} total GENERATED, {} total loaded) - updating active region",
-                currentGeneratedCount, m_chunkManager->GetLoadedChunkCount());
-        }
+        // if (newChunksGenerated) {
+        //     spdlog::debug("New chunks generated ({} total GENERATED, {} total loaded) - updating active region",
+        //         currentGeneratedCount, m_chunkManager->GetLoadedChunkCount());
+        // }
     }
 
     // Log chunk changes for debugging
@@ -744,8 +766,8 @@ void VoxelWorld::InvalidateCopiedChunk(const ChunkCoord& coord) {
             m_copiedChunksPerBuffer[i].erase(it);
         }
     }
-    spdlog::debug("Invalidated chunk [{},{},{}] from copy caches (modified)",
-        coord.x, coord.y, coord.z);
+    // spdlog::debug("Invalidated chunk [{},{},{}] from copy caches (modified)",
+    //     coord.x, coord.y, coord.z);
 }
 
 Result<void> VoxelWorld::CreateChunkCopyPipeline(ID3D12Device* device) {
@@ -1191,12 +1213,26 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* /*device*/, ID3D12CommandQueue
                 bool inWriteBuffer = (m_copiedChunksPerBuffer[writeBufferIndex].find(chunkCoord) != m_copiedChunksPerBuffer[writeBufferIndex].end());
                 bool inReadBuffer = (m_copiedChunksPerBuffer[readBufferIndex].find(chunkCoord) != m_copiedChunksPerBuffer[readBufferIndex].end());
 
-                if (inWriteBuffer && inReadBuffer) {
-                    chunksSkipped++;
-                    continue;  // Already in BOTH buffers - skip
+                // FIX #2 OPTIMIZATION: During cache refill period (first 3 frames after invalidation),
+                // ALWAYS copy chunks to WRITE buffer even if they're in READ buffer.
+                // This aggressively refills BOTH buffers to eliminate holes/floating chunks.
+                // After 3 frames, revert to normal optimization (skip if in both buffers).
+                bool shouldSkip = false;
+                if (m_framesAfterCacheInvalidation >= 3) {
+                    // Normal mode: skip only if in BOTH buffers
+                    shouldSkip = (inWriteBuffer && inReadBuffer);
+                } else {
+                    // Aggressive refill mode: skip only if already in WRITE buffer
+                    // (READ buffer will get synced when we swap at end of frame)
+                    shouldSkip = inWriteBuffer;
                 }
 
-                // If missing from one or both buffers, we need to copy
+                if (shouldSkip) {
+                    chunksSkipped++;
+                    continue;
+                }
+
+                // If missing from write buffer (or during refill period), we need to copy
 
                 Chunk* chunk = it->second;
 
@@ -1370,8 +1406,8 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* /*device*/, ID3D12CommandQueue
         // This prevents race condition: UpdateChunks→WRITE, Physics reads READ writes WRITE, then swap.
 
         // PERFORMANCE FIX: Only log at debug level (info logs cause lag on Windows)
-        spdlog::debug("UpdateActiveRegion: Copied {} NEW chunks ({} skipped, {} not generated) to WRITE buffer",
-            chunksCopied, chunksSkipped, chunksNotGenerated);
+        // spdlog::debug("UpdateActiveRegion: Copied {} NEW chunks ({} skipped, {} not generated) to WRITE buffer",
+        //     chunksCopied, chunksSkipped, chunksNotGenerated);
 
         // CRITICAL FIX: Only advance allocator index AFTER successful execution!
         // This ensures we don't skip allocators when no chunks are copied.
@@ -1393,6 +1429,15 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* /*device*/, ID3D12CommandQueue
     // NOTE: We do NOT wait for GPU completion here!
     // The ring buffer (3 allocators) ensures we won't reuse this allocator
     // for at least 2 more UpdateActiveRegion calls. GPU has plenty of time to complete.
+
+    // FIX #2: Increment frame counter for cache refill tracking
+    // After 3 frames, aggressive copying mode is disabled (normal dual-buffer optimization resumes)
+    if (m_framesAfterCacheInvalidation < 3) {
+        m_framesAfterCacheInvalidation++;
+        if (m_framesAfterCacheInvalidation == 3) {
+            spdlog::info("Cache refill complete - reverting to normal dual-buffer optimization");
+        }
+    }
 }
 
 } // namespace VENPOD::Simulation
