@@ -2,6 +2,7 @@
 #include "TerrainConstants.h"
 #include "../Graphics/RHI/d3dx12.h"
 #include <spdlog/spdlog.h>
+#include <algorithm>
 
 namespace VENPOD::Simulation {
 
@@ -434,19 +435,43 @@ void PhysicsDispatcher::DispatchBrush(
 
     auto dispatchSize = world.GetDispatchSize(8);
 
-    // Paint to WRITE buffer ONLY
-    // The ping-pong system works like this:
-    // - Physics reads from WRITE, writes to WRITE (in-place)
-    // - Brush paints to WRITE
-    // - SwapBuffers makes WRITE become READ for rendering
-    // - Next frame: old READ becomes new WRITE, gets chunks copied to it
+    // Paint to BOTH buffers to ensure painted voxels persist across buffer swaps!
     //
-    // Painting to both buffers causes race conditions with physics!
+    // CRITICAL: We paint BEFORE physics runs, so physics will process our painted voxels.
+    // Painting to both buffers ensures:
+    // 1. WRITE buffer: Physics will see and process painted voxels this frame
+    // 2. READ buffer: Rendered this frame (immediate visual feedback)
+    //
+    // After physics + swap, both buffers will have consistent state because:
+    // - WRITE (with physics) becomes READ for next frame's render
+    // - READ (painted but no physics) becomes WRITE, gets overwritten by next physics
+    //
+    // The result: Painted voxels appear immediately and persist correctly.
+
+    // 1. Paint to READ buffer FIRST (immediate visual feedback - rendered this frame!)
+    world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_brushPipeline.SetRootDescriptorTable(cmdList, 1, world.GetReadBufferUAV().gpu);
+    m_brushPipeline.Dispatch(cmdList, dispatchSize.x, dispatchSize.y, dispatchSize.z);
+
+    // UAV barrier on READ buffer
+    {
+        auto& readBuffer = world.GetReadBuffer();
+        ID3D12Resource* resource = readBuffer.GetResource();
+        if (resource) {
+            D3D12_RESOURCE_BARRIER barrier = {};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+            barrier.UAV.pResource = resource;
+            cmdList->ResourceBarrier(1, &barrier);
+        }
+    }
+
+    // 2. Paint to WRITE buffer (physics will process this, then it becomes READ after swap)
     world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_brushPipeline.SetRootDescriptorTable(cmdList, 1, world.GetWriteBufferUAV().gpu);
     m_brushPipeline.Dispatch(cmdList, dispatchSize.x, dispatchSize.y, dispatchSize.z);
 
-    // UAV barrier on WRITE buffer (ensures brush completes before chunk scan/physics)
+    // UAV barrier on WRITE buffer
     {
         auto& writeBuffer = world.GetWriteBuffer();
         ID3D12Resource* resource = writeBuffer.GetResource();
@@ -696,28 +721,28 @@ void PhysicsDispatcher::DispatchChunkScan(
     constants.chunkSize = CHUNK_SIZE;
     constants.sleepThreshold = m_sleepThreshold;
 
-    // PERFORMANCE OPTIMIZATION: Scan a LIMITED region around the buffer center
-    // 80,000 chunks (100x8x100) per frame is way too expensive!
+    // PERFORMANCE OPTIMIZATION: Scan a region around the buffer center
     //
-    // Physics simulation only needs to run in a small region near the player.
-    // We scan a 32x8x32 region (8,192 chunks) centered in the buffer instead of the full 80,000.
-    // This is ~10x faster while still covering a 512x128x512 voxel area for physics.
+    // The full render buffer is 25x2x25 chunks (1600x128x1600 voxels).
+    // We scan most of it for physics so sand/water works across the visible area.
     //
-    // The center of the buffer is where chunks get copied (camera position maps to buffer center).
-    constexpr uint32_t PHYSICS_REGION_SIZE_X = 32;  // 32 chunks = 512 voxels
-    constexpr uint32_t PHYSICS_REGION_SIZE_Z = 32;  // 32 chunks = 512 voxels
+    // Using 16-voxel physics chunks: 1600/16 = 100 chunks per axis
+    // Scan the full visible region (25 render chunks = 100 physics chunks per axis)
+    constexpr uint32_t PHYSICS_REGION_SIZE_X = 100;  // Full width (1600 voxels / 16 = 100 physics chunks)
+    constexpr uint32_t PHYSICS_REGION_SIZE_Z = 100;  // Full depth
 
     uint32_t fullChunksX = chunkManager.GetChunkCountX();  // 100
     uint32_t fullChunksY = chunkManager.GetChunkCountY();  // 8
     uint32_t fullChunksZ = chunkManager.GetChunkCountZ();  // 100
 
-    // Calculate centered region offset
-    int32_t offsetX = (fullChunksX - PHYSICS_REGION_SIZE_X) / 2;  // (100-32)/2 = 34
-    int32_t offsetZ = (fullChunksZ - PHYSICS_REGION_SIZE_Z) / 2;  // (100-32)/2 = 34
+    // Use full region or configured size, whichever is smaller
+    uint32_t dispatchX = std::min(PHYSICS_REGION_SIZE_X, fullChunksX);
+    uint32_t dispatchY = fullChunksY;  // Always full height
+    uint32_t dispatchZ = std::min(PHYSICS_REGION_SIZE_Z, fullChunksZ);
 
-    uint32_t dispatchX = PHYSICS_REGION_SIZE_X;  // 32 chunks
-    uint32_t dispatchY = fullChunksY;            // 8 chunks (full height)
-    uint32_t dispatchZ = PHYSICS_REGION_SIZE_Z;  // 32 chunks
+    // Calculate centered region offset (0 if using full region)
+    int32_t offsetX = static_cast<int32_t>((fullChunksX - dispatchX) / 2);
+    int32_t offsetZ = static_cast<int32_t>((fullChunksZ - dispatchZ) / 2);
 
     // Pass the offset to the shader so it knows where the scanned region starts
     constants.activeRegionOffsetX = offsetX;
