@@ -891,11 +891,12 @@ int RunSandbox(int argc, char* argv[]) {
         // Transition read buffer to pixel shader resource for rendering
         voxelWorld->TransitionReadBufferTo(commandList.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-        // Build camera params for shader (camera in LOCAL grid space)
+        // Build camera params for shader (camera in WORLD coordinates)
+        // The shader uses regionOrigin to convert world→buffer coordinates internally
         Graphics::Renderer::CameraParams cameraParams;
-        cameraParams.posX = cameraPosLocal.x;
-        cameraParams.posY = cameraPosLocal.y;
-        cameraParams.posZ = cameraPosLocal.z;
+        cameraParams.posX = cameraPos.x;
+        cameraParams.posY = cameraPos.y;
+        cameraParams.posZ = cameraPos.z;
         cameraParams.forwardX = cameraForward.x;
         cameraParams.forwardY = cameraForward.y;
         cameraParams.forwardZ = cameraForward.z;
@@ -911,11 +912,11 @@ int RunSandbox(int argc, char* argv[]) {
         // Build brush preview params from GPU raycast result (NEW!)
         Graphics::Renderer::BrushPreview brushPreview = {};
         if (gpuRaycastResult.hasValidPosition) {
-            // GPU raycast outputs local 256^3 grid coordinates; renderer expects the
-            // same space as the camera, so we pass them through directly.
-            brushPreview.posX = gpuRaycastResult.posX;
-            brushPreview.posY = gpuRaycastResult.posY;
-            brushPreview.posZ = gpuRaycastResult.posZ;
+            // GPU raycast outputs LOCAL buffer coordinates (0 to gridSize)
+            // Shader expects WORLD coordinates, so add regionOrigin to convert
+            brushPreview.posX = gpuRaycastResult.posX + regionOriginWorld.x;
+            brushPreview.posY = gpuRaycastResult.posY + regionOriginWorld.y;
+            brushPreview.posZ = gpuRaycastResult.posZ + regionOriginWorld.z;
             brushPreview.radius = brushController.GetRadius();
             brushPreview.material = brushController.GetMaterial();
             brushPreview.shape = static_cast<uint32_t>(brushController.GetShape());

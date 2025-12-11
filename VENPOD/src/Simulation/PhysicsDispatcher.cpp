@@ -434,13 +434,19 @@ void PhysicsDispatcher::DispatchBrush(
 
     auto dispatchSize = world.GetDispatchSize(8);
 
-    // PRIORITY 1 FIX: Paint to WRITE buffer (not READ!)
-    // WRITE buffer already has chunks from UpdateActiveRegion, we add painted voxels
+    // Paint to WRITE buffer ONLY
+    // The ping-pong system works like this:
+    // - Physics reads from WRITE, writes to WRITE (in-place)
+    // - Brush paints to WRITE
+    // - SwapBuffers makes WRITE become READ for rendering
+    // - Next frame: old READ becomes new WRITE, gets chunks copied to it
+    //
+    // Painting to both buffers causes race conditions with physics!
     world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_brushPipeline.SetRootDescriptorTable(cmdList, 1, world.GetWriteBufferUAV().gpu);
     m_brushPipeline.Dispatch(cmdList, dispatchSize.x, dispatchSize.y, dispatchSize.z);
 
-    // UAV barrier on WRITE buffer (ensures brush completes before chunk scan)
+    // UAV barrier on WRITE buffer (ensures brush completes before chunk scan/physics)
     {
         auto& writeBuffer = world.GetWriteBuffer();
         ID3D12Resource* resource = writeBuffer.GetResource();
@@ -690,33 +696,41 @@ void PhysicsDispatcher::DispatchChunkScan(
     constants.chunkSize = CHUNK_SIZE;
     constants.sleepThreshold = m_sleepThreshold;
 
-    // FIX: ALWAYS use ChunkManager's chunk counts (16-voxel physics chunks)
-    // ChunkManager is initialized with the render buffer size (1600x128x1600) divided by CHUNK_SIZE (16)
-    // This gives us 100x8x100 = 80,000 physics chunks to scan.
+    // PERFORMANCE OPTIMIZATION: Scan a LIMITED region around the buffer center
+    // 80,000 chunks (100x8x100) per frame is way too expensive!
     //
-    // Previously, infinite chunks mode incorrectly used RENDER_BUFFER_CHUNKS_X/Y/Z (25x2x25)
-    // which are 64-voxel STREAMING chunks - completely different coordinate system!
+    // Physics simulation only needs to run in a small region near the player.
+    // We scan a 32x8x32 region (8,192 chunks) centered in the buffer instead of the full 80,000.
+    // This is ~10x faster while still covering a 512x128x512 voxel area for physics.
     //
-    // The chunk scanner and physics shader MUST use the same coordinate system:
-    // - Both operate on the LOCAL render buffer (not world coordinates)
-    // - Both use CHUNK_SIZE=16 for physics simulation
-    // - activeRegionOffset is NOT needed here since we scan the LOCAL buffer
-    uint32_t dispatchX = chunkManager.GetChunkCountX();  // 100 chunks (1600/16)
-    uint32_t dispatchY = chunkManager.GetChunkCountY();  // 8 chunks (128/16)
-    uint32_t dispatchZ = chunkManager.GetChunkCountZ();  // 100 chunks (1600/16)
+    // The center of the buffer is where chunks get copied (camera position maps to buffer center).
+    constexpr uint32_t PHYSICS_REGION_SIZE_X = 32;  // 32 chunks = 512 voxels
+    constexpr uint32_t PHYSICS_REGION_SIZE_Z = 32;  // 32 chunks = 512 voxels
 
-    // activeRegionOffset is set to 0 because scanner operates on LOCAL buffer coordinates
-    // The world-to-local mapping is handled by UpdateActiveRegion (chunk copying)
-    constants.activeRegionOffsetX = 0;
-    constants.activeRegionOffsetY = 0;
-    constants.activeRegionOffsetZ = 0;
+    uint32_t fullChunksX = chunkManager.GetChunkCountX();  // 100
+    uint32_t fullChunksY = chunkManager.GetChunkCountY();  // 8
+    uint32_t fullChunksZ = chunkManager.GetChunkCountZ();  // 100
+
+    // Calculate centered region offset
+    int32_t offsetX = (fullChunksX - PHYSICS_REGION_SIZE_X) / 2;  // (100-32)/2 = 34
+    int32_t offsetZ = (fullChunksZ - PHYSICS_REGION_SIZE_Z) / 2;  // (100-32)/2 = 34
+
+    uint32_t dispatchX = PHYSICS_REGION_SIZE_X;  // 32 chunks
+    uint32_t dispatchY = fullChunksY;            // 8 chunks (full height)
+    uint32_t dispatchZ = PHYSICS_REGION_SIZE_Z;  // 32 chunks
+
+    // Pass the offset to the shader so it knows where the scanned region starts
+    constants.activeRegionOffsetX = offsetX;
+    constants.activeRegionOffsetY = 0;  // Always start at Y=0
+    constants.activeRegionOffsetZ = offsetZ;
 
     // Log only once per second to avoid spam
     static int activeRegionLogThrottle = 0;
     if (++activeRegionLogThrottle % 60 == 1) {
-        spdlog::debug("DispatchChunkScan: Scanning {}×{}×{} = {} physics chunks (CHUNK_SIZE=16)",
+        spdlog::debug("DispatchChunkScan: Scanning {}×{}×{} = {} physics chunks at offset ({},{},{})",
             dispatchX, dispatchY, dispatchZ,
-            dispatchX * dispatchY * dispatchZ);
+            dispatchX * dispatchY * dispatchZ,
+            offsetX, 0, offsetZ);
     }
 
     m_chunkScanPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
