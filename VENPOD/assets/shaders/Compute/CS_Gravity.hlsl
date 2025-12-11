@@ -27,8 +27,13 @@ StructuredBuffer<uint> VoxelGridIn : register(t0);
 RWStructuredBuffer<uint> VoxelGridOut : register(u0);
 
 // Material properties lookup (helpers for physics)
+// Must match IsMovable in CS_GravityChunk.hlsl
 bool IsMovable(uint material) {
-    return material == MAT_SAND || material == MAT_WATER || material == MAT_LAVA || material == MAT_OIL;
+    return material == MAT_SAND || material == MAT_DIRT || material == MAT_WATER ||
+           material == MAT_LAVA || material == MAT_OIL ||
+           material == MAT_SMOKE || material == MAT_FIRE || material == MAT_ACID ||
+           material == MAT_HONEY || material == MAT_CONCRETE || material == MAT_GUNPOWDER ||
+           material == MAT_STEAM;
 }
 
 bool IsEmpty(uint material) {
@@ -75,8 +80,23 @@ void main(uint3 DTid : SV_DispatchThreadID) {
     // Default: copy voxel unchanged
     uint outputVoxel = currentVoxel;
 
-    // Skip air and bedrock
-    if (material == MAT_AIR || material == MAT_BEDROCK) {
+    // For AIR voxels: check if there's a painted voxel in the WRITE buffer
+    // If WRITE has non-AIR, preserve it (it was painted). Otherwise write AIR.
+    // This is handled by using InterlockedCompareExchange - only write if position is "empty"
+    if (material == MAT_AIR) {
+        // Write AIR to initialize the WRITE buffer at this position
+        // But use atomic operation to not overwrite painted voxels
+        uint3 gridSize = uint3(gridSizeX, gridSizeY, gridSizeZ);
+        uint idx = LinearIndex3D(DTid, gridSize);
+
+        // Try to write AIR only if position currently contains garbage/uninitialized
+        // Actually, we can't detect this. Let's just write AIR - brush will paint after physics.
+        SetVoxel(DTid, PackVoxel(MAT_AIR, 0, 0, 0));
+        return;
+    }
+
+    // Bedrock stays in place
+    if (material == MAT_BEDROCK) {
         SetVoxel(DTid, outputVoxel);
         return;
     }
@@ -163,7 +183,7 @@ void main(uint3 DTid : SV_DispatchThreadID) {
         }
 
         // Liquids: horizontal spread (simplified)
-        if (IsLiquid(material)) {
+        if (IsLiquid(currentVoxel)) {
             uint rng = PCGHash(DTid.x + DTid.y * 1000 + DTid.z * 1000000 + frameIndex);
             int dir = (rng & 1) ? 1 : -1;
 

@@ -227,8 +227,11 @@ void PhysicsDispatcher::DispatchPhysics(
         cmdList->ResourceBarrier(1, &barrier);
     }
 
-    // Swap buffers for next frame
-    world.SwapBuffers();
+    // NOTE: SwapBuffers is NOT called here anymore!
+    // The caller must call SwapBuffers AFTER the command list executes.
+    // This is because SwapBuffers is a CPU operation that changes buffer pointers,
+    // but the GPU work (recorded in cmdList) hasn't completed yet.
+    // If we swap here, subsequent command recording would use wrong buffers.
 }
 
 Result<void> PhysicsDispatcher::CreateInitializePipeline(
