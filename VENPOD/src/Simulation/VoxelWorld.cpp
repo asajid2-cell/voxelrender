@@ -764,17 +764,20 @@ glm::vec3 VoxelWorld::UpdateChunks(
     }
 
     // ============================================================================
-    // SIMPLE APPROACH: Keep regionOrigin at (0,0,0)
+    // regionOrigin tells shader where buffer position (0,0,0) is in world coords
     //
-    // The render buffer represents world coordinates starting at (0,0,0).
-    // Chunks are copied to buffer positions matching their world coordinates.
-    // This means only chunks with positive world coords will be visible.
+    // Chunks are copied to buffer with offset:
+    //   destX = (chunkCoord.x - activeRegionCenter.x + RENDER_DISTANCE) * 64
     //
-    // For infinite world support later, we'll need to shift regionOrigin
-    // and adjust chunk copy destinations together. For now, keep it simple.
+    // So buffer (0,0,0) = world chunk (activeRegionCenter - RENDER_DISTANCE)
+    //                   = world voxel (activeRegionCenter - RENDER_DISTANCE) * 64
     // ============================================================================
-    m_regionOriginWorld = glm::vec3(0.0f, 0.0f, 0.0f);  // Buffer starts at world origin
-    glm::vec3 originShiftDelta = glm::vec3(0.0f);
+    m_regionOriginWorld = glm::vec3(
+        static_cast<float>((m_activeRegionCenter.x - RENDER_DISTANCE_HORIZONTAL) * CHUNK_SIZE_VOXELS),
+        static_cast<float>(TERRAIN_CHUNK_MIN_Y * CHUNK_SIZE_VOXELS),
+        static_cast<float>((m_activeRegionCenter.z - RENDER_DISTANCE_HORIZONTAL) * CHUNK_SIZE_VOXELS)
+    );
+    glm::vec3 originShiftDelta = glm::vec3(0.0f);  // Not tracking shifts for now
 
     // Log when region origin shifts (only when buffer actually shifts, not every chunk change)
     if (bufferNeedsShift) {
@@ -1398,11 +1401,11 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* /*device*/, ID3D12CommandQueue
                 Chunk* chunk = it->second;
 
                 // Calculate destination offset in render buffer
-                // With regionOrigin = (0,0,0), buffer positions = world positions
-                // So chunk at world (x*64, y*64, z*64) goes to buffer position (x*64, y*64, z*64)
-                int32_t destX = chunkCoord.x * CHUNK_SIZE_VOXELS;
-                int32_t destY = chunkCoord.y * CHUNK_SIZE_VOXELS;
-                int32_t destZ = chunkCoord.z * CHUNK_SIZE_VOXELS;
+                // Chunks are copied RELATIVE to activeRegionCenter so they fit in buffer
+                // Buffer position (0,0,0) = chunk at (activeRegionCenter - RENDER_DISTANCE)
+                int32_t destX = (chunkCoord.x - m_activeRegionCenter.x + RENDER_DISTANCE_HORIZONTAL) * CHUNK_SIZE_VOXELS;
+                int32_t destY = (chunkCoord.y - TERRAIN_CHUNK_MIN_Y) * CHUNK_SIZE_VOXELS;
+                int32_t destZ = (chunkCoord.z - m_activeRegionCenter.z + RENDER_DISTANCE_HORIZONTAL) * CHUNK_SIZE_VOXELS;
 
                 // DIAGNOSTIC: Enable to debug chunk copy issues
                 static int copyDebugCount = 0;

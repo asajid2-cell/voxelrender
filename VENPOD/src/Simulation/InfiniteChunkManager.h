@@ -130,8 +130,18 @@ private:
     // Loaded chunks (hash map for O(1) access)
     std::unordered_map<ChunkCoord, Chunk*> m_loadedChunks;
 
-    // Chunks waiting to be generated
-    std::queue<ChunkCoord> m_generationQueue;
+    // Chunks waiting to be generated - PRIORITY QUEUE (nearest to camera first)
+    // This ensures chunks near the player generate before distant ones!
+    struct ChunkPriorityEntry {
+        ChunkCoord coord;
+        int32_t distanceSquared;  // Distance from camera (lower = higher priority)
+
+        // Priority queue is max-heap, so use > for min-heap behavior (nearest first)
+        bool operator<(const ChunkPriorityEntry& other) const {
+            return distanceSquared > other.distanceSquared;  // Invert for min-heap
+        }
+    };
+    std::priority_queue<ChunkPriorityEntry> m_generationQueue;
 
     // Last camera chunk position (to avoid redundant updates)
     ChunkCoord m_lastCameraChunk = ChunkCoord{INT32_MAX, INT32_MAX, INT32_MAX};

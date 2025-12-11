@@ -127,7 +127,7 @@ void InfiniteChunkManager::Shutdown() {
     }
     m_loadedChunks.clear();
 
-    // Clear generation queue
+    // Clear generation queue (priority_queue has no clear() method)
     while (!m_generationQueue.empty()) {
         m_generationQueue.pop();
     }
@@ -241,12 +241,25 @@ void InfiniteChunkManager::Update(
         spdlog::warn("Failed to queue chunks: {}", queueResult.error());
     }
 
-    // ===== STEP 3: Generate ONE chunk per frame to prevent GPU flooding =====
-    // CRITICAL FIX: Only generate 1 chunk per frame to prevent:
-    // 1. GPU command queue flooding (was causing system crash)
-    // 2. VRAM exhaustion from too many simultaneous allocations
-    // 3. Ring buffer contention (3 allocators can't handle 1445 chunks)
-    if (!m_generationQueue.empty()) {
+    // ===== STEP 3: Generate chunks to fill visible area =====
+    // STARTUP OPTIMIZATION: Generate MORE chunks per frame initially to fill
+    // the visible area faster. Once loaded chunks >= visible area, slow down.
+    //
+    // Visible area = 25×25×2 = 1250 chunks (RENDER_BUFFER_CHUNKS_X * Z * Y)
+    // During startup: generate up to 8 chunks/frame (fills visible in ~160 frames = 2.7 seconds)
+    // After startup: generate 1 chunk/frame (just keeping up with movement)
+    //
+    // With 3 command allocators, we can safely queue 3 parallel generations.
+    // But GPU bottleneck is still 1 execution at a time, so 8/frame is aggressive but safe.
+    constexpr size_t STARTUP_CHUNKS_PER_FRAME = 8;
+    constexpr size_t NORMAL_CHUNKS_PER_FRAME = 1;
+    constexpr size_t MIN_VISIBLE_CHUNKS = 50;  // Need at least 50 chunks before slowing down
+
+    size_t chunksPerFrame = (m_loadedChunks.size() < MIN_VISIBLE_CHUNKS)
+        ? STARTUP_CHUNKS_PER_FRAME
+        : NORMAL_CHUNKS_PER_FRAME;
+
+    for (size_t i = 0; i < chunksPerFrame && !m_generationQueue.empty(); ++i) {
         GenerateNextChunk(device, cmdQueue);
     }
 
@@ -392,9 +405,15 @@ Result<void> InfiniteChunkManager::QueueChunksAroundCamera(const ChunkCoord& cam
     }
     done_collecting:
 
-    // Add new chunks to generation queue (guaranteed to not exceed maxQueuedChunks)
+    // Add new chunks to generation queue WITH DISTANCE PRIORITY
+    // Nearest chunks to camera are generated first!
     for (const auto& coord : chunksToLoad) {
-        m_generationQueue.push(coord);
+        // Calculate distance squared from camera chunk (only XZ, Y is fixed for terrain)
+        int32_t dx = coord.x - cameraChunk.x;
+        int32_t dz = coord.z - cameraChunk.z;
+        int32_t distSq = dx * dx + dz * dz;
+
+        m_generationQueue.push(ChunkPriorityEntry{coord, distSq});
     }
 
     if (chunksToLoad.size() > 0) {
@@ -428,8 +447,10 @@ Result<void> InfiniteChunkManager::GenerateNextChunk(
         return {};
     }
 
-    ChunkCoord coord = m_generationQueue.front();
+    // Pop highest priority chunk (nearest to camera)
+    ChunkPriorityEntry entry = m_generationQueue.top();
     m_generationQueue.pop();
+    ChunkCoord coord = entry.coord;
 
     // Skip if already loaded (could have been queued multiple times)
     if (m_loadedChunks.find(coord) != m_loadedChunks.end()) {
@@ -465,8 +486,8 @@ Result<void> InfiniteChunkManager::GenerateNextChunk(
             return {};  // Drop this attempt, don't re-queue
         }
 
-        // Re-queue for next frame
-        m_generationQueue.push(coord);
+        // Re-queue for next frame (keep same priority)
+        m_generationQueue.push(entry);
         spdlog::debug("Allocator {} busy (fence {} > completed {}), re-queuing chunk [{},{},{}] (attempt {})",
             allocatorIndex, allocatorFenceValue, m_chunkFence->GetCompletedValue(),
             coord.x, coord.y, coord.z, requeueCount);
@@ -511,10 +532,10 @@ Result<void> InfiniteChunkManager::GenerateNextChunk(
             return {};  // Drop permanently - will retry when heap has space
         }
 
-        // Heap is full - re-queue chunk without touching allocator
+        // Heap is full - re-queue chunk without touching allocator (keep same priority)
         spdlog::debug("Descriptor heap full ({}/{} descriptors), deferring chunk [{},{},{}] (attempt {})",
             currentDescriptors, maxDescriptors, coord.x, coord.y, coord.z, requeueCount);
-        m_generationQueue.push(coord);  // Re-queue for later
+        m_generationQueue.push(entry);  // Re-queue for later
         return {};  // Not an error, just deferring
     }
 
@@ -535,7 +556,7 @@ Result<void> InfiniteChunkManager::GenerateNextChunk(
 
     HRESULT hr = m_chunkCmdAllocators[allocatorIndex]->Reset();
     if (FAILED(hr)) {
-        m_generationQueue.push(coord);  // Re-queue for retry
+        m_generationQueue.push(entry);  // Re-queue for retry (keep same priority)
         spdlog::error("Failed to reset chunk cmd allocator {} (HRESULT={:#x}), re-queuing chunk [{},{},{}]",
             allocatorIndex, static_cast<uint32_t>(hr), coord.x, coord.y, coord.z);
         return Error("Command allocator Reset() failed");
@@ -544,7 +565,7 @@ Result<void> InfiniteChunkManager::GenerateNextChunk(
 
     hr = m_chunkCmdList->Reset(m_chunkCmdAllocators[allocatorIndex].Get(), nullptr);
     if (FAILED(hr)) {
-        m_generationQueue.push(coord);  // Re-queue for retry
+        m_generationQueue.push(entry);  // Re-queue for retry (keep same priority)
         spdlog::error("Failed to reset chunk cmd list (HRESULT={:#x}), re-queuing chunk [{},{},{}]",
             static_cast<uint32_t>(hr), coord.x, coord.y, coord.z);
         return Error("Command list Reset() failed");

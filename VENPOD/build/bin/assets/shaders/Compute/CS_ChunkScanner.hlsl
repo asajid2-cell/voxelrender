@@ -77,21 +77,23 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID, ui
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // FIX: Use LOCAL buffer coordinates (groupId), NOT world coordinates
-    // groupId directly maps to chunks in the LOCAL render buffer (0 to chunkCountX/Y/Z - 1)
-    // The physics shader also uses these local coordinates, so they MUST match!
+    // PERFORMANCE FIX: Scan only a limited region around buffer center
+    // groupId is dispatch-local (0 to dispatchSize-1), we ADD offset to get buffer-local coords
     //
-    // For 1600x128x1600 buffer with CHUNK_SIZE=16:
-    //   groupId.x: 0-99 (1600/16 chunks)
-    //   groupId.y: 0-7  (128/16 chunks)
-    //   groupId.z: 0-99 (1600/16 chunks)
+    // For optimized physics region (32x8x32 dispatch at offset 34,0,34):
+    //   groupId.x: 0-31, actual chunk: 34-65
+    //   groupId.y: 0-7,  actual chunk: 0-7
+    //   groupId.z: 0-31, actual chunk: 34-65
     //
-    // activeRegionOffset is NOT used here because:
-    // 1. Both scanner and physics operate on the LOCAL buffer
-    // 2. World coordinates are handled by UpdateActiveRegion (chunk copying)
-    // 3. Using world offsets here would cause index mismatch with physics shader
+    // This limits physics scanning to ~8,192 chunks instead of 80,000!
 
-    uint3 localChunkId = groupId;  // Direct mapping: dispatch coords = buffer coords
+    // Add offset to get actual buffer-local chunk coordinates
+    uint3 localChunkId = groupId + uint3(activeRegionOffsetX, activeRegionOffsetY, activeRegionOffsetZ);
+
+    // Bounds check - don't process chunks outside the buffer
+    if (localChunkId.x >= chunkCountX || localChunkId.y >= chunkCountY || localChunkId.z >= chunkCountZ) {
+        return;
+    }
 
     // Calculate chunk index in chunk control buffer (LOCAL buffer coordinates)
     uint chunkIndex = localChunkId.x + localChunkId.y * chunkCountX + localChunkId.z * chunkCountX * chunkCountY;
