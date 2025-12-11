@@ -36,6 +36,9 @@ find_package(glm CONFIG REQUIRED)
 # =============================================================================
 set(VENPOD_SOURCES
     src/main.cpp
+    src/main_launcher.cpp
+    src/main_sandsim.cpp
+    src/launcher.cpp
 
     # Core
     src/Core/Engine.cpp
@@ -82,6 +85,8 @@ set(VENPOD_SOURCES
 )
 
 set(VENPOD_HEADERS
+    src/launcher.h
+
     # Core
     src/Core/Engine.h
     src/Core/Window.h
@@ -199,6 +204,11 @@ if(MSVC)
         _UNICODE
         NOMINMAX
         WIN32_LEAN_AND_MEAN
+    )
+
+    # Use Windows subsystem for WinMain entry point
+    set_target_properties(VENPOD PROPERTIES
+        LINK_FLAGS "/SUBSYSTEM:WINDOWS /ENTRY:WinMainCRTStartup"
     )
 endif()
 

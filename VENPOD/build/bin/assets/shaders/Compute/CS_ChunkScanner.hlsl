@@ -39,6 +39,7 @@ groupshared uint gs_hasActiveVoxel;
 groupshared uint gs_particleCount;
 
 // Check if a voxel is "active" (can move)
+// MUST match IsMovable() in CS_GravityChunk.hlsl!
 bool IsVoxelActive(uint voxel) {
     uint material = GetMaterial(voxel);
     uint state = GetState(voxel);
@@ -49,14 +50,17 @@ bool IsVoxelActive(uint voxel) {
     // Static voxels (bedrock, frozen) are not active
     if (state & STATE_IS_STATIC) return false;
 
-    // Falling materials (sand, water, etc.) are active
-    if (material == MAT_SAND || material == MAT_WATER ||
-        material == MAT_LAVA || material == MAT_OIL) {
+    // All movable materials are active (matches CS_GravityChunk.hlsl IsMovable)
+    // Granular/falling: sand, dirt, gunpowder
+    // Liquids: water, lava, oil, acid, honey, concrete (wet)
+    // Gases: smoke, steam
+    // Special: fire
+    if (material == MAT_SAND || material == MAT_DIRT || material == MAT_GUNPOWDER ||
+        material == MAT_WATER || material == MAT_LAVA || material == MAT_OIL ||
+        material == MAT_ACID || material == MAT_HONEY || material == MAT_CONCRETE ||
+        material == MAT_SMOKE || material == MAT_STEAM || material == MAT_FIRE) {
         return true;
     }
-
-    // Fire is always active
-    if (material == MAT_FIRE) return true;
 
     // Everything else is potentially active but settled
     return false;
