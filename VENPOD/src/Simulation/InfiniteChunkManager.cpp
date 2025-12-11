@@ -80,13 +80,16 @@ Result<void> InfiniteChunkManager::Initialize(
         m_allocatorFenceValues[i] = 0;  // 0 = ready for immediate use (never used)
     }
 
-    spdlog::info("InfiniteChunkManager initialized - render distance: {} horiz (FIXED Y={},{} layers), seed: {}",
-        m_config.renderDistanceHorizontal,
+    spdlog::info("InfiniteChunkManager initialized - LOAD distance: {} chunks, UNLOAD distance: {} chunks (FIXED Y={},{} layers), seed: {}",
+        m_config.loadDistanceHorizontal,
+        m_config.unloadDistanceHorizontal,
         TERRAIN_CHUNK_MIN_Y, TERRAIN_CHUNK_MIN_Y + TERRAIN_NUM_CHUNKS_Y - 1,
         m_config.worldSeed);
     spdlog::info("Terrain generation: INDEPENDENT of camera Y - always at world Y={}-{} (chunks {},{})",
         TERRAIN_MIN_Y, TERRAIN_MIN_Y + (TERRAIN_NUM_CHUNKS_Y * CHUNK_SIZE_VOXELS) - 1,
         TERRAIN_CHUNK_MIN_Y, TERRAIN_CHUNK_MIN_Y + TERRAIN_NUM_CHUNKS_Y - 1);
+    spdlog::info("Seamless streaming: chunks load at {} chunks, visible at {} chunks, unload at {} chunks",
+        m_config.loadDistanceHorizontal, RENDER_DISTANCE_HORIZONTAL, m_config.unloadDistanceHorizontal);
 
     return {};
 }
@@ -342,9 +345,12 @@ Result<void> InfiniteChunkManager::QueueChunksAroundCamera(const ChunkCoord& cam
     // FIX: Terrain is at Y=TERRAIN_MIN_Y to Y=TERRAIN_MAX_Y, which spans chunks Y=0 and Y=1
     // We ALWAYS load these TERRAIN_NUM_CHUNKS_Y vertical layers, regardless of camera altitude.
     // Only horizontal (X/Z) position varies based on camera.
+    //
+    // SEAMLESS STREAMING: Use loadDistanceHorizontal (larger than render distance)
+    // This loads chunks BEFORE they become visible, so player never sees pop-in.
     for (int32_t dy = TERRAIN_CHUNK_MIN_Y; dy < TERRAIN_CHUNK_MIN_Y + TERRAIN_NUM_CHUNKS_Y; ++dy) {
-        for (int32_t dx = -m_config.renderDistanceHorizontal; dx <= m_config.renderDistanceHorizontal; ++dx) {
-            for (int32_t dz = -m_config.renderDistanceHorizontal; dz <= m_config.renderDistanceHorizontal; ++dz) {
+        for (int32_t dx = -m_config.loadDistanceHorizontal; dx <= m_config.loadDistanceHorizontal; ++dx) {
+            for (int32_t dz = -m_config.loadDistanceHorizontal; dz <= m_config.loadDistanceHorizontal; ++dz) {
                 // FIX #1: Stop if we've already collected enough chunks
                 if (chunksToLoad.size() >= remainingCapacity) {
                     goto done_collecting;  // Break all loops
@@ -392,12 +398,15 @@ Result<void> InfiniteChunkManager::QueueChunksAroundCamera(const ChunkCoord& cam
     }
 
     if (chunksToLoad.size() > 0) {
-        spdlog::debug("Queued {} new chunks for generation at Y=0,1 (queue size: {}/{})",
-            chunksToLoad.size(), m_generationQueue.size(), m_config.maxQueuedChunks);
+        spdlog::debug("Queued {} new chunks for generation at Y=0,1 (queue size: {}/{}) - load distance: {} chunks",
+            chunksToLoad.size(), m_generationQueue.size(), m_config.maxQueuedChunks,
+            m_config.loadDistanceHorizontal);
 
         // Log first few chunks being queued for verification
         static bool firstLog = true;
         if (firstLog && chunksToLoad.size() > 0) {
+            spdlog::info("Seamless streaming: loading chunks up to {} chunks away (visible at {} chunks)",
+                m_config.loadDistanceHorizontal, RENDER_DISTANCE_HORIZONTAL);
             spdlog::info("First chunks queued (all at Y=0 or Y=1):");
             int count = 0;
             for (const auto& coord : chunksToLoad) {

@@ -24,16 +24,21 @@ namespace VENPOD::Simulation {
 
 // Configuration for infinite chunk manager
 struct InfiniteChunkConfig {
-    // Cylindrical loading pattern (not spherical) to reduce VRAM usage
-    int32_t renderDistanceHorizontal = 2;  // REDUCED: Load ±2 chunks in X/Z (5×5 = 25 chunks per layer)
-    int32_t renderDistanceVertical = 1;    // REDUCED: Load ±1 chunks in Y (3 layers total)
-    // Total: 5×5×3 = 75 chunks × 1 MB = 75 MB VRAM (safe!)
+    // ===== STREAMING DISTANCE CONFIGURATION =====
+    // These create a "buffer zone" where loading/unloading happens out of sight:
+    // - loadDistanceHorizontal: Where chunks START generating (beyond visible area)
+    // - unloadDistanceHorizontal: Where chunks get DELETED (far beyond load area)
+    // The gap between load and unload prevents thrashing when moving back and forth.
 
-    int32_t unloadDistanceHorizontal = 4;  // Unload chunks beyond 4 chunks horizontally
-    int32_t unloadDistanceVertical = 3;    // Unload chunks beyond 3 chunks vertically
+    int32_t loadDistanceHorizontal = 16;   // ±16 chunks = 33×33 = 2178 chunks loading
+    int32_t unloadDistanceHorizontal = 20; // ±20 chunks before deletion (4-chunk hysteresis)
+
+    // Vertical is fixed to terrain layers (Y=0,1) - these are mostly unused
+    int32_t loadDistanceVertical = 2;      // UNUSED - fixed to TERRAIN_NUM_CHUNKS_Y
+    int32_t unloadDistanceVertical = 3;    // Unload chunks beyond terrain layers
 
     uint32_t chunksPerFrame = 1;           // Generate 1 chunk per frame (safe, no GPU flooding)
-    uint32_t maxQueuedChunks = 32;         // NEW: Maximum chunks that can be queued at once
+    uint32_t maxQueuedChunks = 64;         // Queue up to 64 chunks (enough for streaming)
     uint32_t worldSeed = 12345;            // Procedural generation seed
 };
 
@@ -86,8 +91,8 @@ public:
 
     // Configuration
     const InfiniteChunkConfig& GetConfig() const { return m_config; }
-    void SetRenderDistanceHorizontal(int32_t distance) { m_config.renderDistanceHorizontal = distance; }
-    void SetRenderDistanceVertical(int32_t distance) { m_config.renderDistanceVertical = distance; }
+    void SetLoadDistanceHorizontal(int32_t distance) { m_config.loadDistanceHorizontal = distance; }
+    void SetUnloadDistanceHorizontal(int32_t distance) { m_config.unloadDistanceHorizontal = distance; }
 
     // Force generation of specific chunk (for testing)
     Result<void> ForceGenerateChunk(

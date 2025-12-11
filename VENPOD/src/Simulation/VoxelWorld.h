@@ -237,6 +237,15 @@ private:
     // This prevents re-copying ALL chunks every frame (only copy missing/changed ones)
     std::unordered_set<ChunkCoord> m_copiedChunksPerBuffer[2];
 
+    // PAINTED CHUNK PROTECTION: Track chunks that have been modified by painting
+    // These chunks should NEVER be re-copied from source because:
+    // - Source chunks only have original generated terrain
+    // - Painted voxels exist only in the render buffer
+    // - Re-copying would overwrite user's painted content
+    // Chunks stay in this set until they leave the render distance (far enough that
+    // the user won't notice if their paint is lost when they return)
+    std::unordered_set<ChunkCoord> m_modifiedChunks;
+
     // Cache invalidation tracking - used to boost chunk copy speed after cache clear
     // When cache is invalidated (camera moves to new chunk), we need to aggressively
     // refill BOTH buffers to prevent holes/missing chunks during the refill period

@@ -29,11 +29,10 @@ cbuffer PhysicsConstants : register(b0) {
 // Active chunk list - array of chunk indices to simulate
 Buffer<uint> ActiveChunkList : register(t0);
 
-// Input voxel grid (read-only)
-StructuredBuffer<uint> VoxelGridIn : register(t1);
-
-// Output voxel grid (write)
-RWStructuredBuffer<uint> VoxelGridOut : register(u0);
+// Voxel grid - single buffer for in-place updates (infinite chunks mode)
+// For infinite chunks, UpdateChunks copies to this buffer, then physics does in-place update
+// For static grid mode, this same buffer is used with ping-pong swapping in main loop
+RWStructuredBuffer<uint> VoxelGrid : register(u0);
 
 // Material properties lookup (helpers for physics)
 bool IsMovable(uint material) {
@@ -70,7 +69,7 @@ uint3 ChunkIndexToPos(uint chunkIndex) {
     return uint3(x, y, z);
 }
 
-// Safe voxel access
+// Safe voxel access - reads from same buffer we write to (in-place update)
 uint GetVoxelSafe(int3 pos) {
     if (pos.x < 0 || pos.x >= (int)gridSizeX ||
         pos.y < 0 || pos.y >= (int)gridSizeY ||
@@ -80,13 +79,13 @@ uint GetVoxelSafe(int3 pos) {
 
     uint3 gridSize = uint3(gridSizeX, gridSizeY, gridSizeZ);
     uint idx = LinearIndex3D(uint3(pos), gridSize);
-    return VoxelGridIn[idx];
+    return VoxelGrid[idx];  // Read from same buffer we write to
 }
 
 void SetVoxel(uint3 pos, uint voxel) {
     uint3 gridSize = uint3(gridSizeX, gridSizeY, gridSizeZ);
     uint idx = LinearIndex3D(pos, gridSize);
-    VoxelGridOut[idx] = voxel;
+    VoxelGrid[idx] = voxel;  // Write to same buffer we read from
 }
 
 // PCG hash for pseudo-random
@@ -461,36 +460,44 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                         continue;
                     }
 
-                    // Sand: try diagonal down (slide)
-                    if (material == MAT_SAND) {
-                        // Random direction based on position + frame
+                    // Sand/Dirt/Gunpowder: try diagonal down (slide) in all 4 directions
+                    if (material == MAT_SAND || material == MAT_DIRT || material == MAT_GUNPOWDER) {
                         uint rng = PCGHash(pos.x + pos.y * 1000 + pos.z * 1000000 + frameIndex);
-                        int dir = (rng & 1) ? 1 : -1;
 
-                        int3 diagPos1 = pos + int3(dir, -1, 0);
-                        int3 diagPos2 = pos + int3(-dir, -1, 0);
+                        // 4 diagonal-down directions: (+X,-Y), (-X,-Y), (+Z,-Y), (-Z,-Y)
+                        int3 diagDirections[4];
+                        diagDirections[0] = int3(1, -1, 0);   // +X down
+                        diagDirections[1] = int3(-1, -1, 0);  // -X down
+                        diagDirections[2] = int3(0, -1, 1);   // +Z down
+                        diagDirections[3] = int3(0, -1, -1);  // -Z down
 
-                        // Try first diagonal
-                        if (diagPos1.x >= 0 && diagPos1.x < (int)gridSizeX) {
-                            uint diagVoxel = GetVoxelSafe(diagPos1);
+                        // Randomize start direction for even distribution
+                        uint startDir = rng % 4;
+                        bool sandMoved = false;
+
+                        // Try all 4 diagonal directions
+                        for (uint i = 0; i < 4; i++) {
+                            uint dirIdx = (startDir + i) % 4;
+                            int3 diagPos = pos + diagDirections[dirIdx];
+
+                            // Bounds check
+                            if (diagPos.x < 0 || diagPos.x >= (int)gridSizeX ||
+                                diagPos.y < 0 ||
+                                diagPos.z < 0 || diagPos.z >= (int)gridSizeZ) {
+                                continue;
+                            }
+
+                            uint diagVoxel = GetVoxelSafe(diagPos);
                             if (IsEmpty(GetMaterial(diagVoxel))) {
                                 outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, 0);
                                 SetVoxel(uint3(pos), PackVoxel(MAT_AIR, 0, 0, 0));
-                                SetVoxel(uint3(diagPos1), outputVoxel);
-                                continue;
+                                SetVoxel(uint3(diagPos), outputVoxel);
+                                sandMoved = true;
+                                break;  // Exit loop after successful move
                             }
                         }
-
-                        // Try second diagonal
-                        if (diagPos2.x >= 0 && diagPos2.x < (int)gridSizeX) {
-                            uint diagVoxel = GetVoxelSafe(diagPos2);
-                            if (IsEmpty(GetMaterial(diagVoxel))) {
-                                outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, 0);
-                                SetVoxel(uint3(pos), PackVoxel(MAT_AIR, 0, 0, 0));
-                                SetVoxel(uint3(diagPos2), outputVoxel);
-                                continue;
-                            }
-                        }
+                        // Skip "stay put" write if we moved
+                        if (sandMoved) continue;
                     }
 
                     // Liquids: comprehensive 4-directional flow with unbiased spreading

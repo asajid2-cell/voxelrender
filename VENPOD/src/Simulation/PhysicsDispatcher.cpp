@@ -690,53 +690,33 @@ void PhysicsDispatcher::DispatchChunkScan(
     constants.chunkSize = CHUNK_SIZE;
     constants.sleepThreshold = m_sleepThreshold;
 
-    // PRIORITY 3: Determine dispatch size and active region offset
-    uint32_t dispatchX, dispatchY, dispatchZ;
+    // FIX: ALWAYS use ChunkManager's chunk counts (16-voxel physics chunks)
+    // ChunkManager is initialized with the render buffer size (1600x128x1600) divided by CHUNK_SIZE (16)
+    // This gives us 100x8x100 = 80,000 physics chunks to scan.
+    //
+    // Previously, infinite chunks mode incorrectly used RENDER_BUFFER_CHUNKS_X/Y/Z (25x2x25)
+    // which are 64-voxel STREAMING chunks - completely different coordinate system!
+    //
+    // The chunk scanner and physics shader MUST use the same coordinate system:
+    // - Both operate on the LOCAL render buffer (not world coordinates)
+    // - Both use CHUNK_SIZE=16 for physics simulation
+    // - activeRegionOffset is NOT needed here since we scan the LOCAL buffer
+    uint32_t dispatchX = chunkManager.GetChunkCountX();  // 100 chunks (1600/16)
+    uint32_t dispatchY = chunkManager.GetChunkCountY();  // 8 chunks (128/16)
+    uint32_t dispatchZ = chunkManager.GetChunkCountZ();  // 100 chunks (1600/16)
 
-    if (world.IsUsingInfiniteChunks()) {
-        // INFINITE CHUNKS: Scan active region matching render buffer size
-        // FIX: Use TerrainConstants to match 1600×128×1600 buffer (25×2×25 chunks)
-        dispatchX = RENDER_BUFFER_CHUNKS_X;  // 25 chunks
-        dispatchY = RENDER_BUFFER_CHUNKS_Y;  // 2 chunks
-        dispatchZ = RENDER_BUFFER_CHUNKS_Z;  // 25 chunks
+    // activeRegionOffset is set to 0 because scanner operates on LOCAL buffer coordinates
+    // The world-to-local mapping is handled by UpdateActiveRegion (chunk copying)
+    constants.activeRegionOffsetX = 0;
+    constants.activeRegionOffsetY = 0;
+    constants.activeRegionOffsetZ = 0;
 
-        // Get camera chunk coordinate from infinite chunk manager
-        auto* infiniteChunkManager = world.GetChunkManager();
-        ChunkCoord cameraChunk = {0, 0, 0};
-        if (infiniteChunkManager) {
-            cameraChunk = infiniteChunkManager->GetCameraChunk();
-        }
-
-        // Active region starts at (cameraChunk - RENDER_DISTANCE_HORIZONTAL)
-        // This matches UpdateActiveRegion's coordinate calculation in VoxelWorld.cpp
-        // Horizontal: [cameraChunk.x-12 to cameraChunk.x+12] (25 chunks)
-        // Vertical:   [0 to 1] (2 chunks - ALWAYS Y=0,1 regardless of camera)
-        // Horizontal: [cameraChunk.z-12 to cameraChunk.z+12] (25 chunks)
-        constants.activeRegionOffsetX = cameraChunk.x - RENDER_DISTANCE_HORIZONTAL;
-        constants.activeRegionOffsetY = TERRAIN_CHUNK_MIN_Y;  // Always 0 (terrain layers)
-        constants.activeRegionOffsetZ = cameraChunk.z - RENDER_DISTANCE_HORIZONTAL;
-
-        // Log only once per second to avoid spam
-        static int activeRegionLogThrottle = 0;
-        if (++activeRegionLogThrottle % 60 == 1) {
-            spdlog::debug("DispatchChunkScan: Scanning {}×{}×{} active region at offset [{},{},{}] ({} chunks)",
-                dispatchX, dispatchY, dispatchZ,
-                constants.activeRegionOffsetX, constants.activeRegionOffsetY, constants.activeRegionOffsetZ,
-                dispatchX * dispatchY * dispatchZ);
-        }
-    } else {
-        // STATIC GRID: Scan full 16×16×16 grid (4,096 chunks)
-        dispatchX = chunkManager.GetChunkCountX();
-        dispatchY = chunkManager.GetChunkCountY();
-        dispatchZ = chunkManager.GetChunkCountZ();
-
-        // No offset needed for static grid (scans from 0,0,0)
-        constants.activeRegionOffsetX = 0;
-        constants.activeRegionOffsetY = 0;
-        constants.activeRegionOffsetZ = 0;
-
-        spdlog::debug("DispatchChunkScan: Scanning full grid {}×{}×{} chunks",
-            dispatchX, dispatchY, dispatchZ);
+    // Log only once per second to avoid spam
+    static int activeRegionLogThrottle = 0;
+    if (++activeRegionLogThrottle % 60 == 1) {
+        spdlog::debug("DispatchChunkScan: Scanning {}×{}×{} = {} physics chunks (CHUNK_SIZE=16)",
+            dispatchX, dispatchY, dispatchZ,
+            dispatchX * dispatchY * dispatchZ);
     }
 
     m_chunkScanPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
@@ -865,16 +845,8 @@ Result<void> PhysicsDispatcher::CreateGravityChunkPipeline(
         D3D12_DESCRIPTOR_RANGE_TYPE_SRV
     });
 
-    // 2: SRV for input voxel buffer (t1)
-    desc.rootParams.push_back({
-        Graphics::RootParamType::DescriptorTable,
-        1,  // register t1
-        0,  // space 0
-        1,  // 1 descriptor
-        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
-    });
-
-    // 3: UAV for output voxel buffer (u0)
+    // 2: UAV for voxel buffer (u0) - single buffer for in-place updates
+    // Shader reads and writes the same buffer (no separate SRV needed)
     desc.rootParams.push_back({
         Graphics::RootParamType::DescriptorTable,
         0,  // register u0
@@ -951,8 +923,12 @@ void PhysicsDispatcher::DispatchPhysicsIndirect(
     chunkManager.TransitionBuffersForIndirect(cmdList);
 
     // === Step 2: Execute indirect dispatch for chunk-based physics ===
-    // Transition voxel buffers
-    world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    // CRITICAL FIX: For infinite chunks, read from WRITE buffer (where chunks are)!
+    // UpdateActiveRegion copies chunks to WRITE. Physics must read from WRITE to see them.
+    // This is an in-place update (read and write same buffer) but works because:
+    // - Each voxel is processed by exactly one thread (chunk-based dispatch)
+    // - Static voxels just copy themselves in-place (no change)
+    // - Moving voxels use atomic-like behavior (only one can claim destination)
     world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     // Re-set descriptor heaps (in case they were changed)
@@ -978,10 +954,9 @@ void PhysicsDispatcher::DispatchPhysicsIndirect(
 
     m_gravityChunkPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
 
-    // Set descriptors
-    m_gravityChunkPipeline.SetRootDescriptorTable(cmdList, 1, chunkManager.GetActiveListSRV().gpu);  // Active chunk list SRV
-    m_gravityChunkPipeline.SetRootDescriptorTable(cmdList, 2, world.GetReadBufferSRV().gpu);         // Input voxels SRV
-    m_gravityChunkPipeline.SetRootDescriptorTable(cmdList, 3, world.GetWriteBufferUAV().gpu);        // Output voxels UAV
+    // Set descriptors - single buffer for in-place physics updates
+    m_gravityChunkPipeline.SetRootDescriptorTable(cmdList, 1, chunkManager.GetActiveListSRV().gpu);  // Active chunk list SRV (t0)
+    m_gravityChunkPipeline.SetRootDescriptorTable(cmdList, 2, world.GetWriteBufferUAV().gpu);        // Voxel buffer UAV (u0) - read AND write
 
     // Execute indirect dispatch
     cmdList->ExecuteIndirect(

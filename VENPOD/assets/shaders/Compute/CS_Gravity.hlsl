@@ -134,40 +134,36 @@ void main(uint3 DTid : SV_DispatchThreadID) {
             }
         }
 
-        // Sand: try diagonal down (slide)
-        if (material == MAT_SAND) {
-            // Random direction based on position + frame
+        // Sand/granular: try diagonal down (slide) in all 4 directions
+        if (material == MAT_SAND || material == MAT_DIRT || material == MAT_GUNPOWDER) {
             uint rng = PCGHash(DTid.x + DTid.y * 1000 + DTid.z * 1000000 + frameIndex);
-            int dir = (rng & 1) ? 1 : -1;
 
-            int3 diagPos1 = pos + int3(dir, -1, 0);
-            int3 diagPos2 = pos + int3(-dir, -1, 0);
+            // 4 diagonal-down directions: (+X,-Y), (-X,-Y), (+Z,-Y), (-Z,-Y)
+            int3 diagDirections[4];
+            diagDirections[0] = int3(1, -1, 0);   // +X down
+            diagDirections[1] = int3(-1, -1, 0);  // -X down
+            diagDirections[2] = int3(0, -1, 1);   // +Z down
+            diagDirections[3] = int3(0, -1, -1);  // -Z down
 
-            // Try first diagonal
-            if (diagPos1.x >= 0 && diagPos1.x < (int)gridSizeX) {
-                uint diagVoxel = GetVoxelSafe(diagPos1);
-                if (IsEmpty(GetMaterial(diagVoxel))) {
-                    uint3 gridSize = uint3(gridSizeX, gridSizeY, gridSizeZ);
-                    uint diagIdx = LinearIndex3D(uint3(diagPos1), gridSize);
+            // Randomize start direction for even distribution
+            uint startDir = rng % 4;
 
-                    uint originalValue;
-                    InterlockedCompareExchange(VoxelGridOut[diagIdx], PackVoxel(MAT_AIR, 0, 0, 0),
-                                               PackVoxel(material, GetVariant(currentVoxel), 0, 0),
-                                               originalValue);
+            // Try all 4 diagonal directions
+            for (uint i = 0; i < 4; i++) {
+                uint dirIdx = (startDir + i) % 4;
+                int3 diagPos = pos + diagDirections[dirIdx];
 
-                    if (originalValue == PackVoxel(MAT_AIR, 0, 0, 0)) {
-                        SetVoxel(DTid, PackVoxel(MAT_AIR, 0, 0, 0));
-                        return;
-                    }
+                // Bounds check
+                if (diagPos.x < 0 || diagPos.x >= (int)gridSizeX ||
+                    diagPos.y < 0 ||
+                    diagPos.z < 0 || diagPos.z >= (int)gridSizeZ) {
+                    continue;
                 }
-            }
 
-            // Try second diagonal
-            if (diagPos2.x >= 0 && diagPos2.x < (int)gridSizeX) {
-                uint diagVoxel = GetVoxelSafe(diagPos2);
+                uint diagVoxel = GetVoxelSafe(diagPos);
                 if (IsEmpty(GetMaterial(diagVoxel))) {
                     uint3 gridSize = uint3(gridSizeX, gridSizeY, gridSizeZ);
-                    uint diagIdx = LinearIndex3D(uint3(diagPos2), gridSize);
+                    uint diagIdx = LinearIndex3D(uint3(diagPos), gridSize);
 
                     uint originalValue;
                     InterlockedCompareExchange(VoxelGridOut[diagIdx], PackVoxel(MAT_AIR, 0, 0, 0),
@@ -182,14 +178,62 @@ void main(uint3 DTid : SV_DispatchThreadID) {
             }
         }
 
-        // Liquids: horizontal spread (simplified)
+        // Liquids: try diagonal-down first (flow down slopes), then horizontal spread
         if (IsLiquid(currentVoxel)) {
             uint rng = PCGHash(DTid.x + DTid.y * 1000 + DTid.z * 1000000 + frameIndex);
-            int dir = (rng & 1) ? 1 : -1;
 
-            int3 sidePos = pos + int3(dir, 0, 0);
+            // First try diagonal-down (flow down slopes) - 4 directions
+            int3 diagDownDirs[4];
+            diagDownDirs[0] = int3(1, -1, 0);   // +X down
+            diagDownDirs[1] = int3(-1, -1, 0);  // -X down
+            diagDownDirs[2] = int3(0, -1, 1);   // +Z down
+            diagDownDirs[3] = int3(0, -1, -1);  // -Z down
 
-            if (sidePos.x >= 0 && sidePos.x < (int)gridSizeX) {
+            uint startDiag = rng % 4;
+            for (uint i = 0; i < 4; i++) {
+                uint dirIdx = (startDiag + i) % 4;
+                int3 diagPos = pos + diagDownDirs[dirIdx];
+
+                if (diagPos.x < 0 || diagPos.x >= (int)gridSizeX ||
+                    diagPos.y < 0 ||
+                    diagPos.z < 0 || diagPos.z >= (int)gridSizeZ) {
+                    continue;
+                }
+
+                uint diagVoxel = GetVoxelSafe(diagPos);
+                if (IsEmpty(GetMaterial(diagVoxel))) {
+                    uint3 gridSize = uint3(gridSizeX, gridSizeY, gridSizeZ);
+                    uint diagIdx = LinearIndex3D(uint3(diagPos), gridSize);
+
+                    uint originalValue;
+                    InterlockedCompareExchange(VoxelGridOut[diagIdx], PackVoxel(MAT_AIR, 0, 0, 0),
+                                               PackVoxel(material, GetVariant(currentVoxel), 0, 0),
+                                               originalValue);
+
+                    if (originalValue == PackVoxel(MAT_AIR, 0, 0, 0)) {
+                        SetVoxel(DTid, PackVoxel(MAT_AIR, 0, 0, 0));
+                        return;
+                    }
+                }
+            }
+
+            // Then try horizontal spread - 4 directions
+            int3 horizDirs[4];
+            horizDirs[0] = int3(1, 0, 0);   // +X
+            horizDirs[1] = int3(-1, 0, 0);  // -X
+            horizDirs[2] = int3(0, 0, 1);   // +Z
+            horizDirs[3] = int3(0, 0, -1);  // -Z
+
+            uint startHoriz = (rng >> 2) % 4;  // Different random bits
+            for (uint j = 0; j < 4; j++) {
+                uint dirIdx = (startHoriz + j) % 4;
+                int3 sidePos = pos + horizDirs[dirIdx];
+
+                if (sidePos.x < 0 || sidePos.x >= (int)gridSizeX ||
+                    sidePos.z < 0 || sidePos.z >= (int)gridSizeZ) {
+                    continue;
+                }
+
                 uint sideVoxel = GetVoxelSafe(sidePos);
                 if (IsEmpty(GetMaterial(sideVoxel))) {
                     uint3 gridSize = uint3(gridSizeX, gridSizeY, gridSizeZ);
