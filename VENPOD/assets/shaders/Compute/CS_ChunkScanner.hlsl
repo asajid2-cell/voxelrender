@@ -77,19 +77,28 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID, ui
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // PRIORITY 3: Calculate world chunk coordinate
-    // groupId is local (0-3 for 4×4×4 region, 0-15 for full grid)
-    // worldChunkId adds the activeRegionOffset to get actual world chunk coordinate
-    int3 worldChunkId = int3(groupId) + int3(activeRegionOffsetX, activeRegionOffsetY, activeRegionOffsetZ);
+    // FIX: Use LOCAL buffer coordinates (groupId), NOT world coordinates
+    // groupId directly maps to chunks in the LOCAL render buffer (0 to chunkCountX/Y/Z - 1)
+    // The physics shader also uses these local coordinates, so they MUST match!
+    //
+    // For 1600x128x1600 buffer with CHUNK_SIZE=16:
+    //   groupId.x: 0-99 (1600/16 chunks)
+    //   groupId.y: 0-7  (128/16 chunks)
+    //   groupId.z: 0-99 (1600/16 chunks)
+    //
+    // activeRegionOffset is NOT used here because:
+    // 1. Both scanner and physics operate on the LOCAL buffer
+    // 2. World coordinates are handled by UpdateActiveRegion (chunk copying)
+    // 3. Using world offsets here would cause index mismatch with physics shader
 
-    // Calculate chunk index in chunk control buffer (still using world coordinates)
-    // For infinite chunks: chunks are positioned at their world coordinates
-    // For static grid: offset is 0, so worldChunkId == groupId
-    uint chunkIndex = worldChunkId.x + worldChunkId.y * chunkCountX + worldChunkId.z * chunkCountX * chunkCountY;
+    uint3 localChunkId = groupId;  // Direct mapping: dispatch coords = buffer coords
+
+    // Calculate chunk index in chunk control buffer (LOCAL buffer coordinates)
+    uint chunkIndex = localChunkId.x + localChunkId.y * chunkCountX + localChunkId.z * chunkCountX * chunkCountY;
 
     // Each thread handles a 2x2x2 region within the chunk
     uint3 baseVoxelInChunk = groupThreadId * 2;
-    uint3 chunkBase = uint3(worldChunkId) * chunkSize;
+    uint3 chunkBase = localChunkId * chunkSize;  // Local voxel position in buffer
 
     uint localActive = 0;
     uint localParticles = 0;

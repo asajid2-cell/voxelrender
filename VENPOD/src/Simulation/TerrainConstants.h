@@ -25,18 +25,69 @@ constexpr int32_t TERRAIN_NUM_CHUNKS_Y = 2;  // Always load chunks Y=0 and Y=1
 // But we need chunk Y=1 (64-127) for vertical space above terrain
 // Total terrain vertical span: Y=0-127 (chunks 0 and 1)
 
+// ===== INFINITE CHUNK STREAMING DISTANCES =====
+// The key to seamless infinite worlds: load chunks BEFORE they're visible,
+// unload them AFTER they're out of view. This creates a "buffer zone" where
+// loading/unloading happens invisibly to the player.
+//
+// Visual diagram (top-down view, player at center):
+//
+//     UNLOAD_DISTANCE (20 chunks) - chunks deleted here
+//     |
+//     |   LOAD_DISTANCE (16 chunks) - chunks start generating here
+//     |   |
+//     |   |   RENDER_DISTANCE (12 chunks) - what you can see
+//     |   |   |
+//     v   v   v
+//   +-------------------------------------------+
+//   |               UNLOAD ZONE                 |
+//   |   +-----------------------------------+   |
+//   |   |          LOAD BUFFER              |   |
+//   |   |   +---------------------------+   |   |
+//   |   |   |                           |   |   |
+//   |   |   |      VISIBLE AREA         |   |   |
+//   |   |   |        (player)           |   |   |
+//   |   |   |                           |   |   |
+//   |   |   +---------------------------+   |   |
+//   |   |          LOAD BUFFER              |   |
+//   |   +-----------------------------------+   |
+//   |               UNLOAD ZONE                 |
+//   +-------------------------------------------+
+//
+// When moving: chunks in LOAD BUFFER are already generated and waiting.
+// You never see chunks pop in because they're ready before entering view.
+
+constexpr int32_t CHUNK_SIZE_VOXELS = 64;
+
+// RENDER_DISTANCE: What the GPU buffer can hold and render
+// This determines the visible world size: (2*12+1) * 64 = 1600 voxels = 1.6km
+constexpr int32_t RENDER_DISTANCE_HORIZONTAL = 12;  // ±12 chunks visible
+
+// LOAD_DISTANCE: Where we START loading chunks (must be > RENDER_DISTANCE)
+// Chunks at this distance are loading in the background, ready when needed
+// 4-chunk buffer means chunks have ~4 chunks of travel time to generate
+constexpr int32_t LOAD_DISTANCE_HORIZONTAL = 16;  // ±16 chunks = 33×33 = 2178 chunks loading
+
+// UNLOAD_DISTANCE: Where we DELETE chunks (must be > LOAD_DISTANCE)
+// Large gap prevents thrashing at boundaries when camera moves back and forth
+// 4-chunk hysteresis prevents constant load/unload cycles
+constexpr int32_t UNLOAD_DISTANCE_HORIZONTAL = 20;  // ±20 chunks before deletion
+
 // ===== RENDER BUFFER SIZE =====
-// Based on render distance and terrain chunk count
-// RTX 3070 Ti (8GB) MAXED OUT - 25×25×2 = 1,250 chunks = ~1.25GB VRAM for chunks
-constexpr int32_t RENDER_DISTANCE_HORIZONTAL = 12;  // ±12 chunks = 25×25 grid = 1.6km view!
+// Buffer only needs to fit RENDER_DISTANCE (visible area)
+// LOAD_DISTANCE chunks exist in memory but aren't copied to render buffer
 constexpr int32_t RENDER_BUFFER_CHUNKS_X = (RENDER_DISTANCE_HORIZONTAL * 2 + 1);  // 25
 constexpr int32_t RENDER_BUFFER_CHUNKS_Y = TERRAIN_NUM_CHUNKS_Y;  // 2
 constexpr int32_t RENDER_BUFFER_CHUNKS_Z = (RENDER_DISTANCE_HORIZONTAL * 2 + 1);  // 25
 
-constexpr int32_t CHUNK_SIZE_VOXELS = 64;
 constexpr int32_t RENDER_BUFFER_VOXELS_X = RENDER_BUFFER_CHUNKS_X * CHUNK_SIZE_VOXELS;  // 1600
 constexpr int32_t RENDER_BUFFER_VOXELS_Y = RENDER_BUFFER_CHUNKS_Y * CHUNK_SIZE_VOXELS;  // 128
 constexpr int32_t RENDER_BUFFER_VOXELS_Z = RENDER_BUFFER_CHUNKS_Z * CHUNK_SIZE_VOXELS;  // 1600
+
+// ===== VRAM BUDGET =====
+// With LOAD_DISTANCE=16: 33×33×2 = 2,178 chunks × 1 MB = ~2.2 GB for chunks
+// With RENDER_DISTANCE=12: 25×25×2 = 1,250 chunks in render buffer
+// Both fit comfortably in RTX 3070 Ti's 8GB VRAM
 
 // ===== VALIDATION =====
 static_assert(TERRAIN_MAX_Y < 128, "Terrain exceeds 2-chunk vertical span");

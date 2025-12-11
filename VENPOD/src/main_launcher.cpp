@@ -458,9 +458,9 @@ int RunSandbox(int argc, char* argv[]) {
 
     // FIX: Spawn camera at world origin with proper terrain height
     // Terrain generates around world origin (0,0,0) at heights Y=5 to Y=60
-    // Sea level is at Y=40, so spawn slightly above at Y=50 to see the terrain
-    // Camera horizontal position doesn't matter much since chunks load around it
-    glm::vec3 cameraPos = glm::vec3(128.0f, 50.0f, 128.0f);  // Start near world origin
+    // Sea level is at Y=40, so spawn slightly above at Y=70 to see terrain from above
+    // Camera at center of chunk (0,0) which is voxels (32, Y, 32)
+    glm::vec3 cameraPos = glm::vec3(32.0f, 70.0f, 32.0f);  // Center of origin chunk, above terrain
 
     // Camera rotation (pitch and yaw)
     float cameraPitch = -0.5f;  // Look down more to see terrain below
@@ -812,7 +812,33 @@ int RunSandbox(int argc, char* argv[]) {
             }
         }
 
-        // Apply brush painting FIRST (so chunk scanner can detect new voxels)
+        // =====================================================
+        // PHYSICS FIRST, THEN BRUSH (same as sand simulator)
+        // =====================================================
+        // Order matters! Physics copies READ→WRITE (via shader), then brush paints on top.
+        // If brush was first, physics would overwrite painted voxels.
+
+        // Run physics simulation (if not paused)
+        if (!paused) {
+            // Scan chunks to determine which are active
+            physicsDispatcher->DispatchChunkScan(
+                commandList.Get(),
+                *voxelWorld,
+                *chunkManager,
+                static_cast<uint32_t>(frameCount)
+            );
+
+            // Run physics on active chunks using ExecuteIndirect
+            physicsDispatcher->DispatchPhysicsIndirect(
+                commandList.Get(),
+                *voxelWorld,
+                *chunkManager,
+                1.0f/60.0f,
+                static_cast<uint32_t>(frameCount)
+            );
+        }
+
+        // Apply brush painting AFTER physics (so brush changes aren't overwritten)
         // Use GPU raycast position, or fallback to fixed distance in empty air
         if (brushController.IsPainting() || brushController.IsErasing()) {
             glm::vec3 brushPos;
@@ -860,26 +886,6 @@ int RunSandbox(int argc, char* argv[]) {
             brushConstants.seed = static_cast<uint32_t>(frameCount);
 
             physicsDispatcher->DispatchBrush(commandList.Get(), *voxelWorld, brushConstants);
-        }
-
-        // Run physics simulation (if not paused)
-        if (!paused) {
-            // Scan chunks to determine which are active (includes newly painted voxels)
-            physicsDispatcher->DispatchChunkScan(
-                commandList.Get(),
-                *voxelWorld,
-                *chunkManager,
-                static_cast<uint32_t>(frameCount)
-            );
-
-            // Run physics on active chunks using ExecuteIndirect
-            physicsDispatcher->DispatchPhysicsIndirect(
-                commandList.Get(),
-                *voxelWorld,
-                *chunkManager,
-                1.0f/60.0f,
-                static_cast<uint32_t>(frameCount)
-            );
         }
 
         // Transition read buffer to pixel shader resource for rendering

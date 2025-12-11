@@ -97,23 +97,31 @@ Result<void> VoxelWorld::Initialize(
 
         InfiniteChunkConfig chunkConfig;
         chunkConfig.worldSeed = 12345;  // TODO: Make configurable via VoxelWorldConfig
-        chunkConfig.chunksPerFrame = 20;  // RTX 3070 Ti (8GB) - generate 20 chunks/frame for instant world loading!
+        chunkConfig.chunksPerFrame = 20;  // RTX 3070 Ti (8GB) - generate 20 chunks/frame for fast world loading!
 
-        // MAXED OUT: RTX 3070 Ti (8GB VRAM) Configuration
-        // Terrain exists at Y=5-60 (chunks Y=0,1 only), so vertical range is FIXED
-        // Render distance: 12 chunks horizontal = ±12 chunks = 25×25 grid = 1600 voxels = ~1.6km view distance!
-        chunkConfig.renderDistanceHorizontal = 12;  // ±12 chunks = 25×25×2 = 1,250 chunks
-        chunkConfig.renderDistanceVertical = 2;     // UNUSED - we use fixed Y=0,1 layers
-        // With 25×25×2 = 1,250 chunks × 1 MB = 1.25 GB VRAM (well within 8GB budget!)
-
-        // Unload distance: larger hysteresis prevents reload thrashing at boundaries
-        // CRITICAL FIX: Must be > renderDistance + camera movement per frame
-        // renderDistance=12 → 25×25 grid, so unload at 20+ to prevent flickering holes
-        chunkConfig.unloadDistanceHorizontal = 20;  // Unload at 20 chunks (8 chunk safety buffer)
-        chunkConfig.unloadDistanceVertical = 3;     // UNUSED - vertical is fixed to Y=0,1
+        // ===== SEAMLESS INFINITE STREAMING CONFIGURATION =====
+        // The key to truly infinite worlds: load chunks BEFORE they're visible!
+        //
+        // LOAD_DISTANCE (16): Chunks start generating at this distance
+        //   - Creates a 4-chunk "buffer zone" beyond visible area
+        //   - Chunks have time to generate before player reaches them
+        //   - 33×33×2 = 2,178 chunks loaded = ~2.2 GB VRAM (fits in 8GB)
+        //
+        // RENDER_DISTANCE (12): What's visible (defined in TerrainConstants.h)
+        //   - 25×25×2 = 1,250 chunks in render buffer
+        //   - 1600×128×1600 voxel render buffer
+        //
+        // UNLOAD_DISTANCE (20): Chunks deleted at this distance
+        //   - 4-chunk gap from LOAD prevents thrashing when moving back and forth
+        //   - Only chunks truly far away get deleted
+        //
+        chunkConfig.loadDistanceHorizontal = LOAD_DISTANCE_HORIZONTAL;    // ±16 chunks
+        chunkConfig.unloadDistanceHorizontal = UNLOAD_DISTANCE_HORIZONTAL; // ±20 chunks
+        chunkConfig.loadDistanceVertical = 2;      // UNUSED - fixed to Y=0,1 layers
+        chunkConfig.unloadDistanceVertical = 3;    // UNUSED - fixed to Y=0,1 layers
 
         // Faster chunk generation for smooth exploration
-        chunkConfig.maxQueuedChunks = 256;          // Queue up to 256 chunks (enough for 25×25×2 / 2)
+        chunkConfig.maxQueuedChunks = 256;         // Queue up to 256 chunks (enough for streaming)
 
         auto chunkResult = m_chunkManager->Initialize(device, heapManager, chunkConfig);
         if (!chunkResult) {
@@ -131,9 +139,10 @@ Result<void> VoxelWorld::Initialize(
             return Error("Failed to create chunk copy pipeline: {}", result.error());
         }
 
-        spdlog::info("Infinite chunk system enabled ({}×{} render distance, seed: {})",
-            chunkConfig.renderDistanceHorizontal,
-            chunkConfig.renderDistanceVertical,
+        spdlog::info("Infinite chunk system enabled - load: {} chunks, render: {} chunks, unload: {} chunks (seed: {})",
+            chunkConfig.loadDistanceHorizontal,
+            RENDER_DISTANCE_HORIZONTAL,
+            chunkConfig.unloadDistanceHorizontal,
             chunkConfig.worldSeed);
 
         // Initialize active region center to invalid coordinates (will update on first frame)
@@ -727,7 +736,15 @@ glm::vec3 VoxelWorld::UpdateChunks(
     // This reduces buffer shifts from every 64 voxels to every ~512 voxels (8 chunks * 64).
     // ============================================================================
     bool bufferNeedsShift = false;
-    if (chunkChanged) {
+
+    // CRITICAL: First frame initialization - must set activeRegionCenter before anything else!
+    if (m_activeRegionCenter.x == INT32_MAX) {
+        m_activeRegionCenter = cameraChunk;
+        bufferNeedsShift = true;
+        spdlog::info("Initial buffer center set to chunk [{},{},{}]",
+            cameraChunk.x, cameraChunk.y, cameraChunk.z);
+    }
+    else if (chunkChanged) {
         // Calculate distance from camera to current buffer center
         int dx = abs(cameraChunk.x - m_activeRegionCenter.x);
         int dz = abs(cameraChunk.z - m_activeRegionCenter.z);
@@ -736,28 +753,28 @@ glm::vec3 VoxelWorld::UpdateChunks(
         // (12 chunk radius - 4 chunk margin = 8 chunk threshold)
         constexpr int SHIFT_THRESHOLD = 8;
         if (dx > SHIFT_THRESHOLD || dz > SHIFT_THRESHOLD) {
+            ChunkCoord oldCenter = m_activeRegionCenter;
             m_activeRegionCenter = cameraChunk;
             bufferNeedsShift = true;
             spdlog::info("Buffer center shifted from chunk [{},{},{}] to [{},{},{}] (distance: dx={}, dz={})",
-                m_activeRegionCenter.x - (cameraChunk.x - m_activeRegionCenter.x),
-                m_activeRegionCenter.y,
-                m_activeRegionCenter.z - (cameraChunk.z - m_activeRegionCenter.z),
+                oldCenter.x, oldCenter.y, oldCenter.z,
                 cameraChunk.x, cameraChunk.y, cameraChunk.z,
                 dx, dz);
         }
     }
 
     // ============================================================================
-    // CRITICAL FIX: DISABLE ORIGIN SHIFTING COMPLETELY!
+    // SIMPLE APPROACH: Keep regionOrigin at (0,0,0)
     //
-    // Setting regionOrigin to (0,0,0) means the shader receives absolute world coordinates.
-    // The buffer still contains chunks relative to the camera, but we need the shader to
-    // convert world pos → buffer pos using the camera chunk coordinate, not regionOrigin.
+    // The render buffer represents world coordinates starting at (0,0,0).
+    // Chunks are copied to buffer positions matching their world coordinates.
+    // This means only chunks with positive world coords will be visible.
     //
-    // This prevents ALL teleportation because the coordinate system never resets!
+    // For infinite world support later, we'll need to shift regionOrigin
+    // and adjust chunk copy destinations together. For now, keep it simple.
     // ============================================================================
-    m_regionOriginWorld = glm::vec3(0.0f, 0.0f, 0.0f);  // ALWAYS zero - no shifting!
-    glm::vec3 originShiftDelta = glm::vec3(0.0f, 0.0f, 0.0f);  // No shift ever
+    m_regionOriginWorld = glm::vec3(0.0f, 0.0f, 0.0f);  // Buffer starts at world origin
+    glm::vec3 originShiftDelta = glm::vec3(0.0f);
 
     // Log when region origin shifts (only when buffer actually shifts, not every chunk change)
     if (bufferNeedsShift) {
@@ -797,6 +814,17 @@ glm::vec3 VoxelWorld::UpdateChunks(
         if (bufferNeedsShift) {
             m_copiedChunksPerBuffer[0].clear();
             m_copiedChunksPerBuffer[1].clear();
+
+            // CRITICAL: Also clear modified chunks when buffer shifts!
+            // When the buffer center changes, all chunk positions in the buffer change.
+            // The painted voxels are now at wrong positions or outside the buffer entirely.
+            // We can't preserve paint across major buffer shifts (8+ chunks movement).
+            // This is expected behavior - paint is only preserved within the local area.
+            if (!m_modifiedChunks.empty()) {
+                spdlog::info("Buffer shifted - clearing {} modified chunks (painted data lost due to major movement)",
+                    m_modifiedChunks.size());
+                m_modifiedChunks.clear();
+            }
 
             // FIX #2: Reset frame counter to trigger aggressive chunk copying
             // After cache invalidation, we need to refill BOTH buffers ASAP to prevent
@@ -856,22 +884,43 @@ void VoxelWorld::OnChunkUnloaded(const ChunkCoord& coord) {
             m_copiedChunksPerBuffer[i].erase(it);
         }
     }
+
+    // Also clear from modified chunks set - when chunk is unloaded and reloaded,
+    // it will be regenerated fresh. Any painted data is lost (chunk left render distance).
+    m_modifiedChunks.erase(coord);
+
     spdlog::debug("Cleared chunk [{},{},{}] from copy caches on unload",
         coord.x, coord.y, coord.z);
 }
 
 void VoxelWorld::InvalidateCopiedChunk(const ChunkCoord& coord) {
-    // CRITICAL FIX: Remove chunk from BOTH buffer caches when it's modified
-    // This forces UpdateActiveRegion to re-copy the chunk with the painted voxels
-    // Both buffers need invalidation because the modification affects both
-    for (int i = 0; i < 2; ++i) {
-        auto it = m_copiedChunksPerBuffer[i].find(coord);
-        if (it != m_copiedChunksPerBuffer[i].end()) {
-            m_copiedChunksPerBuffer[i].erase(it);
-        }
-    }
-    // spdlog::debug("Invalidated chunk [{},{},{}] from copy caches (modified)",
-    //     coord.x, coord.y, coord.z);
+    // CRITICAL FIX: Mark chunk as MODIFIED instead of removing from cache!
+    //
+    // OLD BROKEN LOGIC:
+    //   1. User paints voxels in render buffer
+    //   2. We remove chunk from cache (invalidate)
+    //   3. UpdateActiveRegion sees chunk not in cache
+    //   4. Chunk gets re-copied from source (which has NO painted data!)
+    //   5. User's paint is LOST - appears to flash/vanish
+    //
+    // NEW CORRECT LOGIC:
+    //   1. User paints voxels in render buffer
+    //   2. We mark chunk as MODIFIED (add to m_modifiedChunks)
+    //   3. UpdateActiveRegion checks: is chunk modified?
+    //   4. YES → skip copying, preserve painted voxels
+    //   5. User's paint persists!
+    //
+    // Chunks stay in m_modifiedChunks until they're unloaded (far from player)
+    // or until the player restarts. This is fine - painted data is in the render
+    // buffer and there's no way to save it to the source chunks anyway.
+
+    m_modifiedChunks.insert(coord);
+
+    // Keep the chunk in the copy cache - we DON'T want to re-copy it!
+    // The painted voxels are already in the render buffer where they belong.
+
+    spdlog::debug("Marked chunk [{},{},{}] as MODIFIED (will not re-copy from source)",
+        coord.x, coord.y, coord.z);
 }
 
 Result<void> VoxelWorld::CreateChunkCopyPipeline(ID3D12Device* device) {
@@ -1308,6 +1357,14 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* /*device*/, ID3D12CommandQueue
                     continue;  // Chunk exists but generation not complete yet
                 }
 
+                // PAINTED CHUNK PROTECTION: Never re-copy chunks that have been modified!
+                // If user painted voxels in this chunk, the painted data only exists in the
+                // render buffer. Re-copying from source would overwrite their painted content.
+                if (m_modifiedChunks.find(chunkCoord) != m_modifiedChunks.end()) {
+                    chunksSkipped++;
+                    continue;  // Skip - preserve painted voxels
+                }
+
                 // CRITICAL FIX: Check if chunk is missing from EITHER buffer
                 // Ping-pong rendering requires BOTH buffers to have the same chunks!
                 // Without this, chunks appear/disappear every frame (checkerboard holes)
@@ -1341,11 +1398,11 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* /*device*/, ID3D12CommandQueue
                 Chunk* chunk = it->second;
 
                 // Calculate destination offset in render buffer
-                // Horizontal: dx ∈ [-RENDER_DISTANCE..+RENDER_DISTANCE] → 25 chunks (12*2+1)
-                // Vertical:   y ∈ [TERRAIN_CHUNK_MIN_Y..TERRAIN_CHUNK_MIN_Y+2) → 2 chunks
-                int32_t destX = (dx + RENDER_DISTANCE_HORIZONTAL) * INFINITE_CHUNK_SIZE;
-                int32_t destY = (y - TERRAIN_CHUNK_MIN_Y) * INFINITE_CHUNK_SIZE;  // Offset to buffer Y=0
-                int32_t destZ = (dz + RENDER_DISTANCE_HORIZONTAL) * INFINITE_CHUNK_SIZE;
+                // With regionOrigin = (0,0,0), buffer positions = world positions
+                // So chunk at world (x*64, y*64, z*64) goes to buffer position (x*64, y*64, z*64)
+                int32_t destX = chunkCoord.x * CHUNK_SIZE_VOXELS;
+                int32_t destY = chunkCoord.y * CHUNK_SIZE_VOXELS;
+                int32_t destZ = chunkCoord.z * CHUNK_SIZE_VOXELS;
 
                 // DIAGNOSTIC: Enable to debug chunk copy issues
                 static int copyDebugCount = 0;
