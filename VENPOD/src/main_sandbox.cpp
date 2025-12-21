@@ -925,6 +925,7 @@ int main(int argc, char* argv[]) {
             commandList.Get(),
             voxelWorld->GetReadBufferSRV(),
             voxelWorld->GetPaletteSRV(),
+            voxelWorld->GetChunkOccupancySRV(),  // Empty space acceleration
             voxelWorld->GetGridSizeX(),
             voxelWorld->GetGridSizeY(),
             voxelWorld->GetGridSizeZ(),

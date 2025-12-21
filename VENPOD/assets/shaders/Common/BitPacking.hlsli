@@ -23,8 +23,8 @@ uint GetVariant(uint voxel) {
     return (voxel >> 8) & 0xFF;
 }
 
-// Extract velocity byte from voxel data
-uint GetVelocity(uint voxel) {
+// Extract velocity byte from voxel data (raw packed bits)
+uint GetVelocityByte(uint voxel) {
     return (voxel >> 16) & 0xFF;
 }
 
@@ -43,8 +43,8 @@ uint SetVariant(uint voxel, uint variant) {
     return (voxel & 0xFFFF00FF) | ((variant & 0xFF) << 8);
 }
 
-// Set velocity in voxel data
-uint SetVelocity(uint voxel, uint velocity) {
+// Set velocity in voxel data (expects packed byte)
+uint SetVelocityByte(uint voxel, uint velocity) {
     return (voxel & 0xFF00FFFF) | ((velocity & 0xFF) << 16);
 }
 
@@ -93,18 +93,18 @@ uint SetHasMoved(uint voxel, bool moved) {
 // X_Speed: bits 4-2 (unsigned, 0 to 7)
 // Heading: bits 1-0 (0=N, 1=E, 2=S, 3=W)
 int GetYVelocity(uint voxel) {
-    int vel = (int)((GetVelocity(voxel) >> 5) & 0x7);
+    int vel = (int)((GetVelocityByte(voxel) >> 5) & 0x7);
     // Sign extend from 3 bits
     if (vel >= 4) vel -= 8;
     return vel;
 }
 
 uint GetXSpeed(uint voxel) {
-    return (GetVelocity(voxel) >> 2) & 0x7;
+    return (GetVelocityByte(voxel) >> 2) & 0x7;
 }
 
 uint GetHeading(uint voxel) {
-    return GetVelocity(voxel) & 0x3;
+    return GetVelocityByte(voxel) & 0x3;
 }
 
 uint PackVelocity(int yVel, uint xSpeed, uint heading) {

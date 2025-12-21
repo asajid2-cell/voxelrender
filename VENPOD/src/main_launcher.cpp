@@ -888,6 +888,10 @@ int RunSandbox(int argc, char* argv[]) {
             physicsDispatcher->DispatchBrush(commandList.Get(), *voxelWorld, brushConstants);
         }
 
+        // Update chunk occupancy for raymarching acceleration (empty space skipping)
+        // This scans the voxel buffer and updates a small 25x2x25 texture indicating which chunks are empty
+        voxelWorld->UpdateChunkOccupancy(commandList.Get());
+
         // Transition read buffer to pixel shader resource for rendering
         voxelWorld->TransitionReadBufferTo(commandList.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
@@ -927,11 +931,13 @@ int RunSandbox(int argc, char* argv[]) {
 
         // Render voxels with raymarch shader (using persistent shader-visible descriptors)
         // Brush preview now uses GPU raycasting (2,000,000x less bandwidth!)
+        // Chunk occupancy enables empty space skipping (raymarcher can skip entire 64-voxel chunks)
         glm::vec3 regionOrigin = voxelWorld->GetRegionOriginWorld();
         renderer->RenderVoxels(
             commandList.Get(),
             voxelWorld->GetReadBufferSRV(),
             voxelWorld->GetPaletteSRV(),
+            voxelWorld->GetChunkOccupancySRV(),  // Chunk occupancy for empty space skipping
             voxelWorld->GetGridSizeX(),
             voxelWorld->GetGridSizeY(),
             voxelWorld->GetGridSizeZ(),

@@ -32,11 +32,88 @@
 #define MAT_STEAM      17
 #define MAT_BEDROCK    255
 
-// State flags (in high byte)
-#define STATE_IS_STATIC  0x80
-#define STATE_IS_IGNITED 0x40
-#define STATE_HAS_MOVED  0x20
-#define STATE_LIFE_MASK  0x0F
+// State flags (in high byte, bits 31-24)
+#define STATE_IS_STATIC  0x80  // Bit 31: Frozen/immovable
+#define STATE_IS_IGNITED 0x40  // Bit 30: On fire (for oil napalm)
+#define STATE_HAS_MOVED  0x20  // Bit 29: Moved this frame
+#define STATE_SETTLED    0x10  // Bit 28: Liquid at equilibrium (skip physics)
+#define STATE_LIFE_MASK  0x0F  // Bits 27-24: Life counter (0-15)
+
+// =============================================================================
+// VELOCITY ENCODING (bits 23-16)
+// =============================================================================
+// New layout for smooth fluid physics:
+//   Bits 23-21: X velocity (signed 3-bit: -4 to +3)
+//   Bits 20-18: Z velocity (signed 3-bit: -4 to +3)
+//   Bits 17-16: Y velocity (signed 2-bit: -2 to +1, mostly for gravity)
+//
+// This allows liquids to have momentum and move smoothly instead of
+// teleporting 1 voxel per frame.
+
+#define VEL_X_SHIFT 21
+#define VEL_X_MASK  0x07  // 3 bits
+#define VEL_Z_SHIFT 18
+#define VEL_Z_MASK  0x07  // 3 bits
+#define VEL_Y_SHIFT 16
+#define VEL_Y_MASK  0x03  // 2 bits
+
+// Velocity byte mask (all velocity bits)
+#define VEL_BYTE_MASK 0x00FF0000
+
+// Helper: Extract signed velocity from voxel
+// Returns int3 with x,y,z velocities
+#ifdef __HLSL_VERSION
+inline int3 GetVelocity(uint voxel) {
+    uint velByte = (voxel >> 16) & 0xFF;
+
+    // Extract and sign-extend each component
+    int vx = (int)((velByte >> 5) & VEL_X_MASK);
+    int vz = (int)((velByte >> 2) & VEL_Z_MASK);
+    int vy = (int)(velByte & VEL_Y_MASK);
+
+    // Sign extend: if high bit set, subtract range to make negative
+    if (vx >= 4) vx -= 8;  // 4,5,6,7 -> -4,-3,-2,-1
+    if (vz >= 4) vz -= 8;
+    if (vy >= 2) vy -= 4;  // 2,3 -> -2,-1
+
+    return int3(vx, vy, vz);
+}
+
+// Helper: Pack velocity into voxel
+// vel components should be clamped to valid ranges before calling
+inline uint SetVelocity(uint voxel, int3 vel) {
+    // Clamp to valid ranges
+    int vx = clamp(vel.x, -4, 3);
+    int vy = clamp(vel.y, -2, 1);
+    int vz = clamp(vel.z, -4, 3);
+
+    // Convert to unsigned (wrap negatives)
+    uint ux = (uint)(vx & 0x7);  // -4 to 3 -> 4,5,6,7,0,1,2,3
+    uint uy = (uint)(vy & 0x3);  // -2 to 1 -> 2,3,0,1
+    uint uz = (uint)(vz & 0x7);
+
+    // Pack into velocity byte
+    uint velByte = (ux << 5) | (uz << 2) | uy;
+
+    // Clear old velocity, set new
+    return (voxel & ~VEL_BYTE_MASK) | (velByte << 16);
+}
+
+// Helper: Check if voxel has significant velocity
+inline bool HasVelocity(uint voxel) {
+    int3 vel = GetVelocity(voxel);
+    return (abs(vel.x) > 0 || abs(vel.y) > 0 || abs(vel.z) > 0);
+}
+
+// Helper: Apply drag to velocity (reduces by ~12.5% per frame)
+inline int3 ApplyDrag(int3 vel) {
+    // Horizontal drag (water resistance)
+    vel.x = (vel.x * 7) / 8;
+    vel.z = (vel.z * 7) / 8;
+    // No drag on Y (gravity handles it)
+    return vel;
+}
+#endif
 
 // Frame constants passed from CPU (max 64 DWORDs total for root signature)
 struct FrameConstants {

@@ -6,6 +6,14 @@ A high-performance voxel physics engine built with DirectX 12 and compute shader
 
 VENPOD is a GPU-accelerated voxel engine that demonstrates modern graphics programming techniques including compute shaders, GPU raymarching, infinite terrain generation, and real-time physics simulation. The engine uses a hybrid rendering approach with DDA raymarching for visualization and parallel compute dispatches for physics.
 
+### Two Modes
+
+VENPOD features two distinct gameplay modes accessible through a launcher dialog:
+
+1. **Sand Simulator** - Material physics and gravity simulation in a fixed 256x128x256 voxel grid. Paint with different materials (sand, water, stone, etc.) and watch them interact with realistic physics. Perfect for experimenting with falling sand mechanics and material interactions.
+
+2. **Sandbox Mode** - Infinite terrain exploration with procedural generation. Fly through an endless voxel world with chunk streaming, build structures, and explore terrain that generates around you. Features flight mode toggle and ground collision.
+
 ## Screenshots
 
 ### Voxel Painting Examples
@@ -172,11 +180,15 @@ cd VENPOD
 cd VENPOD\build\bin
 VENPOD.exe
 
-or 
+or
 
 cd VENPOD
 >> .\run.ps1
 ```
+
+When you launch VENPOD, a launcher dialog will appear asking you to choose between:
+- **Sand Simulator** - Material physics and gravity simulation
+- **Sandbox Mode** - Infinite terrain exploration
 
 ### Controls
 

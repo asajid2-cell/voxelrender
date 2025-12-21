@@ -17,6 +17,11 @@ StructuredBuffer<uint> VoxelGrid : register(t0);
 
 // Material palette
 Texture1D<float4> MaterialPalette : register(t1);
+
+// Chunk occupancy texture for empty space skipping (25x2x25 chunks)
+// 0 = chunk is empty (all air), 1 = chunk has solid voxels
+Texture3D<uint> ChunkOccupancy : register(t2);
+
 SamplerState PaletteSampler : register(s0);
 
 struct PSInput {
@@ -57,6 +62,54 @@ bool IntersectBox(float3 rayOrigin, float3 rayDir, float3 boxMin, float3 boxMax,
     tMax = min(min(tFar.x, tFar.y), tFar.z);
 
     return tMax >= tMin && tMax >= 0.0f;
+}
+
+// ===== CHUNK OCCUPANCY ACCELERATION =====
+// Check if a chunk (in buffer-local coordinates) is empty
+// Returns true if chunk has no solid voxels (can skip entire 64-voxel span)
+static const uint CHUNK_SIZE = 64;
+
+bool IsChunkEmpty(int3 bufferPos) {
+    // Convert buffer position to chunk coordinates
+    int3 chunkCoord = bufferPos / (int)CHUNK_SIZE;
+
+    // Bounds check chunk coordinates (25x2x25 chunks)
+    uint chunksX = frame.gridSizeX / CHUNK_SIZE;  // 25
+    uint chunksY = frame.gridSizeY / CHUNK_SIZE;  // 2
+    uint chunksZ = frame.gridSizeZ / CHUNK_SIZE;  // 25
+
+    if (chunkCoord.x < 0 || chunkCoord.x >= (int)chunksX ||
+        chunkCoord.y < 0 || chunkCoord.y >= (int)chunksY ||
+        chunkCoord.z < 0 || chunkCoord.z >= (int)chunksZ) {
+        return true;  // Out of bounds = treat as empty
+    }
+
+    // Sample occupancy texture (0 = empty, 1 = has solid)
+    uint occupancy = ChunkOccupancy.Load(int4(chunkCoord, 0));
+    return (occupancy == 0);
+}
+
+// Calculate distance to exit current chunk (in voxel units)
+// Returns how far to travel along ray to exit the current 64x64x64 chunk
+float DistanceToChunkExit(float3 pos, float3 rayDir, int3 chunkCoord) {
+    // Chunk boundaries in voxel coordinates
+    float3 chunkMin = float3(chunkCoord) * CHUNK_SIZE;
+    float3 chunkMax = chunkMin + CHUNK_SIZE;
+
+    // Calculate distance to each boundary
+    float3 invDir = 1.0f / rayDir;
+
+    float3 t0 = (chunkMin - pos) * invDir;
+    float3 t1 = (chunkMax - pos) * invDir;
+
+    // We want the exit point (max of near, but only positive values)
+    float3 tFar = max(t0, t1);
+
+    // Minimum positive distance to exit
+    float tExit = min(min(tFar.x, tFar.y), tFar.z);
+
+    // Ensure we move at least a little bit to avoid getting stuck
+    return max(tExit, 0.1f);
 }
 
 // DDA Raymarcher
@@ -102,8 +155,49 @@ float4 Raymarch(float3 rayOrigin, float3 rayDir) {
     float3 normal = float3(0, 1, 0);
     float dist = 0.0f;
 
-    // DDA traversal
+    // Track current chunk for occupancy acceleration
+    int3 lastChunkCoord = int3(-9999, -9999, -9999);  // Force initial check
+    bool currentChunkEmpty = false;
+
+    // DDA traversal with chunk-level empty space skipping
     for (int i = 0; i < maxSteps; i++) {
+        // Convert world position to buffer-local position for occupancy check
+        int3 bufferPos = voxelPos - int3(frame.regionOrigin.xyz);
+
+        // Check if we've entered a new chunk
+        int3 currentChunkCoord = bufferPos / (int)CHUNK_SIZE;
+        if (currentChunkCoord.x != lastChunkCoord.x ||
+            currentChunkCoord.y != lastChunkCoord.y ||
+            currentChunkCoord.z != lastChunkCoord.z) {
+            // New chunk - check occupancy
+            lastChunkCoord = currentChunkCoord;
+            currentChunkEmpty = IsChunkEmpty(bufferPos);
+        }
+
+        // ===== CHUNK SKIP OPTIMIZATION =====
+        // If current chunk is empty, skip to the chunk boundary instead of stepping voxel-by-voxel
+        if (currentChunkEmpty) {
+            // Calculate distance to exit this chunk
+            float skipDist = DistanceToChunkExit(float3(bufferPos) + 0.5f, rayDir, currentChunkCoord);
+
+            // Advance position by skip distance
+            float3 skipVec = rayDir * skipDist;
+            voxelPos += int3(skipVec);
+            dist += skipDist;
+
+            // Update sideDist for DDA continuation
+            float3 newPos = float3(voxelPos);
+            sideDist.x = (rayDir.x > 0.0f) ? (voxelPos.x + 1.0f - newPos.x) : (newPos.x - voxelPos.x);
+            sideDist.y = (rayDir.y > 0.0f) ? (voxelPos.y + 1.0f - newPos.y) : (newPos.y - voxelPos.y);
+            sideDist.z = (rayDir.z > 0.0f) ? (voxelPos.z + 1.0f - newPos.z) : (newPos.z - voxelPos.z);
+            sideDist *= deltaDist;
+            sideDist += dist;
+
+            if (dist > maxDist) break;
+            continue;  // Check next chunk
+        }
+
+        // ===== NORMAL VOXEL-BY-VOXEL DDA =====
         uint voxel = GetVoxel(voxelPos);
         uint material = GetMaterial(voxel);
 

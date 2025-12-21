@@ -536,6 +536,7 @@ int RunSandSimulator(int argc, char* argv[]) {
             commandList.Get(),
             voxelWorld->GetReadBufferSRV(),
             voxelWorld->GetPaletteSRV(),
+            Graphics::DescriptorHandle{},  // No chunk occupancy (fixed grid mode)
             voxelWorld->GetGridSizeX(),
             voxelWorld->GetGridSizeY(),
             voxelWorld->GetGridSizeZ(),

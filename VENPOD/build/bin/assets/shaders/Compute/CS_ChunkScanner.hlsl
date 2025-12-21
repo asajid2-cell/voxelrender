@@ -38,7 +38,7 @@ RWBuffer<uint> ActiveChunkCount : register(u2);
 groupshared uint gs_hasActiveVoxel;
 groupshared uint gs_particleCount;
 
-// Check if a voxel is "active" (can move)
+// Check if a voxel is "active" (needs physics simulation)
 // MUST match IsMovable() in CS_GravityChunk.hlsl!
 bool IsVoxelActive(uint voxel) {
     uint material = GetMaterial(voxel);
@@ -49,6 +49,11 @@ bool IsVoxelActive(uint voxel) {
 
     // Static voxels (bedrock, frozen) are not active
     if (state & STATE_IS_STATIC) return false;
+
+    // PERFORMANCE: Settled liquids are NOT active (they've reached equilibrium)
+    // This dramatically reduces physics computation for calm oceans
+    // Settled voxels will be woken up when neighbors disturb them
+    if (state & STATE_SETTLED) return false;
 
     // All movable materials are active (matches CS_GravityChunk.hlsl IsMovable)
     // Granular/falling: sand, dirt, gunpowder
@@ -62,7 +67,32 @@ bool IsVoxelActive(uint voxel) {
         return true;
     }
 
-    // Everything else is potentially active but settled
+    // Everything else is not active
+    return false;
+}
+
+// Check if a voxel is unsettled (has velocity or recently moved)
+// Used to wake up settled neighbors
+bool IsUnsettled(uint voxel) {
+    uint material = GetMaterial(voxel);
+    uint state = GetState(voxel);
+
+    // Air doesn't wake neighbors
+    if (material == MAT_AIR) return false;
+
+    // Static materials don't wake neighbors
+    if (state & STATE_IS_STATIC) return false;
+
+    // Non-settled movable voxels wake neighbors
+    if (!(state & STATE_SETTLED)) {
+        if (material == MAT_SAND || material == MAT_DIRT || material == MAT_GUNPOWDER ||
+            material == MAT_WATER || material == MAT_LAVA || material == MAT_OIL ||
+            material == MAT_ACID || material == MAT_HONEY || material == MAT_CONCRETE ||
+            material == MAT_SMOKE || material == MAT_STEAM || material == MAT_FIRE) {
+            return true;
+        }
+    }
+
     return false;
 }
 

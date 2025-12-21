@@ -148,6 +148,19 @@ Result<void> VoxelWorld::Initialize(
         // Initialize active region center to invalid coordinates (will update on first frame)
         m_activeRegionCenter = ChunkCoord{INT32_MAX, INT32_MAX, INT32_MAX};
         m_activeRegionNeedsUpdate = true;
+
+        // ===== CREATE CHUNK OCCUPANCY ACCELERATION RESOURCES =====
+        result = CreateChunkOccupancyResources(device, heapManager);
+        if (!result) {
+            return Error("Failed to create chunk occupancy resources: {}", result.error());
+        }
+
+        result = CreateOccupancyUpdatePipeline(device);
+        if (!result) {
+            return Error("Failed to create occupancy update pipeline: {}", result.error());
+        }
+
+        spdlog::info("Chunk occupancy acceleration enabled - raymarcher can skip empty 64-voxel chunks");
     }
 
     return {};
@@ -212,6 +225,27 @@ void VoxelWorld::Shutdown() {
     // Cleanup ground raycast buffers
     m_groundRaycastResult.Shutdown();
     m_groundRaycastReadback.Reset();
+
+    // Cleanup chunk occupancy resources
+    if (m_occupancyConstantBuffer) {
+        if (m_occupancyConstantBufferMappedPtr) {
+            m_occupancyConstantBuffer->Unmap(0, nullptr);
+            m_occupancyConstantBufferMappedPtr = nullptr;
+        }
+        m_occupancyConstantBuffer.Reset();
+    }
+    m_occupancyUpdatePSO.Reset();
+    m_occupancyUpdateRootSignature.Reset();
+
+    if (m_heapManager) {
+        if (m_chunkOccupancySRV.IsValid()) {
+            m_heapManager->FreeShaderVisibleCbvSrvUav(m_chunkOccupancySRV);
+        }
+        if (m_chunkOccupancyUAV.IsValid()) {
+            m_heapManager->FreeShaderVisibleCbvSrvUav(m_chunkOccupancyUAV);
+        }
+    }
+    m_chunkOccupancyTexture.Reset();
 
     m_materialPalette.Reset();
     m_paletteUpload.Reset();
@@ -1601,6 +1635,278 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* /*device*/, ID3D12CommandQueue
         if (m_framesAfterCacheInvalidation == 3) {
             spdlog::info("Cache refill complete - reverting to normal dual-buffer optimization");
         }
+    }
+
+    // Mark occupancy as needing update after chunk copies
+    if (chunksCopied > 0) {
+        m_occupancyNeedsUpdate = true;
+    }
+}
+
+// =============================================================================
+// CHUNK OCCUPANCY ACCELERATION
+// =============================================================================
+
+Result<void> VoxelWorld::CreateChunkOccupancyResources(ID3D12Device* device, Graphics::DescriptorHeapManager& heapManager) {
+    // Calculate occupancy texture dimensions (one texel per chunk)
+    // Render buffer is RENDER_BUFFER_CHUNKS_X × RENDER_BUFFER_CHUNKS_Y × RENDER_BUFFER_CHUNKS_Z chunks
+    constexpr uint32_t chunksX = RENDER_BUFFER_CHUNKS_X;  // 25
+    constexpr uint32_t chunksY = RENDER_BUFFER_CHUNKS_Y;  // 2
+    constexpr uint32_t chunksZ = RENDER_BUFFER_CHUNKS_Z;  // 25
+
+    // Create 3D texture for chunk occupancy (R8_UINT format - 1 byte per chunk)
+    D3D12_RESOURCE_DESC texDesc = {};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    texDesc.Alignment = 0;
+    texDesc.Width = chunksX;
+    texDesc.Height = chunksY;
+    texDesc.DepthOrArraySize = static_cast<UINT16>(chunksZ);
+    texDesc.MipLevels = 1;
+    texDesc.Format = DXGI_FORMAT_R32_UINT;  // Use R32_UINT for easier UAV access
+    texDesc.SampleDesc.Count = 1;
+    texDesc.SampleDesc.Quality = 0;
+    texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    D3D12_HEAP_PROPERTIES heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+
+    HRESULT hr = device->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &texDesc,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        nullptr,
+        IID_PPV_ARGS(&m_chunkOccupancyTexture)
+    );
+    if (FAILED(hr)) {
+        return Error("Failed to create chunk occupancy texture: {}", hr);
+    }
+    m_chunkOccupancyTexture->SetName(L"ChunkOccupancyTexture");
+
+    // Create SRV for raymarcher to read
+    m_chunkOccupancySRV = heapManager.AllocateShaderVisibleCbvSrvUav();
+    if (!m_chunkOccupancySRV.IsValid()) {
+        return Error("Failed to allocate shader-visible SRV for chunk occupancy");
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_R32_UINT;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Texture3D.MipLevels = 1;
+    srvDesc.Texture3D.MostDetailedMip = 0;
+    srvDesc.Texture3D.ResourceMinLODClamp = 0.0f;
+
+    device->CreateShaderResourceView(m_chunkOccupancyTexture.Get(), &srvDesc, m_chunkOccupancySRV.cpu);
+
+    // Create UAV for compute shader to write
+    m_chunkOccupancyUAV = heapManager.AllocateShaderVisibleCbvSrvUav();
+    if (!m_chunkOccupancyUAV.IsValid()) {
+        return Error("Failed to allocate shader-visible UAV for chunk occupancy");
+    }
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+    uavDesc.Format = DXGI_FORMAT_R32_UINT;
+    uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+    uavDesc.Texture3D.MipSlice = 0;
+    uavDesc.Texture3D.FirstWSlice = 0;
+    uavDesc.Texture3D.WSize = chunksZ;
+
+    device->CreateUnorderedAccessView(m_chunkOccupancyTexture.Get(), nullptr, &uavDesc, m_chunkOccupancyUAV.cpu);
+
+    spdlog::info("Chunk occupancy texture created: {}x{}x{} chunks ({} bytes)",
+        chunksX, chunksY, chunksZ, chunksX * chunksY * chunksZ * 4);
+
+    return {};
+}
+
+Result<void> VoxelWorld::CreateOccupancyUpdatePipeline(ID3D12Device* device) {
+    // ===== COMPILE SHADER =====
+    Graphics::ShaderCompiler compiler;
+    auto initResult = compiler.Initialize();
+    if (!initResult) {
+        return Error("Failed to initialize shader compiler: {}", initResult.error());
+    }
+
+    std::filesystem::path shaderPath = "assets/shaders/Compute/CS_UpdateChunkOccupancy.hlsl";
+    auto compileResult = compiler.CompileComputeShader(shaderPath, L"main", true);
+    if (!compileResult) {
+        return Error("Failed to compile CS_UpdateChunkOccupancy.hlsl: {}", compileResult.error());
+    }
+
+    auto& compiledShader = compileResult.value();
+    if (!compiledShader.IsValid()) {
+        return Error("CS_UpdateChunkOccupancy.hlsl compilation failed: {}", compiledShader.errors);
+    }
+
+    // ===== CREATE ROOT SIGNATURE =====
+    // Parameters:
+    // b0 = OccupancyConstants (CBV)
+    // t0 = VoxelGrid (SRV)
+    // u0 = ChunkOccupancy (UAV - descriptor table for 3D texture)
+    D3D12_ROOT_PARAMETER1 rootParams[3] = {};
+
+    // Parameter 0: CBV
+    rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rootParams[0].Descriptor.ShaderRegister = 0;
+    rootParams[0].Descriptor.RegisterSpace = 0;
+    rootParams[0].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+    rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    // Parameter 1: SRV (voxel grid)
+    rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    rootParams[1].Descriptor.ShaderRegister = 0;
+    rootParams[1].Descriptor.RegisterSpace = 0;
+    rootParams[1].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+    rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    // Parameter 2: UAV descriptor table (for 3D texture)
+    D3D12_DESCRIPTOR_RANGE1 uavRange = {};
+    uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    uavRange.NumDescriptors = 1;
+    uavRange.BaseShaderRegister = 0;
+    uavRange.RegisterSpace = 0;
+    uavRange.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_NONE;
+    uavRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    rootParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rootParams[2].DescriptorTable.NumDescriptorRanges = 1;
+    rootParams[2].DescriptorTable.pDescriptorRanges = &uavRange;
+    rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC rootSigDesc = {};
+    rootSigDesc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    rootSigDesc.Desc_1_1.NumParameters = 3;
+    rootSigDesc.Desc_1_1.pParameters = rootParams;
+    rootSigDesc.Desc_1_1.NumStaticSamplers = 0;
+    rootSigDesc.Desc_1_1.pStaticSamplers = nullptr;
+    rootSigDesc.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    Microsoft::WRL::ComPtr<ID3DBlob> signature;
+    Microsoft::WRL::ComPtr<ID3DBlob> error;
+    HRESULT hr = D3D12SerializeVersionedRootSignature(&rootSigDesc, &signature, &error);
+    if (FAILED(hr)) {
+        std::string errorMsg = error ? static_cast<const char*>(error->GetBufferPointer()) : "Unknown error";
+        return Error("Failed to serialize occupancy root signature: {}", errorMsg);
+    }
+
+    hr = device->CreateRootSignature(0, signature->GetBufferPointer(),
+        signature->GetBufferSize(), IID_PPV_ARGS(&m_occupancyUpdateRootSignature));
+    if (FAILED(hr)) {
+        return Error("Failed to create occupancy root signature");
+    }
+
+    // ===== CREATE PSO =====
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+    psoDesc.pRootSignature = m_occupancyUpdateRootSignature.Get();
+    psoDesc.CS = compiledShader.GetBytecode();
+    psoDesc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+
+    hr = device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&m_occupancyUpdatePSO));
+    if (FAILED(hr)) {
+        return Error("Failed to create occupancy PSO");
+    }
+
+    m_occupancyUpdatePSO->SetName(L"CS_UpdateChunkOccupancy_PSO");
+    m_occupancyUpdateRootSignature->SetName(L"CS_UpdateChunkOccupancy_RootSig");
+
+    // ===== CREATE CONSTANT BUFFER =====
+    struct OccupancyConstants {
+        uint32_t gridSizeX;
+        uint32_t gridSizeY;
+        uint32_t gridSizeZ;
+        uint32_t chunkSize;
+        uint32_t chunksX;
+        uint32_t chunksY;
+        uint32_t chunksZ;
+        uint32_t padding;
+    };
+
+    D3D12_HEAP_PROPERTIES heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+    D3D12_RESOURCE_DESC cbDesc = CD3DX12_RESOURCE_DESC::Buffer(256);  // 256-byte aligned
+
+    hr = device->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &cbDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&m_occupancyConstantBuffer)
+    );
+    if (FAILED(hr)) {
+        return Error("Failed to create occupancy constant buffer");
+    }
+
+    // Map and initialize constant buffer
+    hr = m_occupancyConstantBuffer->Map(0, nullptr, &m_occupancyConstantBufferMappedPtr);
+    if (FAILED(hr)) {
+        return Error("Failed to map occupancy constant buffer");
+    }
+
+    OccupancyConstants* constants = static_cast<OccupancyConstants*>(m_occupancyConstantBufferMappedPtr);
+    constants->gridSizeX = m_config.gridSizeX;
+    constants->gridSizeY = m_config.gridSizeY;
+    constants->gridSizeZ = m_config.gridSizeZ;
+    constants->chunkSize = CHUNK_SIZE_VOXELS;
+    constants->chunksX = RENDER_BUFFER_CHUNKS_X;
+    constants->chunksY = RENDER_BUFFER_CHUNKS_Y;
+    constants->chunksZ = RENDER_BUFFER_CHUNKS_Z;
+    constants->padding = 0;
+
+    spdlog::info("Occupancy update pipeline created");
+    return {};
+}
+
+void VoxelWorld::UpdateChunkOccupancy(ID3D12GraphicsCommandList* cmdList) {
+    if (!m_occupancyNeedsUpdate || !m_occupancyUpdatePSO || !m_chunkOccupancyTexture) {
+        return;  // Nothing to update or pipeline not ready
+    }
+
+    // Transition voxel buffer to SRV for reading
+    TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    // Transition occupancy texture to UAV for writing (only if not already in UAV state)
+    if (m_occupancyTextureState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+        D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_chunkOccupancyTexture.Get(),
+            m_occupancyTextureState,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        );
+        cmdList->ResourceBarrier(1, &barrier);
+        m_occupancyTextureState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+
+    // Set pipeline state
+    cmdList->SetComputeRootSignature(m_occupancyUpdateRootSignature.Get());
+    cmdList->SetPipelineState(m_occupancyUpdatePSO.Get());
+
+    // Bind resources
+    cmdList->SetComputeRootConstantBufferView(0, m_occupancyConstantBuffer->GetGPUVirtualAddress());
+    cmdList->SetComputeRootShaderResourceView(1, GetReadBuffer().GetGPUVirtualAddress());
+    cmdList->SetComputeRootDescriptorTable(2, m_chunkOccupancyUAV.gpu);
+
+    // Dispatch one thread group per chunk (25x2x25 = 1250 thread groups)
+    cmdList->Dispatch(RENDER_BUFFER_CHUNKS_X, RENDER_BUFFER_CHUNKS_Y, RENDER_BUFFER_CHUNKS_Z);
+
+    // UAV barrier to ensure writes complete before raymarcher reads
+    D3D12_RESOURCE_BARRIER uavBarrier = CD3DX12_RESOURCE_BARRIER::UAV(m_chunkOccupancyTexture.Get());
+    cmdList->ResourceBarrier(1, &uavBarrier);
+
+    // Transition occupancy texture to PIXEL_SHADER_RESOURCE for raymarcher
+    D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+        m_chunkOccupancyTexture.Get(),
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+    );
+    cmdList->ResourceBarrier(1, &barrier);
+    m_occupancyTextureState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+    m_occupancyNeedsUpdate = false;
+
+    static int updateCount = 0;
+    if (++updateCount % 60 == 1) {
+        spdlog::debug("Chunk occupancy updated ({}x{}x{} chunks scanned)",
+            RENDER_BUFFER_CHUNKS_X, RENDER_BUFFER_CHUNKS_Y, RENDER_BUFFER_CHUNKS_Z);
     }
 }
 

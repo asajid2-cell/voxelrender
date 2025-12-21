@@ -141,6 +141,7 @@ void Renderer::RenderVoxels(
     ID3D12GraphicsCommandList* cmdList,
     const DescriptorHandle& voxelGridSRV,
     const DescriptorHandle& materialPaletteSRV,
+    const DescriptorHandle& chunkOccupancySRV,
     uint32_t gridSizeX,
     uint32_t gridSizeY,
     uint32_t gridSizeZ,
@@ -251,6 +252,11 @@ void Renderer::RenderVoxels(
     // Use persistent shader-visible descriptors directly (no per-frame copy needed)
     cmdList->SetGraphicsRootDescriptorTable(1, voxelGridSRV.gpu);
     cmdList->SetGraphicsRootDescriptorTable(2, materialPaletteSRV.gpu);
+
+    // Bind chunk occupancy texture for empty space skipping (t2 in shader)
+    if (chunkOccupancySRV.IsValid()) {
+        cmdList->SetGraphicsRootDescriptorTable(3, chunkOccupancySRV.gpu);
+    }
 
     // Draw fullscreen triangle
     cmdList->DrawInstanced(3, 1, 0, 0);
@@ -379,6 +385,16 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
     pipelineDesc.rootParams.push_back({
         RootParamType::DescriptorTable,
         1,  // register t1
+        0,  // space 0
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,  // numDescriptors
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+
+    // t2: ChunkOccupancy 3D texture (for empty space skipping acceleration)
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        2,  // register t2
         0,  // space 0
         D3D12_SHADER_VISIBILITY_PIXEL,
         1,  // numDescriptors

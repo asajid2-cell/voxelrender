@@ -78,6 +78,7 @@ public:
         ID3D12GraphicsCommandList* cmdList,
         const DescriptorHandle& voxelGridSRV,
         const DescriptorHandle& materialPaletteSRV,
+        const DescriptorHandle& chunkOccupancySRV,  // For empty space skipping optimization
         uint32_t gridSizeX,
         uint32_t gridSizeY,
         uint32_t gridSizeZ,

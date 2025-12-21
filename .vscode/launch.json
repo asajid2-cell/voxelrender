@@ -1,0 +1,37 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "VENPOD Debug",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/VENPOD/build/bin/VENPOD.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/VENPOD/build/bin",
+            "environment": [],
+            "console": "integratedTerminal",
+            "preLaunchTask": "Build Debug"
+        },
+        {
+            "name": "VENPOD Release",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/VENPOD/build/bin/VENPOD.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/VENPOD/build/bin",
+            "environment": [],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "VENPOD Attach",
+            "type": "cppvsdbg",
+            "request": "attach",
+            "processId": "${command:pickProcess}",
+            "sourceFileMap": {
+                "/": "${workspaceFolder}/"
+            }
+        }
+    ]
+}

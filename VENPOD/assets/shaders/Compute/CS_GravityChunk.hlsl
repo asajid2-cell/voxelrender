@@ -504,6 +504,28 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                     if (IsLiquid(currentVoxel)) {
                         uint rng = PCGHash(pos.x + pos.y * 1000 + pos.z * 1000000 + frameIndex);
 
+                        // =================================================================
+                        // SMOOTH FLUID PHYSICS WITH VELOCITY AND SETTLING
+                        // =================================================================
+                        // Get current velocity from voxel (momentum-based movement)
+                        int3 vel = GetVelocity(currentVoxel);
+                        uint settleCount = GetLife(currentVoxel);  // Use life bits as settle counter
+                        uint currentState = GetState(currentVoxel);
+
+                        // Check if this voxel is settled (at equilibrium)
+                        // Settled voxels skip most physics until disturbed
+                        bool isSettled = (currentState & STATE_SETTLED) != 0;
+
+                        // Apply gravity to vertical velocity
+                        // Terminal velocity is -2 (max fall speed in our 2-bit system)
+                        if (vel.y > -2) {
+                            vel.y = vel.y - 1;
+                        }
+
+                        // Apply drag to horizontal velocity (water resistance)
+                        // This causes momentum to gradually decay
+                        vel = ApplyDrag(vel);
+
                         // === CHECK FOR WATER INTERACTIONS ===
                         if (material == MAT_WATER) {
                             // Check all 6 adjacent voxels for interactions
@@ -595,12 +617,15 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                             }
                         }
 
-                        // === PRIORITY 3: HORIZONTAL SPREAD (puddle leveling) ===
-                        // Only spread if destination water column is LOWER (pressure-based flow)
+                        // === PRIORITY 3: HORIZONTAL SPREAD (pressure-based flow) ===
+                        // Uses pressure differential to determine flow probability
+                        // Higher pressure difference = more likely to flow
+                        // This creates smooth, gradual equalization instead of jittery binary flow
 
-                        if (!moved) {  // Only spread horizontally if we didn't move diagonally
-                            // Get current water column height
+                        if (!moved && !isSettled) {  // Only spread if we didn't move and aren't settled
+                            // Get current water column height (measures pressure)
                             int myHeight = GetLiquidColumnHeight(pos);
+                            int myPressure = myHeight - pos.y;  // Depth below surface = pressure
 
                             // Shuffle to try directions in random order
                             int startIdx = (rng >> 4) & 0x3;
@@ -617,25 +642,75 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                                 uint sideVoxel = GetVoxelSafe(sidePos);
 
                                 if (IsEmpty(GetMaterial(sideVoxel))) {
-                                    // Check if neighbor water column is lower than ours
+                                    // Calculate pressure differential
                                     int neighborHeight = GetLiquidColumnHeight(sidePos);
+                                    int neighborPressure = neighborHeight - sidePos.y;
+                                    int pressureDiff = myPressure - neighborPressure;
 
-                                    // Only spread if we're leveling out (neighbor is at least 1 block lower)
-                                    // The "1" prevents single-voxel jittering while allowing natural leveling
-                                    if (neighborHeight < myHeight - 1) {
+                                    // SMOOTH FLOW: Use probability based on pressure difference
+                                    // pressureDiff of 1 = 10% chance, 5 = 50%, 10+ = 100%
+                                    // This creates gradual equalization instead of binary threshold
+                                    int flowThreshold = 10 - pressureDiff;
+                                    int flowRoll = (int)((rng >> 8) % 10);
+
+                                    if (pressureDiff > 0 && flowRoll >= flowThreshold) {
+                                        // Transfer some horizontal velocity toward flow direction
+                                        if (idx == 0) vel.x = min(vel.x + 1, 3);      // +X
+                                        else if (idx == 1) vel.x = max(vel.x - 1, -4); // -X
+                                        else if (idx == 2) vel.z = min(vel.z + 1, 3);  // +Z
+                                        else vel.z = max(vel.z - 1, -4);               // -Z
+
+                                        // Create output voxel with updated velocity
                                         outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, 0);
+                                        outputVoxel = SetVelocity(outputVoxel, vel);
                                         SetVoxel(uint3(pos), PackVoxel(MAT_AIR, 0, 0, 0));
                                         SetVoxel(uint3(sidePos), outputVoxel);
                                         moved = true;
+                                        settleCount = 0;  // Reset settle counter on movement
                                         break;
                                     }
                                 }
                             }
                         }
 
-                        // If voxel moved, we're done - skip the "stay put" write below
+                        // === SETTLING BEHAVIOR ===
+                        // If voxel didn't move and has low velocity, increment settle counter
+                        // After enough frames of no movement, mark as settled (skip physics)
+                        if (!moved) {
+                            bool hasSignificantVel = (abs(vel.x) > 0 || abs(vel.z) > 0 || vel.y < -1);
+
+                            if (!hasSignificantVel) {
+                                // No movement, increment settle counter
+                                if (settleCount < 15) {
+                                    settleCount++;
+                                }
+
+                                // After 15 frames of no movement, mark as settled
+                                if (settleCount >= 15) {
+                                    uint newState = (currentState | STATE_SETTLED) & ~STATE_LIFE_MASK;
+                                    newState |= (settleCount & STATE_LIFE_MASK);
+                                    outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, newState);
+                                    outputVoxel = SetVelocity(outputVoxel, int3(0, 0, 0));  // Zero velocity
+                                    SetVoxel(uint3(pos), outputVoxel);
+                                    continue;  // Skip to next voxel
+                                }
+                            } else {
+                                // Has velocity, reset settle counter
+                                settleCount = 0;
+                            }
+
+                            // Update voxel with current velocity and settle count
+                            uint newState = (currentState & ~(STATE_SETTLED | STATE_LIFE_MASK));
+                            newState |= (settleCount & STATE_LIFE_MASK);
+                            outputVoxel = PackVoxel(material, GetVariant(currentVoxel), 0, newState);
+                            outputVoxel = SetVelocity(outputVoxel, vel);
+                            SetVoxel(uint3(pos), outputVoxel);
+                            continue;
+                        }
+
+                        // Voxel moved - continue to next voxel
                         if (moved) {
-                            continue;  // Now this correctly skips to next voxel
+                            continue;
                         }
                     }
 

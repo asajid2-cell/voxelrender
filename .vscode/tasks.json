@@ -1,0 +1,70 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build Debug",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/VENPOD/build",
+                "--config",
+                "Debug",
+                "--parallel"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": ["$msCompile"],
+            "detail": "Build VENPOD in Debug configuration"
+        },
+        {
+            "label": "Build Release",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/VENPOD/build",
+                "--config",
+                "Release",
+                "--parallel"
+            ],
+            "group": "build",
+            "problemMatcher": ["$msCompile"],
+            "detail": "Build VENPOD in Release configuration"
+        },
+        {
+            "label": "Clean",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/VENPOD/build",
+                "--target",
+                "clean"
+            ],
+            "problemMatcher": [],
+            "detail": "Clean build artifacts"
+        },
+        {
+            "label": "Rebuild Debug",
+            "type": "shell",
+            "dependsOn": ["Clean", "Build Debug"],
+            "dependsOrder": "sequence",
+            "problemMatcher": [],
+            "detail": "Clean and rebuild Debug configuration"
+        },
+        {
+            "label": "Sync Shaders",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-Command",
+                "Copy-Item -Path '${workspaceFolder}/VENPOD/assets/shaders' -Destination '${workspaceFolder}/VENPOD/build/bin/assets/' -Recurse -Force"
+            ],
+            "problemMatcher": [],
+            "detail": "Copy shader files to build directory"
+        }
+    ]
+}

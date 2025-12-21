@@ -268,6 +268,39 @@ private:
     uint64_t m_chunkCopyFenceValue = 0;
     uint64_t m_copyAllocatorFenceValues[NUM_COPY_BUFFERS] = {0, 0, 0};
     HANDLE m_chunkCopyFenceEvent = nullptr;
+
+    // ===== CHUNK OCCUPANCY ACCELERATION =====
+    // 3D texture storing whether each chunk has any solid voxels (25x2x25 for render buffer)
+    // 0 = empty (all air), 1 = has solid voxels
+    // Used by raymarcher to skip entire 64-voxel chunks at once
+    ComPtr<ID3D12Resource> m_chunkOccupancyTexture;
+    Graphics::DescriptorHandle m_chunkOccupancySRV;      // For raymarcher to read
+    Graphics::DescriptorHandle m_chunkOccupancyUAV;      // For compute shader to write
+
+    // Occupancy update compute pipeline
+    ComPtr<ID3D12PipelineState> m_occupancyUpdatePSO;
+    ComPtr<ID3D12RootSignature> m_occupancyUpdateRootSignature;
+    ComPtr<ID3D12Resource> m_occupancyConstantBuffer;
+    void* m_occupancyConstantBufferMappedPtr = nullptr;
+
+    // Track if occupancy needs update (after chunk copies or buffer swap)
+    bool m_occupancyNeedsUpdate = true;
+
+    // Track occupancy texture state for proper transitions
+    D3D12_RESOURCE_STATES m_occupancyTextureState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+
+    Result<void> CreateChunkOccupancyResources(ID3D12Device* device, Graphics::DescriptorHeapManager& heapManager);
+    Result<void> CreateOccupancyUpdatePipeline(ID3D12Device* device);
+
+public:
+    // Update chunk occupancy texture (call after chunk copies complete)
+    void UpdateChunkOccupancy(ID3D12GraphicsCommandList* cmdList);
+
+    // Get occupancy SRV for raymarcher binding
+    const Graphics::DescriptorHandle& GetChunkOccupancySRV() const { return m_chunkOccupancySRV; }
+
+    // Mark occupancy as needing update (called when voxels change)
+    void InvalidateOccupancy() { m_occupancyNeedsUpdate = true; }
 };
 
 } // namespace VENPOD::Simulation
