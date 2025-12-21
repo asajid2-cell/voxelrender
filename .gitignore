@@ -1,0 +1,5 @@
+# PowerShell history files (prevent leaking secrets)
+**/ps-history*.txt
+**/ConsoleHost_history.txt
+**/*PSReadLine*history*.txt
+
