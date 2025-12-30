@@ -13,6 +13,7 @@
 #include "Input/InputManager.h"
 #include "Input/BrushController.h"
 #include <spdlog/spdlog.h>
+#include <spdlog/sinks/basic_file_sink.h>
 #include <SDL3/SDL.h>
 #include <glm/glm.hpp>
 #include <memory>
@@ -46,7 +47,16 @@ int RunSandSimulator(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
 
-    spdlog::set_level(spdlog::level::info);
+    // Setup file logging so we can see what's happening in GUI mode
+    try {
+        auto file_logger = spdlog::basic_logger_mt("venpod_sandsim", "venpod_sandsim_log.txt", true);
+        spdlog::set_default_logger(file_logger);
+    } catch (const spdlog::spdlog_ex& ex) {
+        // Fall back to default logger if file creation fails
+    }
+
+    spdlog::set_level(spdlog::level::debug);
+    spdlog::flush_on(spdlog::level::debug);  // Flush immediately for debugging
     spdlog::info("===========================================");
     spdlog::info("  VENPOD - Voxel Physics Engine v0.1.0");
     spdlog::info("  Target: 100M+ Active Voxels @ 60 FPS");
@@ -170,6 +180,12 @@ int RunSandSimulator(int argc, char* argv[]) {
         return 1;
     }
 
+    // CRITICAL: Disable infinite chunks for SandSimulator mode
+    // SandSimulator uses a fixed 256x128x256 grid, not the infinite streaming system
+    // The InfiniteChunkManager was designed for 1600x128x1600 render buffers
+    voxelWorld->SetUseInfiniteChunks(false);
+    spdlog::info("SandSimulator: Using fixed 256x128x256 grid (infinite chunks disabled)");
+
     // Initialize ChunkManager for sparse chunk-based optimization
     auto chunkManager = std::make_unique<Simulation::ChunkManager>();
     auto chunkResult = chunkManager->Initialize(
@@ -247,13 +263,13 @@ int RunSandSimulator(int argc, char* argv[]) {
     const float mouseSensitivity = 0.001f;  // Radians per pixel (halved for better control)
 
     // Initial camera position
+    // Spawn above terrain (base level ~60) and look down to see the world
     float gridSizeXInit = static_cast<float>(voxelWorld->GetGridSizeX());
-    float gridSizeYInit = static_cast<float>(voxelWorld->GetGridSizeY());
     float gridSizeZInit = static_cast<float>(voxelWorld->GetGridSizeZ());
-    glm::vec3 cameraPos = glm::vec3(gridSizeXInit * 0.5f, gridSizeYInit * 0.5f, gridSizeZInit * 0.5f);
+    glm::vec3 cameraPos = glm::vec3(gridSizeXInit * 0.5f, 90.0f, gridSizeZInit * 0.5f);
 
     // Camera rotation (pitch and yaw)
-    float cameraPitch = 0.0f;  // Look straight
+    float cameraPitch = -0.3f;  // Look slightly down to see terrain
     float cameraYaw = 0.0f;  // Look forward
 
     // Main loop
@@ -261,6 +277,9 @@ int RunSandSimulator(int argc, char* argv[]) {
     bool paused = false;
     uint64_t frameCount = 0;
     bool mouseInitialized = false;  // Track if mouse capture has been enabled
+
+    spdlog::info("=== ENTERING MAIN LOOP (SandSimulator) ===");
+    spdlog::default_logger()->flush();
 
     while (running) {
         // Process SDL events FIRST to update mouse/keyboard state
@@ -271,6 +290,7 @@ int RunSandSimulator(int argc, char* argv[]) {
 
             switch (event.type) {
                 case SDL_EVENT_QUIT:
+                    spdlog::info("=== SDL_EVENT_QUIT RECEIVED (SandSimulator) ===");
                     running = false;
                     break;
 
@@ -445,6 +465,12 @@ int RunSandSimulator(int argc, char* argv[]) {
                 1.0f/60.0f,
                 static_cast<uint32_t>(frameCount)
             );
+
+            // CRITICAL: Invalidate occupancy after physics because voxels moved!
+            // Without this, the raymarcher uses stale occupancy data and either:
+            // - Skips chunks that now have solid voxels (rendering holes)
+            // - Doesn't skip chunks that are now empty (slow voxel-by-voxel scan)
+            voxelWorld->InvalidateOccupancy();
         }
 
         // Apply brush painting AFTER physics (so brush changes aren't overwritten)
@@ -493,7 +519,14 @@ int RunSandSimulator(int argc, char* argv[]) {
             brushConstants.seed = static_cast<uint32_t>(frameCount);
 
             physicsDispatcher->DispatchBrush(commandList.Get(), *voxelWorld, brushConstants);
+
+            // Invalidate occupancy after brush painting too
+            voxelWorld->InvalidateOccupancy();
         }
+
+        // Update chunk occupancy for raymarching acceleration (empty space skipping)
+        // This scans the voxel buffer and updates a small texture indicating which chunks are empty
+        voxelWorld->UpdateChunkOccupancy(commandList.Get());
 
         // Transition read buffer to pixel shader resource for rendering
         voxelWorld->TransitionReadBufferTo(commandList.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -536,7 +569,7 @@ int RunSandSimulator(int argc, char* argv[]) {
             commandList.Get(),
             voxelWorld->GetReadBufferSRV(),
             voxelWorld->GetPaletteSRV(),
-            Graphics::DescriptorHandle{},  // No chunk occupancy (fixed grid mode)
+            voxelWorld->GetChunkOccupancySRV(),  // Occupancy texture for empty space skipping
             voxelWorld->GetGridSizeX(),
             voxelWorld->GetGridSizeY(),
             voxelWorld->GetGridSizeZ(),
@@ -604,5 +637,6 @@ int RunSandSimulator(int argc, char* argv[]) {
     device->Shutdown();
 
     spdlog::info("VENPOD shut down cleanly. Total frames: {}", frameCount);
+    spdlog::default_logger()->flush();
     return 0;
 }

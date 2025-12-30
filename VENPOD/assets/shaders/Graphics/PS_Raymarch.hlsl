@@ -180,20 +180,20 @@ float4 Raymarch(float3 rayOrigin, float3 rayDir) {
             // Calculate distance to exit this chunk
             float skipDist = DistanceToChunkExit(float3(bufferPos) + 0.5f, rayDir, currentChunkCoord);
 
-            // Advance position by skip distance
-            float3 skipVec = rayDir * skipDist;
-            voxelPos += int3(skipVec);
+            // Advance along ray by skip distance
             dist += skipDist;
-
-            // Update sideDist for DDA continuation
-            float3 newPos = float3(voxelPos);
-            sideDist.x = (rayDir.x > 0.0f) ? (voxelPos.x + 1.0f - newPos.x) : (newPos.x - voxelPos.x);
-            sideDist.y = (rayDir.y > 0.0f) ? (voxelPos.y + 1.0f - newPos.y) : (newPos.y - voxelPos.y);
-            sideDist.z = (rayDir.z > 0.0f) ? (voxelPos.z + 1.0f - newPos.z) : (newPos.z - voxelPos.z);
-            sideDist *= deltaDist;
-            sideDist += dist;
-
             if (dist > maxDist) break;
+
+            // Calculate new position along ray from original start
+            float3 newWorldPos = startPos + rayDir * dist;
+            voxelPos = int3(floor(newWorldPos));
+
+            // Recalculate sideDist from actual position for proper DDA continuation
+            sideDist.x = (rayDir.x > 0.0f) ? (voxelPos.x + 1.0f - newWorldPos.x) : (newWorldPos.x - voxelPos.x);
+            sideDist.y = (rayDir.y > 0.0f) ? (voxelPos.y + 1.0f - newWorldPos.y) : (newWorldPos.y - voxelPos.y);
+            sideDist.z = (rayDir.z > 0.0f) ? (voxelPos.z + 1.0f - newWorldPos.z) : (newWorldPos.z - voxelPos.z);
+            sideDist *= deltaDist;
+
             continue;  // Check next chunk
         }
 

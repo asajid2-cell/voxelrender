@@ -283,6 +283,11 @@ private:
     ComPtr<ID3D12Resource> m_occupancyConstantBuffer;
     void* m_occupancyConstantBufferMappedPtr = nullptr;
 
+    // Actual chunk dimensions (computed from grid size, not hardcoded)
+    uint32_t m_occupancyChunksX = 0;
+    uint32_t m_occupancyChunksY = 0;
+    uint32_t m_occupancyChunksZ = 0;
+
     // Track if occupancy needs update (after chunk copies or buffer swap)
     bool m_occupancyNeedsUpdate = true;
 

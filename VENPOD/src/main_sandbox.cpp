@@ -860,6 +860,9 @@ int main(int argc, char* argv[]) {
             brushConstants.seed = static_cast<uint32_t>(frameCount);
 
             physicsDispatcher->DispatchBrush(commandList.Get(), *voxelWorld, brushConstants);
+
+            // Invalidate occupancy after brush painting
+            voxelWorld->InvalidateOccupancy();
         }
 
         // Run physics simulation (if not paused)
@@ -880,7 +883,13 @@ int main(int argc, char* argv[]) {
                 1.0f/60.0f,
                 static_cast<uint32_t>(frameCount)
             );
+
+            // CRITICAL: Invalidate occupancy after physics because voxels moved!
+            voxelWorld->InvalidateOccupancy();
         }
+
+        // Update chunk occupancy for raymarching acceleration (empty space skipping)
+        voxelWorld->UpdateChunkOccupancy(commandList.Get());
 
         // Transition read buffer to pixel shader resource for rendering
         voxelWorld->TransitionReadBufferTo(commandList.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);

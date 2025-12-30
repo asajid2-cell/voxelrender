@@ -20,6 +20,7 @@
 #include "UI/PauseMenu.h"
 #include <imgui.h>
 #include <spdlog/spdlog.h>
+#include <spdlog/sinks/basic_file_sink.h>
 #include <SDL3/SDL.h>
 #include <glm/glm.hpp>
 #include <memory>
@@ -56,6 +57,14 @@ int RunSandbox(int argc, char* argv[]) {
     (void)argc;
     (void)argv;
 
+    // Setup file logging so we can see what's happening in GUI mode
+    try {
+        auto file_logger = spdlog::basic_logger_mt("venpod", "venpod_log.txt", true);
+        spdlog::set_default_logger(file_logger);
+    } catch (const spdlog::spdlog_ex& ex) {
+        // Fall back to default logger if file creation fails
+    }
+
     // DEBUG MODE: When true, bypass streaming and use a fixed 2x2 static
     // chunk layout copied into the 256x128x256 voxel buffer each frame.
     // This isolates copy/origin bugs from the infinite chunk streaming logic.
@@ -63,6 +72,7 @@ int RunSandbox(int argc, char* argv[]) {
 
     // DEBUGGING: Enable debug level to see synchronization logs
     spdlog::set_level(spdlog::level::debug);
+    spdlog::flush_on(spdlog::level::debug);  // Flush immediately for debugging
     spdlog::info("===========================================");
     spdlog::info("  VENPOD - Voxel Physics Engine v0.1.0");
     spdlog::info("  Target: 100M+ Active Voxels @ 60 FPS");
@@ -485,6 +495,8 @@ int RunSandbox(int argc, char* argv[]) {
     uint64_t frameCount = 0;
     bool mouseInitialized = false;  // Track if mouse capture has been enabled
 
+    spdlog::info("=== ENTERING MAIN LOOP ===");
+
     while (running) {
         // Process SDL events FIRST to update mouse/keyboard state
         SDL_Event event;
@@ -497,6 +509,7 @@ int RunSandbox(int argc, char* argv[]) {
 
             switch (event.type) {
                 case SDL_EVENT_QUIT:
+                    spdlog::info("=== SDL_EVENT_QUIT RECEIVED ===");
                     running = false;
                     break;
 
@@ -836,6 +849,9 @@ int RunSandbox(int argc, char* argv[]) {
                 1.0f/60.0f,
                 static_cast<uint32_t>(frameCount)
             );
+
+            // CRITICAL: Invalidate occupancy after physics because voxels moved!
+            voxelWorld->InvalidateOccupancy();
         }
 
         // Apply brush painting AFTER physics (so brush changes aren't overwritten)
@@ -886,6 +902,9 @@ int RunSandbox(int argc, char* argv[]) {
             brushConstants.seed = static_cast<uint32_t>(frameCount);
 
             physicsDispatcher->DispatchBrush(commandList.Get(), *voxelWorld, brushConstants);
+
+            // Invalidate occupancy after brush painting too
+            voxelWorld->InvalidateOccupancy();
         }
 
         // Update chunk occupancy for raymarching acceleration (empty space skipping)
@@ -996,7 +1015,7 @@ int RunSandbox(int argc, char* argv[]) {
         // }
     }
 
-    spdlog::info("Shutting down...");
+    spdlog::info("Shutting down... Total frames: {}", frameCount);
 
     // CRITICAL: Wait for all GPU work to complete before cleanup
     // This prevents OBJECT_DELETED_WHILE_STILL_IN_USE errors
@@ -1018,5 +1037,6 @@ int RunSandbox(int argc, char* argv[]) {
     device->Shutdown();
 
     spdlog::info("VENPOD shut down cleanly. Total frames: {}", frameCount);
+    spdlog::default_logger()->flush();
     return 0;
 }

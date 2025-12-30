@@ -1,0 +1,408 @@
+[2025-12-30 10:36:41.258] [venpod_sandsim] [info] ===========================================
+[2025-12-30 10:36:41.259] [venpod_sandsim] [info]   VENPOD - Voxel Physics Engine v0.1.0
+[2025-12-30 10:36:41.259] [venpod_sandsim] [info]   Target: 100M+ Active Voxels @ 60 FPS
+[2025-12-30 10:36:41.259] [venpod_sandsim] [info] ===========================================
+[2025-12-30 10:36:41.259] [venpod_sandsim] [info] Initializing DX12 Device...
+[2025-12-30 10:36:41.262] [venpod_sandsim] [info] D3D12 Debug Layer enabled
+[2025-12-30 10:36:41.262] [venpod_sandsim] [info] GPU-based validation enabled
+[2025-12-30 10:36:41.262] [venpod_sandsim] [info] DX12 DRED (auto-breadcrumbs + page fault reporting) enabled
+[2025-12-30 10:36:41.418] [venpod_sandsim] [info] Selected GPU: NVIDIA GeForce RTX 3070 Ti
+[2025-12-30 10:36:41.418] [venpod_sandsim] [info]   Dedicated Video Memory: 8017 MB
+[2025-12-30 10:36:41.585] [venpod_sandsim] [info] Variable refresh rate (tearing) supported
+[2025-12-30 10:36:41.585] [venpod_sandsim] [info] DX12 Device initialized successfully
+[2025-12-30 10:36:41.623] [venpod_sandsim] [info] Command Queue initialized (Direct (Graphics))
+[2025-12-30 10:36:41.664] [venpod_sandsim] [info] Window created: 1920x1080 (VENPOD - Voxel Physics Engine)
+[2025-12-30 10:36:41.672] [venpod_sandsim] [info] Swap chain created with 3 buffers (triple buffering)
+[2025-12-30 10:36:41.672] [venpod_sandsim] [info] Render target views created
+[2025-12-30 10:36:41.672] [venpod_sandsim] [info] Shader path: Z:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\build\bin\assets\shaders
+[2025-12-30 10:36:41.672] [venpod_sandsim] [debug] DescriptorHeap created: StagingCbvSrvUav (4096 descriptors, CPU-only)
+[2025-12-30 10:36:41.673] [venpod_sandsim] [debug] DescriptorHeap created: ShaderVisibleCbvSrvUav (4096 descriptors, shader-visible)
+[2025-12-30 10:36:41.673] [venpod_sandsim] [debug] DescriptorHeap created: RtvHeap (32 descriptors, CPU-only)
+[2025-12-30 10:36:41.673] [venpod_sandsim] [debug] DescriptorHeap created: DsvHeap (8 descriptors, CPU-only)
+[2025-12-30 10:36:41.673] [venpod_sandsim] [info] DescriptorHeapManager initialized: CBV/SRV/UAV=4096, RTV=32, DSV=8
+[2025-12-30 10:36:41.674] [venpod_sandsim] [info] ShaderCompiler initialized with DXC
+[2025-12-30 10:36:41.674] [venpod_sandsim] [debug] Created 3 RTVs for swapchain
+[2025-12-30 10:36:41.682] [venpod_sandsim] [debug] Shader compiled successfully: VS_Fullscreen.hlsl
+[2025-12-30 10:36:41.730] [venpod_sandsim] [debug] Shader compiled successfully: PS_Raymarch.hlsl
+[2025-12-30 10:36:41.765] [venpod_sandsim] [info] DX12GraphicsPipeline created: FullscreenPipeline
+[2025-12-30 10:36:41.765] [venpod_sandsim] [info] Fullscreen pipeline created successfully
+[2025-12-30 10:36:41.765] [venpod_sandsim] [info] Renderer initialized (1920x1080)
+[2025-12-30 10:36:41.768] [venpod_sandsim] [debug] Created persistent shader-visible descriptors for voxel buffers
+[2025-12-30 10:36:41.769] [venpod_sandsim] [debug] Material palette created with 256 colors (shader-visible descriptor allocated)
+[2025-12-30 10:36:41.769] [venpod_sandsim] [info] VoxelWorld initialized: 256x128x256 grid (64 MB)
+[2025-12-30 10:36:41.769] [venpod_sandsim] [info] GPU brush raycasting enabled (16 bytes readback vs 32 MB!)
+[2025-12-30 10:36:41.769] [venpod_sandsim] [info] GPU ground detection enabled for player collision
+[2025-12-30 10:36:41.769] [venpod_sandsim] [info] ShaderCompiler initialized with DXC
+[2025-12-30 10:36:41.808] [venpod_sandsim] [debug] Shader compiled successfully: CS_GenerateChunk.hlsl
+[2025-12-30 10:36:41.815] [venpod_sandsim] [info] Generation pipeline created successfully
+[2025-12-30 10:36:41.815] [venpod_sandsim] [info] Shared constant buffer created (256 bytes, persistent mapping)
+[2025-12-30 10:36:41.816] [venpod_sandsim] [info] InfiniteChunkManager initialized - LOAD distance: 16 chunks, UNLOAD distance: 20 chunks (FIXED Y=0,1 layers), seed: 12345
+[2025-12-30 10:36:41.816] [venpod_sandsim] [info] Terrain generation: INDEPENDENT of camera Y - always at world Y=5-132 (chunks 0,1)
+[2025-12-30 10:36:41.816] [venpod_sandsim] [info] Seamless streaming: chunks load at 16 chunks, visible at 12 chunks, unload at 20 chunks
+[2025-12-30 10:36:41.816] [venpod_sandsim] [info] ShaderCompiler initialized with DXC
+[2025-12-30 10:36:41.830] [venpod_sandsim] [debug] Shader compiled successfully: CS_CopyChunkToBuffer.hlsl
+[2025-12-30 10:36:41.832] [venpod_sandsim] [info] Chunk copy pipeline created successfully (ring buffer with 3 allocators)
+[2025-12-30 10:36:41.832] [venpod_sandsim] [info] Infinite chunk system enabled - load: 16 chunks, render: 12 chunks, unload: 20 chunks (seed: 12345)
+[2025-12-30 10:36:41.833] [venpod_sandsim] [info] Chunk occupancy texture created: 4x2x4 chunks (128 bytes)
+[2025-12-30 10:36:41.833] [venpod_sandsim] [info] ShaderCompiler initialized with DXC
+[2025-12-30 10:36:41.842] [venpod_sandsim] [debug] Shader compiled successfully: CS_UpdateChunkOccupancy.hlsl
+[2025-12-30 10:36:41.845] [venpod_sandsim] [info] Occupancy update pipeline created
+[2025-12-30 10:36:41.845] [venpod_sandsim] [info] Chunk occupancy acceleration enabled - raymarcher can skip empty 64-voxel chunks
+[2025-12-30 10:36:41.845] [venpod_sandsim] [info] SandSimulator: Using fixed 256x128x256 grid (infinite chunks disabled)
+[2025-12-30 10:36:41.845] [venpod_sandsim] [info] ChunkManager: 16x8x16 chunks (2048 total) for world 256x128x256
+[2025-12-30 10:36:41.846] [venpod_sandsim] [info] ChunkManager initialized successfully
+[2025-12-30 10:36:41.919] [venpod_sandsim] [debug] Shader compiled successfully: CS_Initialize.hlsl
+[2025-12-30 10:36:41.933] [venpod_sandsim] [info] DX12ComputePipeline created: CS_Initialize
+[2025-12-30 10:36:41.969] [venpod_sandsim] [debug] Shader compiled successfully: CS_Gravity.hlsl
+[2025-12-30 10:36:41.975] [venpod_sandsim] [info] DX12ComputePipeline created: CS_Gravity
+[2025-12-30 10:36:41.990] [venpod_sandsim] [debug] Shader compiled successfully: CS_Brush.hlsl
+[2025-12-30 10:36:41.994] [venpod_sandsim] [info] DX12ComputePipeline created: CS_Brush
+[2025-12-30 10:36:41.994] [venpod_sandsim] [info] Brush pipeline created successfully
+[2025-12-30 10:36:42.008] [venpod_sandsim] [debug] Shader compiled successfully: CS_ChunkScanner.hlsl
+[2025-12-30 10:36:42.012] [venpod_sandsim] [info] DX12ComputePipeline created: CS_ChunkScanner
+[2025-12-30 10:36:42.012] [venpod_sandsim] [info] Chunk scanner pipeline created successfully
+[2025-12-30 10:36:42.015] [venpod_sandsim] [debug] Shader compiled successfully: CS_PrepareIndirect.hlsl
+[2025-12-30 10:36:42.017] [venpod_sandsim] [info] DX12ComputePipeline created: CS_PrepareIndirect
+[2025-12-30 10:36:42.017] [venpod_sandsim] [info] Prepare indirect pipeline created successfully
+[2025-12-30 10:36:42.209] [venpod_sandsim] [debug] Shader compiled successfully: CS_GravityChunk.hlsl
+[2025-12-30 10:36:42.240] [venpod_sandsim] [info] DX12ComputePipeline created: CS_GravityChunk
+[2025-12-30 10:36:42.240] [venpod_sandsim] [info] Gravity chunk pipeline created successfully
+[2025-12-30 10:36:42.264] [venpod_sandsim] [debug] Shader compiled successfully: CS_BrushRaycast.hlsl
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] DX12ComputePipeline created: BrushRaycastPipeline
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] Brush raycast pipeline created successfully (GPU raycasting enabled)
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] Command signature created for indirect dispatch
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] PhysicsDispatcher initialized
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] DispatchInitialize: START
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] DispatchInitialize: Pipeline and cmdList valid
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] DispatchInitialize: Buffer transitioned to UAV
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] DispatchInitialize: Descriptor heaps set
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] DispatchInitialize: Pipeline bound
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] DispatchInitialize: Constants set: 256x128x256, seed=12345
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] DispatchInitialize: Root constants pushed
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] DispatchInitialize: Getting shader-visible UAV
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] DispatchInitialize: Root descriptor table set
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] DispatchInitialize: About to dispatch: 32x16x32
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] DispatchInitialize: Dispatch complete
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] DispatchInitialize: Copied WRITE → READ for Frame 0 rendering
+[2025-12-30 10:36:42.268] [venpod_sandsim] [debug] Dispatched voxel initialization: 32x16x32 thread groups
+[2025-12-30 10:36:42.268] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1)
+[2025-12-30 10:36:42.274] [venpod_sandsim] [info] InputManager initialized: 1920x1080
+[2025-12-30 10:36:42.274] [venpod_sandsim] [info] Initialization complete. Entering main loop...
+[2025-12-30 10:36:42.274] [venpod_sandsim] [info] Controls: WASD=Move, Mouse=Look, Space/Shift=Up/Down, Tab=Toggle Mouse, LMB=Paint, RMB=Erase, Q/E=Material, P=Pause
+[2025-12-30 10:36:42.274] [venpod_sandsim] [info] === ENTERING MAIN LOOP (SandSimulator) ===
+[2025-12-30 10:36:42.275] [venpod_sandsim] [info] Mouse captured - FPS camera mode enabled (cursor hidden)
+[2025-12-30 10:36:42.275] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:42.276] [venpod_sandsim] [debug] Created brush raycast readback buffer (16 bytes - 2,000,000x smaller!)
+[2025-12-30 10:36:42.628] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #61)
+[2025-12-30 10:36:42.634] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:42.876] [venpod_sandsim] [debug] Frame 100
+[2025-12-30 10:36:42.991] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #121)
+[2025-12-30 10:36:42.997] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:43.355] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #181)
+[2025-12-30 10:36:43.361] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:43.482] [venpod_sandsim] [debug] Frame 200
+[2025-12-30 10:36:43.531] [venpod_sandsim] [info] Painting at raycast pos: (127.5, 91.5, 128.5), material=1
+[2025-12-30 10:36:43.719] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #241)
+[2025-12-30 10:36:43.724] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:44.082] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #301)
+[2025-12-30 10:36:44.088] [venpod_sandsim] [debug] Frame 300
+[2025-12-30 10:36:44.088] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:44.786] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #361)
+[2025-12-30 10:36:44.794] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:45.209] [venpod_sandsim] [debug] Frame 400
+[2025-12-30 10:36:45.410] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #421)
+[2025-12-30 10:36:45.420] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:45.708] [venpod_sandsim] [info] Painting at raycast pos: (72.5, 128.5, 155.5), material=1
+[2025-12-30 10:36:46.010] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #481)
+[2025-12-30 10:36:46.020] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:46.203] [venpod_sandsim] [debug] Frame 500
+[2025-12-30 10:36:46.303] [venpod_sandsim] [info] Painting at raycast pos: (139.5, 115.5, 131.5), material=1
+[2025-12-30 10:36:46.609] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #541)
+[2025-12-30 10:36:46.618] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:46.907] [venpod_sandsim] [info] Painting at raycast pos: (108.5, 128.5, 143.5), material=1
+[2025-12-30 10:36:47.187] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #601)
+[2025-12-30 10:36:47.191] [venpod_sandsim] [debug] Frame 600
+[2025-12-30 10:36:47.196] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:47.209] [venpod_sandsim] [info] Material: 2
+[2025-12-30 10:36:47.811] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #661)
+[2025-12-30 10:36:47.821] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:47.912] [venpod_sandsim] [info] Painting at raycast pos: (106.5, 128.5, 182.5), material=2
+[2025-12-30 10:36:48.215] [venpod_sandsim] [debug] Frame 700
+[2025-12-30 10:36:48.405] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #721)
+[2025-12-30 10:36:48.415] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:48.502] [venpod_sandsim] [info] Painting at raycast pos: (139.5, 118.5, 136.5), material=2
+[2025-12-30 10:36:48.983] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #781)
+[2025-12-30 10:36:48.992] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:49.079] [venpod_sandsim] [info] Painting at raycast pos: (144.5, 128.5, 153.5), material=2
+[2025-12-30 10:36:49.179] [venpod_sandsim] [debug] Frame 800
+[2025-12-30 10:36:49.566] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #841)
+[2025-12-30 10:36:49.576] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:49.669] [venpod_sandsim] [info] Painting at raycast pos: (141.5, 127.5, 188.5), material=2
+[2025-12-30 10:36:50.210] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #901)
+[2025-12-30 10:36:50.215] [venpod_sandsim] [debug] Frame 900
+[2025-12-30 10:36:50.221] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:50.325] [venpod_sandsim] [info] Painting at raycast pos: (138.5, 128.5, 216.5), material=2
+[2025-12-30 10:36:50.912] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #961)
+[2025-12-30 10:36:50.923] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:51.028] [venpod_sandsim] [info] Painting at raycast pos: (139.5, 128.5, 221.5), material=2
+[2025-12-30 10:36:51.385] [venpod_sandsim] [debug] Frame 1000
+[2025-12-30 10:36:51.619] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1021)
+[2025-12-30 10:36:51.631] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:52.303] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1081)
+[2025-12-30 10:36:52.314] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:52.518] [venpod_sandsim] [debug] Frame 1100
+[2025-12-30 10:36:52.950] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1141)
+[2025-12-30 10:36:52.961] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:53.612] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1201)
+[2025-12-30 10:36:53.615] [venpod_sandsim] [debug] Frame 1200
+[2025-12-30 10:36:53.623] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:53.694] [venpod_sandsim] [info] Material: 3
+[2025-12-30 10:36:54.262] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1261)
+[2025-12-30 10:36:54.274] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:54.637] [venpod_sandsim] [info] Painting at raycast pos: (159.5, 117.5, 215.5), material=3
+[2025-12-30 10:36:54.694] [venpod_sandsim] [debug] Frame 1300
+[2025-12-30 10:36:54.901] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1321)
+[2025-12-30 10:36:54.911] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:55.542] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1381)
+[2025-12-30 10:36:55.553] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:55.606] [venpod_sandsim] [info] Painting at raycast pos: (130.5, 120.5, 192.5), material=3
+[2025-12-30 10:36:55.760] [venpod_sandsim] [debug] Frame 1400
+[2025-12-30 10:36:55.869] [venpod_sandsim] [info] Material: 4
+[2025-12-30 10:36:56.190] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1441)
+[2025-12-30 10:36:56.200] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:56.708] [venpod_sandsim] [info] Painting at raycast pos: (118.5, 104.5, 164.5), material=4
+[2025-12-30 10:36:56.796] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1501)
+[2025-12-30 10:36:56.797] [venpod_sandsim] [debug] Frame 1500
+[2025-12-30 10:36:56.806] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:57.211] [venpod_sandsim] [info] Painting at raycast pos: (121.5, 128.5, 176.5), material=4
+[2025-12-30 10:36:57.274] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1561)
+[2025-12-30 10:36:57.282] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:57.324] [venpod_sandsim] [info] Material: 5
+[2025-12-30 10:36:57.609] [venpod_sandsim] [debug] Frame 1600
+[2025-12-30 10:36:57.793] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1621)
+[2025-12-30 10:36:57.802] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:57.984] [venpod_sandsim] [info] Painting at raycast pos: (133.5, 128.5, 197.5), material=5
+[2025-12-30 10:36:58.270] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1681)
+[2025-12-30 10:36:58.277] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:58.409] [venpod_sandsim] [debug] Frame 1700
+[2025-12-30 10:36:58.421] [venpod_sandsim] [info] Painting at raycast pos: (133.5, 110.5, 210.5), material=5
+[2025-12-30 10:36:58.482] [venpod_sandsim] [info] Material: 6
+[2025-12-30 10:36:58.652] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1741)
+[2025-12-30 10:36:58.658] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:58.999] [venpod_sandsim] [info] Painting at raycast pos: (159.5, 108.5, 156.5), material=6
+[2025-12-30 10:36:59.052] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1801)
+[2025-12-30 10:36:59.057] [venpod_sandsim] [debug] Frame 1800
+[2025-12-30 10:36:59.059] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:59.373] [venpod_sandsim] [info] Painting at raycast pos: (233.5, 114.5, 141.5), material=6
+[2025-12-30 10:36:59.422] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1861)
+[2025-12-30 10:36:59.427] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:36:59.669] [venpod_sandsim] [debug] Frame 1900
+[2025-12-30 10:36:59.694] [venpod_sandsim] [info] Painting in air at: (0.5, 127.5, 0.5), material=6
+[2025-12-30 10:36:59.785] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1921)
+[2025-12-30 10:36:59.791] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:00.057] [venpod_sandsim] [info] Painting in air at: (26.6, 127.5, 0.5), material=6
+[2025-12-30 10:37:00.149] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #1981)
+[2025-12-30 10:37:00.155] [venpod_sandsim] [info] Painting at raycast pos: (195.5, 87.5, 184.5), material=6
+[2025-12-30 10:37:00.155] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:00.275] [venpod_sandsim] [debug] Frame 2000
+[2025-12-30 10:37:00.566] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #2041)
+[2025-12-30 10:37:00.574] [venpod_sandsim] [info] Painting at raycast pos: (115.5, 120.5, 53.5), material=6
+[2025-12-30 10:37:00.574] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:01.010] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #2101)
+[2025-12-30 10:37:01.015] [venpod_sandsim] [debug] Frame 2100
+[2025-12-30 10:37:01.017] [venpod_sandsim] [info] Painting at raycast pos: (136.5, 113.5, 72.5), material=6
+[2025-12-30 10:37:01.017] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:01.411] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #2161)
+[2025-12-30 10:37:01.418] [venpod_sandsim] [info] Painting at raycast pos: (190.5, 128.5, 39.5), material=6
+[2025-12-30 10:37:01.418] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:01.487] [venpod_sandsim] [info] Material: 7
+[2025-12-30 10:37:01.687] [venpod_sandsim] [debug] Frame 2200
+[2025-12-30 10:37:01.829] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #2221)
+[2025-12-30 10:37:01.837] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:02.276] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #2281)
+[2025-12-30 10:37:02.282] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:02.348] [venpod_sandsim] [info] Painting at raycast pos: (158.5, 128.5, 48.5), material=7
+[2025-12-30 10:37:02.403] [venpod_sandsim] [debug] Frame 2300
+[2025-12-30 10:37:02.679] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #2341)
+[2025-12-30 10:37:02.688] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:02.782] [venpod_sandsim] [info] Painting at raycast pos: (134.5, 128.5, 84.5), material=7
+[2025-12-30 10:37:03.156] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #2401)
+[2025-12-30 10:37:03.160] [venpod_sandsim] [debug] Frame 2400
+[2025-12-30 10:37:03.163] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:03.247] [venpod_sandsim] [info] Painting at raycast pos: (129.5, 128.5, 94.5), material=7
+[2025-12-30 10:37:03.626] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #2461)
+[2025-12-30 10:37:03.633] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:03.766] [venpod_sandsim] [info] Material: 8
+[2025-12-30 10:37:03.930] [venpod_sandsim] [debug] Frame 2500
+[2025-12-30 10:37:04.086] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #2521)
+[2025-12-30 10:37:04.094] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:04.154] [venpod_sandsim] [info] Painting at raycast pos: (85.5, 114.5, 92.5), material=8
+[2025-12-30 10:37:04.617] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #2581)
+[2025-12-30 10:37:04.626] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:04.689] [venpod_sandsim] [info] Painting at raycast pos: (71.5, 128.5, 114.5), material=8
+[2025-12-30 10:37:04.803] [venpod_sandsim] [debug] Frame 2600
+[2025-12-30 10:37:05.150] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #2641)
+[2025-12-30 10:37:05.157] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:05.546] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #2701)
+[2025-12-30 10:37:05.548] [venpod_sandsim] [debug] Frame 2700
+[2025-12-30 10:37:05.553] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:05.592] [venpod_sandsim] [info] Painting at raycast pos: (57.5, 95.5, 94.5), material=8
+[2025-12-30 10:37:06.051] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #2761)
+[2025-12-30 10:37:06.061] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:06.112] [venpod_sandsim] [info] Painting at raycast pos: (86.5, 101.5, 89.5), material=8
+[2025-12-30 10:37:06.439] [venpod_sandsim] [debug] Frame 2800
+[2025-12-30 10:37:06.590] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #2821)
+[2025-12-30 10:37:06.591] [venpod_sandsim] [info] Material: 9
+[2025-12-30 10:37:06.598] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:06.782] [venpod_sandsim] [info] Painting at raycast pos: (58.5, 113.5, 94.5), material=9
+[2025-12-30 10:37:07.061] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #2881)
+[2025-12-30 10:37:07.070] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:07.263] [venpod_sandsim] [debug] Frame 2900
+[2025-12-30 10:37:07.313] [venpod_sandsim] [info] Painting at raycast pos: (53.5, 128.5, 79.5), material=9
+[2025-12-30 10:37:07.701] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #2941)
+[2025-12-30 10:37:07.710] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:07.809] [venpod_sandsim] [info] Material: 10
+[2025-12-30 10:37:08.255] [venpod_sandsim] [info] Painting at raycast pos: (74.5, 123.5, 70.5), material=10
+[2025-12-30 10:37:08.371] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3001)
+[2025-12-30 10:37:08.372] [venpod_sandsim] [debug] Frame 3000
+[2025-12-30 10:37:08.382] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:08.651] [venpod_sandsim] [info] Material: 11
+[2025-12-30 10:37:08.899] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3061)
+[2025-12-30 10:37:08.911] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:09.090] [venpod_sandsim] [info] Painting at raycast pos: (63.5, 119.5, 67.5), material=11
+[2025-12-30 10:37:09.372] [venpod_sandsim] [debug] Frame 3100
+[2025-12-30 10:37:09.603] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3121)
+[2025-12-30 10:37:09.614] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:09.639] [venpod_sandsim] [info] Material: 12
+[2025-12-30 10:37:10.152] [venpod_sandsim] [info] Painting at raycast pos: (64.5, 115.5, 84.5), material=12
+[2025-12-30 10:37:10.265] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3181)
+[2025-12-30 10:37:10.277] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:10.487] [venpod_sandsim] [debug] Frame 3200
+[2025-12-30 10:37:10.512] [venpod_sandsim] [info] Material: 13
+[2025-12-30 10:37:10.891] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3241)
+[2025-12-30 10:37:10.902] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:11.214] [venpod_sandsim] [info] Painting at raycast pos: (62.5, 126.5, 70.5), material=13
+[2025-12-30 10:37:11.513] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3301)
+[2025-12-30 10:37:11.518] [venpod_sandsim] [debug] Frame 3300
+[2025-12-30 10:37:11.522] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:11.639] [venpod_sandsim] [info] Material: 14
+[2025-12-30 10:37:12.028] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3361)
+[2025-12-30 10:37:12.036] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:12.176] [venpod_sandsim] [info] Painting at raycast pos: (72.5, 128.5, 57.5), material=14
+[2025-12-30 10:37:12.366] [venpod_sandsim] [debug] Frame 3400
+[2025-12-30 10:37:12.545] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3421)
+[2025-12-30 10:37:12.554] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:12.766] [venpod_sandsim] [info] Material: 15
+[2025-12-30 10:37:13.082] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3481)
+[2025-12-30 10:37:13.091] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:13.271] [venpod_sandsim] [info] Painting at raycast pos: (65.5, 124.5, 78.5), material=15
+[2025-12-30 10:37:13.275] [venpod_sandsim] [debug] Frame 3500
+[2025-12-30 10:37:13.629] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3541)
+[2025-12-30 10:37:13.636] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:13.954] [venpod_sandsim] [info] Material: 16
+[2025-12-30 10:37:14.102] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3601)
+[2025-12-30 10:37:14.105] [venpod_sandsim] [debug] Frame 3600
+[2025-12-30 10:37:14.110] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:14.423] [venpod_sandsim] [info] Painting at raycast pos: (89.5, 100.5, 34.5), material=16
+[2025-12-30 10:37:14.527] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3661)
+[2025-12-30 10:37:14.534] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:14.790] [venpod_sandsim] [debug] Frame 3700
+[2025-12-30 10:37:14.806] [venpod_sandsim] [info] Painting at raycast pos: (65.5, 128.5, 67.5), material=16
+[2025-12-30 10:37:14.929] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3721)
+[2025-12-30 10:37:14.937] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:15.263] [venpod_sandsim] [info] Material: 17
+[2025-12-30 10:37:15.404] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3781)
+[2025-12-30 10:37:15.411] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:15.554] [venpod_sandsim] [debug] Frame 3800
+[2025-12-30 10:37:15.890] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3841)
+[2025-12-30 10:37:15.900] [venpod_sandsim] [info] Painting at raycast pos: (101.5, 115.5, 86.5), material=17
+[2025-12-30 10:37:15.900] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:16.105] [venpod_sandsim] [info] Material: 1
+[2025-12-30 10:37:16.336] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3901)
+[2025-12-30 10:37:16.342] [venpod_sandsim] [debug] Frame 3900
+[2025-12-30 10:37:16.342] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:16.645] [venpod_sandsim] [info] Painting at raycast pos: (47.5, 128.5, 101.5), material=1
+[2025-12-30 10:37:16.700] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #3961)
+[2025-12-30 10:37:16.706] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:16.948] [venpod_sandsim] [debug] Frame 4000
+[2025-12-30 10:37:17.063] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4021)
+[2025-12-30 10:37:17.069] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:17.427] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4081)
+[2025-12-30 10:37:17.433] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:17.554] [venpod_sandsim] [debug] Frame 4100
+[2025-12-30 10:37:17.791] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4141)
+[2025-12-30 10:37:17.797] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:18.155] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4201)
+[2025-12-30 10:37:18.160] [venpod_sandsim] [debug] Frame 4200
+[2025-12-30 10:37:18.161] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:18.288] [venpod_sandsim] [info] Painting at raycast pos: (3.5, 80.5, 47.5), material=1
+[2025-12-30 10:37:18.518] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4261)
+[2025-12-30 10:37:18.524] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:18.651] [venpod_sandsim] [info] Painting at raycast pos: (14.5, 55.5, 49.5), material=1
+[2025-12-30 10:37:18.766] [venpod_sandsim] [debug] Frame 4300
+[2025-12-30 10:37:18.882] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4321)
+[2025-12-30 10:37:18.887] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:19.015] [venpod_sandsim] [info] Painting at raycast pos: (0.5, 77.5, 59.5), material=1
+[2025-12-30 10:37:19.245] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4381)
+[2025-12-30 10:37:19.251] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:19.372] [venpod_sandsim] [debug] Frame 4400
+[2025-12-30 10:37:19.378] [venpod_sandsim] [info] Painting at raycast pos: (9.5, 73.5, 73.5), material=1
+[2025-12-30 10:37:19.609] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4441)
+[2025-12-30 10:37:19.615] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:19.743] [venpod_sandsim] [info] Painting at raycast pos: (5.5, 83.5, 72.5), material=1
+[2025-12-30 10:37:20.007] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4501)
+[2025-12-30 10:37:20.008] [venpod_sandsim] [debug] Frame 4500
+[2025-12-30 10:37:20.014] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:20.155] [venpod_sandsim] [info] Painting at raycast pos: (23.5, 79.5, 52.5), material=1
+[2025-12-30 10:37:20.391] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4561)
+[2025-12-30 10:37:20.396] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:20.639] [venpod_sandsim] [debug] Frame 4600
+[2025-12-30 10:37:20.663] [venpod_sandsim] [info] Painting at raycast pos: (0.5, 91.5, 103.5), material=1
+[2025-12-30 10:37:20.754] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4621)
+[2025-12-30 10:37:20.760] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:21.027] [venpod_sandsim] [info] Painting at raycast pos: (0.5, 74.5, 142.5), material=1
+[2025-12-30 10:37:21.118] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4681)
+[2025-12-30 10:37:21.124] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:21.245] [venpod_sandsim] [debug] Frame 4700
+[2025-12-30 10:37:21.390] [venpod_sandsim] [info] Painting at raycast pos: (4.5, 118.5, 152.5), material=1
+[2025-12-30 10:37:21.481] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4741)
+[2025-12-30 10:37:21.487] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:21.845] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4801)
+[2025-12-30 10:37:21.851] [venpod_sandsim] [debug] Frame 4800
+[2025-12-30 10:37:21.851] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:21.875] [venpod_sandsim] [info] Painting at raycast pos: (42.5, 111.5, 165.5), material=1
+[2025-12-30 10:37:22.211] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4861)
+[2025-12-30 10:37:22.218] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:22.247] [venpod_sandsim] [info] Painting at raycast pos: (14.5, 123.5, 192.5), material=1
+[2025-12-30 10:37:22.523] [venpod_sandsim] [debug] Frame 4900
+[2025-12-30 10:37:22.693] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4921)
+[2025-12-30 10:37:22.701] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:22.734] [venpod_sandsim] [info] Painting at raycast pos: (7.5, 128.5, 227.5), material=1
+[2025-12-30 10:37:23.278] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #4981)
+[2025-12-30 10:37:23.289] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:23.338] [venpod_sandsim] [info] Painting at raycast pos: (79.5, 128.5, 204.5), material=1
+[2025-12-30 10:37:23.523] [venpod_sandsim] [debug] Frame 5000
+[2025-12-30 10:37:23.958] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #5041)
+[2025-12-30 10:37:23.967] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:24.003] [venpod_sandsim] [info] Painting at raycast pos: (119.5, 111.5, 139.5), material=1
+[2025-12-30 10:37:24.451] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #5101)
+[2025-12-30 10:37:24.457] [venpod_sandsim] [debug] Frame 5100
+[2025-12-30 10:37:24.460] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:24.492] [venpod_sandsim] [info] Painting at raycast pos: (129.5, 128.5, 109.5), material=1
+[2025-12-30 10:37:24.914] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #5161)
+[2025-12-30 10:37:24.921] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:24.949] [venpod_sandsim] [info] Painting at raycast pos: (110.5, 128.5, 130.5), material=1
+[2025-12-30 10:37:25.232] [venpod_sandsim] [debug] Frame 5200
+[2025-12-30 10:37:25.426] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #5221)
+[2025-12-30 10:37:25.436] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:25.475] [venpod_sandsim] [info] Painting at raycast pos: (99.5, 104.5, 175.5), material=1
+[2025-12-30 10:37:25.991] [venpod_sandsim] [info] SwapBuffers: 0 → 1 (swap #5281)
+[2025-12-30 10:37:26.000] [venpod_sandsim] [debug] Chunk occupancy updated (4x2x4 chunks scanned)
+[2025-12-30 10:37:26.178] [venpod_sandsim] [debug] Frame 5300
+[2025-12-30 10:37:26.457] [venpod_sandsim] [info] === SDL_EVENT_QUIT RECEIVED (SandSimulator) ===
+[2025-12-30 10:37:26.457] [venpod_sandsim] [info] Shutting down...
+[2025-12-30 10:37:26.487] [venpod_sandsim] [info] InfiniteChunkManager shut down
+[2025-12-30 10:37:26.535] [venpod_sandsim] [info] Window shut down
+[2025-12-30 10:37:26.549] [venpod_sandsim] [info] DX12 Device shut down
+[2025-12-30 10:37:26.549] [venpod_sandsim] [info] VENPOD shut down cleanly. Total frames: 5330
+[2025-12-30 10:37:26.596] [venpod_sandsim] [info] Window shut down

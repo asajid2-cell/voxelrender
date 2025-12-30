@@ -148,20 +148,22 @@ Result<void> VoxelWorld::Initialize(
         // Initialize active region center to invalid coordinates (will update on first frame)
         m_activeRegionCenter = ChunkCoord{INT32_MAX, INT32_MAX, INT32_MAX};
         m_activeRegionNeedsUpdate = true;
-
-        // ===== CREATE CHUNK OCCUPANCY ACCELERATION RESOURCES =====
-        result = CreateChunkOccupancyResources(device, heapManager);
-        if (!result) {
-            return Error("Failed to create chunk occupancy resources: {}", result.error());
-        }
-
-        result = CreateOccupancyUpdatePipeline(device);
-        if (!result) {
-            return Error("Failed to create occupancy update pipeline: {}", result.error());
-        }
-
-        spdlog::info("Chunk occupancy acceleration enabled - raymarcher can skip empty 64-voxel chunks");
     }
+
+    // ===== CREATE CHUNK OCCUPANCY ACCELERATION RESOURCES =====
+    // CRITICAL: Must be created for ALL modes (infinite chunks AND fixed grid)
+    // The raymarcher shader ALWAYS expects t2 to be bound, even if not used for skipping
+    result = CreateChunkOccupancyResources(device, heapManager);
+    if (!result) {
+        return Error("Failed to create chunk occupancy resources: {}", result.error());
+    }
+
+    result = CreateOccupancyUpdatePipeline(device);
+    if (!result) {
+        return Error("Failed to create occupancy update pipeline: {}", result.error());
+    }
+
+    spdlog::info("Chunk occupancy acceleration enabled - raymarcher can skip empty 64-voxel chunks");
 
     return {};
 }
@@ -879,6 +881,11 @@ glm::vec3 VoxelWorld::UpdateChunks(
         m_chunkManager->PollCompletedChunks();
 
         UpdateActiveRegion(device, cmdQueue, bufferNeedsShift);
+
+        // CRITICAL FIX: Always invalidate occupancy after UpdateActiveRegion
+        // The occupancy texture must reflect the current state of the voxel buffer
+        // Without this, the raymarcher may skip chunks that have valid terrain
+        m_occupancyNeedsUpdate = true;
 
         if (bufferNeedsShift) {
             spdlog::debug("Camera at chunk [{},{},{}] - updating active region (buffer shifted)",
@@ -1648,11 +1655,16 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* /*device*/, ID3D12CommandQueue
 // =============================================================================
 
 Result<void> VoxelWorld::CreateChunkOccupancyResources(ID3D12Device* device, Graphics::DescriptorHeapManager& heapManager) {
-    // Calculate occupancy texture dimensions (one texel per chunk)
-    // Render buffer is RENDER_BUFFER_CHUNKS_X × RENDER_BUFFER_CHUNKS_Y × RENDER_BUFFER_CHUNKS_Z chunks
-    constexpr uint32_t chunksX = RENDER_BUFFER_CHUNKS_X;  // 25
-    constexpr uint32_t chunksY = RENDER_BUFFER_CHUNKS_Y;  // 2
-    constexpr uint32_t chunksZ = RENDER_BUFFER_CHUNKS_Z;  // 25
+    // Calculate occupancy texture dimensions based on ACTUAL grid size (one texel per chunk)
+    // This works for both infinite chunks mode (1600x128x1600) and fixed grid mode (256x128x256)
+    uint32_t chunksX = m_config.gridSizeX / CHUNK_SIZE_VOXELS;
+    uint32_t chunksY = m_config.gridSizeY / CHUNK_SIZE_VOXELS;
+    uint32_t chunksZ = m_config.gridSizeZ / CHUNK_SIZE_VOXELS;
+
+    // Store for later use in dispatch
+    m_occupancyChunksX = chunksX;
+    m_occupancyChunksY = chunksY;
+    m_occupancyChunksZ = chunksZ;
 
     // Create 3D texture for chunk occupancy (R8_UINT format - 1 byte per chunk)
     D3D12_RESOURCE_DESC texDesc = {};
@@ -1848,9 +1860,9 @@ Result<void> VoxelWorld::CreateOccupancyUpdatePipeline(ID3D12Device* device) {
     constants->gridSizeY = m_config.gridSizeY;
     constants->gridSizeZ = m_config.gridSizeZ;
     constants->chunkSize = CHUNK_SIZE_VOXELS;
-    constants->chunksX = RENDER_BUFFER_CHUNKS_X;
-    constants->chunksY = RENDER_BUFFER_CHUNKS_Y;
-    constants->chunksZ = RENDER_BUFFER_CHUNKS_Z;
+    constants->chunksX = m_occupancyChunksX;  // Use actual grid-based chunk count
+    constants->chunksY = m_occupancyChunksY;
+    constants->chunksZ = m_occupancyChunksZ;
     constants->padding = 0;
 
     spdlog::info("Occupancy update pipeline created");
@@ -1876,6 +1888,12 @@ void VoxelWorld::UpdateChunkOccupancy(ID3D12GraphicsCommandList* cmdList) {
         m_occupancyTextureState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     }
 
+    // Set descriptor heaps (required for descriptor table binding)
+    if (m_heapManager) {
+        ID3D12DescriptorHeap* heaps[] = { m_heapManager->GetShaderVisibleCbvSrvUavHeap() };
+        cmdList->SetDescriptorHeaps(1, heaps);
+    }
+
     // Set pipeline state
     cmdList->SetComputeRootSignature(m_occupancyUpdateRootSignature.Get());
     cmdList->SetPipelineState(m_occupancyUpdatePSO.Get());
@@ -1885,8 +1903,8 @@ void VoxelWorld::UpdateChunkOccupancy(ID3D12GraphicsCommandList* cmdList) {
     cmdList->SetComputeRootShaderResourceView(1, GetReadBuffer().GetGPUVirtualAddress());
     cmdList->SetComputeRootDescriptorTable(2, m_chunkOccupancyUAV.gpu);
 
-    // Dispatch one thread group per chunk (25x2x25 = 1250 thread groups)
-    cmdList->Dispatch(RENDER_BUFFER_CHUNKS_X, RENDER_BUFFER_CHUNKS_Y, RENDER_BUFFER_CHUNKS_Z);
+    // Dispatch one thread group per chunk (using actual grid-based chunk count)
+    cmdList->Dispatch(m_occupancyChunksX, m_occupancyChunksY, m_occupancyChunksZ);
 
     // UAV barrier to ensure writes complete before raymarcher reads
     D3D12_RESOURCE_BARRIER uavBarrier = CD3DX12_RESOURCE_BARRIER::UAV(m_chunkOccupancyTexture.Get());
@@ -1906,7 +1924,7 @@ void VoxelWorld::UpdateChunkOccupancy(ID3D12GraphicsCommandList* cmdList) {
     static int updateCount = 0;
     if (++updateCount % 60 == 1) {
         spdlog::debug("Chunk occupancy updated ({}x{}x{} chunks scanned)",
-            RENDER_BUFFER_CHUNKS_X, RENDER_BUFFER_CHUNKS_Y, RENDER_BUFFER_CHUNKS_Z);
+            m_occupancyChunksX, m_occupancyChunksY, m_occupancyChunksZ);
     }
 }
 

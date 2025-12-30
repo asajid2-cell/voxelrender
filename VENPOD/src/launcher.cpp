@@ -4,6 +4,16 @@
 
 #include <Windows.h>
 #include <string>
+#include <fstream>
+
+// Simple file logging for debugging
+static void LauncherLog(const char* msg) {
+    std::ofstream log("venpod_startup.log", std::ios::app);
+    if (log.is_open()) {
+        log << "[Launcher] " << msg << std::endl;
+        log.flush();
+    }
+}
 
 enum class LaunchMode {
     None,
@@ -13,6 +23,8 @@ enum class LaunchMode {
 
 // Global variable to store selected mode
 static LaunchMode g_selectedMode = LaunchMode::None;
+// Flag to exit message loop without PostQuitMessage (which pollutes SDL's event queue)
+static bool g_dialogClosed = false;
 
 // Window procedure for the launcher window
 LRESULT CALLBACK LauncherWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -22,10 +34,12 @@ LRESULT CALLBACK LauncherWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 int wmId = LOWORD(wParam);
                 if (wmId == 101) {
                     g_selectedMode = LaunchMode::SandSimulator;
+                    g_dialogClosed = true;
                     DestroyWindow(hwnd);
                     return 0;
                 } else if (wmId == 102) {
                     g_selectedMode = LaunchMode::Sandbox;
+                    g_dialogClosed = true;
                     DestroyWindow(hwnd);
                     return 0;
                 }
@@ -34,11 +48,15 @@ LRESULT CALLBACK LauncherWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
         case WM_CLOSE:
             g_selectedMode = LaunchMode::None;
+            g_dialogClosed = true;
             DestroyWindow(hwnd);
             return 0;
 
         case WM_DESTROY:
-            PostQuitMessage(0);
+            // DO NOT use PostQuitMessage here!
+            // It pollutes the thread message queue and SDL3 will see it as SDL_EVENT_QUIT
+            // causing the game to exit immediately after the launcher closes.
+            // Instead, we use g_dialogClosed flag to exit our message loop.
             return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -46,6 +64,8 @@ LRESULT CALLBACK LauncherWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
 
 // Create and show launcher dialog
 LaunchMode ShowLauncherDialog(HINSTANCE hInstance) {
+    LauncherLog("ShowLauncherDialog entered");
+
     // Register window class
     const wchar_t CLASS_NAME[] = L"VENPODLauncherClass";
 
@@ -56,8 +76,17 @@ LaunchMode ShowLauncherDialog(HINSTANCE hInstance) {
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
 
-    RegisterClassW(&wc);
+    LauncherLog("Registering window class...");
+    ATOM classAtom = RegisterClassW(&wc);
+    if (!classAtom) {
+        LauncherLog("ERROR: RegisterClassW failed!");
+        MessageBoxW(NULL, L"Failed to register window class!", L"VENPOD Launcher Error", MB_OK | MB_ICONERROR);
+        return LaunchMode::Sandbox;  // Default to sandbox
+    }
+    LauncherLog("Window class registered successfully");
+
     // Create launcher window
+    LauncherLog("Creating launcher window...");
     HWND hwnd = CreateWindowExW(
         WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
         CLASS_NAME,
@@ -68,8 +97,14 @@ LaunchMode ShowLauncherDialog(HINSTANCE hInstance) {
     );
 
     if (!hwnd) {
+        DWORD err = GetLastError();
+        LauncherLog("ERROR: CreateWindowExW failed!");
+        wchar_t msg[256];
+        swprintf_s(msg, L"Failed to create launcher window! Error: %lu", err);
+        MessageBoxW(NULL, msg, L"VENPOD Launcher Error", MB_OK | MB_ICONERROR);
         return LaunchMode::Sandbox;  // Default to sandbox if window creation fails
     }
+    LauncherLog("Launcher window created successfully");
 
     // Center the window
     RECT rc;
@@ -108,18 +143,36 @@ LaunchMode ShowLauncherDialog(HINSTANCE hInstance) {
     SendMessage(btnSandbox, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     // Show the window
+    LauncherLog("Showing window...");
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
+    LauncherLog("Window shown, entering message loop...");
 
-    // Message loop
+    // Reset dialog closed flag
+    g_dialogClosed = false;
+
+    // Message loop - uses flag instead of PostQuitMessage to avoid polluting SDL's event queue
     MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+    int msgCount = 0;
+    while (!g_dialogClosed) {
+        // Use PeekMessage + WaitMessage instead of GetMessage to avoid blocking on WM_QUIT
+        if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            msgCount++;
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        } else {
+            // No messages pending, wait for one
+            WaitMessage();
+        }
     }
+
+    char logBuf[256];
+    sprintf_s(logBuf, "Message loop exited after %d messages, g_selectedMode = %d", msgCount, (int)g_selectedMode);
+    LauncherLog(logBuf);
 
     // Unregister window class
     UnregisterClassW(CLASS_NAME, hInstance);
 
+    LauncherLog("ShowLauncherDialog exiting");
     return g_selectedMode;
 }
