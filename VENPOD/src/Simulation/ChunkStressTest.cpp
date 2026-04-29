@@ -500,11 +500,11 @@ StressTestResult ChunkStressTest::TestResourceStateTransitions(
         if (currentState != nextState) {
             D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
                 chunk->GetVoxelBuffer().GetResource(),
-                currentState,  // ✅ Use tracked state, not assumed
+                currentState,  //  Use tracked state, not assumed
                 nextState
             );
             cmdList->ResourceBarrier(1, &barrier);
-            currentState = nextState;  // ✅ Update tracked state
+            currentState = nextState;  //  Update tracked state
         }
 
         cmdList->Close();

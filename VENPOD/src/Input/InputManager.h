@@ -120,6 +120,7 @@ private:
 
     // Double-click detection
     std::array<uint64_t, static_cast<size_t>(KeyAction::Count)> m_lastKeyPressTimes{};
+    std::array<bool, static_cast<size_t>(KeyAction::Count)> m_actionsDoubleClicked{};
     static constexpr uint64_t DOUBLE_CLICK_TIME_MS = 300;  // 300ms window for double-click
 };
 

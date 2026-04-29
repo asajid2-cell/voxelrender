@@ -362,7 +362,7 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                     // Decrement life counter
                     uint currentLife = GetLife(currentVoxel);
                     if (currentLife == 0) {
-                        // Fire burns out → becomes smoke
+                        // Fire burns out -> becomes smoke
                         SetVoxel(uint3(pos), PackVoxel(MAT_SMOKE, GetVariant(currentVoxel), 0, 15));
                         continue;
                     }
@@ -384,7 +384,7 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                         uint neighborVoxel = GetVoxelSafe(neighborPos);
                         uint neighborMat = GetMaterial(neighborVoxel);
 
-                        // Water extinguishes fire → creates steam
+                        // Water extinguishes fire -> creates steam
                         if (neighborMat == MAT_WATER) {
                             SetVoxel(uint3(pos), PackVoxel(MAT_STEAM, GetVariant(currentVoxel), 0, 12));
                             SetVoxel(uint3(neighborPos), PackVoxel(MAT_STEAM, GetVariant(neighborVoxel), 0, 12));
@@ -540,7 +540,7 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                                     }
                                     continue;  // Skip to next voxel in outer loop
                                 }
-                                // Water touching fire → both become steam
+                                // Water touching fire -> both become steam
                                 else if (neighborMat == MAT_FIRE) {
                                     SetVoxel(uint3(pos), PackVoxel(MAT_STEAM, GetVariant(currentVoxel), 0, 12));  // Water becomes steam
                                     SetVoxel(uint3(neighbors[i]), PackVoxel(MAT_STEAM, GetVariant(neighborVoxel), 0, 12));  // Fire becomes steam
@@ -658,7 +658,7 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                             uint neighborVoxel = GetVoxelSafe(neighborPos);
                             uint neighborMat = GetMaterial(neighborVoxel);
 
-                            // Lava + Water → turn water to stone
+                            // Lava + Water -> turn water to stone
                             if (neighborMat == MAT_WATER) {
                                 SetVoxel(uint3(neighborPos), PackVoxel(MAT_STONE, GetVariant(neighborVoxel), 0, STATE_IS_STATIC));
                             }
@@ -880,7 +880,7 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                             uint neighborVoxel = GetVoxelSafe(neighbors[i]);
                             uint neighborMat = GetMaterial(neighborVoxel);
 
-                            // Acid + Water → Neutralization (becomes dirt)
+                            // Acid + Water -> Neutralization (becomes dirt)
                             if (neighborMat == MAT_WATER) {
                                 SetVoxel(uint3(pos), PackVoxel(MAT_DIRT, GetVariant(currentVoxel), 0, STATE_IS_STATIC));
                                 SetVoxel(uint3(neighbors[i]), PackVoxel(MAT_DIRT, GetVariant(neighborVoxel), 0, STATE_IS_STATIC));

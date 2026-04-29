@@ -1,7 +1,7 @@
 #pragma once
 
 // =============================================================================
-// VENPOD Chunk - Individual 64³ voxel region for infinite world
+// VENPOD Chunk - Individual 64^3 voxel region for infinite world
 // Each chunk holds its own voxel buffer and generation state
 // =============================================================================
 
@@ -112,14 +112,14 @@ public:
 
     // Calculate buffer size in bytes (4 bytes per voxel = 1 MB per chunk)
     static constexpr uint64_t GetBufferSize() {
-        return static_cast<uint64_t>(GetVoxelCount()) * 4;  // 64³ * 4 = 1,048,576 bytes
+        return static_cast<uint64_t>(GetVoxelCount()) * 4;  // 64^3 * 4 = 1,048,576 bytes
     }
 
 private:
     ChunkCoord m_coord;                   // Position in chunk grid
     ChunkState m_state = ChunkState::Ungenerated;
 
-    // GPU voxel buffer (64³ voxels = 1 MB)
+    // GPU voxel buffer (64^3 voxels = 1 MB)
     Graphics::GPUBuffer m_voxelBuffer;
 
     // Shader-visible descriptors (for rendering and compute access)

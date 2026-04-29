@@ -1,6 +1,6 @@
 // =============================================================================
 // VENPOD Chunk Generation Compute Shader
-// Generates a single 64³ chunk using world coordinates for seamless terrain
+// Generates a single 64^3 chunk using world coordinates for seamless terrain
 // =============================================================================
 
 #include "../Common/SharedTypes.hlsli"
@@ -20,45 +20,85 @@ cbuffer ChunkConstants : register(b0) {
     uint padding[3];        // Pad to 32 bytes (8 DWORDs)
 };
 
-// Output buffer (64³ voxels for this chunk)
+// Output buffer (64^3 voxels for this chunk)
 RWStructuredBuffer<uint> ChunkVoxelOutput : register(u0);
 
-// Sea level for oceans and lakes
-// FIX: Reduced from 80.0 to 40.0 to generate more air above terrain
-static const float SEA_LEVEL = 40.0;
+static const float TERRAIN_MIN_HEIGHT = 4.0;
+static const float TERRAIN_MAX_HEIGHT = 124.0;
+static const float SEA_LEVEL = 16.0;
 
-// Generate terrain height for XZ coordinate
-// CRITICAL: Uses world coordinates, not local chunk coordinates
-// OPTIMIZED: Reduced octaves for better performance
+float Smooth01(float value) {
+    value = saturate(value);
+    return value * value * (3.0 - 2.0 * value);
+}
+
+// Generate terrain height for XZ coordinate.
 float GenerateTerrainHeight(float2 xz, uint seed) {
-    // Scale coordinates for terrain features
-    float3 pos = float3(xz.x, 0, xz.y);
+    float seedOffset = (float)(seed & 0xFFFFu);
+    float3 pos = float3(xz.x + seedOffset * 3.17, 0.0, xz.y - seedOffset * 2.31);
 
-    // Add seed offset for variation
-    pos += float3(seed * 0.01, 0, seed * 0.01);
+    // Domain warp keeps the landforms connected without obvious grid-aligned bands.
+    float warpX = FBM3D(pos * 0.0010 + float3(17.0, 0.0, 91.0), 3, 0.52, 2.0);
+    float warpZ = FBM3D(pos * 0.0010 + float3(83.0, 0.0, 29.0), 3, 0.52, 2.0);
+    float3 warped = pos + float3(warpX * 230.0, 0.0, warpZ * 230.0);
 
-    // FIX: Use more continuous noise for connected terrain
-    // Base terrain (low frequency for gentle rolling landscape)
-    float base = FBM3D(pos * 0.002, 3, 0.5, 2.0);
+    // Broad lift creates continent-scale peaks and valleys.
+    float continent = FBM3D(warped * 0.00055, 4, 0.58, 2.0);
+    float mountainMask = Smooth01((continent + 0.10) * 1.15);
 
-    // Medium detail (hills and valleys)
-    float detail = FBM3D(pos * 0.008, 2, 0.5, 2.0);
+    // Ridged noise gives extreme-hills silhouettes without random needle spikes.
+    float ridgeBase = FBM3D(warped * 0.00165 + float3(0.0, 37.0, 0.0), 4, 0.50, 2.0);
+    float ridges = 1.0 - abs(ridgeBase);
+    ridges = pow(saturate(ridges), 1.45);
 
-    // Fine detail (small bumps)
-    float fine = SimplexNoise3D(pos * 0.02);
+    // Valley carving lowers broad passes between mountain chains.
+    float valleyNoise = FBM3D(warped * 0.00125 + float3(41.0, 0.0, 73.0), 3, 0.55, 2.0);
+    float valleys = pow(saturate(1.0 - abs(valleyNoise)), 1.35);
 
-    // Combine layers for continuous terrain
-    float height = 0.0;
-    height += base * 20.0;      // Base elevation (±20 voxels)
-    height += detail * 10.0;    // Medium features (±10 voxels)
-    height += fine * 3.0;       // Small details (±3 voxels)
+    float shelfBreaks = pow(saturate(abs(FBM3D(warped * 0.0033 + float3(9.0, 0.0, 53.0), 3, 0.48, 2.0))), 1.2);
+    float shoulder = FBM3D(warped * 0.0065 + float3(5.0, 0.0, 11.0), 2, 0.48, 2.0);
+    float fine = SimplexNoise3D(warped * 0.022);
 
-    // Base elevation at Y=30
-    height += 30.0;
+    float height = 42.0;
+    height += continent * 42.0;
+    height += ridges * (0.35 + mountainMask) * 86.0;
+    height -= valleys * (1.15 - mountainMask * 0.35) * 48.0;
+    height += shelfBreaks * mountainMask * 18.0;
+    height += shoulder * 10.0;
+    height += fine * 3.0;
 
-    // Clamp to keep terrain between Y=5 and Y=55
-    // This ensures: ocean floor at Y=5, surface at ~Y=30, peaks at Y=55
-    return clamp(height, 5.0, 55.0);
+    return clamp(height, TERRAIN_MIN_HEIGHT, TERRAIN_MAX_HEIGHT);
+}
+
+float RiverMask(float2 xz, uint seed) {
+    float seedOffset = (float)(seed & 0xFFFFu);
+    float3 pos = float3(xz.x + seedOffset * 1.73, 0.0, xz.y - seedOffset * 1.19);
+    float riverField = FBM3D(pos * 0.0018 + float3(113.0, 0.0, 47.0), 3, 0.55, 2.0);
+    float riverCenter = 1.0 - smoothstep(0.018, 0.070, abs(riverField));
+    float continuity = Smooth01(FBM3D(pos * 0.00055 + float3(7.0, 0.0, 211.0), 2, 0.5, 2.0) * 0.5 + 0.5);
+    return riverCenter * continuity;
+}
+
+float BasinMask(float2 xz, uint seed) {
+    float seedOffset = (float)(seed & 0xFFFFu);
+    float3 pos = float3(xz.x - seedOffset * 0.91, 0.0, xz.y + seedOffset * 1.41);
+    float basin = FBM3D(pos * 0.0009 + float3(31.0, 0.0, 157.0), 3, 0.55, 2.0);
+    return Smooth01((basin - 0.38) * 2.8);
+}
+
+float WaterSurfaceHeight(float2 xz, uint seed, float terrainHeight) {
+    float river = RiverMask(xz, seed);
+    river *= saturate((54.0 - terrainHeight) / 38.0);
+    float basin = BasinMask(xz, seed) * saturate((24.0 - terrainHeight) / 18.0);
+    float waterMask = max(river, basin);
+
+    if (waterMask <= 0.05) {
+        return -1.0;
+    }
+
+    float riverSurface = max(terrainHeight + 1.0, SEA_LEVEL + river * 8.0);
+    float basinSurface = SEA_LEVEL + basin * 11.0;
+    return lerp(basinSurface, riverSurface, saturate(river * 1.4));
 }
 
 // Select surface material based on biome
@@ -68,23 +108,30 @@ uint SelectSurfaceMaterial(float2 xz, uint seed, float height, float seaLevel) {
 
     // Single noise sample for temperature
     float temperature = SimplexNoise3D(biomePos * 1.0) * 0.5 + 0.5;
-    temperature -= (height - 60.0) * 0.003;  // Colder at high altitudes
+    temperature -= (height - 70.0) * 0.004;  // Colder at high altitudes
+    float materialNoise = SimplexNoise3D(biomePos * 3.3 + float3(19.0, 0.0, 61.0)) * 0.5 + 0.5;
 
     // Underwater terrain gets different materials
     if (height < seaLevel - 5) {
         return MAT_SAND;  // Sandy ocean floor
     }
 
-    // Determine surface material (simplified)
-    if (temperature < 0.35) {
-        return MAT_ICE;  // Cold biome
+    if (height > 96.0) {
+        return (temperature < 0.45) ? MAT_ICE : MAT_STONE;
     }
-    else if (temperature < 0.65) {
-        return MAT_DIRT;  // Temperate
+    if (height > 76.0) {
+        return (materialNoise > 0.52) ? MAT_STONE : MAT_CONCRETE;
     }
-    else {
-        return MAT_SAND;  // Hot/desert
+    if (temperature > 0.72 && materialNoise > 0.45) {
+        return MAT_SAND;
     }
+    if (materialNoise > 0.84) {
+        return MAT_CONCRETE;
+    }
+    if (temperature < 0.28) {
+        return MAT_ICE;
+    }
+    return MAT_DIRT;
 }
 
 [numthreads(8, 8, 8)]
@@ -109,6 +156,7 @@ void main(uint3 DTid : SV_DispatchThreadID) {
     // ===== PROPER TERRAIN GENERATION =====
     // Generate terrain height for this XZ column using world coordinates
     float terrainHeight = GenerateTerrainHeight(float2(worldPos.x, worldPos.z), worldSeed);
+    float waterSurface = WaterSurfaceHeight(float2(worldPos.x, worldPos.z), worldSeed, terrainHeight);
 
     // Default to air
     uint material = MAT_AIR;
@@ -135,8 +183,8 @@ void main(uint3 DTid : SV_DispatchThreadID) {
             state = STATE_IS_STATIC;
         }
     }
-    else if (worldPos.y < SEA_LEVEL) {
-        // Above terrain but below sea level - water
+    else if (waterSurface > 0.0 && worldPos.y < waterSurface) {
+        // Water is deliberate: rivers and basin lakes only, not a global default plane.
         material = MAT_WATER;
         state = STATE_IS_STATIC;  // Terrain oceans are static; brush-painted water remains dynamic
     }

@@ -30,8 +30,8 @@ struct InfiniteChunkConfig {
     // - unloadDistanceHorizontal: Where chunks get DELETED (far beyond load area)
     // The gap between load and unload prevents thrashing when moving back and forth.
 
-    int32_t loadDistanceHorizontal = 16;   // ±16 chunks = 33×33 = 2178 chunks loading
-    int32_t unloadDistanceHorizontal = 20; // ±20 chunks before deletion (4-chunk hysteresis)
+    int32_t loadDistanceHorizontal = 16;   // +/-16 chunks = 33x33 = 2178 chunks loading
+    int32_t unloadDistanceHorizontal = 20; // +/-20 chunks before deletion (4-chunk hysteresis)
 
     // Vertical is fixed to terrain layers (Y=0,1) - these are mostly unused
     int32_t loadDistanceVertical = 2;      // UNUSED - fixed to TERRAIN_NUM_CHUNKS_Y
@@ -191,7 +191,7 @@ private:
 
     // FIX #16/#19: Deferred chunk deletion to prevent GPU accessing freed buffers
     // The bug: Chunks (including GPU buffers) were freed immediately on unload, but GPU
-    // might still be using them → OBJECT_DELETED_WHILE_STILL_IN_USE crash
+    // might still be using them -> OBJECT_DELETED_WHILE_STILL_IN_USE crash
     // Solution: Queue entire chunk for deferred delete, only free after GPU finishes using it
     struct DeferredChunkDelete {
         Chunk* chunk;            // Chunk to delete (includes buffers AND descriptors)

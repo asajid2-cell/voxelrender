@@ -146,7 +146,7 @@ int main(int argc, char* argv[]) {
     }
 
     // =============================================================================
-    // 🧪 CHUNK GENERATION TESTS (DISABLED - causes descriptor heap conflicts)
+    //  CHUNK GENERATION TESTS (DISABLED - causes descriptor heap conflicts)
     // =============================================================================
     // CRITICAL FIX: Tests allocate/free descriptors that get recycled by main app,
     // causing descriptor handle collisions (TEXTURE2D vs BUFFER mismatch errors).
@@ -158,15 +158,15 @@ int main(int argc, char* argv[]) {
 
     if (runTests) {
         spdlog::info("\n");
-        spdlog::info("╔══════════════════════════════════════════════════════════════╗");
-        spdlog::info("║  🧪 RUNNING INFINITE CHUNK GENERATION TESTS                 ║");
-        spdlog::info("╚══════════════════════════════════════════════════════════════╝");
+        spdlog::info("");
+        spdlog::info("   RUNNING INFINITE CHUNK GENERATION TESTS                 ");
+        spdlog::info("");
         spdlog::info("");
 
         bool testsPass = Simulation::ChunkGenerationTest::RunAllTests(*device, *commandQueue, renderer->GetHeapManager());
 
         if (!testsPass) {
-            spdlog::critical("❌ CHUNK GENERATION TESTS FAILED!");
+            spdlog::critical("FAILED CHUNK GENERATION TESTS FAILED!");
             spdlog::critical("   Fix the issues above before proceeding.");
             spdlog::critical("   Press ENTER to exit...");
             std::cin.get();
@@ -244,11 +244,11 @@ int main(int argc, char* argv[]) {
     Simulation::VoxelWorldConfig voxelConfig;
     // RTX 3070 Ti (8GB) MAXED OUT: Render buffer sized for massive world
     // Terrain exists at Y=5-60 (spans chunks Y=0,1 only = 128 voxels)
-    // Horizontal: 25×25 chunks (render distance 12 = camera ±12 chunks)
+    // Horizontal: 25x25 chunks (render distance 12 = camera +/-12 chunks)
     voxelConfig.gridSizeX = 1600;  // 25 chunks wide (64 * 25)
     voxelConfig.gridSizeY = 128;   // 2 chunks tall (64 * 2) - exactly terrain height
     voxelConfig.gridSizeZ = 1600;  // 25 chunks deep (64 * 25)
-    // Total: 25×2×25 = 1,250 chunks × 262KB = ~52 MB render buffer (×2 for ping-pong = 104 MB)
+    // Total: 25x2x25 = 1,250 chunks x 262KB = ~52 MB render buffer (x2 for ping-pong = 104 MB)
     // With 8GB VRAM, this is trivial! Leaves 7.9GB for chunks + rendering
 
     // Need a one-time command list for upload
@@ -312,7 +312,7 @@ int main(int argc, char* argv[]) {
         // DispatchInitialize writes to the WRITE buffer, so we need to swap
         // to make that data available as the READ buffer for rendering
         voxelWorld->SwapBuffers();
-        spdlog::info("Initialized 256³ voxel grid with procedural terrain (CS_Initialize)");
+        spdlog::info("Initialized 256^3 voxel grid with procedural terrain (CS_Initialize)");
     } else {
         // CRITICAL FIX: Clear both voxel buffers to air (0) before using infinite chunks!
         // Without this, uninitialized GPU memory contains garbage that the raymarcher
@@ -999,13 +999,13 @@ int main(int argc, char* argv[]) {
 
         // FIX #17: CRITICAL - Swap read/write buffers for next frame
         // The bug: Without this swap, chunks are copied to WRITE buffer every frame,
-        // but READ buffer (used by renderer) stays empty forever → no terrain visible!
+        // but READ buffer (used by renderer) stays empty forever -> no terrain visible!
         // UpdateChunks and physics wrote to WRITE buffer this frame.
         // Swap makes it the READ buffer so renderer can see new chunk data next frame.
         // Sequence:
         //   Frame N: chunks copied to WRITE (buffer 1), physics writes to buffer 1, render reads buffer 0
-        //   Swap → buffer 1 becomes READ, buffer 0 becomes WRITE
-        //   Frame N+1: chunks copied to WRITE (now buffer 0), physics writes to buffer 0, render reads buffer 1 ← sees chunks from frame N!
+        //   Swap -> buffer 1 becomes READ, buffer 0 becomes WRITE
+        //   Frame N+1: chunks copied to WRITE (now buffer 0), physics writes to buffer 0, render reads buffer 1  sees chunks from frame N!
         voxelWorld->SwapBuffers();
 
         // Present

@@ -33,47 +33,47 @@ bool ChunkGenerationTest::RunAllTests(
     Graphics::DX12CommandQueue& commandQueue,
     Graphics::DescriptorHeapManager& heapManager)
 {
-    spdlog::info("╔═══════════════════════════════════════════╗");
-    spdlog::info("║  CHUNK GENERATION TEST SUITE             ║");
-    spdlog::info("╚═══════════════════════════════════════════╝");
+    spdlog::info("");
+    spdlog::info("CHUNK GENERATION TEST SUITE");
+    spdlog::info("");
 
     bool allPassed = true;
 
     // Test 1: Single chunk generation
     spdlog::info("\n[TEST 1] Single Chunk Generation");
     if (!TestSingleChunkGeneration(device, commandQueue, heapManager)) {
-        spdlog::error("❌ FAILED: Single chunk generation test");
+        spdlog::error("FAILED: Single chunk generation test");
         allPassed = false;
     } else {
-        spdlog::info("✅ PASSED: Single chunk generation test");
+        spdlog::info("PASSED: Single chunk generation test");
     }
 
     // Test 2: Chunk boundaries
     spdlog::info("\n[TEST 2] Chunk Boundary Seamlessness");
     if (!TestChunkBoundaries(device, commandQueue, heapManager)) {
-        spdlog::error("❌ FAILED: Chunk boundary test");
+        spdlog::error("FAILED: Chunk boundary test");
         allPassed = false;
     } else {
-        spdlog::info("✅ PASSED: Chunk boundary test");
+        spdlog::info("PASSED: Chunk boundary test");
     }
 
     // Test 3: World coordinates
     spdlog::info("\n[TEST 3] World Coordinate Mapping");
     if (!TestWorldCoordinates(device, commandQueue, heapManager)) {
-        spdlog::error("❌ FAILED: World coordinate test");
+        spdlog::error("FAILED: World coordinate test");
         allPassed = false;
     } else {
-        spdlog::info("✅ PASSED: World coordinate test");
+        spdlog::info("PASSED: World coordinate test");
     }
 
     // Summary
-    spdlog::info("\n╔═══════════════════════════════════════════╗");
+    spdlog::info("\n");
     if (allPassed) {
-        spdlog::info("║  ALL TESTS PASSED ✅                     ║");
+        spdlog::info("ALL TESTS PASSED");
     } else {
-        spdlog::info("║  SOME TESTS FAILED ❌                    ║");
+        spdlog::info("SOME TESTS FAILED");
     }
-    spdlog::info("╚═══════════════════════════════════════════╝\n");
+    spdlog::info("\n");
 
     return allPassed;
 }
@@ -102,7 +102,7 @@ bool ChunkGenerationTest::TestSingleChunkGeneration(
         return false;
     }
 
-    spdlog::info("  ✓ Chunk manager initialized");
+    spdlog::info("  OK Chunk manager initialized");
 
     // Create command list for generation
     ComPtr<ID3D12CommandAllocator> cmdAllocator;
@@ -128,7 +128,7 @@ bool ChunkGenerationTest::TestSingleChunkGeneration(
         return false;
     }
 
-    spdlog::info("  ✓ Command list created");
+    spdlog::info("  OK Command list created");
 
     // Force generate chunk at origin
     ChunkCoord testCoord = {0, 0, 0};
@@ -152,7 +152,7 @@ bool ChunkGenerationTest::TestSingleChunkGeneration(
 
     // Wait for GPU to finish
     commandQueue.Flush();
-    spdlog::info("  ✓ Chunk generation complete");
+    spdlog::info("  OK Chunk generation complete");
 
     // Get generated chunk
     Chunk* chunk = chunkManager.GetChunk(testCoord);
@@ -166,7 +166,7 @@ bool ChunkGenerationTest::TestSingleChunkGeneration(
         return false;
     }
 
-    spdlog::info("  ✓ Chunk is in Generated state");
+    spdlog::info("  OK Chunk is in Generated state");
 
     // Read back voxel data
     constexpr uint32_t voxelCount = 64 * 64 * 64;
@@ -186,7 +186,7 @@ bool ChunkGenerationTest::TestSingleChunkGeneration(
         return false;
     }
 
-    spdlog::info("  ✓ GPU data read back successfully");
+    spdlog::info("  OK GPU data read back successfully");
 
     // Analyze the data
     spdlog::info("  Analyzing voxel data...");
@@ -250,7 +250,7 @@ bool ChunkGenerationTest::TestChunkBoundaries(
     commandQueue.GetCommandQueue()->ExecuteCommandLists(1, lists);
     commandQueue.Flush();
 
-    spdlog::info("  ✓ Both chunks generated");
+    spdlog::info("  OK Both chunks generated");
 
     // Read back both chunks
     std::vector<uint32_t> dataA(64 * 64 * 64);
@@ -280,7 +280,7 @@ bool ChunkGenerationTest::TestChunkBoundaries(
             uint32_t indexB = 0 + y * 64 + z * 64 * 64;
             uint8_t materialB = dataB[indexB] & 0xFF;
 
-            // Materials should be similar at boundary (same height → similar terrain)
+            // Materials should be similar at boundary (same height -> similar terrain)
             // Allow some variation due to noise
             if (materialA == materialB) {
                 similarMaterials++;
@@ -296,9 +296,9 @@ bool ChunkGenerationTest::TestChunkBoundaries(
     bool passed = similarityPercent > 50.0f;  // At least 50% should match
 
     if (passed) {
-        spdlog::info("  ✓ Chunks appear to connect seamlessly");
+        spdlog::info("  OK Chunks appear to connect seamlessly");
     } else {
-        spdlog::warn("  ⚠ Low boundary similarity - check world coordinate usage");
+        spdlog::warn("WARN Low boundary similarity - check world coordinate usage");
     }
 
     chunkManager.Shutdown();
@@ -340,20 +340,20 @@ bool ChunkGenerationTest::TestWorldCoordinates(
                        result.z == test.expectedChunkZ);
 
         if (!matches) {
-            spdlog::error("  ❌ World({},{},{}) → Chunk[{},{},{}], expected [{},{},{}]",
+            spdlog::error("  FAILED World({},{},{}) -> Chunk[{},{},{}], expected [{},{},{}]",
                          test.worldX, test.worldY, test.worldZ,
                          result.x, result.y, result.z,
                          test.expectedChunkX, test.expectedChunkY, test.expectedChunkZ);
             allPassed = false;
         } else {
-            spdlog::debug("  ✓ World({},{},{}) → Chunk[{},{},{}]",
+            spdlog::debug("  OK World({},{},{}) -> Chunk[{},{},{}]",
                          test.worldX, test.worldY, test.worldZ,
                          result.x, result.y, result.z);
         }
     }
 
     if (allPassed) {
-        spdlog::info("  ✓ All world coordinate mappings correct");
+        spdlog::info("  OK All world coordinate mappings correct");
     }
 
     return allPassed;
@@ -454,12 +454,12 @@ Result<void> ChunkGenerationTest::ReadbackGPUBuffer(
 
 void ChunkGenerationTest::AnalyzeVoxelData(const uint32_t* voxelData, uint32_t voxelCount) {
     // ===== CRITICAL: Check for magic value at index 0 (shader execution test) =====
-    spdlog::info("  🔍 SHADER EXECUTION TEST:");
+    spdlog::info("SHADER EXECUTION TEST:");
     if (voxelData[0] == 0xDEADBEEF) {
-        spdlog::info("    ✅ MAGIC VALUE FOUND! Shader executed successfully!");
+        spdlog::info("MAGIC VALUE FOUND! Shader executed successfully!");
         spdlog::info("    voxelData[0] = 0x{:08X} (expected 0xDEADBEEF)", voxelData[0]);
     } else {
-        spdlog::error("    ❌ SHADER DID NOT EXECUTE!");
+        spdlog::error("    FAILED SHADER DID NOT EXECUTE!");
         spdlog::error("    voxelData[0] = 0x{:08X} (expected 0xDEADBEEF)", voxelData[0]);
         spdlog::error("    This proves the compute shader is NOT writing to the buffer!");
     }
@@ -493,20 +493,20 @@ void ChunkGenerationTest::AnalyzeVoxelData(const uint32_t* voxelData, uint32_t v
     bool hasWater = materialCounts[2] > 0;  // MAT_WATER
 
     spdlog::info("  Validation:");
-    spdlog::info("    Air present: {}", hasAir ? "✓" : "✗");
-    spdlog::info("    Solid materials: {}", hasSolid ? "✓" : "✗");
-    spdlog::info("    Water present: {}", hasWater ? "✓" : "✗");
+    spdlog::info("    Air present: {}", hasAir ? "OK" : "no");
+    spdlog::info("    Solid materials: {}", hasSolid ? "OK" : "no");
+    spdlog::info("    Water present: {}", hasWater ? "OK" : "no");
 
     if (!hasAir) {
-        spdlog::warn("    ⚠ No air found - terrain might be solid!");
+        spdlog::warn("     No air found - terrain might be solid!");
     }
 
     if (!hasSolid) {
-        spdlog::error("    ✗ No solid materials - chunk is empty!");
+        spdlog::error("    no No solid materials - chunk is empty!");
     }
 
     if (hasAir && hasSolid) {
-        spdlog::info("    ✓ Chunk has realistic terrain distribution");
+        spdlog::info("    OK Chunk has realistic terrain distribution");
     }
 }
 

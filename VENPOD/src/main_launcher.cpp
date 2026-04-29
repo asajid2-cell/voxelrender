@@ -29,6 +29,7 @@
 #include <cstring>
 #include <iostream>
 #include <cstdlib>
+#include <algorithm>
 
 using namespace VENPOD;
 using namespace VENPOD::Graphics;
@@ -163,7 +164,7 @@ int RunSandbox(int argc, char* argv[]) {
     }
 
     // =============================================================================
-    // 🧪 CHUNK GENERATION TESTS (DISABLED - causes descriptor heap conflicts)
+    // CHUNK GENERATION TESTS (DISABLED - causes descriptor heap conflicts)
     // =============================================================================
     // CRITICAL FIX: Tests allocate/free descriptors that get recycled by main app,
     // causing descriptor handle collisions (TEXTURE2D vs BUFFER mismatch errors).
@@ -175,15 +176,13 @@ int RunSandbox(int argc, char* argv[]) {
 
     if (runTests) {
         spdlog::info("\n");
-        spdlog::info("╔══════════════════════════════════════════════════════════════╗");
-        spdlog::info("║  🧪 RUNNING INFINITE CHUNK GENERATION TESTS                 ║");
-        spdlog::info("╚══════════════════════════════════════════════════════════════╝");
+        spdlog::info("RUNNING INFINITE CHUNK GENERATION TESTS");
         spdlog::info("");
 
         bool testsPass = Simulation::ChunkGenerationTest::RunAllTests(*device, *commandQueue, renderer->GetHeapManager());
 
         if (!testsPass) {
-            spdlog::critical("❌ CHUNK GENERATION TESTS FAILED!");
+            spdlog::critical("CHUNK GENERATION TESTS FAILED!");
             spdlog::critical("   Fix the issues above before proceeding.");
             spdlog::critical("   Press ENTER to exit...");
             std::cin.get();
@@ -259,14 +258,14 @@ int RunSandbox(int argc, char* argv[]) {
     // Initialize VoxelWorld
     auto voxelWorld = std::make_unique<Simulation::VoxelWorld>();
     Simulation::VoxelWorldConfig voxelConfig;
-    // RTX 3070 Ti (8GB) MAXED OUT: Render buffer sized for massive world
-    // Terrain exists at Y=5-60 (spans chunks Y=0,1 only = 128 voxels)
-    // Horizontal: 25×25 chunks (render distance 12 = camera ±12 chunks)
+    // Render buffer sized for the public infinite-world demo.
+    // Terrain spans chunks Y=0 and Y=1, for 128 voxels of vertical range.
+    // Horizontal: 25x25 chunks (render distance 12 = camera +/-12 chunks)
     voxelConfig.gridSizeX = 1600;  // 25 chunks wide (64 * 25)
     voxelConfig.gridSizeY = 128;   // 2 chunks tall (64 * 2) - exactly terrain height
     voxelConfig.gridSizeZ = 1600;  // 25 chunks deep (64 * 25)
-    // Total: 25×2×25 = 1,250 chunks × 262KB = ~52 MB render buffer (×2 for ping-pong = 104 MB)
-    // With 8GB VRAM, this is trivial! Leaves 7.9GB for chunks + rendering
+    // Total: 25x2x25 = 1,250 chunks x 262KB = ~52 MB render buffer (x2 for ping-pong = 104 MB)
+    // The loaded chunk budget lives outside this moving render buffer.
 
     // Need a one-time command list for upload
     ComPtr<ID3D12GraphicsCommandList> initCommandList;
@@ -329,7 +328,7 @@ int RunSandbox(int argc, char* argv[]) {
         // DispatchInitialize writes to the WRITE buffer, so we need to swap
         // to make that data available as the READ buffer for rendering
         voxelWorld->SwapBuffers();
-        spdlog::info("Initialized 256³ voxel grid with procedural terrain (CS_Initialize)");
+        spdlog::info("Initialized 256^3 voxel grid with procedural terrain (CS_Initialize)");
     } else {
         // CRITICAL FIX: Clear both voxel buffers to air (0) before using infinite chunks!
         // Without this, uninitialized GPU memory contains garbage that the raymarcher
@@ -515,10 +514,8 @@ int RunSandbox(int argc, char* argv[]) {
     float gridSizeYInit = static_cast<float>(voxelWorld->GetGridSizeY());
     float gridSizeZInit = static_cast<float>(voxelWorld->GetGridSizeZ());
 
-    // Spawn camera at center of chunk (0,0) at a height above terrain
-    // Terrain generates at Y=5-55, so Y=60 should be safely above all terrain
-    // With cleared buffers, sky will show until chunks load, then terrain appears
-    glm::vec3 cameraPos = glm::vec3(32.0f, 60.0f, 32.0f);  // Center of chunk (0,0), above terrain
+    // Spawn at eye level above the highest possible generated terrain.
+    glm::vec3 cameraPos = glm::vec3(32.0f, 127.0f, 32.0f);
 
     // Camera rotation (pitch and yaw)
     float cameraPitch = -0.3f;  // Slight downward look to see terrain below
@@ -547,8 +544,16 @@ int RunSandbox(int argc, char* argv[]) {
     bool paused = false;
     uint64_t frameCount = 0;
     bool mouseInitialized = false;  // Track if mouse capture has been enabled
+    uint64_t lastFrameCounter = SDL_GetPerformanceCounter();
+    const double performanceFrequency = static_cast<double>(SDL_GetPerformanceFrequency());
 
     while (running) {
+        uint64_t currentFrameCounter = SDL_GetPerformanceCounter();
+        float dt = static_cast<float>(
+            static_cast<double>(currentFrameCounter - lastFrameCounter) / performanceFrequency);
+        lastFrameCounter = currentFrameCounter;
+        dt = std::clamp(dt, 1.0f / 240.0f, 1.0f / 30.0f);
+
         // Process SDL events FIRST to update mouse/keyboard state
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
@@ -627,6 +632,9 @@ int RunSandbox(int argc, char* argv[]) {
             spdlog::info("Brush radius: {:.1f}", brushController.GetRadius());
         }
 
+        const bool jumpPressed = inputManager.IsActionPressed(Input::KeyAction::CameraUp);
+        const bool flightTogglePressed = inputManager.IsActionDoubleClicked(Input::KeyAction::CameraUp);
+
         // Mouse look - update camera rotation
         glm::vec2 mouseDelta = inputManager.GetMouseDelta();
         cameraYaw += mouseDelta.x * mouseSensitivity;  // Inverted from - to + for correct left/right
@@ -647,29 +655,34 @@ int RunSandbox(int argc, char* argv[]) {
         glm::vec3 cameraUp = glm::cross(cameraRight, cameraForward);
 
         // Camera movement with WASD (horizontal only for walking mode)
-        float dt = 1.0f / 60.0f;  // Approximate delta time
         float moveSpeed = cameraSpeed * dt;
 
         // Calculate horizontal movement direction (forward/right with Y removed)
         glm::vec3 horizontalForward = glm::normalize(glm::vec3(cameraForward.x, 0, cameraForward.z));
         glm::vec3 horizontalRight = glm::normalize(glm::vec3(cameraRight.x, 0, cameraRight.z));
 
+        glm::vec3 previousCameraPos = cameraPos;
+        glm::vec3 moveDirection(0.0f);
+
         // WASD for horizontal movement only
         if (inputManager.IsActionDown(Input::KeyAction::CameraForward)) {
-            cameraPos += horizontalForward * moveSpeed;
+            moveDirection += horizontalForward;
         }
         if (inputManager.IsActionDown(Input::KeyAction::CameraBackward)) {
-            cameraPos -= horizontalForward * moveSpeed;
+            moveDirection -= horizontalForward;
         }
         if (inputManager.IsActionDown(Input::KeyAction::CameraLeft)) {
-            cameraPos -= horizontalRight * moveSpeed;
+            moveDirection -= horizontalRight;
         }
         if (inputManager.IsActionDown(Input::KeyAction::CameraRight)) {
-            cameraPos += horizontalRight * moveSpeed;
+            moveDirection += horizontalRight;
+        }
+        if (glm::length(moveDirection) > 0.001f) {
+            cameraPos += glm::normalize(moveDirection) * moveSpeed;
         }
 
         // Check for double-click on Space to toggle flight mode
-        if (inputManager.IsActionDoubleClicked(Input::KeyAction::CameraUp)) {
+        if (flightTogglePressed) {
             flightMode = !flightMode;
             if (flightMode) {
                 cameraVelocityY = 0.0f;  // Cancel gravity when entering flight mode
@@ -827,20 +840,29 @@ int RunSandbox(int argc, char* argv[]) {
 
                 // Player feet position in world space
                 float playerFeetWorldY = cameraPos.y - playerHeight;
+                float groundDelta = playerFeetWorldY - groundWorldY;
 
-                // Check if we're on or near the ground
-                bool onGround = playerFeetWorldY <= groundWorldY + 0.5f;
+                bool onGround = false;
 
-                // If we've fallen through ground, snap feet to ground surface
-                if (playerFeetWorldY < groundWorldY) {
-                    cameraPos.y = groundWorldY + playerHeight;  // Camera at eye level above ground
-                    cameraVelocityY = 0.0f;  // Stop falling
+                if (groundDelta < -0.05f) {
+                    float climbHeight = -groundDelta;
+                    if (climbHeight <= stepHeight + 0.25f) {
+                        cameraPos.y = groundWorldY + playerHeight;
+                        cameraVelocityY = 0.0f;
+                        onGround = true;
+                    } else {
+                        cameraPos.x = previousCameraPos.x;
+                        cameraPos.z = previousCameraPos.z;
+                        cameraVelocityY = 0.0f;
+                    }
+                } else if (cameraVelocityY <= 0.0f && groundDelta <= stepHeight) {
+                    cameraPos.y = groundWorldY + playerHeight;
+                    cameraVelocityY = 0.0f;
                     onGround = true;
                 }
 
                 // Space to jump (if on ground and not double-click)
-                if (inputManager.IsActionPressed(Input::KeyAction::CameraUp) && onGround &&
-                    !inputManager.IsActionDoubleClicked(Input::KeyAction::CameraUp)) {
+                if (jumpPressed && onGround && !flightTogglePressed) {
                     cameraVelocityY = 20.0f;  // Jump velocity
                 }
             }
@@ -888,7 +910,7 @@ int RunSandbox(int argc, char* argv[]) {
         // =====================================================
         // PHYSICS FIRST, THEN BRUSH (same as sand simulator)
         // =====================================================
-        // Order matters! Physics copies READ→WRITE (via shader), then brush paints on top.
+        // Order matters! Physics copies READ->WRITE (via shader), then brush paints on top.
         // If brush was first, physics would overwrite painted voxels.
 
         // Run physics simulation (if not paused)
@@ -965,7 +987,7 @@ int RunSandbox(int argc, char* argv[]) {
         voxelWorld->TransitionReadBufferTo(commandList.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
         // Build camera params for shader (camera in WORLD coordinates)
-        // The shader uses regionOrigin to convert world→buffer coordinates internally
+        // The shader uses regionOrigin to convert world->buffer coordinates internally
         Graphics::Renderer::CameraParams cameraParams;
         cameraParams.posX = cameraPos.x;
         cameraParams.posY = cameraPos.y;
@@ -1050,13 +1072,13 @@ int RunSandbox(int argc, char* argv[]) {
 
         // FIX #17: CRITICAL - Swap read/write buffers for next frame
         // The bug: Without this swap, chunks are copied to WRITE buffer every frame,
-        // but READ buffer (used by renderer) stays empty forever → no terrain visible!
+        // but READ buffer (used by renderer) stays empty forever -> no terrain visible!
         // UpdateChunks and physics wrote to WRITE buffer this frame.
         // Swap makes it the READ buffer so renderer can see new chunk data next frame.
         // Sequence:
         //   Frame N: chunks copied to WRITE (buffer 1), physics writes to buffer 1, render reads buffer 0
-        //   Swap → buffer 1 becomes READ, buffer 0 becomes WRITE
-        //   Frame N+1: chunks copied to WRITE (now buffer 0), physics writes to buffer 0, render reads buffer 1 ← sees chunks from frame N!
+        //   Swap -> buffer 1 becomes READ, buffer 0 becomes WRITE
+        //   Frame N+1: chunks copied to WRITE (now buffer 0), physics writes to buffer 0, render reads buffer 1
         voxelWorld->SwapBuffers();
 
         // Present

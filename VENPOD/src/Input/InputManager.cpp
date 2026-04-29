@@ -21,6 +21,7 @@ void InputManager::Initialize(uint32_t windowWidth, uint32_t windowHeight, SDL_W
     m_keysJustPressed.fill(false);
     m_keysDown.fill(false);
     m_lastKeyPressTimes.fill(0);
+    m_actionsDoubleClicked.fill(false);
 
     spdlog::info("InputManager initialized: {}x{}", windowWidth, windowHeight);
 }
@@ -123,6 +124,19 @@ void InputManager::ProcessEvent(const SDL_Event& event) {
                     m_keysJustPressed[scancode] = true;
                     m_keysDown[scancode] = true;
                 }
+
+                const uint64_t currentTime = SDL_GetTicks();
+                for (size_t actionIdx = 0; actionIdx < m_keyMappings.size(); ++actionIdx) {
+                    if (m_keyMappings[actionIdx] != event.key.key) {
+                        continue;
+                    }
+
+                    const uint64_t lastPressTime = m_lastKeyPressTimes[actionIdx];
+                    const uint64_t timeSinceLastPress = currentTime - lastPressTime;
+                    m_actionsDoubleClicked[actionIdx] =
+                        lastPressTime != 0 && timeSinceLastPress <= DOUBLE_CLICK_TIME_MS;
+                    m_lastKeyPressTimes[actionIdx] = currentTime;
+                }
             }
             break;
 
@@ -162,6 +176,7 @@ void InputManager::EndFrame() {
 
     // Clear "just pressed" flags at end of frame
     m_keysJustPressed.fill(false);
+    m_actionsDoubleClicked.fill(false);
 }
 
 void InputManager::OnResize(uint32_t width, uint32_t height) {
@@ -227,23 +242,7 @@ bool InputManager::IsActionPressed(KeyAction action) const {
 }
 
 bool InputManager::IsActionDoubleClicked(KeyAction action) const {
-    if (!IsActionPressed(action)) {
-        return false;
-    }
-
-    // Check if this press happened within double-click time window
-    size_t actionIdx = static_cast<size_t>(action);
-    uint64_t currentTime = SDL_GetTicks();
-    uint64_t lastPressTime = m_lastKeyPressTimes[actionIdx];
-
-    // Calculate time since last press
-    uint64_t timeSinceLastPress = currentTime - lastPressTime;
-
-    // Update last press time
-    const_cast<InputManager*>(this)->m_lastKeyPressTimes[actionIdx] = currentTime;
-
-    // Double-click detected if within time window
-    return timeSinceLastPress <= DOUBLE_CLICK_TIME_MS;
+    return m_actionsDoubleClicked[static_cast<size_t>(action)];
 }
 
 } // namespace VENPOD::Input

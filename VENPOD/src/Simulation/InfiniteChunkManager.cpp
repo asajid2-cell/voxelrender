@@ -71,9 +71,9 @@ Result<void> InfiniteChunkManager::Initialize(
     // FIX #10: Initialize allocator fence values to 0 to indicate "never used/ready"
     // The previous UINT64_MAX logic had a critical bug:
     //   - On Frame 0, allocatorFenceValue = UINT64_MAX
-    //   - Fence check: if (UINT64_MAX != UINT64_MAX) → FALSE, but then...
-    //   - Wait check: 0 < UINT64_MAX → TRUE, thinks allocator is BUSY!
-    //   - Result: All 3 allocators fail busy check on Frame 0 → no chunks generate
+    //   - Fence check: if (UINT64_MAX != UINT64_MAX) -> FALSE, but then...
+    //   - Wait check: 0 < UINT64_MAX -> TRUE, thinks allocator is BUSY!
+    //   - Result: All 3 allocators fail busy check on Frame 0 -> no chunks generate
     // Correct logic: Use 0 = "never used", check `if (value > 0)` to detect actual usage
     for (uint32_t i = 0; i < NUM_FRAME_BUFFERS; ++i) {
         m_allocatorFenceValues[i] = 0;  // 0 = ready for immediate use (never used)
@@ -203,7 +203,7 @@ void InfiniteChunkManager::Update(
     if (cameraChunk == m_lastCameraChunk) {
         // CRITICAL FIX: Continue generating queued chunks even when stationary
         // The previous logic had a deadlock: after 3 chunks, it would return if queue wasn't empty,
-        // causing 20+ chunks to remain stuck in queue forever → system freeze
+        // causing 20+ chunks to remain stuck in queue forever -> system freeze
         m_stationaryFrameCount++;
 
         // If we have queued chunks, skip re-queueing and fall through to the
@@ -245,7 +245,7 @@ void InfiniteChunkManager::Update(
     // STARTUP OPTIMIZATION: Generate MORE chunks per frame initially to fill
     // the visible area faster. Once loaded chunks >= visible area, slow down.
     //
-    // Visible area = 25×25×2 = 1250 chunks (RENDER_BUFFER_CHUNKS_X * Z * Y)
+    // Visible area = 25x25x2 = 1250 chunks (RENDER_BUFFER_CHUNKS_X * Z * Y)
     // During startup: generate up to 8 chunks/frame (fills visible in ~160 frames = 2.7 seconds)
     // After startup: generate 1 chunk/frame (just keeping up with movement)
     //
@@ -364,12 +364,12 @@ Result<void> InfiniteChunkManager::QueueChunksAroundCamera(const ChunkCoord& cam
             for (int32_t dz = -m_config.loadDistanceHorizontal; dz <= m_config.loadDistanceHorizontal; ++dz) {
                 // FIX: Use SQUARE pattern to match VoxelWorld renderer expectations
                 // The renderer scans a square grid (25x25), so we must load chunks in a square pattern
-                // Previously used circular radius which skipped corners → 124 missing chunks → holes
+                // Previously used circular radius which skipped corners -> 124 missing chunks -> holes
                 // Now using Chebyshev distance (max of abs(dx), abs(dz)) for square coverage
                 //
                 // Example with renderDistance=12:
-                // - Square: loads all chunks where |dx| <= 12 AND |dz| <= 12 → 25×25 = 625 chunks
-                // - Circle: loads chunks where dx²+dz² <= 144 → ~501 chunks (misses 124 corners!)
+                // - Square: loads all chunks where |dx| <= 12 AND |dz| <= 12 -> 25x25 = 625 chunks
+                // - Circle: loads chunks where dx+dz <= 144 -> ~501 chunks (misses 124 corners!)
                 //
                 // No distance check needed - the loop bounds already define the square:
                 // for dx in [-renderDistance, +renderDistance]
@@ -538,7 +538,7 @@ Result<void> InfiniteChunkManager::GenerateNextChunk(
 
     // CRITICAL FIX: DO NOT advance allocator index yet!
     // We must only advance AFTER successful chunk creation, otherwise we consume
-    // an allocator slot without creating a chunk → allocator starvation
+    // an allocator slot without creating a chunk -> allocator starvation
 
     // NOW safe to reset this allocator (GPU has finished with it)
     // FIX #7: Check HRESULT - if Reset() fails, re-queue chunk and skip this frame
@@ -642,7 +642,7 @@ void InfiniteChunkManager::UnloadDistantChunks(const ChunkCoord& cameraChunk) {
     // FIX #9: CRITICAL - Don't unload chunks during startup phase!
     // During startup, chunks are being queued/generated for the first time.
     // Unloading them before they're all generated causes:
-    // 1. Fence waits on chunks that haven't even started GPU work (5 second timeout × N chunks)
+    // 1. Fence waits on chunks that haven't even started GPU work (5 second timeout x N chunks)
     // 2. Wasted work - chunk queued, then unloaded before generation
     // 3. Queue thrashing - same chunks queue/unload repeatedly
     if (m_startupPhase) {
@@ -731,7 +731,7 @@ void InfiniteChunkManager::UnloadDistantChunks(const ChunkCoord& cameraChunk) {
                 DeferredChunkDelete deferredDelete;
                 deferredDelete.chunk = chunk;
                 // Delete 10 frames later - ensures GPU has finished using chunk buffers
-                // (3 frame ring buffer × 3 = 9 frames safety margin, rounded to 10)
+                // (3 frame ring buffer x 3 = 9 frames safety margin, rounded to 10)
                 deferredDelete.fenceValue = m_chunkFenceValue + 10;
 
                 m_deferredChunkDeletes.push_back(deferredDelete);

@@ -12,7 +12,7 @@ struct alignas(16) ChunkConstants {
     int32_t chunkWorldOffsetZ;
     uint32_t worldSeed;
     uint32_t chunkSize;
-    uint32_t padding[3];  // Pad to 32 bytes (2×16-byte alignment)
+    uint32_t padding[3];  // Pad to 32 bytes (2x16-byte alignment)
 };
 
 Chunk::Chunk(Chunk&& other) noexcept
@@ -71,7 +71,7 @@ Result<void> Chunk::Initialize(
     std::string bufferName = std::format("{}[{},{},{}]_VoxelBuffer",
         debugNamePrefix, coord.x, coord.y, coord.z);
 
-    // ===== STEP 1: Create voxel buffer (64³ × 4 bytes = 1,048,576 bytes) =====
+    // ===== STEP 1: Create voxel buffer (64^3 x 4 bytes = 1,048,576 bytes) =====
     auto result = m_voxelBuffer.Initialize(
         device,
         GetBufferSize(),  // 1 MB
@@ -185,7 +185,7 @@ Result<void> Chunk::Generate(
         return {};
     }
 
-    // ===== STEP 1: Calculate chunk world offset (coord × 64) =====
+    // ===== STEP 1: Calculate chunk world offset (coord x 64) =====
     int32_t worldOffsetX, worldOffsetY, worldOffsetZ;
     GetWorldOrigin(worldOffsetX, worldOffsetY, worldOffsetZ);
 
@@ -238,8 +238,8 @@ Result<void> Chunk::Generate(
     cmdList->SetComputeRootUnorderedAccessView(1, m_voxelBuffer.GetGPUVirtualAddress());
 
     // ===== STEP 7: Dispatch compute shader =====
-    // 8×8×8 thread groups (each group has 8×8×8 threads = 512 threads)
-    // Total: 8³ groups × 512 threads = 262,144 threads = 64³ voxels ✅
+    // 8x8x8 thread groups (each group has 8x8x8 threads = 512 threads)
+    // Total: 8^3 groups x 512 threads = 262,144 threads = 64^3 voxels
     cmdList->Dispatch(8, 8, 8);
 
     // ===== STEP 8: UAV barrier (ensure compute completes before next use) =====

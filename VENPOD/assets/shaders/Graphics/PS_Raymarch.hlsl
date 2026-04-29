@@ -62,7 +62,7 @@ bool IntersectBox(float3 rayOrigin, float3 rayDir, float3 boxMin, float3 boxMax,
 // DDA Raymarcher
 float4 Raymarch(float3 rayOrigin, float3 rayDir) {
     // INFINITE WORLD: maxDist must cover diagonal of render buffer
-    // Buffer is 1600x128x1600, diagonal ≈ sqrt(1600² + 128² + 1600²) ≈ 2265
+    // Buffer is 1600x128x1600, diagonal  sqrt(1600 + 128 + 1600)  2265
     // Use 2500 for safety margin
     const float maxDist = 2500.0f;
     const int maxSteps = 2048;      // More steps for distant voxels (1600 diagonal needs ~1600+ steps)

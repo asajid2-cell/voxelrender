@@ -1,64 +1,82 @@
 # VENPOD
 
-VENPOD is a DirectX 12 voxel engine tech demo written in C++20 and HLSL. It renders a first-person infinite terrain sandbox with GPU-generated chunks, HLSL raymarching, voxel physics, brush editing tools, and an ImGui diagnostics layer.
+VENPOD is a DirectX 12 voxel engine tech demo written in C++20 and HLSL. It renders an infinite first-person voxel sandbox with GPU-generated terrain, chunk streaming, HLSL raymarching, voxel physics, brush editing tools, and ImGui diagnostics.
 
-The project is intended to show low-level graphics and GPU-simulation work clearly: descriptor management, command queues, resource barriers, shader compilation, allocator reuse, fence synchronization, chunk streaming, and compute-driven simulation.
+The goal of the project is to make low-level graphics and GPU-simulation systems visible: descriptor management, command queues, resource barriers, shader compilation, allocator reuse, fence synchronization, chunk streaming, and compute-driven simulation.
+
+## Demo
 
 <p align="center">
-  <img src="docs/screenshots/painting_example_1.png" width="80%" alt="VENPOD procedural voxel terrain">
+  <img src="docs/screenshots/painting_example_1.png" width="80%" alt="VENPOD procedural voxel terrain and brush editing">
 </p>
 
-## Current Snapshot
+Additional captures are in [docs/screenshots](docs/screenshots).
 
-This branch is a stable public tech-demo snapshot. The infinite-world sandbox is the main mode. It includes:
+## Features
 
-- DirectX 12 rendering infrastructure with explicit resource state management.
+- DirectX 12 rendering backend with explicit resource state management.
 - Runtime HLSL shader compilation with DXC.
 - DDA raymarching in the pixel shader.
 - GPU-generated terrain in `64 x 64 x 64` voxel chunks.
+- `1 MB` GPU buffer per chunk.
 - A visible render window of `25 x 2 x 25` chunks, or 1,250 chunks total.
 - A loaded-world budget of `33 x 2 x 33` chunks, or 2,178 chunks total.
+- Infinite-world chunk queueing, streaming, unloading, and deferred cleanup.
 - GPU brush raycasting and localized brush compute dispatches.
-- Chunk-scoped physics and diagnostics.
+- Chunk-scoped voxel physics and ImGui diagnostics.
 
-## Build And Run
+## Architecture
+
+```text
+Camera
+  -> InfiniteChunkManager
+  -> GPU chunk generation
+  -> moving render buffer
+  -> HLSL raymarch renderer
+  -> ImGui diagnostics
+```
+
+The sandbox keeps more chunks loaded than are visible, so chunks can be generated before they enter the render window. The renderer then raymarches a moving GPU buffer centered around the player. Brush edits and physics operate on the same voxel buffers through compute shaders.
+
+## Build
 
 VENPOD currently targets Windows with DirectX 12.
 
-Prerequisites:
+Requirements:
 
 - Windows 10 or 11
+- DirectX 12 capable GPU
 - Visual Studio 2022 with the C++ desktop workload
 - CMake 3.20 or newer
 - Git
 - PowerShell
+- vcpkg
 
-From the repository root:
-
-```powershell
-cd VENPOD
-.\setup.ps1
-.\run.ps1
-```
-
-For normal development after setup:
-
-```powershell
-cd VENPOD
-.\build.ps1
-.\run.ps1
-```
-
-Manual build:
-
-Open a Visual Studio Developer PowerShell or Developer Command Prompt, then run:
+Recommended manual setup:
 
 ```powershell
 cd VENPOD
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
-build\bin\VENPOD.exe
 ```
+
+Optional one-command setup:
+
+```powershell
+cd VENPOD
+.\setup.ps1
+```
+
+`setup.ps1` imports the Visual Studio build environment, installs or locates Ninja, installs vcpkg packages, checks the vendored ImGui source, configures CMake, and builds the executable. It is convenient for local development, but the manual commands above are clearer if you prefer to manage tools yourself.
+
+## Run
+
+```powershell
+cd VENPOD
+.\run.ps1
+```
+
+Choose `Sandbox Mode` in the launcher to run the infinite terrain explorer.
 
 ## Controls
 
@@ -94,7 +112,7 @@ VENPOD/
   src/Input/            keyboard, mouse, and brush input
   src/Simulation/       voxel buffers, chunk streaming, physics
   src/UI/               ImGui panels and overlays
-  vendor/imgui/         Dear ImGui source
+  vendor/imgui/         Dear ImGui source, vendored for reproducible demo builds
 docs/
   screenshots/          README images
   tutorials/            guided learning docs
@@ -103,9 +121,9 @@ docs/
   reference/            controls and runtime details
 ```
 
-## Notes
+## Known Limits
 
-This is a graphics programming demo, not a packaged game. The code favors explicit DirectX 12 systems over engine middleware so the rendering and synchronization work is visible in the repository.
+VENPOD is a graphics programming tech demo, not a packaged game engine. The code favors explicit DirectX 12 systems over engine middleware so the rendering, synchronization, and chunk-streaming work is visible in the repository.
 
 Generated build outputs are intentionally excluded from version control. Rebuild locally with the PowerShell scripts or CMake commands above.
 
