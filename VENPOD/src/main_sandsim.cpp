@@ -432,7 +432,7 @@ int RunSandSimulator(int argc, char* argv[]) {
         // =====================================================
         // PHYSICS FIRST, THEN BRUSH
         // =====================================================
-        // Order matters! Physics copies READ→WRITE (via shader), then brush paints on top.
+        // Order matters! Physics copies READ->WRITE (via shader), then brush paints on top.
         // If brush was first, physics would overwrite painted voxels.
 
         // Run physics simulation (if not paused)

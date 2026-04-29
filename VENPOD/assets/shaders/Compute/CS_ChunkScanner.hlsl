@@ -20,7 +20,7 @@ cbuffer ChunkScanConstants : register(b0) {
     uint chunkSize;     // CHUNK_SIZE (16)
 
     uint sleepThreshold; // Frames before chunk goes to sleep
-    // PRIORITY 3: Active region offset for 4×4×4 optimization
+    // PRIORITY 3: Active region offset for 4x4x4 optimization
     int activeRegionOffsetX;  // Camera chunk X - 1 (start of active region)
     int activeRegionOffsetY;  // Camera chunk Y - 1
     int activeRegionOffsetZ;  // Camera chunk Z - 1

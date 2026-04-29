@@ -13,18 +13,27 @@ Install:
 - Git
 - PowerShell
 
-The setup script can install Ninja and vcpkg dependencies if they are missing.
+The setup script can install Ninja and vcpkg dependencies if they are missing. If you prefer to manage tools yourself, use the manual CMake path below.
 
-## 2. Configure the project
+## 2. Configure manually
 
-From the repository root:
+Open a Visual Studio Developer PowerShell or Developer Command Prompt, then run from the repository root:
 
 ```powershell
 cd VENPOD
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release
+```
+
+## 3. Optional setup script
+
+For a one-command local setup:
+
+```powershell
 .\setup.ps1
 ```
 
-The setup script:
+The script:
 
 - imports the Visual Studio build environment
 - installs or locates Ninja
@@ -33,7 +42,7 @@ The setup script:
 - configures CMake
 - builds `VENPOD.exe`
 
-## 3. Run the demo
+## 4. Run the demo
 
 ```powershell
 .\run.ps1
@@ -41,7 +50,7 @@ The setup script:
 
 Choose `Sandbox Mode` in the launcher. This is the infinite terrain explorer.
 
-## 4. Rebuild after edits
+## 5. Rebuild after edits
 
 ```powershell
 .\build.ps1

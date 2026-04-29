@@ -157,11 +157,11 @@ void PhysicsDispatcher::DispatchInitialize(
         spdlog::warn("DispatchInitialize: Write buffer resource is null!");
     }
 
-    // CRITICAL: Copy WRITE → READ after initialization so rendering sees terrain on Frame 0
+    // CRITICAL: Copy WRITE -> READ after initialization so rendering sees terrain on Frame 0
     world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_COPY_SOURCE);
     world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_COPY_DEST);
     cmdList->CopyResource(world.GetReadBuffer().GetResource(), world.GetWriteBuffer().GetResource());
-    spdlog::info("DispatchInitialize: Copied WRITE → READ for Frame 0 rendering");
+    spdlog::info("DispatchInitialize: Copied WRITE -> READ for Frame 0 rendering");
 
     spdlog::debug("Dispatched voxel initialization: {}x{}x{} thread groups",
         dispatchSize.x, dispatchSize.y, dispatchSize.z);
@@ -180,8 +180,8 @@ void PhysicsDispatcher::DispatchPhysics(
 
     // PERFORMANCE FIX: GPU-side synchronization ONLY - no CPU wait needed!
     // D3D12 command queues are FIFO (First-In-First-Out), so when we do:
-    //   1. UpdateActiveRegion() → ExecuteCommandLists(chunkCopyList) → Signal(fence)
-    //   2. DispatchPhysics() → ExecuteCommandLists(physicsList)
+    //   1. UpdateActiveRegion() -> ExecuteCommandLists(chunkCopyList) -> Signal(fence)
+    //   2. DispatchPhysics() -> ExecuteCommandLists(physicsList)
     // The GPU automatically waits for (1) to complete before starting (2).
     // We don't need a CPU spin-wait - that was causing 1-5ms frame stalls!
     // The command queue serialization handles it for us.
@@ -415,11 +415,11 @@ void PhysicsDispatcher::DispatchBrush(
     //
     // Correct Timeline:
     // Frame N:
-    //   1. UpdateActiveRegion: Copy NEW chunks → WRITE buffer
-    //   2. DispatchBrush: Paint voxels → WRITE buffer (adds to copied chunks)
+    //   1. UpdateActiveRegion: Copy NEW chunks -> WRITE buffer
+    //   2. DispatchBrush: Paint voxels -> WRITE buffer (adds to copied chunks)
     //   3. DispatchChunkScan: Scan WRITE buffer (sees chunks + painted voxels)
     //   4. DispatchPhysicsIndirect: Read READ (Frame N-1), write WRITE (Frame N)
-    //   5. SwapBuffers() - READ ↔ WRITE (WRITE becomes READ for next frame)
+    //   5. SwapBuffers() - READ  WRITE (WRITE becomes READ for next frame)
     //   6. Render from READ buffer (now has Frame N final state)
     //
     // Key: WRITE = Frame N workspace, READ = Frame N-1 final state (read-only)
@@ -738,11 +738,11 @@ void PhysicsDispatcher::DispatchChunkScan(
 
     // === PERFORMANCE FIX: Scan WRITE buffer directly (no copy needed!) ===
     // DispatchBrush painted to WRITE buffer (line 436), so we scan WRITE to detect new voxels.
-    // Previous frame ended with SwapBuffers → old WRITE became READ.
+    // Previous frame ended with SwapBuffers -> old WRITE became READ.
     // Current frame: chunks copied to WRITE, brush paints to WRITE, we scan WRITE.
-    // This eliminates the redundant 64 MB WRITE→READ copy!
+    // This eliminates the redundant 64 MB WRITE->READ copy!
     //
-    // Timeline: UpdateActiveRegion→WRITE, Brush→WRITE, ChunkScan→WRITE,
+    // Timeline: UpdateActiveRegion->WRITE, Brush->WRITE, ChunkScan->WRITE,
     //           Physics reads READ writes WRITE, SwapBuffers
 
     // Reset active chunk count to zero before scanning
@@ -802,7 +802,7 @@ void PhysicsDispatcher::DispatchChunkScan(
     // Log only once per second to avoid spam
     static int activeRegionLogThrottle = 0;
     if (++activeRegionLogThrottle % 60 == 1) {
-        spdlog::debug("DispatchChunkScan: Scanning {}×{}×{} = {} physics chunks at offset ({},{},{})",
+        spdlog::debug("DispatchChunkScan: Scanning {}x{}x{} = {} physics chunks at offset ({},{},{})",
             dispatchX, dispatchY, dispatchZ,
             dispatchX * dispatchY * dispatchZ,
             offsetX, 0, offsetZ);
@@ -816,7 +816,7 @@ void PhysicsDispatcher::DispatchChunkScan(
     m_chunkScanPipeline.SetRootDescriptorTable(cmdList, 3, chunkManager.GetActiveListUAV().gpu);
     m_chunkScanPipeline.SetRootDescriptorTable(cmdList, 4, chunkManager.GetActiveCountUAV().gpu);
 
-    // PRIORITY 3: Dispatch optimized 25×2×25 region for infinite chunks, full grid for static
+    // PRIORITY 3: Dispatch optimized 25x2x25 region for infinite chunks, full grid for static
     m_chunkScanPipeline.Dispatch(cmdList, dispatchX, dispatchY, dispatchZ);
 
     // UAV barrier to ensure writes complete
@@ -832,7 +832,7 @@ void PhysicsDispatcher::DispatchChunkScan(
     // Log only once per second to avoid spam
     static int logThrottle = 0;
     if (++logThrottle % 60 == 1) {
-        spdlog::debug("DispatchChunkScan: Dispatched {}×{}×{} chunks (ChunkManager grid: {}×{}×{})",
+        spdlog::debug("DispatchChunkScan: Dispatched {}x{}x{} chunks (ChunkManager grid: {}x{}x{})",
             dispatchX, dispatchY, dispatchZ,
             chunkManager.GetChunkCountX(), chunkManager.GetChunkCountY(), chunkManager.GetChunkCountZ());
     }
@@ -966,26 +966,26 @@ void PhysicsDispatcher::DispatchPhysicsIndirect(
         return;
     }
 
-    // === Step 0: REMOVED REDUNDANT READ→WRITE COPY ===
-    // CRITICAL FIX: The previous 64 MB READ→WRITE copy was DESTROYING newly copied chunks!
+    // === Step 0: REMOVED REDUNDANT READ->WRITE COPY ===
+    // CRITICAL FIX: The previous 64 MB READ->WRITE copy was DESTROYING newly copied chunks!
     //
     // Timeline issue (before fix):
-    //   1. UpdateActiveRegion() → copies chunks to WRITE buffer (separate command list)
-    //   2. DispatchPhysicsIndirect() → copies READ→WRITE (OVERWRITES the new chunks!)
-    //   3. Physics runs on corrupted data → crashes or rendering bugs
+    //   1. UpdateActiveRegion() -> copies chunks to WRITE buffer (separate command list)
+    //   2. DispatchPhysicsIndirect() -> copies READ->WRITE (OVERWRITES the new chunks!)
+    //   3. Physics runs on corrupted data -> crashes or rendering bugs
     //
     // The correct architecture is:
-    //   - UpdateActiveRegion writes NEW chunks → WRITE buffer
-    //   - Brush paints → WRITE buffer
+    //   - UpdateActiveRegion writes NEW chunks -> WRITE buffer
+    //   - Brush paints -> WRITE buffer
     //   - ChunkScan reads WRITE buffer to find active chunks
     //   - Physics reads READ (old frame), writes WRITE (new frame) - preserves chunk data!
     //   - SwapBuffers() makes WRITE become READ for next frame
     //
-    // No READ→WRITE copy is needed because:
+    // No READ->WRITE copy is needed because:
     //   - For static grid: WRITE already has complete data from previous physics pass
     //   - For infinite chunks: UpdateActiveRegion copies chunks directly to WRITE
     //
-    // This fix also saves 64 MB/frame × 60 FPS = 3.84 GB/s bandwidth!
+    // This fix also avoids a redundant 64 MB copy on each physics frame.
 
     // === Step 1: Prepare indirect dispatch arguments ===
     // Set descriptor heaps
@@ -1071,7 +1071,7 @@ void PhysicsDispatcher::DispatchPhysicsIndirect(
     // Log only once per second to avoid spam
     static int physicsLogThrottle = 0;
     if (++physicsLogThrottle % 60 == 1) {
-        spdlog::debug("DispatchPhysicsIndirect: Indirect physics dispatch complete (60 FPS)");
+        spdlog::debug("DispatchPhysicsIndirect: Indirect physics dispatch complete");
     }
 }
 

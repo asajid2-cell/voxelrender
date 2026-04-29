@@ -73,7 +73,7 @@ public:
 private:
     Result<void> CreateMaterialPalette(ID3D12Device* device, DescriptorHeapManager& heapManager);
 
-    // NOTE: Voxel buffers removed - VoxelWorld manages buffers now (256³ ping-pong)
+    // NOTE: Voxel buffers removed - VoxelWorld manages buffers now (256^3 ping-pong)
     // This saves 32MB+ of unused GPU memory
 
     // Material palette texture

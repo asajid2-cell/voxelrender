@@ -1,6 +1,6 @@
 # =============================================================================
 # VENPOD - Automated Setup Script (PowerShell)
-# High-Performance Voxel Physics Engine
+# DirectX 12 voxel engine tech demo
 # =============================================================================
 
 param(
@@ -23,8 +23,8 @@ $startTime = Get-Date
 Write-Host @"
 ===============================================================
               VENPOD - SETUP SCRIPT
-     High-Performance Voxel Physics Engine v0.1.0
-          Target: 100M+ Active Voxels @ 60 FPS
+       DirectX 12 Voxel Engine Tech Demo v0.1.0
+      Large GPU-Resident Chunked Voxel Worlds
 ===============================================================
 "@ -ForegroundColor Magenta
 

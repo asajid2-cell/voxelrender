@@ -106,18 +106,18 @@ Result<void> VoxelWorld::Initialize(
         // LOAD_DISTANCE (16): Chunks start generating at this distance
         //   - Creates a 4-chunk "buffer zone" beyond visible area
         //   - Chunks have time to generate before player reaches them
-        //   - 33×33×2 = 2,178 chunks loaded = ~2.2 GB VRAM (fits in 8GB)
+        //   - 33x33x2 = 2,178 chunks loaded = ~2.2 GB VRAM (fits in 8GB)
         //
         // RENDER_DISTANCE (12): What's visible (defined in TerrainConstants.h)
-        //   - 25×25×2 = 1,250 chunks in render buffer
-        //   - 1600×128×1600 voxel render buffer
+        //   - 25x25x2 = 1,250 chunks in render buffer
+        //   - 1600x128x1600 voxel render buffer
         //
         // UNLOAD_DISTANCE (20): Chunks deleted at this distance
         //   - 4-chunk gap from LOAD prevents thrashing when moving back and forth
         //   - Only chunks truly far away get deleted
         //
-        chunkConfig.loadDistanceHorizontal = LOAD_DISTANCE_HORIZONTAL;    // ±16 chunks
-        chunkConfig.unloadDistanceHorizontal = UNLOAD_DISTANCE_HORIZONTAL; // ±20 chunks
+        chunkConfig.loadDistanceHorizontal = LOAD_DISTANCE_HORIZONTAL;    // +/-16 chunks
+        chunkConfig.unloadDistanceHorizontal = UNLOAD_DISTANCE_HORIZONTAL; // +/-20 chunks
         chunkConfig.loadDistanceVertical = 2;      // UNUSED - fixed to Y=0,1 layers
         chunkConfig.unloadDistanceVertical = 3;    // UNUSED - fixed to Y=0,1 layers
 
@@ -245,7 +245,7 @@ void VoxelWorld::SwapBuffers() {
     // DIAGNOSTIC: Log swap periodically
     static int swapCount = 0;
     if (++swapCount % 60 == 1) {
-        spdlog::debug("SwapBuffers: {} → {} (swap #{})", oldReadIndex, m_readBufferIndex, swapCount);
+        spdlog::debug("SwapBuffers: {} -> {} (swap #{})", oldReadIndex, m_readBufferIndex, swapCount);
     }
 }
 
@@ -706,8 +706,8 @@ glm::vec3 VoxelWorld::UpdateChunks(
     // Problem: Updating m_activeRegionCenter every chunk boundary (every 64 voxels) causes:
     // 1. RegionOrigin shifts by 64 voxels
     // 2. Cache invalidation forces re-copying ALL 1,250 chunks
-    // 3. For 2-3 frames, buffer has mismatched data/origin → flickering and visual jump
-    // 4. This happens every 64 voxels → constant stuttering
+    // 3. For 2-3 frames, buffer has mismatched data/origin -> flickering and visual jump
+    // 4. This happens every 64 voxels -> constant stuttering
     //
     // Solution: Only shift the render buffer when camera gets FAR from center (e.g., 8+ chunks).
     // This reduces buffer shifts from every 64 voxels to every ~512 voxels (8 chunks * 64).
@@ -883,7 +883,7 @@ glm::vec3 VoxelWorld::UpdateChunks(
 void VoxelWorld::OnChunkUnloaded(const ChunkCoord& coord) {
     // CACHE FIX: Clear this chunk from BOTH buffer caches when it's unloaded
     // Without this, if the chunk gets reloaded later, UpdateActiveRegion thinks
-    // it's already in the render buffer and skips copying it → invisible chunk!
+    // it's already in the render buffer and skips copying it -> invisible chunk!
     for (int i = 0; i < 2; ++i) {
         auto it = m_copiedChunksPerBuffer[i].find(coord);
         if (it != m_copiedChunksPerBuffer[i].end()) {
@@ -913,7 +913,7 @@ void VoxelWorld::InvalidateCopiedChunk(const ChunkCoord& coord) {
     //   1. User paints voxels in render buffer
     //   2. We mark chunk as MODIFIED (add to m_modifiedChunks)
     //   3. UpdateActiveRegion checks: is chunk modified?
-    //   4. YES → skip copying, preserve painted voxels
+    //   4. YES -> skip copying, preserve painted voxels
     //   5. User's paint persists!
     //
     // Chunks stay in m_modifiedChunks until they're unloaded (far from player)
@@ -1253,8 +1253,8 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* /*device*/, ID3D12CommandQueue
         return;
     }
 
-    // ===== STEP 1: Determine which chunks to copy into 512×256×512 render buffer =====
-    // FIX #18: The buffer represents 8×4×8 = 256 chunks (each 64³) - increased from 4×2×4 = 32
+    // ===== STEP 1: Determine which chunks to copy into 512x256x512 render buffer =====
+    // FIX #18: The buffer represents 8x4x8 = 256 chunks (each 64^3) - increased from 4x2x4 = 32
     // We center on the camera's chunk and copy nearby chunks
 
     const auto& loadedChunks = m_chunkManager->GetLoadedChunks();
@@ -1263,8 +1263,8 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* /*device*/, ID3D12CommandQueue
     }
 
     // Camera is at m_activeRegionCenter chunk coordinate
-    // For a 256×128×256 buffer with 64³ chunks, we can fit 4×2×4 chunks
-    // Center on camera chunk: copy chunks in range dx,dz ∈ [-1..2], dy ∈ [-1..0]
+    // For a 256x128x256 buffer with 64^3 chunks, we can fit 4x2x4 chunks
+    // Center on camera chunk: copy chunks in range dx,dz  [-1..2], dy  [-1..0]
 
     // ===== STEP 2: Ring buffer - get next allocator =====
     uint32_t allocatorIndex = m_currentCopyAllocatorIndex;
@@ -1308,7 +1308,7 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* /*device*/, ID3D12CommandQueue
 
     // FIX #6: Copy chunks to WRITE buffer (not READ)!
     // This prevents race condition where chunk copy and physics both write to same buffer
-    // Architecture: UpdateChunks() writes NEW chunks → WRITE, then physics simulates on READ → WRITE
+    // Architecture: UpdateChunks() writes NEW chunks -> WRITE, then physics simulates on READ -> WRITE
     //
     // NOTE: We defer the buffer transition until we know we'll actually copy chunks.
     // If we transition here but then copy 0 chunks, we'd update the CPU state tracking
@@ -1318,7 +1318,7 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* /*device*/, ID3D12CommandQueue
     m_chunkCopyCmdList->SetPipelineState(m_chunkCopyPSO.Get());
     m_chunkCopyCmdList->SetComputeRootSignature(m_chunkCopyRootSignature.Get());
 
-    // ===== STEP 3: Copy chunks within 9×2×9 grid centered on camera =====
+    // ===== STEP 3: Copy chunks within 9x2x9 grid centered on camera =====
     int32_t chunksCopied = 0;
     int32_t chunksSkipped = 0;
     int32_t chunksNotGenerated = 0;  // DEBUG: Track chunks that exist but aren't generated yet
@@ -1330,9 +1330,9 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* /*device*/, ID3D12CommandQueue
     // still allows rapid fill-in without monopolizing the graphics queue.
     int32_t maxChunksPerFrame = 64;
 
-    // FIX: Copy range for 9×2×9 render buffer (576×128×576 / 64³ = 9×2×9)
-    // Horizontal: dx,dz ∈ [-4..4] = 9 chunks × 64 = 576 voxels ✓ (relative to camera)
-    // Vertical:   y ∈ [0..1]      = 2 chunks × 64 = 128 voxels ✓ (ABSOLUTE coordinates)
+    // FIX: Copy range for 9x2x9 render buffer (576x128x576 / 64^3 = 9x2x9)
+    // Horizontal: dx,dz  [-4..4] = 9 chunks x 64 = 576 voxels OK (relative to camera)
+    // Vertical:   y  [0..1]      = 2 chunks x 64 = 128 voxels OK (ABSOLUTE coordinates)
     //             Terrain at Y=5-60 spans chunk Y=0 (0-63) and Y=1 (64-127)
 
     int32_t chunksNotLoaded = 0;  // DEBUG: Count chunks not in loadedChunks map
@@ -1400,7 +1400,7 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* /*device*/, ID3D12CommandQueue
                 // DIAGNOSTIC: Enable to debug chunk copy issues
                 static int copyDebugCount = 0;
                 if (copyDebugCount < 20) {
-                    spdlog::info("[CHUNK_COPY] Chunk coord [{},{},{}] dx={} dz={} → buffer dest [{},{},{}]",
+                    spdlog::info("[CHUNK_COPY] Chunk coord [{},{},{}] dx={} dz={} -> buffer dest [{},{},{}]",
                         chunkCoord.x, chunkCoord.y, chunkCoord.z, dx, dz, destX, destY, destZ);
                     copyDebugCount++;
                 }
@@ -1551,7 +1551,7 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* /*device*/, ID3D12CommandQueue
 
         // NO BUFFER SWAP here! We write directly to WRITE buffer.
         // Chunks will appear after physics swaps buffers at end of frame.
-        // This prevents race condition: UpdateChunks→WRITE, Physics reads READ writes WRITE, then swap.
+        // This prevents race condition: UpdateChunks->WRITE, Physics reads READ writes WRITE, then swap.
 
         // PERFORMANCE FIX: Only log at debug level (info logs cause lag on Windows)
         // spdlog::debug("UpdateActiveRegion: Copied {} NEW chunks ({} skipped, {} not generated) to WRITE buffer",

@@ -1,15 +1,15 @@
 // =============================================================================
 // VENPOD Chunk-to-Buffer Copy Compute Shader
-// Copies a 64³ chunk into a specific region of the 256³ render buffer
+// Copies a 64^3 chunk into a specific region of the 256^3 render buffer
 // =============================================================================
 
 #include "../Common/SharedTypes.hlsli"
 
 // Copy parameters
 cbuffer CopyChunkConstants : register(b0) {
-    uint destOffsetX;      // Destination offset in 256³ buffer (0-192 in steps of 64)
-    uint destOffsetY;      // Destination offset in 256³ buffer (0-192 in steps of 64)
-    uint destOffsetZ;      // Destination offset in 256³ buffer (0-192 in steps of 64)
+    uint destOffsetX;      // Destination offset in 256^3 buffer (0-192 in steps of 64)
+    uint destOffsetY;      // Destination offset in 256^3 buffer (0-192 in steps of 64)
+    uint destOffsetZ;      // Destination offset in 256^3 buffer (0-192 in steps of 64)
     uint chunkSize;        // Always 64 for infinite chunks
     uint destGridSizeX;    // Always 256 for render buffer
     uint destGridSizeY;    // Always 256 for render buffer
@@ -17,15 +17,15 @@ cbuffer CopyChunkConstants : register(b0) {
     uint padding;
 };
 
-// Source: Single 64³ chunk buffer
+// Source: Single 64^3 chunk buffer
 StructuredBuffer<uint> ChunkVoxelInput : register(t0);
 
-// Destination: 256³ render buffer
+// Destination: 256^3 render buffer
 RWStructuredBuffer<uint> RenderBufferOutput : register(u0);
 
 [numthreads(8, 8, 8)]
 void main(uint3 DTid : SV_DispatchThreadID) {
-    // Bounds check (operating on 64³ chunk)
+    // Bounds check (operating on 64^3 chunk)
     if (DTid.x >= chunkSize || DTid.y >= chunkSize || DTid.z >= chunkSize) {
         return;
     }
@@ -33,17 +33,17 @@ void main(uint3 DTid : SV_DispatchThreadID) {
     // Calculate source index (local chunk coordinates)
     uint srcIndex = DTid.x + DTid.y * chunkSize + DTid.z * chunkSize * chunkSize;
 
-    // Calculate destination coordinates in 256³ buffer
+    // Calculate destination coordinates in 256^3 buffer
     uint destX = destOffsetX + DTid.x;
     uint destY = destOffsetY + DTid.y;
     uint destZ = destOffsetZ + DTid.z;
 
-    // Bounds check destination (ensure we don't write outside 256³ buffer)
+    // Bounds check destination (ensure we don't write outside 256^3 buffer)
     if (destX >= destGridSizeX || destY >= destGridSizeY || destZ >= destGridSizeZ) {
         return;  // Skip voxels outside render buffer
     }
 
-    // Calculate destination index in 256³ buffer
+    // Calculate destination index in 256^3 buffer
     uint destIndex = destX + destY * destGridSizeX + destZ * destGridSizeX * destGridSizeY;
 
     // Copy voxel from chunk to render buffer

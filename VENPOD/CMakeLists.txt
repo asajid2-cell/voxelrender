@@ -2,8 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 project(VENPOD VERSION 0.1.0 LANGUAGES CXX)
 
 # =============================================================================
-# VENPOD - High-Performance Voxel Physics Engine
-# Target: 100M+ active voxels @ 60 FPS
+# VENPOD - DirectX 12 voxel engine tech demo
+# Designed around large GPU-resident chunked voxel worlds
 # =============================================================================
 
 # Modern C++20 Standard

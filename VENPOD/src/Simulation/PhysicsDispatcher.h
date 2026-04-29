@@ -46,7 +46,7 @@ struct ChunkScanConstants {
     uint32_t chunkSize;
 
     uint32_t sleepThreshold;
-    // PRIORITY 3: Active region offset for 4×2×4 optimization (infinite chunks)
+    // PRIORITY 3: Active region offset for 4x2x4 optimization (infinite chunks)
     int32_t activeRegionOffsetX;  // Camera chunk X - 1 (start of active region)
     int32_t activeRegionOffsetY;  // Camera chunk Y - 1 (start of vertical region, 2 chunks high)
     int32_t activeRegionOffsetZ;  // Camera chunk Z - 1 (start of active region)
