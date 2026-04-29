@@ -138,7 +138,7 @@ void main(uint3 DTid : SV_DispatchThreadID) {
     else if (worldPos.y < SEA_LEVEL) {
         // Above terrain but below sea level - water
         material = MAT_WATER;
-        state = 0;  // Water is dynamic
+        state = STATE_IS_STATIC;  // Terrain oceans are static; brush-painted water remains dynamic
     }
 
     // Pack voxel data

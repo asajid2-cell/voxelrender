@@ -200,9 +200,10 @@ Result<void> Chunk::Generate(
     constants.padding[1] = 0;
     constants.padding[2] = 0;
 
-    // ===== STEP 3: Update shared constant buffer (OPTIMIZED!) =====
-    // Instead of creating a new buffer, just update the existing one
-    memcpy(sharedConstantBufferMappedPtr, &constants, sizeof(ChunkConstants));
+    // Constants are passed as root constants so each dispatch records its own
+    // world offset in the command stream. A shared upload CBV is unsafe here
+    // because later CPU writes can overwrite constants before the GPU consumes
+    // earlier chunk-generation dispatches.
 
     // ===== STEP 4: Transition voxel buffer to UAV state =====
     // FIX #4: Use tracked resource state instead of assuming COMMON
@@ -225,8 +226,13 @@ Result<void> Chunk::Generate(
     cmdList->SetComputeRootSignature(rootSignature);
 
     // ===== STEP 6: Set root parameters =====
-    // Root parameter 0: Constant Buffer View (CBV) - using shared constant buffer
-    cmdList->SetComputeRootConstantBufferView(0, sharedConstantBuffer->GetGPUVirtualAddress());
+    // Root parameter 0: ChunkConstants as 8 DWORD root constants
+    cmdList->SetComputeRoot32BitConstants(
+        0,
+        static_cast<UINT>(sizeof(ChunkConstants) / sizeof(uint32_t)),
+        &constants,
+        0
+    );
 
     // Root parameter 1: Unordered Access View (UAV) for ChunkVoxelOutput
     cmdList->SetComputeRootUnorderedAccessView(1, m_voxelBuffer.GetGPUVirtualAddress());

@@ -3,6 +3,7 @@
 #include "../Graphics/RHI/d3dx12.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
+#include <cmath>
 
 namespace VENPOD::Simulation {
 
@@ -368,12 +369,12 @@ Result<void> PhysicsDispatcher::CreateBrushPipeline(
     desc.debugName = "CS_Brush";
 
     // Root parameters:
-    // 0: Root constants (BrushConstants - 12 floats/uints)
+    // 0: Root constants (brush constants plus localized dispatch start - 16 dwords)
     desc.rootParams.push_back({
         Graphics::RootParamType::Constants32Bit,
         0,  // register b0
         0,  // space 0
-        12  // 12 uint32s (sizeof(BrushConstants) / 4)
+        16
     });
 
     // 1: UAV for voxel buffer (read-write)
@@ -430,10 +431,61 @@ void PhysicsDispatcher::DispatchBrush(
     // Bind brush pipeline
     m_brushPipeline.Bind(cmdList);
 
-    // Set constants
-    m_brushPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(brushConstants) / 4, &brushConstants);
+    struct BrushDispatchConstants {
+        float positionX;
+        float positionY;
+        float positionZ;
+        float radius;
+        uint32_t material;
+        uint32_t mode;
+        uint32_t shape;
+        float strength;
+        uint32_t gridSizeX;
+        uint32_t gridSizeY;
+        uint32_t gridSizeZ;
+        uint32_t seed;
+        uint32_t startX;
+        uint32_t startY;
+        uint32_t startZ;
+        uint32_t padding;
+    };
 
-    auto dispatchSize = world.GetDispatchSize(8);
+    const int32_t radiusCeil = static_cast<int32_t>(std::ceil(brushConstants.radius)) + 2;
+    int32_t startX = std::max<int32_t>(0, static_cast<int32_t>(std::floor(brushConstants.positionX)) - radiusCeil);
+    int32_t startY = std::max<int32_t>(0, static_cast<int32_t>(std::floor(brushConstants.positionY)) - radiusCeil);
+    int32_t startZ = std::max<int32_t>(0, static_cast<int32_t>(std::floor(brushConstants.positionZ)) - radiusCeil);
+    int32_t endX = std::min<int32_t>(static_cast<int32_t>(world.GetGridSizeX()), static_cast<int32_t>(std::ceil(brushConstants.positionX)) + radiusCeil + 1);
+    int32_t endY = std::min<int32_t>(static_cast<int32_t>(world.GetGridSizeY()), static_cast<int32_t>(std::ceil(brushConstants.positionY)) + radiusCeil + 1);
+    int32_t endZ = std::min<int32_t>(static_cast<int32_t>(world.GetGridSizeZ()), static_cast<int32_t>(std::ceil(brushConstants.positionZ)) + radiusCeil + 1);
+
+    if (endX <= startX || endY <= startY || endZ <= startZ) {
+        return;
+    }
+
+    BrushDispatchConstants constants = {};
+    constants.positionX = brushConstants.positionX;
+    constants.positionY = brushConstants.positionY;
+    constants.positionZ = brushConstants.positionZ;
+    constants.radius = brushConstants.radius;
+    constants.material = brushConstants.material;
+    constants.mode = brushConstants.mode;
+    constants.shape = brushConstants.shape;
+    constants.strength = brushConstants.strength;
+    constants.gridSizeX = brushConstants.gridSizeX;
+    constants.gridSizeY = brushConstants.gridSizeY;
+    constants.gridSizeZ = brushConstants.gridSizeZ;
+    constants.seed = brushConstants.seed;
+    constants.startX = static_cast<uint32_t>(startX);
+    constants.startY = static_cast<uint32_t>(startY);
+    constants.startZ = static_cast<uint32_t>(startZ);
+
+    auto dispatchSize = glm::uvec3(
+        (static_cast<uint32_t>(endX - startX) + 7) / 8,
+        (static_cast<uint32_t>(endY - startY) + 7) / 8,
+        (static_cast<uint32_t>(endZ - startZ) + 7) / 8
+    );
+
+    m_brushPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
 
     // Paint to BOTH buffers to ensure painted voxels persist across buffer swaps!
     //
@@ -721,15 +773,13 @@ void PhysicsDispatcher::DispatchChunkScan(
     constants.chunkSize = CHUNK_SIZE;
     constants.sleepThreshold = m_sleepThreshold;
 
-    // PERFORMANCE OPTIMIZATION: Scan a region around the buffer center
-    //
-    // The full render buffer is 25x2x25 chunks (1600x128x1600 voxels).
-    // We scan most of it for physics so sand/water works across the visible area.
-    //
-    // Using 16-voxel physics chunks: 1600/16 = 100 chunks per axis
-    // Scan the full visible region (25 render chunks = 100 physics chunks per axis)
-    constexpr uint32_t PHYSICS_REGION_SIZE_X = 100;  // Full width (1600 voxels / 16 = 100 physics chunks)
-    constexpr uint32_t PHYSICS_REGION_SIZE_Z = 100;  // Full depth
+    // PERFORMANCE OPTIMIZATION: Scan a local region around the centered camera.
+    // The full render buffer is 100x8x100 physics chunks; scanning all 80,000
+    // chunks every frame caused startup hitches and made static oceans enter
+    // the physics path. A 32x8x32 window covers 512x128x512 voxels around the
+    // player, which is enough for interactive brush physics.
+    constexpr uint32_t PHYSICS_REGION_SIZE_X = 32;
+    constexpr uint32_t PHYSICS_REGION_SIZE_Z = 32;
 
     uint32_t fullChunksX = chunkManager.GetChunkCountX();  // 100
     uint32_t fullChunksY = chunkManager.GetChunkCountY();  // 8

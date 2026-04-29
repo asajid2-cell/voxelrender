@@ -314,7 +314,49 @@ int main(int argc, char* argv[]) {
         voxelWorld->SwapBuffers();
         spdlog::info("Initialized 256³ voxel grid with procedural terrain (CS_Initialize)");
     } else {
-        spdlog::info("Skipping CS_Initialize - using infinite chunk system for terrain generation");
+        // CRITICAL FIX: Clear both voxel buffers to air (0) before using infinite chunks!
+        // Without this, uninitialized GPU memory contains garbage that the raymarcher
+        // interprets as random terrain, causing terrain to appear in wrong locations.
+        spdlog::info("Clearing voxel buffers to air for infinite chunk mode...");
+
+        // Transition both buffers to UAV state for clearing
+        voxelWorld->TransitionReadBufferTo(initCommandList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        voxelWorld->TransitionWriteBufferTo(initCommandList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        // Clear both buffers using ClearUnorderedAccessViewUint
+        // This sets all voxels to 0 (MAT_AIR)
+        UINT clearValues[4] = {0, 0, 0, 0};
+        auto& heapManager = renderer->GetHeapManager();
+        ID3D12DescriptorHeap* heaps[] = { heapManager.GetShaderVisibleCbvSrvUavHeap() };
+        initCommandList->SetDescriptorHeaps(1, heaps);
+
+        // Clear READ buffer
+        initCommandList->ClearUnorderedAccessViewUint(
+            voxelWorld->GetReadBufferUAV().gpu,
+            voxelWorld->GetReadBufferUAV().cpu,
+            voxelWorld->GetReadBuffer().GetResource(),
+            clearValues,
+            0, nullptr
+        );
+
+        // Clear WRITE buffer
+        initCommandList->ClearUnorderedAccessViewUint(
+            voxelWorld->GetWriteBufferUAV().gpu,
+            voxelWorld->GetWriteBufferUAV().cpu,
+            voxelWorld->GetWriteBuffer().GetResource(),
+            clearValues,
+            0, nullptr
+        );
+
+        // UAV barriers to ensure clears complete
+        D3D12_RESOURCE_BARRIER uavBarriers[2] = {};
+        uavBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uavBarriers[0].UAV.pResource = voxelWorld->GetReadBuffer().GetResource();
+        uavBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uavBarriers[1].UAV.pResource = voxelWorld->GetWriteBuffer().GetResource();
+        initCommandList->ResourceBarrier(2, uavBarriers);
+
+        spdlog::info("Both voxel buffers cleared to air - ready for infinite chunk streaming");
     }
 
     initCommandList->Close();

@@ -146,11 +146,9 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID, ui
 
         ctrl.particleCount = gs_particleCount;
 
-        // ALWAYS add chunks with any voxels to active list
-        // This ensures they get copied from READ to WRITE buffer
-        // even if they're not actively simulating physics
-        if (gs_particleCount > 0) {
-            // Chunk has voxels - add to active list for copying
+        // Only chunks with movable voxels need physics. Static terrain and
+        // generated ocean water are already copied by the streaming system.
+        if (gs_hasActiveVoxel > 0) {
             uint listIndex;
             InterlockedAdd(ActiveChunkCount[0], 1, listIndex);
             ActiveChunkList[listIndex] = chunkIndex;

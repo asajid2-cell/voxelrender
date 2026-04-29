@@ -224,8 +224,9 @@ private:
     bool m_useInfiniteChunks = true;  // Toggle for testing (set false to use old 256^3 system)
 
     // Active region tracking (which chunk is at center of render buffer)
-    ChunkCoord m_activeRegionCenter;
+    ChunkCoord m_activeRegionCenter = ChunkCoord(INT32_MAX, INT32_MAX, INT32_MAX);  // Sentinel for "not initialized"
     bool m_activeRegionNeedsUpdate = true;
+    bool m_firstUpdateDone = false;  // Flag to track first UpdateChunks call
 
     // World-space origin (in voxel coordinates) that maps to (0,0,0) in the 256^3 buffer
     // when using infinite chunks. This is derived from m_activeRegionCenter and the
@@ -250,6 +251,10 @@ private:
     // When cache is invalidated (camera moves to new chunk), we need to aggressively
     // refill BOTH buffers to prevent holes/missing chunks during the refill period
     int32_t m_framesAfterCacheInvalidation = 0;
+
+    // Buffer stability tracking - prevent swaps during refill to avoid visual artifacts
+    // When true, SwapBuffers() is a no-op until buffers are stable again
+    bool m_buffersStable = true;
 
     // Chunk copy pipeline (for UpdateActiveRegion)
     ComPtr<ID3D12PipelineState> m_chunkCopyPSO;

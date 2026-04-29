@@ -20,6 +20,7 @@
 #include "UI/PauseMenu.h"
 #include <imgui.h>
 #include <spdlog/spdlog.h>
+#include <spdlog/sinks/basic_file_sink.h>
 #include <SDL3/SDL.h>
 #include <glm/glm.hpp>
 #include <memory>
@@ -27,6 +28,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <cstdlib>
 
 using namespace VENPOD;
 using namespace VENPOD::Graphics;
@@ -59,20 +61,35 @@ int RunSandbox(int argc, char* argv[]) {
     // DEBUG MODE: When true, bypass streaming and use a fixed 2x2 static
     // chunk layout copied into the 256x128x256 voxel buffer each frame.
     // This isolates copy/origin bugs from the infinite chunk streaming logic.
-    const bool useStaticChunkLayout = false;
+    const bool useStaticChunkLayout = std::getenv("VENPOD_STATIC_CHUNKS") != nullptr;
+    const bool disablePhysics = std::getenv("VENPOD_DISABLE_PHYSICS") != nullptr;
+    const bool enableDiagnostics = std::getenv("VENPOD_DIAGNOSTICS") != nullptr;
+    const bool enableRuntimeLog = enableDiagnostics || std::getenv("VENPOD_LOG_FILE") != nullptr;
+    const bool enableD3DDebug = std::getenv("VENPOD_D3D_DEBUG") != nullptr;
 
-    // DEBUGGING: Enable debug level to see synchronization logs
-    spdlog::set_level(spdlog::level::debug);
+    if (enableRuntimeLog) {
+        auto logPath = GetExecutableDirectorySandbox() / "venpod_runtime.log";
+        auto fileLogger = spdlog::basic_logger_mt("venpod_file", logPath.string(), true);
+        spdlog::set_default_logger(fileLogger);
+        spdlog::flush_on(spdlog::level::info);
+        spdlog::info("  Log path: {}", logPath.string());
+    }
+
+    spdlog::set_level(enableDiagnostics ? spdlog::level::debug : spdlog::level::warn);
     spdlog::info("===========================================");
     spdlog::info("  VENPOD - Voxel Physics Engine v0.1.0");
     spdlog::info("  Target: 100M+ Active Voxels @ 60 FPS");
+    spdlog::info("  Static chunks: {} | Physics disabled: {} | Diagnostics: {}",
+        useStaticChunkLayout ? "yes" : "no",
+        disablePhysics ? "yes" : "no",
+        enableDiagnostics ? "yes" : "no");
     spdlog::info("===========================================");
 
     // Initialize DX12 Device
     auto device = std::make_unique<DX12Device>();
     DeviceConfig deviceConfig;
-    deviceConfig.enableDebugLayer = true;
-    deviceConfig.enableGPUValidation = true;  // Enable for debugging GPU raycast crash
+    deviceConfig.enableDebugLayer = enableD3DDebug;
+    deviceConfig.enableGPUValidation = enableD3DDebug;
 
     auto deviceResult = device->Initialize(deviceConfig);
     if (deviceResult.IsErr()) {
@@ -314,7 +331,49 @@ int RunSandbox(int argc, char* argv[]) {
         voxelWorld->SwapBuffers();
         spdlog::info("Initialized 256³ voxel grid with procedural terrain (CS_Initialize)");
     } else {
-        spdlog::info("Skipping CS_Initialize - using infinite chunk system for terrain generation");
+        // CRITICAL FIX: Clear both voxel buffers to air (0) before using infinite chunks!
+        // Without this, uninitialized GPU memory contains garbage that the raymarcher
+        // interprets as random terrain, causing terrain to appear in wrong locations.
+        spdlog::info("Clearing voxel buffers to air for infinite chunk mode...");
+
+        // Transition both buffers to UAV state for clearing
+        voxelWorld->TransitionReadBufferTo(initCommandList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        voxelWorld->TransitionWriteBufferTo(initCommandList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+        // Clear both buffers using ClearUnorderedAccessViewUint
+        // This sets all voxels to 0 (MAT_AIR)
+        UINT clearValues[4] = {0, 0, 0, 0};
+        auto& heapManager = renderer->GetHeapManager();
+        ID3D12DescriptorHeap* heaps[] = { heapManager.GetShaderVisibleCbvSrvUavHeap() };
+        initCommandList->SetDescriptorHeaps(1, heaps);
+
+        // Clear READ buffer
+        initCommandList->ClearUnorderedAccessViewUint(
+            voxelWorld->GetReadBufferUAV().gpu,
+            voxelWorld->GetReadBufferUAV().cpu,
+            voxelWorld->GetReadBuffer().GetResource(),
+            clearValues,
+            0, nullptr
+        );
+
+        // Clear WRITE buffer
+        initCommandList->ClearUnorderedAccessViewUint(
+            voxelWorld->GetWriteBufferUAV().gpu,
+            voxelWorld->GetWriteBufferUAV().cpu,
+            voxelWorld->GetWriteBuffer().GetResource(),
+            clearValues,
+            0, nullptr
+        );
+
+        // UAV barriers to ensure clears complete
+        D3D12_RESOURCE_BARRIER uavBarriers[2] = {};
+        uavBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uavBarriers[0].UAV.pResource = voxelWorld->GetReadBuffer().GetResource();
+        uavBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uavBarriers[1].UAV.pResource = voxelWorld->GetWriteBuffer().GetResource();
+        initCommandList->ResourceBarrier(2, uavBarriers);
+
+        spdlog::info("Both voxel buffers cleared to air - ready for infinite chunk streaming");
     }
 
     initCommandList->Close();
@@ -456,14 +515,13 @@ int RunSandbox(int argc, char* argv[]) {
     float gridSizeYInit = static_cast<float>(voxelWorld->GetGridSizeY());
     float gridSizeZInit = static_cast<float>(voxelWorld->GetGridSizeZ());
 
-    // FIX: Spawn camera at world origin with proper terrain height
-    // Terrain generates around world origin (0,0,0) at heights Y=5 to Y=60
-    // Sea level is at Y=40, so spawn slightly above at Y=70 to see terrain from above
-    // Camera at center of chunk (0,0) which is voxels (32, Y, 32)
-    glm::vec3 cameraPos = glm::vec3(32.0f, 70.0f, 32.0f);  // Center of origin chunk, above terrain
+    // Spawn camera at center of chunk (0,0) at a height above terrain
+    // Terrain generates at Y=5-55, so Y=60 should be safely above all terrain
+    // With cleared buffers, sky will show until chunks load, then terrain appears
+    glm::vec3 cameraPos = glm::vec3(32.0f, 60.0f, 32.0f);  // Center of chunk (0,0), above terrain
 
     // Camera rotation (pitch and yaw)
-    float cameraPitch = -0.5f;  // Look down more to see terrain below
+    float cameraPitch = -0.3f;  // Slight downward look to see terrain below
     float cameraYaw = 0.0f;  // Look straight ahead (north)
 
     // Player physics for walking on terrain
@@ -475,6 +533,11 @@ int RunSandbox(int argc, char* argv[]) {
 
     // Flight mode toggle (double-click Space to enable/disable)
     bool flightMode = false;
+
+    // Terrain ready flag - don't apply gravity until ground detection works
+    // This prevents the camera from falling through the world during startup
+    // before chunks have been generated
+    bool terrainReady = false;
 
     // Player position represents feet/collision point
     // Camera rendering position is offset upward by playerHeight for natural eye-level view
@@ -616,13 +679,17 @@ int RunSandbox(int argc, char* argv[]) {
             }
         }
 
-        // Apply gravity to vertical velocity (only when not in flight mode)
-        if (!flightMode) {
+        // Apply gravity to vertical velocity (only when not in flight mode AND terrain is ready)
+        // During startup, terrain might not be generated yet - disable gravity until
+        // ground detection works to prevent falling through the world
+        if (!flightMode && terrainReady) {
             cameraVelocityY += gravity * dt;
         }
 
-        // Apply vertical velocity to camera position
-        cameraPos.y += cameraVelocityY * dt;
+        // Apply vertical velocity to camera position (only if terrain ready or flying)
+        if (terrainReady || flightMode) {
+            cameraPos.y += cameraVelocityY * dt;
+        }
 
         // Calculate ray for GPU brush raycasting
         // When mouse is captured (FPS mode), always use screen center for crosshair
@@ -748,6 +815,12 @@ int RunSandbox(int argc, char* argv[]) {
             // Normal mode - ground collision and gravity
             // Ground raycast hit detection
             if (groundRaycastResult.hasValidPosition) {
+                // Terrain is ready! Ground detection found solid ground.
+                if (!terrainReady) {
+                    terrainReady = true;
+                    spdlog::info("Terrain ready - gravity enabled");
+                }
+
                 // Ground raycast hit something - use it for collision
                 float groundLocalY = groundRaycastResult.posY;
                 float groundWorldY = groundLocalY + regionOriginWorld.y;
@@ -771,7 +844,7 @@ int RunSandbox(int argc, char* argv[]) {
                     cameraVelocityY = 20.0f;  // Jump velocity
                 }
             }
-            // No ground detected - free fall in air
+            // No ground detected - terrain not ready yet or in air above terrain
         }
 
         // === HORIZONTAL COLLISION (Cave/Wall Detection) ===
@@ -819,7 +892,7 @@ int RunSandbox(int argc, char* argv[]) {
         // If brush was first, physics would overwrite painted voxels.
 
         // Run physics simulation (if not paused)
-        if (!paused) {
+        if (!paused && !disablePhysics) {
             // Scan chunks to determine which are active
             physicsDispatcher->DispatchChunkScan(
                 commandList.Get(),
@@ -928,6 +1001,19 @@ int RunSandbox(int argc, char* argv[]) {
         // Render voxels with raymarch shader (using persistent shader-visible descriptors)
         // Brush preview now uses GPU raycasting (2,000,000x less bandwidth!)
         glm::vec3 regionOrigin = voxelWorld->GetRegionOriginWorld();
+        if (enableDiagnostics && frameCount % 60 == 0) {
+            spdlog::info(
+                "[FRAME_DIAG] frame={} camWorld=({:.2f},{:.2f},{:.2f}) camLocal=({:.2f},{:.2f},{:.2f}) forward=({:.3f},{:.3f},{:.3f}) regionOrigin=({:.0f},{:.0f},{:.0f}) groundValid={} groundLocal=({:.2f},{:.2f},{:.2f}) brushValid={} brushLocal=({:.2f},{:.2f},{:.2f})",
+                frameCount,
+                cameraPos.x, cameraPos.y, cameraPos.z,
+                cameraPosLocal.x, cameraPosLocal.y, cameraPosLocal.z,
+                cameraForward.x, cameraForward.y, cameraForward.z,
+                regionOrigin.x, regionOrigin.y, regionOrigin.z,
+                groundRaycastResult.hasValidPosition ? 1 : 0,
+                groundRaycastResult.posX, groundRaycastResult.posY, groundRaycastResult.posZ,
+                gpuRaycastResult.hasValidPosition ? 1 : 0,
+                gpuRaycastResult.posX, gpuRaycastResult.posY, gpuRaycastResult.posZ);
+        }
         renderer->RenderVoxels(
             commandList.Get(),
             voxelWorld->GetReadBufferSRV(),

@@ -1,0 +1,46 @@
+# Build outputs
+build/
+VENPOD/build/
+**/build/
+out/
+bin/
+obj/
+x64/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CMakeUserPresets.json
+
+# Visual Studio
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.vcxproj.user
+
+# Runtime artifacts
+*.log
+*.dmp
+*.pdb
+VENPOD/venpod_capture.png
+VENPOD/build/bin/venpod_runtime.log
+
+# Local agent/editor state
+.claude/
+.vscode/
+.idea/
+
+# Package manager outputs
+vcpkg_installed/
+
+# OS noise
+Thumbs.db
+Desktop.ini

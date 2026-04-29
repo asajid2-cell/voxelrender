@@ -6,7 +6,6 @@
 #include "../Graphics/RHI/DX12ComputePipeline.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
-#include <unordered_set>
 
 namespace VENPOD::Simulation {
 
@@ -198,26 +197,25 @@ void InfiniteChunkManager::Update(
     // PRIORITY 2: Store camera chunk for external access (chunk scan optimization)
     m_cameraChunk = cameraChunk;
 
-    // Only update if camera moved to different chunk (avoid redundant work)
+    bool shouldQueueChunks = true;
+
+    // Only queue new chunks if camera moved or the current queue drained.
     if (cameraChunk == m_lastCameraChunk) {
         // CRITICAL FIX: Continue generating queued chunks even when stationary
         // The previous logic had a deadlock: after 3 chunks, it would return if queue wasn't empty,
         // causing 20+ chunks to remain stuck in queue forever → system freeze
         m_stationaryFrameCount++;
 
-        // If we have queued chunks, keep generating them (1 per frame is safe)
+        // If we have queued chunks, skip re-queueing and fall through to the
+        // batched generation loop below. Returning here limited startup to one
+        // chunk per frame.
         if (!m_generationQueue.empty()) {
-            GenerateNextChunk(device, cmdQueue);
-            return;  // Continue next frame
+            shouldQueueChunks = false;
         }
-
-        // Queue is empty - check if we should re-queue chunks
-        // Only re-queue every 10 frames when stationary to avoid redundant work
-        if (m_stationaryFrameCount > 10) {
-            m_stationaryFrameCount = 0;  // Reset counter
-            // Fall through to QueueChunksAroundCamera() below
-        } else {
-            return;  // Queue empty, wait before re-queueing
+        else {
+            // Queue is empty, so immediately look for the next nearest missing
+            // batch. Waiting here made nearby terrain fill in visible pulses.
+            m_stationaryFrameCount = 0;
         }
     } else {
         // Camera moved - reset stationary counter and re-queue immediately
@@ -236,9 +234,11 @@ void InfiniteChunkManager::Update(
     }
 
     // ===== STEP 2: Queue chunks within cylindrical render distance =====
-    auto queueResult = QueueChunksAroundCamera(cameraChunk);
-    if (!queueResult) {
-        spdlog::warn("Failed to queue chunks: {}", queueResult.error());
+    if (shouldQueueChunks) {
+        auto queueResult = QueueChunksAroundCamera(cameraChunk);
+        if (!queueResult) {
+            spdlog::warn("Failed to queue chunks: {}", queueResult.error());
+        }
     }
 
     // ===== STEP 3: Generate chunks to fill visible area =====
@@ -251,13 +251,7 @@ void InfiniteChunkManager::Update(
     //
     // With 3 command allocators, we can safely queue 3 parallel generations.
     // But GPU bottleneck is still 1 execution at a time, so 8/frame is aggressive but safe.
-    constexpr size_t STARTUP_CHUNKS_PER_FRAME = 8;
-    constexpr size_t NORMAL_CHUNKS_PER_FRAME = 1;
-    constexpr size_t MIN_VISIBLE_CHUNKS = 50;  // Need at least 50 chunks before slowing down
-
-    size_t chunksPerFrame = (m_loadedChunks.size() < MIN_VISIBLE_CHUNKS)
-        ? STARTUP_CHUNKS_PER_FRAME
-        : NORMAL_CHUNKS_PER_FRAME;
+    size_t chunksPerFrame = std::max<size_t>(1, m_config.chunksPerFrame);
 
     for (size_t i = 0; i < chunksPerFrame && !m_generationQueue.empty(); ++i) {
         GenerateNextChunk(device, cmdQueue);
@@ -348,11 +342,15 @@ Result<void> InfiniteChunkManager::QueueChunksAroundCamera(const ChunkCoord& cam
         return {};  // Queue is full, wait for existing chunks to generate
     }
 
-    // Use unordered_set to avoid duplicate queue entries
-    std::unordered_set<ChunkCoord> chunksToLoad;
-
-    // FIX #1: Calculate remaining queue capacity BEFORE loop
-    size_t remainingCapacity = m_config.maxQueuedChunks - m_generationQueue.size();
+    struct Candidate {
+        ChunkCoord coord;
+        int32_t distanceSquared;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(static_cast<size_t>(
+        (m_config.loadDistanceHorizontal * 2 + 1) *
+        (m_config.loadDistanceHorizontal * 2 + 1) *
+        TERRAIN_NUM_CHUNKS_Y));
 
     // ===== FIXED VERTICAL LAYERS + HORIZONTAL LOADING =====
     // FIX: Terrain is at Y=TERRAIN_MIN_Y to Y=TERRAIN_MAX_Y, which spans chunks Y=0 and Y=1
@@ -364,11 +362,6 @@ Result<void> InfiniteChunkManager::QueueChunksAroundCamera(const ChunkCoord& cam
     for (int32_t dy = TERRAIN_CHUNK_MIN_Y; dy < TERRAIN_CHUNK_MIN_Y + TERRAIN_NUM_CHUNKS_Y; ++dy) {
         for (int32_t dx = -m_config.loadDistanceHorizontal; dx <= m_config.loadDistanceHorizontal; ++dx) {
             for (int32_t dz = -m_config.loadDistanceHorizontal; dz <= m_config.loadDistanceHorizontal; ++dz) {
-                // FIX #1: Stop if we've already collected enough chunks
-                if (chunksToLoad.size() >= remainingCapacity) {
-                    goto done_collecting;  // Break all loops
-                }
-
                 // FIX: Use SQUARE pattern to match VoxelWorld renderer expectations
                 // The renderer scans a square grid (25x25), so we must load chunks in a square pattern
                 // Previously used circular radius which skipped corners → 124 missing chunks → holes
@@ -399,39 +392,50 @@ Result<void> InfiniteChunkManager::QueueChunksAroundCamera(const ChunkCoord& cam
                     continue;  // Already queued/generating
                 }
 
-                chunksToLoad.insert(coord);
+                int32_t distSq = dx * dx + dz * dz;
+                candidates.push_back(Candidate{coord, distSq});
             }
         }
     }
-    done_collecting:
 
-    // Add new chunks to generation queue WITH DISTANCE PRIORITY
-    // Nearest chunks to camera are generated first!
-    for (const auto& coord : chunksToLoad) {
-        // Calculate distance squared from camera chunk (only XZ, Y is fixed for terrain)
-        int32_t dx = coord.x - cameraChunk.x;
-        int32_t dz = coord.z - cameraChunk.z;
-        int32_t distSq = dx * dx + dz * dz;
+    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+        if (a.distanceSquared != b.distanceSquared) {
+            return a.distanceSquared < b.distanceSquared;
+        }
+        if (a.coord.y != b.coord.y) {
+            return a.coord.y < b.coord.y;
+        }
+        if (a.coord.x != b.coord.x) {
+            return a.coord.x < b.coord.x;
+        }
+        return a.coord.z < b.coord.z;
+    });
 
-        m_generationQueue.push(ChunkPriorityEntry{coord, distSq});
+    size_t remainingCapacity = m_config.maxQueuedChunks - m_generationQueue.size();
+    size_t queuedCount = std::min(remainingCapacity, candidates.size());
+
+    // Add new chunks to generation queue with true distance priority. The old
+    // code stopped while scanning dx=-loadDistance, so startup queued a far
+    // edge of terrain before the chunks under the player.
+    for (size_t i = 0; i < queuedCount; ++i) {
+        m_generationQueue.push(ChunkPriorityEntry{candidates[i].coord, candidates[i].distanceSquared});
     }
 
-    if (chunksToLoad.size() > 0) {
+    if (queuedCount > 0) {
         spdlog::debug("Queued {} new chunks for generation at Y=0,1 (queue size: {}/{}) - load distance: {} chunks",
-            chunksToLoad.size(), m_generationQueue.size(), m_config.maxQueuedChunks,
+            queuedCount, m_generationQueue.size(), m_config.maxQueuedChunks,
             m_config.loadDistanceHorizontal);
 
         // Log first few chunks being queued for verification
         static bool firstLog = true;
-        if (firstLog && chunksToLoad.size() > 0) {
+        if (firstLog) {
             spdlog::info("Seamless streaming: loading chunks up to {} chunks away (visible at {} chunks)",
                 m_config.loadDistanceHorizontal, RENDER_DISTANCE_HORIZONTAL);
-            spdlog::info("First chunks queued (all at Y=0 or Y=1):");
-            int count = 0;
-            for (const auto& coord : chunksToLoad) {
-                if (count++ < 5) {
-                    spdlog::info("  Chunk [{},{},{}]", coord.x, coord.y, coord.z);
-                }
+            spdlog::info("First chunks queued by distance (all at Y=0 or Y=1):");
+            for (size_t i = 0; i < std::min<size_t>(5, queuedCount); ++i) {
+                const auto& coord = candidates[i].coord;
+                spdlog::info("  Chunk [{},{},{}] distSq={}",
+                    coord.x, coord.y, coord.z, candidates[i].distanceSquared);
             }
             firstLog = false;
         }
@@ -464,34 +468,27 @@ Result<void> InfiniteChunkManager::GenerateNextChunk(
         return {};
     }
 
-    // ===== RING BUFFER FIX: Get next allocator from ring buffer =====
+    // ===== RING BUFFER FIX: Find an available allocator instead of retrying one busy slot =====
     uint32_t allocatorIndex = m_currentAllocatorIndex;
-
-    // CRITICAL FIX: Check if this allocator is still busy - if so, SKIP this frame
-    // instead of waiting (prevents CPU stalls on startup when generating many chunks)
-    uint64_t allocatorFenceValue = m_allocatorFenceValues[allocatorIndex];
-    // FIX #10: 0 means "never used/ready", only check fence if allocator was actually used
-    if (allocatorFenceValue > 0 && m_chunkFence->GetCompletedValue() < allocatorFenceValue) {
-        // GPU still using this allocator - check if we should re-queue or drop
-        // FIX: Track re-queue attempts to prevent infinite loops
-        uint32_t requeueCount = ++m_chunkRequeueCount[coord];
-
-        // If this chunk has been re-queued too many times (50+ frames), drop it temporarily
-        // It will be re-queued naturally when camera moves or queue empties
-        constexpr uint32_t MAX_REQUEUE_ATTEMPTS = 50;
-        if (requeueCount > MAX_REQUEUE_ATTEMPTS) {
-            spdlog::warn("Chunk [{},{},{}] exceeded {} re-queue attempts, dropping (will retry later)",
-                coord.x, coord.y, coord.z, MAX_REQUEUE_ATTEMPTS);
-            m_chunkRequeueCount.erase(coord);  // Reset counter
-            return {};  // Drop this attempt, don't re-queue
+    uint64_t completedFence = m_chunkFence->GetCompletedValue();
+    uint32_t triesRemaining = NUM_FRAME_BUFFERS;
+    while (triesRemaining > 0) {
+        uint64_t allocatorFenceValue = m_allocatorFenceValues[allocatorIndex];
+        if (allocatorFenceValue == 0 || completedFence >= allocatorFenceValue) {
+            break;
         }
+        allocatorIndex = (allocatorIndex + 1) % NUM_FRAME_BUFFERS;
+        triesRemaining--;
+    }
 
-        // Re-queue for next frame (keep same priority)
+    if (triesRemaining == 0) {
         m_generationQueue.push(entry);
-        spdlog::debug("Allocator {} busy (fence {} > completed {}), re-queuing chunk [{},{},{}] (attempt {})",
-            allocatorIndex, allocatorFenceValue, m_chunkFence->GetCompletedValue(),
-            coord.x, coord.y, coord.z, requeueCount);
-        return {};  // Skip chunk generation this frame, will retry next frame
+        static uint32_t busyLogThrottle = 0;
+        if (++busyLogThrottle % 60 == 1) {
+            spdlog::debug("All chunk generation allocators busy (completed fence {}), deferring generation",
+                completedFence);
+        }
+        return {};
     }
 
     // REMOVED BAD CODE: Don't reset to GetCompletedValue() here!
@@ -778,16 +775,16 @@ Result<void> InfiniteChunkManager::CreateGenerationPipeline(ID3D12Device* device
     }
 
     // ===== CREATE ROOT SIGNATURE =====
-    // Root parameter 0: CBV (ChunkConstants at b0)
+    // Root parameter 0: root constants (ChunkConstants at b0)
     // Root parameter 1: UAV (ChunkVoxelOutput at u0)
 
     D3D12_ROOT_PARAMETER1 rootParams[2] = {};
 
-    // Parameter 0: CBV
-    rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-    rootParams[0].Descriptor.ShaderRegister = 0;
-    rootParams[0].Descriptor.RegisterSpace = 0;
-    rootParams[0].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+    // Parameter 0: root constants
+    rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rootParams[0].Constants.ShaderRegister = 0;
+    rootParams[0].Constants.RegisterSpace = 0;
+    rootParams[0].Constants.Num32BitValues = 8;
     rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     // Parameter 1: UAV
