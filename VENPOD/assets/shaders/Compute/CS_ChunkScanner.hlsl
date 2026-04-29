@@ -20,9 +20,10 @@ cbuffer ChunkScanConstants : register(b0) {
     uint chunkSize;     // CHUNK_SIZE (16)
 
     uint sleepThreshold; // Frames before chunk goes to sleep
-    uint padding0;
-    uint padding1;
-    uint padding2;
+    // PRIORITY 3: Active region offset for 4×4×4 optimization
+    int activeRegionOffsetX;  // Camera chunk X - 1 (start of active region)
+    int activeRegionOffsetY;  // Camera chunk Y - 1
+    int activeRegionOffsetZ;  // Camera chunk Z - 1
 };
 
 // Input voxel grid (read-only)
@@ -38,6 +39,7 @@ groupshared uint gs_hasActiveVoxel;
 groupshared uint gs_particleCount;
 
 // Check if a voxel is "active" (can move)
+// MUST match IsMovable() in CS_GravityChunk.hlsl!
 bool IsVoxelActive(uint voxel) {
     uint material = GetMaterial(voxel);
     uint state = GetState(voxel);
@@ -48,14 +50,17 @@ bool IsVoxelActive(uint voxel) {
     // Static voxels (bedrock, frozen) are not active
     if (state & STATE_IS_STATIC) return false;
 
-    // Falling materials (sand, water, etc.) are active
-    if (material == MAT_SAND || material == MAT_WATER ||
-        material == MAT_LAVA || material == MAT_OIL) {
+    // All movable materials are active (matches CS_GravityChunk.hlsl IsMovable)
+    // Granular/falling: sand, dirt, gunpowder
+    // Liquids: water, lava, oil, acid, honey, concrete (wet)
+    // Gases: smoke, steam
+    // Special: fire
+    if (material == MAT_SAND || material == MAT_DIRT || material == MAT_GUNPOWDER ||
+        material == MAT_WATER || material == MAT_LAVA || material == MAT_OIL ||
+        material == MAT_ACID || material == MAT_HONEY || material == MAT_CONCRETE ||
+        material == MAT_SMOKE || material == MAT_STEAM || material == MAT_FIRE) {
         return true;
     }
-
-    // Fire is always active
-    if (material == MAT_FIRE) return true;
 
     // Everything else is potentially active but settled
     return false;
@@ -72,12 +77,30 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID, ui
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // Calculate chunk index
-    uint chunkIndex = groupId.x + groupId.y * chunkCountX + groupId.z * chunkCountX * chunkCountY;
+    // PERFORMANCE FIX: Scan only a limited region around buffer center
+    // groupId is dispatch-local (0 to dispatchSize-1), we ADD offset to get buffer-local coords
+    //
+    // For optimized physics region (32x8x32 dispatch at offset 34,0,34):
+    //   groupId.x: 0-31, actual chunk: 34-65
+    //   groupId.y: 0-7,  actual chunk: 0-7
+    //   groupId.z: 0-31, actual chunk: 34-65
+    //
+    // This limits physics scanning to ~8,192 chunks instead of 80,000!
+
+    // Add offset to get actual buffer-local chunk coordinates
+    uint3 localChunkId = groupId + uint3(activeRegionOffsetX, activeRegionOffsetY, activeRegionOffsetZ);
+
+    // Bounds check - don't process chunks outside the buffer
+    if (localChunkId.x >= chunkCountX || localChunkId.y >= chunkCountY || localChunkId.z >= chunkCountZ) {
+        return;
+    }
+
+    // Calculate chunk index in chunk control buffer (LOCAL buffer coordinates)
+    uint chunkIndex = localChunkId.x + localChunkId.y * chunkCountX + localChunkId.z * chunkCountX * chunkCountY;
 
     // Each thread handles a 2x2x2 region within the chunk
     uint3 baseVoxelInChunk = groupThreadId * 2;
-    uint3 chunkBase = groupId * chunkSize;
+    uint3 chunkBase = localChunkId * chunkSize;  // Local voxel position in buffer
 
     uint localActive = 0;
     uint localParticles = 0;
@@ -123,11 +146,9 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID, ui
 
         ctrl.particleCount = gs_particleCount;
 
-        // ALWAYS add chunks with any voxels to active list
-        // This ensures they get copied from READ to WRITE buffer
-        // even if they're not actively simulating physics
-        if (gs_particleCount > 0) {
-            // Chunk has voxels - add to active list for copying
+        // Only chunks with movable voxels need physics. Static terrain and
+        // generated ocean water are already copied by the streaming system.
+        if (gs_hasActiveVoxel > 0) {
             uint listIndex;
             InterlockedAdd(ActiveChunkCount[0], 1, listIndex);
             ActiveChunkList[listIndex] = chunkIndex;

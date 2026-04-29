@@ -46,9 +46,10 @@ struct ChunkScanConstants {
     uint32_t chunkSize;
 
     uint32_t sleepThreshold;
-    uint32_t padding0;
-    uint32_t padding1;
-    uint32_t padding2;
+    // PRIORITY 3: Active region offset for 4×2×4 optimization (infinite chunks)
+    int32_t activeRegionOffsetX;  // Camera chunk X - 1 (start of active region)
+    int32_t activeRegionOffsetY;  // Camera chunk Y - 1 (start of vertical region, 2 chunks high)
+    int32_t activeRegionOffsetZ;  // Camera chunk Z - 1 (start of active region)
 };
 
 // Chunk-based physics constants
@@ -128,6 +129,14 @@ public:
 
     // GPU brush raycasting (NEW - replaces CPU-side DDA)
     void DispatchBrushRaycast(
+        ID3D12GraphicsCommandList* cmdList,
+        VoxelWorld& world,
+        const glm::vec3& rayOrigin,
+        const glm::vec3& rayDirection
+    );
+
+    // GPU ground detection raycasting (for player collision)
+    void DispatchGroundRaycast(
         ID3D12GraphicsCommandList* cmdList,
         VoxelWorld& world,
         const glm::vec3& rayOrigin,

@@ -1,7 +1,12 @@
 #include "VoxelWorld.h"
+#include "TerrainConstants.h"
 #include "../Graphics/RHI/d3dx12.h"
+#include "../Graphics/RHI/ShaderCompiler.h"
+#include "InfiniteChunkManager.h"
 #include <spdlog/spdlog.h>
 #include <array>
+#include <filesystem>
+#include <unordered_set>
 
 namespace VENPOD::Simulation {
 
@@ -55,10 +60,96 @@ Result<void> VoxelWorld::Initialize(
     m_brushRaycastCPU.normalPacked = 0;
     m_brushRaycastCPU.hasValidPosition = false;
 
+    // Create ground raycast result buffer (16 bytes GPU + 16 bytes CPU readback)
+    result = m_groundRaycastResult.Initialize(
+        device,
+        16,  // 4 floats = 16 bytes (posX, posY, posZ, normalPacked)
+        Graphics::BufferUsage::StructuredBuffer | Graphics::BufferUsage::UnorderedAccess,
+        16,  // stride = 16 bytes (entire structure)
+        "GroundRaycastResult"
+    );
+    if (!result) {
+        return Error("Failed to create ground raycast result buffer: {}", result.error());
+    }
+
+    // Create UAV for ground raycast result
+    result = m_groundRaycastResult.CreateUAV(device, heapManager);
+    if (!result) {
+        return Error("Failed to create UAV for ground raycast result: {}", result.error());
+    }
+
+    // Initialize CPU-side ground result to invalid
+    m_groundRaycastCPU.posX = 0.0f;
+    m_groundRaycastCPU.posY = 40.0f;  // Default to sea level
+    m_groundRaycastCPU.posZ = 0.0f;
+    m_groundRaycastCPU.normalPacked = 0;
+    m_groundRaycastCPU.hasValidPosition = false;
+
     uint64_t totalMemoryMB = (GetTotalVoxels() * sizeof(uint32_t) * 2) / (1024 * 1024);
     spdlog::info("VoxelWorld initialized: {}x{}x{} grid ({} MB)",
         m_config.gridSizeX, m_config.gridSizeY, m_config.gridSizeZ, totalMemoryMB);
     spdlog::info("GPU brush raycasting enabled (16 bytes readback vs 32 MB!)");
+    spdlog::info("GPU ground detection enabled for player collision");
+
+    // ===== INITIALIZE INFINITE CHUNK SYSTEM =====
+    if (m_useInfiniteChunks) {
+        m_chunkManager = std::make_unique<InfiniteChunkManager>();
+
+        InfiniteChunkConfig chunkConfig;
+        chunkConfig.worldSeed = 12345;  // TODO: Make configurable via VoxelWorldConfig
+        chunkConfig.chunksPerFrame = 6;  // Smooth streaming budget; avoids starving rendering on startup.
+        chunkConfig.maxQueuedChunks = 256;  // Queue nearest chunks first without flooding GPU work.
+
+        // ===== SEAMLESS INFINITE STREAMING CONFIGURATION =====
+        // The key to truly infinite worlds: load chunks BEFORE they're visible!
+        //
+        // LOAD_DISTANCE (16): Chunks start generating at this distance
+        //   - Creates a 4-chunk "buffer zone" beyond visible area
+        //   - Chunks have time to generate before player reaches them
+        //   - 33×33×2 = 2,178 chunks loaded = ~2.2 GB VRAM (fits in 8GB)
+        //
+        // RENDER_DISTANCE (12): What's visible (defined in TerrainConstants.h)
+        //   - 25×25×2 = 1,250 chunks in render buffer
+        //   - 1600×128×1600 voxel render buffer
+        //
+        // UNLOAD_DISTANCE (20): Chunks deleted at this distance
+        //   - 4-chunk gap from LOAD prevents thrashing when moving back and forth
+        //   - Only chunks truly far away get deleted
+        //
+        chunkConfig.loadDistanceHorizontal = LOAD_DISTANCE_HORIZONTAL;    // ±16 chunks
+        chunkConfig.unloadDistanceHorizontal = UNLOAD_DISTANCE_HORIZONTAL; // ±20 chunks
+        chunkConfig.loadDistanceVertical = 2;      // UNUSED - fixed to Y=0,1 layers
+        chunkConfig.unloadDistanceVertical = 3;    // UNUSED - fixed to Y=0,1 layers
+
+        // Faster chunk generation for smooth exploration
+        chunkConfig.maxQueuedChunks = 256;         // Queue up to 256 chunks (enough for streaming)
+
+        auto chunkResult = m_chunkManager->Initialize(device, heapManager, chunkConfig);
+        if (!chunkResult) {
+            return Error("Failed to initialize infinite chunk manager: {}", chunkResult.error());
+        }
+
+        // CACHE FIX: Set callback to notify VoxelWorld when chunks are unloaded
+        m_chunkManager->SetUnloadCallback([this](const ChunkCoord& coord) {
+            this->OnChunkUnloaded(coord);
+        });
+
+        // Create chunk copy pipeline for UpdateActiveRegion
+        result = CreateChunkCopyPipeline(device);
+        if (!result) {
+            return Error("Failed to create chunk copy pipeline: {}", result.error());
+        }
+
+        spdlog::info("Infinite chunk system enabled - load: {} chunks, render: {} chunks, unload: {} chunks (seed: {})",
+            chunkConfig.loadDistanceHorizontal,
+            RENDER_DISTANCE_HORIZONTAL,
+            chunkConfig.unloadDistanceHorizontal,
+            chunkConfig.worldSeed);
+
+        // Initialize active region center to invalid coordinates (will update on first frame)
+        m_activeRegionCenter = ChunkCoord{INT32_MAX, INT32_MAX, INT32_MAX};
+        m_activeRegionNeedsUpdate = true;
+    }
 
     return {};
 }
@@ -66,6 +157,34 @@ Result<void> VoxelWorld::Initialize(
 void VoxelWorld::Shutdown() {
     m_voxelBuffers[0].Shutdown();
     m_voxelBuffers[1].Shutdown();
+
+    // ===== SHUTDOWN INFINITE CHUNK SYSTEM (NEW) =====
+    if (m_chunkManager) {
+        m_chunkManager->Shutdown();
+        m_chunkManager.reset();
+    }
+
+    // Cleanup chunk copy pipeline
+    if (m_chunkCopyConstantBuffer) {
+        if (m_chunkCopyConstantBufferMappedPtr) {
+            m_chunkCopyConstantBuffer->Unmap(0, nullptr);
+            m_chunkCopyConstantBufferMappedPtr = nullptr;
+        }
+        m_chunkCopyConstantBuffer.Reset();
+    }
+    m_chunkCopyPSO.Reset();
+    m_chunkCopyRootSignature.Reset();
+    m_chunkCopyCmdList.Reset();
+
+    // Cleanup ring buffer allocators and fence
+    for (uint32_t i = 0; i < NUM_COPY_BUFFERS; ++i) {
+        m_chunkCopyCmdAllocators[i].Reset();
+    }
+    if (m_chunkCopyFenceEvent) {
+        CloseHandle(m_chunkCopyFenceEvent);
+        m_chunkCopyFenceEvent = nullptr;
+    }
+    m_chunkCopyFence.Reset();
 
     // Free shader-visible descriptors for voxel buffers
     if (m_heapManager) {
@@ -91,13 +210,43 @@ void VoxelWorld::Shutdown() {
     m_brushRaycastResult.Shutdown();
     m_brushRaycastReadback.Reset();
 
+    // Cleanup ground raycast buffers
+    m_groundRaycastResult.Shutdown();
+    m_groundRaycastReadback.Reset();
+
     m_materialPalette.Reset();
     m_paletteUpload.Reset();
     m_heapManager = nullptr;
 }
 
 void VoxelWorld::SwapBuffers() {
+    // CRITICAL FIX: Wait for pending chunk copy operations to complete on GPU
+    // This prevents race condition where we swap buffers before GPU finishes copying chunks
+    if (m_chunkCopyFence && m_chunkCopyFenceValue > 0) {
+        uint64_t completedValue = m_chunkCopyFence->GetCompletedValue();
+
+        // Only wait if GPU hasn't caught up yet
+        if (completedValue < m_chunkCopyFenceValue) {
+            HRESULT hr = m_chunkCopyFence->SetEventOnCompletion(m_chunkCopyFenceValue, m_chunkCopyFenceEvent);
+            if (SUCCEEDED(hr)) {
+                // Wait with 100ms timeout to prevent infinite hang
+                DWORD waitResult = WaitForSingleObject(m_chunkCopyFenceEvent, 100);
+                if (waitResult == WAIT_TIMEOUT) {
+                    spdlog::warn("SwapBuffers: GPU fence wait timeout! (completed={}, expected={})",
+                        completedValue, m_chunkCopyFenceValue);
+                }
+            }
+        }
+    }
+
+    int oldReadIndex = m_readBufferIndex;
     m_readBufferIndex = 1 - m_readBufferIndex;
+
+    // DIAGNOSTIC: Log swap periodically
+    static int swapCount = 0;
+    if (++swapCount % 60 == 1) {
+        spdlog::debug("SwapBuffers: {} → {} (swap #{})", oldReadIndex, m_readBufferIndex, swapCount);
+    }
 }
 
 void VoxelWorld::TransitionReadBufferTo(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_STATES state) {
@@ -432,6 +581,1002 @@ void VoxelWorld::RequestBrushRaycastReadback(ID3D12GraphicsCommandList* cmdList)
         D3D12_RANGE writeRange = {0, 0};
         m_brushRaycastReadback->Unmap(0, &writeRange);
     }
+}
+
+void VoxelWorld::RequestGroundRaycastReadback(ID3D12GraphicsCommandList* cmdList) {
+    if (!cmdList) return;
+
+    ID3D12Device* device = nullptr;
+    m_groundRaycastResult.GetResource()->GetDevice(IID_PPV_ARGS(&device));
+    if (!device) return;
+
+    // Create tiny 16-byte readback buffer if it doesn't exist
+    if (!m_groundRaycastReadback) {
+        constexpr uint64_t bufferSize = 16;  // 4 floats = 16 bytes
+
+        D3D12_HEAP_PROPERTIES readbackHeap = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
+        D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(bufferSize);
+
+        HRESULT hr = device->CreateCommittedResource(
+            &readbackHeap,
+            D3D12_HEAP_FLAG_NONE,
+            &bufferDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,
+            IID_PPV_ARGS(&m_groundRaycastReadback)
+        );
+
+        if (FAILED(hr)) {
+            spdlog::error("Failed to create ground raycast readback buffer: 0x{:08X}", hr);
+            device->Release();
+            return;
+        }
+
+        m_groundRaycastReadback->SetName(L"GroundRaycastReadback");
+        spdlog::debug("Created ground raycast readback buffer (16 bytes)");
+    }
+
+    device->Release();
+
+    // Transition ground result buffer to copy source
+    D3D12_RESOURCE_STATES currentState = m_groundRaycastResult.GetCurrentState();
+    if (currentState != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_groundRaycastResult.GetResource(),
+            currentState,
+            D3D12_RESOURCE_STATE_COPY_SOURCE
+        );
+        cmdList->ResourceBarrier(1, &barrier);
+    }
+
+    // Copy tiny 16-byte GPU buffer to CPU readback buffer
+    cmdList->CopyResource(m_groundRaycastReadback.Get(), m_groundRaycastResult.GetResource());
+
+    // Transition back to UAV state for next raycast
+    if (currentState != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_groundRaycastResult.GetResource(),
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            currentState
+        );
+        cmdList->ResourceBarrier(1, &barrier);
+    }
+
+    // Map and read the result immediately
+    void* mappedData = nullptr;
+    D3D12_RANGE readRange = {0, 16};
+    HRESULT hr = m_groundRaycastReadback->Map(0, &readRange, &mappedData);
+    if (SUCCEEDED(hr)) {
+        float* data = static_cast<float*>(mappedData);
+        m_groundRaycastCPU.posX = data[0];
+        m_groundRaycastCPU.posY = data[1];
+        m_groundRaycastCPU.posZ = data[2];
+
+        // Unpack normal and validity flag
+        uint32_t packed = *reinterpret_cast<uint32_t*>(&data[3]);
+        m_groundRaycastCPU.normalPacked = packed;
+        m_groundRaycastCPU.hasValidPosition = (packed >> 6) & 1;
+
+        D3D12_RANGE writeRange = {0, 0};
+        m_groundRaycastReadback->Unmap(0, &writeRange);
+    }
+}
+
+glm::vec3 VoxelWorld::UpdateChunks(
+    ID3D12Device* device,
+    ID3D12CommandQueue* cmdQueue,  // CHANGED: Pass queue instead of cmdList
+    const glm::vec3& cameraPos)
+{
+    if (!m_chunkManager || !m_useInfiniteChunks) {
+        return glm::vec3(0.0f, 0.0f, 0.0f);  // Chunk system disabled, no origin shift
+    }
+
+    // Update chunk loading/unloading based on camera position
+    m_chunkManager->Update(device, cmdQueue, cameraPos);
+
+    // Calculate which chunk the camera is currently in (HORIZONTAL ONLY)
+    // FIX: Terrain is independent of camera Y - always at Y=0-64 chunk range
+    ChunkCoord cameraChunk = ChunkCoord::FromWorldPosition(
+        static_cast<int32_t>(std::floor(cameraPos.x)),
+        0,  // FIX: Always use Y=0 as reference chunk (terrain layers are Y=0,1)
+        static_cast<int32_t>(std::floor(cameraPos.z)),
+        INFINITE_CHUNK_SIZE
+    );
+
+    // Update active region when camera moves OR when new chunks finish generating
+    static ChunkCoord lastProcessedChunk = {INT32_MAX, INT32_MAX, INT32_MAX};
+    static size_t lastGeneratedCount = 0;
+
+    bool chunkChanged = (cameraChunk != lastProcessedChunk);
+
+    // FIX: Count GENERATED chunks only (not just queued/submitted chunks)
+    // GetLoadedChunkCount() includes chunks that are queued but not generated yet,
+    // so we need to manually count chunks in Generated or Dirty state
+    size_t currentGeneratedCount = 0;
+    for (const auto& [coord, chunk] : m_chunkManager->GetLoadedChunks()) {
+        if (chunk && chunk->IsGenerated()) {
+            currentGeneratedCount++;
+        }
+    }
+    bool newChunksGenerated = (currentGeneratedCount != lastGeneratedCount);
+
+    // ============================================================================
+    // CRITICAL FIX: Update activeRegionCenter with HYSTERESIS to prevent constant stuttering!
+    //
+    // Problem: Updating m_activeRegionCenter every chunk boundary (every 64 voxels) causes:
+    // 1. RegionOrigin shifts by 64 voxels
+    // 2. Cache invalidation forces re-copying ALL 1,250 chunks
+    // 3. For 2-3 frames, buffer has mismatched data/origin → flickering and visual jump
+    // 4. This happens every 64 voxels → constant stuttering
+    //
+    // Solution: Only shift the render buffer when camera gets FAR from center (e.g., 8+ chunks).
+    // This reduces buffer shifts from every 64 voxels to every ~512 voxels (8 chunks * 64).
+    // ============================================================================
+    bool bufferNeedsShift = false;
+
+    // CRITICAL: First frame initialization - must set activeRegionCenter before anything else!
+    // NOTE: On first frame, DON'T mark as buffer shift - just initialize center.
+    // This allows normal swapping while chunks are generating, so we see terrain as soon
+    // as any chunks are ready (even if not all 1250 are generated yet).
+    if (m_activeRegionCenter.x == INT32_MAX) {
+        m_activeRegionCenter = cameraChunk;
+        // DON'T set bufferNeedsShift = true here - we want normal operation on first frame
+        // The caches start empty, so all chunks will be copied naturally
+        spdlog::info("=== FIRST FRAME INITIALIZATION ===");
+        spdlog::info("Camera at world ({:.1f}, {:.1f}, {:.1f}) = chunk [{},{},{}]",
+            cameraPos.x, cameraPos.y, cameraPos.z, cameraChunk.x, cameraChunk.y, cameraChunk.z);
+        spdlog::info("Active region center set to chunk [{},{},{}]",
+            m_activeRegionCenter.x, m_activeRegionCenter.y, m_activeRegionCenter.z);
+    }
+    else if (chunkChanged) {
+        // Calculate distance from camera to current buffer center
+        int dx = cameraChunk.x - m_activeRegionCenter.x;
+        int dz = cameraChunk.z - m_activeRegionCenter.z;
+        int absDx = abs(dx);
+        int absDz = abs(dz);
+
+        // Keep a large margin before recentring. A render-window shift currently
+        // invalidates both ping-pong copy caches, so doing it every 2 chunks
+        // caused a hard hitch after only a few seconds of walking.
+        constexpr int SHIFT_THRESHOLD = 8;
+        if (absDx > SHIFT_THRESHOLD || absDz > SHIFT_THRESHOLD) {
+            ChunkCoord oldCenter = m_activeRegionCenter;
+
+            // GRADUAL SHIFT: Move 1 chunk toward camera instead of jumping directly
+            // This prevents large buffer jumps that cause holes and teleportation
+            if (dx > SHIFT_THRESHOLD) {
+                m_activeRegionCenter.x += 1;
+            } else if (dx < -SHIFT_THRESHOLD) {
+                m_activeRegionCenter.x -= 1;
+            }
+
+            if (dz > SHIFT_THRESHOLD) {
+                m_activeRegionCenter.z += 1;
+            } else if (dz < -SHIFT_THRESHOLD) {
+                m_activeRegionCenter.z -= 1;
+            }
+
+            bufferNeedsShift = true;
+            spdlog::debug("Buffer center shifted from chunk [{},{},{}] to [{},{},{}] (camera at [{},{},{}])",
+                oldCenter.x, oldCenter.y, oldCenter.z,
+                m_activeRegionCenter.x, m_activeRegionCenter.y, m_activeRegionCenter.z,
+                cameraChunk.x, cameraChunk.y, cameraChunk.z);
+        }
+    }
+
+    // ============================================================================
+    // regionOrigin tells shader where buffer position (0,0,0) is in world coords
+    //
+    // Chunks are copied to buffer with offset:
+    //   destX = (chunkCoord.x - activeRegionCenter.x + RENDER_DISTANCE) * 64
+    //
+    // So buffer (0,0,0) = world chunk (activeRegionCenter - RENDER_DISTANCE)
+    //                   = world voxel (activeRegionCenter - RENDER_DISTANCE) * 64
+    // ============================================================================
+    m_regionOriginWorld = glm::vec3(
+        static_cast<float>((m_activeRegionCenter.x - RENDER_DISTANCE_HORIZONTAL) * CHUNK_SIZE_VOXELS),
+        static_cast<float>(TERRAIN_CHUNK_MIN_Y * CHUNK_SIZE_VOXELS),
+        static_cast<float>((m_activeRegionCenter.z - RENDER_DISTANCE_HORIZONTAL) * CHUNK_SIZE_VOXELS)
+    );
+    glm::vec3 originShiftDelta = glm::vec3(0.0f);  // Not tracking shifts for now
+
+    // Log first frame region origin (critical for debugging camera position issues)
+    if (!m_firstUpdateDone) {
+        spdlog::info("Region origin set to world voxel ({},{},{})",
+            static_cast<int>(m_regionOriginWorld.x),
+            static_cast<int>(m_regionOriginWorld.y),
+            static_cast<int>(m_regionOriginWorld.z));
+        glm::vec3 expectedBufferPos = cameraPos - m_regionOriginWorld;
+        spdlog::info("Camera buffer position should be ({:.1f},{:.1f},{:.1f}) (center of 1600x128x1600 buffer)",
+            expectedBufferPos.x, expectedBufferPos.y, expectedBufferPos.z);
+    }
+
+    // Log when region origin shifts (only when buffer actually shifts, not every chunk change)
+    if (bufferNeedsShift) {
+        spdlog::info("Region origin shifted to world voxel ({},{},{}) - Cache invalidated",
+            static_cast<int>(m_regionOriginWorld.x),
+            static_cast<int>(m_regionOriginWorld.y),
+            static_cast<int>(m_regionOriginWorld.z));
+    }
+
+    // DIAGNOSTIC: Log camera position and chunk periodically
+    static int diagFrameCount = 0;
+    static bool firstFrameLogged = false;
+    if (++diagFrameCount >= 60 || !firstFrameLogged) {
+        // Calculate what the shader will compute
+        glm::vec3 bufferPos = cameraPos - m_regionOriginWorld;
+        spdlog::info("[CAMERA DIAG] Pos=({:.1f},{:.1f},{:.1f}) Chunk=[{},{},{}] RegionOrigin=({:.0f},{:.0f},{:.0f}) BufferPos=({:.1f},{:.1f},{:.1f})",
+            cameraPos.x, cameraPos.y, cameraPos.z,
+            cameraChunk.x, cameraChunk.y, cameraChunk.z,
+            m_regionOriginWorld.x, m_regionOriginWorld.y, m_regionOriginWorld.z,
+            bufferPos.x, bufferPos.y, bufferPos.z);
+        diagFrameCount = 0;
+        firstFrameLogged = true;
+    }
+
+    // Track if this is the first update (need to force UpdateActiveRegion on startup)
+    bool needsUpdate = bufferNeedsShift || newChunksGenerated || !m_firstUpdateDone;
+
+    // Update if buffer needs shift OR if new chunks were generated OR first frame
+    if (needsUpdate) {
+        m_firstUpdateDone = true;
+        // CRITICAL FIX: When buffer center shifts, buffer layout changes!
+        // All cached chunk positions become INVALID because destX/Y/Z calculations
+        // depend on m_activeRegionCenter.
+        // With gradual 1-chunk shifts, the visual impact is minimal.
+        if (bufferNeedsShift) {
+            // Clear BOTH caches - all chunks need to be re-copied at new positions
+            m_copiedChunksPerBuffer[0].clear();
+            m_copiedChunksPerBuffer[1].clear();
+
+            // Clear modified chunks - painted data will be lost on shift
+            // This is expected - paint is preserved only within local area
+            if (!m_modifiedChunks.empty()) {
+                spdlog::debug("Buffer shift: clearing {} modified chunks", m_modifiedChunks.size());
+                m_modifiedChunks.clear();
+            }
+
+            spdlog::debug("Buffer shift: caches cleared, chunks will be re-copied");
+        }
+
+        lastProcessedChunk = cameraChunk;
+        lastGeneratedCount = currentGeneratedCount;
+
+        // CRITICAL FIX: Poll for completed chunks RIGHT BEFORE UpdateActiveRegion
+        // This catches chunks that JUST finished generating in this frame's Update() call
+        // Without this, UpdateActiveRegion won't see newly completed chunks until next frame
+        m_chunkManager->PollCompletedChunks();
+
+        UpdateActiveRegion(device, cmdQueue, bufferNeedsShift);
+
+        if (bufferNeedsShift) {
+            spdlog::debug("Camera at chunk [{},{},{}] - updating active region (buffer shifted)",
+                cameraChunk.x, cameraChunk.y, cameraChunk.z);
+        }
+        // if (newChunksGenerated) {
+        //     spdlog::debug("New chunks generated ({} total GENERATED, {} total loaded) - updating active region",
+        //         currentGeneratedCount, m_chunkManager->GetLoadedChunkCount());
+        // }
+    }
+
+    // Log chunk changes for debugging
+    static ChunkCoord lastLoggedChunk = {INT32_MAX, INT32_MAX, INT32_MAX};
+    if (cameraChunk != lastLoggedChunk) {
+        const auto& loadedChunks = m_chunkManager->GetLoadedChunks();
+        spdlog::debug("Camera entered chunk [{},{},{}] - {} chunks loaded",
+            cameraChunk.x, cameraChunk.y, cameraChunk.z,
+            loadedChunks.size());
+        lastLoggedChunk = cameraChunk;
+    }
+
+    // CRITICAL FIX: Return origin shift delta so caller can adjust camera!
+    // If regionOrigin shifted by (+64, 0, +64), caller must adjust camera by (-64, 0, -64)
+    // to prevent teleportation.
+    if (glm::length(originShiftDelta) > 0.01f) {
+        spdlog::info("Origin shifted by ({:.1f}, {:.1f}, {:.1f}) - caller must adjust camera by ({:.1f}, {:.1f}, {:.1f})",
+            originShiftDelta.x, originShiftDelta.y, originShiftDelta.z,
+            -originShiftDelta.x, -originShiftDelta.y, -originShiftDelta.z);
+    }
+    return originShiftDelta;
+}
+
+void VoxelWorld::OnChunkUnloaded(const ChunkCoord& coord) {
+    // CACHE FIX: Clear this chunk from BOTH buffer caches when it's unloaded
+    // Without this, if the chunk gets reloaded later, UpdateActiveRegion thinks
+    // it's already in the render buffer and skips copying it → invisible chunk!
+    for (int i = 0; i < 2; ++i) {
+        auto it = m_copiedChunksPerBuffer[i].find(coord);
+        if (it != m_copiedChunksPerBuffer[i].end()) {
+            m_copiedChunksPerBuffer[i].erase(it);
+        }
+    }
+
+    // Also clear from modified chunks set - when chunk is unloaded and reloaded,
+    // it will be regenerated fresh. Any painted data is lost (chunk left render distance).
+    m_modifiedChunks.erase(coord);
+
+    spdlog::debug("Cleared chunk [{},{},{}] from copy caches on unload",
+        coord.x, coord.y, coord.z);
+}
+
+void VoxelWorld::InvalidateCopiedChunk(const ChunkCoord& coord) {
+    // CRITICAL FIX: Mark chunk as MODIFIED instead of removing from cache!
+    //
+    // OLD BROKEN LOGIC:
+    //   1. User paints voxels in render buffer
+    //   2. We remove chunk from cache (invalidate)
+    //   3. UpdateActiveRegion sees chunk not in cache
+    //   4. Chunk gets re-copied from source (which has NO painted data!)
+    //   5. User's paint is LOST - appears to flash/vanish
+    //
+    // NEW CORRECT LOGIC:
+    //   1. User paints voxels in render buffer
+    //   2. We mark chunk as MODIFIED (add to m_modifiedChunks)
+    //   3. UpdateActiveRegion checks: is chunk modified?
+    //   4. YES → skip copying, preserve painted voxels
+    //   5. User's paint persists!
+    //
+    // Chunks stay in m_modifiedChunks until they're unloaded (far from player)
+    // or until the player restarts. This is fine - painted data is in the render
+    // buffer and there's no way to save it to the source chunks anyway.
+
+    m_modifiedChunks.insert(coord);
+
+    // Keep the chunk in the copy cache - we DON'T want to re-copy it!
+    // The painted voxels are already in the render buffer where they belong.
+
+    spdlog::debug("Marked chunk [{},{},{}] as MODIFIED (will not re-copy from source)",
+        coord.x, coord.y, coord.z);
+}
+
+Result<void> VoxelWorld::CreateChunkCopyPipeline(ID3D12Device* device) {
+    // ===== COMPILE SHADER =====
+    Graphics::ShaderCompiler compiler;
+    auto initResult = compiler.Initialize();
+    if (!initResult) {
+        return Error("Failed to initialize shader compiler: {}", initResult.error());
+    }
+
+    std::filesystem::path shaderPath = "assets/shaders/Compute/CS_CopyChunkToBuffer.hlsl";
+    auto compileResult = compiler.CompileComputeShader(shaderPath, L"main", true);
+    if (!compileResult) {
+        return Error("Failed to compile CS_CopyChunkToBuffer.hlsl: {}", compileResult.error());
+    }
+
+    auto& compiledShader = compileResult.value();
+    if (!compiledShader.IsValid()) {
+        return Error("CS_CopyChunkToBuffer.hlsl compilation failed: {}", compiledShader.errors);
+    }
+
+    // ===== CREATE ROOT SIGNATURE =====
+    // Root parameter 0: root constants (CopyChunkConstants at b0)
+    // Root parameter 1: SRV (ChunkVoxelInput at t0)
+    // Root parameter 2: UAV (RenderBufferOutput at u0)
+
+    D3D12_ROOT_PARAMETER1 rootParams[3] = {};
+
+    // Parameter 0: root constants
+    rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rootParams[0].Constants.ShaderRegister = 0;
+    rootParams[0].Constants.RegisterSpace = 0;
+    rootParams[0].Constants.Num32BitValues = 8;
+    rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    // Parameter 1: SRV
+    rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    rootParams[1].Descriptor.ShaderRegister = 0;
+    rootParams[1].Descriptor.RegisterSpace = 0;
+    rootParams[1].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+    rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    // Parameter 2: UAV
+    rootParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rootParams[2].Descriptor.ShaderRegister = 0;
+    rootParams[2].Descriptor.RegisterSpace = 0;
+    rootParams[2].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+    rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC rootSigDesc = {};
+    rootSigDesc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    rootSigDesc.Desc_1_1.NumParameters = 3;
+    rootSigDesc.Desc_1_1.pParameters = rootParams;
+    rootSigDesc.Desc_1_1.NumStaticSamplers = 0;
+    rootSigDesc.Desc_1_1.pStaticSamplers = nullptr;
+    rootSigDesc.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    Microsoft::WRL::ComPtr<ID3DBlob> signature;
+    Microsoft::WRL::ComPtr<ID3DBlob> error;
+    HRESULT hr = D3D12SerializeVersionedRootSignature(&rootSigDesc, &signature, &error);
+    if (FAILED(hr)) {
+        std::string errorMsg = error ? static_cast<const char*>(error->GetBufferPointer()) : "Unknown error";
+        return Error("Failed to serialize chunk copy root signature: {}", errorMsg);
+    }
+
+    hr = device->CreateRootSignature(
+        0,
+        signature->GetBufferPointer(),
+        signature->GetBufferSize(),
+        IID_PPV_ARGS(&m_chunkCopyRootSignature)
+    );
+
+    if (FAILED(hr)) {
+        return Error("Failed to create chunk copy root signature");
+    }
+
+    // ===== CREATE PIPELINE STATE =====
+    D3D12_COMPUTE_PIPELINE_STATE_DESC psoDesc = {};
+    psoDesc.pRootSignature = m_chunkCopyRootSignature.Get();
+    psoDesc.CS = compiledShader.GetBytecode();
+    psoDesc.Flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+
+    hr = device->CreateComputePipelineState(&psoDesc, IID_PPV_ARGS(&m_chunkCopyPSO));
+    if (FAILED(hr)) {
+        return Error("Failed to create chunk copy pipeline state");
+    }
+
+    m_chunkCopyPSO->SetName(L"CS_CopyChunkToBuffer_PSO");
+    m_chunkCopyRootSignature->SetName(L"CS_CopyChunkToBuffer_RootSig");
+
+    // ===== CREATE SHARED CONSTANT BUFFER =====
+    // Persistent mapped buffer for copy parameters (32 bytes)
+    D3D12_HEAP_PROPERTIES heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
+    D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(32);
+
+    hr = device->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &bufferDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&m_chunkCopyConstantBuffer)
+    );
+
+    if (FAILED(hr)) {
+        return Error("Failed to create chunk copy constant buffer");
+    }
+
+    m_chunkCopyConstantBuffer->SetName(L"ChunkCopyConstantBuffer");
+
+    // Persistent mapping
+    D3D12_RANGE readRange = {0, 0};
+    hr = m_chunkCopyConstantBuffer->Map(0, &readRange, &m_chunkCopyConstantBufferMappedPtr);
+    if (FAILED(hr)) {
+        return Error("Failed to map chunk copy constant buffer");
+    }
+
+    // ===== RING BUFFER FIX: Create 3 command allocators for chunk copy =====
+    for (uint32_t i = 0; i < NUM_COPY_BUFFERS; ++i) {
+        hr = device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&m_chunkCopyCmdAllocators[i])
+        );
+        if (FAILED(hr)) {
+            return Error("Failed to create chunk copy command allocator {}", i);
+        }
+        m_copyAllocatorFenceValues[i] = 0;
+    }
+
+    // Create command list
+    hr = device->CreateCommandList(
+        0,
+        D3D12_COMMAND_LIST_TYPE_DIRECT,
+        m_chunkCopyCmdAllocators[0].Get(),
+        nullptr,
+        IID_PPV_ARGS(&m_chunkCopyCmdList)
+    );
+    if (FAILED(hr)) {
+        return Error("Failed to create chunk copy command list");
+    }
+
+    // Create GPU fence for synchronization
+    hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_chunkCopyFence));
+    if (FAILED(hr)) {
+        return Error("Failed to create chunk copy fence");
+    }
+
+    m_chunkCopyFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (!m_chunkCopyFenceEvent) {
+        return Error("Failed to create chunk copy fence event");
+    }
+
+    m_chunkCopyFenceValue = 0;
+    m_currentCopyAllocatorIndex = 0;
+
+    // Close command list (ready for Reset() in UpdateActiveRegion)
+    m_chunkCopyCmdList->Close();
+
+    spdlog::info("Chunk copy pipeline created successfully (ring buffer with {} allocators)", NUM_COPY_BUFFERS);
+    return {};
+}
+
+void VoxelWorld::CopyStatic2x2Chunks(ID3D12CommandQueue* cmdQueue) {
+    if (!m_chunkManager || !cmdQueue) {
+        return;
+    }
+
+    // Ensure copy pipeline is available
+    if (!m_chunkCopyPSO || !m_chunkCopyRootSignature || !m_chunkCopyConstantBuffer || !m_chunkCopyFence) {
+        spdlog::warn("CopyStatic2x2Chunks: chunk copy pipeline not initialized");
+        return;
+    }
+
+    // ===== STEP 1: Acquire a copy allocator from the ring buffer =====
+    uint32_t allocatorIndex = m_currentCopyAllocatorIndex;
+    uint64_t allocatorFenceValue = m_copyAllocatorFenceValues[allocatorIndex];
+    uint32_t triesRemaining = NUM_COPY_BUFFERS;
+
+    while (allocatorFenceValue > 0 &&
+           m_chunkCopyFence->GetCompletedValue() < allocatorFenceValue &&
+           triesRemaining > 0) {
+        allocatorIndex = (allocatorIndex + 1) % NUM_COPY_BUFFERS;
+        allocatorFenceValue = m_copyAllocatorFenceValues[allocatorIndex];
+        --triesRemaining;
+
+        if (triesRemaining == 0) {
+            static uint32_t skipFrameCount = 0;
+            if (++skipFrameCount % 60 == 1) {  // Log once per second
+                spdlog::warn("CopyStatic2x2Chunks: all {} copy allocators busy, skipping copy ({} times)",
+                    NUM_COPY_BUFFERS, skipFrameCount);
+            }
+            return;
+        }
+    }
+
+    HRESULT hr = m_chunkCopyCmdAllocators[allocatorIndex]->Reset();
+    if (FAILED(hr)) {
+        spdlog::error("CopyStatic2x2Chunks: failed to reset cmd allocator {} (HRESULT={:#x})",
+            allocatorIndex, static_cast<uint32_t>(hr));
+        return;
+    }
+
+    hr = m_chunkCopyCmdList->Reset(m_chunkCopyCmdAllocators[allocatorIndex].Get(), nullptr);
+    if (FAILED(hr)) {
+        spdlog::error("CopyStatic2x2Chunks: failed to reset cmd list (HRESULT={:#x})",
+            static_cast<uint32_t>(hr));
+        return;
+    }
+
+    m_chunkCopyCmdList->SetPipelineState(m_chunkCopyPSO.Get());
+    m_chunkCopyCmdList->SetComputeRootSignature(m_chunkCopyRootSignature.Get());
+
+    int32_t chunksCopied = 0;
+    bool writeBufferTransitioned = false;
+
+    constexpr int32_t chunkSize = static_cast<int32_t>(INFINITE_CHUNK_SIZE);
+
+    struct StaticEntry {
+        ChunkCoord coord;
+        int32_t destX;
+        int32_t destY;
+        int32_t destZ;
+    };
+
+    StaticEntry entries[4] = {
+        { ChunkCoord{0, 0, 0}, 0,          0, 0          },
+        { ChunkCoord{1, 0, 0}, chunkSize,  0, 0          },
+        { ChunkCoord{0, 0, 1}, 0,          0, chunkSize  },
+        { ChunkCoord{1, 0, 1}, chunkSize,  0, chunkSize  },
+    };
+
+    for (const auto& entry : entries) {
+        Chunk* chunk = m_chunkManager->GetChunk(entry.coord);
+        if (!chunk || !chunk->IsGenerated()) {
+            continue;
+        }
+
+        // Bounds check against 256x128x256 grid
+        if (entry.destX < 0 || entry.destY < 0 || entry.destZ < 0) {
+            continue;
+        }
+        if (entry.destX + chunkSize > static_cast<int32_t>(m_config.gridSizeX) ||
+            entry.destY + chunkSize > static_cast<int32_t>(m_config.gridSizeY) ||
+            entry.destZ + chunkSize > static_cast<int32_t>(m_config.gridSizeZ)) {
+            continue;
+        }
+
+        struct CopyChunkConstants {
+            uint32_t destOffsetX;
+            uint32_t destOffsetY;
+            uint32_t destOffsetZ;
+            uint32_t chunkSize;
+            uint32_t destGridSizeX;
+            uint32_t destGridSizeY;
+            uint32_t destGridSizeZ;
+            uint32_t padding;
+        };
+
+        CopyChunkConstants constants;
+        constants.destOffsetX = static_cast<uint32_t>(entry.destX);
+        constants.destOffsetY = static_cast<uint32_t>(entry.destY);
+        constants.destOffsetZ = static_cast<uint32_t>(entry.destZ);
+        constants.chunkSize = INFINITE_CHUNK_SIZE;
+        constants.destGridSizeX = m_config.gridSizeX;
+        constants.destGridSizeY = m_config.gridSizeY;
+        constants.destGridSizeZ = m_config.gridSizeZ;
+        constants.padding = 0;
+
+        if (!writeBufferTransitioned) {
+            TransitionWriteBufferTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            writeBufferTransitioned = true;
+        }
+
+        // Bind constants and resources. Root constants record this entry's
+        // destination offset into the command stream; a shared upload CBV would
+        // be overwritten by later entries before the GPU reads it.
+        m_chunkCopyCmdList->SetComputeRoot32BitConstants(
+            0,
+            static_cast<UINT>(sizeof(CopyChunkConstants) / sizeof(uint32_t)),
+            &constants,
+            0
+        );
+
+        // Ensure chunk buffer is in SRV state before reading
+        chunk->TransitionBufferTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        m_chunkCopyCmdList->SetComputeRootShaderResourceView(1, chunk->GetVoxelBuffer().GetGPUVirtualAddress());
+        m_chunkCopyCmdList->SetComputeRootUnorderedAccessView(2, GetWriteBuffer().GetGPUVirtualAddress());
+
+        // Dispatch 8x8x8 groups for 64^3 chunk
+        m_chunkCopyCmdList->Dispatch(8, 8, 8);
+
+        // UAV barrier between copies on WRITE buffer
+        D3D12_RESOURCE_BARRIER uavBarrier = CD3DX12_RESOURCE_BARRIER::UAV(GetWriteBuffer().GetResource());
+        m_chunkCopyCmdList->ResourceBarrier(1, &uavBarrier);
+
+        ++chunksCopied;
+    }
+
+    if (chunksCopied > 0) {
+        // Transition WRITE buffer back to SRV for rendering after swap
+        TransitionWriteBufferTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+        m_chunkCopyCmdList->Close();
+        ID3D12CommandList* lists[] = { m_chunkCopyCmdList.Get() };
+        cmdQueue->ExecuteCommandLists(1, lists);
+
+        m_chunkCopyFenceValue++;
+        cmdQueue->Signal(m_chunkCopyFence.Get(), m_chunkCopyFenceValue);
+        m_copyAllocatorFenceValues[allocatorIndex] = m_chunkCopyFenceValue;
+
+        m_currentCopyAllocatorIndex = (m_currentCopyAllocatorIndex + 1) % NUM_COPY_BUFFERS;
+
+        spdlog::debug("CopyStatic2x2Chunks: Copied {} chunks into WRITE buffer", chunksCopied);
+    } else {
+        // No chunks copied: clear fence tracking for this allocator and just close list
+        m_copyAllocatorFenceValues[allocatorIndex] = 0;
+        m_chunkCopyCmdList->Close();
+    }
+}
+
+void VoxelWorld::UpdateActiveRegion(ID3D12Device* /*device*/, ID3D12CommandQueue* cmdQueue, bool chunkChanged) {
+    if (!m_chunkManager || !cmdQueue) {
+        return;
+    }
+
+    // ===== STEP 1: Determine which chunks to copy into 512×256×512 render buffer =====
+    // FIX #18: The buffer represents 8×4×8 = 256 chunks (each 64³) - increased from 4×2×4 = 32
+    // We center on the camera's chunk and copy nearby chunks
+
+    const auto& loadedChunks = m_chunkManager->GetLoadedChunks();
+    if (loadedChunks.empty()) {
+        return;  // No chunks loaded yet
+    }
+
+    // Camera is at m_activeRegionCenter chunk coordinate
+    // For a 256×128×256 buffer with 64³ chunks, we can fit 4×2×4 chunks
+    // Center on camera chunk: copy chunks in range dx,dz ∈ [-1..2], dy ∈ [-1..0]
+
+    // ===== STEP 2: Ring buffer - get next allocator =====
+    uint32_t allocatorIndex = m_currentCopyAllocatorIndex;
+
+    // FIX #5: Check if this allocator is still busy
+    // IMPROVED: Try other allocators before giving up
+    uint64_t allocatorFenceValue = m_copyAllocatorFenceValues[allocatorIndex];
+    uint32_t triesRemaining = NUM_COPY_BUFFERS;
+    while (allocatorFenceValue > 0 && m_chunkCopyFence->GetCompletedValue() < allocatorFenceValue && triesRemaining > 0) {
+        // This allocator is busy, try next one in ring buffer
+        allocatorIndex = (allocatorIndex + 1) % NUM_COPY_BUFFERS;
+        allocatorFenceValue = m_copyAllocatorFenceValues[allocatorIndex];
+        triesRemaining--;
+
+        if (triesRemaining == 0) {
+            // All allocators are busy - skip this frame but log less frequently
+            static uint32_t skipFrameCount = 0;
+            if (++skipFrameCount % 60 == 1) {  // Log once per second
+                spdlog::warn("All {} copy allocators busy, skipping chunk copy ({} times)",
+                    NUM_COPY_BUFFERS, skipFrameCount);
+            }
+            return;  // Skip chunk copy this frame
+        }
+    }
+
+    // NOW safe to reset this allocator (GPU has finished with it)
+    // FIX #7: Check HRESULT - if Reset() fails, skip chunk copy this frame
+    HRESULT hr = m_chunkCopyCmdAllocators[allocatorIndex]->Reset();
+    if (FAILED(hr)) {
+        spdlog::error("Failed to reset chunk copy cmd allocator {} (HRESULT={:#x}), skipping chunk copy",
+            allocatorIndex, static_cast<uint32_t>(hr));
+        return;  // Skip chunk copy this frame, will retry next frame
+    }
+
+    hr = m_chunkCopyCmdList->Reset(m_chunkCopyCmdAllocators[allocatorIndex].Get(), nullptr);
+    if (FAILED(hr)) {
+        spdlog::error("Failed to reset chunk copy cmd list (HRESULT={:#x}), skipping chunk copy",
+            static_cast<uint32_t>(hr));
+        return;  // Skip chunk copy this frame, will retry next frame
+    }
+
+    // FIX #6: Copy chunks to WRITE buffer (not READ)!
+    // This prevents race condition where chunk copy and physics both write to same buffer
+    // Architecture: UpdateChunks() writes NEW chunks → WRITE, then physics simulates on READ → WRITE
+    //
+    // NOTE: We defer the buffer transition until we know we'll actually copy chunks.
+    // If we transition here but then copy 0 chunks, we'd update the CPU state tracking
+    // without executing any GPU commands, causing state desync. See "deferred transition" below.
+
+    // Set pipeline and root signature
+    m_chunkCopyCmdList->SetPipelineState(m_chunkCopyPSO.Get());
+    m_chunkCopyCmdList->SetComputeRootSignature(m_chunkCopyRootSignature.Get());
+
+    // ===== STEP 3: Copy chunks within 9×2×9 grid centered on camera =====
+    int32_t chunksCopied = 0;
+    int32_t chunksSkipped = 0;
+    int32_t chunksNotGenerated = 0;  // DEBUG: Track chunks that exist but aren't generated yet
+    bool writeBufferTransitioned = false;  // Deferred transition flag
+    bool readBufferTransitioned = false;   // Track READ buffer transition
+
+    // Limit chunk copies per frame to prevent startup hitches.
+    // Each logical chunk may be copied into both ping-pong buffers, so 64 here
+    // still allows rapid fill-in without monopolizing the graphics queue.
+    int32_t maxChunksPerFrame = 64;
+
+    // FIX: Copy range for 9×2×9 render buffer (576×128×576 / 64³ = 9×2×9)
+    // Horizontal: dx,dz ∈ [-4..4] = 9 chunks × 64 = 576 voxels ✓ (relative to camera)
+    // Vertical:   y ∈ [0..1]      = 2 chunks × 64 = 128 voxels ✓ (ABSOLUTE coordinates)
+    //             Terrain at Y=5-60 spans chunk Y=0 (0-63) and Y=1 (64-127)
+
+    int32_t chunksNotLoaded = 0;  // DEBUG: Count chunks not in loadedChunks map
+    int32_t chunksChecked = 0;    // DEBUG: Total chunks checked
+    int32_t chunksOutOfBounds = 0; // DEBUG: Chunks that failed bounds check
+
+    for (int32_t dz = -RENDER_DISTANCE_HORIZONTAL; dz <= RENDER_DISTANCE_HORIZONTAL; ++dz) {
+        for (int32_t y = TERRAIN_CHUNK_MIN_Y; y < TERRAIN_CHUNK_MIN_Y + TERRAIN_NUM_CHUNKS_Y; ++y) {
+            for (int32_t dx = -RENDER_DISTANCE_HORIZONTAL; dx <= RENDER_DISTANCE_HORIZONTAL; ++dx) {
+                chunksChecked++;
+
+                // CRITICAL FIX: Stop if we've copied enough this frame
+                if (chunksCopied >= maxChunksPerFrame) {
+                    goto done_copying;  // Break out of all loops
+                }
+                ChunkCoord chunkCoord = {
+                    m_activeRegionCenter.x + dx,
+                    y,  // FIX: Use absolute Y coordinate (not relative to camera)
+                    m_activeRegionCenter.z + dz
+                };
+
+                // Check if chunk is loaded
+                auto it = loadedChunks.find(chunkCoord);
+                if (it == loadedChunks.end()) {
+                    chunksNotLoaded++;
+                    continue;  // Chunk not loaded at all
+                }
+                if (!it->second->IsGenerated()) {
+                    chunksNotGenerated++;
+                    continue;  // Chunk exists but generation not complete yet
+                }
+
+                // PAINTED CHUNK PROTECTION: Never re-copy chunks that have been modified!
+                // If user painted voxels in this chunk, the painted data only exists in the
+                // render buffer. Re-copying from source would overwrite their painted content.
+                if (m_modifiedChunks.find(chunkCoord) != m_modifiedChunks.end()) {
+                    chunksSkipped++;
+                    continue;  // Skip - preserve painted voxels
+                }
+
+                // Check if chunk is in BOTH buffers (convergent caching)
+                int writeBufferIndex = 1 - m_readBufferIndex;
+                int readBufferIndex = m_readBufferIndex;
+                bool inWriteBuffer = (m_copiedChunksPerBuffer[writeBufferIndex].find(chunkCoord) != m_copiedChunksPerBuffer[writeBufferIndex].end());
+                bool inReadBuffer = (m_copiedChunksPerBuffer[readBufferIndex].find(chunkCoord) != m_copiedChunksPerBuffer[readBufferIndex].end());
+
+                // Skip only if chunk is in BOTH buffers (fully converged)
+                // This ensures both ping-pong buffers have the terrain data
+                if (inWriteBuffer && inReadBuffer) {
+                    chunksSkipped++;
+                    continue;  // Already in both buffers, skip
+                }
+
+                // Chunk needs to be copied to at least one buffer
+
+                Chunk* chunk = it->second;
+
+                // Calculate destination offset in render buffer
+                // Chunks are copied RELATIVE to activeRegionCenter so they fit in buffer
+                // Buffer position (0,0,0) = chunk at (activeRegionCenter - RENDER_DISTANCE)
+                int32_t destX = (chunkCoord.x - m_activeRegionCenter.x + RENDER_DISTANCE_HORIZONTAL) * CHUNK_SIZE_VOXELS;
+                int32_t destY = (chunkCoord.y - TERRAIN_CHUNK_MIN_Y) * CHUNK_SIZE_VOXELS;
+                int32_t destZ = (chunkCoord.z - m_activeRegionCenter.z + RENDER_DISTANCE_HORIZONTAL) * CHUNK_SIZE_VOXELS;
+
+                // DIAGNOSTIC: Enable to debug chunk copy issues
+                static int copyDebugCount = 0;
+                if (copyDebugCount < 20) {
+                    spdlog::info("[CHUNK_COPY] Chunk coord [{},{},{}] dx={} dz={} → buffer dest [{},{},{}]",
+                        chunkCoord.x, chunkCoord.y, chunkCoord.z, dx, dz, destX, destY, destZ);
+                    copyDebugCount++;
+                }
+
+                // Skip if out of bounds
+                if (destX < 0 || destY < 0 || destZ < 0 ||
+                    destX + INFINITE_CHUNK_SIZE > static_cast<int32_t>(m_config.gridSizeX) ||
+                    destY + INFINITE_CHUNK_SIZE > static_cast<int32_t>(m_config.gridSizeY) ||
+                    destZ + INFINITE_CHUNK_SIZE > static_cast<int32_t>(m_config.gridSizeZ)) {
+                    chunksOutOfBounds++;
+                    continue;
+                }
+
+                // ===== STEP 4: Update constant buffer =====
+                struct CopyChunkConstants {
+                    uint32_t destOffsetX;
+                    uint32_t destOffsetY;
+                    uint32_t destOffsetZ;
+                    uint32_t chunkSize;
+                    uint32_t destGridSizeX;
+                    uint32_t destGridSizeY;
+                    uint32_t destGridSizeZ;
+                    uint32_t padding;
+                };
+
+                CopyChunkConstants constants;
+                constants.destOffsetX = static_cast<uint32_t>(destX);
+                constants.destOffsetY = static_cast<uint32_t>(destY);
+                constants.destOffsetZ = static_cast<uint32_t>(destZ);
+                constants.chunkSize = INFINITE_CHUNK_SIZE;
+                constants.destGridSizeX = m_config.gridSizeX;
+                constants.destGridSizeY = m_config.gridSizeY;
+                constants.destGridSizeZ = m_config.gridSizeZ;
+                constants.padding = 0;
+
+                // ===== DEFERRED TRANSITION: Only transition WRITE buffer when we have chunks to copy =====
+                // This fixes a critical bug where we'd update CPU state tracking but not execute any GPU commands.
+                // If we transition but then exit early (0 chunks copied), the CPU thinks the buffer is in UAV
+                // but the GPU never saw that transition. This causes invalid state transitions later.
+                if (!writeBufferTransitioned) {
+                    TransitionWriteBufferTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    writeBufferTransitioned = true;
+                }
+
+                // ===== STEP 5: Bind resources and dispatch =====
+                // Root parameter 0: CopyChunkConstants as 8 DWORD root constants.
+                // This must be recorded per dispatch; using one mapped upload
+                // CBV here makes every dispatch race against later CPU writes.
+                m_chunkCopyCmdList->SetComputeRoot32BitConstants(
+                    0,
+                    static_cast<UINT>(sizeof(CopyChunkConstants) / sizeof(uint32_t)),
+                    &constants,
+                    0
+                );
+
+                // CRITICAL FIX: Transition chunk buffer to SRV state before reading!
+                // After generation, chunks are left in UAV state. We MUST transition to
+                // NON_PIXEL_SHADER_RESOURCE before using as SRV input for copy shader.
+                chunk->TransitionBufferTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+                // Root parameter 1: SRV (chunk input)
+                m_chunkCopyCmdList->SetComputeRootShaderResourceView(1, chunk->GetVoxelBuffer().GetGPUVirtualAddress());
+
+                // Copy to WRITE buffer if needed
+                if (!inWriteBuffer) {
+                    m_chunkCopyCmdList->SetComputeRootUnorderedAccessView(2, GetWriteBuffer().GetGPUVirtualAddress());
+                    m_chunkCopyCmdList->Dispatch(8, 8, 8);
+
+                    D3D12_RESOURCE_BARRIER uavBarrier = CD3DX12_RESOURCE_BARRIER::UAV(GetWriteBuffer().GetResource());
+                    m_chunkCopyCmdList->ResourceBarrier(1, &uavBarrier);
+
+                    m_copiedChunksPerBuffer[writeBufferIndex].insert(chunkCoord);
+                    chunksCopied++;
+                }
+
+                // Copy to READ buffer if needed (ensures both buffers stay in sync)
+                if (!inReadBuffer) {
+                    // Transition READ buffer to UAV for writing (once per frame)
+                    if (!readBufferTransitioned) {
+                        TransitionReadBufferTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        readBufferTransitioned = true;
+                    }
+
+                    m_chunkCopyCmdList->SetComputeRoot32BitConstants(
+                        0,
+                        static_cast<UINT>(sizeof(CopyChunkConstants) / sizeof(uint32_t)),
+                        &constants,
+                        0
+                    );
+                    m_chunkCopyCmdList->SetComputeRootShaderResourceView(1, chunk->GetVoxelBuffer().GetGPUVirtualAddress());
+                    m_chunkCopyCmdList->SetComputeRootUnorderedAccessView(2, GetReadBuffer().GetGPUVirtualAddress());
+                    m_chunkCopyCmdList->Dispatch(8, 8, 8);
+
+                    D3D12_RESOURCE_BARRIER uavBarrier = CD3DX12_RESOURCE_BARRIER::UAV(GetReadBuffer().GetResource());
+                    m_chunkCopyCmdList->ResourceBarrier(1, &uavBarrier);
+
+                    m_copiedChunksPerBuffer[readBufferIndex].insert(chunkCoord);
+                    chunksCopied++;
+                }
+            }
+        }
+    }
+    done_copying:  // Label for early exit when max chunks reached
+
+    // DEBUG: Log copy statistics
+    static int debugFrameCount = 0;
+    static int lastCopied = 0;
+    debugFrameCount++;
+
+    int writeBufferIndex = 1 - m_readBufferIndex;
+    int readBufferIndex = m_readBufferIndex;
+    size_t cachedInWriteBuffer = m_copiedChunksPerBuffer[writeBufferIndex].size();
+    size_t cachedInReadBuffer = m_copiedChunksPerBuffer[readBufferIndex].size();
+    size_t expectedChunks = (2 * RENDER_DISTANCE_HORIZONTAL + 1) * TERRAIN_NUM_CHUNKS_Y *
+                            (2 * RENDER_DISTANCE_HORIZONTAL + 1);  // 1250
+
+    // Log every second or when significant changes occur
+    bool significantChange = (chunksCopied > 0 && chunksCopied != lastCopied);
+    bool starvation = (chunksCopied == 0 && chunksNotGenerated > 0);
+
+    if (significantChange || starvation || debugFrameCount % 60 == 1) {
+        spdlog::info("Chunks: {} copied | READ[{}]={} WRITE[{}]={} | notGen={} skip={}",
+            chunksCopied, readBufferIndex, cachedInReadBuffer, writeBufferIndex, cachedInWriteBuffer,
+            chunksNotGenerated, chunksSkipped);
+        lastCopied = chunksCopied;
+    }
+
+    // ===== STEP 6: Close and execute (ONLY if we copied something new) =====
+    if (chunksCopied > 0) {
+        // Transition WRITE buffer from UAV to SRV state
+        if (writeBufferTransitioned) {
+            TransitionWriteBufferTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+
+        // Transition READ buffer from UAV back to SRV state if we wrote to it
+        if (readBufferTransitioned) {
+            TransitionReadBufferTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+
+        m_chunkCopyCmdList->Close();
+        ID3D12CommandList* lists[] = { m_chunkCopyCmdList.Get() };
+        cmdQueue->ExecuteCommandLists(1, lists);
+
+        // ===== SIGNAL FENCE: Track when this copy operation completes =====
+        m_chunkCopyFenceValue++;
+        cmdQueue->Signal(m_chunkCopyFence.Get(), m_chunkCopyFenceValue);
+        m_copyAllocatorFenceValues[allocatorIndex] = m_chunkCopyFenceValue;
+
+        // NO BUFFER SWAP here! We write directly to WRITE buffer.
+        // Chunks will appear after physics swaps buffers at end of frame.
+        // This prevents race condition: UpdateChunks→WRITE, Physics reads READ writes WRITE, then swap.
+
+        // PERFORMANCE FIX: Only log at debug level (info logs cause lag on Windows)
+        // spdlog::debug("UpdateActiveRegion: Copied {} NEW chunks ({} skipped, {} not generated) to WRITE buffer",
+        //     chunksCopied, chunksSkipped, chunksNotGenerated);
+
+        // CRITICAL FIX: Only advance allocator index AFTER successful execution!
+        // This ensures we don't skip allocators when no chunks are copied.
+        m_currentCopyAllocatorIndex = (m_currentCopyAllocatorIndex + 1) % NUM_COPY_BUFFERS;
+    } else {
+        // CRITICAL FIX: If no chunks copied, we didn't execute or signal fence!
+        // Clear the fence value for this allocator so next frame can use it.
+        // We do NOT advance m_currentCopyAllocatorIndex - same allocator will be reused.
+        m_copyAllocatorFenceValues[allocatorIndex] = 0;
+
+        // No new chunks to copy - just close the command list without executing
+        m_chunkCopyCmdList->Close();
+        if (chunksSkipped > 0 || chunksNotGenerated > 0) {
+            spdlog::debug("UpdateActiveRegion: No chunks copied ({} skipped, {} not generated yet)",
+                chunksSkipped, chunksNotGenerated);
+        }
+    }
+
+    // NOTE: We do NOT wait for GPU completion here!
+    // The ring buffer (3 allocators) ensures we won't reuse this allocator
+    // for at least 2 more UpdateActiveRegion calls. GPU has plenty of time to complete.
 }
 
 } // namespace VENPOD::Simulation

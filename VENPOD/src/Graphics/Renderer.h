@@ -82,6 +82,9 @@ public:
         uint32_t gridSizeY,
         uint32_t gridSizeZ,
         const CameraParams& camera,
+        float regionOriginX,
+        float regionOriginY,
+        float regionOriginZ,
         const BrushPreview* brushPreview = nullptr
     );
 

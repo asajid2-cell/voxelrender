@@ -35,6 +35,11 @@ cbuffer BrushConstants : register(b0) {
     uint gridSizeY;
     uint gridSizeZ;
     uint seed;
+
+    uint startX;
+    uint startY;
+    uint startZ;
+    uint padding;
 };
 
 // Voxel buffer (read-write)
@@ -73,8 +78,10 @@ float GetBrushSDF(float3 p, float3 center, float r, uint brushShape) {
 
 [numthreads(8, 8, 8)]
 void main(uint3 DTid : SV_DispatchThreadID) {
+    uint3 voxelCoord = DTid + uint3(startX, startY, startZ);
+
     // Bounds check
-    if (DTid.x >= gridSizeX || DTid.y >= gridSizeY || DTid.z >= gridSizeZ) {
+    if (voxelCoord.x >= gridSizeX || voxelCoord.y >= gridSizeY || voxelCoord.z >= gridSizeZ) {
         return;
     }
 
@@ -82,7 +89,7 @@ void main(uint3 DTid : SV_DispatchThreadID) {
     float3 brushCenter = float3(positionX, positionY, positionZ);
 
     // Get voxel position (center of voxel)
-    float3 voxelPos = float3(DTid) + 0.5;
+    float3 voxelPos = float3(voxelCoord) + 0.5;
 
     // Calculate SDF distance
     float dist = GetBrushSDF(voxelPos, brushCenter, radius, shape);
@@ -94,14 +101,14 @@ void main(uint3 DTid : SV_DispatchThreadID) {
 
     // Calculate linear index
     uint3 gridSize = uint3(gridSizeX, gridSizeY, gridSizeZ);
-    uint index = LinearIndex3D(DTid, gridSize);
+    uint index = LinearIndex3D(voxelCoord, gridSize);
 
     // Read current voxel
     uint currentVoxel = VoxelBuffer[index];
     uint currentMaterial = GetMaterial(currentVoxel);
 
     // Generate random variant for new voxels
-    uint random = Random3D(DTid, seed);
+    uint random = Random3D(voxelCoord, seed);
     uint variant = random & 0xFF;
 
     // Apply brush based on mode

@@ -128,8 +128,8 @@ Result<void> GPUBuffer::Initialize(
         m_resource->SetName(wideName.c_str());
     }
 
-    spdlog::debug("GPUBuffer created: {} ({} bytes, stride={})",
-        debugName ? debugName : "unnamed", sizeBytes, stride);
+    // spdlog::debug("GPUBuffer created: {} ({} bytes, stride={})",
+    //     debugName ? debugName : "unnamed", sizeBytes, stride);
 
     return {};
 }

@@ -261,11 +261,19 @@ void ChunkManager::TransitionBuffersForCompute(ID3D12GraphicsCommandList* cmdLis
         }
     };
 
-    // Transition all chunk buffers to UAV state for compute shader access
-    addBarrier(m_chunkControlBuffer.GetResource(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    addBarrier(m_activeChunkListBuffer.GetResource(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    addBarrier(m_activeChunkCountBuffer.GetResource(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    addBarrier(m_indirectArgsBuffer.GetResource(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    // CRITICAL FIX: Use tracked resource states instead of assuming COMMON
+    // Previous code assumed resources were always in COMMON state, but after first use
+    // they remain in UAV state. Invalid transitions cause D3D12 validation errors and crashes.
+    addBarrier(m_chunkControlBuffer.GetResource(), m_chunkControlState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    addBarrier(m_activeChunkListBuffer.GetResource(), m_activeListState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    addBarrier(m_activeChunkCountBuffer.GetResource(), m_activeCountState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    addBarrier(m_indirectArgsBuffer.GetResource(), m_indirectArgsState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    // Update tracked states
+    m_chunkControlState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    m_activeListState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    m_activeCountState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    m_indirectArgsState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 
     if (barrierCount > 0) {
         cmdList->ResourceBarrier(barrierCount, barriers);
@@ -273,16 +281,30 @@ void ChunkManager::TransitionBuffersForCompute(ID3D12GraphicsCommandList* cmdLis
 }
 
 void ChunkManager::TransitionBuffersForIndirect(ID3D12GraphicsCommandList* cmdList) {
-    // Transition indirect args buffer for indirect dispatch
-    D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-        m_indirectArgsBuffer.GetResource(),
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
-    );
-    cmdList->ResourceBarrier(1, &barrier);
+    // CRITICAL FIX: Only transition if not already in correct state
+    if (m_indirectArgsState != D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT) {
+        D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_indirectArgsBuffer.GetResource(),
+            m_indirectArgsState,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+        );
+        cmdList->ResourceBarrier(1, &barrier);
+        m_indirectArgsState = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    }
 }
 
 void ChunkManager::ResetActiveCount(ID3D12GraphicsCommandList* cmdList) {
+    // CRITICAL FIX: Transition to COPY_DEST before copy operation
+    if (m_activeCountState != D3D12_RESOURCE_STATE_COPY_DEST) {
+        D3D12_RESOURCE_BARRIER toDestBarrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_activeChunkCountBuffer.GetResource(),
+            m_activeCountState,
+            D3D12_RESOURCE_STATE_COPY_DEST
+        );
+        cmdList->ResourceBarrier(1, &toDestBarrier);
+        m_activeCountState = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+
     // Copy zero from upload buffer to active count buffer
     cmdList->CopyBufferRegion(
         m_activeChunkCountBuffer.GetResource(),
@@ -299,6 +321,7 @@ void ChunkManager::ResetActiveCount(ID3D12GraphicsCommandList* cmdList) {
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS
     );
     cmdList->ResourceBarrier(1, &barrier);
+    m_activeCountState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
 }
 
 void ChunkManager::MarkAllChunksActive(ID3D12GraphicsCommandList* cmdList) {

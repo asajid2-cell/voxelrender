@@ -82,6 +82,9 @@ public:
     bool IsActionDown(KeyAction action) const;
     bool IsActionPressed(KeyAction action) const;
 
+    // Double-click detection
+    bool IsActionDoubleClicked(KeyAction action) const;
+
     // Get mouse ray in normalized device coordinates (-1 to 1)
     glm::vec2 GetMouseNDC() const;
 
@@ -114,6 +117,10 @@ private:
 
     // Key mappings
     std::array<SDL_Keycode, static_cast<size_t>(KeyAction::Count)> m_keyMappings{};
+
+    // Double-click detection
+    std::array<uint64_t, static_cast<size_t>(KeyAction::Count)> m_lastKeyPressTimes{};
+    static constexpr uint64_t DOUBLE_CLICK_TIME_MS = 300;  // 300ms window for double-click
 };
 
 } // namespace VENPOD::Input

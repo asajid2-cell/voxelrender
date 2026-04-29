@@ -36,6 +36,9 @@ find_package(glm CONFIG REQUIRED)
 # =============================================================================
 set(VENPOD_SOURCES
     src/main.cpp
+    src/main_launcher.cpp
+    src/main_sandsim.cpp
+    src/launcher.cpp
 
     # Core
     src/Core/Engine.cpp
@@ -61,6 +64,10 @@ set(VENPOD_SOURCES
     src/Simulation/VoxelWorld.cpp
     src/Simulation/ChunkManager.cpp
     src/Simulation/PhysicsDispatcher.cpp
+    src/Simulation/Chunk.cpp
+    src/Simulation/InfiniteChunkManager.cpp
+    src/Simulation/ChunkGenerationTest.cpp
+    src/Simulation/ChunkStressTest.cpp
 
     # Input
     src/Input/InputManager.cpp
@@ -71,12 +78,15 @@ set(VENPOD_SOURCES
     src/UI/DebugOverlay.cpp
     src/UI/MaterialPalette.cpp
     src/UI/BrushPanel.cpp
+    src/UI/PauseMenu.cpp
 
     # Utils
     src/Utils/FileUtils.cpp
 )
 
 set(VENPOD_HEADERS
+    src/launcher.h
+
     # Core
     src/Core/Engine.h
     src/Core/Window.h
@@ -102,6 +112,11 @@ set(VENPOD_HEADERS
     src/Simulation/VoxelWorld.h
     src/Simulation/ChunkManager.h
     src/Simulation/PhysicsDispatcher.h
+    src/Simulation/ChunkCoord.h
+    src/Simulation/Chunk.h
+    src/Simulation/InfiniteChunkManager.h
+    src/Simulation/ChunkGenerationTest.h
+    src/Simulation/ChunkStressTest.h
 
     # Input
     src/Input/InputManager.h
@@ -112,6 +127,7 @@ set(VENPOD_HEADERS
     src/UI/DebugOverlay.h
     src/UI/MaterialPalette.h
     src/UI/BrushPanel.h
+    src/UI/PauseMenu.h
 
     # Utils
     src/Utils/Result.h
@@ -124,13 +140,13 @@ set(VENPOD_HEADERS
 # ImGui Sources (will be populated when imgui is added)
 # =============================================================================
 set(IMGUI_SOURCES
-    # vendor/imgui/imgui.cpp
-    # vendor/imgui/imgui_draw.cpp
-    # vendor/imgui/imgui_tables.cpp
-    # vendor/imgui/imgui_widgets.cpp
-    # vendor/imgui/imgui_demo.cpp
-    # vendor/imgui/backends/imgui_impl_sdl3.cpp
-    # vendor/imgui/backends/imgui_impl_dx12.cpp
+    vendor/imgui/imgui.cpp
+    vendor/imgui/imgui_draw.cpp
+    vendor/imgui/imgui_tables.cpp
+    vendor/imgui/imgui_widgets.cpp
+    vendor/imgui/imgui_demo.cpp
+    vendor/imgui/backends/imgui_impl_sdl3.cpp
+    vendor/imgui/backends/imgui_impl_dx12.cpp
 )
 
 # =============================================================================
@@ -188,6 +204,11 @@ if(MSVC)
         _UNICODE
         NOMINMAX
         WIN32_LEAN_AND_MEAN
+    )
+
+    # Use Windows subsystem for WinMain entry point
+    set_target_properties(VENPOD PROPERTIES
+        LINK_FLAGS "/SUBSYSTEM:WINDOWS /ENTRY:WinMainCRTStartup"
     )
 endif()
 

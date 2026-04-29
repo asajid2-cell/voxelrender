@@ -131,6 +131,13 @@ private:
     ComPtr<ID3D12Resource> m_countResetBuffer;
 
     Graphics::DescriptorHeapManager* m_heapManager = nullptr;
+
+    // CRITICAL FIX: Resource state tracking to prevent invalid D3D12 transitions
+    // Without this, the code assumed resources were always in COMMON state, causing crashes
+    D3D12_RESOURCE_STATES m_chunkControlState = D3D12_RESOURCE_STATE_COMMON;
+    D3D12_RESOURCE_STATES m_activeListState = D3D12_RESOURCE_STATE_COMMON;
+    D3D12_RESOURCE_STATES m_activeCountState = D3D12_RESOURCE_STATE_COMMON;
+    D3D12_RESOURCE_STATES m_indirectArgsState = D3D12_RESOURCE_STATE_COMMON;
 };
 
 } // namespace VENPOD::Simulation

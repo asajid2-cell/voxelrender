@@ -21,11 +21,13 @@ Chunk::Chunk(Chunk&& other) noexcept
     , m_voxelBuffer(std::move(other.m_voxelBuffer))
     , m_voxelSRV(other.m_voxelSRV)
     , m_voxelUAV(other.m_voxelUAV)
+    , m_currentVoxelState(other.m_currentVoxelState)
     , m_heapManager(other.m_heapManager)
 {
     other.m_state = ChunkState::Ungenerated;
     other.m_voxelSRV.Invalidate();
     other.m_voxelUAV.Invalidate();
+    other.m_currentVoxelState = D3D12_RESOURCE_STATE_COMMON;
     other.m_heapManager = nullptr;
 }
 
@@ -38,11 +40,13 @@ Chunk& Chunk::operator=(Chunk&& other) noexcept {
         m_voxelBuffer = std::move(other.m_voxelBuffer);
         m_voxelSRV = other.m_voxelSRV;
         m_voxelUAV = other.m_voxelUAV;
+        m_currentVoxelState = other.m_currentVoxelState;
         m_heapManager = other.m_heapManager;
 
         other.m_state = ChunkState::Ungenerated;
         other.m_voxelSRV.Invalidate();
         other.m_voxelUAV.Invalidate();
+        other.m_currentVoxelState = D3D12_RESOURCE_STATE_COMMON;
         other.m_heapManager = nullptr;
     }
     return *this;
@@ -61,6 +65,7 @@ Result<void> Chunk::Initialize(
     m_coord = coord;
     m_heapManager = &heapManager;
     m_state = ChunkState::Ungenerated;
+    m_currentVoxelState = D3D12_RESOURCE_STATE_COMMON;  // Initial state
 
     // Create debug name
     std::string bufferName = std::format("{}[{},{},{}]_VoxelBuffer",
@@ -121,20 +126,30 @@ Result<void> Chunk::Initialize(
         m_voxelSRV.cpu
     );
 
-    spdlog::debug("Chunk[{},{},{}] initialized - {} MB",
-        coord.x, coord.y, coord.z,
-        GetBufferSize() / (1024.0f * 1024.0f));
+    // spdlog::debug("Chunk[{},{},{}] initialized - {} MB",
+    //     coord.x, coord.y, coord.z,
+    //     GetBufferSize() / (1024.0f * 1024.0f));
 
     return {};
 }
 
 void Chunk::Shutdown() {
+    // FIX #2: CRITICAL - Always free descriptors even if heap manager is null
+    // This prevents descriptor leaks when chunks are unloaded
     if (m_heapManager) {
         if (m_voxelSRV.IsValid()) {
             m_heapManager->FreeShaderVisibleCbvSrvUav(m_voxelSRV);
+            m_voxelSRV.Invalidate();  // Mark as freed
         }
         if (m_voxelUAV.IsValid()) {
             m_heapManager->FreeShaderVisibleCbvSrvUav(m_voxelUAV);
+            m_voxelUAV.Invalidate();  // Mark as freed
+        }
+    } else {
+        // WARN: Heap manager was null but descriptors were allocated
+        if (m_voxelSRV.IsValid() || m_voxelUAV.IsValid()) {
+            spdlog::warn("Chunk[{},{},{}] shutdown with null heap manager but valid descriptors - potential leak!",
+                m_coord.x, m_coord.y, m_coord.z);
         }
     }
 
@@ -148,17 +163,27 @@ Result<void> Chunk::Generate(
     ID3D12GraphicsCommandList* cmdList,
     ID3D12PipelineState* generationPSO,
     ID3D12RootSignature* rootSignature,
+    ID3D12Resource* sharedConstantBuffer,
+    void* sharedConstantBufferMappedPtr,
     uint32_t worldSeed)
 {
-    if (!device || !cmdList || !generationPSO || !rootSignature) {
+    if (!device || !cmdList || !generationPSO || !rootSignature || !sharedConstantBuffer || !sharedConstantBufferMappedPtr) {
         return Error("Chunk::Generate - null parameters");
     }
 
-    if (m_state == ChunkState::Generated || m_state == ChunkState::Generating) {
-        return {};  // Already generated, skip
+    // CRITICAL FIX: Prevent double-generation while GPU work is in flight
+    if (m_state == ChunkState::GenerationSubmitted) {
+        // GPU work already submitted and in flight - DO NOT re-generate
+        // This would cause resource state conflicts and potential device removal
+        spdlog::warn("Chunk[{},{},{}] generation called while GPU work in flight (state: GenerationSubmitted), skipping",
+            m_coord.x, m_coord.y, m_coord.z);
+        return {};  // Skip silently - chunk will complete via fence
     }
 
-    m_state = ChunkState::Generating;
+    if (m_state == ChunkState::Generated) {
+        // Already fully generated - skip
+        return {};
+    }
 
     // ===== STEP 1: Calculate chunk world offset (coord × 64) =====
     int32_t worldOffsetX, worldOffsetY, worldOffsetZ;
@@ -175,52 +200,39 @@ Result<void> Chunk::Generate(
     constants.padding[1] = 0;
     constants.padding[2] = 0;
 
-    // ===== STEP 3: Create temporary upload buffer for constants =====
-    // DX12 requires constant buffers to be 256-byte aligned
-    constexpr uint64_t CB_ALIGNMENT = D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT;  // 256
-    uint64_t alignedSize = (sizeof(ChunkConstants) + CB_ALIGNMENT - 1) & ~(CB_ALIGNMENT - 1);
-
-    // Create upload heap buffer
-    D3D12_HEAP_PROPERTIES uploadHeapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
-    D3D12_RESOURCE_DESC bufferDesc = CD3DX12_RESOURCE_DESC::Buffer(alignedSize);
-
-    Microsoft::WRL::ComPtr<ID3D12Resource> constantBuffer;
-    HRESULT hr = device->CreateCommittedResource(
-        &uploadHeapProps,
-        D3D12_HEAP_FLAG_NONE,
-        &bufferDesc,
-        D3D12_RESOURCE_STATE_GENERIC_READ,
-        nullptr,
-        IID_PPV_ARGS(&constantBuffer)
-    );
-
-    if (FAILED(hr)) {
-        m_state = ChunkState::Ungenerated;
-        return Error("Failed to create constant buffer for chunk generation");
-    }
-
-    // Map and upload constants
-    void* mappedData = nullptr;
-    D3D12_RANGE readRange = {0, 0};
-    constantBuffer->Map(0, &readRange, &mappedData);
-    memcpy(mappedData, &constants, sizeof(ChunkConstants));
-    constantBuffer->Unmap(0, nullptr);
+    // Constants are passed as root constants so each dispatch records its own
+    // world offset in the command stream. A shared upload CBV is unsafe here
+    // because later CPU writes can overwrite constants before the GPU consumes
+    // earlier chunk-generation dispatches.
 
     // ===== STEP 4: Transition voxel buffer to UAV state =====
-    D3D12_RESOURCE_BARRIER barrierToUAV = CD3DX12_RESOURCE_BARRIER::Transition(
-        m_voxelBuffer.GetResource(),
-        D3D12_RESOURCE_STATE_COMMON,
-        D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-    );
-    cmdList->ResourceBarrier(1, &barrierToUAV);
+    // FIX #4: Use tracked resource state instead of assuming COMMON
+    // This prevents invalid state transitions that cause device removal errors
+    // CRITICAL FIX: Only transition if not already in target state (prevents D3D12 errors)
+    if (m_currentVoxelState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+        D3D12_RESOURCE_BARRIER barrierToUAV = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_voxelBuffer.GetResource(),
+            m_currentVoxelState,  // Use actual tracked state
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        );
+        cmdList->ResourceBarrier(1, &barrierToUAV);
+
+        // Update tracked state after transition
+        m_currentVoxelState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
 
     // ===== STEP 5: Bind compute pipeline and root signature =====
     cmdList->SetPipelineState(generationPSO);
     cmdList->SetComputeRootSignature(rootSignature);
 
     // ===== STEP 6: Set root parameters =====
-    // Root parameter 0: Constant Buffer View (CBV)
-    cmdList->SetComputeRootConstantBufferView(0, constantBuffer->GetGPUVirtualAddress());
+    // Root parameter 0: ChunkConstants as 8 DWORD root constants
+    cmdList->SetComputeRoot32BitConstants(
+        0,
+        static_cast<UINT>(sizeof(ChunkConstants) / sizeof(uint32_t)),
+        &constants,
+        0
+    );
 
     // Root parameter 1: Unordered Access View (UAV) for ChunkVoxelOutput
     cmdList->SetComputeRootUnorderedAccessView(1, m_voxelBuffer.GetGPUVirtualAddress());
@@ -234,14 +246,31 @@ Result<void> Chunk::Generate(
     D3D12_RESOURCE_BARRIER uavBarrier = CD3DX12_RESOURCE_BARRIER::UAV(m_voxelBuffer.GetResource());
     cmdList->ResourceBarrier(1, &uavBarrier);
 
-    // ===== STEP 9: Mark as generated =====
-    m_state = ChunkState::Generated;
+    // ===== STEP 9: Mark as submitted (NOT generated yet - GPU work is async!) =====
+    // The InfiniteChunkManager will mark as Generated after the GPU fence signals
+    m_state = ChunkState::GenerationSubmitted;
 
-    spdlog::info("Chunk[{},{},{}] generated - world offset ({},{},{})",
-        m_coord.x, m_coord.y, m_coord.z,
-        worldOffsetX, worldOffsetY, worldOffsetZ);
+    // spdlog::debug("Chunk[{},{},{}] generation submitted - world offset ({},{},{})",
+    //     m_coord.x, m_coord.y, m_coord.z,
+    //     worldOffsetX, worldOffsetY, worldOffsetZ);
 
     return {};
+}
+
+void Chunk::TransitionBufferTo(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_STATES newState) {
+    if (!cmdList || !m_voxelBuffer.GetResource() || m_currentVoxelState == newState) {
+        return;  // No-op if same state
+    }
+
+    D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+        m_voxelBuffer.GetResource(),
+        m_currentVoxelState,
+        newState
+    );
+    cmdList->ResourceBarrier(1, &barrier);
+
+    // Update tracked state after transition
+    m_currentVoxelState = newState;
 }
 
 } // namespace VENPOD::Simulation

@@ -133,6 +133,10 @@ public:
     uint32_t GetRtvDescriptorSize() const { return m_rtvHeap.GetDescriptorSize(); }
     uint32_t GetDsvDescriptorSize() const { return m_dsvHeap.GetDescriptorSize(); }
 
+    // STRESS TEST SUPPORT: Get allocated descriptor counts
+    uint32_t GetShaderVisibleCbvSrvUavAllocatedCount() const { return m_shaderVisibleCbvSrvUav.GetAllocatedCount(); }
+    uint32_t GetStagingCbvSrvUavAllocatedCount() const { return m_stagingCbvSrvUav.GetAllocatedCount(); }
+
 private:
     // Staging heap (CPU-only) - persistent descriptors
     DescriptorHeap m_stagingCbvSrvUav;

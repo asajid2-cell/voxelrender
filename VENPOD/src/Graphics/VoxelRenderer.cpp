@@ -16,14 +16,10 @@ Result<void> VoxelRenderer::Initialize(
     m_config = config;
     m_heapManager = &heapManager;
 
-    // Create voxel buffers
-    auto result = CreateVoxelBuffers(device, heapManager);
-    if (!result) {
-        return Error("Failed to create voxel buffers: {}", result.error());
-    }
+    // NOTE: Voxel buffers removed - VoxelWorld manages them now (saves 32MB+ GPU memory)
 
     // Create material palette
-    result = CreateMaterialPalette(device, heapManager);
+    auto result = CreateMaterialPalette(device, heapManager);
     if (!result) {
         return Error("Failed to create material palette: {}", result.error());
     }
@@ -52,8 +48,7 @@ void VoxelRenderer::Shutdown() {
 
     m_frameConstantBuffer.Shutdown();
     m_materialPalette.Reset();
-    m_voxelBufferA.Shutdown();
-    m_voxelBufferB.Shutdown();
+    // NOTE: Voxel buffers removed - VoxelWorld manages them now
     m_heapManager = nullptr;
 }
 
@@ -70,11 +65,8 @@ void VoxelRenderer::Render(ID3D12GraphicsCommandList* cmdList, DX12GraphicsPipel
     // Bind constant buffer (b0)
     cmdList->SetGraphicsRootConstantBufferView(0, m_frameConstantBuffer.GetGPUVirtualAddress());
 
-    // Bind voxel grid SRV (t0) - use current buffer
-    GPUBuffer& currentBuffer = m_useBufferA ? m_voxelBufferA : m_voxelBufferB;
-    if (currentBuffer.GetShaderVisibleSRV().IsValid()) {
-        cmdList->SetGraphicsRootDescriptorTable(1, currentBuffer.GetShaderVisibleSRV().gpu);
-    }
+    // NOTE: Voxel buffer binding removed - caller binds VoxelWorld's READ buffer directly
+    // See main.cpp: renderer->RenderVoxels() which passes voxelWorld->GetReadBufferSRV()
 
     // Bind material palette (t1)
     if (m_paletteSRV.IsValid()) {
@@ -85,60 +77,6 @@ void VoxelRenderer::Render(ID3D12GraphicsCommandList* cmdList, DX12GraphicsPipel
 
     // Draw fullscreen triangle
     cmdList->DrawInstanced(3, 1, 0, 0);
-}
-
-Result<void> VoxelRenderer::CreateVoxelBuffers(ID3D12Device* device, DescriptorHeapManager& heapManager) {
-    uint64_t totalVoxels = GetTotalVoxels();
-    uint64_t bufferSize = totalVoxels * sizeof(uint32_t);  // 32-bit packed voxels
-
-    // Create buffer A (current state)
-    auto result = m_voxelBufferA.Initialize(
-        device,
-        bufferSize,
-        BufferUsage::StructuredBuffer | BufferUsage::UnorderedAccess,
-        sizeof(uint32_t),  // stride
-        "VoxelBufferA"
-    );
-    if (!result) {
-        return Error("Failed to create voxel buffer A: {}", result.error());
-    }
-
-    // Create SRV and UAV for buffer A
-    result = m_voxelBufferA.CreateSRV(device, heapManager);
-    if (!result) {
-        return Error("Failed to create SRV for voxel buffer A: {}", result.error());
-    }
-
-    result = m_voxelBufferA.CreateUAV(device, heapManager);
-    if (!result) {
-        return Error("Failed to create UAV for voxel buffer A: {}", result.error());
-    }
-
-    // Create buffer B (next state for physics ping-pong)
-    result = m_voxelBufferB.Initialize(
-        device,
-        bufferSize,
-        BufferUsage::StructuredBuffer | BufferUsage::UnorderedAccess,
-        sizeof(uint32_t),
-        "VoxelBufferB"
-    );
-    if (!result) {
-        return Error("Failed to create voxel buffer B: {}", result.error());
-    }
-
-    // Create SRV and UAV for buffer B
-    result = m_voxelBufferB.CreateSRV(device, heapManager);
-    if (!result) {
-        return Error("Failed to create SRV for voxel buffer B: {}", result.error());
-    }
-
-    result = m_voxelBufferB.CreateUAV(device, heapManager);
-    if (!result) {
-        return Error("Failed to create UAV for voxel buffer B: {}", result.error());
-    }
-
-    spdlog::debug("Created ping-pong voxel buffers ({} bytes each)", bufferSize);
-    return {};
 }
 
 Result<void> VoxelRenderer::CreateMaterialPalette(ID3D12Device* device, DescriptorHeapManager& heapManager) {

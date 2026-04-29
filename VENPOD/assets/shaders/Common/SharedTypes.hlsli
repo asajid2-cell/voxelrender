@@ -59,6 +59,11 @@ struct FrameConstants {
     uint     frameIndex;
     uint     debugMode;
 
+    // Region origin for infinite world (4 DWORDs) - CRITICAL FOR CAMERA MOVEMENT!
+    // This is the world-space origin of the render buffer's (0,0,0) voxel
+    // Shader MUST subtract this from world coords to get buffer-local coords
+    float4   regionOrigin;       // xyz = world origin, w = unused
+
     // Brush preview (8 DWORDs)
     float4   brushPosition;      // xyz = position, w = radius
     float4   brushParams;        // x = material, y = shape, z = hasValidPosition, w = unused
