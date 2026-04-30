@@ -70,6 +70,18 @@ struct PhysicsChunkConstants {
     uint32_t padding;
 };
 
+struct PhysicsDispatcherStats {
+    uint32_t scanBudgetChunks = 0;
+    uint32_t scannedChunksLastFrame = 0;
+    uint32_t skippedScanChunksLastFrame = 0;
+    uint32_t dispatchX = 0;
+    uint32_t dispatchY = 0;
+    uint32_t dispatchZ = 0;
+    int32_t offsetX = 0;
+    int32_t offsetY = 0;
+    int32_t offsetZ = 0;
+};
+
 class PhysicsDispatcher {
 public:
     PhysicsDispatcher() = default;
@@ -124,8 +136,12 @@ public:
         ID3D12GraphicsCommandList* cmdList,
         VoxelWorld& world,
         ChunkManager& chunkManager,
-        uint32_t frameIndex
+        uint32_t frameIndex,
+        const glm::vec3& centerLocal,
+        uint32_t scanBudgetChunks
     );
+
+    const PhysicsDispatcherStats& GetStats() const { return m_stats; }
 
     // GPU brush raycasting (NEW - replaces CPU-side DDA)
     void DispatchBrushRaycast(
@@ -211,6 +227,7 @@ private:
     float m_gravity = 9.8f;
     uint32_t m_simulationFlags = 0;
     uint32_t m_sleepThreshold = 30;  // Frames before chunk sleeps
+    PhysicsDispatcherStats m_stats = {};
 };
 
 } // namespace VENPOD::Simulation

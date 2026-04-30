@@ -73,6 +73,11 @@ public:
         bool hasValidPosition;
     };
 
+    struct CharacterPreview {
+        float feetX, feetY, feetZ;
+        bool visible;
+    };
+
     // Render voxels with raymarch shader (binds voxel resources)
     void RenderVoxels(
         ID3D12GraphicsCommandList* cmdList,
@@ -85,7 +90,8 @@ public:
         float regionOriginX,
         float regionOriginY,
         float regionOriginZ,
-        const BrushPreview* brushPreview = nullptr
+        const BrushPreview* brushPreview = nullptr,
+        const CharacterPreview* characterPreview = nullptr
     );
 
     // Render crosshair at screen center

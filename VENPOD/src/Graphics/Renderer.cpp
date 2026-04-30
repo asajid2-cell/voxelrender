@@ -148,7 +148,8 @@ void Renderer::RenderVoxels(
     float regionOriginX,
     float regionOriginY,
     float regionOriginZ,
-    const BrushPreview* brushPreview)
+    const BrushPreview* brushPreview,
+    const CharacterPreview* characterPreview)
 {
     if (!cmdList) return;
 
@@ -160,7 +161,7 @@ void Renderer::RenderVoxels(
     m_fullscreenPipeline.Bind(cmdList);
 
     // Create frame constants on stack (will be passed as root constants)
-    // Must match SharedTypes.hlsli FrameConstants exactly - 40 DWORDs (added 4 for regionOrigin)
+    // Must match SharedTypes.hlsli FrameConstants exactly.
     struct FrameConstants {
         float cameraPosition[4];      // xyz = pos, w = fov
         float cameraForward[4];       // xyz = forward, w = aspectRatio
@@ -178,6 +179,7 @@ void Renderer::RenderVoxels(
         float regionOrigin[4];        // xyz = world origin, w = unused - CRITICAL FOR INFINITE WORLD!
         float brushPosition[4];       // xyz = position, w = radius
         float brushParams[4];         // x = material, y = shape, z = hasValidPosition, w = unused
+        float characterPosition[4];   // xyz = feet position, w = visible flag
     } constants = {};
 
     // Fill in camera data
@@ -245,6 +247,18 @@ void Renderer::RenderVoxels(
         constants.brushParams[3] = 0.0f;
     }
 
+    if (characterPreview && characterPreview->visible) {
+        constants.characterPosition[0] = characterPreview->feetX;
+        constants.characterPosition[1] = characterPreview->feetY;
+        constants.characterPosition[2] = characterPreview->feetZ;
+        constants.characterPosition[3] = 1.0f;
+    } else {
+        constants.characterPosition[0] = 0.0f;
+        constants.characterPosition[1] = 0.0f;
+        constants.characterPosition[2] = 0.0f;
+        constants.characterPosition[3] = 0.0f;
+    }
+
     // Set root constants (b0)
     cmdList->SetGraphicsRoot32BitConstants(0, sizeof(constants) / 4, &constants, 0);
 
@@ -257,64 +271,10 @@ void Renderer::RenderVoxels(
 }
 
 void Renderer::RenderCrosshair(ID3D12GraphicsCommandList* cmdList) {
-    if (!cmdList) return;
-
-    // Crosshair dimensions
-    const uint32_t crosshairSize = 10;  // Length of each line from center
-    const uint32_t crosshairThickness = 2;  // Thickness in pixels
-
-    // Calculate center position
-    uint32_t centerX = m_width / 2;
-    uint32_t centerY = m_height / 2;
-
-    // Bind fullscreen pipeline (for simple rendering)
-    m_fullscreenPipeline.Bind(cmdList);
-
-    // Set viewport to full screen
-    D3D12_VIEWPORT viewport = {};
-    viewport.Width = static_cast<float>(m_width);
-    viewport.Height = static_cast<float>(m_height);
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
-    cmdList->RSSetViewports(1, &viewport);
-
-    // Draw horizontal line (left and right of center)
-    D3D12_RECT horizontalScissor = {};
-    horizontalScissor.left = centerX - crosshairSize;
-    horizontalScissor.right = centerX + crosshairSize;
-    horizontalScissor.top = centerY - crosshairThickness / 2;
-    horizontalScissor.bottom = centerY + crosshairThickness / 2;
-    cmdList->RSSetScissorRects(1, &horizontalScissor);
-
-    // Draw white color using a simple fullscreen pass
-    // We'll use the fullscreen pipeline with modified constants to render white
-    struct CrosshairConstants {
-        float color[4];  // RGBA
-        uint32_t padding[24];  // Padding to match FrameConstants size (28 DWORDs)
-    } crosshairData = {};
-    crosshairData.color[0] = 1.0f;  // R
-    crosshairData.color[1] = 1.0f;  // G
-    crosshairData.color[2] = 1.0f;  // B
-    crosshairData.color[3] = 1.0f;  // A
-
-    cmdList->SetGraphicsRoot32BitConstants(0, 4, &crosshairData, 0);
-    cmdList->DrawInstanced(3, 1, 0, 0);
-
-    // Draw vertical line (top and bottom of center)
-    D3D12_RECT verticalScissor = {};
-    verticalScissor.left = centerX - crosshairThickness / 2;
-    verticalScissor.right = centerX + crosshairThickness / 2;
-    verticalScissor.top = centerY - crosshairSize;
-    verticalScissor.bottom = centerY + crosshairSize;
-    cmdList->RSSetScissorRects(1, &verticalScissor);
-
-    cmdList->DrawInstanced(3, 1, 0, 0);
-
-    // Restore full scissor rect
-    D3D12_RECT fullScissor = {};
-    fullScissor.right = static_cast<LONG>(m_width);
-    fullScissor.bottom = static_cast<LONG>(m_height);
-    cmdList->RSSetScissorRects(1, &fullScissor);
+    (void)cmdList;
+    // Crosshair is drawn by ImGui in the app layer. This legacy function used
+    // the voxel raymarch pipeline with partial constants in scissored strips,
+    // which produced world-space scanline artifacts if called.
 }
 
 Result<void> Renderer::OnResize(uint32_t width, uint32_t height) {
@@ -356,13 +316,13 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
 
     // Root signature parameters (for voxel rendering)
     // b0: FrameConstants (inline 32-bit constants)
-    // Layout: camPos(4) + camFwd(4) + camRight(4) + camUp(4) + sunDir(4) + grid(4) + viewport(4) + regionOrigin(4) + brushPos(4) + brushParams(4) = 40 DWORDs
+    // Layout: camPos(4) + camFwd(4) + camRight(4) + camUp(4) + sunDir(4) + grid(4) + viewport(4) + regionOrigin(4) + brushPos(4) + brushParams(4) + character(4) = 44 DWORDs
     RootParameter frameConstantsParam;
     frameConstantsParam.type = RootParamType::Constants32Bit;
     frameConstantsParam.shaderRegister = 0;  // register b0
     frameConstantsParam.registerSpace = 0;   // space 0
     frameConstantsParam.visibility = D3D12_SHADER_VISIBILITY_ALL;
-    frameConstantsParam.num32BitValues = 40;  // sizeof(FrameConstants) / 4 - UPDATED for regionOrigin!
+    frameConstantsParam.num32BitValues = 44;
     pipelineDesc.rootParams.push_back(frameConstantsParam);
 
     // t0: VoxelGrid SRV (descriptor table for structured buffer)
@@ -421,8 +381,6 @@ Result<void> Renderer::CreateRTVsForSwapchain() {
     }
 
     ID3D12Device* device = m_device->GetDevice();
-    uint32_t rtvDescriptorSize = m_heapManager.GetRtvDescriptorSize();
-
     // Free old RTVs
     for (auto& handle : m_rtvHandles) {
         if (handle.IsValid()) {

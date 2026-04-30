@@ -75,6 +75,7 @@ void InputManager::UpdateKeyMappings() {
     m_keyMappings[static_cast<size_t>(KeyAction::BrushIncrease)] = SDLK_RIGHTBRACKET;
     m_keyMappings[static_cast<size_t>(KeyAction::BrushDecrease)] = SDLK_LEFTBRACKET;
     m_keyMappings[static_cast<size_t>(KeyAction::TogglePause)] = SDLK_P;
+    m_keyMappings[static_cast<size_t>(KeyAction::TogglePerspective)] = SDLK_V;
     m_keyMappings[static_cast<size_t>(KeyAction::ResetWorld)] = SDLK_R;
 }
 

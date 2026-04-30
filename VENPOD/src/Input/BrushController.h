@@ -40,6 +40,12 @@ struct BrushConstants {
     uint32_t gridSizeY;
     uint32_t gridSizeZ;
     uint32_t seed;          // Random seed for variant generation
+
+    // CPU persistence/debug only. The GPU brush shader receives the fields above.
+    int32_t hitNormalX = 0;
+    int32_t hitNormalY = 0;
+    int32_t hitNormalZ = 0;
+    uint32_t hasHitNormal = 0;
 };
 
 class BrushController {

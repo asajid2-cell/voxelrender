@@ -369,18 +369,36 @@ Result<void> PhysicsDispatcher::CreateBrushPipeline(
     desc.debugName = "CS_Brush";
 
     // Root parameters:
-    // 0: Root constants (brush constants plus localized dispatch start - 16 dwords)
+    // 0: Root constants (brush constants plus localized dispatch start and feedback controls - 20 dwords)
     desc.rootParams.push_back({
         Graphics::RootParamType::Constants32Bit,
         0,  // register b0
         0,  // space 0
-        16
+        20
     });
 
     // 1: UAV for voxel buffer (read-write)
     desc.rootParams.push_back({
         Graphics::RootParamType::DescriptorTable,
         0,  // register u0
+        0,  // space 0
+        1,  // 1 descriptor
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+    });
+
+    // 2: UAV for compact GPU brush edit events
+    desc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        1,  // register u1
+        0,  // space 0
+        1,  // 1 descriptor
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+    });
+
+    // 3: UAV for compact GPU brush edit counter
+    desc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        2,  // register u2
         0,  // space 0
         1,  // 1 descriptor
         D3D12_DESCRIPTOR_RANGE_TYPE_UAV
@@ -448,6 +466,10 @@ void PhysicsDispatcher::DispatchBrush(
         uint32_t startY;
         uint32_t startZ;
         uint32_t padding;
+        uint32_t recordEdits;
+        uint32_t maxEditEvents;
+        uint32_t feedbackFrame;
+        uint32_t feedbackPadding;
     };
 
     const int32_t radiusCeil = static_cast<int32_t>(std::ceil(brushConstants.radius)) + 2;
@@ -478,6 +500,7 @@ void PhysicsDispatcher::DispatchBrush(
     constants.startX = static_cast<uint32_t>(startX);
     constants.startY = static_cast<uint32_t>(startY);
     constants.startZ = static_cast<uint32_t>(startZ);
+    constants.maxEditEvents = world.GetMaxBrushEditFeedbackEvents();
 
     auto dispatchSize = glm::uvec3(
         (static_cast<uint32_t>(endX - startX) + 7) / 8,
@@ -485,7 +508,9 @@ void PhysicsDispatcher::DispatchBrush(
         (static_cast<uint32_t>(endZ - startZ) + 7) / 8
     );
 
-    m_brushPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
+    const bool feedbackRecording = world.BeginBrushEditFeedback(cmdList);
+    m_brushPipeline.SetRootDescriptorTable(cmdList, 2, world.GetBrushEditEventUAV().gpu);
+    m_brushPipeline.SetRootDescriptorTable(cmdList, 3, world.GetBrushEditCounterUAV().gpu);
 
     // Paint to BOTH buffers to ensure painted voxels persist across buffer swaps!
     //
@@ -501,6 +526,8 @@ void PhysicsDispatcher::DispatchBrush(
     // The result: Painted voxels appear immediately and persist correctly.
 
     // 1. Paint to READ buffer FIRST (immediate visual feedback - rendered this frame!)
+    constants.recordEdits = 0;
+    m_brushPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
     world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_brushPipeline.SetRootDescriptorTable(cmdList, 1, world.GetReadBufferUAV().gpu);
     m_brushPipeline.Dispatch(cmdList, dispatchSize.x, dispatchSize.y, dispatchSize.z);
@@ -519,6 +546,8 @@ void PhysicsDispatcher::DispatchBrush(
     }
 
     // 2. Paint to WRITE buffer (physics will process this, then it becomes READ after swap)
+    constants.recordEdits = feedbackRecording ? 1u : 0u;
+    m_brushPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
     world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_brushPipeline.SetRootDescriptorTable(cmdList, 1, world.GetWriteBufferUAV().gpu);
     m_brushPipeline.Dispatch(cmdList, dispatchSize.x, dispatchSize.y, dispatchSize.z);
@@ -536,87 +565,25 @@ void PhysicsDispatcher::DispatchBrush(
         }
     }
 
-    // CRITICAL FIX: Invalidate chunk copy cache for the painted region
-    // Without this, the chunk won't be re-copied and painted voxels may be lost
-    // on subsequent frames when the render buffer gets refreshed.
-    //
-    // NOTE: For infinite chunks, brushConstants positions are in LOCAL 256^3 grid
-    // space, so we must convert them back to world voxel coordinates using the
-    // region origin provided by VoxelWorld.
-    if (world.IsUsingInfiniteChunks()) {
-        glm::vec3 regionOriginWorld = world.GetRegionOriginWorld();
-        auto toWorld = [&](float x, float y, float z) -> glm::vec3 {
-            return glm::vec3(x, y, z) + regionOriginWorld;
-        };
-
-        glm::vec3 paintedWorld = toWorld(
+    if (feedbackRecording) {
+        world.QueueBrushEditFeedbackReadback(cmdList);
+    } else if (world.IsUsingInfiniteChunks()) {
+        // Fallback only. The normal path persists the exact shader edits from
+        // an async GPU feedback buffer once the frame fence completes.
+        world.RecordPersistentBrushEdit(
             brushConstants.positionX,
             brushConstants.positionY,
-            brushConstants.positionZ
-        );
-
-        ChunkCoord paintedChunk = ChunkCoord::FromWorldPosition(
-            static_cast<int32_t>(paintedWorld.x),
-            static_cast<int32_t>(paintedWorld.y),
-            static_cast<int32_t>(paintedWorld.z),
-            INFINITE_CHUNK_SIZE
-        );
-        world.InvalidateCopiedChunk(paintedChunk);
-
-        // If brush is near chunk boundaries, invalidate adjacent chunks too
-        // (brush radius can cross chunk boundaries)
-        float radius = brushConstants.radius;
-        if (radius > 1.0f) {
-            // Check +/- X direction
-            {
-                glm::vec3 worldPosPlusX = toWorld(
-                    brushConstants.positionX + radius,
-                    brushConstants.positionY,
-                    brushConstants.positionZ
-                );
-                world.InvalidateCopiedChunk(ChunkCoord::FromWorldPosition(
-                    static_cast<int32_t>(worldPosPlusX.x),
-                    static_cast<int32_t>(worldPosPlusX.y),
-                    static_cast<int32_t>(worldPosPlusX.z),
-                    INFINITE_CHUNK_SIZE));
-
-                glm::vec3 worldPosMinusX = toWorld(
-                    brushConstants.positionX - radius,
-                    brushConstants.positionY,
-                    brushConstants.positionZ
-                );
-                world.InvalidateCopiedChunk(ChunkCoord::FromWorldPosition(
-                    static_cast<int32_t>(worldPosMinusX.x),
-                    static_cast<int32_t>(worldPosMinusX.y),
-                    static_cast<int32_t>(worldPosMinusX.z),
-                    INFINITE_CHUNK_SIZE));
-            }
-
-            // Check +/- Z direction
-            {
-                glm::vec3 worldPosPlusZ = toWorld(
-                    brushConstants.positionX,
-                    brushConstants.positionY,
-                    brushConstants.positionZ + radius
-                );
-                world.InvalidateCopiedChunk(ChunkCoord::FromWorldPosition(
-                    static_cast<int32_t>(worldPosPlusZ.x),
-                    static_cast<int32_t>(worldPosPlusZ.y),
-                    static_cast<int32_t>(worldPosPlusZ.z),
-                    INFINITE_CHUNK_SIZE));
-
-                glm::vec3 worldPosMinusZ = toWorld(
-                    brushConstants.positionX,
-                    brushConstants.positionY,
-                    brushConstants.positionZ - radius
-                );
-                world.InvalidateCopiedChunk(ChunkCoord::FromWorldPosition(
-                    static_cast<int32_t>(worldPosMinusZ.x),
-                    static_cast<int32_t>(worldPosMinusZ.y),
-                    static_cast<int32_t>(worldPosMinusZ.z),
-                    INFINITE_CHUNK_SIZE));
-            }
-        }
+            brushConstants.positionZ,
+            brushConstants.radius,
+            brushConstants.material,
+            brushConstants.mode,
+            brushConstants.shape,
+            brushConstants.strength,
+            brushConstants.seed,
+            brushConstants.hitNormalX,
+            brushConstants.hitNormalY,
+            brushConstants.hitNormalZ,
+            brushConstants.hasHitNormal != 0);
     }
 }
 
@@ -729,7 +696,9 @@ void PhysicsDispatcher::DispatchChunkScan(
     ID3D12GraphicsCommandList* cmdList,
     VoxelWorld& world,
     ChunkManager& chunkManager,
-    uint32_t frameIndex)
+    uint32_t frameIndex,
+    const glm::vec3& centerLocal,
+    uint32_t scanBudgetChunks)
 {
     if (!cmdList || !m_chunkScanPipeline.IsValid()) {
         spdlog::warn("DispatchChunkScan: pipeline or cmdList invalid");
@@ -773,31 +742,51 @@ void PhysicsDispatcher::DispatchChunkScan(
     constants.chunkSize = CHUNK_SIZE;
     constants.sleepThreshold = m_sleepThreshold;
 
-    // PERFORMANCE OPTIMIZATION: Scan a local region around the centered camera.
-    // The full render buffer is 100x8x100 physics chunks; scanning all 80,000
-    // chunks every frame caused startup hitches and made static oceans enter
-    // the physics path. A 32x8x32 window covers 512x128x512 voxels around the
-    // player, which is enough for interactive brush physics.
-    constexpr uint32_t PHYSICS_REGION_SIZE_X = 32;
-    constexpr uint32_t PHYSICS_REGION_SIZE_Z = 32;
+    const uint32_t fullChunksX = chunkManager.GetChunkCountX();
+    const uint32_t fullChunksY = chunkManager.GetChunkCountY();
+    const uint32_t fullChunksZ = chunkManager.GetChunkCountZ();
 
-    uint32_t fullChunksX = chunkManager.GetChunkCountX();  // 100
-    uint32_t fullChunksY = chunkManager.GetChunkCountY();  // 8
-    uint32_t fullChunksZ = chunkManager.GetChunkCountZ();  // 100
+    const uint32_t requestedBudget = std::max<uint32_t>(1, scanBudgetChunks);
+    const uint32_t dispatchY = std::min<uint32_t>(4, fullChunksY);
+    const uint32_t xzBudget = std::max<uint32_t>(1, requestedBudget / std::max<uint32_t>(1, dispatchY));
+    const uint32_t side = std::max<uint32_t>(4, static_cast<uint32_t>(std::sqrt(static_cast<float>(xzBudget))));
+    const uint32_t dispatchX = std::min<uint32_t>(side, fullChunksX);
+    const uint32_t dispatchZ = std::min<uint32_t>(side, fullChunksZ);
 
-    // Use full region or configured size, whichever is smaller
-    uint32_t dispatchX = std::min(PHYSICS_REGION_SIZE_X, fullChunksX);
-    uint32_t dispatchY = fullChunksY;  // Always full height
-    uint32_t dispatchZ = std::min(PHYSICS_REGION_SIZE_Z, fullChunksZ);
+    const int32_t centerChunkX = std::clamp(
+        static_cast<int32_t>(centerLocal.x / static_cast<float>(CHUNK_SIZE)),
+        0,
+        static_cast<int32_t>(fullChunksX) - 1);
+    const int32_t centerChunkY = std::clamp(
+        static_cast<int32_t>(centerLocal.y / static_cast<float>(CHUNK_SIZE)),
+        0,
+        static_cast<int32_t>(fullChunksY) - 1);
+    const int32_t centerChunkZ = std::clamp(
+        static_cast<int32_t>(centerLocal.z / static_cast<float>(CHUNK_SIZE)),
+        0,
+        static_cast<int32_t>(fullChunksZ) - 1);
 
-    // Calculate centered region offset (0 if using full region)
-    int32_t offsetX = static_cast<int32_t>((fullChunksX - dispatchX) / 2);
-    int32_t offsetZ = static_cast<int32_t>((fullChunksZ - dispatchZ) / 2);
+    const int32_t maxOffsetX = static_cast<int32_t>(fullChunksX - dispatchX);
+    const int32_t maxOffsetY = static_cast<int32_t>(fullChunksY - dispatchY);
+    const int32_t maxOffsetZ = static_cast<int32_t>(fullChunksZ - dispatchZ);
+    const int32_t offsetX = std::clamp(centerChunkX - static_cast<int32_t>(dispatchX / 2), 0, maxOffsetX);
+    const int32_t offsetY = std::clamp(centerChunkY - static_cast<int32_t>(dispatchY / 2), 0, maxOffsetY);
+    const int32_t offsetZ = std::clamp(centerChunkZ - static_cast<int32_t>(dispatchZ / 2), 0, maxOffsetZ);
 
     // Pass the offset to the shader so it knows where the scanned region starts
     constants.activeRegionOffsetX = offsetX;
-    constants.activeRegionOffsetY = 0;  // Always start at Y=0
+    constants.activeRegionOffsetY = offsetY;
     constants.activeRegionOffsetZ = offsetZ;
+
+    m_stats.scanBudgetChunks = requestedBudget;
+    m_stats.scannedChunksLastFrame = dispatchX * dispatchY * dispatchZ;
+    m_stats.skippedScanChunksLastFrame = (fullChunksX * fullChunksY * fullChunksZ) - m_stats.scannedChunksLastFrame;
+    m_stats.dispatchX = dispatchX;
+    m_stats.dispatchY = dispatchY;
+    m_stats.dispatchZ = dispatchZ;
+    m_stats.offsetX = offsetX;
+    m_stats.offsetY = offsetY;
+    m_stats.offsetZ = offsetZ;
 
     // Log only once per second to avoid spam
     static int activeRegionLogThrottle = 0;
@@ -805,7 +794,7 @@ void PhysicsDispatcher::DispatchChunkScan(
         spdlog::debug("DispatchChunkScan: Scanning {}x{}x{} = {} physics chunks at offset ({},{},{})",
             dispatchX, dispatchY, dispatchZ,
             dispatchX * dispatchY * dispatchZ,
-            offsetX, 0, offsetZ);
+            offsetX, offsetY, offsetZ);
     }
 
     m_chunkScanPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
@@ -816,7 +805,7 @@ void PhysicsDispatcher::DispatchChunkScan(
     m_chunkScanPipeline.SetRootDescriptorTable(cmdList, 3, chunkManager.GetActiveListUAV().gpu);
     m_chunkScanPipeline.SetRootDescriptorTable(cmdList, 4, chunkManager.GetActiveCountUAV().gpu);
 
-    // PRIORITY 3: Dispatch optimized 25x2x25 region for infinite chunks, full grid for static
+    // Dispatch the local physics window.
     m_chunkScanPipeline.Dispatch(cmdList, dispatchX, dispatchY, dispatchZ);
 
     // UAV barrier to ensure writes complete

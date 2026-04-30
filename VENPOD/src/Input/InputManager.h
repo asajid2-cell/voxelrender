@@ -32,6 +32,7 @@ enum class KeyAction : uint8_t {
     BrushIncrease,
     BrushDecrease,
     TogglePause,
+    TogglePerspective,
     ResetWorld,
     Count
 };

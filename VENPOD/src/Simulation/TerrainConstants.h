@@ -9,20 +9,20 @@
 
 namespace VENPOD::Simulation {
 
-// ===== TERRAIN HEIGHT BOUNDS =====
-// These MUST match the values in CS_GenerateChunk.hlsl
-constexpr int32_t TERRAIN_MIN_Y = 4;     // Minimum terrain height (deep valley/ocean floor)
-constexpr int32_t TERRAIN_MAX_Y = 124;   // Maximum terrain height within the 2-chunk render span
-constexpr int32_t SEA_LEVEL_Y = 16;      // Baseline for rivers and basin lakes
+// ===== CONCEPTUAL TERRAIN HEIGHT BOUNDS =====
+// These MUST match the values in CS_GenerateChunk.hlsl.
+// The renderer does not allocate this entire height at once. Instead, it keeps
+// a moving 3D render window around the player and streams chunk Y layers.
+constexpr int32_t TERRAIN_MIN_Y = -332;   // Deep ravine/cavern floor target
+constexpr int32_t TERRAIN_MAX_Y = 664;    // Needle spire / extreme peak target
+constexpr int32_t SEA_LEVEL_Y = -48;      // Low basin water, not a global ground plane
 
 // ===== CHUNK COORDINATES =====
-// Terrain spans these chunk Y coordinates (64-voxel chunks)
-constexpr int32_t TERRAIN_CHUNK_MIN_Y = TERRAIN_MIN_Y / 64;    // = 0
-constexpr int32_t TERRAIN_CHUNK_MAX_Y = TERRAIN_MAX_Y / 64;    // = 1
-constexpr int32_t TERRAIN_NUM_CHUNKS_Y = 2;  // Always load chunks Y=0 and Y=1
-
-// Terrain uses the full Y=0-127 render span, so chunks Y=0 and Y=1 must
-// both be generated even when the camera is far above or below sea level.
+// Floor-divide Y bounds into 64-voxel chunks. Negative Y matters here:
+// -332 lives in chunk -6, 664 lives in chunk 10.
+constexpr int32_t TERRAIN_CHUNK_MIN_Y = -6;
+constexpr int32_t TERRAIN_CHUNK_MAX_Y = 10;
+constexpr int32_t TERRAIN_TOTAL_CHUNKS_Y = TERRAIN_CHUNK_MAX_Y - TERRAIN_CHUNK_MIN_Y + 1;
 
 // ===== INFINITE CHUNK STREAMING DISTANCES =====
 // The key to seamless infinite worlds: load chunks BEFORE they're visible,
@@ -31,11 +31,11 @@ constexpr int32_t TERRAIN_NUM_CHUNKS_Y = 2;  // Always load chunks Y=0 and Y=1
 //
 // Visual diagram (top-down view, player at center):
 //
-//     UNLOAD_DISTANCE (20 chunks) - chunks deleted here
+//     UNLOAD_DISTANCE (18 chunks) - chunks deleted here
 //     |
-//     |   LOAD_DISTANCE (16 chunks) - chunks start generating here
+//     |   LOAD_DISTANCE (14 chunks) - chunks start generating here
 //     |   |
-//     |   |   RENDER_DISTANCE (12 chunks) - what you can see
+//     |   |   RENDER_DISTANCE (9 chunks) - dense voxel window
 //     |   |   |
 //     v   v   v
 //   +-------------------------------------------+
@@ -58,39 +58,72 @@ constexpr int32_t TERRAIN_NUM_CHUNKS_Y = 2;  // Always load chunks Y=0 and Y=1
 
 constexpr int32_t CHUNK_SIZE_VOXELS = 64;
 
-// RENDER_DISTANCE: What the GPU buffer can hold and render
-// This determines the visible world size: (2*12+1) * 64 = 1600 voxels = 1.6km
-constexpr int32_t RENDER_DISTANCE_HORIZONTAL = 12;  // +/-12 chunks visible
+// RENDER_DISTANCE: What the dense GPU voxel buffer can hold and render.
+// Horizontal dense distance stays bounded so the renderer can afford a tall
+// moving Y window. Longer distance should come from a future explicit far-LOD
+// renderer, not from expanding this dense editable buffer.
+constexpr int32_t RENDER_DISTANCE_HORIZONTAL = 9;  // +/-9 chunks dense/editable view
+constexpr int32_t RENDER_DISTANCE_VERTICAL_BELOW = 4;
+constexpr int32_t RENDER_DISTANCE_VERTICAL_ABOVE = 2;
+constexpr int32_t RENDER_BUFFER_CHUNKS_Y =
+    RENDER_DISTANCE_VERTICAL_BELOW + 1 + RENDER_DISTANCE_VERTICAL_ABOVE;  // 7
 
 // LOAD_DISTANCE: Where we START loading chunks (must be > RENDER_DISTANCE)
 // Chunks at this distance are loading in the background, ready when needed
 // 4-chunk buffer means chunks have ~4 chunks of travel time to generate
-constexpr int32_t LOAD_DISTANCE_HORIZONTAL = 16;  // +/-16 chunks = 33x33 = 2178 chunks loading
+constexpr int32_t LOAD_DISTANCE_HORIZONTAL = 14;  // +/-14 chunks load buffer
+constexpr int32_t LOAD_DISTANCE_VERTICAL_BELOW = 5;
+constexpr int32_t LOAD_DISTANCE_VERTICAL_ABOVE = 3;
 
 // UNLOAD_DISTANCE: Where we DELETE chunks (must be > LOAD_DISTANCE)
 // Large gap prevents thrashing at boundaries when camera moves back and forth
 // 4-chunk hysteresis prevents constant load/unload cycles
-constexpr int32_t UNLOAD_DISTANCE_HORIZONTAL = 20;  // +/-20 chunks before deletion
+constexpr int32_t UNLOAD_DISTANCE_HORIZONTAL = 18;  // +/-18 chunks before deletion
+constexpr int32_t UNLOAD_DISTANCE_VERTICAL_BELOW = 6;
+constexpr int32_t UNLOAD_DISTANCE_VERTICAL_ABOVE = 4;
 
 // ===== RENDER BUFFER SIZE =====
 // Buffer only needs to fit RENDER_DISTANCE (visible area)
 // LOAD_DISTANCE chunks exist in memory but aren't copied to render buffer
-constexpr int32_t RENDER_BUFFER_CHUNKS_X = (RENDER_DISTANCE_HORIZONTAL * 2 + 1);  // 25
-constexpr int32_t RENDER_BUFFER_CHUNKS_Y = TERRAIN_NUM_CHUNKS_Y;  // 2
-constexpr int32_t RENDER_BUFFER_CHUNKS_Z = (RENDER_DISTANCE_HORIZONTAL * 2 + 1);  // 25
+constexpr int32_t RENDER_BUFFER_CHUNKS_X = (RENDER_DISTANCE_HORIZONTAL * 2 + 1);  // 19
+constexpr int32_t RENDER_BUFFER_CHUNKS_Z = (RENDER_DISTANCE_HORIZONTAL * 2 + 1);  // 19
 
-constexpr int32_t RENDER_BUFFER_VOXELS_X = RENDER_BUFFER_CHUNKS_X * CHUNK_SIZE_VOXELS;  // 1600
-constexpr int32_t RENDER_BUFFER_VOXELS_Y = RENDER_BUFFER_CHUNKS_Y * CHUNK_SIZE_VOXELS;  // 128
-constexpr int32_t RENDER_BUFFER_VOXELS_Z = RENDER_BUFFER_CHUNKS_Z * CHUNK_SIZE_VOXELS;  // 1600
+constexpr int32_t RENDER_BUFFER_VOXELS_X = RENDER_BUFFER_CHUNKS_X * CHUNK_SIZE_VOXELS;  // 1216
+constexpr int32_t RENDER_BUFFER_VOXELS_Y = RENDER_BUFFER_CHUNKS_Y * CHUNK_SIZE_VOXELS;  // 448
+constexpr int32_t RENDER_BUFFER_VOXELS_Z = RENDER_BUFFER_CHUNKS_Z * CHUNK_SIZE_VOXELS;  // 1216
+
+// Clamp a vertical streaming/render-window center so the requested below/above
+// chunk span still intersects the generated terrain range. This must never be
+// applied to player/camera world position; it is only a content streaming policy.
+constexpr int32_t ClampVerticalChunkCenter(
+    int32_t rawCenterY,
+    int32_t chunksBelow,
+    int32_t chunksAbove)
+{
+    const int32_t strictMinCenter = TERRAIN_CHUNK_MIN_Y + chunksBelow;
+    const int32_t strictMaxCenter = TERRAIN_CHUNK_MAX_Y - chunksAbove;
+    const int32_t minCenter = (strictMinCenter <= strictMaxCenter) ? strictMinCenter : TERRAIN_CHUNK_MIN_Y;
+    const int32_t maxCenter = (strictMinCenter <= strictMaxCenter) ? strictMaxCenter : TERRAIN_CHUNK_MAX_Y;
+
+    return rawCenterY < minCenter ? minCenter :
+        (rawCenterY > maxCenter ? maxCenter : rawCenterY);
+}
 
 // ===== VRAM BUDGET =====
-// With LOAD_DISTANCE=16: 33x33x2 = 2,178 chunks x 1 MB = ~2.2 GB for chunks
-// With RENDER_DISTANCE=12: 25x25x2 = 1,250 chunks in render buffer
-// Both fit comfortably in RTX 3070 Ti's 8GB VRAM
+// Render window: 19x7x19 = 2,527 chunks = 662M voxels per ping-pong buffer.
+// This is a high default for the current dense editable representation. It
+// improves near-field view distance without jumping to the unsafe +/-14 dense
+// setting, which would require roughly 12.8 GB for ping-pong buffers alone.
+// Longer distance should come from far LOD / sparse acceleration, not just a
+// larger dense box.
 
 // ===== VALIDATION =====
-static_assert(TERRAIN_MAX_Y < 128, "Terrain exceeds 2-chunk vertical span");
-static_assert(TERRAIN_MIN_Y >= 0, "Terrain below world origin");
+static_assert(RENDER_BUFFER_CHUNKS_Y == 7, "Expected a 7-chunk vertical render window");
+static_assert(LOAD_DISTANCE_VERTICAL_BELOW >= RENDER_DISTANCE_VERTICAL_BELOW,
+    "Vertical load window must cover the render window below the player");
+static_assert(LOAD_DISTANCE_VERTICAL_ABOVE >= RENDER_DISTANCE_VERTICAL_ABOVE,
+    "Vertical load window must cover the render window above the player");
+static_assert(TERRAIN_CHUNK_MIN_Y < 0, "Vertical world should support negative terrain");
 static_assert(SEA_LEVEL_Y > TERRAIN_MIN_Y && SEA_LEVEL_Y < TERRAIN_MAX_Y,
     "Sea level outside terrain bounds");
 

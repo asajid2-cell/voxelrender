@@ -58,12 +58,17 @@ struct ChunkCoord {
     // Convert world voxel position to chunk coordinate
     // For CHUNK_SIZE=64: voxel {65,0,0} -> ChunkCoord{1,0,0}
     // For negative coords: voxel {-1,0,0} -> ChunkCoord{-1,0,0} (NOT chunk 0!)
-    static ChunkCoord FromWorldPosition(int32_t worldX, int32_t worldY, int32_t worldZ, uint32_t chunkSize) {
-        // Floor division that correctly handles negative coordinates
-        auto FloorDiv = [](int32_t a, int32_t b) -> int32_t {
-            return (a >= 0) ? (a / b) : ((a - b + 1) / b);
-        };
+    static int32_t FloorDiv(int32_t value, int32_t divisor) {
+        return (value >= 0) ? (value / divisor) : ((value - divisor + 1) / divisor);
+    }
 
+    static uint32_t LocalCoord(int32_t worldCoord, uint32_t chunkSize) {
+        const int32_t size = static_cast<int32_t>(chunkSize);
+        int32_t local = worldCoord % size;
+        return static_cast<uint32_t>(local < 0 ? local + size : local);
+    }
+
+    static ChunkCoord FromWorldPosition(int32_t worldX, int32_t worldY, int32_t worldZ, uint32_t chunkSize) {
         int32_t chunkSizeSigned = static_cast<int32_t>(chunkSize);
         return ChunkCoord{
             FloorDiv(worldX, chunkSizeSigned),

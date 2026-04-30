@@ -5,6 +5,8 @@
 
 #include "launcher.h"
 #include <Windows.h>
+#include <cstdlib>
+#include <cstring>
 
 // Forward declarations for mode entry points
 int RunSandSimulator(int argc, char* argv[]);
@@ -15,6 +17,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     (void)hPrevInstance;
     (void)lpCmdLine;
     (void)nCmdShow;
+
+    const char* modeOverride = std::getenv("VENPOD_MODE");
+    if (modeOverride) {
+        int argc = 0;
+        char** argv = nullptr;
+        if (_stricmp(modeOverride, "sandbox") == 0) {
+            return RunSandbox(argc, argv);
+        }
+        if (_stricmp(modeOverride, "sand") == 0 || _stricmp(modeOverride, "sandsim") == 0) {
+            return RunSandSimulator(argc, argv);
+        }
+    }
 
     // Show launcher dialog
     LaunchMode mode = ShowLauncherDialog(hInstance);

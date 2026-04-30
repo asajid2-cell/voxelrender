@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <algorithm>
 
 using namespace VENPOD;
 using namespace VENPOD::Graphics;
@@ -38,6 +39,67 @@ struct FrameContext {
     ComPtr<ID3D12CommandAllocator> commandAllocator;
     uint64_t fenceValue = 0;
 };
+
+static glm::vec3 ApplyCloseTraversalBrushFallback(
+    const glm::vec3& rawBrushLocal,
+    const glm::vec3& cameraLocal,
+    const glm::vec3& cameraForward,
+    float playerHeight,
+    float playerRadius,
+    float brushRadius,
+    bool buildStroke,
+    bool* adjustedOut = nullptr)
+{
+    if (adjustedOut) {
+        *adjustedOut = false;
+    }
+    if (!buildStroke) {
+        return rawBrushLocal;
+    }
+
+    const glm::vec3 feetLocal = cameraLocal - glm::vec3(0.0f, playerHeight, 0.0f);
+    glm::vec3 flatToBrush(rawBrushLocal.x - feetLocal.x, 0.0f, rawBrushLocal.z - feetLocal.z);
+    float horizontalDistance = glm::length(flatToBrush);
+
+    glm::vec3 flatForward(cameraForward.x, 0.0f, cameraForward.z);
+    if (glm::length(flatForward) < 0.001f) {
+        flatForward = glm::vec3(0.0f, 0.0f, 1.0f);
+    } else {
+        flatForward = glm::normalize(flatForward);
+    }
+
+    glm::vec3 rampDirection = horizontalDistance > 0.001f ? flatToBrush / horizontalDistance : flatForward;
+    if (glm::dot(rampDirection, flatForward) < -0.1f) {
+        return rawBrushLocal;
+    }
+
+    const float closeRampStart = std::max(18.0f, brushRadius * 4.0f);
+    const float minSafeDistance = std::max(playerRadius + brushRadius * 0.85f, 4.0f);
+    if (horizontalDistance > closeRampStart) {
+        return rawBrushLocal;
+    }
+
+    glm::vec3 adjusted = rawBrushLocal;
+    if (horizontalDistance < minSafeDistance) {
+        adjusted.x = feetLocal.x + rampDirection.x * minSafeDistance;
+        adjusted.z = feetLocal.z + rampDirection.z * minSafeDistance;
+        horizontalDistance = minSafeDistance;
+    }
+
+    const float range = std::max(0.001f, closeRampStart - minSafeDistance);
+    float blend = 1.0f - std::clamp((horizontalDistance - minSafeDistance) / range, 0.0f, 1.0f);
+    blend = blend * blend * (3.0f - 2.0f * blend);
+
+    const float nearCenterY = feetLocal.y - std::max(0.5f, brushRadius * 0.45f);
+    if (nearCenterY < adjusted.y) {
+        adjusted.y = adjusted.y + (nearCenterY - adjusted.y) * blend;
+    }
+
+    if (adjustedOut && glm::length(adjusted - rawBrushLocal) > 0.001f) {
+        *adjustedOut = true;
+    }
+    return adjusted;
+}
 
 // Get the executable directory to find assets
 std::filesystem::path GetExecutableDirectory() {
@@ -115,7 +177,7 @@ int main(int argc, char* argv[]) {
     // Initialize Renderer
     auto renderer = std::make_unique<Renderer>();
     RendererConfig rendererConfig;
-    rendererConfig.cbvSrvUavDescriptorCount = 8192;  // DOUBLED: Increased from 4096 to handle 100+ chunks safely
+    rendererConfig.cbvSrvUavDescriptorCount = 32768;  // Larger stream window needs room for chunk SRV/UAV descriptors.
     rendererConfig.rtvDescriptorCount = 32;
     rendererConfig.dsvDescriptorCount = 8;
     rendererConfig.debugShaders = true;  // Enable debug info for development
@@ -679,12 +741,13 @@ int main(int argc, char* argv[]) {
             cameraRight * brushNDC.x * tanHalfFov * aspectRatio +
             cameraUp * brushNDC.y * tanHalfFov
         );
+        glm::vec3 brushRayOriginWorld = cameraPos;
 
         // Update brush controller (material, radius, buttons)
         // No CPU voxel data needed - GPU does the raycasting!
         brushController.UpdateFromMouse(
             brushNDC,
-            cameraPos,
+            brushRayOriginWorld,
             cameraForward,
             cameraRight,
             cameraUp,
@@ -703,6 +766,7 @@ int main(int argc, char* argv[]) {
 
         // Wait for this frame's previous work to complete
         commandQueue->WaitForFenceValue(ctx.fenceValue);
+        voxelWorld->RetireBrushEditFeedback(commandQueue->GetLastCompletedFenceValue());
 
         // Reset command allocator and command list
         ctx.commandAllocator->Reset();
@@ -729,7 +793,7 @@ int main(int argc, char* argv[]) {
                 int readIdx = voxelWorld->GetReadBufferIndex();
                 size_t copiedRead  = voxelWorld->GetCopiedChunkCount(readIdx);
                 size_t copiedWrite = voxelWorld->GetCopiedChunkCount(1 - readIdx);
-                spdlog::info("Copied chunks: READ={} WRITE={} (readIdx={})",
+                spdlog::debug("Copied chunks: READ={} WRITE={} (readIdx={})",
                     copiedRead, copiedWrite, readIdx);
             }
         }
@@ -752,13 +816,14 @@ int main(int argc, char* argv[]) {
         // Cast a ray straight down from player FEET position to find ground
         // Camera is at eye level, so subtract playerHeight to get feet position
         glm::vec3 playerFeetLocal = cameraPosLocal - glm::vec3(0, playerHeight, 0);
+        glm::vec3 brushRayOriginLocal = cameraPosLocal;
         glm::vec3 downDir = glm::vec3(0, -1, 0);
         physicsDispatcher->DispatchGroundRaycast(commandList.Get(), *voxelWorld, playerFeetLocal, downDir);
 
-        // === GPU BRUSH RAYCASTING (NEW - 2,000,000x FASTER!) ===
-        // Dispatch single-thread GPU compute to find brush position in local grid space.
-        // This replaces the 32MB CPU readback with 16 bytes!
-        physicsDispatcher->DispatchBrushRaycast(commandList.Get(), *voxelWorld, cameraPosLocal, rayDir);
+        // === GPU BRUSH RAYCASTING ===
+        // Target from the camera/crosshair. Feet-relative traversal placement
+        // should be brush policy, not the raw ray origin.
+        physicsDispatcher->DispatchBrushRaycast(commandList.Get(), *voxelWorld, brushRayOriginLocal, rayDir);
 
         // Begin frame - transitions back buffer, sets render target, viewport, etc.
         renderer->BeginFrame(commandList.Get(), frameIndex);
@@ -824,7 +889,8 @@ int main(int argc, char* argv[]) {
             // Calculate distance to hit point
             glm::vec3 hitPosLocal = glm::vec3(gpuRaycastResult.posX, gpuRaycastResult.posY, gpuRaycastResult.posZ);
             glm::vec3 hitPosWorld = hitPosLocal + regionOriginWorld;
-            float distanceToHit = glm::length(hitPosWorld - cameraPos);
+            glm::vec3 currentBrushOriginWorld = cameraPos;
+            float distanceToHit = glm::length(hitPosWorld - currentBrushOriginWorld);
 
             // If we're about to walk into a wall (hit within player radius + small margin)
             // and the hit is roughly at player height (not floor/ceiling), stop horizontal movement
@@ -858,6 +924,7 @@ int main(int argc, char* argv[]) {
         // Use GPU raycast position, or fallback to fixed distance in empty air
         if (brushController.IsPainting() || brushController.IsErasing()) {
             glm::vec3 brushPos;
+            const bool buildStroke = brushController.IsPainting() && !brushController.IsErasing();
 
             if (gpuRaycastResult.hasValidPosition) {
                 // Use GPU raycast hit position (on solid voxel face).
@@ -869,9 +936,9 @@ int main(int argc, char* argv[]) {
                         brushPos.x, brushPos.y, brushPos.z, brushController.GetMaterial());
                 }
             } else {
-                // Fallback: place at fixed distance in empty air (10 voxels ahead)
-                // in LOCAL 256^3 grid space around the camera.
-                brushPos = cameraPosLocal + rayDir * 10.0f;
+                // Fallback: place at fixed distance from the crosshair ray.
+                // Avoid underfoot placement, which can lift/snap the player.
+                brushPos = cameraPosLocal + rayDir * 12.0f;
 
                 // Clamp to grid bounds
                 brushPos = glm::clamp(brushPos,
@@ -884,6 +951,31 @@ int main(int argc, char* argv[]) {
                 if (logCounter++ % 60 == 0) {  // Log once per second
                     spdlog::info("Painting in air at: ({:.1f}, {:.1f}, {:.1f}), material={}",
                         brushPos.x, brushPos.y, brushPos.z, brushController.GetMaterial());
+                }
+            }
+
+            bool closeRampAdjusted = false;
+            brushPos = ApplyCloseTraversalBrushFallback(
+                brushPos,
+                cameraPosLocal,
+                cameraForward,
+                playerHeight,
+                playerRadius,
+                brushController.GetRadius(),
+                buildStroke,
+                &closeRampAdjusted);
+
+            brushPos = glm::clamp(brushPos,
+                glm::vec3(0.5f),
+                glm::vec3(voxelWorld->GetGridSizeX() - 0.5f,
+                         voxelWorld->GetGridSizeY() - 0.5f,
+                         voxelWorld->GetGridSizeZ() - 0.5f));
+
+            if (closeRampAdjusted) {
+                static int rampLogCounter = 0;
+                if (rampLogCounter++ % 60 == 0) {
+                    spdlog::info("Close traversal brush ramp: local=({:.1f},{:.1f},{:.1f})",
+                        brushPos.x, brushPos.y, brushPos.z);
                 }
             }
 
@@ -911,7 +1003,9 @@ int main(int argc, char* argv[]) {
                 commandList.Get(),
                 *voxelWorld,
                 *chunkManager,
-                static_cast<uint32_t>(frameCount)
+                static_cast<uint32_t>(frameCount),
+                cameraPosLocal,
+                512u
             );
 
             // Run physics on active chunks using ExecuteIndirect
@@ -977,10 +1071,21 @@ int main(int argc, char* argv[]) {
             &brushPreview  // GPU result handles validity internally
         );
 
-        // Render crosshair at screen center
-        renderer->RenderCrosshair(commandList.Get());
-
         // Render ImGui draw data to command list
+        ImDrawList* foregroundDrawList = ImGui::GetForegroundDrawList();
+        const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
+        const ImVec2 center(displaySize.x * 0.5f, displaySize.y * 0.5f);
+        const ImU32 crosshairColor = IM_COL32(225, 240, 255, 210);
+        foregroundDrawList->AddLine(
+            ImVec2(center.x - 8.0f, center.y),
+            ImVec2(center.x + 8.0f, center.y),
+            crosshairColor,
+            1.5f);
+        foregroundDrawList->AddLine(
+            ImVec2(center.x, center.y - 8.0f),
+            ImVec2(center.x, center.y + 8.0f),
+            crosshairColor,
+            1.5f);
         imguiBackend.Render(commandList.Get());
 
         // Request tiny 16-byte GPU->CPU readback for next frame's brush preview
@@ -1013,6 +1118,7 @@ int main(int argc, char* argv[]) {
 
         // Signal fence for this frame
         ctx.fenceValue = commandQueue->Signal();
+        voxelWorld->NotifyBrushEditFeedbackFence(ctx.fenceValue);
 
         // End input frame
         inputManager.EndFrame();
