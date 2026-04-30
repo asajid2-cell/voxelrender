@@ -30,12 +30,13 @@ struct InfiniteChunkConfig {
     // - unloadDistanceHorizontal: Where chunks get DELETED (far beyond load area)
     // The gap between load and unload prevents thrashing when moving back and forth.
 
-    int32_t loadDistanceHorizontal = 16;   // +/-16 chunks = 33x33 = 2178 chunks loading
-    int32_t unloadDistanceHorizontal = 20; // +/-20 chunks before deletion (4-chunk hysteresis)
+    int32_t loadDistanceHorizontal = 14;   // Default overridden from TerrainConstants in sandbox.
+    int32_t unloadDistanceHorizontal = 18; // 4-chunk hysteresis beyond the load window.
 
-    // Vertical is fixed to terrain layers (Y=0,1) - these are mostly unused
-    int32_t loadDistanceVertical = 2;      // UNUSED - fixed to TERRAIN_NUM_CHUNKS_Y
-    int32_t unloadDistanceVertical = 3;    // Unload chunks beyond terrain layers
+    int32_t loadDistanceVerticalBelow = 3;
+    int32_t loadDistanceVerticalAbove = 2;
+    int32_t unloadDistanceVerticalBelow = 4;
+    int32_t unloadDistanceVerticalAbove = 3;
 
     uint32_t chunksPerFrame = 1;           // Generate 1 chunk per frame (safe, no GPU flooding)
     uint32_t maxQueuedChunks = 64;         // Queue up to 64 chunks (enough for streaming)
@@ -121,6 +122,7 @@ private:
     Result<void> QueueChunksAroundCamera(const ChunkCoord& cameraChunk);
     Result<void> GenerateNextChunk(ID3D12Device* device, ID3D12CommandQueue* cmdQueue);  // CHANGED: Uses internal cmdList + executes immediately
     void UnloadDistantChunks(const ChunkCoord& cameraChunk);
+    bool IsWithinLoadWindow(const ChunkCoord& coord, const ChunkCoord& center) const;
 
     // Create generation compute pipeline
     Result<void> CreateGenerationPipeline(ID3D12Device* device);

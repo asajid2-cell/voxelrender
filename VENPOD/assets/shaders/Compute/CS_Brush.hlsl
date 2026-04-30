@@ -40,10 +40,17 @@ cbuffer BrushConstants : register(b0) {
     uint startY;
     uint startZ;
     uint padding;
+
+    uint recordEdits;
+    uint maxEditEvents;
+    uint feedbackFrame;
+    uint feedbackPadding;
 };
 
 // Voxel buffer (read-write)
 RWStructuredBuffer<uint> VoxelBuffer : register(u0);
+RWStructuredBuffer<uint2> EditEvents : register(u1);
+RWStructuredBuffer<uint> EditCounter : register(u2);
 
 // Signed distance functions
 float SDFSphere(float3 p, float3 center, float r) {
@@ -154,6 +161,17 @@ void main(uint3 DTid : SV_DispatchThreadID) {
         }
     }
 
-    // Write result
-    VoxelBuffer[index] = newVoxel;
+    // Write only real changes. This is also the persistence boundary: if the
+    // shader did not change a voxel, the CPU should not persist a fake edit.
+    if (newVoxel != currentVoxel) {
+        VoxelBuffer[index] = newVoxel;
+
+        if (recordEdits != 0) {
+            uint eventIndex = 0;
+            InterlockedAdd(EditCounter[0], 1, eventIndex);
+            if (eventIndex < maxEditEvents) {
+                EditEvents[eventIndex] = uint2(index, newVoxel);
+            }
+        }
+    }
 }

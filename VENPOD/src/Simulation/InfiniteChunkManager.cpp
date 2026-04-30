@@ -6,6 +6,7 @@
 #include "../Graphics/RHI/DX12ComputePipeline.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
+#include <cmath>
 
 namespace VENPOD::Simulation {
 
@@ -79,14 +80,18 @@ Result<void> InfiniteChunkManager::Initialize(
         m_allocatorFenceValues[i] = 0;  // 0 = ready for immediate use (never used)
     }
 
-    spdlog::info("InfiniteChunkManager initialized - LOAD distance: {} chunks, UNLOAD distance: {} chunks (FIXED Y={},{} layers), seed: {}",
+    spdlog::info("InfiniteChunkManager initialized - load XZ +/-{}, load Y -{}/+{}, unload XZ +/-{}, unload Y -{}/+{}, seed: {}",
         m_config.loadDistanceHorizontal,
+        m_config.loadDistanceVerticalBelow,
+        m_config.loadDistanceVerticalAbove,
         m_config.unloadDistanceHorizontal,
-        TERRAIN_CHUNK_MIN_Y, TERRAIN_CHUNK_MIN_Y + TERRAIN_NUM_CHUNKS_Y - 1,
+        m_config.unloadDistanceVerticalBelow,
+        m_config.unloadDistanceVerticalAbove,
         m_config.worldSeed);
-    spdlog::info("Terrain generation: INDEPENDENT of camera Y - always at world Y={}-{} (chunks {},{})",
-        TERRAIN_MIN_Y, TERRAIN_MIN_Y + (TERRAIN_NUM_CHUNKS_Y * CHUNK_SIZE_VOXELS) - 1,
-        TERRAIN_CHUNK_MIN_Y, TERRAIN_CHUNK_MIN_Y + TERRAIN_NUM_CHUNKS_Y - 1);
+    spdlog::info("Terrain generation: vertical world Y={}..{} (chunks {}..{}), rendered through a moving {}-chunk Y window",
+        TERRAIN_MIN_Y, TERRAIN_MAX_Y,
+        TERRAIN_CHUNK_MIN_Y, TERRAIN_CHUNK_MAX_Y,
+        RENDER_BUFFER_CHUNKS_Y);
     spdlog::info("Seamless streaming: chunks load at {} chunks, visible at {} chunks, unload at {} chunks",
         m_config.loadDistanceHorizontal, RENDER_DISTANCE_HORIZONTAL, m_config.unloadDistanceHorizontal);
 
@@ -182,25 +187,39 @@ void InfiniteChunkManager::Update(
     // ===== STEP 0b: FIX #1/#3 - Verify completed chunks and mark as Generated =====
     VerifyGeneratedChunks();
 
-    // ===== STEP 1: Calculate camera's chunk coordinate (HORIZONTAL ONLY) =====
-    // FIX: Terrain generation should be INDEPENDENT of camera Y position!
-    // The terrain exists at Y=5 to Y=60, which spans chunks Y=0 and Y=64.
-    // We should ALWAYS load those chunks, regardless of camera altitude.
-    // Only use camera X/Z to determine horizontal chunk position.
-    ChunkCoord cameraChunk = ChunkCoord::FromWorldPosition(
-        static_cast<int32_t>(cameraWorldPos.x),
-        0,  // FIX: Always use Y=0 as reference (terrain is at Y=0-64 chunk range)
-        static_cast<int32_t>(cameraWorldPos.z),
+    // ===== STEP 1: Calculate camera's chunk coordinate in full 3D =====
+    // Keep the raw camera chunk for diagnostics, but clamp the streaming Y
+    // center so flying above/below the conceptual terrain range does not unload
+    // every real terrain chunk and leave the player looking at an empty window.
+    ChunkCoord rawCameraChunk = ChunkCoord::FromWorldPosition(
+        static_cast<int32_t>(std::floor(cameraWorldPos.x)),
+        static_cast<int32_t>(std::floor(cameraWorldPos.y)),
+        static_cast<int32_t>(std::floor(cameraWorldPos.z)),
         INFINITE_CHUNK_SIZE
     );
+    ChunkCoord cameraChunk = rawCameraChunk;
+    cameraChunk.y = ClampVerticalChunkCenter(
+        rawCameraChunk.y,
+        m_config.loadDistanceVerticalBelow,
+        m_config.loadDistanceVerticalAbove);
 
     // PRIORITY 2: Store camera chunk for external access (chunk scan optimization)
-    m_cameraChunk = cameraChunk;
+    m_cameraChunk = rawCameraChunk;
 
     bool shouldQueueChunks = true;
+    const bool cameraMoved = cameraChunk != m_lastCameraChunk;
+
+    if (cameraMoved) {
+        // Keep existing pending work instead of destroying it on every chunk
+        // boundary. Most queued chunks are still inside the new load window, and
+        // repeatedly clearing the queue prevents render-window edge chunks from
+        // ever finishing during fast movement. GenerateNextChunk drops truly
+        // stale entries when they reach the front of the queue.
+        m_stationaryFrameCount = 0;
+    }
 
     // Only queue new chunks if camera moved or the current queue drained.
-    if (cameraChunk == m_lastCameraChunk) {
+    if (!cameraMoved) {
         // CRITICAL FIX: Continue generating queued chunks even when stationary
         // The previous logic had a deadlock: after 3 chunks, it would return if queue wasn't empty,
         // causing 20+ chunks to remain stuck in queue forever -> system freeze
@@ -217,20 +236,18 @@ void InfiniteChunkManager::Update(
             // batch. Waiting here made nearby terrain fill in visible pulses.
             m_stationaryFrameCount = 0;
         }
-    } else {
-        // Camera moved - reset stationary counter and re-queue immediately
-        m_stationaryFrameCount = 0;
     }
 
     m_lastCameraChunk = cameraChunk;
 
     // Log only when camera chunk changes (not every frame)
     static ChunkCoord lastLoggedChunk = {INT32_MAX, INT32_MAX, INT32_MAX};
-    if (cameraChunk != lastLoggedChunk) {
-        spdlog::debug("Camera chunk: [{},{},{}] - world pos: ({:.1f},{:.1f},{:.1f})",
+    if (rawCameraChunk != lastLoggedChunk) {
+        spdlog::debug("Camera chunk: raw=[{},{},{}] stream=[{},{},{}] - world pos: ({:.1f},{:.1f},{:.1f})",
+            rawCameraChunk.x, rawCameraChunk.y, rawCameraChunk.z,
             cameraChunk.x, cameraChunk.y, cameraChunk.z,
             cameraWorldPos.x, cameraWorldPos.y, cameraWorldPos.z);
-        lastLoggedChunk = cameraChunk;
+        lastLoggedChunk = rawCameraChunk;
     }
 
     // ===== STEP 2: Queue chunks within cylindrical render distance =====
@@ -245,8 +262,8 @@ void InfiniteChunkManager::Update(
     // STARTUP OPTIMIZATION: Generate MORE chunks per frame initially to fill
     // the visible area faster. Once loaded chunks >= visible area, slow down.
     //
-    // Visible area = 25x25x2 = 1250 chunks (RENDER_BUFFER_CHUNKS_X * Z * Y)
-    // During startup: generate up to 8 chunks/frame (fills visible in ~160 frames = 2.7 seconds)
+    // Visible area = 15x6x15 = 1350 chunks (RENDER_BUFFER_CHUNKS_X * Z * Y)
+    // During startup: generate a small fixed batch per frame to preserve frame time.
     // After startup: generate 1 chunk/frame (just keeping up with movement)
     //
     // With 3 command allocators, we can safely queue 3 parallel generations.
@@ -347,19 +364,19 @@ Result<void> InfiniteChunkManager::QueueChunksAroundCamera(const ChunkCoord& cam
         int32_t distanceSquared;
     };
     std::vector<Candidate> candidates;
+    int32_t yMin = std::max(TERRAIN_CHUNK_MIN_Y, cameraChunk.y - m_config.loadDistanceVerticalBelow);
+    int32_t yMax = std::min(TERRAIN_CHUNK_MAX_Y, cameraChunk.y + m_config.loadDistanceVerticalAbove);
+    int32_t yCount = std::max<int32_t>(0, yMax - yMin + 1);
     candidates.reserve(static_cast<size_t>(
         (m_config.loadDistanceHorizontal * 2 + 1) *
         (m_config.loadDistanceHorizontal * 2 + 1) *
-        TERRAIN_NUM_CHUNKS_Y));
+        yCount));
 
-    // ===== FIXED VERTICAL LAYERS + HORIZONTAL LOADING =====
-    // FIX: Terrain is at Y=TERRAIN_MIN_Y to Y=TERRAIN_MAX_Y, which spans chunks Y=0 and Y=1
-    // We ALWAYS load these TERRAIN_NUM_CHUNKS_Y vertical layers, regardless of camera altitude.
-    // Only horizontal (X/Z) position varies based on camera.
-    //
-    // SEAMLESS STREAMING: Use loadDistanceHorizontal (larger than render distance)
-    // This loads chunks BEFORE they become visible, so player never sees pop-in.
-    for (int32_t dy = TERRAIN_CHUNK_MIN_Y; dy < TERRAIN_CHUNK_MIN_Y + TERRAIN_NUM_CHUNKS_Y; ++dy) {
+    // ===== 3D VERTICAL WINDOW + HORIZONTAL LOADING =====
+    // Queue chunk layers around the player's current Y chunk, clamped to the
+    // conceptual terrain range. This keeps the loaded set bounded while allowing
+    // the visible window to travel from deep ravines to high spires.
+    for (int32_t chunkY = yMin; chunkY <= yMax; ++chunkY) {
         for (int32_t dx = -m_config.loadDistanceHorizontal; dx <= m_config.loadDistanceHorizontal; ++dx) {
             for (int32_t dz = -m_config.loadDistanceHorizontal; dz <= m_config.loadDistanceHorizontal; ++dz) {
                 // FIX: Use SQUARE pattern to match VoxelWorld renderer expectations
@@ -378,7 +395,7 @@ Result<void> InfiniteChunkManager::QueueChunksAroundCamera(const ChunkCoord& cam
 
                 ChunkCoord coord = {
                     cameraChunk.x + dx,
-                    dy,  // FIX: Absolute Y coordinate (0 or 1), not relative to camera
+                    chunkY,
                     cameraChunk.z + dz
                 };
 
@@ -392,7 +409,8 @@ Result<void> InfiniteChunkManager::QueueChunksAroundCamera(const ChunkCoord& cam
                     continue;  // Already queued/generating
                 }
 
-                int32_t distSq = dx * dx + dz * dz;
+                int32_t dy = chunkY - cameraChunk.y;
+                int32_t distSq = dx * dx + dz * dz + dy * dy;
                 candidates.push_back(Candidate{coord, distSq});
             }
         }
@@ -422,8 +440,9 @@ Result<void> InfiniteChunkManager::QueueChunksAroundCamera(const ChunkCoord& cam
     }
 
     if (queuedCount > 0) {
-        spdlog::debug("Queued {} new chunks for generation at Y=0,1 (queue size: {}/{}) - load distance: {} chunks",
-            queuedCount, m_generationQueue.size(), m_config.maxQueuedChunks,
+        spdlog::debug("Queued {} new chunks for generation at Y={}..{} (queue size: {}/{}) - load distance: {} chunks",
+            queuedCount, yMin, yMax,
+            m_generationQueue.size(), m_config.maxQueuedChunks,
             m_config.loadDistanceHorizontal);
 
         // Log first few chunks being queued for verification
@@ -451,10 +470,30 @@ Result<void> InfiniteChunkManager::GenerateNextChunk(
         return {};
     }
 
-    // Pop highest priority chunk (nearest to camera)
-    ChunkPriorityEntry entry = m_generationQueue.top();
-    m_generationQueue.pop();
-    ChunkCoord coord = entry.coord;
+    // Pop highest priority chunk (nearest to the center when it was queued).
+    // Discard stale entries that are no longer inside the current load window;
+    // this avoids old far work blocking new near chunks without throwing away
+    // still-useful pending chunks on every camera chunk transition.
+    ChunkPriorityEntry entry;
+    ChunkCoord coord;
+    bool foundRelevantEntry = false;
+    while (!m_generationQueue.empty()) {
+        entry = m_generationQueue.top();
+        m_generationQueue.pop();
+        coord = entry.coord;
+
+        if (!IsWithinLoadWindow(coord, m_lastCameraChunk)) {
+            m_chunkRequeueCount.erase(coord);
+            continue;
+        }
+
+        foundRelevantEntry = true;
+        break;
+    }
+
+    if (!foundRelevantEntry) {
+        return {};
+    }
 
     // Skip if already loaded (could have been queued multiple times)
     if (m_loadedChunks.find(coord) != m_loadedChunks.end()) {
@@ -655,10 +694,7 @@ void InfiniteChunkManager::UnloadDistantChunks(const ChunkCoord& cameraChunk) {
     for (auto it = m_loadedChunks.begin(); it != m_loadedChunks.end(); ) {
         const ChunkCoord& coord = it->first;
 
-        // FIX: Only check horizontal distance, keep terrain layers always loaded
-        // Unload chunks that are outside the terrain vertical range OR too far horizontally
-        bool outsideTerrainLayers = (coord.y < TERRAIN_CHUNK_MIN_Y ||
-                                      coord.y >= TERRAIN_CHUNK_MIN_Y + TERRAIN_NUM_CHUNKS_Y);
+        bool outsideTerrainRange = (coord.y < TERRAIN_CHUNK_MIN_Y || coord.y > TERRAIN_CHUNK_MAX_Y);
 
         // FIX: Calculate horizontal distance using SQUARE (Chebyshev) metric
         // Must match the square loading pattern, not circular
@@ -667,9 +703,11 @@ void InfiniteChunkManager::UnloadDistantChunks(const ChunkCoord& cameraChunk) {
         int32_t horizontalDist = std::max(std::abs(dx), std::abs(dz));  // Chebyshev distance
 
         bool beyondHorizontal = horizontalDist > m_config.unloadDistanceHorizontal;
+        bool beyondVertical =
+            coord.y < cameraChunk.y - m_config.unloadDistanceVerticalBelow ||
+            coord.y > cameraChunk.y + m_config.unloadDistanceVerticalAbove;
 
-        // Unload if outside terrain layers OR beyond horizontal distance
-        if (outsideTerrainLayers || beyondHorizontal) {
+        if (outsideTerrainRange || beyondHorizontal || beyondVertical) {
             // CRITICAL FIX #7: Don't unload chunks that are still generating!
             // This prevents CPU-GPU deadlock when trying to unload mid-generation chunks
             Chunk* chunk = it->second;
@@ -725,17 +763,17 @@ void InfiniteChunkManager::UnloadDistantChunks(const ChunkCoord& cameraChunk) {
             // previous frames causes D3D12 ERROR: OBJECT_DELETED_WHILE_STILL_IN_USE crash
             // Solution: Queue entire chunk for deferred delete, will delete 10 frames later when GPU is done
             if (it->second) {
-                Chunk* chunk = it->second;
+                Chunk* chunkToDelete = it->second;
 
                 // Queue entire chunk for deferred deletion (includes buffers AND descriptors)
                 DeferredChunkDelete deferredDelete;
-                deferredDelete.chunk = chunk;
+                deferredDelete.chunk = chunkToDelete;
                 // Delete 10 frames later - ensures GPU has finished using chunk buffers
                 // (3 frame ring buffer x 3 = 9 frames safety margin, rounded to 10)
                 deferredDelete.fenceValue = m_chunkFenceValue + 10;
 
                 m_deferredChunkDeletes.push_back(deferredDelete);
-                spdlog::debug("Chunk [{},{},{}] queued for deferred delete (fence {})",
+                spdlog::trace("Chunk [{},{},{}] queued for deferred delete (fence {})",
                     coord.x, coord.y, coord.z, deferredDelete.fenceValue);
             }
 
@@ -745,14 +783,30 @@ void InfiniteChunkManager::UnloadDistantChunks(const ChunkCoord& cameraChunk) {
             // Clear re-queue counter for unloaded chunks
             m_chunkRequeueCount.erase(coord);
 
-            spdlog::debug("Unloaded chunk [{},{},{}] - distance: horiz={} (outsideTerrainLayers={})",
-                coord.x, coord.y, coord.z, horizontalDist, outsideTerrainLayers);
+            spdlog::trace("Unloaded chunk [{},{},{}] - distance: horiz={} outsideRange={} beyondVertical={}",
+                coord.x, coord.y, coord.z, horizontalDist, outsideTerrainRange, beyondVertical);
 
             it = m_loadedChunks.erase(it);
         } else {
             ++it;
         }
     }
+}
+
+bool InfiniteChunkManager::IsWithinLoadWindow(const ChunkCoord& coord, const ChunkCoord& center) const {
+    if (coord.y < TERRAIN_CHUNK_MIN_Y || coord.y > TERRAIN_CHUNK_MAX_Y) {
+        return false;
+    }
+
+    const int32_t dx = coord.x - center.x;
+    const int32_t dz = coord.z - center.z;
+    const int32_t horizontalDist = std::max(std::abs(dx), std::abs(dz));
+    if (horizontalDist > m_config.loadDistanceHorizontal) {
+        return false;
+    }
+
+    return coord.y >= center.y - m_config.loadDistanceVerticalBelow &&
+           coord.y <= center.y + m_config.loadDistanceVerticalAbove;
 }
 
 Result<void> InfiniteChunkManager::CreateGenerationPipeline(ID3D12Device* device) {
@@ -891,7 +945,7 @@ void InfiniteChunkManager::ProcessDeferredChunkDeletes() {
                 delete it->chunk;
             }
 
-            spdlog::debug("Deferred chunk delete complete (fence {} >= {})",
+            spdlog::trace("Deferred chunk delete complete (fence {} >= {})",
                 completedFenceValue, it->fenceValue);
 
             // Remove from deferred list

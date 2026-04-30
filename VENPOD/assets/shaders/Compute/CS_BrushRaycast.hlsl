@@ -10,7 +10,7 @@
 
 // Brush raycast input
 cbuffer BrushRaycastConstants : register(b0) {
-    float4 rayOrigin;       // xyz = camera position, w = unused
+    float4 rayOrigin;       // xyz = local-space ray origin, w = unused
     float4 rayDirection;    // xyz = normalized ray direction, w = unused
 
     uint gridSizeX;
@@ -91,13 +91,11 @@ void main(uint3 DTid : SV_DispatchThreadID) {
 
     // Start raymarching from grid entry point (or ray origin if inside grid)
     // Add small epsilon to ensure we're inside the grid when entering from outside
-    float entryT = max(tMin, 0.0f);
-    if (tMin > 0.0f) entryT += 0.001f;  // Move slightly inside grid boundary
+    float entryT = max(tMin, 0.0f) + 0.001f;  // Move slightly off voxel/grid boundaries
     float3 startPos = origin + dir * entryT;
 
     // DDA setup (same as PS_Raymarch.hlsl and CPU BrushController)
-    // Add small epsilon to floor to avoid precision issues at boundaries
-    int3 voxelPos = int3(floor(startPos + float3(1e-4f, 1e-4f, 1e-4f)));
+    int3 voxelPos = int3(floor(startPos));
     float3 deltaDist = abs(1.0f / dir);
     int3 step = int3(sign(dir));
 
@@ -129,29 +127,34 @@ void main(uint3 DTid : SV_DispatchThreadID) {
         }
 
         // Step to next voxel boundary
+        float nextDist;
         if (sideDist.x < sideDist.y) {
             if (sideDist.x < sideDist.z) {
-                sideDist.x += deltaDist.x;
+                nextDist = sideDist.x;
                 voxelPos.x += step.x;
+                sideDist.x += deltaDist.x;
                 normal = int3(-step.x, 0, 0);
-                dist = sideDist.x;
+                dist = nextDist;
             } else {
-                sideDist.z += deltaDist.z;
+                nextDist = sideDist.z;
                 voxelPos.z += step.z;
+                sideDist.z += deltaDist.z;
                 normal = int3(0, 0, -step.z);
-                dist = sideDist.z;
+                dist = nextDist;
             }
         } else {
             if (sideDist.y < sideDist.z) {
-                sideDist.y += deltaDist.y;
+                nextDist = sideDist.y;
                 voxelPos.y += step.y;
+                sideDist.y += deltaDist.y;
                 normal = int3(0, -step.y, 0);
-                dist = sideDist.y;
+                dist = nextDist;
             } else {
-                sideDist.z += deltaDist.z;
+                nextDist = sideDist.z;
                 voxelPos.z += step.z;
+                sideDist.z += deltaDist.z;
                 normal = int3(0, 0, -step.z);
-                dist = sideDist.z;
+                dist = nextDist;
             }
         }
 
