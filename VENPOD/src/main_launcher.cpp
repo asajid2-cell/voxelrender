@@ -97,6 +97,7 @@ static glm::vec3 ApplyCloseTraversalBrushFallback(
     const glm::vec3 feetLocal = cameraLocal - glm::vec3(0.0f, playerHeight, 0.0f);
     glm::vec3 flatToBrush(rawBrushLocal.x - feetLocal.x, 0.0f, rawBrushLocal.z - feetLocal.z);
     float horizontalDistance = glm::length(flatToBrush);
+    const float eyeDistance = glm::length(rawBrushLocal - cameraLocal);
 
     glm::vec3 flatForward(cameraForward.x, 0.0f, cameraForward.z);
     if (glm::length(flatForward) < 0.001f) {
@@ -110,9 +111,10 @@ static glm::vec3 ApplyCloseTraversalBrushFallback(
         return rawBrushLocal;
     }
 
-    const float closeRampStart = std::max(56.0f, brushRadius * 11.0f);
+    const float closeEyeStart = std::max(12.0f, brushRadius * 2.7f + playerRadius);
+    const float closeRampStart = std::max(8.0f, brushRadius * 2.2f + playerRadius);
     const float finishDistance = std::max(0.65f, playerRadius * 0.65f);
-    if (horizontalDistance > closeRampStart && !strokeState.closeRampActive) {
+    if (eyeDistance > closeEyeStart && !strokeState.closeRampActive) {
         return rawBrushLocal;
     }
 
@@ -124,11 +126,10 @@ static glm::vec3 ApplyCloseTraversalBrushFallback(
     if (!strokeState.closeRampActive) {
         strokeState.closeRampActive = true;
         strokeState.closeRampDirection = rampDirection;
-        // If the GPU raycast has already hit the close part of our own fresh
-        // stroke, restart the close phase from the outer edge of the ramp zone
-        // instead of placing one underfoot blob and stopping.
+        // Start only when the brush is actually close to the camera. Horizontal
+        // distance alone is misleading when looking sharply up/down at cliffs.
         strokeState.closeRampHorizontalDistance = std::clamp(
-            std::max(horizontalDistance, closeRampStart * 0.85f),
+            std::max(horizontalDistance, closeRampStart),
             finishDistance,
             closeRampStart);
     } else if (glm::length(strokeState.closeRampDirection) < 0.001f) {
