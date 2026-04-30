@@ -111,8 +111,8 @@ static glm::vec3 ApplyCloseTraversalBrushFallback(
         return rawBrushLocal;
     }
 
-    const float closeEyeStart = std::max(12.0f, brushRadius * 2.7f + playerRadius);
-    const float closeRampStart = std::max(8.0f, brushRadius * 2.2f + playerRadius);
+    const float closeEyeStart = std::max(10.0f, brushRadius * 2.35f + playerRadius);
+    const float closeRampStart = std::max(7.0f, brushRadius * 1.95f + playerRadius);
     const float finishDistance = std::max(0.65f, playerRadius * 0.65f);
     if (eyeDistance > closeEyeStart && !strokeState.closeRampActive) {
         return rawBrushLocal;
