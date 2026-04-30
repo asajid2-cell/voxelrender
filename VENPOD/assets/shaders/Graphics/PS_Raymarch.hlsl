@@ -24,6 +24,9 @@ static const float FAR_TERRAIN_MAX_HEIGHT = 664.0f;
 static const float FAR_SEA_LEVEL = -48.0f;
 static const uint FAR_WORLD_SEED = 12345u;
 static const bool FAR_TERRAIN_HORIZON_ENABLED = true;
+static const float FAR_SVO_ROOT_CELL_SIZE = 512.0f;
+static const float FAR_SVO_MIN_CELL_SIZE = 24.0f;
+static const int FAR_SVO_MAX_LEVELS = 5;
 
 struct PSInput {
     float4 position : SV_Position;
@@ -184,6 +187,58 @@ float3 FarTerrainNormal(float2 xz) {
     return normalize(float3(hx0 - hx1, 6.0f, hz0 - hz1));
 }
 
+bool FarSvoCellOccupied(float3 cellMin, float cellSize) {
+    // First SVO pass: implicit node occupancy over the far procedural terrain.
+    // This is intentionally read-only and visual-only. A node is occupied when
+    // its world-space AABB intersects the terrain volume described by sampled
+    // heightfield bounds. Empty cells can be skipped like sparse octree nodes.
+    float3 cellMax = cellMin + cellSize;
+    if (cellMax.y < FAR_TERRAIN_MIN_HEIGHT || cellMin.y > FAR_TERRAIN_MAX_HEIGHT + cellSize) {
+        return false;
+    }
+
+    float2 c0 = cellMin.xz;
+    float2 c1 = cellMin.xz + float2(cellSize, 0.0f);
+    float2 c2 = cellMin.xz + float2(0.0f, cellSize);
+    float2 c3 = cellMin.xz + float2(cellSize, cellSize);
+    float2 cc = cellMin.xz + cellSize * 0.5f;
+
+    float mm, sm, rm;
+    float h0 = FarTerrainHeight(c0, mm, sm, rm);
+    float h1 = FarTerrainHeight(c1, mm, sm, rm);
+    float h2 = FarTerrainHeight(c2, mm, sm, rm);
+    float h3 = FarTerrainHeight(c3, mm, sm, rm);
+    float hc = FarTerrainHeight(cc, mm, sm, rm);
+
+    float maxH = max(max(max(h0, h1), max(h2, h3)), hc) + cellSize * 0.35f;
+    return cellMin.y <= maxH && cellMax.y >= FAR_TERRAIN_MIN_HEIGHT;
+}
+
+float FarSvoCellExitDistance(float3 rayOrigin, float3 rayDir, float3 cellMin, float cellSize, float currentT) {
+    float tMin, tMax;
+    if (!IntersectBox(rayOrigin, rayDir, cellMin, cellMin + cellSize, tMin, tMax)) {
+        return currentT + cellSize;
+    }
+    return max(currentT + 1.0f, tMax + 0.75f);
+}
+
+float FarSvoSuggestedStep(float3 rayOrigin, float3 rayDir, float currentT) {
+    float3 pos = rayOrigin + rayDir * currentT;
+    float cellSize = FAR_SVO_ROOT_CELL_SIZE;
+
+    [unroll]
+    for (int level = 0; level < FAR_SVO_MAX_LEVELS; ++level) {
+        float3 cellMin = floor(pos / cellSize) * cellSize;
+        if (!FarSvoCellOccupied(cellMin, cellSize)) {
+            return min(FarSvoCellExitDistance(rayOrigin, rayDir, cellMin, cellSize, currentT) - currentT,
+                       cellSize * 1.25f);
+        }
+        cellSize *= 0.5f;
+    }
+
+    return max(FAR_SVO_MIN_CELL_SIZE, cellSize);
+}
+
 bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out RayHit farHit) {
     farHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
 
@@ -207,8 +262,10 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     float previousSigned = previousPos.y - previousHeight;
 
     [loop]
-    for (int i = 0; i < 48 && t < farMaxDist; ++i) {
-        float stepSize = lerp(96.0f, 320.0f, saturate(t / farMaxDist));
+    for (int i = 0; i < 96 && t < farMaxDist; ++i) {
+        float svoStep = FarSvoSuggestedStep(rayOrigin, rayDir, t);
+        float distanceStep = lerp(48.0f, 220.0f, saturate(t / farMaxDist));
+        float stepSize = max(FAR_SVO_MIN_CELL_SIZE, max(svoStep, distanceStep));
         t += stepSize;
 
         float3 pos = rayOrigin + rayDir * t;
