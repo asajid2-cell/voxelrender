@@ -7,9 +7,10 @@ vertical-window sandbox. The engine now keeps a bounded local render buffer
 around the player while chunk coordinates, generation, copy placement, and
 render sampling operate in signed world-space Y.
 
-The default terrain preset is `extreme mountains`: large cliffs, terraces,
-needle spires, ravines, cavern mouths, basin water, and cave carving generated
-from world-coordinate noise so chunk seams remain stable.
+The default terrain style is an extreme vertical traversal sandbox: large
+cliffs, terraces, needle spires, ravines, cavern mouths, basin water, cave
+carving, and paintable traversal surfaces generated from world-coordinate
+fields so chunk seams remain stable.
 
 ## Previous Limits
 
@@ -30,22 +31,22 @@ The conceptual terrain range is:
 - `TERRAIN_MAX_Y = 664`
 - chunk range `Y=-6..10`
 
-The renderer does not allocate this full range. It uses a moving render window:
+The renderer does not allocate this full range. It uses a moving dense render
+window:
 
-- `17 x 4 x 17` chunks
-- `1088 x 256 x 1088` voxels
-- `303,038,464` voxels per buffer
+- `19 x 7 x 19` chunks
+- `1216 x 448 x 1216` voxels
+- `662,437,888` voxels per buffer
 
-This keeps render-buffer capacity close to the old shallow window:
-
-- old: `25 x 2 x 25 = 1,250` chunks
-- current: `15 x 6 x 15 = 1,350` chunks
+This is deliberately larger than the earlier shallow window, but still bounded
+so the dense buffer remains the editable near field rather than the full world.
 
 Loaded chunks use a larger background window:
 
-- horizontal load distance: `+/-10`
-- vertical load window: `3 chunks below`, `2 chunks above`
-- steady loaded budget near spawn: `2,646` chunks
+- horizontal load distance: `+/-14`
+- vertical load window: `5 chunks below`, `3 chunks above`
+- horizontal unload distance: `+/-18`
+- vertical unload window: `6 chunks below`, `4 chunks above`
 
 ## Terrain Generator
 
@@ -72,11 +73,32 @@ on chunk-local coordinates.
 - Chunk copy work remains capped by the adaptive copy budget.
 - Buffer swaps do not block on chunk-copy fences; the renderer keeps the last
   stable buffer if copy work is behind.
-- Raymarch budget is bounded at `1600` voxels / `1536` steps.
+- Raymarch budget is bounded and reported through the diagnostics overlay.
 - VSync remains enabled for the public `static` tech demo target.
 - Metrics overlay now reports world position, chunk coordinate, render Y bounds,
   visible chunks, loaded chunks, generated voxels, pixels, copy budget, skipped
-  work, and raymarch budget.
+  work, raymarch budget, brush feedback, and far SVO state.
+
+## Persistent Traversal Edits
+
+The brush path now uses GPU raycast results and compact GPU edit feedback. The
+CPU stores sparse per-chunk edit overlays keyed by stable world/chunk
+coordinates. When a chunk streams or recenters back into the dense render
+window, its overlay is replayed on top of generated terrain.
+
+This means bridges, ramps, platforms, tunnels, and walls painted during a
+session survive render-window recentering. Disk save/load is still future work.
+
+The traversal brush also has a close-range handoff: line-of-sight painting
+continues normally until it gets close to the player, then the brush finishes
+the last span as a shallow ramp toward the feet instead of building a blocker at
+eye height.
+
+## Far Visual SVO
+
+This checkpoint also includes a visual sparse voxel octree far field. The dense
+render buffer remains authoritative for gameplay, while `FarVoxelOctree`
+provides read-only far terrain silhouettes to extend perceived distance.
 
 ## Verification
 
@@ -96,6 +118,8 @@ Runtime smoke test:
 - Loaded chunks converged to `2646`.
 - Visual capture showed steep walls, shelves, cavernous drops, and terrain near
   spawn with the overlay holding around 60 FPS.
+- Later Release smoke tests confirmed `PS_Raymarch.hlsl` compiled with the far
+  SVO bindings and the far octree initialized with 81 pages and 1,910,633 nodes.
 
 ## Remaining Architectural Blockers
 
@@ -109,6 +133,9 @@ architecture:
 - Terrain presets are compile-time shader constants, not runtime UI options.
 - The chunk generation queue still uses a single priority queue rather than
   separate near-field, vertical, and background lanes.
+- The sparse far-field SVO is visual-only and static around origin.
+- Brush edit overlays are runtime-persistent, but disk persistence is not yet
+  the default public path.
 
 ## Next Refactor
 

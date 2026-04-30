@@ -20,3 +20,11 @@ If you are reviewing the project, read [Engine architecture](explanation/archite
 - [Debug runtime behavior](how-to/debug-runtime.md)
 - [Engine architecture](explanation/architecture.md)
 - [Runtime reference](reference/runtime.md)
+- [Vertical world pass](reports/vertical-world-pass.md)
+- [Sparse voxel octree far-field plan](reports/sparse-voxel-octree-plan.md)
+
+## Media
+
+Screenshots and demo video are not included in this checkpoint. The public docs
+are structured so captures can be added later without changing the build or
+architecture documentation.

@@ -2,7 +2,7 @@
 
 This tutorial gets the tech demo running from a clean checkout.
 
-## 1. Install prerequisites
+## 1. Install Prerequisites
 
 Use a Windows machine with DirectX 12 support.
 
@@ -12,24 +12,17 @@ Install:
 - CMake 3.20 or newer
 - Git
 - PowerShell
+- vcpkg
 
-The setup script can install Ninja and vcpkg dependencies if they are missing. If you prefer to manage tools yourself, use the manual CMake path below.
+The setup script can install or locate Ninja and install vcpkg dependencies. If
+you prefer to manage tools yourself, use the manual CMake path below.
 
-## 2. Configure manually
+## 2. Recommended Setup
 
-Open a Visual Studio Developer PowerShell or Developer Command Prompt, then run from the repository root:
+From the repository root:
 
 ```powershell
 cd VENPOD
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-```
-
-## 3. Optional setup script
-
-For a one-command local setup:
-
-```powershell
 .\setup.ps1
 ```
 
@@ -42,22 +35,47 @@ The script:
 - configures CMake
 - builds `VENPOD.exe`
 
-## 4. Run the demo
+## 3. Manual Build
+
+Open a Visual Studio Developer PowerShell or Developer Command Prompt, then run:
+
+```powershell
+cd VENPOD
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake"
+cmake --build build --config Release
+```
+
+## 4. Run The Demo
 
 ```powershell
 .\run.ps1
 ```
 
-Choose `Sandbox Mode` in the launcher. This is the infinite terrain explorer.
+Choose `Sandbox Mode` in the launcher.
 
-## 5. Rebuild after edits
+## 5. Rebuild After Edits
 
 ```powershell
-.\build.ps1
+.\build.ps1 -Config Release
 ```
 
-Use `.\clean.ps1` if you want to remove generated build files and configure again.
+For the shortest local test loop:
+
+```powershell
+.\rebrun.ps1
+```
+
+Useful flags:
+
+```powershell
+.\rebrun.ps1 -Diagnostics
+.\rebrun.ps1 -DisablePhysics
+.\rebrun.ps1 -D3DDebug
+```
 
 ## Expected Result
 
-The sandbox opens in a first-person view above generated voxel terrain. Nearby terrain streams in first, then the surrounding render window fills in. Mouse look and WASD movement should be smooth once the initial visible chunk window is populated.
+The sandbox opens in a first-person view above generated vertical voxel
+terrain. Nearby chunks stream into a dense local render window, while the
+diagnostics overlay reports frame time, voxel capacity, chunk queues, brush
+feedback, physics, and far SVO state.

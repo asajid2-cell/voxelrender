@@ -1,46 +1,80 @@
 # VENPOD
 
-VENPOD is a DirectX 12 voxel engine tech demo written in C++20 and HLSL. It renders an infinite first-person voxel sandbox with GPU-generated terrain, chunk streaming, HLSL raymarching, voxel physics, brush editing tools, and ImGui diagnostics.
+VENPOD is a DirectX 12 voxel engine tech demo written in C++20 and HLSL. It
+renders an infinite first-person voxel sandbox with GPU-generated terrain,
+chunk streaming, HLSL raymarching, persistent brush editing, voxel physics,
+ImGui diagnostics, and an experimental sparse voxel octree far-field renderer.
 
-The goal of the project is to make low-level graphics and GPU-simulation systems visible: descriptor management, command queues, resource barriers, shader compilation, allocator reuse, fence synchronization, chunk streaming, and compute-driven simulation.
+The project is built to show low-level graphics and simulation engineering:
+descriptor management, command queues, resource barriers, shader compilation,
+allocator reuse, fence synchronization, chunk streaming, GPU readback, and
+compute-driven editing/simulation.
 
-## Demo
+## Current Demo
 
-<p align="center">
-  <img src="docs/screenshots/painting_example_1.png" width="80%" alt="VENPOD procedural voxel terrain and brush editing">
-</p>
+The public demo path is `Sandbox Mode`.
 
-Additional captures are in [docs/screenshots](docs/screenshots).
+In the sandbox you can:
 
-## Features
+- explore an extreme vertical voxel world with cliffs, ravines, spires, shelves,
+  basin water, and cave-like terrain openings
+- paint and erase voxels directly into the streamed world
+- use painting as traversal support by building bridges, ramps, platforms, and
+  tunnels
+- move across streamed chunk boundaries while edits persist during the session
+- inspect runtime metrics for FPS, frame time, pixels, voxel capacity, streaming
+  queues, chunk copy work, brush feedback, physics, and far SVO state
 
-- DirectX 12 rendering backend with explicit resource state management.
+Screenshots and demo video are intentionally not included yet. They will be
+added after the current checkpoint is captured.
+
+## Feature Highlights
+
+- DirectX 12 rendering backend with explicit resource state transitions.
 - Runtime HLSL shader compilation with DXC.
-- DDA raymarching in the pixel shader.
+- Fullscreen HLSL raymarch renderer over a moving dense voxel window.
 - GPU-generated terrain in `64 x 64 x 64` voxel chunks.
-- `1 MB` GPU buffer per chunk.
-- A visible render window of `25 x 2 x 25` chunks, or 1,250 chunks total.
-- A loaded-world budget of `33 x 2 x 33` chunks, or 2,178 chunks total.
-- Infinite-world chunk queueing, streaming, unloading, and deferred cleanup.
-- GPU brush raycasting and localized brush compute dispatches.
-- Chunk-scoped voxel physics and ImGui diagnostics.
+- `1 MB` GPU buffer per generated chunk.
+- Dense editable render window of `19 x 7 x 19` chunks.
+- `1216 x 448 x 1216` dense voxel render buffer, or `662,437,888` voxels per
+  buffer.
+- Conceptual vertical terrain range from `Y = -332` to `Y = 664`.
+- Chunk loading, unloading, fence-aware deferred cleanup, and recenter
+  diagnostics.
+- GPU brush raycasting with asynchronous compact edit feedback.
+- Sparse per-chunk edit overlays so brush changes survive render-window
+  streaming and recentering during a run.
+- Traversal brush handoff that finishes line-of-sight painting as a ramp near
+  the player feet.
+- Chunk-budgeted physics path that avoids full vertical-buffer scans by default.
+- Experimental GPU-backed sparse voxel octree far field for visual distance.
+- Dear ImGui runtime metrics overlay.
 
 ## Architecture
 
 ```text
-Camera
+Input / Camera
   -> InfiniteChunkManager
   -> GPU chunk generation
-  -> moving render buffer
+  -> persistent edit overlays
+  -> moving dense render buffer
   -> HLSL raymarch renderer
+  -> optional sparse far-field SVO
   -> ImGui diagnostics
 ```
 
-The sandbox keeps more chunks loaded than are visible, so chunks can be generated before they enter the render window. The renderer then raymarches a moving GPU buffer centered around the player. Brush edits and physics operate on the same voxel buffers through compute shaders.
+VENPOD keeps gameplay and editing in a dense local voxel window centered around
+the player. World chunks use stable signed world/chunk coordinates, while the
+render buffer is a moving GPU window. The shader converts world coordinates into
+buffer-local coordinates with the active render origin.
+
+The sparse voxel octree path is visual-only in this checkpoint. It extends far
+terrain silhouettes without making the SVO authoritative for collision, brush
+edits, or physics.
 
 ## Build
 
-VENPOD currently targets Windows with DirectX 12.
+VENPOD targets Windows and DirectX 12.
 
 Requirements:
 
@@ -52,45 +86,60 @@ Requirements:
 - PowerShell
 - vcpkg
 
-Recommended manual setup:
-
-```powershell
-cd VENPOD
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-```
-
-Optional one-command setup:
+Recommended setup:
 
 ```powershell
 cd VENPOD
 .\setup.ps1
 ```
 
-`setup.ps1` imports the Visual Studio build environment, installs or locates Ninja, installs vcpkg packages, checks the vendored ImGui source, configures CMake, and builds the executable. It is convenient for local development, but the manual commands above are clearer if you prefer to manage tools yourself.
+`setup.ps1` imports the Visual Studio build environment, installs or locates
+Ninja, installs vcpkg packages, checks the vendored ImGui source, configures
+CMake, and builds the executable.
+
+Manual build, if you manage dependencies yourself:
+
+```powershell
+cd VENPOD
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake"
+cmake --build build --config Release
+```
 
 ## Run
+
+For normal use:
 
 ```powershell
 cd VENPOD
 .\run.ps1
 ```
 
-Choose `Sandbox Mode` in the launcher to run the infinite terrain explorer.
+For the fastest rebuild-and-test loop:
+
+```powershell
+cd VENPOD
+.\rebrun.ps1
+```
+
+Choose `Sandbox Mode` in the launcher.
 
 ## Controls
 
-- `WASD`: Move
-- Mouse: Look
-- `Space`: Jump
-- Double-tap `Space`: Toggle flight mode
-- `Space` / `Shift` in flight mode: Fly up / down
-- Left mouse: Paint voxels
-- Right mouse: Erase voxels
-- `Q` / `E`: Previous / next material
-- `[` / `]`: Decrease / increase brush radius
-- `Tab`: Toggle mouse capture
-- `Esc`: Pause menu
+| Input | Action |
+| --- | --- |
+| `WASD` | Move |
+| Mouse | Look |
+| `Space` | Jump |
+| Double-tap `Space` | Toggle flight mode |
+| `Space` in flight mode | Fly up |
+| `Shift` in flight mode | Fly down |
+| `V` | Toggle first-person / third-person camera |
+| Left mouse | Paint voxels |
+| Right mouse | Erase voxels |
+| `Q` / `E` | Previous / next material |
+| `[` / `]` | Decrease / increase brush radius |
+| `Tab` | Toggle mouse capture |
+| `Esc` | Pause menu |
 
 ## Documentation
 
@@ -101,6 +150,8 @@ The docs are organized using the Diataxis model:
 - How-to: [Debug runtime behavior](docs/how-to/debug-runtime.md)
 - Explanation: [Engine architecture](docs/explanation/architecture.md)
 - Reference: [Runtime reference](docs/reference/runtime.md)
+- Report: [Vertical world pass](docs/reports/vertical-world-pass.md)
+- Report: [Sparse voxel octree far-field plan](docs/reports/sparse-voxel-octree-plan.md)
 
 ## Project Layout
 
@@ -108,24 +159,33 @@ The docs are organized using the Diataxis model:
 VENPOD/
   assets/shaders/       HLSL graphics and compute shaders
   src/Core/             windowing, timing, and app infrastructure
-  src/Graphics/         renderer and DirectX 12 RHI helpers
+  src/Graphics/         renderer, far SVO, and DirectX 12 RHI helpers
   src/Input/            keyboard, mouse, and brush input
-  src/Simulation/       voxel buffers, chunk streaming, physics
+  src/Simulation/       voxel buffers, chunk streaming, physics, edit overlays
   src/UI/               ImGui panels and overlays
   vendor/imgui/         Dear ImGui source, vendored for reproducible demo builds
 docs/
-  screenshots/          README images
   tutorials/            guided learning docs
   how-to/               task-oriented docs
   explanation/          design and architecture docs
   reference/            controls and runtime details
+  reports/              implementation reports and future work
 ```
 
 ## Known Limits
 
-VENPOD is a graphics programming tech demo, not a packaged game engine. The code favors explicit DirectX 12 systems over engine middleware so the rendering, synchronization, and chunk-streaming work is visible in the repository.
+VENPOD is a graphics programming tech demo, not a packaged game engine.
 
-Generated build outputs are intentionally excluded from version control. Rebuild locally with the PowerShell scripts or CMake commands above.
+Current limitations:
+
+- Far SVO terrain is visual-only and static around origin in this checkpoint.
+- Brush edits persist during a runtime session, but disk save/load for edited
+  chunks is not the default public path yet.
+- Infinite physics remains conservative and budgeted; the stable demo favors
+  responsiveness over simulating the whole vertical world at once.
+- Screenshots and demo video still need to be captured for the public repo.
+
+Generated build outputs are intentionally excluded from version control.
 
 ## License
 
