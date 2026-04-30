@@ -60,6 +60,9 @@ struct BrushQueryMetadata {
 struct BuildStrokeState {
     bool active = false;
     float rayDistance = 64.0f;
+    bool closeRampActive = false;
+    float closeRampHorizontalDistance = 0.0f;
+    glm::vec3 closeRampDirection{0.0f, 0.0f, 1.0f};
 };
 
 static glm::ivec3 DecodePackedNormal(uint32_t packedNormal, bool& valid) {
@@ -78,13 +81,16 @@ static glm::vec3 ApplyCloseTraversalBrushFallback(
     float playerHeight,
     float playerRadius,
     float brushRadius,
+    float dt,
     bool buildStroke,
+    BuildStrokeState& strokeState,
     bool* adjustedOut = nullptr)
 {
     if (adjustedOut) {
         *adjustedOut = false;
     }
     if (!buildStroke) {
+        strokeState.closeRampActive = false;
         return rawBrushLocal;
     }
 
@@ -105,33 +111,47 @@ static glm::vec3 ApplyCloseTraversalBrushFallback(
     }
 
     const float closeRampStart = std::max(56.0f, brushRadius * 11.0f);
-    const float nearSnapDistance = std::max(1.0f, std::min(playerRadius + brushRadius * 0.25f, brushRadius * 0.45f));
-    if (horizontalDistance > closeRampStart) {
+    const float finishDistance = std::max(0.65f, playerRadius * 0.65f);
+    if (horizontalDistance > closeRampStart && !strokeState.closeRampActive) {
         return rawBrushLocal;
     }
 
     const float forwardDot = glm::dot(rampDirection, flatForward);
-    if (forwardDot < 0.35f && horizontalDistance > brushRadius * 1.5f) {
+    if (forwardDot < 0.35f && horizontalDistance > brushRadius * 1.5f && !strokeState.closeRampActive) {
         return rawBrushLocal;
     }
 
-    glm::vec3 adjusted = rawBrushLocal;
-    if (horizontalDistance < nearSnapDistance) {
-        // Finish the traversal stroke under/slightly ahead of the player so
-        // the last painted blobs become walkable instead of face blockers.
-        adjusted.x = feetLocal.x + flatForward.x * 0.75f;
-        adjusted.z = feetLocal.z + flatForward.z * 0.75f;
-        horizontalDistance = 0.0f;
+    if (!strokeState.closeRampActive) {
+        strokeState.closeRampActive = true;
+        strokeState.closeRampDirection = rampDirection;
+        // If the GPU raycast has already hit the close part of our own fresh
+        // stroke, restart the close phase from the outer edge of the ramp zone
+        // instead of placing one underfoot blob and stopping.
+        strokeState.closeRampHorizontalDistance = std::clamp(
+            std::max(horizontalDistance, closeRampStart * 0.85f),
+            finishDistance,
+            closeRampStart);
+    } else if (glm::length(strokeState.closeRampDirection) < 0.001f) {
+        strokeState.closeRampDirection = rampDirection;
     }
 
-    // Cap the brush center to a shallow walkable ramp as it approaches the
-    // player. This reaches foot level at the end instead of stopping early.
+    const float rampAdvancePerSecond = std::max(54.0f, brushRadius * 10.0f);
+    const float rampAdvance = std::max(0.30f, rampAdvancePerSecond * std::max(dt, 0.0f));
+    strokeState.closeRampHorizontalDistance = std::max(
+        finishDistance,
+        strokeState.closeRampHorizontalDistance - rampAdvance);
+
+    glm::vec3 adjusted = rawBrushLocal;
+    const glm::vec3 rampDir = glm::normalize(strokeState.closeRampDirection);
+    adjusted.x = feetLocal.x + rampDir.x * strokeState.closeRampHorizontalDistance;
+    adjusted.z = feetLocal.z + rampDir.z * strokeState.closeRampHorizontalDistance;
+
+    // Move the close phase along a shallow walkable ramp. The last brush centers
+    // land at foot level, which makes held painting finish as a traversable path
+    // instead of a face-height blocker.
     const float nearCenterY = feetLocal.y - std::max(0.35f, brushRadius * 0.35f);
     constexpr float kTraversalRampSlope = 0.14f;  // Roughly 1 voxel up per 7 voxels forward.
-    const float rampY = nearCenterY + horizontalDistance * kTraversalRampSlope;
-    if (rampY < adjusted.y) {
-        adjusted.y = rampY;
-    }
+    adjusted.y = nearCenterY + strokeState.closeRampHorizontalDistance * kTraversalRampSlope;
 
     if (adjustedOut && glm::length(adjusted - rawBrushLocal) > 0.001f) {
         *adjustedOut = true;
@@ -1300,6 +1320,8 @@ int RunSandbox(int argc, char* argv[]) {
             if (!buildStroke) {
                 buildStrokeState.active = false;
                 buildStrokeState.rayDistance = 64.0f;
+                buildStrokeState.closeRampActive = false;
+                buildStrokeState.closeRampHorizontalDistance = 0.0f;
             }
 
             if (brushHitValid) {
@@ -1350,7 +1372,9 @@ int RunSandbox(int argc, char* argv[]) {
                 playerHeight,
                 playerRadius,
                 brushController.GetRadius(),
+                dt,
                 buildStroke,
+                buildStrokeState,
                 &closeRampAdjusted);
 
             brushPos = glm::clamp(brushPos,
@@ -1393,6 +1417,8 @@ int RunSandbox(int argc, char* argv[]) {
         } else {
             buildStrokeState.active = false;
             buildStrokeState.rayDistance = 64.0f;
+            buildStrokeState.closeRampActive = false;
+            buildStrokeState.closeRampHorizontalDistance = 0.0f;
         }
 
         // Transition read buffer to pixel shader resource for rendering
