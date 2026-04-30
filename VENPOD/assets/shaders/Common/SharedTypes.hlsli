@@ -70,6 +70,10 @@ struct FrameConstants {
 
     // Third-person block character (4 DWORDs)
     float4   characterPosition;  // xyz = feet position, w = visible flag
+
+    // Sparse visual far field (4 DWORDs)
+    // x = enabled, y = page count, z = node count, w = page size
+    float4   farFieldParams;
 };
 
 // Chunk control structure for sparse optimization

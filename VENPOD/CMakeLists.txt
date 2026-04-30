@@ -57,6 +57,7 @@ set(VENPOD_SOURCES
     src/Graphics/RHI/ShaderCompiler.cpp
 
     # Graphics
+    src/Graphics/FarVoxelOctree.cpp
     src/Graphics/Renderer.cpp
     src/Graphics/VoxelRenderer.cpp
 
@@ -105,6 +106,7 @@ set(VENPOD_HEADERS
     src/Graphics/RHI/d3dx12.h
 
     # Graphics
+    src/Graphics/FarVoxelOctree.h
     src/Graphics/Renderer.h
     src/Graphics/VoxelRenderer.h
 

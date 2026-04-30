@@ -19,6 +19,23 @@ StructuredBuffer<uint> VoxelGrid : register(t0);
 Texture1D<float4> MaterialPalette : register(t1);
 SamplerState PaletteSampler : register(s0);
 
+struct FarVoxelNode {
+    uint childBase;
+    uint childMask;
+    uint material;
+    uint flags;
+};
+
+struct FarVoxelPage {
+    int originX;
+    int originY;
+    int originZ;
+    uint rootNode;
+};
+
+StructuredBuffer<FarVoxelNode> FarVoxelNodes : register(t2);
+StructuredBuffer<FarVoxelPage> FarVoxelPages : register(t3);
+
 static const float FAR_TERRAIN_MIN_HEIGHT = -332.0f;
 static const float FAR_TERRAIN_MAX_HEIGHT = 664.0f;
 static const float FAR_SEA_LEVEL = -48.0f;
@@ -71,6 +88,31 @@ bool IntersectBox(float3 rayOrigin, float3 rayDir, float3 boxMin, float3 boxMax,
     tMax = min(min(tFar.x, tFar.y), tFar.z);
 
     return tMax >= tMin && tMax >= 0.0f;
+}
+
+bool IntersectBoxWithNormal(float3 rayOrigin, float3 rayDir, float3 boxMin, float3 boxMax, out float tMin, out float tMax, out float3 normal) {
+    float3 invDir = 1.0f / rayDir;
+    float3 t0 = (boxMin - rayOrigin) * invDir;
+    float3 t1 = (boxMax - rayOrigin) * invDir;
+
+    float3 tNear = min(t0, t1);
+    float3 tFar = max(t0, t1);
+
+    tMin = max(max(tNear.x, tNear.y), tNear.z);
+    tMax = min(min(tFar.x, tFar.y), tFar.z);
+    if (tMax < tMin || tMax < 0.0f) {
+        normal = float3(0, 1, 0);
+        return false;
+    }
+
+    if (tNear.x >= tNear.y && tNear.x >= tNear.z) {
+        normal = float3(rayDir.x > 0.0f ? -1.0f : 1.0f, 0.0f, 0.0f);
+    } else if (tNear.y >= tNear.z) {
+        normal = float3(0.0f, rayDir.y > 0.0f ? -1.0f : 1.0f, 0.0f);
+    } else {
+        normal = float3(0.0f, 0.0f, rayDir.z > 0.0f ? -1.0f : 1.0f);
+    }
+    return true;
 }
 
 RayHit MakeHit(float4 color, float distance) {
@@ -185,6 +227,143 @@ float3 FarTerrainNormal(float2 xz) {
     float hz0 = FarTerrainHeight(xz - float2(0.0f, 3.0f), mountainMaskA, spireMaskA, ravineMaskA);
     float hz1 = FarTerrainHeight(xz + float2(0.0f, 3.0f), mountainMaskB, spireMaskB, ravineMaskB);
     return normalize(float3(hx0 - hx1, 6.0f, hz0 - hz1));
+}
+
+uint FarVoxelChildNodeIndex(uint childBase, uint childMask, uint childOrdinal) {
+    uint precedingMask = childMask & ((1u << childOrdinal) - 1u);
+    return childBase + countbits(precedingMask);
+}
+
+bool TraverseFarVoxelPage(
+    float3 rayOrigin,
+    float3 rayDir,
+    uint rootNode,
+    float3 pageMin,
+    float pageSize,
+    float startDist,
+    inout float nearestT,
+    inout float3 nearestNormal,
+    inout uint nearestMaterial)
+{
+    uint nodeStack[64];
+    float3 minStack[64];
+    float sizeStack[64];
+    int stackCount = 0;
+
+    nodeStack[stackCount] = rootNode;
+    minStack[stackCount] = pageMin;
+    sizeStack[stackCount] = pageSize;
+    stackCount++;
+
+    bool hit = false;
+    [loop]
+    while (stackCount > 0) {
+        stackCount--;
+        uint nodeIndex = nodeStack[stackCount];
+        float3 nodeMin = minStack[stackCount];
+        float nodeSize = sizeStack[stackCount];
+
+        if (nodeIndex >= (uint)frame.farFieldParams.z) {
+            continue;
+        }
+
+        float tNear, tFar;
+        float3 boxNormal;
+        if (!IntersectBoxWithNormal(rayOrigin, rayDir, nodeMin, nodeMin + nodeSize, tNear, tFar, boxNormal)) {
+            continue;
+        }
+        if (tFar < startDist || tNear > nearestT) {
+            continue;
+        }
+
+        FarVoxelNode node = FarVoxelNodes[nodeIndex];
+        if ((node.flags & 1u) != 0u || node.childMask == 0u || node.childBase == 0xFFFFFFFFu) {
+            float candidateT = max(tNear, startDist);
+            if (candidateT < nearestT) {
+                nearestT = candidateT;
+                nearestNormal = boxNormal;
+                nearestMaterial = node.material;
+                hit = true;
+            }
+            continue;
+        }
+
+        float childSize = nodeSize * 0.5f;
+        [unroll]
+        for (uint child = 0; child < 8; ++child) {
+            if ((node.childMask & (1u << child)) == 0u || stackCount >= 64) {
+                continue;
+            }
+
+            float3 childMin = nodeMin + float3(
+                (child & 1u) ? childSize : 0.0f,
+                (child & 2u) ? childSize : 0.0f,
+                (child & 4u) ? childSize : 0.0f);
+
+            uint childNode = FarVoxelChildNodeIndex(node.childBase, node.childMask, child);
+            nodeStack[stackCount] = childNode;
+            minStack[stackCount] = childMin;
+            sizeStack[stackCount] = childSize;
+            stackCount++;
+        }
+    }
+
+    return hit;
+}
+
+bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, out RayHit farHit) {
+    farHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
+
+    if (frame.farFieldParams.x < 0.5f || frame.farFieldParams.y < 1.0f || frame.farFieldParams.z < 1.0f) {
+        return false;
+    }
+    if (rayDir.y > 0.18f || rayDir.y < -0.42f) {
+        return false;
+    }
+
+    uint pageCount = min((uint)frame.farFieldParams.y, 4096u);
+    float pageSize = max(frame.farFieldParams.w, 1.0f);
+    float nearestT = 1e20f;
+    float3 nearestNormal = float3(0, 1, 0);
+    uint nearestMaterial = MAT_STONE;
+
+    [loop]
+    for (uint pageIndex = 0; pageIndex < pageCount; ++pageIndex) {
+        FarVoxelPage page = FarVoxelPages[pageIndex];
+        float3 pageMin = float3((float)page.originX, (float)page.originY, (float)page.originZ);
+
+        float tNear, tFar;
+        if (!IntersectBox(rayOrigin, rayDir, pageMin, pageMin + pageSize, tNear, tFar)) {
+            continue;
+        }
+        if (tFar < startDist || tNear > nearestT) {
+            continue;
+        }
+
+        TraverseFarVoxelPage(
+            rayOrigin,
+            rayDir,
+            page.rootNode,
+            pageMin,
+            pageSize,
+            startDist,
+            nearestT,
+            nearestNormal,
+            nearestMaterial);
+    }
+
+    if (nearestT >= 1e19f) {
+        return false;
+    }
+
+    float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, (nearestMaterial + 0.5f) / 256.0f, 0);
+    float3 lightDir = SkySunDirection();
+    float ndotl = saturate(dot(nearestNormal, lightDir));
+    float3 color = baseColor.rgb * (SkyAmbient(nearestNormal) * 0.34f + ndotl * 0.82f);
+    float fogFactor = saturate((nearestT - 900.0f) / (10400.0f - 900.0f));
+    color = lerp(color, SkyColor(rayDir), fogFactor * 0.72f);
+    farHit = MakeHit(float4(color, 1.0f), nearestT);
+    return true;
 }
 
 bool FarSvoCellOccupied(float3 cellMin, float cellSize) {
@@ -335,6 +514,9 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
     float tMin, tMax;
     if (!IntersectBox(rayOrigin, rayDir, gridMin, gridMax, tMin, tMax)) {
         RayHit farHit;
+        if (RaymarchSparseFarField(rayOrigin, rayDir, 32.0f, farHit)) {
+            return farHit;
+        }
         if (RaymarchFarTerrain(rayOrigin, rayDir, 32.0f, farHit)) {
             return farHit;
         }

@@ -78,6 +78,15 @@ public:
         bool visible;
     };
 
+    struct SparseFarField {
+        DescriptorHandle nodeSRV;
+        DescriptorHandle pageSRV;
+        uint32_t nodeCount = 0;
+        uint32_t pageCount = 0;
+        float pageSize = 0.0f;
+        bool enabled = false;
+    };
+
     // Render voxels with raymarch shader (binds voxel resources)
     void RenderVoxels(
         ID3D12GraphicsCommandList* cmdList,
@@ -91,7 +100,8 @@ public:
         float regionOriginY,
         float regionOriginZ,
         const BrushPreview* brushPreview = nullptr,
-        const CharacterPreview* characterPreview = nullptr
+        const CharacterPreview* characterPreview = nullptr,
+        const SparseFarField* sparseFarField = nullptr
     );
 
     // Render crosshair at screen center

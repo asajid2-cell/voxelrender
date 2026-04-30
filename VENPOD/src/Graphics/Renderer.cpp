@@ -149,7 +149,8 @@ void Renderer::RenderVoxels(
     float regionOriginY,
     float regionOriginZ,
     const BrushPreview* brushPreview,
-    const CharacterPreview* characterPreview)
+    const CharacterPreview* characterPreview,
+    const SparseFarField* sparseFarField)
 {
     if (!cmdList) return;
 
@@ -180,6 +181,7 @@ void Renderer::RenderVoxels(
         float brushPosition[4];       // xyz = position, w = radius
         float brushParams[4];         // x = material, y = shape, z = hasValidPosition, w = unused
         float characterPosition[4];   // xyz = feet position, w = visible flag
+        float farFieldParams[4];      // x = enabled, y = page count, z = node count, w = page size
     } constants = {};
 
     // Fill in camera data
@@ -259,12 +261,26 @@ void Renderer::RenderVoxels(
         constants.characterPosition[3] = 0.0f;
     }
 
+    const bool farFieldEnabled =
+        sparseFarField &&
+        sparseFarField->enabled &&
+        sparseFarField->nodeSRV.IsValid() &&
+        sparseFarField->pageSRV.IsValid() &&
+        sparseFarField->nodeCount > 0 &&
+        sparseFarField->pageCount > 0;
+    constants.farFieldParams[0] = farFieldEnabled ? 1.0f : 0.0f;
+    constants.farFieldParams[1] = farFieldEnabled ? static_cast<float>(sparseFarField->pageCount) : 0.0f;
+    constants.farFieldParams[2] = farFieldEnabled ? static_cast<float>(sparseFarField->nodeCount) : 0.0f;
+    constants.farFieldParams[3] = farFieldEnabled ? sparseFarField->pageSize : 0.0f;
+
     // Set root constants (b0)
     cmdList->SetGraphicsRoot32BitConstants(0, sizeof(constants) / 4, &constants, 0);
 
     // Use persistent shader-visible descriptors directly (no per-frame copy needed)
     cmdList->SetGraphicsRootDescriptorTable(1, voxelGridSRV.gpu);
     cmdList->SetGraphicsRootDescriptorTable(2, materialPaletteSRV.gpu);
+    cmdList->SetGraphicsRootDescriptorTable(3, farFieldEnabled ? sparseFarField->nodeSRV.gpu : voxelGridSRV.gpu);
+    cmdList->SetGraphicsRootDescriptorTable(4, farFieldEnabled ? sparseFarField->pageSRV.gpu : voxelGridSRV.gpu);
 
     // Draw fullscreen triangle
     cmdList->DrawInstanced(3, 1, 0, 0);
@@ -316,13 +332,13 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
 
     // Root signature parameters (for voxel rendering)
     // b0: FrameConstants (inline 32-bit constants)
-    // Layout: camPos(4) + camFwd(4) + camRight(4) + camUp(4) + sunDir(4) + grid(4) + viewport(4) + regionOrigin(4) + brushPos(4) + brushParams(4) + character(4) = 44 DWORDs
+    // Layout: camPos(4) + camFwd(4) + camRight(4) + camUp(4) + sunDir(4) + grid(4) + viewport(4) + regionOrigin(4) + brushPos(4) + brushParams(4) + character(4) + farField(4) = 48 DWORDs
     RootParameter frameConstantsParam;
     frameConstantsParam.type = RootParamType::Constants32Bit;
     frameConstantsParam.shaderRegister = 0;  // register b0
     frameConstantsParam.registerSpace = 0;   // space 0
     frameConstantsParam.visibility = D3D12_SHADER_VISIBILITY_ALL;
-    frameConstantsParam.num32BitValues = 44;
+    frameConstantsParam.num32BitValues = 48;
     pipelineDesc.rootParams.push_back(frameConstantsParam);
 
     // t0: VoxelGrid SRV (descriptor table for structured buffer)
@@ -342,6 +358,26 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
         0,  // space 0
         D3D12_SHADER_VISIBILITY_PIXEL,
         1,  // numDescriptors
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+
+    // t2: Far voxel octree nodes
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        2,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+
+    // t3: Far voxel octree pages
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        3,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
         D3D12_DESCRIPTOR_RANGE_TYPE_SRV
     });
 

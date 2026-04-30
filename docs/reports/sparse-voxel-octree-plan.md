@@ -9,27 +9,34 @@ GPU work.
 The sparse voxel octree direction is for visual far distance first. The dense
 near field remains the source of truth for gameplay.
 
-## Current First Pass
+## Implemented GPU Node/Page Pass
 
-The first implementation is an implicit shader-side sparse voxel octree over
-the existing far procedural terrain silhouette.
+The current implementation has moved past the implicit shader prototype. The
+sandbox now builds a GPU-backed sparse far-field tree at startup:
 
-It adds:
+- `FarVoxelOctree` builds a square forest of far pages around origin.
+- Each page is a 1024-voxel root cube with an 8-child sparse tree below it.
+- Child root nodes are packed contiguously, so the shader can traverse with
+  `childBase + popcount(childMask before ordinal)`.
+- Interior cells that are safely below sampled terrain are collapsed into
+  coarse leaves, while surface/ravine/cliff cells are subdivided down to the
+  configured depth.
+- Node and page data are uploaded as structured buffers and bound to the
+  fullscreen raymarch pass as `t2` and `t3`.
+- `FrameConstants.farFieldParams` enables the pass and reports page count,
+  node count, and page size to the shader.
+- The diagnostics overlay reports the far SVO state, page count, node count,
+  page size, and covered world size.
 
-- coarse far-field cells
-- cell occupancy tests against sampled terrain height bounds
-- hierarchical descent for occupied cells
-- empty-cell skipping for air cells
-- horizon-only rendering so the far field does not leak through the dense
-  editable window
+The first measured startup build produced 81 pages and 1,910,633 nodes, covering
+9216 world units horizontally. This is a visual far-field representation only.
+The dense streaming voxel buffer remains authoritative for editing, collision,
+physics, raycast, and persistence.
 
-This is not a persistent GPU node pool yet. It is a safe prototype of the
-traversal model: the ray shader asks whether large spatial cells are empty and
-skips them before refining toward smaller occupied cells.
+## Why This Version Is Still Isolated
 
-## Why This Version First
-
-A full SVO/DAG renderer needs new infrastructure:
+A gameplay-authoritative SVO/DAG renderer still needs additional
+infrastructure:
 
 - CPU or GPU construction of far-field nodes
 - a compact node layout
@@ -39,9 +46,10 @@ A full SVO/DAG renderer needs new infrastructure:
 - optional far-field material/normal mips
 - clear separation from brush/collision/readback systems
 
-Adding all of that directly into the existing dense renderer would risk the
-currently stable demo. The implicit SVO pass lets us validate traversal and
-visual behavior before adding persistent node streaming.
+Adding that authority directly into the existing dense renderer would risk the
+currently stable demo. The GPU node/page pass validates real buffer ownership,
+root-signature binding, and tree traversal while keeping gameplay semantics in
+the known-good dense path.
 
 ## Target Architecture
 
@@ -98,21 +106,44 @@ struct FarVoxelPage {
 - Far SVO pages should be allowed to lag behind; dense near-field streaming
   remains higher priority.
 
+## Runtime Controls
+
+- Default: far SVO enabled.
+- `VENPOD_DISABLE_FAR_SVO=1`: disables the node/page far field and falls back to
+  the older procedural far terrain path.
+
+## Verification
+
+Release build succeeded. A diagnostics runtime smoke test confirmed:
+
+- `PS_Raymarch.hlsl` compiled with the expanded root signature.
+- the far voxel octree initialized successfully
+- dense chunk generation, copy, edit, brush raycast, and physics shaders still
+  compiled
+- no critical/error/failed/device-removed log entries appeared during the smoke
+  run
+
+## Known Limitations
+
+- The far SVO is static around origin; it is not camera-centered streamed yet.
+- The node data is built from a CPU approximation of the far terrain function,
+  not directly from generated chunk buffers.
+- It is read-only visual terrain. It does not participate in brush edits,
+  persistence, collision, ground snapping, or physics.
+- The page buffers use an upload heap for a simple safe first integration.
+  A production version should upload once into default GPU memory.
+- The shader still keeps the older procedural far terrain fallback for rays that
+  miss the SVO coverage. That is useful for continuity, but a future pass should
+  replace it with streamed pages or a top-level page accelerator.
+
 ## Next Implementation Pass
 
-1. Add a `FarVoxelField` runtime object owned by the sandbox/renderer layer.
-2. Generate low-resolution brick occupancy from the same terrain source as
-   chunk generation.
-3. Upload a compact node/page buffer.
-4. Bind that buffer as `t2` in the fullscreen raymarch root signature.
-5. Replace the implicit shader occupancy test with actual node traversal.
-6. Add overlay metrics:
-   node count, page count, far rays tested, far hits, empty skips, traversal
-   steps, upload budget, and far-field memory.
-
-## Known Limitation Of Current Pass
-
-The current implicit SVO uses the far procedural height approximation. It is a
-visual acceleration prototype, not an exact representation of generated chunks.
-It should improve the shape of the architecture and make far-distance tests
-cheaper, but it does not yet solve persistent far edits or exact far terrain.
+1. Move far nodes/pages into default GPU buffers through a copy upload path.
+2. Add a top-level page grid accelerator so the shader does not test every page
+   for every far-field ray.
+3. Stream/rebuild page rings around the camera instead of keeping a static
+   origin-centered page forest.
+4. Generate far pages from the same terrain source used by chunk generation.
+5. Add far-field counters for rays tested, pages tested, tree nodes visited,
+   hits, misses, and fallback hits.
+6. Add optional low-resolution material/normal mips for smoother far silhouettes.

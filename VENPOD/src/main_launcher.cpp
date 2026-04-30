@@ -7,6 +7,7 @@
 #include "Graphics/RHI/DX12Device.h"
 #include "Graphics/RHI/DX12CommandQueue.h"
 #include "Graphics/Renderer.h"
+#include "Graphics/FarVoxelOctree.h"
 #include "Simulation/VoxelWorld.h"
 #include "Simulation/TerrainConstants.h"
 #include "Simulation/PhysicsDispatcher.h"
@@ -165,6 +166,7 @@ int RunSandbox(int argc, char* argv[]) {
     const bool enableRuntimeLog = enableDiagnostics || std::getenv("VENPOD_LOG_FILE") != nullptr;
     const bool enableD3DDebug = std::getenv("VENPOD_D3D_DEBUG") != nullptr;
     const bool enableBoundaryTest = std::getenv("VENPOD_BOUNDARY_TEST") != nullptr;
+    const bool enableFarSVO = std::getenv("VENPOD_DISABLE_FAR_SVO") == nullptr;
 
     if (enableRuntimeLog) {
         auto logPath = GetExecutableDirectorySandbox() / "venpod_runtime.log";
@@ -178,12 +180,13 @@ int RunSandbox(int argc, char* argv[]) {
     spdlog::info("===========================================");
     spdlog::info("  VENPOD - Voxel Physics Engine v0.1.0");
     spdlog::info("  Target: 100M+ Active Voxels @ 60 FPS");
-    spdlog::info("  Static chunks: {} | Physics disabled: {} | Infinite physics: {} | Diagnostics: {} | Boundary test: {}",
+    spdlog::info("  Static chunks: {} | Physics disabled: {} | Infinite physics: {} | Diagnostics: {} | Boundary test: {} | Far SVO: {}",
         useStaticChunkLayout ? "yes" : "no",
         disablePhysics ? "yes" : "no",
         enableInfinitePhysics ? "yes" : "no",
         enableDiagnostics ? "yes" : "no",
-        enableBoundaryTest ? "yes" : "no");
+        enableBoundaryTest ? "yes" : "no",
+        enableFarSVO ? "yes" : "no");
     spdlog::info("===========================================");
 
     // Initialize DX12 Device
@@ -261,6 +264,27 @@ int RunSandbox(int argc, char* argv[]) {
     if (!rendererResult) {
         spdlog::critical("Failed to initialize renderer: {}", rendererResult.error());
         return 1;
+    }
+
+    FarVoxelOctree farVoxelOctree;
+    Renderer::SparseFarField sparseFarField = {};
+    if (enableFarSVO) {
+        FarVoxelOctreeConfig farConfig;
+        auto farResult = farVoxelOctree.Initialize(
+            device->GetDevice(),
+            renderer->GetHeapManager(),
+            farConfig);
+        if (!farResult) {
+            spdlog::warn("Far sparse voxel octree disabled: {}", farResult.error());
+        } else {
+            const auto& farStats = farVoxelOctree.GetStats();
+            sparseFarField.nodeSRV = farVoxelOctree.GetNodeSRV();
+            sparseFarField.pageSRV = farVoxelOctree.GetPageSRV();
+            sparseFarField.nodeCount = farStats.nodeCount;
+            sparseFarField.pageCount = farStats.pageCount;
+            sparseFarField.pageSize = farStats.pageSize;
+            sparseFarField.enabled = true;
+        }
     }
 
     // =============================================================================
@@ -1447,7 +1471,8 @@ int RunSandbox(int argc, char* argv[]) {
             regionOrigin.y,
             regionOrigin.z,
             &brushPreview,
-            &characterPreview
+            &characterPreview,
+            &sparseFarField
         );
 
         // Always-on performance counters for the public tech demo. These are
@@ -1513,6 +1538,12 @@ int RunSandbox(int argc, char* argv[]) {
                 streamingStats.queuedChunks);
             ImGui::Text("Generated voxels %llu",
                 static_cast<unsigned long long>(streamingStats.loadedVoxelCapacity));
+            ImGui::Text("Far SVO %s | pages %u | nodes %u | page %.0f | coverage %.0f",
+                sparseFarField.enabled ? "on" : "off",
+                sparseFarField.pageCount,
+                sparseFarField.nodeCount,
+                sparseFarField.pageSize,
+                farVoxelOctree.GetStats().coveredWorldSize);
             ImGui::Text("World pos %.1f %.1f %.1f | chunk %d %d %d",
                 cameraPos.x, cameraPos.y, cameraPos.z,
                 playerChunk.x, playerChunk.y, playerChunk.z);
@@ -1724,6 +1755,7 @@ int RunSandbox(int argc, char* argv[]) {
     physicsDispatcher->Shutdown();
     chunkManager->Shutdown();
     voxelWorld->Shutdown();
+    farVoxelOctree.Shutdown();
 
     renderer->Shutdown();
     window->Shutdown();
