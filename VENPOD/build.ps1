@@ -80,6 +80,18 @@ if ($buildResult -ne 0) {
     exit 1
 }
 
+$binDir = Join-Path $buildDir "bin"
+$sourceAssets = Join-Path $projectRoot "assets"
+$targetAssets = Join-Path $binDir "assets"
+if ((Test-Path $sourceAssets) -and (Test-Path $binDir)) {
+    Write-Step "Refreshing runtime assets..."
+    if (-not (Test-Path $targetAssets)) {
+        New-Item -ItemType Directory -Path $targetAssets | Out-Null
+    }
+    Copy-Item -Path (Join-Path $sourceAssets "*") -Destination $targetAssets -Recurse -Force
+    Write-Success "Runtime assets refreshed"
+}
+
 $buildTime = (Get-Date) - $startTime
 
 # Report

@@ -1,8 +1,12 @@
 #include "FarVoxelOctree.h"
 #include "../Simulation/TerrainConstants.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <thread>
 #include <spdlog/spdlog.h>
 
 namespace VENPOD::Graphics {
@@ -43,41 +47,206 @@ Result<void> FarVoxelOctree::Initialize(
     }
 
     Shutdown();
-    m_config = config;
-    m_nodes.clear();
-    m_pages.clear();
+    BuildResult built = BuildCpuData(config);
+    if (!built.success) {
+        return Error("{}", built.error);
+    }
 
-    const int32_t radius = std::max(1, m_config.pageRadius);
+    m_config = built.config;
+    m_stats = built.stats;
+    m_nodes = std::move(built.nodes);
+    m_pages = std::move(built.pages);
+    m_pageIndex = std::move(built.pageIndex);
+    return UploadToGpu(device, heapManager);
+}
+
+void FarVoxelOctree::BeginAsyncLoad(const FarVoxelOctreeConfig& config) {
+    if (m_asyncPending) {
+        return;
+    }
+    Shutdown();
+    m_asyncPending = true;
+    m_asyncBuild = std::async(std::launch::async, [config]() {
+        return FarVoxelOctree::BuildCpuData(config);
+    });
+}
+
+bool FarVoxelOctree::TryFinalizeAsyncUpload(ID3D12Device* device, DescriptorHeapManager& heapManager) {
+    if (!m_asyncPending || !m_asyncBuild.valid()) {
+        return IsValid();
+    }
+
+    if (m_asyncBuild.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        return false;
+    }
+
+    BuildResult built = m_asyncBuild.get();
+    m_asyncPending = false;
+    if (!built.success) {
+        spdlog::warn("Far sparse voxel octree async load failed: {}", built.error);
+        return false;
+    }
+
+    m_config = built.config;
+    m_stats = built.stats;
+    m_nodes = std::move(built.nodes);
+    m_pages = std::move(built.pages);
+    m_pageIndex = std::move(built.pageIndex);
+
+    auto uploadResult = UploadToGpu(device, heapManager);
+    if (!uploadResult) {
+        spdlog::warn("Far sparse voxel octree async upload failed: {}", uploadResult.error());
+        Shutdown();
+        return false;
+    }
+    return true;
+}
+
+FarVoxelOctree::BuildResult FarVoxelOctree::BuildCpuData(const FarVoxelOctreeConfig& config) {
+    const auto buildStart = std::chrono::steady_clock::now();
+    BuildResult result;
+    result.config = config;
+
+    FarVoxelOctree builder;
+    builder.m_config = config;
+
+    const int32_t radius = std::max(1, builder.m_config.pageRadius);
     const int32_t pageCountPerAxis = radius * 2 + 1;
-    m_nodes.reserve(static_cast<size_t>(pageCountPerAxis * pageCountPerAxis * 64));
-    m_pages.reserve(static_cast<size_t>(pageCountPerAxis * pageCountPerAxis));
+    constexpr uint32_t kMissingPage = 0xFFFFFFFFu;
 
-    for (int32_t pz = -radius; pz <= radius; ++pz) {
-        for (int32_t px = -radius; px <= radius; ++px) {
-            const float originX = static_cast<float>(px) * m_config.pageSize;
-            const float originZ = static_cast<float>(pz) * m_config.pageSize;
-            const BuildBounds rootBounds{
-                originX,
-                m_config.rootMinY,
-                originZ,
-                m_config.pageSize
-            };
+    struct CacheHeader {
+        uint32_t magic = 0x56534631u; // "VSF1"
+        uint32_t version = 2;
+        int32_t pageRadius = 0;
+        uint32_t maxDepth = 0;
+        uint32_t seed = 0;
+        float pageSize = 0.0f;
+        float rootMinY = 0.0f;
+        uint64_t nodeCount = 0;
+        uint64_t pageCount = 0;
+        uint64_t pageIndexCount = 0;
+    };
 
-            if (!CellMayContainTerrain(rootBounds)) {
-                continue;
+    const auto cachePath = std::filesystem::current_path() /
+        ("venpod_far_svo_cache_r" + std::to_string(radius) +
+         "_d" + std::to_string(builder.m_config.maxDepth) +
+         "_s" + std::to_string(builder.m_config.seed) + ".bin");
+
+    bool loadedFromCache = false;
+    {
+        std::ifstream in(cachePath, std::ios::binary);
+        CacheHeader header{};
+        if (in.read(reinterpret_cast<char*>(&header), sizeof(header)) &&
+            header.magic == 0x56534631u &&
+            header.version == 2 &&
+            header.pageRadius == radius &&
+            header.maxDepth == builder.m_config.maxDepth &&
+            header.seed == builder.m_config.seed &&
+            header.pageSize == builder.m_config.pageSize &&
+            header.rootMinY == builder.m_config.rootMinY &&
+            header.nodeCount > 0 &&
+            header.pageCount > 0 &&
+            header.pageIndexCount == static_cast<uint64_t>(pageCountPerAxis * pageCountPerAxis)) {
+
+            builder.m_nodes.resize(static_cast<size_t>(header.nodeCount));
+            builder.m_pages.resize(static_cast<size_t>(header.pageCount));
+            builder.m_pageIndex.resize(static_cast<size_t>(header.pageIndexCount));
+
+            if (in.read(reinterpret_cast<char*>(builder.m_nodes.data()), static_cast<std::streamsize>(builder.m_nodes.size() * sizeof(Node))) &&
+                in.read(reinterpret_cast<char*>(builder.m_pages.data()), static_cast<std::streamsize>(builder.m_pages.size() * sizeof(Page))) &&
+                in.read(reinterpret_cast<char*>(builder.m_pageIndex.data()), static_cast<std::streamsize>(builder.m_pageIndex.size() * sizeof(uint32_t)))) {
+                loadedFromCache = true;
+            } else {
+                builder.m_nodes.clear();
+                builder.m_pages.clear();
+                builder.m_pageIndex.clear();
             }
-
-            Page page;
-            page.originX = static_cast<int32_t>(std::floor(originX));
-            page.originY = static_cast<int32_t>(std::floor(m_config.rootMinY));
-            page.originZ = static_cast<int32_t>(std::floor(originZ));
-            page.rootNode = BuildNode(rootBounds, 0);
-            m_pages.push_back(page);
         }
     }
 
-    if (m_nodes.empty() || m_pages.empty()) {
-        return Error("FarVoxelOctree generated no nodes/pages");
+    if (!loadedFromCache) {
+        builder.m_nodes.reserve(static_cast<size_t>(pageCountPerAxis * pageCountPerAxis * 64));
+        builder.m_pages.reserve(static_cast<size_t>(pageCountPerAxis * pageCountPerAxis));
+        builder.m_pageIndex.assign(static_cast<size_t>(pageCountPerAxis * pageCountPerAxis), kMissingPage);
+
+        for (int32_t pz = -radius; pz <= radius; ++pz) {
+            for (int32_t px = -radius; px <= radius; ++px) {
+                const float originX = static_cast<float>(px) * builder.m_config.pageSize;
+                const float originZ = static_cast<float>(pz) * builder.m_config.pageSize;
+                const BuildBounds rootBounds{
+                    originX,
+                    builder.m_config.rootMinY,
+                    originZ,
+                    builder.m_config.pageSize
+                };
+
+                if (!builder.CellMayContainTerrain(rootBounds)) {
+                    continue;
+                }
+
+                Page page;
+                page.originX = static_cast<int32_t>(std::floor(originX));
+                page.originY = static_cast<int32_t>(std::floor(builder.m_config.rootMinY));
+                page.originZ = static_cast<int32_t>(std::floor(originZ));
+                page.rootNode = builder.BuildNode(rootBounds, 0);
+                const uint32_t pageIndex = static_cast<uint32_t>(builder.m_pages.size());
+                const size_t denseIndex = static_cast<size_t>(pz + radius) *
+                                          static_cast<size_t>(pageCountPerAxis) +
+                                          static_cast<size_t>(px + radius);
+                builder.m_pageIndex[denseIndex] = pageIndex;
+                builder.m_pages.push_back(page);
+            }
+        }
+
+        CacheHeader header{};
+        header.pageRadius = radius;
+        header.maxDepth = builder.m_config.maxDepth;
+        header.seed = builder.m_config.seed;
+        header.pageSize = builder.m_config.pageSize;
+        header.rootMinY = builder.m_config.rootMinY;
+        header.nodeCount = static_cast<uint64_t>(builder.m_nodes.size());
+        header.pageCount = static_cast<uint64_t>(builder.m_pages.size());
+        header.pageIndexCount = static_cast<uint64_t>(builder.m_pageIndex.size());
+
+        std::ofstream out(cachePath, std::ios::binary | std::ios::trunc);
+        if (out.write(reinterpret_cast<const char*>(&header), sizeof(header)) &&
+            out.write(reinterpret_cast<const char*>(builder.m_nodes.data()), static_cast<std::streamsize>(builder.m_nodes.size() * sizeof(Node))) &&
+            out.write(reinterpret_cast<const char*>(builder.m_pages.data()), static_cast<std::streamsize>(builder.m_pages.size() * sizeof(Page))) &&
+            out.write(reinterpret_cast<const char*>(builder.m_pageIndex.data()), static_cast<std::streamsize>(builder.m_pageIndex.size() * sizeof(uint32_t)))) {
+            spdlog::info("Saved far voxel octree cache: {}", cachePath.string());
+        }
+    }
+
+    if (builder.m_nodes.empty() || builder.m_pages.empty()) {
+        result.error = "FarVoxelOctree generated no nodes/pages";
+        return result;
+    }
+
+    result.stats.pageCount = static_cast<uint32_t>(builder.m_pages.size());
+    result.stats.nodeCount = static_cast<uint32_t>(builder.m_nodes.size());
+    result.stats.pageIndexCount = static_cast<uint32_t>(builder.m_pageIndex.size());
+    result.stats.pageRadius = radius;
+    result.stats.maxDepth = builder.m_config.maxDepth;
+    result.stats.pageSize = builder.m_config.pageSize;
+    result.stats.rootMinY = builder.m_config.rootMinY;
+    result.stats.coveredWorldSize = static_cast<float>(pageCountPerAxis) * builder.m_config.pageSize;
+    result.stats.loadedFromCache = loadedFromCache;
+    result.stats.cpuBuildMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - buildStart).count();
+    result.nodes = std::move(builder.m_nodes);
+    result.pages = std::move(builder.m_pages);
+    result.pageIndex = std::move(builder.m_pageIndex);
+    result.success = true;
+    return result;
+}
+
+Result<void> FarVoxelOctree::UploadToGpu(ID3D12Device* device, DescriptorHeapManager& heapManager) {
+    const auto uploadStart = std::chrono::steady_clock::now();
+    if (!device) {
+        return Error("FarVoxelOctree::UploadToGpu - device is null");
+    }
+    if (m_nodes.empty() || m_pages.empty() || m_pageIndex.empty()) {
+        return Error("FarVoxelOctree::UploadToGpu - CPU data is empty");
     }
 
     auto nodeResult = m_nodeBuffer.Initialize(
@@ -110,25 +279,46 @@ Result<void> FarVoxelOctree::Initialize(
         return Error("Failed to create far octree page SRV: {}", pageResult.error());
     }
 
-    m_stats.pageCount = static_cast<uint32_t>(m_pages.size());
-    m_stats.nodeCount = static_cast<uint32_t>(m_nodes.size());
-    m_stats.maxDepth = m_config.maxDepth;
-    m_stats.pageSize = m_config.pageSize;
-    m_stats.coveredWorldSize = static_cast<float>(pageCountPerAxis) * m_config.pageSize;
+    auto indexResult = m_pageIndexBuffer.Initialize(
+        device,
+        static_cast<uint64_t>(m_pageIndex.size() * sizeof(uint32_t)),
+        BufferUsage::Upload | BufferUsage::StructuredBuffer,
+        sizeof(uint32_t),
+        "FarVoxelOctree_PageIndex");
+    if (!indexResult) {
+        return Error("Failed to create far octree page index buffer: {}", indexResult.error());
+    }
+    m_pageIndexBuffer.Upload(m_pageIndex.data(), m_pageIndex.size() * sizeof(uint32_t));
+    indexResult = m_pageIndexBuffer.CreateSRV(device, heapManager);
+    if (!indexResult) {
+        return Error("Failed to create far octree page index SRV: {}", indexResult.error());
+    }
 
-    spdlog::info("Far voxel octree initialized: {} pages, {} nodes, pageSize={}, coverage={} world units",
+    m_stats.gpuUploadMs = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - uploadStart).count();
+    spdlog::info("Far voxel octree initialized: {} pages, {} nodes, {} page-index cells, pageSize={}, coverage={} world units, source={}, {:.1f} ms",
         m_stats.pageCount,
         m_stats.nodeCount,
+        m_stats.pageIndexCount,
         m_stats.pageSize,
-        m_stats.coveredWorldSize);
+        m_stats.coveredWorldSize,
+        m_stats.loadedFromCache ? "cache" : "build",
+        m_stats.cpuBuildMs + m_stats.gpuUploadMs);
     return {};
 }
 
 void FarVoxelOctree::Shutdown() {
+    if (m_asyncPending && m_asyncBuild.valid() &&
+        m_asyncBuild.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        (void)m_asyncBuild.get();
+        m_asyncPending = false;
+    }
     m_nodeBuffer.Shutdown();
     m_pageBuffer.Shutdown();
+    m_pageIndexBuffer.Shutdown();
     m_nodes.clear();
     m_pages.clear();
+    m_pageIndex.clear();
     m_stats = {};
 }
 

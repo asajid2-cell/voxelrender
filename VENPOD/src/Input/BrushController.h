@@ -159,7 +159,7 @@ private:
     bool m_isErasing = false;
 
     // Brush settings
-    uint32_t m_material = 1;  // Default: sand
+    uint32_t m_material = 14;  // Default: concrete traversal material
     float m_radius = 5.0f;
     float m_strength = 1.0f;
     BrushMode m_mode = BrushMode::Paint;

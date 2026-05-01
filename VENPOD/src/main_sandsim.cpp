@@ -535,6 +535,7 @@ int RunSandSimulator(int argc, char* argv[]) {
         renderer->RenderVoxels(
             commandList.Get(),
             voxelWorld->GetReadBufferSRV(),
+            voxelWorld->GetReadChunkValidMaskSRV(),
             voxelWorld->GetPaletteSRV(),
             voxelWorld->GetGridSizeX(),
             voxelWorld->GetGridSizeY(),

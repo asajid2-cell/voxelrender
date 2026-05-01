@@ -171,6 +171,13 @@ void main(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID) {
                     continue;
                 }
 
+                // Brush-built traversal voxels are intentionally static even
+                // when their material would normally be simulated, e.g. sand.
+                if (IsStatic(currentVoxel)) {
+                    SetVoxel(uint3(pos), outputVoxel);
+                    continue;
+                }
+
                 // Process static/non-movable materials
                 if (!IsMovable(material)) {
                     // === ICE MELTING ===

@@ -14,7 +14,11 @@ cbuffer CopyChunkConstants : register(b0) {
     uint destGridSizeX;    // Always 256 for render buffer
     uint destGridSizeY;    // Always 256 for render buffer
     uint destGridSizeZ;    // Always 256 for render buffer
-    uint padding;
+    uint validChunkIndex;   // 64^3 chunk slot in the moving render window
+    uint worldChunkX;
+    uint worldChunkY;
+    uint worldChunkZ;
+    uint paddingTag;
 };
 
 // Source: Single 64^3 chunk buffer
@@ -22,6 +26,7 @@ StructuredBuffer<uint> ChunkVoxelInput : register(t0);
 
 // Destination: 256^3 render buffer
 RWStructuredBuffer<uint> RenderBufferOutput : register(u0);
+RWStructuredBuffer<uint4> ChunkValidMask : register(u1);
 
 [numthreads(8, 8, 8)]
 void main(uint3 DTid : SV_DispatchThreadID) {
@@ -48,4 +53,8 @@ void main(uint3 DTid : SV_DispatchThreadID) {
 
     // Copy voxel from chunk to render buffer
     RenderBufferOutput[destIndex] = ChunkVoxelInput[srcIndex];
+
+    if (DTid.x == 0 && DTid.y == 0 && DTid.z == 0) {
+        ChunkValidMask[validChunkIndex] = uint4(worldChunkX, worldChunkY, worldChunkZ, 1u);
+    }
 }

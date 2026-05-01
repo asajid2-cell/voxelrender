@@ -74,6 +74,15 @@ struct FrameConstants {
     // Sparse visual far field (4 DWORDs)
     // x = enabled, y = page count, z = node count, w = page size
     float4   farFieldParams;
+
+    // Adaptive render budget (4 DWORDs)
+    // x = dense max ray distance, y = dense max DDA steps, z = far-field quality, w = overall quality
+    float4   renderBudgetParams;
+
+    // Far-field page index metadata (4 DWORDs)
+    // x = page radius, y = page-index side length, z = root min Y, w = reserved
+    float4   farFieldGridParams;
+
 };
 
 // Chunk control structure for sparse optimization

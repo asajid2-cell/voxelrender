@@ -9,6 +9,7 @@
 #include <wrl/client.h>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <queue>
 #include <vector>
 #include <functional>
@@ -40,6 +41,7 @@ struct InfiniteChunkConfig {
 
     uint32_t chunksPerFrame = 1;           // Generate 1 chunk per frame (safe, no GPU flooding)
     uint32_t maxQueuedChunks = 64;         // Queue up to 64 chunks (enough for streaming)
+    uint32_t maxChunksQueuedPerUpdate = 128; // Incremental queue fill to avoid startup floods
     uint32_t worldSeed = 12345;            // Procedural generation seed
 };
 
@@ -83,6 +85,7 @@ public:
 
     // Get generation queue size (for debugging)
     size_t GetGenerationQueueSize() const { return m_generationQueue.size(); }
+    size_t GetQueuedUniqueChunkCount() const { return m_queuedChunks.size(); }
 
     // PRIORITY 2: Get current camera chunk coordinate (for chunk scan optimization)
     ChunkCoord GetCameraChunk() const { return m_cameraChunk; }
@@ -94,6 +97,10 @@ public:
     const InfiniteChunkConfig& GetConfig() const { return m_config; }
     void SetLoadDistanceHorizontal(int32_t distance) { m_config.loadDistanceHorizontal = distance; }
     void SetUnloadDistanceHorizontal(int32_t distance) { m_config.unloadDistanceHorizontal = distance; }
+    void SetChunksPerFrame(uint32_t chunks) { m_config.chunksPerFrame = chunks; }
+    void GenerateQueuedChunks(ID3D12Device* device, ID3D12CommandQueue* cmdQueue);
+    void EnsureQueuedAroundChunk(const ChunkCoord& centerChunk);
+    bool QueueUrgentChunk(const ChunkCoord& coord, int32_t priority = -1'000'000);
 
     // Force generation of specific chunk (for testing)
     Result<void> ForceGenerateChunk(
@@ -122,7 +129,10 @@ private:
     Result<void> QueueChunksAroundCamera(const ChunkCoord& cameraChunk);
     Result<void> GenerateNextChunk(ID3D12Device* device, ID3D12CommandQueue* cmdQueue);  // CHANGED: Uses internal cmdList + executes immediately
     void UnloadDistantChunks(const ChunkCoord& cameraChunk);
+    void TrimSourceCacheForVisibleWindow(const ChunkCoord& cameraChunk);
+    void PruneGenerationQueueForCenter(const ChunkCoord& centerChunk);
     bool IsWithinLoadWindow(const ChunkCoord& coord, const ChunkCoord& center) const;
+    bool IsChunkQueued(const ChunkCoord& coord) const;
 
     // Create generation compute pipeline
     Result<void> CreateGenerationPipeline(ID3D12Device* device);
@@ -136,14 +146,16 @@ private:
     // This ensures chunks near the player generate before distant ones!
     struct ChunkPriorityEntry {
         ChunkCoord coord;
-        int32_t distanceSquared;  // Distance from camera (lower = higher priority)
+        int32_t priority;  // Lower value is generated first.
 
-        // Priority queue is max-heap, so use > for min-heap behavior (nearest first)
+        // Priority queue is max-heap, so use > for min-heap behavior.
         bool operator<(const ChunkPriorityEntry& other) const {
-            return distanceSquared > other.distanceSquared;  // Invert for min-heap
+            return priority > other.priority;
         }
     };
+    bool EnqueueChunk(const ChunkPriorityEntry& entry);
     std::priority_queue<ChunkPriorityEntry> m_generationQueue;
+    std::unordered_set<ChunkCoord> m_queuedChunks;
 
     // Last camera chunk position (to avoid redundant updates)
     ChunkCoord m_lastCameraChunk = ChunkCoord{INT32_MAX, INT32_MAX, INT32_MAX};
@@ -172,8 +184,10 @@ private:
     // 2. Multiple chunks per frame would flood the command list
     // 3. Synchronization issues - we read buffers before GPU completes
 
-    // RING BUFFER FIX: Use 3 allocators to prevent reuse while GPU is executing
-    static constexpr uint32_t NUM_FRAME_BUFFERS = 3;
+    // Ring of generation allocators. Keep enough in flight that startup can
+    // fill the visible render cache quickly without reusing an allocator while
+    // the GPU is still consuming its command list.
+    static constexpr uint32_t NUM_FRAME_BUFFERS = 8;
     ComPtr<ID3D12CommandAllocator> m_chunkCmdAllocators[NUM_FRAME_BUFFERS];
     ComPtr<ID3D12GraphicsCommandList> m_chunkCmdList;
     uint32_t m_currentAllocatorIndex = 0;
@@ -181,8 +195,8 @@ private:
     // GPU FENCE: Track chunk generation completion
     ComPtr<ID3D12Fence> m_chunkFence;
     uint64_t m_chunkFenceValue = 0;
-    uint64_t m_allocatorFenceValues[NUM_FRAME_BUFFERS] = {0, 0, 0};  // Track when each allocator was last used
-    uint32_t m_allocatorSkipCounts[NUM_FRAME_BUFFERS] = {0, 0, 0};   // Per-allocator skip counters
+    uint64_t m_allocatorFenceValues[NUM_FRAME_BUFFERS] = {};  // Track when each allocator was last used
+    uint32_t m_allocatorSkipCounts[NUM_FRAME_BUFFERS] = {};   // Per-allocator skip counters
     HANDLE m_chunkFenceEvent = nullptr;
 
     // FIX #1: Track per-chunk fence values to verify when generation completes

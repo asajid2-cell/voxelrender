@@ -44,10 +44,14 @@ struct VoxelWorldStreamingStats {
     uint32_t chunksSkippedLastFrame = 0;
     uint32_t chunksNotGeneratedLastFrame = 0;
     uint32_t chunksNotLoadedLastFrame = 0;
+    uint32_t urgentVisibleChunksQueuedLastFrame = 0;
     uint32_t chunksCheckedLastFrame = 0;
     uint32_t cachedReadChunks = 0;
     uint32_t cachedWriteChunks = 0;
     uint32_t expectedVisibleChunks = 0;
+    uint32_t readSlotMismatches = 0;
+    uint32_t writeSlotMismatches = 0;
+    uint32_t toroidalSlotCount = 0;
     uint32_t loadedChunkRecords = 0;
     uint32_t generatedChunks = 0;
     uint32_t queuedChunks = 0;
@@ -135,6 +139,30 @@ public:
     const Graphics::DescriptorHandle& GetReadBufferUAV() const { return m_shaderVisibleUAVs[m_readBufferIndex]; }
     const Graphics::DescriptorHandle& GetWriteBufferSRV() const { return m_shaderVisibleSRVs[1 - m_readBufferIndex]; }
     const Graphics::DescriptorHandle& GetWriteBufferUAV() const { return m_shaderVisibleUAVs[1 - m_readBufferIndex]; }
+    const Graphics::DescriptorHandle& GetReadChunkValidMaskSRV() const { return m_chunkValidMaskSRVs[m_readBufferIndex]; }
+    glm::vec3 WorldToRenderLocal(const glm::vec3& worldPosition) const;
+    bool RenderLocalToWorld(const glm::vec3& localPosition, glm::vec3& outWorldPosition) const;
+    bool IsWorldChunkCachedForRead(const ChunkCoord& coord) const;
+    bool IsWorldChunkCachedForWrite(const ChunkCoord& coord) const;
+    bool IsWorldChunkCachedForReadWrite(const ChunkCoord& coord) const;
+    bool IsWorldVoxelCachedForRead(int32_t worldX, int32_t worldY, int32_t worldZ) const;
+    bool IsWorldVoxelCachedForReadWrite(int32_t worldX, int32_t worldY, int32_t worldZ) const;
+    bool EnsureWorldBrushVolumeCachedForReadWrite(float worldX, float worldY, float worldZ, float radius);
+    void RecordPersistentWorldBrushEdit(
+        float worldPositionX,
+        float worldPositionY,
+        float worldPositionZ,
+        float radius,
+        uint32_t material,
+        uint32_t mode,
+        uint32_t shape,
+        float strength,
+        uint32_t seed,
+        int32_t hitNormalX,
+        int32_t hitNormalY,
+        int32_t hitNormalZ,
+        bool hasHitNormal);
+    void RequestActiveRegionRefresh(uint32_t frames = 8);
 
     // Grid properties
     uint32_t GetGridSizeX() const { return m_config.gridSizeX; }
@@ -167,6 +195,8 @@ public:
     // Resource barriers
     void TransitionReadBufferTo(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_STATES state);
     void TransitionWriteBufferTo(ID3D12GraphicsCommandList* cmdList, D3D12_RESOURCE_STATES state);
+    void SetChunkGenerationBudget(uint32_t chunksPerFrame);
+    void PumpChunkGeneration(ID3D12Device* device, ID3D12CommandQueue* cmdQueue);
 
     // GPU brush raycasting (NEW - replaces CPU readback)
     // Get the GPU buffer that stores brush raycast results (16 bytes)
@@ -350,6 +380,10 @@ private:
     // Shader-visible descriptors for voxel buffers (persistent, no per-frame copying)
     Graphics::DescriptorHandle m_shaderVisibleSRVs[2];  // SRV for each buffer
     Graphics::DescriptorHandle m_shaderVisibleUAVs[2];  // UAV for each buffer
+    Graphics::GPUBuffer m_chunkValidMasks[2];
+    Graphics::DescriptorHandle m_chunkValidMaskSRVs[2];
+    Graphics::DescriptorHandle m_chunkValidMaskUAVs[2];
+    std::array<std::vector<ChunkCoord>, 2> m_chunkSlotWorldCoords;
 
     // Material palette (256 colors)
     ComPtr<ID3D12Resource> m_materialPalette;
@@ -384,6 +418,7 @@ private:
         Graphics::GPUBuffer counterReadback;
         bool pending = false;
         uint64_t fenceValue = 0;
+        uint32_t bufferIndex = 0;
         glm::vec3 regionOriginWorld = glm::vec3(0.0f);
     };
 
@@ -401,6 +436,7 @@ private:
 
     // Active region tracking (which chunk is at center of render buffer)
     ChunkCoord m_activeRegionCenter = ChunkCoord(INT32_MAX, INT32_MAX, INT32_MAX);  // Sentinel for "not initialized"
+    ChunkCoord m_lastRenderCameraChunk = ChunkCoord(INT32_MAX, INT32_MAX, INT32_MAX);
     bool m_activeRegionNeedsUpdate = true;
     bool m_firstUpdateDone = false;  // Flag to track first UpdateChunks call
 
@@ -432,6 +468,7 @@ private:
     // When cache is invalidated (camera moves to new chunk), we need to aggressively
     // refill BOTH buffers to prevent holes/missing chunks during the refill period
     int32_t m_framesAfterCacheInvalidation = 0;
+    uint32_t m_forcedActiveRegionUpdateFrames = 0;
     uint32_t m_maxChunkCopiesPerFrame = 24;
     VoxelWorldStreamingStats m_streamingStats = {};
 
@@ -442,6 +479,7 @@ private:
 
     // RING BUFFER FIX: Use 3 allocators for chunk copy to prevent reuse while GPU executing
     static constexpr uint32_t NUM_COPY_BUFFERS = 3;
+    static constexpr uint32_t NUM_EDIT_UPLOAD_SLOTS = NUM_COPY_BUFFERS * 2;
 
     // Chunk copy pipeline (for UpdateActiveRegion)
     ComPtr<ID3D12PipelineState> m_chunkCopyPSO;
@@ -452,9 +490,9 @@ private:
     // Persistent edit overlay apply pipeline.
     ComPtr<ID3D12PipelineState> m_editApplyPSO;
     ComPtr<ID3D12RootSignature> m_editApplyRootSignature;
-    ComPtr<ID3D12Resource> m_editUploadBuffers[NUM_COPY_BUFFERS];
-    void* m_editUploadMappedPtrs[NUM_COPY_BUFFERS] = {nullptr, nullptr, nullptr};
-    uint32_t m_editUploadCapacities[NUM_COPY_BUFFERS] = {0, 0, 0};
+    ComPtr<ID3D12Resource> m_editUploadBuffers[NUM_EDIT_UPLOAD_SLOTS];
+    void* m_editUploadMappedPtrs[NUM_EDIT_UPLOAD_SLOTS] = {};
+    uint32_t m_editUploadCapacities[NUM_EDIT_UPLOAD_SLOTS] = {};
 
     ComPtr<ID3D12CommandAllocator> m_chunkCopyCmdAllocators[NUM_COPY_BUFFERS];
     ComPtr<ID3D12GraphicsCommandList> m_chunkCopyCmdList;

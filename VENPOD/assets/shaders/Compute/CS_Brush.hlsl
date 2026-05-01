@@ -125,7 +125,7 @@ void main(uint3 DTid : SV_DispatchThreadID) {
         case BRUSH_MODE_PAINT:
             // Only paint in air or if forcing
             if (currentMaterial == MAT_AIR) {
-                newVoxel = PackVoxel(material, variant, 0, 0);
+                newVoxel = PackVoxel(material, variant, 0, STATE_IS_STATIC);
             }
             break;
 
@@ -139,14 +139,14 @@ void main(uint3 DTid : SV_DispatchThreadID) {
         case BRUSH_MODE_REPLACE:
             // Replace any non-air, non-bedrock voxel
             if (currentMaterial != MAT_AIR && currentMaterial != MAT_BEDROCK) {
-                newVoxel = PackVoxel(material, variant, 0, 0);
+                newVoxel = PackVoxel(material, variant, 0, STATE_IS_STATIC);
             }
             break;
 
         case BRUSH_MODE_FILL:
             // Fill all voxels (including air, but not bedrock)
             if (currentMaterial != MAT_BEDROCK) {
-                newVoxel = PackVoxel(material, variant, 0, 0);
+                newVoxel = PackVoxel(material, variant, 0, STATE_IS_STATIC);
             }
             break;
     }

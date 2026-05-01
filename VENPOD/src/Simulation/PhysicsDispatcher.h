@@ -74,6 +74,7 @@ struct PhysicsDispatcherStats {
     uint32_t scanBudgetChunks = 0;
     uint32_t scannedChunksLastFrame = 0;
     uint32_t skippedScanChunksLastFrame = 0;
+    uint32_t theoreticalChunkUniverse = 0;
     uint32_t dispatchX = 0;
     uint32_t dispatchY = 0;
     uint32_t dispatchZ = 0;

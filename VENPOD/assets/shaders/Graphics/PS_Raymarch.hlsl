@@ -35,6 +35,8 @@ struct FarVoxelPage {
 
 StructuredBuffer<FarVoxelNode> FarVoxelNodes : register(t2);
 StructuredBuffer<FarVoxelPage> FarVoxelPages : register(t3);
+StructuredBuffer<uint> FarVoxelPageIndex : register(t4);
+StructuredBuffer<uint4> ChunkValidMask : register(t5);
 
 static const float FAR_TERRAIN_MIN_HEIGHT = -332.0f;
 static const float FAR_TERRAIN_MAX_HEIGHT = 664.0f;
@@ -43,7 +45,7 @@ static const uint FAR_WORLD_SEED = 12345u;
 static const bool FAR_TERRAIN_HORIZON_ENABLED = true;
 static const float FAR_SVO_ROOT_CELL_SIZE = 512.0f;
 static const float FAR_SVO_MIN_CELL_SIZE = 24.0f;
-static const int FAR_SVO_MAX_LEVELS = 5;
+static const int FAR_SVO_MAX_LEVELS = 3;
 
 struct PSInput {
     float4 position : SV_Position;
@@ -55,23 +57,48 @@ struct RayHit {
     float distance;
 };
 
-// Sample voxel from grid
-uint GetVoxel(int3 worldPos) {
-    // CRITICAL FIX: Convert world position to buffer-local position
-    // The render buffer is a "moving window" that follows the camera.
-    // When camera moves, chunks are copied to different buffer positions,
-    // so we must subtract the region origin to get the correct buffer index.
-    int3 bufferPos = worldPos - int3(frame.regionOrigin.xyz);
+int FloorDiv64(int value) {
+    return value >= 0 ? value / 64 : -(((-value) + 63) / 64);
+}
 
-    // Bounds check (buffer-local coordinates)
-    if (bufferPos.x < 0 || bufferPos.x >= (int)frame.gridSizeX ||
-        bufferPos.y < 0 || bufferPos.y >= (int)frame.gridSizeY ||
-        bufferPos.z < 0 || bufferPos.z >= (int)frame.gridSizeZ) {
+int FloorModInt(int value, int modulus) {
+    int r = value % modulus;
+    return r < 0 ? r + modulus : r;
+}
+
+uint RenderSlotIndex(int3 chunkCoord, out uint3 slotCoord) {
+    int3 dims = int3((int)(frame.gridSizeX / 64u), (int)(frame.gridSizeY / 64u), (int)(frame.gridSizeZ / 64u));
+    slotCoord = uint3(
+        (uint)FloorModInt(chunkCoord.x, dims.x),
+        (uint)FloorModInt(chunkCoord.y, dims.y),
+        (uint)FloorModInt(chunkCoord.z, dims.z));
+    return slotCoord.x + slotCoord.y * (uint)dims.x + slotCoord.z * (uint)dims.x * (uint)dims.y;
+}
+
+// Sample voxel from toroidal near-field chunk cache.
+uint GetVoxel(int3 worldPos) {
+    int3 worldChunk = int3(
+        FloorDiv64(worldPos.x),
+        FloorDiv64(worldPos.y),
+        FloorDiv64(worldPos.z));
+    uint3 localVoxel = uint3(
+        (uint)FloorModInt(worldPos.x, 64),
+        (uint)FloorModInt(worldPos.y, 64),
+        (uint)FloorModInt(worldPos.z, 64));
+
+    uint3 slotCoord;
+    uint chunkIndex = RenderSlotIndex(worldChunk, slotCoord);
+    uint4 slotTag = ChunkValidMask[chunkIndex];
+    if (slotTag.w == 0u ||
+        slotTag.x != (uint)worldChunk.x ||
+        slotTag.y != (uint)worldChunk.y ||
+        slotTag.z != (uint)worldChunk.z) {
         return PackVoxel(MAT_AIR, 0, 0, 0);
     }
 
+    uint3 bufferPos = slotCoord * 64u + localVoxel;
     uint3 gridSize = uint3(frame.gridSizeX, frame.gridSizeY, frame.gridSizeZ);
-    uint idx = LinearIndex3D(uint3(bufferPos), gridSize);
+    uint idx = LinearIndex3D(bufferPos, gridSize);
     return VoxelGrid[idx];
 }
 
@@ -184,10 +211,10 @@ float FarTerrainHeight(float2 xz, out float mountainMask, out float spireMask, o
     float originUplift = (1.0f - FarSmooth01(d / 420.0f)) * 170.0f;
 
     float height = -85.0f;
-    height += continent * 210.0f;
-    height += ridgeA * (125.0f + mountainMask * 170.0f);
-    height += ridgeB * mountainMask * 95.0f;
-    height += spireMask * 360.0f;
+    height += continent * 175.0f;
+    height += ridgeA * (95.0f + mountainMask * 115.0f);
+    height += ridgeB * mountainMask * 62.0f;
+    height += spireMask * 150.0f;
     height += originUplift;
     height -= broadValley * (90.0f - mountainMask * 30.0f);
     height -= ravineMask * 230.0f;
@@ -314,42 +341,87 @@ bool TraverseFarVoxelPage(
 bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, out RayHit farHit) {
     farHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
 
-    if (frame.farFieldParams.x < 0.5f || frame.farFieldParams.y < 1.0f || frame.farFieldParams.z < 1.0f) {
+    if (frame.farFieldParams.x < 0.5f || frame.renderBudgetParams.z < 0.25f ||
+        frame.farFieldParams.y < 1.0f || frame.farFieldParams.z < 1.0f) {
         return false;
     }
     if (rayDir.y > 0.18f || rayDir.y < -0.42f) {
         return false;
     }
 
-    uint pageCount = min((uint)frame.farFieldParams.y, 4096u);
+    const uint pageCount = (uint)frame.farFieldParams.y;
+    const int pageRadius = (int)frame.farFieldGridParams.x;
+    const int pageSide = (int)frame.farFieldGridParams.y;
     float pageSize = max(frame.farFieldParams.w, 1.0f);
+    if (pageRadius <= 0 || pageSide <= 0) {
+        return false;
+    }
+
+    // The first SVO integration scanned every page for every far-field pixel.
+    // That is correct but far too expensive once the page forest grows. This
+    // top-level 2D DDA only probes the page cells crossed by the ray in X/Z,
+    // then traverses the octree for those candidate pages.
+    const float farMaxDist = 10400.0f;
+    float t = max(startDist, 32.0f);
     float nearestT = 1e20f;
     float3 nearestNormal = float3(0, 1, 0);
     uint nearestMaterial = MAT_STONE;
 
+    float2 rayXZ = rayDir.xz;
+    float2 originXZ = rayOrigin.xz;
+    int maxPageSteps = frame.renderBudgetParams.z < 0.6f ? 18 : (frame.renderBudgetParams.z < 0.9f ? 28 : 40);
+
     [loop]
-    for (uint pageIndex = 0; pageIndex < pageCount; ++pageIndex) {
-        FarVoxelPage page = FarVoxelPages[pageIndex];
-        float3 pageMin = float3((float)page.originX, (float)page.originY, (float)page.originZ);
+    for (int stepIndex = 0; stepIndex < maxPageSteps && t < farMaxDist && t < nearestT; ++stepIndex) {
+        float3 pos = rayOrigin + rayDir * t;
+        int px = (int)floor(pos.x / pageSize);
+        int pz = (int)floor(pos.z / pageSize);
 
-        float tNear, tFar;
-        if (!IntersectBox(rayOrigin, rayDir, pageMin, pageMin + pageSize, tNear, tFar)) {
-            continue;
-        }
-        if (tFar < startDist || tNear > nearestT) {
-            continue;
+        if (px >= -pageRadius && px <= pageRadius &&
+            pz >= -pageRadius && pz <= pageRadius) {
+            uint denseIndex = (uint)((pz + pageRadius) * pageSide + (px + pageRadius));
+            uint pageIndex = FarVoxelPageIndex[denseIndex];
+
+            if (pageIndex != 0xFFFFFFFFu && pageIndex < pageCount) {
+                FarVoxelPage page = FarVoxelPages[pageIndex];
+                float3 pageMin = float3((float)page.originX, (float)page.originY, (float)page.originZ);
+
+                float tNear, tFar;
+                if (IntersectBox(rayOrigin, rayDir, pageMin, pageMin + pageSize, tNear, tFar) &&
+                    tFar >= startDist &&
+                    tNear <= nearestT) {
+                    TraverseFarVoxelPage(
+                        rayOrigin,
+                        rayDir,
+                        page.rootNode,
+                        pageMin,
+                        pageSize,
+                        startDist,
+                        nearestT,
+                        nearestNormal,
+                        nearestMaterial);
+                }
+            }
         }
 
-        TraverseFarVoxelPage(
-            rayOrigin,
-            rayDir,
-            page.rootNode,
-            pageMin,
-            pageSize,
-            startDist,
-            nearestT,
-            nearestNormal,
-            nearestMaterial);
+        float nextTx = 1e20f;
+        if (abs(rayXZ.x) > 0.0001f) {
+            float boundaryX = ((rayXZ.x > 0.0f) ? (float)(px + 1) : (float)px) * pageSize;
+            nextTx = (boundaryX - originXZ.x) / rayXZ.x;
+        }
+
+        float nextTz = 1e20f;
+        if (abs(rayXZ.y) > 0.0001f) {
+            float boundaryZ = ((rayXZ.y > 0.0f) ? (float)(pz + 1) : (float)pz) * pageSize;
+            nextTz = (boundaryZ - originXZ.y) / rayXZ.y;
+        }
+
+        float nextT = min(nextTx, nextTz);
+        if (nextT <= t + 0.5f || nextT >= 1e19f) {
+            t += max(64.0f, pageSize * 0.125f);
+        } else {
+            t = nextT + 0.5f;
+        }
     }
 
     if (nearestT >= 1e19f) {
@@ -421,7 +493,7 @@ float FarSvoSuggestedStep(float3 rayOrigin, float3 rayDir, float currentT) {
 bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out RayHit farHit) {
     farHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
 
-    if (!FAR_TERRAIN_HORIZON_ENABLED) {
+    if (!FAR_TERRAIN_HORIZON_ENABLED || frame.renderBudgetParams.z < 0.15f) {
         return false;
     }
 
@@ -440,10 +512,16 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     float previousHeight = FarTerrainHeight(previousPos.xz, mountainMask, spireMask, ravineMask);
     float previousSigned = previousPos.y - previousHeight;
 
+    // This is a continuity fallback behind the page-indexed SVO, not the main
+    // far renderer. Keep it cheap enough that sky/horizon pixels cannot become
+    // the frame-time bottleneck.
+    int farStepBudget = frame.renderBudgetParams.z < 0.6f ? 24 : (frame.renderBudgetParams.z < 0.9f ? 36 : 48);
     [loop]
-    for (int i = 0; i < 96 && t < farMaxDist; ++i) {
-        float svoStep = FarSvoSuggestedStep(rayOrigin, rayDir, t);
-        float distanceStep = lerp(48.0f, 220.0f, saturate(t / farMaxDist));
+    for (int i = 0; i < farStepBudget && t < farMaxDist; ++i) {
+        float distanceStep = lerp(96.0f, 360.0f, saturate(t / farMaxDist));
+        float svoStep = frame.renderBudgetParams.z > 0.92f
+            ? FarSvoSuggestedStep(rayOrigin, rayDir, t)
+            : distanceStep;
         float stepSize = max(FAR_SVO_MIN_CELL_SIZE, max(svoStep, distanceStep));
         t += stepSize;
 
@@ -485,7 +563,7 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             // Extra fog hides the fact that this is a heightfield fallback, not
             // the exact editable voxel buffer.
             float fogFactor = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
-            color = lerp(color, SkyColor(rayDir), fogFactor * 0.72f);
+            color = lerp(color, SkyColor(rayDir), fogFactor * 0.90f + 0.10f);
             farHit = MakeHit(float4(color, 1.0f), hitT);
             return true;
         }
@@ -502,8 +580,8 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
     // Must cover the diagonal of the moving render window. Keep this generous:
     // shortening it can make startup look like a black/empty screen while chunks
     // are visible but beyond the ray budget.
-    const float maxDist = 2500.0f;
-    const int maxSteps = 2048;
+    float maxDist = clamp(frame.renderBudgetParams.x, 900.0f, 3000.0f);
+    int maxSteps = clamp((int)frame.renderBudgetParams.y, 640, 2048);
 
     // CRITICAL FIX: Grid bounds in WORLD coordinates (not buffer coordinates)
     // The buffer is a moving window, so grid bounds = regionOrigin + bufferSize
@@ -614,10 +692,23 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
         if (dist > maxMarchDist) break;
     }
 
-    // Do not draw the far proxy through the near editable volume. If a ray
-    // traversed the dense window and found no voxel, showing the proxy behind it
-    // makes transient missing chunks look like strange overhead sheets/spikes.
-    // Far terrain is only used when the ray misses the dense AABB entirely.
+    // If the ray cleanly exits the dense editable cache, continue into the
+    // far-field renderer from just beyond the cache. This preserves the earlier
+    // protection against drawing far terrain through missing near chunks, while
+    // avoiding a hard sky cutoff when the camera pans past the near window.
+    if (entryDist + dist >= tMax - 1.0f) {
+        RayHit farHit;
+        float farStart = max(tMax + 8.0f, entryDist + dist);
+        // Do not invoke the page-indexed SVO for every sky pixel that has
+        // already crossed the dense cache; that path is correct but too costly
+        // as a background fill. The cheaper heightfield fallback is enough for
+        // continuity behind the editable window.
+        if (rayDir.y > -0.18f && rayDir.y < 0.10f &&
+            RaymarchFarTerrain(rayOrigin, rayDir, farStart, farHit)) {
+            return farHit;
+        }
+    }
+
     return MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
 }
 

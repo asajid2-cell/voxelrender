@@ -62,6 +62,22 @@ int32_t FloorMod(int32_t value, int32_t modulus) {
     return static_cast<int32_t>(ChunkCoord::LocalCoord(value, static_cast<uint32_t>(modulus)));
 }
 
+uint32_t RenderSlotIndexFromWorldChunk(const ChunkCoord& coord) {
+    const uint32_t slotX = static_cast<uint32_t>(FloorMod(coord.x, RENDER_BUFFER_CHUNKS_X));
+    const uint32_t slotY = static_cast<uint32_t>(FloorMod(coord.y, RENDER_BUFFER_CHUNKS_Y));
+    const uint32_t slotZ = static_cast<uint32_t>(FloorMod(coord.z, RENDER_BUFFER_CHUNKS_Z));
+    return slotX +
+        slotY * RENDER_BUFFER_CHUNKS_X +
+        slotZ * RENDER_BUFFER_CHUNKS_X * RENDER_BUFFER_CHUNKS_Y;
+}
+
+glm::ivec3 RenderSlotCoordFromWorldChunk(const ChunkCoord& coord) {
+    return glm::ivec3(
+        FloorMod(coord.x, RENDER_BUFFER_CHUNKS_X),
+        FloorMod(coord.y, RENDER_BUFFER_CHUNKS_Y),
+        FloorMod(coord.z, RENDER_BUFFER_CHUNKS_Z));
+}
+
 uint32_t LocalVoxelIndex(uint32_t x, uint32_t y, uint32_t z) {
     return x + y * INFINITE_CHUNK_SIZE + z * INFINITE_CHUNK_SIZE * INFINITE_CHUNK_SIZE;
 }
@@ -194,8 +210,19 @@ Result<void> VoxelWorld::Initialize(
 
         InfiniteChunkConfig chunkConfig;
         chunkConfig.worldSeed = 12345;  // TODO: Make configurable via VoxelWorldConfig
-        chunkConfig.chunksPerFrame = 8;  // Keep streaming ahead during fast flight without flooding GPU work.
-    chunkConfig.maxQueuedChunks = 2048;  // Queue nearest chunks first with enough backlog for sprint/fly traversal.
+        chunkConfig.chunksPerFrame = 3;  // Match the generation allocator ring without retry churn.
+        const uint32_t visibleDenseChunkCount =
+            RENDER_BUFFER_CHUNKS_X * RENDER_BUFFER_CHUNKS_Y * RENDER_BUFFER_CHUNKS_Z;
+        chunkConfig.maxQueuedChunks =
+            visibleDenseChunkCount + 768;
+        chunkConfig.maxChunksQueuedPerUpdate = 256;
+        // Resident+queued source chunks must cover the visible dense window, but
+        // also needs enough headroom to pre-generate the next several columns.
+        // A cache only slightly larger than the dense window made streaming
+        // behave like a just-in-time boundary load: old source chunks were
+        // trimmed before the next edge was generated, so terrain appeared only
+        // after crossing into it. Keep a real prefetch margin without trying to
+        // hoard the full load cube.
 
         // ===== SEAMLESS INFINITE STREAMING CONFIGURATION =====
         // The key to truly infinite worlds: load chunks BEFORE they're visible!
@@ -221,8 +248,8 @@ Result<void> VoxelWorld::Initialize(
         chunkConfig.unloadDistanceVerticalBelow = UNLOAD_DISTANCE_VERTICAL_BELOW;
         chunkConfig.unloadDistanceVerticalAbove = UNLOAD_DISTANCE_VERTICAL_ABOVE;
 
-        // Faster chunk generation for smooth exploration
-    chunkConfig.maxQueuedChunks = 2048;        // Queue enough chunks for fast movement without starvation.
+        // Faster chunk generation for smooth exploration, bounded by the
+        // resident source-chunk VRAM budget above.
 
         auto chunkResult = m_chunkManager->Initialize(device, heapManager, chunkConfig);
         if (!chunkResult) {
@@ -285,7 +312,7 @@ void VoxelWorld::Shutdown() {
     m_chunkCopyRootSignature.Reset();
     m_chunkCopyCmdList.Reset();
 
-    for (uint32_t i = 0; i < NUM_COPY_BUFFERS; ++i) {
+    for (uint32_t i = 0; i < NUM_EDIT_UPLOAD_SLOTS; ++i) {
         if (m_editUploadBuffers[i] && m_editUploadMappedPtrs[i]) {
             m_editUploadBuffers[i]->Unmap(0, nullptr);
             m_editUploadMappedPtrs[i] = nullptr;
@@ -315,6 +342,12 @@ void VoxelWorld::Shutdown() {
             if (m_shaderVisibleUAVs[i].IsValid()) {
                 m_heapManager->FreeShaderVisibleCbvSrvUav(m_shaderVisibleUAVs[i]);
             }
+            if (m_chunkValidMaskSRVs[i].IsValid()) {
+                m_heapManager->FreeShaderVisibleCbvSrvUav(m_chunkValidMaskSRVs[i]);
+            }
+            if (m_chunkValidMaskUAVs[i].IsValid()) {
+                m_heapManager->FreeShaderVisibleCbvSrvUav(m_chunkValidMaskUAVs[i]);
+            }
         }
 
         if (m_paletteSRV.IsValid()) {
@@ -327,6 +360,8 @@ void VoxelWorld::Shutdown() {
     }
 
     // Cleanup brush raycast buffers
+    m_chunkValidMasks[0].Shutdown();
+    m_chunkValidMasks[1].Shutdown();
     m_brushRaycastResult.Shutdown();
     m_brushRaycastReadback.Reset();
 
@@ -342,6 +377,7 @@ void VoxelWorld::Shutdown() {
         slot.counterReadback.Shutdown();
         slot.pending = false;
         slot.fenceValue = 0;
+        slot.bufferIndex = 0;
     }
     m_activeBrushEditFeedbackSlot = -1;
     m_brushEditFeedbackAvailable = false;
@@ -352,6 +388,14 @@ void VoxelWorld::Shutdown() {
 }
 
 void VoxelWorld::SwapBuffers() {
+    // Infinite streaming now keeps both dense buffers resident through the
+    // toroidal copy path and brush writes. Local physics is in-place/budgeted,
+    // not a complete READ->WRITE frame synthesis. Swapping here alternates
+    // between two partially different worlds and makes painted geometry flicker.
+    if (IsUsingInfiniteChunks()) {
+        return;
+    }
+
     // Do not block the CPU frame on chunk-copy completion. If copy work is still
     // in flight, keep the current read/write roles for one more frame and let
     // the renderer present the last stable buffer.
@@ -447,6 +491,58 @@ Result<void> VoxelWorld::CreateVoxelBuffers(ID3D12Device* device, Graphics::Desc
             m_shaderVisibleUAVs[i].cpu,
             m_voxelBuffers[i].GetStagingUAV().cpu,
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+        const uint64_t maskBytes =
+            static_cast<uint64_t>(RENDER_BUFFER_CHUNKS_X) *
+            static_cast<uint64_t>(RENDER_BUFFER_CHUNKS_Y) *
+            static_cast<uint64_t>(RENDER_BUFFER_CHUNKS_Z) *
+            sizeof(uint32_t) * 4u;
+        result = m_chunkValidMasks[i].Initialize(
+            device,
+            maskBytes,
+            Graphics::BufferUsage::StructuredBuffer | Graphics::BufferUsage::UnorderedAccess,
+            sizeof(uint32_t) * 4u,
+            i == 0 ? "ChunkSlotTags_A" : "ChunkSlotTags_B");
+        if (!result) {
+            return Error("Failed to create chunk valid mask {}: {}", i, result.error());
+        }
+
+        result = m_chunkValidMasks[i].CreateSRV(device, heapManager);
+        if (!result) {
+            return Error("Failed to create SRV for chunk valid mask {}: {}", i, result.error());
+        }
+        result = m_chunkValidMasks[i].CreateUAV(device, heapManager);
+        if (!result) {
+            return Error("Failed to create UAV for chunk valid mask {}: {}", i, result.error());
+        }
+
+        m_chunkValidMaskSRVs[i] = heapManager.AllocateShaderVisibleCbvSrvUav();
+        if (!m_chunkValidMaskSRVs[i].IsValid()) {
+            return Error("Failed to allocate shader-visible SRV for chunk valid mask {}", i);
+        }
+        device->CopyDescriptorsSimple(
+            1,
+            m_chunkValidMaskSRVs[i].cpu,
+            m_chunkValidMasks[i].GetStagingSRV().cpu,
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+        m_chunkValidMaskUAVs[i] = heapManager.AllocateShaderVisibleCbvSrvUav();
+        if (!m_chunkValidMaskUAVs[i].IsValid()) {
+            return Error("Failed to allocate shader-visible UAV for chunk valid mask {}", i);
+        }
+        device->CopyDescriptorsSimple(
+            1,
+            m_chunkValidMaskUAVs[i].cpu,
+            m_chunkValidMasks[i].GetStagingUAV().cpu,
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+
+    const size_t slotCount =
+        static_cast<size_t>(RENDER_BUFFER_CHUNKS_X) *
+        static_cast<size_t>(RENDER_BUFFER_CHUNKS_Y) *
+        static_cast<size_t>(RENDER_BUFFER_CHUNKS_Z);
+    for (auto& slots : m_chunkSlotWorldCoords) {
+        slots.assign(slotCount, ChunkCoord(INT32_MAX, INT32_MAX, INT32_MAX));
     }
 
     spdlog::debug("Created persistent shader-visible descriptors for voxel buffers");
@@ -1057,6 +1153,11 @@ glm::vec3 VoxelWorld::UpdateChunks(
 
     // Update chunk loading/unloading based on camera position
     m_chunkManager->Update(device, cmdQueue, cameraPos);
+    // Keep generated-count decisions and copy decisions in the same fence
+    // snapshot. Polling again later let chunks be copied before they were
+    // included in lastVisibleGeneratedCount, which woke UpdateActiveRegion on
+    // the next frame even though there was no new visible copy work left.
+    m_chunkManager->PollCompletedChunks();
 
     // Calculate which chunk the camera is currently in. X/Z follow the stable
     // world camera chunk. Y is clamped to the generated terrain-backed range:
@@ -1075,10 +1176,13 @@ glm::vec3 VoxelWorld::UpdateChunks(
         rawCameraChunk.y,
         RENDER_DISTANCE_VERTICAL_BELOW,
         RENDER_DISTANCE_VERTICAL_ABOVE);
+    m_lastRenderCameraChunk = cameraChunk;
 
     // Update active region when the render-window policy requests a shift or
     // when new chunks finish generating.
     static size_t lastGeneratedCount = 0;
+    static size_t lastVisibleGeneratedCount = 0;
+    static uint32_t refillPulseCounter = 0;
 
     // FIX: Count GENERATED chunks only (not just queued/submitted chunks)
     // GetLoadedChunkCount() includes chunks that are queued but not generated yet,
@@ -1098,7 +1202,7 @@ glm::vec3 VoxelWorld::UpdateChunks(
         static_cast<uint64_t>(INFINITE_CHUNK_SIZE) *
         static_cast<uint64_t>(INFINITE_CHUNK_SIZE) *
         static_cast<uint64_t>(INFINITE_CHUNK_SIZE);
-    bool newChunksGenerated = (currentGeneratedCount != lastGeneratedCount);
+    const bool anyChunksGenerated = (currentGeneratedCount != lastGeneratedCount);
 
     // ============================================================================
     // CRITICAL FIX: Update activeRegionCenter with HYSTERESIS to prevent constant stuttering!
@@ -1124,12 +1228,12 @@ glm::vec3 VoxelWorld::UpdateChunks(
         m_activeRegionCenter = cameraChunk;
         // DON'T set bufferNeedsShift = true here - we want normal operation on first frame
         // The caches start empty, so all chunks will be copied naturally
-        spdlog::info("=== FIRST FRAME INITIALIZATION ===");
-        spdlog::info("Camera at world ({:.1f}, {:.1f}, {:.1f}) = raw chunk [{},{},{}], render chunk [{},{},{}]",
+        spdlog::debug("=== FIRST FRAME INITIALIZATION ===");
+        spdlog::debug("Camera at world ({:.1f}, {:.1f}, {:.1f}) = raw chunk [{},{},{}], render chunk [{},{},{}]",
             cameraPos.x, cameraPos.y, cameraPos.z,
             rawCameraChunk.x, rawCameraChunk.y, rawCameraChunk.z,
             cameraChunk.x, cameraChunk.y, cameraChunk.z);
-        spdlog::info("Active region center set to chunk [{},{},{}]",
+        spdlog::debug("Active region center set to chunk [{},{},{}]",
             m_activeRegionCenter.x, m_activeRegionCenter.y, m_activeRegionCenter.z);
     }
     else {
@@ -1267,18 +1371,19 @@ glm::vec3 VoxelWorld::UpdateChunks(
     m_streamingStats.activeChunkZ = m_activeRegionCenter.z;
     m_streamingStats.renderMinY = static_cast<int32_t>(m_regionOriginWorld.y);
     m_streamingStats.renderMaxY = m_streamingStats.renderMinY + static_cast<int32_t>(m_config.gridSizeY) - 1;
+    m_chunkManager->EnsureQueuedAroundChunk(m_activeRegionCenter);
     glm::vec3 originShiftDelta = bufferNeedsShift
         ? (m_regionOriginWorld - oldRegionOriginWorld)
         : glm::vec3(0.0f);
 
     // Log first frame region origin (critical for debugging camera position issues)
     if (!m_firstUpdateDone) {
-        spdlog::info("Region origin set to world voxel ({},{},{})",
+        spdlog::debug("Region origin set to world voxel ({},{},{})",
             static_cast<int>(m_regionOriginWorld.x),
             static_cast<int>(m_regionOriginWorld.y),
             static_cast<int>(m_regionOriginWorld.z));
         glm::vec3 expectedBufferPos = cameraPos - m_regionOriginWorld;
-        spdlog::info("Camera buffer position should be ({:.1f},{:.1f},{:.1f}) inside the moving render buffer",
+        spdlog::debug("Camera buffer position should be ({:.1f},{:.1f},{:.1f}) inside the moving render buffer",
             expectedBufferPos.x, expectedBufferPos.y, expectedBufferPos.z);
     }
 
@@ -1300,7 +1405,7 @@ glm::vec3 VoxelWorld::UpdateChunks(
             "%s",
             recenterReason.c_str());
 
-        spdlog::info("Region recenter reason={} oldOrigin=({:.0f},{:.0f},{:.0f}) newOrigin=({:.0f},{:.0f},{:.0f}) delta=({:.0f},{:.0f},{:.0f}) playerWorld=({:.2f},{:.2f},{:.2f}) playerLocalBefore=({:.2f},{:.2f},{:.2f}) playerLocalAfter=({:.2f},{:.2f},{:.2f})",
+        spdlog::debug("Region recenter reason={} oldOrigin=({:.0f},{:.0f},{:.0f}) newOrigin=({:.0f},{:.0f},{:.0f}) delta=({:.0f},{:.0f},{:.0f}) playerWorld=({:.2f},{:.2f},{:.2f}) playerLocalBefore=({:.2f},{:.2f},{:.2f}) playerLocalAfter=({:.2f},{:.2f},{:.2f})",
             recenterReason,
             oldRegionOriginWorld.x, oldRegionOriginWorld.y, oldRegionOriginWorld.z,
             m_regionOriginWorld.x, m_regionOriginWorld.y, m_regionOriginWorld.z,
@@ -1312,7 +1417,7 @@ glm::vec3 VoxelWorld::UpdateChunks(
             cameraPos.x - m_regionOriginWorld.x,
             cameraPos.y - m_regionOriginWorld.y,
             cameraPos.z - m_regionOriginWorld.z);
-        spdlog::info("Region origin shifted to world voxel ({},{},{}) - Cache invalidated",
+        spdlog::debug("Region origin shifted to world voxel ({},{},{}) - Cache invalidated",
             static_cast<int>(m_regionOriginWorld.x),
             static_cast<int>(m_regionOriginWorld.y),
             static_cast<int>(m_regionOriginWorld.z));
@@ -1324,7 +1429,7 @@ glm::vec3 VoxelWorld::UpdateChunks(
     if (++diagFrameCount >= 60 || !firstFrameLogged) {
         // Calculate what the shader will compute
         glm::vec3 bufferPos = cameraPos - m_regionOriginWorld;
-        spdlog::info("[CAMERA DIAG] Pos=({:.1f},{:.1f},{:.1f}) RawChunk=[{},{},{}] RenderChunk=[{},{},{}] RegionOrigin=({:.0f},{:.0f},{:.0f}) BufferPos=({:.1f},{:.1f},{:.1f})",
+        spdlog::debug("[CAMERA DIAG] Pos=({:.1f},{:.1f},{:.1f}) RawChunk=[{},{},{}] RenderChunk=[{},{},{}] RegionOrigin=({:.0f},{:.0f},{:.0f}) BufferPos=({:.1f},{:.1f},{:.1f})",
             cameraPos.x, cameraPos.y, cameraPos.z,
             rawCameraChunk.x, rawCameraChunk.y, rawCameraChunk.z,
             cameraChunk.x, cameraChunk.y, cameraChunk.z,
@@ -1340,16 +1445,58 @@ glm::vec3 VoxelWorld::UpdateChunks(
         static_cast<size_t>((2 * RENDER_DISTANCE_HORIZONTAL + 1) *
                             RENDER_BUFFER_CHUNKS_Y *
                             (2 * RENDER_DISTANCE_HORIZONTAL + 1));
+    size_t currentVisibleGeneratedCount = 0;
+    if (m_activeRegionCenter.x != INT32_MAX) {
+        const auto& loadedChunks = m_chunkManager->GetLoadedChunks();
+        const int32_t renderChunkMinY = m_activeRegionCenter.y - RENDER_DISTANCE_VERTICAL_BELOW;
+        const int32_t renderChunkMaxY = m_activeRegionCenter.y + RENDER_DISTANCE_VERTICAL_ABOVE;
+        for (int32_t dz = -RENDER_DISTANCE_HORIZONTAL; dz <= RENDER_DISTANCE_HORIZONTAL; ++dz) {
+            for (int32_t y = renderChunkMinY; y <= renderChunkMaxY; ++y) {
+                for (int32_t dx = -RENDER_DISTANCE_HORIZONTAL; dx <= RENDER_DISTANCE_HORIZONTAL; ++dx) {
+                    const ChunkCoord visibleCoord{
+                        m_activeRegionCenter.x + dx,
+                        y,
+                        m_activeRegionCenter.z + dz
+                    };
+                    auto it = loadedChunks.find(visibleCoord);
+                    if (it != loadedChunks.end() && it->second && it->second->IsGenerated()) {
+                        ++currentVisibleGeneratedCount;
+                    }
+                }
+            }
+        }
+    }
+    const size_t visibleGeneratedDelta =
+        currentVisibleGeneratedCount > lastVisibleGeneratedCount
+            ? currentVisibleGeneratedCount - lastVisibleGeneratedCount
+            : lastVisibleGeneratedCount - currentVisibleGeneratedCount;
+    const bool visibleGeneratedChanged = currentVisibleGeneratedCount != lastVisibleGeneratedCount;
+    const bool refillPulseDue = !m_buffersStable && ((++refillPulseCounter % 4u) == 0u);
+    const bool visibleChunksGenerated =
+        initialRenderBufferFill ||
+        bufferNeedsShift ||
+        visibleGeneratedChanged ||
+        visibleGeneratedDelta >= 24 ||
+        (refillPulseDue && currentVisibleGeneratedCount != lastVisibleGeneratedCount);
     const bool renderCachesIncomplete =
         m_firstUpdateDone &&
-        (m_copiedChunksPerBuffer[0].size() < expectedVisibleChunks ||
-         m_copiedChunksPerBuffer[1].size() < expectedVisibleChunks);
+        (m_streamingStats.expectedVisibleChunks == 0 ||
+         m_streamingStats.cachedReadChunks < expectedVisibleChunks ||
+         m_streamingStats.cachedWriteChunks < expectedVisibleChunks);
+    const bool visibleDemandPending =
+        m_firstUpdateDone &&
+        (m_streamingStats.readSlotMismatches > 0 ||
+         m_streamingStats.writeSlotMismatches > 0 ||
+         m_streamingStats.chunksNotLoadedLastFrame > 0 ||
+         m_streamingStats.chunksNotGeneratedLastFrame > 0);
+    const bool forcedRefresh = m_forcedActiveRegionUpdateFrames > 0;
     bool needsUpdate =
         bufferNeedsShift ||
-        newChunksGenerated ||
+        visibleChunksGenerated ||
         initialRenderBufferFill ||
-        !m_buffersStable ||
-        renderCachesIncomplete;
+        renderCachesIncomplete ||
+        visibleDemandPending ||
+        forcedRefresh;
 
     // Update if buffer needs shift, new chunks were generated, first frame, or
     // the ping-pong buffers are still converging. Without this path, READ could
@@ -1362,50 +1509,66 @@ glm::vec3 VoxelWorld::UpdateChunks(
         // depend on m_activeRegionCenter.
         // With gradual 1-chunk shifts, the visual impact is minimal.
         if (bufferNeedsShift) {
-            // Clear BOTH caches - all chunks need to be re-copied at new positions
-            m_copiedChunksPerBuffer[0].clear();
-            m_copiedChunksPerBuffer[1].clear();
+            // Toroidal chunk slots preserve overlapping world chunks across
+            // recentering. Do not clear the caches or valid tags here; newly
+            // exposed edge chunks overwrite only their modulo slots.
             m_buffersStable = false;
             m_framesAfterCacheInvalidation = 24;
 
-            // Clear modified chunks - painted data will be lost on shift
-            // This is expected - paint is preserved only within local area
+            // Persistent edit overlays own user changes; local modified flags
+            // are only transient dense-buffer dirtiness markers.
             if (!m_modifiedChunks.empty()) {
                 spdlog::debug("Buffer shift: clearing {} modified chunks", m_modifiedChunks.size());
                 m_modifiedChunks.clear();
             }
 
-            spdlog::debug("Buffer shift: caches cleared, chunks will be re-copied");
+            spdlog::debug("Buffer shift: toroidal slots preserved, edge chunks will be copied");
         }
 
         lastGeneratedCount = currentGeneratedCount;
-
-        // CRITICAL FIX: Poll for completed chunks RIGHT BEFORE UpdateActiveRegion
-        // This catches chunks that JUST finished generating in this frame's Update() call
-        // Without this, UpdateActiveRegion won't see newly completed chunks until next frame
-        m_chunkManager->PollCompletedChunks();
+        lastVisibleGeneratedCount = currentVisibleGeneratedCount;
 
         if (initialRenderBufferFill) {
             m_buffersStable = false;
             m_framesAfterCacheInvalidation = 24;
         }
 
-        // Clear on first fill and on recenter. Keeping old dense-buffer voxels
-        // after regionOriginWorld changes makes stale chunks get interpreted in
-        // the new coordinate frame, which looks like floating islands/teleports
-        // and can poison raycast/collision readbacks. A future chunk-slot ring
-        // should preserve overlap without clearing; for this dense buffer, air is
-        // safer than showing wrong-world contents.
-        UpdateActiveRegion(device, cmdQueue, initialRenderBufferFill || bufferNeedsShift);
+        // Clear only on the first fill. Recenter is handled by toroidal
+        // per-slot world tags, so clearing on movement would reintroduce the
+        // full-window flash this cache is designed to remove.
+        UpdateActiveRegion(device, cmdQueue, initialRenderBufferFill);
+        if (m_forcedActiveRegionUpdateFrames > 0) {
+            --m_forcedActiveRegionUpdateFrames;
+        }
 
         if (bufferNeedsShift) {
             spdlog::debug("Camera at chunk [{},{},{}] - updating active region (buffer shifted)",
                 cameraChunk.x, cameraChunk.y, cameraChunk.z);
         }
-        // if (newChunksGenerated) {
+        // if (visibleChunksGenerated) {
         //     spdlog::debug("New chunks generated ({} total GENERATED, {} total loaded) - updating active region",
         //         currentGeneratedCount, m_chunkManager->GetLoadedChunkCount());
         // }
+    }
+    else if (anyChunksGenerated) {
+        lastGeneratedCount = currentGeneratedCount;
+        lastVisibleGeneratedCount = currentVisibleGeneratedCount;
+        m_streamingStats.copyBudget = m_maxChunkCopiesPerFrame;
+        m_streamingStats.chunksCopiedLastFrame = 0;
+        m_streamingStats.chunksSkippedLastFrame = 0;
+        m_streamingStats.chunksNotGeneratedLastFrame = 0;
+        m_streamingStats.chunksNotLoadedLastFrame = 0;
+        m_streamingStats.urgentVisibleChunksQueuedLastFrame = 0;
+        m_streamingStats.chunksCheckedLastFrame = 0;
+    }
+    else {
+        m_streamingStats.copyBudget = m_maxChunkCopiesPerFrame;
+        m_streamingStats.chunksCopiedLastFrame = 0;
+        m_streamingStats.chunksSkippedLastFrame = 0;
+        m_streamingStats.chunksNotGeneratedLastFrame = 0;
+        m_streamingStats.chunksNotLoadedLastFrame = 0;
+        m_streamingStats.urgentVisibleChunksQueuedLastFrame = 0;
+        m_streamingStats.chunksCheckedLastFrame = 0;
     }
 
     // Log chunk changes for debugging
@@ -1471,6 +1634,7 @@ void VoxelWorld::StorePersistentVoxelEdit(int32_t worldX, int32_t worldY, int32_
     }
 
     m_modifiedChunks.insert(coord);
+    RequestActiveRegionRefresh(12);
 }
 
 bool VoxelWorld::TryGetPersistentVoxelEdit(int32_t worldX, int32_t worldY, int32_t worldZ, uint32_t* outVoxel) const {
@@ -1581,6 +1745,11 @@ bool VoxelWorld::BeginBrushEditFeedback(ID3D12GraphicsCommandList* cmdList) {
     auto& slot = m_brushEditFeedbackSlots[static_cast<uint32_t>(selectedSlot)];
     slot.pending = true;
     slot.fenceValue = 0;
+    // Brush feedback is recorded from the READ pass because READ is the
+    // authoritative visible cache in infinite streaming mode. Persisting this
+    // buffer's exact shader writes prevents feedback from following a stale or
+    // divergent WRITE slot.
+    slot.bufferIndex = m_readBufferIndex;
     slot.regionOriginWorld = m_regionOriginWorld;
     m_activeBrushEditFeedbackSlot = selectedSlot;
     m_streamingStats.gpuBrushFeedbackQueued++;
@@ -1664,9 +1833,26 @@ void VoxelWorld::RetireBrushEditFeedback(uint64_t completedFenceValue) {
             const uint32_t localX = event.localRenderIndex % m_config.gridSizeX;
             const uint32_t localY = (event.localRenderIndex / m_config.gridSizeX) % m_config.gridSizeY;
             const uint32_t localZ = event.localRenderIndex / (m_config.gridSizeX * m_config.gridSizeY);
-            const int32_t worldX = FloorToInt(slot.regionOriginWorld.x) + static_cast<int32_t>(localX);
-            const int32_t worldY = FloorToInt(slot.regionOriginWorld.y) + static_cast<int32_t>(localY);
-            const int32_t worldZ = FloorToInt(slot.regionOriginWorld.z) + static_cast<int32_t>(localZ);
+            const uint32_t slotX = localX / CHUNK_SIZE_VOXELS;
+            const uint32_t slotY = localY / CHUNK_SIZE_VOXELS;
+            const uint32_t slotZ = localZ / CHUNK_SIZE_VOXELS;
+            const uint32_t slotIndex =
+                slotX +
+                slotY * RENDER_BUFFER_CHUNKS_X +
+                slotZ * RENDER_BUFFER_CHUNKS_X * RENDER_BUFFER_CHUNKS_Y;
+            if (slot.bufferIndex >= m_chunkSlotWorldCoords.size() ||
+                slotIndex >= m_chunkSlotWorldCoords[slot.bufferIndex].size()) {
+                ++m_streamingStats.gpuBrushEventsDroppedLastFrame;
+                continue;
+            }
+            const ChunkCoord worldChunk = m_chunkSlotWorldCoords[slot.bufferIndex][slotIndex];
+            if (worldChunk.x == INT32_MAX) {
+                ++m_streamingStats.gpuBrushEventsDroppedLastFrame;
+                continue;
+            }
+            const int32_t worldX = worldChunk.x * CHUNK_SIZE_VOXELS + static_cast<int32_t>(localX % CHUNK_SIZE_VOXELS);
+            const int32_t worldY = worldChunk.y * CHUNK_SIZE_VOXELS + static_cast<int32_t>(localY % CHUNK_SIZE_VOXELS);
+            const int32_t worldZ = worldChunk.z * CHUNK_SIZE_VOXELS + static_cast<int32_t>(localZ % CHUNK_SIZE_VOXELS);
 
             StorePersistentVoxelEdit(worldX, worldY, worldZ, event.packedVoxel);
             ++appliedCount;
@@ -1683,15 +1869,19 @@ void VoxelWorld::RetireBrushEditFeedback(uint64_t completedFenceValue) {
                 MAX_BRUSH_EDIT_FEEDBACK_EVENTS);
         }
         if (appliedCount > 0) {
-            spdlog::debug("GPU brush edit feedback applied {} events at region origin ({:.0f}, {:.0f}, {:.0f})",
-                appliedCount,
-                slot.regionOriginWorld.x,
-                slot.regionOriginWorld.y,
-                slot.regionOriginWorld.z);
+            static uint32_t feedbackLogThrottle = 0;
+            if ((++feedbackLogThrottle % 60) == 1) {
+                spdlog::debug("GPU brush edit feedback applied {} events at region origin ({:.0f}, {:.0f}, {:.0f})",
+                    appliedCount,
+                    slot.regionOriginWorld.x,
+                    slot.regionOriginWorld.y,
+                    slot.regionOriginWorld.z);
+            }
         }
 
         slot.pending = false;
         slot.fenceValue = 0;
+        slot.bufferIndex = 0;
         slot.regionOriginWorld = glm::vec3(0.0f);
     }
 
@@ -1740,7 +1930,54 @@ void VoxelWorld::RecordPersistentBrushEdit(
     uint32_t evaluatedThisBrush = 0;
     uint32_t rejectedThisBrush = 0;
     std::unordered_set<ChunkCoord> touchedChunks;
-    const glm::vec3 brushCenterWorld = m_regionOriginWorld + glm::vec3(localPositionX, localPositionY, localPositionZ);
+    const auto localToWorldVoxel = [this](int32_t x, int32_t y, int32_t z, int32_t& worldX, int32_t& worldY, int32_t& worldZ) -> bool {
+        if (x < 0 || y < 0 || z < 0 ||
+            x >= static_cast<int32_t>(m_config.gridSizeX) ||
+            y >= static_cast<int32_t>(m_config.gridSizeY) ||
+            z >= static_cast<int32_t>(m_config.gridSizeZ)) {
+            return false;
+        }
+        const uint32_t slotX = static_cast<uint32_t>(x / CHUNK_SIZE_VOXELS);
+        const uint32_t slotY = static_cast<uint32_t>(y / CHUNK_SIZE_VOXELS);
+        const uint32_t slotZ = static_cast<uint32_t>(z / CHUNK_SIZE_VOXELS);
+        const uint32_t slotIndex =
+            slotX +
+            slotY * RENDER_BUFFER_CHUNKS_X +
+            slotZ * RENDER_BUFFER_CHUNKS_X * RENDER_BUFFER_CHUNKS_Y;
+        if (m_readBufferIndex >= m_chunkSlotWorldCoords.size() ||
+            m_chunkSlotWorldCoords[m_readBufferIndex].empty()) {
+            worldX = FloorToInt(m_regionOriginWorld.x) + x;
+            worldY = FloorToInt(m_regionOriginWorld.y) + y;
+            worldZ = FloorToInt(m_regionOriginWorld.z) + z;
+            return true;
+        }
+        if (slotIndex >= m_chunkSlotWorldCoords[m_readBufferIndex].size()) {
+            return false;
+        }
+        const ChunkCoord chunk = m_chunkSlotWorldCoords[m_readBufferIndex][slotIndex];
+        if (chunk.x == INT32_MAX) {
+            return false;
+        }
+        worldX = chunk.x * CHUNK_SIZE_VOXELS + (x % CHUNK_SIZE_VOXELS);
+        worldY = chunk.y * CHUNK_SIZE_VOXELS + (y % CHUNK_SIZE_VOXELS);
+        worldZ = chunk.z * CHUNK_SIZE_VOXELS + (z % CHUNK_SIZE_VOXELS);
+        return true;
+    };
+    int32_t brushCenterWorldX = 0;
+    int32_t brushCenterWorldY = 0;
+    int32_t brushCenterWorldZ = 0;
+    const bool brushCenterWorldValid = localToWorldVoxel(
+        FloorToInt(localPositionX),
+        FloorToInt(localPositionY),
+        FloorToInt(localPositionZ),
+        brushCenterWorldX,
+        brushCenterWorldY,
+        brushCenterWorldZ);
+    const glm::vec3 brushCenterWorld = brushCenterWorldValid
+        ? glm::vec3(static_cast<float>(brushCenterWorldX) + 0.5f,
+                    static_cast<float>(brushCenterWorldY) + 0.5f,
+                    static_cast<float>(brushCenterWorldZ) + 0.5f)
+        : m_regionOriginWorld + glm::vec3(localPositionX, localPositionY, localPositionZ);
     const glm::vec3 hitNormal = glm::vec3(
         static_cast<float>(hitNormalX),
         static_cast<float>(hitNormalY),
@@ -1764,9 +2001,13 @@ void VoxelWorld::RecordPersistentBrushEdit(
                     continue;
                 }
 
-                const int32_t worldX = FloorToInt(m_regionOriginWorld.x) + x;
-                const int32_t worldY = FloorToInt(m_regionOriginWorld.y) + y;
-                const int32_t worldZ = FloorToInt(m_regionOriginWorld.z) + z;
+                int32_t worldX = 0;
+                int32_t worldY = 0;
+                int32_t worldZ = 0;
+                if (!localToWorldVoxel(x, y, z, worldX, worldY, worldZ)) {
+                    ++rejectedThisBrush;
+                    continue;
+                }
                 if (worldY <= TERRAIN_MIN_Y + 5) {
                     ++rejectedThisBrush;
                     continue;
@@ -1824,15 +2065,15 @@ void VoxelWorld::RecordPersistentBrushEdit(
                         ++rejectedThisBrush;
                         continue;
                     }
-                    packedVoxel = PackVoxelCPU(material, variant, 0, 0);
+                    packedVoxel = PackVoxelCPU(material, variant, 0, 0x80u);
                 } else if (mode == CPU_BRUSH_MODE_REPLACE) {
                     if (hasExistingOverlay && existingOverlayMaterial == MAT_AIR_CPU) {
                         ++rejectedThisBrush;
                         continue;
                     }
-                    packedVoxel = PackVoxelCPU(material, variant, 0, 0);
+                    packedVoxel = PackVoxelCPU(material, variant, 0, 0x80u);
                 } else if (mode == CPU_BRUSH_MODE_FILL) {
-                    packedVoxel = PackVoxelCPU(material, variant, 0, 0);
+                    packedVoxel = PackVoxelCPU(material, variant, 0, 0x80u);
                 } else {
                     ++rejectedThisBrush;
                     continue;
@@ -1846,9 +2087,9 @@ void VoxelWorld::RecordPersistentBrushEdit(
     }
 
     UpdateTargetVoxelDebug(
-        FloorToInt(m_regionOriginWorld.x + localPositionX),
-        FloorToInt(m_regionOriginWorld.y + localPositionY),
-        FloorToInt(m_regionOriginWorld.z + localPositionZ),
+        brushCenterWorldValid ? brushCenterWorldX : FloorToInt(m_regionOriginWorld.x + localPositionX),
+        brushCenterWorldValid ? brushCenterWorldY : FloorToInt(m_regionOriginWorld.y + localPositionY),
+        brushCenterWorldValid ? brushCenterWorldZ : FloorToInt(m_regionOriginWorld.z + localPositionZ),
         hasHitNormal ? hitNormalX : 0,
         hasHitNormal ? hitNormalY : 0,
         hasHitNormal ? hitNormalZ : 0);
@@ -1858,10 +2099,160 @@ void VoxelWorld::RecordPersistentBrushEdit(
     m_streamingStats.persistentEditsRecordedLastStroke = editedThisBrush;
 
     if (editedThisBrush > 0) {
-        spdlog::debug("Persistent brush edit recorded {} voxels across {} chunks (total edits={})",
-            editedThisBrush,
-            touchedChunks.size(),
-            m_totalEditedVoxels);
+        RequestActiveRegionRefresh(16);
+        static uint32_t persistentBrushLogThrottle = 0;
+        if ((++persistentBrushLogThrottle % 60u) == 1u) {
+            spdlog::debug("Persistent brush edit recorded {} voxels across {} chunks (total edits={})",
+                editedThisBrush,
+                touchedChunks.size(),
+                m_totalEditedVoxels);
+        }
+    }
+}
+
+void VoxelWorld::RecordPersistentWorldBrushEdit(
+    float worldPositionX,
+    float worldPositionY,
+    float worldPositionZ,
+    float radius,
+    uint32_t material,
+    uint32_t mode,
+    uint32_t shape,
+    float strength,
+    uint32_t seed,
+    int32_t hitNormalX,
+    int32_t hitNormalY,
+    int32_t hitNormalZ,
+    bool hasHitNormal)
+{
+    if (!IsUsingInfiniteChunks() || radius <= 0.0f) {
+        return;
+    }
+
+    const int32_t radiusCeil = static_cast<int32_t>(std::ceil(radius)) + 2;
+    const int32_t centerX = FloorToInt(worldPositionX);
+    const int32_t centerY = FloorToInt(worldPositionY);
+    const int32_t centerZ = FloorToInt(worldPositionZ);
+    const int32_t startX = centerX - radiusCeil;
+    const int32_t startY = centerY - radiusCeil;
+    const int32_t startZ = centerZ - radiusCeil;
+    const int32_t endX = static_cast<int32_t>(std::ceil(worldPositionX)) + radiusCeil + 1;
+    const int32_t endY = static_cast<int32_t>(std::ceil(worldPositionY)) + radiusCeil + 1;
+    const int32_t endZ = static_cast<int32_t>(std::ceil(worldPositionZ)) + radiusCeil + 1;
+
+    uint32_t editedThisBrush = 0;
+    uint32_t evaluatedThisBrush = 0;
+    uint32_t rejectedThisBrush = 0;
+    std::unordered_set<ChunkCoord> touchedChunks;
+    const glm::vec3 brushCenterWorld(worldPositionX, worldPositionY, worldPositionZ);
+    const glm::vec3 hitNormal(
+        static_cast<float>(hitNormalX),
+        static_cast<float>(hitNormalY),
+        static_cast<float>(hitNormalZ));
+
+    for (int32_t z = startZ; z < endZ; ++z) {
+        for (int32_t y = startY; y < endY; ++y) {
+            for (int32_t x = startX; x < endX; ++x) {
+                ++evaluatedThisBrush;
+                const float sdf = BrushSdf(
+                    static_cast<float>(x) + 0.5f,
+                    static_cast<float>(y) + 0.5f,
+                    static_cast<float>(z) + 0.5f,
+                    worldPositionX,
+                    worldPositionY,
+                    worldPositionZ,
+                    radius,
+                    shape);
+                if (sdf > 0.5f) {
+                    ++rejectedThisBrush;
+                    continue;
+                }
+                if (y <= TERRAIN_MIN_Y + 5) {
+                    ++rejectedThisBrush;
+                    continue;
+                }
+
+                const uint32_t variant = HashVoxelVariant(x, y, z, seed);
+                uint32_t existingOverlayVoxel = 0;
+                const bool hasExistingOverlay = TryGetPersistentVoxelEdit(x, y, z, &existingOverlayVoxel);
+                const uint32_t existingOverlayMaterial = hasExistingOverlay ? GetMaterialCPU(existingOverlayVoxel) : MAT_AIR_CPU;
+                if (existingOverlayMaterial == MAT_BEDROCK_CPU) {
+                    ++rejectedThisBrush;
+                    continue;
+                }
+
+                if (strength < 1.0f && sdf > -0.5f) {
+                    const float edgeFactor = std::clamp(1.0f - sdf / 0.5f, 0.0f, 1.0f);
+                    const float probability = edgeFactor * strength;
+                    if ((static_cast<float>(variant) / 255.0f) > probability) {
+                        ++rejectedThisBrush;
+                        continue;
+                    }
+                }
+
+                if (hasHitNormal) {
+                    const glm::vec3 voxelCenterWorld(
+                        static_cast<float>(x) + 0.5f,
+                        static_cast<float>(y) + 0.5f,
+                        static_cast<float>(z) + 0.5f);
+                    const float faceSide = glm::dot(voxelCenterWorld - brushCenterWorld, hitNormal);
+                    if (mode == CPU_BRUSH_MODE_PAINT && faceSide < -0.35f) {
+                        ++rejectedThisBrush;
+                        continue;
+                    }
+                    if ((mode == CPU_BRUSH_MODE_ERASE || mode == CPU_BRUSH_MODE_REPLACE) && faceSide > 0.65f) {
+                        ++rejectedThisBrush;
+                        continue;
+                    }
+                }
+
+                uint32_t packedVoxel = 0;
+                if (mode == CPU_BRUSH_MODE_ERASE) {
+                    if (hasExistingOverlay && existingOverlayMaterial == MAT_AIR_CPU) {
+                        ++rejectedThisBrush;
+                        continue;
+                    }
+                    packedVoxel = PackVoxelCPU(MAT_AIR_CPU, 0, 0, 0);
+                } else if (mode == CPU_BRUSH_MODE_PAINT) {
+                    if (hasExistingOverlay && existingOverlayMaterial != MAT_AIR_CPU) {
+                        ++rejectedThisBrush;
+                        continue;
+                    }
+                    packedVoxel = PackVoxelCPU(material, variant, 0, 0x80u);
+                } else if (mode == CPU_BRUSH_MODE_REPLACE) {
+                    if (hasExistingOverlay && existingOverlayMaterial == MAT_AIR_CPU) {
+                        ++rejectedThisBrush;
+                        continue;
+                    }
+                    packedVoxel = PackVoxelCPU(material, variant, 0, 0x80u);
+                } else if (mode == CPU_BRUSH_MODE_FILL) {
+                    packedVoxel = PackVoxelCPU(material, variant, 0, 0x80u);
+                } else {
+                    ++rejectedThisBrush;
+                    continue;
+                }
+
+                StorePersistentVoxelEdit(x, y, z, packedVoxel);
+                touchedChunks.insert(ChunkCoord::FromWorldPosition(x, y, z, INFINITE_CHUNK_SIZE));
+                ++editedThisBrush;
+            }
+        }
+    }
+
+    UpdateTargetVoxelDebug(
+        centerX,
+        centerY,
+        centerZ,
+        hasHitNormal ? hitNormalX : 0,
+        hasHitNormal ? hitNormalY : 0,
+        hasHitNormal ? hitNormalZ : 0);
+    RefreshPersistentEditStats();
+    m_streamingStats.brushVoxelsEvaluatedLastStroke = evaluatedThisBrush;
+    m_streamingStats.brushVoxelsRejectedLastStroke = rejectedThisBrush;
+    m_streamingStats.persistentEditsRecordedLastStroke = editedThisBrush;
+
+    if (editedThisBrush > 0) {
+        RequestActiveRegionRefresh(16);
     }
 }
 
@@ -2001,14 +2392,15 @@ Result<void> VoxelWorld::CreateChunkCopyPipeline(ID3D12Device* device) {
     // Root parameter 0: root constants (CopyChunkConstants at b0)
     // Root parameter 1: SRV (ChunkVoxelInput at t0)
     // Root parameter 2: UAV (RenderBufferOutput at u0)
+    // Root parameter 3: UAV (ChunkValidMask at u1)
 
-    D3D12_ROOT_PARAMETER1 rootParams[3] = {};
+    D3D12_ROOT_PARAMETER1 rootParams[4] = {};
 
     // Parameter 0: root constants
     rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     rootParams[0].Constants.ShaderRegister = 0;
     rootParams[0].Constants.RegisterSpace = 0;
-    rootParams[0].Constants.Num32BitValues = 8;
+    rootParams[0].Constants.Num32BitValues = 12;
     rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     // Parameter 1: SRV
@@ -2025,9 +2417,16 @@ Result<void> VoxelWorld::CreateChunkCopyPipeline(ID3D12Device* device) {
     rootParams[2].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
     rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
+    // Parameter 3: valid-mask UAV
+    rootParams[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    rootParams[3].Descriptor.ShaderRegister = 1;
+    rootParams[3].Descriptor.RegisterSpace = 0;
+    rootParams[3].Descriptor.Flags = D3D12_ROOT_DESCRIPTOR_FLAG_NONE;
+    rootParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC rootSigDesc = {};
     rootSigDesc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-    rootSigDesc.Desc_1_1.NumParameters = 3;
+    rootSigDesc.Desc_1_1.NumParameters = 4;
     rootSigDesc.Desc_1_1.pParameters = rootParams;
     rootSigDesc.Desc_1_1.NumStaticSamplers = 0;
     rootSigDesc.Desc_1_1.pStaticSamplers = nullptr;
@@ -2219,7 +2618,7 @@ Result<void> VoxelWorld::CreateEditApplyPipeline(ID3D12Device* device) {
 }
 
 Result<void> VoxelWorld::EnsureEditUploadCapacity(ID3D12Device* device, uint32_t uploadSlot, uint32_t entryCount) {
-    if (uploadSlot >= NUM_COPY_BUFFERS) {
+    if (uploadSlot >= NUM_EDIT_UPLOAD_SLOTS) {
         return Error("Invalid persistent edit upload slot {}", uploadSlot);
     }
 
@@ -2279,6 +2678,9 @@ uint32_t VoxelWorld::ApplyPersistentEditsForCopiedChunks(
     Graphics::GPUBuffer& targetBuffer)
 {
     if (!device || !cmdList || copiedChunks.empty() || !m_editApplyPSO || !m_editApplyRootSignature) {
+        return 0;
+    }
+    if (m_editOverlays.empty()) {
         return 0;
     }
 
@@ -2357,8 +2759,175 @@ uint32_t VoxelWorld::ApplyPersistentEditsForCopiedChunks(
     m_streamingStats.chunksWithEditsAppliedLastFrame += chunksWithEdits;
     m_streamingStats.lastEditOverlayApplied = 1;
 
-    spdlog::debug("Applied {} persistent voxel edits across {} copied chunks", entries.size(), chunksWithEdits);
+    static uint32_t editApplyLogThrottle = 0;
+    if (++editApplyLogThrottle % 60 == 1) {
+        spdlog::debug("Applied {} persistent voxel edits across {} copied chunks", entries.size(), chunksWithEdits);
+    }
     return constants.editCount;
+}
+
+void VoxelWorld::SetChunkGenerationBudget(uint32_t chunksPerFrame) {
+    if (m_chunkManager) {
+        m_chunkManager->SetChunksPerFrame(chunksPerFrame);
+    }
+}
+
+glm::vec3 VoxelWorld::WorldToRenderLocal(const glm::vec3& worldPosition) const {
+    const int32_t worldX = FloorToInt(worldPosition.x);
+    const int32_t worldY = FloorToInt(worldPosition.y);
+    const int32_t worldZ = FloorToInt(worldPosition.z);
+    const ChunkCoord chunk = ChunkCoord::FromWorldPosition(worldX, worldY, worldZ, INFINITE_CHUNK_SIZE);
+    const glm::ivec3 slot = RenderSlotCoordFromWorldChunk(chunk);
+    return glm::vec3(
+        static_cast<float>(slot.x * CHUNK_SIZE_VOXELS + FloorMod(worldX, CHUNK_SIZE_VOXELS)) + (worldPosition.x - std::floor(worldPosition.x)),
+        static_cast<float>(slot.y * CHUNK_SIZE_VOXELS + FloorMod(worldY, CHUNK_SIZE_VOXELS)) + (worldPosition.y - std::floor(worldPosition.y)),
+        static_cast<float>(slot.z * CHUNK_SIZE_VOXELS + FloorMod(worldZ, CHUNK_SIZE_VOXELS)) + (worldPosition.z - std::floor(worldPosition.z)));
+}
+
+bool VoxelWorld::RenderLocalToWorld(const glm::vec3& localPosition, glm::vec3& outWorldPosition) const {
+    const int32_t localX = FloorToInt(localPosition.x);
+    const int32_t localY = FloorToInt(localPosition.y);
+    const int32_t localZ = FloorToInt(localPosition.z);
+    if (localX < 0 || localY < 0 || localZ < 0 ||
+        localX >= static_cast<int32_t>(m_config.gridSizeX) ||
+        localY >= static_cast<int32_t>(m_config.gridSizeY) ||
+        localZ >= static_cast<int32_t>(m_config.gridSizeZ)) {
+        return false;
+    }
+    const uint32_t slotX = static_cast<uint32_t>(localX / CHUNK_SIZE_VOXELS);
+    const uint32_t slotY = static_cast<uint32_t>(localY / CHUNK_SIZE_VOXELS);
+    const uint32_t slotZ = static_cast<uint32_t>(localZ / CHUNK_SIZE_VOXELS);
+    const uint32_t slotIndex =
+        slotX +
+        slotY * RENDER_BUFFER_CHUNKS_X +
+        slotZ * RENDER_BUFFER_CHUNKS_X * RENDER_BUFFER_CHUNKS_Y;
+    if (m_readBufferIndex >= m_chunkSlotWorldCoords.size() ||
+        slotIndex >= m_chunkSlotWorldCoords[m_readBufferIndex].size()) {
+        return false;
+    }
+    const ChunkCoord chunk = m_chunkSlotWorldCoords[m_readBufferIndex][slotIndex];
+    if (chunk.x == INT32_MAX) {
+        return false;
+    }
+    outWorldPosition = glm::vec3(
+        static_cast<float>(chunk.x * CHUNK_SIZE_VOXELS + (localX % CHUNK_SIZE_VOXELS)) + (localPosition.x - std::floor(localPosition.x)),
+        static_cast<float>(chunk.y * CHUNK_SIZE_VOXELS + (localY % CHUNK_SIZE_VOXELS)) + (localPosition.y - std::floor(localPosition.y)),
+        static_cast<float>(chunk.z * CHUNK_SIZE_VOXELS + (localZ % CHUNK_SIZE_VOXELS)) + (localPosition.z - std::floor(localPosition.z)));
+    return true;
+}
+
+bool VoxelWorld::IsWorldChunkCachedForRead(const ChunkCoord& coord) const {
+    if (!m_useInfiniteChunks) {
+        return true;
+    }
+
+    const uint32_t slotIndex = RenderSlotIndexFromWorldChunk(coord);
+    if (m_readBufferIndex >= m_chunkSlotWorldCoords.size() ||
+        slotIndex >= m_chunkSlotWorldCoords[m_readBufferIndex].size()) {
+        return false;
+    }
+
+    return m_chunkSlotWorldCoords[m_readBufferIndex][slotIndex] == coord;
+}
+
+bool VoxelWorld::IsWorldChunkCachedForWrite(const ChunkCoord& coord) const {
+    if (!m_useInfiniteChunks) {
+        return true;
+    }
+
+    const int writeBufferIndex = 1 - m_readBufferIndex;
+    const uint32_t slotIndex = RenderSlotIndexFromWorldChunk(coord);
+    if (writeBufferIndex < 0 ||
+        writeBufferIndex >= static_cast<int>(m_chunkSlotWorldCoords.size()) ||
+        slotIndex >= m_chunkSlotWorldCoords[writeBufferIndex].size()) {
+        return false;
+    }
+
+    return m_chunkSlotWorldCoords[writeBufferIndex][slotIndex] == coord;
+}
+
+bool VoxelWorld::IsWorldChunkCachedForReadWrite(const ChunkCoord& coord) const {
+    return IsWorldChunkCachedForRead(coord) && IsWorldChunkCachedForWrite(coord);
+}
+
+bool VoxelWorld::IsWorldVoxelCachedForRead(int32_t worldX, int32_t worldY, int32_t worldZ) const {
+    const ChunkCoord coord = ChunkCoord::FromWorldPosition(worldX, worldY, worldZ, INFINITE_CHUNK_SIZE);
+    return IsWorldChunkCachedForRead(coord);
+}
+
+bool VoxelWorld::IsWorldVoxelCachedForReadWrite(int32_t worldX, int32_t worldY, int32_t worldZ) const {
+    const ChunkCoord coord = ChunkCoord::FromWorldPosition(worldX, worldY, worldZ, INFINITE_CHUNK_SIZE);
+    return IsWorldChunkCachedForReadWrite(coord);
+}
+
+void VoxelWorld::RequestActiveRegionRefresh(uint32_t frames) {
+    if (!m_useInfiniteChunks || frames == 0) {
+        return;
+    }
+    m_forcedActiveRegionUpdateFrames = std::max(m_forcedActiveRegionUpdateFrames, frames);
+}
+
+bool VoxelWorld::EnsureWorldBrushVolumeCachedForReadWrite(float worldX, float worldY, float worldZ, float radius) {
+    if (!m_useInfiniteChunks) {
+        return true;
+    }
+
+    const int32_t radiusCeil = static_cast<int32_t>(std::ceil(std::max(radius, 0.0f))) + 2;
+    const int32_t minX = static_cast<int32_t>(std::floor(worldX)) - radiusCeil;
+    const int32_t minY = static_cast<int32_t>(std::floor(worldY)) - radiusCeil;
+    const int32_t minZ = static_cast<int32_t>(std::floor(worldZ)) - radiusCeil;
+    const int32_t maxX = static_cast<int32_t>(std::ceil(worldX)) + radiusCeil;
+    const int32_t maxY = static_cast<int32_t>(std::ceil(worldY)) + radiusCeil;
+    const int32_t maxZ = static_cast<int32_t>(std::ceil(worldZ)) + radiusCeil;
+
+    const ChunkCoord minChunk = ChunkCoord::FromWorldPosition(minX, minY, minZ, INFINITE_CHUNK_SIZE);
+    const ChunkCoord maxChunk = ChunkCoord::FromWorldPosition(maxX, maxY, maxZ, INFINITE_CHUNK_SIZE);
+
+    bool fullyCached = true;
+    uint32_t missingChunks = 0;
+    for (int32_t z = minChunk.z; z <= maxChunk.z; ++z) {
+        for (int32_t y = minChunk.y; y <= maxChunk.y; ++y) {
+            for (int32_t x = minChunk.x; x <= maxChunk.x; ++x) {
+                const ChunkCoord coord{x, y, z};
+                if (IsWorldChunkCachedForReadWrite(coord)) {
+                    continue;
+                }
+
+                fullyCached = false;
+                ++missingChunks;
+                if (m_chunkManager) {
+                    const int32_t centerDx = x - ((minChunk.x + maxChunk.x) / 2);
+                    const int32_t centerDy = y - ((minChunk.y + maxChunk.y) / 2);
+                    const int32_t centerDz = z - ((minChunk.z + maxChunk.z) / 2);
+                    const int32_t priority =
+                        -3'200'000 +
+                        (centerDx * centerDx + centerDz * centerDz) * 8 +
+                        centerDy * centerDy * 2;
+                    m_chunkManager->QueueUrgentChunk(coord, priority);
+                }
+            }
+        }
+    }
+
+    if (!fullyCached) {
+        RequestActiveRegionRefresh(16);
+        static uint32_t missingBrushCacheLogThrottle = 0;
+        if ((++missingBrushCacheLogThrottle % 60u) == 1u) {
+            spdlog::debug("Brush volume waiting for {} chunk slots to converge around world ({:.1f},{:.1f},{:.1f})",
+                missingChunks,
+                worldX,
+                worldY,
+                worldZ);
+        }
+    }
+
+    return fullyCached;
+}
+
+void VoxelWorld::PumpChunkGeneration(ID3D12Device* device, ID3D12CommandQueue* cmdQueue) {
+    if (m_chunkManager) {
+        m_chunkManager->GenerateQueuedChunks(device, cmdQueue);
+    }
 }
 
 void VoxelWorld::CopyStatic2x2Chunks(ID3D12CommandQueue* cmdQueue) {
@@ -2413,6 +2982,7 @@ void VoxelWorld::CopyStatic2x2Chunks(ID3D12CommandQueue* cmdQueue) {
 
     int32_t chunksCopied = 0;
     bool writeBufferTransitioned = false;
+    bool writeMaskTransitioned = false;
 
     constexpr int32_t chunkSize = static_cast<int32_t>(INFINITE_CHUNK_SIZE);
 
@@ -2454,7 +3024,11 @@ void VoxelWorld::CopyStatic2x2Chunks(ID3D12CommandQueue* cmdQueue) {
             uint32_t destGridSizeX;
             uint32_t destGridSizeY;
             uint32_t destGridSizeZ;
-            uint32_t padding;
+            uint32_t validChunkIndex;
+            uint32_t worldChunkX;
+            uint32_t worldChunkY;
+            uint32_t worldChunkZ;
+            uint32_t paddingTag;
         };
 
         CopyChunkConstants constants;
@@ -2465,11 +3039,27 @@ void VoxelWorld::CopyStatic2x2Chunks(ID3D12CommandQueue* cmdQueue) {
         constants.destGridSizeX = m_config.gridSizeX;
         constants.destGridSizeY = m_config.gridSizeY;
         constants.destGridSizeZ = m_config.gridSizeZ;
-        constants.padding = 0;
+        const uint32_t chunkSlotX = static_cast<uint32_t>(entry.destX / chunkSize);
+        const uint32_t chunkSlotY = static_cast<uint32_t>(entry.destY / chunkSize);
+        const uint32_t chunkSlotZ = static_cast<uint32_t>(entry.destZ / chunkSize);
+        constants.validChunkIndex =
+            chunkSlotX +
+            chunkSlotY * RENDER_BUFFER_CHUNKS_X +
+            chunkSlotZ * RENDER_BUFFER_CHUNKS_X * RENDER_BUFFER_CHUNKS_Y;
+        constants.worldChunkX = static_cast<uint32_t>(entry.coord.x);
+        constants.worldChunkY = static_cast<uint32_t>(entry.coord.y);
+        constants.worldChunkZ = static_cast<uint32_t>(entry.coord.z);
+        constants.paddingTag = 0;
 
         if (!writeBufferTransitioned) {
             TransitionWriteBufferTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             writeBufferTransitioned = true;
+        }
+        if (!writeMaskTransitioned) {
+            m_chunkValidMasks[1 - m_readBufferIndex].TransitionTo(
+                m_chunkCopyCmdList.Get(),
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            writeMaskTransitioned = true;
         }
 
         // Bind constants and resources. Root constants record this entry's
@@ -2487,6 +3077,9 @@ void VoxelWorld::CopyStatic2x2Chunks(ID3D12CommandQueue* cmdQueue) {
 
         m_chunkCopyCmdList->SetComputeRootShaderResourceView(1, chunk->GetVoxelBuffer().GetGPUVirtualAddress());
         m_chunkCopyCmdList->SetComputeRootUnorderedAccessView(2, GetWriteBuffer().GetGPUVirtualAddress());
+        m_chunkCopyCmdList->SetComputeRootUnorderedAccessView(
+            3,
+            m_chunkValidMasks[1 - m_readBufferIndex].GetGPUVirtualAddress());
 
         // Dispatch 8x8x8 groups for 64^3 chunk
         m_chunkCopyCmdList->Dispatch(8, 8, 8);
@@ -2501,6 +3094,11 @@ void VoxelWorld::CopyStatic2x2Chunks(ID3D12CommandQueue* cmdQueue) {
     if (chunksCopied > 0) {
         // Transition WRITE buffer back to SRV for rendering after swap
         TransitionWriteBufferTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (writeMaskTransitioned) {
+            m_chunkValidMasks[1 - m_readBufferIndex].TransitionTo(
+                m_chunkCopyCmdList.Get(),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
 
         m_chunkCopyCmdList->Close();
         ID3D12CommandList* lists[] = { m_chunkCopyCmdList.Get() };
@@ -2537,6 +3135,7 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
         m_streamingStats.chunksSkippedLastFrame = 0;
         m_streamingStats.chunksNotGeneratedLastFrame = 0;
         m_streamingStats.chunksNotLoadedLastFrame = 0;
+        m_streamingStats.urgentVisibleChunksQueuedLastFrame = 0;
         m_streamingStats.chunksCheckedLastFrame = 0;
         m_streamingStats.cachedReadChunks = 0;
         m_streamingStats.cachedWriteChunks = 0;
@@ -2557,6 +3156,7 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
     m_streamingStats.chunksSkippedLastFrame = 0;
     m_streamingStats.chunksNotGeneratedLastFrame = 0;
     m_streamingStats.chunksNotLoadedLastFrame = 0;
+    m_streamingStats.urgentVisibleChunksQueuedLastFrame = 0;
     m_streamingStats.chunksCheckedLastFrame = 0;
     m_streamingStats.editsAppliedLastFrame = 0;
     m_streamingStats.chunksWithEditsAppliedLastFrame = 0;
@@ -2582,7 +3182,7 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
             // All allocators are busy - skip this frame but log less frequently
             static uint32_t skipFrameCount = 0;
             if (++skipFrameCount % 60 == 1) {  // Log once per second
-                spdlog::warn("All {} copy allocators busy, skipping chunk copy ({} times)",
+                spdlog::debug("All {} copy allocators busy, skipping chunk copy ({} times)",
                     NUM_COPY_BUFFERS, skipFrameCount);
             }
             return;  // Skip chunk copy this frame
@@ -2630,34 +3230,43 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
     int32_t chunksNotGenerated = 0;  // DEBUG: Track chunks that exist but aren't generated yet
     bool writeBufferTransitioned = false;  // Deferred transition flag
     bool readBufferTransitioned = false;   // Track READ buffer transition
+    bool writeMaskTransitioned = false;
+    bool readMaskTransitioned = false;
     std::vector<CopiedChunkTarget> copiedWriteChunks;
     std::vector<CopiedChunkTarget> copiedReadChunks;
 
     if (clearRenderBuffers) {
-        // When the moving render window is first created or recentered, most
-        // visible chunk slots are not copied yet. Clear both ping-pong buffers
-        // to air so missing slots render as empty space instead of stale data.
-        m_voxelBuffers[0].TransitionTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        m_voxelBuffers[1].TransitionTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        // Recenter invalidates chunk slots, not the voxel memory itself. Clear
+        // the small per-chunk valid masks instead of clearing multi-GB dense
+        // buffers; shaders ignore stale voxel data until the chunk slot is
+        // recopied and marked valid.
+        m_chunkValidMasks[0].TransitionTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        m_chunkValidMasks[1].TransitionTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
         const UINT clearValues[4] = {0, 0, 0, 0};
         for (int bufferIndex = 0; bufferIndex < 2; ++bufferIndex) {
+            if (bufferIndex < static_cast<int>(m_chunkSlotWorldCoords.size())) {
+                std::fill(
+                    m_chunkSlotWorldCoords[bufferIndex].begin(),
+                    m_chunkSlotWorldCoords[bufferIndex].end(),
+                    ChunkCoord(INT32_MAX, INT32_MAX, INT32_MAX));
+            }
             m_chunkCopyCmdList->ClearUnorderedAccessViewUint(
-                m_shaderVisibleUAVs[bufferIndex].gpu,
-                m_voxelBuffers[bufferIndex].GetStagingUAV().cpu,
-                m_voxelBuffers[bufferIndex].GetResource(),
+                m_chunkValidMaskUAVs[bufferIndex].gpu,
+                m_chunkValidMasks[bufferIndex].GetStagingUAV().cpu,
+                m_chunkValidMasks[bufferIndex].GetResource(),
                 clearValues,
                 0,
                 nullptr);
 
             D3D12_RESOURCE_BARRIER uavBarrier =
-                CD3DX12_RESOURCE_BARRIER::UAV(m_voxelBuffers[bufferIndex].GetResource());
+                CD3DX12_RESOURCE_BARRIER::UAV(m_chunkValidMasks[bufferIndex].GetResource());
             m_chunkCopyCmdList->ResourceBarrier(1, &uavBarrier);
         }
 
-        readBufferTransitioned = true;
-        writeBufferTransitioned = true;
-        spdlog::debug("Cleared render-window ping-pong buffers to air before chunk refill");
+        readMaskTransitioned = true;
+        writeMaskTransitioned = true;
+        spdlog::debug("Cleared render-window chunk-valid masks before chunk refill");
     }
 
     const size_t expectedVisibleChunks =
@@ -2668,17 +3277,28 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
         m_copiedChunksPerBuffer[0].size() < expectedVisibleChunks ||
         m_copiedChunksPerBuffer[1].size() < expectedVisibleChunks;
 
-    // Limit chunk copies per frame to prevent startup hitches. After a recenter
-    // we temporarily boost this budget because a slow refill is visually worse
-    // than a short burst of copy work. While the window is unstable, prioritize
-    // the presented READ buffer; the hidden WRITE buffer can catch up after the
-    // player can already see the correct coordinate frame.
+    // Limit chunk copies per frame to prevent startup/recenter hitches. The
+    // dense window is now hundreds of millions of voxels; a previous 512-chunk
+    // burst could queue a very large GPU packet after a vertical recenter and
+    // look like a crash/hang. Refill still gets a modest boost, but remains
+    // bounded so the game can present intermediate frames.
     int32_t maxChunksPerFrame = requestedCopyBudget;
+    const bool frameBudgetPressure = requestedCopyBudget < 32;
     if (m_framesAfterCacheInvalidation > 0 || !m_buffersStable || renderCachesIncomplete) {
-        maxChunksPerFrame = std::max<int32_t>(maxChunksPerFrame, 256);
+        const int32_t refillMinBurst = frameBudgetPressure ? requestedCopyBudget : 40;
+        const int32_t refillMaxBurst = frameBudgetPressure ? 32 : 64;
+        maxChunksPerFrame = std::clamp<int32_t>(
+            std::max<int32_t>(maxChunksPerFrame, refillMinBurst),
+            1,
+            refillMaxBurst);
     }
     if (clearRenderBuffers) {
-        maxChunksPerFrame = std::max<int32_t>(maxChunksPerFrame, 512);
+        const int32_t recenterMinBurst = frameBudgetPressure ? requestedCopyBudget : 48;
+        const int32_t recenterMaxBurst = frameBudgetPressure ? 48 : 64;
+        maxChunksPerFrame = std::clamp<int32_t>(
+            std::max<int32_t>(maxChunksPerFrame, recenterMinBurst),
+            1,
+            recenterMaxBurst);
     }
 
     int32_t chunksNotLoaded = 0;  // DEBUG: Count chunks not in loadedChunks map
@@ -2702,13 +3322,24 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
         for (int32_t y = renderChunkMinY; y <= renderChunkMaxY; ++y) {
             for (int32_t dx = -RENDER_DISTANCE_HORIZONTAL; dx <= RENDER_DISTANCE_HORIZONTAL; ++dx) {
                 const int32_t dy = y - m_activeRegionCenter.y;
-                const int32_t horizontalDistance2 = dx * dx + dz * dz;
-                const int32_t verticalDistance2 = dy * dy;
+                const ChunkCoord worldChunk{
+                    m_activeRegionCenter.x + dx,
+                    y,
+                    m_activeRegionCenter.z + dz
+                };
+                const int32_t cameraDx = worldChunk.x - m_lastRenderCameraChunk.x;
+                const int32_t cameraDy = worldChunk.y - m_lastRenderCameraChunk.y;
+                const int32_t cameraDz = worldChunk.z - m_lastRenderCameraChunk.z;
+                const int32_t cameraDistance2 =
+                    cameraDx * cameraDx * 8 +
+                    cameraDz * cameraDz * 8 +
+                    cameraDy * cameraDy * 2;
+                const int32_t centerDistance2 = dx * dx + dz * dz + dy * dy;
                 copyCandidates.push_back(CopyCandidate{
                     dx,
                     y,
                     dz,
-                    horizontalDistance2 * 4 + verticalDistance2
+                    cameraDistance2 * 16 + centerDistance2
                 });
             }
         }
@@ -2731,8 +3362,31 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
         });
 
     const size_t expectedChunks = expectedVisibleChunks;
-    const size_t criticalVisibleCoverage = (expectedChunks * 3) / 4;
-    const size_t writeCatchupCoverage = std::min<size_t>(criticalVisibleCoverage, expectedChunks / 3);
+    uint32_t urgentVisibleQueues = 0;
+    constexpr uint32_t MAX_URGENT_VISIBLE_QUEUES_PER_FRAME = 256;
+
+    // Visible pages are hard demand, not speculative background work. The
+    // source cache can be "full" while still missing pages in the active
+    // render window, especially after fast flight or a vertical recenter. Queue
+    // those missing chunks explicitly before the copy budget early-outs.
+    for (const CopyCandidate& candidate : copyCandidates) {
+        if (urgentVisibleQueues >= MAX_URGENT_VISIBLE_QUEUES_PER_FRAME) {
+            break;
+        }
+
+        const ChunkCoord chunkCoord = {
+            m_activeRegionCenter.x + candidate.dx,
+            candidate.y,
+            m_activeRegionCenter.z + candidate.dz
+        };
+
+        if (loadedChunks.find(chunkCoord) == loadedChunks.end()) {
+            const int32_t priority = -2'000'000 + candidate.priority;
+            if (m_chunkManager->QueueUrgentChunk(chunkCoord, priority)) {
+                ++urgentVisibleQueues;
+            }
+        }
+    }
 
     for (const CopyCandidate& candidate : copyCandidates) {
                 chunksChecked++;
@@ -2758,11 +3412,31 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
                     continue;  // Chunk exists but generation not complete yet
                 }
 
-                // Check if chunk is in BOTH buffers (convergent caching)
+                // Toroidal dense cache: physical slot is stable modulo world
+                // chunk coordinate, so overlapping chunks survive recentering.
+                const glm::ivec3 slotCoord = RenderSlotCoordFromWorldChunk(chunkCoord);
+                const uint32_t slotIndex = RenderSlotIndexFromWorldChunk(chunkCoord);
+
+                // Check if chunk is in BOTH buffers (convergent caching).
+                // Trust the exact toroidal slot tag, not the legacy copied set:
+                // a set entry can survive a recenter or overwrite while the
+                // physical slot now contains another world chunk. Using the set
+                // here caused permanent page misses because the copy pass kept
+                // skipping chunks whose actual slot tag was stale.
                 int writeBufferIndex = 1 - m_readBufferIndex;
                 int readBufferIndex = m_readBufferIndex;
-                bool inWriteBuffer = (m_copiedChunksPerBuffer[writeBufferIndex].find(chunkCoord) != m_copiedChunksPerBuffer[writeBufferIndex].end());
-                bool inReadBuffer = (m_copiedChunksPerBuffer[readBufferIndex].find(chunkCoord) != m_copiedChunksPerBuffer[readBufferIndex].end());
+                bool inWriteBuffer =
+                    slotIndex < m_chunkSlotWorldCoords[writeBufferIndex].size() &&
+                    m_chunkSlotWorldCoords[writeBufferIndex][slotIndex] == chunkCoord;
+                bool inReadBuffer =
+                    slotIndex < m_chunkSlotWorldCoords[readBufferIndex].size() &&
+                    m_chunkSlotWorldCoords[readBufferIndex][slotIndex] == chunkCoord;
+                if (!inWriteBuffer) {
+                    m_copiedChunksPerBuffer[writeBufferIndex].erase(chunkCoord);
+                }
+                if (!inReadBuffer) {
+                    m_copiedChunksPerBuffer[readBufferIndex].erase(chunkCoord);
+                }
 
                 // Skip only if chunk is in BOTH buffers (fully converged)
                 // This ensures both ping-pong buffers have the terrain data
@@ -2775,17 +3449,14 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
 
                 Chunk* chunk = it->second;
 
-                // Calculate destination offset in render buffer
-                // Chunks are copied RELATIVE to activeRegionCenter so they fit in buffer
-                // Buffer position (0,0,0) = chunk at (activeRegionCenter - RENDER_DISTANCE)
-                int32_t destX = (chunkCoord.x - m_activeRegionCenter.x + RENDER_DISTANCE_HORIZONTAL) * CHUNK_SIZE_VOXELS;
-                int32_t destY = (chunkCoord.y - renderChunkMinY) * CHUNK_SIZE_VOXELS;
-                int32_t destZ = (chunkCoord.z - m_activeRegionCenter.z + RENDER_DISTANCE_HORIZONTAL) * CHUNK_SIZE_VOXELS;
+                int32_t destX = slotCoord.x * CHUNK_SIZE_VOXELS;
+                int32_t destY = slotCoord.y * CHUNK_SIZE_VOXELS;
+                int32_t destZ = slotCoord.z * CHUNK_SIZE_VOXELS;
 
                 // DIAGNOSTIC: Enable to debug chunk copy issues
                 static int copyDebugCount = 0;
                 if (copyDebugCount < 20) {
-                    spdlog::info("[CHUNK_COPY] Chunk coord [{},{},{}] dx={} dz={} -> buffer dest [{},{},{}]",
+                    spdlog::debug("[CHUNK_COPY] Chunk coord [{},{},{}] dx={} dz={} -> buffer dest [{},{},{}]",
                         chunkCoord.x, chunkCoord.y, chunkCoord.z, candidate.dx, candidate.dz, destX, destY, destZ);
                     copyDebugCount++;
                 }
@@ -2808,7 +3479,11 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
                     uint32_t destGridSizeX;
                     uint32_t destGridSizeY;
                     uint32_t destGridSizeZ;
-                    uint32_t padding;
+                    uint32_t validChunkIndex;
+                    uint32_t worldChunkX;
+                    uint32_t worldChunkY;
+                    uint32_t worldChunkZ;
+                    uint32_t paddingTag;
                 };
 
                 CopyChunkConstants constants;
@@ -2819,7 +3494,17 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
                 constants.destGridSizeX = m_config.gridSizeX;
                 constants.destGridSizeY = m_config.gridSizeY;
                 constants.destGridSizeZ = m_config.gridSizeZ;
-                constants.padding = 0;
+                const uint32_t chunkSlotX = static_cast<uint32_t>(destX / CHUNK_SIZE_VOXELS);
+                const uint32_t chunkSlotY = static_cast<uint32_t>(destY / CHUNK_SIZE_VOXELS);
+                const uint32_t chunkSlotZ = static_cast<uint32_t>(destZ / CHUNK_SIZE_VOXELS);
+                constants.validChunkIndex =
+                    chunkSlotX +
+                    chunkSlotY * RENDER_BUFFER_CHUNKS_X +
+                    chunkSlotZ * RENDER_BUFFER_CHUNKS_X * RENDER_BUFFER_CHUNKS_Y;
+                constants.worldChunkX = static_cast<uint32_t>(chunkCoord.x);
+                constants.worldChunkY = static_cast<uint32_t>(chunkCoord.y);
+                constants.worldChunkZ = static_cast<uint32_t>(chunkCoord.z);
+                constants.paddingTag = 0;
 
                 // CRITICAL FIX: Transition chunk buffer to SRV state before reading!
                 // After generation, chunks are left in UAV state. We MUST transition to
@@ -2834,6 +3519,12 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
                         TransitionReadBufferTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                         readBufferTransitioned = true;
                     }
+                    if (!readMaskTransitioned) {
+                        m_chunkValidMasks[readBufferIndex].TransitionTo(
+                            m_chunkCopyCmdList.Get(),
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        readMaskTransitioned = true;
+                    }
 
                     m_chunkCopyCmdList->SetComputeRoot32BitConstants(
                         0,
@@ -2843,26 +3534,30 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
                     );
                     m_chunkCopyCmdList->SetComputeRootShaderResourceView(1, chunk->GetVoxelBuffer().GetGPUVirtualAddress());
                     m_chunkCopyCmdList->SetComputeRootUnorderedAccessView(2, GetReadBuffer().GetGPUVirtualAddress());
+                    m_chunkCopyCmdList->SetComputeRootUnorderedAccessView(
+                        3,
+                        m_chunkValidMasks[readBufferIndex].GetGPUVirtualAddress());
                     m_chunkCopyCmdList->Dispatch(8, 8, 8);
 
-                    D3D12_RESOURCE_BARRIER uavBarrier = CD3DX12_RESOURCE_BARRIER::UAV(GetReadBuffer().GetResource());
-                    m_chunkCopyCmdList->ResourceBarrier(1, &uavBarrier);
+                    D3D12_RESOURCE_BARRIER uavBarriers[] = {
+                        CD3DX12_RESOURCE_BARRIER::UAV(GetReadBuffer().GetResource()),
+                        CD3DX12_RESOURCE_BARRIER::UAV(m_chunkValidMasks[readBufferIndex].GetResource())
+                    };
+                    m_chunkCopyCmdList->ResourceBarrier(2, uavBarriers);
 
+                    if (constants.validChunkIndex < m_chunkSlotWorldCoords[readBufferIndex].size()) {
+                        const ChunkCoord previous = m_chunkSlotWorldCoords[readBufferIndex][constants.validChunkIndex];
+                        if (previous.x != INT32_MAX && previous != chunkCoord) {
+                            m_copiedChunksPerBuffer[readBufferIndex].erase(previous);
+                        }
+                        m_chunkSlotWorldCoords[readBufferIndex][constants.validChunkIndex] = chunkCoord;
+                    }
                     m_copiedChunksPerBuffer[readBufferIndex].insert(chunkCoord);
                     copiedReadChunks.push_back(CopiedChunkTarget{chunkCoord, destX, destY, destZ});
                     chunksCopied++;
                 }
 
                 if (chunksCopied >= maxChunksPerFrame) {
-                    continue;
-                }
-
-                // During a recenter/refill, every copied WRITE chunk is one less
-                // READ chunk visible this frame. Fill the presented buffer first;
-                // physics and ping-pong swapping stay gated until WRITE catches
-                // up, so this does not reintroduce the old overwrite race.
-                if (!m_buffersStable &&
-                    m_copiedChunksPerBuffer[readBufferIndex].size() < writeCatchupCoverage) {
                     continue;
                 }
 
@@ -2873,6 +3568,12 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
                         TransitionWriteBufferTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                         writeBufferTransitioned = true;
                     }
+                    if (!writeMaskTransitioned) {
+                        m_chunkValidMasks[writeBufferIndex].TransitionTo(
+                            m_chunkCopyCmdList.Get(),
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        writeMaskTransitioned = true;
+                    }
 
                     m_chunkCopyCmdList->SetComputeRoot32BitConstants(
                         0,
@@ -2882,11 +3583,24 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
                     );
                     m_chunkCopyCmdList->SetComputeRootShaderResourceView(1, chunk->GetVoxelBuffer().GetGPUVirtualAddress());
                     m_chunkCopyCmdList->SetComputeRootUnorderedAccessView(2, GetWriteBuffer().GetGPUVirtualAddress());
+                    m_chunkCopyCmdList->SetComputeRootUnorderedAccessView(
+                        3,
+                        m_chunkValidMasks[writeBufferIndex].GetGPUVirtualAddress());
                     m_chunkCopyCmdList->Dispatch(8, 8, 8);
 
-                    D3D12_RESOURCE_BARRIER uavBarrier = CD3DX12_RESOURCE_BARRIER::UAV(GetWriteBuffer().GetResource());
-                    m_chunkCopyCmdList->ResourceBarrier(1, &uavBarrier);
+                    D3D12_RESOURCE_BARRIER uavBarriers[] = {
+                        CD3DX12_RESOURCE_BARRIER::UAV(GetWriteBuffer().GetResource()),
+                        CD3DX12_RESOURCE_BARRIER::UAV(m_chunkValidMasks[writeBufferIndex].GetResource())
+                    };
+                    m_chunkCopyCmdList->ResourceBarrier(2, uavBarriers);
 
+                    if (constants.validChunkIndex < m_chunkSlotWorldCoords[writeBufferIndex].size()) {
+                        const ChunkCoord previous = m_chunkSlotWorldCoords[writeBufferIndex][constants.validChunkIndex];
+                        if (previous.x != INT32_MAX && previous != chunkCoord) {
+                            m_copiedChunksPerBuffer[writeBufferIndex].erase(previous);
+                        }
+                        m_chunkSlotWorldCoords[writeBufferIndex][constants.validChunkIndex] = chunkCoord;
+                    }
                     m_copiedChunksPerBuffer[writeBufferIndex].insert(chunkCoord);
                     copiedWriteChunks.push_back(CopiedChunkTarget{chunkCoord, destX, destY, destZ});
                     chunksCopied++;
@@ -2900,17 +3614,50 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
 
     int writeBufferIndex = 1 - m_readBufferIndex;
     int readBufferIndex = m_readBufferIndex;
-    size_t cachedInWriteBuffer = m_copiedChunksPerBuffer[writeBufferIndex].size();
-    size_t cachedInReadBuffer = m_copiedChunksPerBuffer[readBufferIndex].size();
+    const auto countExactVisibleCoverage = [&](int bufferIndex, uint32_t& mismatches) -> size_t {
+        mismatches = 0;
+        if (bufferIndex < 0 ||
+            bufferIndex >= static_cast<int>(m_chunkSlotWorldCoords.size()) ||
+            m_chunkSlotWorldCoords[bufferIndex].empty()) {
+            mismatches = static_cast<uint32_t>(expectedChunks);
+            return 0;
+        }
+
+        size_t coverage = 0;
+        for (const CopyCandidate& candidate : copyCandidates) {
+            const ChunkCoord chunkCoord{
+                m_activeRegionCenter.x + candidate.dx,
+                candidate.y,
+                m_activeRegionCenter.z + candidate.dz
+            };
+            const uint32_t slotIndex = RenderSlotIndexFromWorldChunk(chunkCoord);
+            if (slotIndex < m_chunkSlotWorldCoords[bufferIndex].size() &&
+                m_chunkSlotWorldCoords[bufferIndex][slotIndex] == chunkCoord) {
+                ++coverage;
+            } else {
+                ++mismatches;
+            }
+        }
+        return coverage;
+    };
+    uint32_t readMismatches = 0;
+    uint32_t writeMismatches = 0;
+    size_t cachedInReadBuffer = countExactVisibleCoverage(readBufferIndex, readMismatches);
+    size_t cachedInWriteBuffer = countExactVisibleCoverage(writeBufferIndex, writeMismatches);
     m_streamingStats.copyBudget = static_cast<uint32_t>(maxChunksPerFrame);
     m_streamingStats.chunksCopiedLastFrame = static_cast<uint32_t>(chunksCopied);
     m_streamingStats.chunksSkippedLastFrame = static_cast<uint32_t>(chunksSkipped);
     m_streamingStats.chunksNotGeneratedLastFrame = static_cast<uint32_t>(chunksNotGenerated);
     m_streamingStats.chunksNotLoadedLastFrame = static_cast<uint32_t>(chunksNotLoaded);
+    m_streamingStats.urgentVisibleChunksQueuedLastFrame = urgentVisibleQueues;
     m_streamingStats.chunksCheckedLastFrame = static_cast<uint32_t>(chunksChecked);
     m_streamingStats.cachedReadChunks = static_cast<uint32_t>(cachedInReadBuffer);
     m_streamingStats.cachedWriteChunks = static_cast<uint32_t>(cachedInWriteBuffer);
     m_streamingStats.expectedVisibleChunks = static_cast<uint32_t>(expectedChunks);
+    m_streamingStats.readSlotMismatches = readMismatches;
+    m_streamingStats.writeSlotMismatches = writeMismatches;
+    m_streamingStats.toroidalSlotCount =
+        static_cast<uint32_t>(RENDER_BUFFER_CHUNKS_X * RENDER_BUFFER_CHUNKS_Y * RENDER_BUFFER_CHUNKS_Z);
 
     if (!m_buffersStable) {
         if (cachedInReadBuffer >= expectedChunks && cachedInWriteBuffer >= expectedChunks) {
@@ -2919,11 +3666,6 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
             spdlog::debug("Render buffers fully converged after refill");
         } else if (m_framesAfterCacheInvalidation > 0) {
             --m_framesAfterCacheInvalidation;
-        } else if (cachedInReadBuffer >= criticalVisibleCoverage &&
-                   cachedInWriteBuffer >= criticalVisibleCoverage) {
-            m_buffersStable = true;
-            spdlog::debug("Render buffers passed critical coverage after refill (READ={} WRITE={} expected={})",
-                cachedInReadBuffer, cachedInWriteBuffer, expectedChunks);
         }
     }
 
@@ -2942,7 +3684,7 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
             ApplyPersistentEditsForCopiedChunks(
                 device,
                 m_chunkCopyCmdList.Get(),
-                allocatorIndex,
+                allocatorIndex * 2u,
                 copiedWriteChunks,
                 GetWriteBuffer());
         }
@@ -2951,7 +3693,7 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
             ApplyPersistentEditsForCopiedChunks(
                 device,
                 m_chunkCopyCmdList.Get(),
-                allocatorIndex,
+                allocatorIndex * 2u + 1u,
                 copiedReadChunks,
                 GetReadBuffer());
         }
@@ -2960,10 +3702,20 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
         if (writeBufferTransitioned) {
             TransitionWriteBufferTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
+        if (writeMaskTransitioned) {
+            m_chunkValidMasks[writeBufferIndex].TransitionTo(
+                m_chunkCopyCmdList.Get(),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
 
         // Transition READ buffer from UAV back to SRV state if we wrote to it
         if (readBufferTransitioned) {
             TransitionReadBufferTo(m_chunkCopyCmdList.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        if (readMaskTransitioned) {
+            m_chunkValidMasks[readBufferIndex].TransitionTo(
+                m_chunkCopyCmdList.Get(),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         }
 
         m_chunkCopyCmdList->Close();
@@ -2994,9 +3746,11 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
 
         // No new chunks to copy - just close the command list without executing
         m_chunkCopyCmdList->Close();
-        if (chunksSkipped > 0 || chunksNotGenerated > 0) {
-            spdlog::debug("UpdateActiveRegion: No chunks copied ({} skipped, {} not generated yet)",
-                chunksSkipped, chunksNotGenerated);
+        static uint32_t noCopyLogThrottle = 0;
+        if ((chunksSkipped > 0 || chunksNotGenerated > 0 || chunksNotLoaded > 0 || chunksOutOfBounds > 0) &&
+            (++noCopyLogThrottle % 120 == 1)) {
+            spdlog::debug("UpdateActiveRegion: No chunks copied ({} skipped, {} not generated, {} not loaded, {} out of bounds)",
+                chunksSkipped, chunksNotGenerated, chunksNotLoaded, chunksOutOfBounds);
         }
     }
 

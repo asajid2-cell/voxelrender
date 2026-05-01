@@ -547,7 +547,7 @@ int main(int argc, char* argv[]) {
     pauseMenu.Initialize();
 
     spdlog::info("Initialization complete. Entering main loop...");
-    spdlog::info("Controls: ESC=Pause, WASD=Move, Mouse=Look, Space=Jump/Fly, Double-Space=Toggle Flight, Tab=Toggle Mouse, LMB=Paint, RMB=Erase");
+    spdlog::info("Controls: P=Pause/Menu, ESC=Pause/Menu, WASD=Move, Mouse=Look, Space=Jump/Fly, Double-Space=Toggle Flight, LMB=Paint, RMB=Erase");
 
     // Camera setup with pitch/yaw for mouse look
     const float fov = 60.0f * 3.14159f / 180.0f;
@@ -589,6 +589,17 @@ int main(int argc, char* argv[]) {
     uint64_t frameCount = 0;
     bool mouseInitialized = false;  // Track if mouse capture has been enabled
 
+    auto setPauseMenuOpen = [&](bool open) {
+        if (open) {
+            pauseMenu.Show();
+        } else {
+            pauseMenu.Hide();
+        }
+        paused = open;
+        inputManager.SetMouseCaptured(!open);
+        spdlog::info("Pause menu {}", open ? "opened" : "closed");
+    };
+
     while (running) {
         // Process SDL events FIRST to update mouse/keyboard state
         SDL_Event event;
@@ -606,14 +617,7 @@ int main(int argc, char* argv[]) {
 
                 case SDL_EVENT_KEY_DOWN:
                     if (event.key.key == SDLK_ESCAPE) {
-                        // Toggle pause menu instead of quitting
-                        pauseMenu.Toggle();
-                        // Release/capture mouse based on pause menu state
-                        inputManager.SetMouseCaptured(!pauseMenu.IsVisible());
-                    }
-                    else if (event.key.key == SDLK_TAB) {
-                        // Toggle mouse capture
-                        inputManager.SetMouseCaptured(!inputManager.IsMouseCaptured());
+                        setPauseMenuOpen(!pauseMenu.IsVisible());
                     }
                     break;
 
@@ -648,28 +652,28 @@ int main(int argc, char* argv[]) {
 
         // Handle input actions
         if (inputManager.IsActionPressed(Input::KeyAction::TogglePause)) {
-            paused = !paused;
-            spdlog::info("Simulation {}", paused ? "paused" : "resumed");
+            setPauseMenuOpen(!pauseMenu.IsVisible());
         }
-        if (inputManager.IsActionPressed(Input::KeyAction::MaterialNext)) {
+        const bool gameplayInputEnabled = !pauseMenu.IsVisible();
+        if (gameplayInputEnabled && inputManager.IsActionPressed(Input::KeyAction::MaterialNext)) {
             brushController.NextMaterial();
             spdlog::info("Material: {}", brushController.GetMaterial());
         }
-        if (inputManager.IsActionPressed(Input::KeyAction::MaterialPrev)) {
+        if (gameplayInputEnabled && inputManager.IsActionPressed(Input::KeyAction::MaterialPrev)) {
             brushController.PrevMaterial();
             spdlog::info("Material: {}", brushController.GetMaterial());
         }
-        if (inputManager.IsActionPressed(Input::KeyAction::BrushIncrease)) {
+        if (gameplayInputEnabled && inputManager.IsActionPressed(Input::KeyAction::BrushIncrease)) {
             brushController.IncreaseRadius();
             spdlog::info("Brush radius: {:.1f}", brushController.GetRadius());
         }
-        if (inputManager.IsActionPressed(Input::KeyAction::BrushDecrease)) {
+        if (gameplayInputEnabled && inputManager.IsActionPressed(Input::KeyAction::BrushDecrease)) {
             brushController.DecreaseRadius();
             spdlog::info("Brush radius: {:.1f}", brushController.GetRadius());
         }
 
         // Mouse look - update camera rotation
-        glm::vec2 mouseDelta = inputManager.GetMouseDelta();
+        glm::vec2 mouseDelta = gameplayInputEnabled ? inputManager.GetMouseDelta() : glm::vec2(0.0f);
         cameraYaw += mouseDelta.x * mouseSensitivity;  // Inverted from - to + for correct left/right
         cameraPitch -= mouseDelta.y * mouseSensitivity;
 
@@ -696,21 +700,21 @@ int main(int argc, char* argv[]) {
         glm::vec3 horizontalRight = glm::normalize(glm::vec3(cameraRight.x, 0, cameraRight.z));
 
         // WASD for horizontal movement only
-        if (inputManager.IsActionDown(Input::KeyAction::CameraForward)) {
+        if (gameplayInputEnabled && inputManager.IsActionDown(Input::KeyAction::CameraForward)) {
             cameraPos += horizontalForward * moveSpeed;
         }
-        if (inputManager.IsActionDown(Input::KeyAction::CameraBackward)) {
+        if (gameplayInputEnabled && inputManager.IsActionDown(Input::KeyAction::CameraBackward)) {
             cameraPos -= horizontalForward * moveSpeed;
         }
-        if (inputManager.IsActionDown(Input::KeyAction::CameraLeft)) {
+        if (gameplayInputEnabled && inputManager.IsActionDown(Input::KeyAction::CameraLeft)) {
             cameraPos -= horizontalRight * moveSpeed;
         }
-        if (inputManager.IsActionDown(Input::KeyAction::CameraRight)) {
+        if (gameplayInputEnabled && inputManager.IsActionDown(Input::KeyAction::CameraRight)) {
             cameraPos += horizontalRight * moveSpeed;
         }
 
         // Check for double-click on Space to toggle flight mode
-        if (inputManager.IsActionDoubleClicked(Input::KeyAction::CameraUp)) {
+        if (gameplayInputEnabled && inputManager.IsActionDoubleClicked(Input::KeyAction::CameraUp)) {
             flightMode = !flightMode;
             if (flightMode) {
                 cameraVelocityY = 0.0f;  // Cancel gravity when entering flight mode
@@ -721,12 +725,14 @@ int main(int argc, char* argv[]) {
         }
 
         // Apply gravity to vertical velocity (only when not in flight mode)
-        if (!flightMode) {
+        if (gameplayInputEnabled && !flightMode) {
             cameraVelocityY += gravity * dt;
         }
 
         // Apply vertical velocity to camera position
-        cameraPos.y += cameraVelocityY * dt;
+        if (gameplayInputEnabled) {
+            cameraPos.y += cameraVelocityY * dt;
+        }
 
         // Calculate ray for GPU brush raycasting
         // When mouse is captured (FPS mode), always use screen center for crosshair
@@ -753,9 +759,9 @@ int main(int argc, char* argv[]) {
             cameraUp,
             fov,
             aspectRatio,
-            inputManager.IsMouseButtonDown(Input::MouseButton::Left),
-            inputManager.IsMouseButtonDown(Input::MouseButton::Right),
-            inputManager.GetScrollDelta(),
+            gameplayInputEnabled && inputManager.IsMouseButtonDown(Input::MouseButton::Left),
+            gameplayInputEnabled && inputManager.IsMouseButtonDown(Input::MouseButton::Right),
+            gameplayInputEnabled ? inputManager.GetScrollDelta() : 0.0f,
             nullptr,  // No CPU voxel data (GPU raycasting now!)
             0
         );
@@ -843,7 +849,7 @@ int main(int argc, char* argv[]) {
         auto groundRaycastResult = voxelWorld->GetGroundRaycastResult();
 
         // === COLLISION DETECTION ===
-        if (flightMode) {
+        if (gameplayInputEnabled && flightMode) {
             // Flight mode - manual vertical control, no gravity or collision
             if (inputManager.IsActionDown(Input::KeyAction::CameraUp)) {
                 cameraPos.y += moveSpeed * 2.0f;  // Fly up
@@ -851,7 +857,7 @@ int main(int argc, char* argv[]) {
             if (inputManager.IsActionDown(Input::KeyAction::CameraDown)) {
                 cameraPos.y -= moveSpeed * 2.0f;  // Fly down
             }
-        } else {
+        } else if (gameplayInputEnabled) {
             // Normal mode - ground collision and gravity
             // Ground raycast hit detection
             if (groundRaycastResult.hasValidPosition) {
@@ -873,7 +879,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 // Space to jump (if on ground and not double-click)
-                if (inputManager.IsActionPressed(Input::KeyAction::CameraUp) && onGround &&
+                if (gameplayInputEnabled && inputManager.IsActionPressed(Input::KeyAction::CameraUp) && onGround &&
                     !inputManager.IsActionDoubleClicked(Input::KeyAction::CameraUp)) {
                     cameraVelocityY = 20.0f;  // Jump velocity
                 }

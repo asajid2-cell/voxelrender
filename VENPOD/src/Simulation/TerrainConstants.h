@@ -111,11 +111,9 @@ constexpr int32_t ClampVerticalChunkCenter(
 
 // ===== VRAM BUDGET =====
 // Render window: 19x7x19 = 2,527 chunks = 662M voxels per ping-pong buffer.
-// This is a high default for the current dense editable representation. It
-// improves near-field view distance without jumping to the unsafe +/-14 dense
-// setting, which would require roughly 12.8 GB for ping-pong buffers alone.
-// Longer distance should come from far LOD / sparse acceleration, not just a
-// larger dense box.
+// This is a high default for the current dense editable representation. Startup
+// must stream it incrementally and queue visible chunks first; do not flood the
+// full load cube at launch.
 
 // ===== VALIDATION =====
 static_assert(RENDER_BUFFER_CHUNKS_Y == 7, "Expected a 7-chunk vertical render window");

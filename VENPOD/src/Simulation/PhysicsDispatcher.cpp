@@ -512,21 +512,10 @@ void PhysicsDispatcher::DispatchBrush(
     m_brushPipeline.SetRootDescriptorTable(cmdList, 2, world.GetBrushEditEventUAV().gpu);
     m_brushPipeline.SetRootDescriptorTable(cmdList, 3, world.GetBrushEditCounterUAV().gpu);
 
-    // Paint to BOTH buffers to ensure painted voxels persist across buffer swaps!
-    //
-    // CRITICAL: We paint BEFORE physics runs, so physics will process our painted voxels.
-    // Painting to both buffers ensures:
-    // 1. WRITE buffer: Physics will see and process painted voxels this frame
-    // 2. READ buffer: Rendered this frame (immediate visual feedback)
-    //
-    // After physics + swap, both buffers will have consistent state because:
-    // - WRITE (with physics) becomes READ for next frame's render
-    // - READ (painted but no physics) becomes WRITE, gets overwritten by next physics
-    //
-    // The result: Painted voxels appear immediately and persist correctly.
-
-    // 1. Paint to READ buffer FIRST (immediate visual feedback - rendered this frame!)
-    constants.recordEdits = 0;
+    // Paint to both buffers. In infinite streaming mode the READ buffer is the
+    // authoritative visible cache, so GPU feedback records the exact visible
+    // READ writes and the WRITE pass mirrors the result for local simulation.
+    constants.recordEdits = feedbackRecording ? 1u : 0u;
     m_brushPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
     world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_brushPipeline.SetRootDescriptorTable(cmdList, 1, world.GetReadBufferUAV().gpu);
@@ -545,8 +534,7 @@ void PhysicsDispatcher::DispatchBrush(
         }
     }
 
-    // 2. Paint to WRITE buffer (physics will process this, then it becomes READ after swap)
-    constants.recordEdits = feedbackRecording ? 1u : 0u;
+    constants.recordEdits = 0;
     m_brushPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
     world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     m_brushPipeline.SetRootDescriptorTable(cmdList, 1, world.GetWriteBufferUAV().gpu);
@@ -567,9 +555,13 @@ void PhysicsDispatcher::DispatchBrush(
 
     if (feedbackRecording) {
         world.QueueBrushEditFeedbackReadback(cmdList);
-    } else if (world.IsUsingInfiniteChunks()) {
-        // Fallback only. The normal path persists the exact shader edits from
-        // an async GPU feedback buffer once the frame fence completes.
+    }
+
+    if (world.IsUsingInfiniteChunks()) {
+        // Immediate sparse overlay prevents a later chunk copy/refill from
+        // briefly replacing a freshly painted READ/WRITE slot with generated
+        // terrain before async GPU edit feedback retires. The feedback path
+        // still records exact shader writes into the same per-voxel keys.
         world.RecordPersistentBrushEdit(
             brushConstants.positionX,
             brushConstants.positionY,
@@ -705,20 +697,15 @@ void PhysicsDispatcher::DispatchChunkScan(
         return;
     }
 
-    // === PERFORMANCE FIX: Scan WRITE buffer directly (no copy needed!) ===
-    // DispatchBrush painted to WRITE buffer (line 436), so we scan WRITE to detect new voxels.
-    // Previous frame ended with SwapBuffers -> old WRITE became READ.
-    // Current frame: chunks copied to WRITE, brush paints to WRITE, we scan WRITE.
-    // This eliminates the redundant 64 MB WRITE->READ copy!
-    //
-    // Timeline: UpdateActiveRegion->WRITE, Brush->WRITE, ChunkScan->WRITE,
-    //           Physics reads READ writes WRITE, SwapBuffers
+    // Infinite streaming no longer relies on a full-frame ping-pong swap. The
+    // READ buffer is the currently rendered authoritative near field, while the
+    // WRITE buffer is kept mirrored for copy/brush safety. Scan READ so physics
+    // follows the world the player actually sees.
 
     // Reset active chunk count to zero before scanning
     chunkManager.ResetActiveCount(cmdList);
 
-    // Scan WRITE buffer (it has chunks + painted voxels from this frame)
-    world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
     // Transition chunk buffers to UAV for writing
     chunkManager.TransitionBuffersForCompute(cmdList);
@@ -780,7 +767,11 @@ void PhysicsDispatcher::DispatchChunkScan(
 
     m_stats.scanBudgetChunks = requestedBudget;
     m_stats.scannedChunksLastFrame = dispatchX * dispatchY * dispatchZ;
-    m_stats.skippedScanChunksLastFrame = (fullChunksX * fullChunksY * fullChunksZ) - m_stats.scannedChunksLastFrame;
+    m_stats.skippedScanChunksLastFrame =
+        requestedBudget > m_stats.scannedChunksLastFrame
+            ? requestedBudget - m_stats.scannedChunksLastFrame
+            : 0;
+    m_stats.theoreticalChunkUniverse = fullChunksX * fullChunksY * fullChunksZ;
     m_stats.dispatchX = dispatchX;
     m_stats.dispatchY = dispatchY;
     m_stats.dispatchZ = dispatchZ;
@@ -799,8 +790,7 @@ void PhysicsDispatcher::DispatchChunkScan(
 
     m_chunkScanPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
 
-    // Set descriptors - scan WRITE buffer directly (saves 64 MB copy!)
-    m_chunkScanPipeline.SetRootDescriptorTable(cmdList, 1, world.GetWriteBufferSRV().gpu);
+    m_chunkScanPipeline.SetRootDescriptorTable(cmdList, 1, world.GetReadBufferSRV().gpu);
     m_chunkScanPipeline.SetRootDescriptorTable(cmdList, 2, chunkManager.GetChunkControlUAV().gpu);
     m_chunkScanPipeline.SetRootDescriptorTable(cmdList, 3, chunkManager.GetActiveListUAV().gpu);
     m_chunkScanPipeline.SetRootDescriptorTable(cmdList, 4, chunkManager.GetActiveCountUAV().gpu);
@@ -950,8 +940,12 @@ void PhysicsDispatcher::DispatchPhysicsIndirect(
     uint32_t frameIndex)
 {
     if (!cmdList || !m_gravityChunkPipeline.IsValid() || !m_prepareIndirectPipeline.IsValid() || !m_commandSignature) {
-        // Fall back to regular dispatch if indirect isn't ready
-        DispatchPhysics(cmdList, world, deltaTime, frameIndex);
+        // In the large streaming world, the dense fallback scans the entire
+        // 400M+ voxel window and can look like a crash. Skip physics until the
+        // chunk-budgeted path is ready instead of issuing full-buffer work.
+        (void)world;
+        (void)deltaTime;
+        (void)frameIndex;
         return;
     }
 
@@ -1001,21 +995,11 @@ void PhysicsDispatcher::DispatchPhysicsIndirect(
     chunkManager.TransitionBuffersForIndirect(cmdList);
 
     // === Step 2: Execute indirect dispatch for chunk-based physics ===
-    // CRITICAL FIX: For infinite chunks, read from WRITE buffer (where chunks are)!
-    // UpdateActiveRegion copies chunks to WRITE. Physics must read from WRITE to see them.
-    // This is an in-place update (read and write same buffer) but works because:
-    // - Each voxel is processed by exactly one thread (chunk-based dispatch)
-    // - Static voxels just copy themselves in-place (no change)
-    // - Moving voxels use atomic-like behavior (only one can claim destination)
-    world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-    // Re-set descriptor heaps (in case they were changed)
-    cmdList->SetDescriptorHeaps(1, heaps);
-
-    // Bind gravity chunk pipeline
-    m_gravityChunkPipeline.Bind(cmdList);
-
-    // Set constants
+    // The infinite-world dense buffers are kept as mirrored caches. Physics is
+    // a local in-place update, so run the same active chunk work against both
+    // buffers. This avoids the old alternating-buffer flicker where only WRITE
+    // had the simulated result and SwapBuffers bounced the renderer between
+    // different voxel states.
     PhysicsChunkConstants constants;
     constants.gridSizeX = world.GetGridSizeX();
     constants.gridSizeY = world.GetGridSizeY();
@@ -1030,27 +1014,40 @@ void PhysicsDispatcher::DispatchPhysicsIndirect(
     constants.chunkCountZ = chunkManager.GetChunkCountZ();
     constants.padding = 0;
 
-    m_gravityChunkPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
+    auto dispatchInPlace = [&](bool readBuffer) {
+        if (readBuffer) {
+            world.TransitionReadBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        } else {
+            world.TransitionWriteBufferTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
 
-    // Set descriptors - single buffer for in-place physics updates
-    m_gravityChunkPipeline.SetRootDescriptorTable(cmdList, 1, chunkManager.GetActiveListSRV().gpu);  // Active chunk list SRV (t0)
-    m_gravityChunkPipeline.SetRootDescriptorTable(cmdList, 2, world.GetWriteBufferUAV().gpu);        // Voxel buffer UAV (u0) - read AND write
+        cmdList->SetDescriptorHeaps(1, heaps);
+        m_gravityChunkPipeline.Bind(cmdList);
+        m_gravityChunkPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
+        m_gravityChunkPipeline.SetRootDescriptorTable(cmdList, 1, chunkManager.GetActiveListSRV().gpu);
+        m_gravityChunkPipeline.SetRootDescriptorTable(
+            cmdList,
+            2,
+            readBuffer ? world.GetReadBufferUAV().gpu : world.GetWriteBufferUAV().gpu);
 
-    // Execute indirect dispatch
-    cmdList->ExecuteIndirect(
-        m_commandSignature.Get(),
-        1,  // Max command count
-        chunkManager.GetIndirectArgsBuffer().GetResource(),
-        0,  // Offset to arguments
-        nullptr,  // No count buffer
-        0
-    );
+        cmdList->ExecuteIndirect(
+            m_commandSignature.Get(),
+            1,
+            chunkManager.GetIndirectArgsBuffer().GetResource(),
+            0,
+            nullptr,
+            0);
 
-    // UAV barrier on output
-    D3D12_RESOURCE_BARRIER uavBarrier = {};
-    uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-    uavBarrier.UAV.pResource = world.GetWriteBuffer().GetResource();
-    cmdList->ResourceBarrier(1, &uavBarrier);
+        D3D12_RESOURCE_BARRIER uavBarrier = {};
+        uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uavBarrier.UAV.pResource = readBuffer
+            ? world.GetReadBuffer().GetResource()
+            : world.GetWriteBuffer().GetResource();
+        cmdList->ResourceBarrier(1, &uavBarrier);
+    };
+
+    dispatchInPlace(true);
+    dispatchInPlace(false);
 
     // REMOVED DUPLICATE: SwapBuffers() is called in main loop after physics!
     // Double-swapping was causing READ and WRITE buffers to point to same buffer,
@@ -1089,6 +1086,7 @@ void PhysicsDispatcher::DispatchBrushRaycast(
         float rayOriginX, rayOriginY, rayOriginZ, rayOriginW;
         float rayDirX, rayDirY, rayDirZ, rayDirW;
         uint32_t gridSizeX, gridSizeY, gridSizeZ, padding;
+        float regionOriginX, regionOriginY, regionOriginZ, regionOriginW;
     } constants = {};
 
     constants.rayOriginX = rayOrigin.x;
@@ -1105,12 +1103,18 @@ void PhysicsDispatcher::DispatchBrushRaycast(
     constants.gridSizeY = world.GetGridSizeY();
     constants.gridSizeZ = world.GetGridSizeZ();
     constants.padding = 0;
+    const glm::vec3 regionOrigin = world.GetRegionOriginWorld();
+    constants.regionOriginX = regionOrigin.x;
+    constants.regionOriginY = regionOrigin.y;
+    constants.regionOriginZ = regionOrigin.z;
+    constants.regionOriginW = 0.0f;
 
     m_brushRaycastPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
 
-    // Set descriptors: t0 = voxel grid SRV, u0 = result UAV
+    // Set descriptors: t0 = voxel grid SRV, t1 = valid chunk mask, u0 = result UAV
     m_brushRaycastPipeline.SetRootDescriptorTable(cmdList, 1, world.GetReadBufferSRV().gpu);
-    m_brushRaycastPipeline.SetRootDescriptorTable(cmdList, 2, world.GetBrushRaycastResultBuffer().GetShaderVisibleUAV().gpu);
+    m_brushRaycastPipeline.SetRootDescriptorTable(cmdList, 2, world.GetReadChunkValidMaskSRV().gpu);
+    m_brushRaycastPipeline.SetRootDescriptorTable(cmdList, 3, world.GetBrushRaycastResultBuffer().GetShaderVisibleUAV().gpu);
 
     // Dispatch single thread (1x1x1)
     cmdList->Dispatch(1, 1, 1);
@@ -1147,6 +1151,7 @@ void PhysicsDispatcher::DispatchGroundRaycast(
         float rayOriginX, rayOriginY, rayOriginZ, rayOriginW;
         float rayDirX, rayDirY, rayDirZ, rayDirW;
         uint32_t gridSizeX, gridSizeY, gridSizeZ, padding;
+        float regionOriginX, regionOriginY, regionOriginZ, regionOriginW;
     } constants = {};
 
     constants.rayOriginX = rayOrigin.x;
@@ -1163,12 +1168,18 @@ void PhysicsDispatcher::DispatchGroundRaycast(
     constants.gridSizeY = world.GetGridSizeY();
     constants.gridSizeZ = world.GetGridSizeZ();
     constants.padding = 0;
+    const glm::vec3 regionOrigin = world.GetRegionOriginWorld();
+    constants.regionOriginX = regionOrigin.x;
+    constants.regionOriginY = regionOrigin.y;
+    constants.regionOriginZ = regionOrigin.z;
+    constants.regionOriginW = 0.0f;
 
     m_brushRaycastPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
 
-    // Set descriptors: t0 = voxel grid SRV, u0 = GROUND result UAV (different from brush!)
+    // Set descriptors: t0 = voxel grid SRV, t1 = valid chunk mask, u0 = GROUND result UAV
     m_brushRaycastPipeline.SetRootDescriptorTable(cmdList, 1, world.GetReadBufferSRV().gpu);
-    m_brushRaycastPipeline.SetRootDescriptorTable(cmdList, 2, world.GetGroundRaycastResultBuffer().GetShaderVisibleUAV().gpu);
+    m_brushRaycastPipeline.SetRootDescriptorTable(cmdList, 2, world.GetReadChunkValidMaskSRV().gpu);
+    m_brushRaycastPipeline.SetRootDescriptorTable(cmdList, 3, world.GetGroundRaycastResultBuffer().GetShaderVisibleUAV().gpu);
 
     // Dispatch single thread (1x1x1)
     cmdList->Dispatch(1, 1, 1);
@@ -1198,8 +1209,9 @@ Result<void> PhysicsDispatcher::CreateBrushRaycastPipeline(
     }
 
     // Root signature:
-    // b0: BrushRaycastConstants (12 DWORDs)
+    // b0: BrushRaycastConstants (16 DWORDs)
     // t0: VoxelGrid SRV (descriptor table)
+    // t1: ChunkValidMask SRV (descriptor table)
     // u0: BrushRaycastResult UAV (descriptor table)
     Graphics::ComputePipelineDesc pipelineDesc;
     pipelineDesc.computeShader = cs;
@@ -1210,13 +1222,22 @@ Result<void> PhysicsDispatcher::CreateBrushRaycastPipeline(
         Graphics::RootParamType::Constants32Bit,
         0,  // register b0
         0,  // space 0
-        12  // 12 uint32s (BrushRaycastConstants)
+        16  // 16 uint32s (BrushRaycastConstants)
     });
 
     // t0: Voxel grid SRV
     pipelineDesc.rootParams.push_back({
         Graphics::RootParamType::DescriptorTable,
         0,  // register t0
+        0,  // space 0
+        1,  // 1 descriptor
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+
+    // u0: Brush raycast result UAV
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        1,  // register t1
         0,  // space 0
         1,  // 1 descriptor
         D3D12_DESCRIPTOR_RANGE_TYPE_SRV

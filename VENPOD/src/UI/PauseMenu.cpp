@@ -73,8 +73,7 @@ void PauseMenu::Render(
 
     // Controls
     ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Controls:");
-    ImGui::BulletText("ESC: Toggle this menu");
-    ImGui::BulletText("Tab: Toggle mouse capture");
+    ImGui::BulletText("P / ESC: Toggle this menu");
     ImGui::BulletText("WASD: Move camera");
     ImGui::BulletText("Mouse: Look around");
     ImGui::BulletText("Space/Shift: Up/Down");
@@ -85,7 +84,7 @@ void PauseMenu::Render(
     ImGui::BulletText("Scroll: Change brush size");
     ImGui::Separator();
 
-    ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Press ESC to resume");
+    ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "Press P to resume");
 
     ImGui::End();
 

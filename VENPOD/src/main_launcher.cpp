@@ -39,11 +39,68 @@ using namespace VENPOD::Graphics;
 
 // Frame synchronization
 static constexpr uint32_t kFrameCount = Window::BUFFER_COUNT;
+static constexpr float kBrushDefaultAimDistance = 384.0f;
+static constexpr float kBrushMaxInteractionDistance = 4096.0f;
+static constexpr float kBrushStrokePullSpeed = 250.0f;
 
 struct FrameContext {
     ComPtr<ID3D12CommandAllocator> commandAllocator;
     uint64_t fenceValue = 0;
 };
+
+static constexpr uint32_t kGpuTimestampCount = 4;
+
+struct GpuTimingStats {
+    bool valid = false;
+    double frameMs = 0.0;
+    double preRenderMs = 0.0;
+    double raymarchMs = 0.0;
+    double uiAndReadbackMs = 0.0;
+};
+
+static bool ReadGpuTiming(
+    ID3D12Resource* readbackBuffer,
+    uint64_t timestampFrequency,
+    uint32_t frameIndex,
+    GpuTimingStats& stats)
+{
+    if (!readbackBuffer || timestampFrequency == 0) {
+        return false;
+    }
+
+    const uint64_t baseByte = static_cast<uint64_t>(frameIndex) * kGpuTimestampCount * sizeof(uint64_t);
+    const D3D12_RANGE readRange{
+        static_cast<SIZE_T>(baseByte),
+        static_cast<SIZE_T>(baseByte + kGpuTimestampCount * sizeof(uint64_t))
+    };
+
+    uint8_t* mapped = nullptr;
+    HRESULT hr = readbackBuffer->Map(0, &readRange, reinterpret_cast<void**>(&mapped));
+    if (FAILED(hr) || !mapped) {
+        return false;
+    }
+
+    const uint64_t* timestamps = reinterpret_cast<const uint64_t*>(mapped + baseByte);
+    const uint64_t t0 = timestamps[0];
+    const uint64_t t1 = timestamps[1];
+    const uint64_t t2 = timestamps[2];
+    const uint64_t t3 = timestamps[3];
+
+    const D3D12_RANGE writtenRange{0, 0};
+    readbackBuffer->Unmap(0, &writtenRange);
+
+    if (t0 == 0 || t1 < t0 || t2 < t1 || t3 < t2) {
+        return false;
+    }
+
+    const double tickToMs = 1000.0 / static_cast<double>(timestampFrequency);
+    stats.valid = true;
+    stats.preRenderMs = static_cast<double>(t1 - t0) * tickToMs;
+    stats.raymarchMs = static_cast<double>(t2 - t1) * tickToMs;
+    stats.uiAndReadbackMs = static_cast<double>(t3 - t2) * tickToMs;
+    stats.frameMs = static_cast<double>(t3 - t0) * tickToMs;
+    return true;
+}
 
 struct GroundQueryMetadata {
     bool valid = false;
@@ -55,14 +112,26 @@ struct BrushQueryMetadata {
     bool valid = false;
     glm::vec3 regionOriginWorld{0.0f};
     glm::vec3 originWorld{0.0f};
+    glm::vec3 directionWorld{0.0f, 0.0f, 1.0f};
 };
 
 struct BuildStrokeState {
     bool active = false;
-    float rayDistance = 64.0f;
+    float rayDistance = kBrushDefaultAimDistance;
     bool closeRampActive = false;
     float closeRampHorizontalDistance = 0.0f;
     glm::vec3 closeRampDirection{0.0f, 0.0f, 1.0f};
+    bool hasLastBrushWorldPosition = false;
+    glm::vec3 lastBrushWorldPosition{0.0f};
+    bool hasLastBrushRayDirection = false;
+    glm::vec3 lastBrushRayDirection{0.0f, 0.0f, 1.0f};
+    uint32_t lastBrushMode = UINT32_MAX;
+    uint32_t sweepStampsLastFrame = 0;
+    bool hasStableAimDistance = false;
+    float stableAimDistance = kBrushDefaultAimDistance;
+    glm::vec3 stableAimWorldPosition{0.0f};
+    bool hasPreviewWorldPosition = false;
+    glm::vec3 previewWorldPosition{0.0f};
 };
 
 static glm::ivec3 DecodePackedNormal(uint32_t packedNormal, bool& valid) {
@@ -136,7 +205,7 @@ static glm::vec3 ApplyCloseTraversalBrushFallback(
         strokeState.closeRampDirection = rampDirection;
     }
 
-    const float rampAdvancePerSecond = std::max(54.0f, brushRadius * 10.0f);
+    const float rampAdvancePerSecond = std::max(150.0f, brushRadius * 22.0f);
     const float rampAdvance = std::max(0.30f, rampAdvancePerSecond * std::max(dt, 0.0f));
     strokeState.closeRampHorizontalDistance = std::max(
         finishDistance,
@@ -182,7 +251,7 @@ int RunSandbox(int argc, char* argv[]) {
     // This isolates copy/origin bugs from the infinite chunk streaming logic.
     const bool useStaticChunkLayout = std::getenv("VENPOD_STATIC_CHUNKS") != nullptr;
     const bool disablePhysics = std::getenv("VENPOD_DISABLE_PHYSICS") != nullptr;
-    const bool enableInfinitePhysics = std::getenv("VENPOD_ENABLE_INFINITE_PHYSICS") != nullptr;
+    const bool enableInfinitePhysics = std::getenv("VENPOD_DISABLE_INFINITE_PHYSICS") == nullptr;
     const bool enableDiagnostics = std::getenv("VENPOD_DIAGNOSTICS") != nullptr;
     const bool enableRuntimeLog = enableDiagnostics || std::getenv("VENPOD_LOG_FILE") != nullptr;
     const bool enableD3DDebug = std::getenv("VENPOD_D3D_DEBUG") != nullptr;
@@ -197,7 +266,8 @@ int RunSandbox(int argc, char* argv[]) {
         spdlog::info("  Log path: {}", logPath.string());
     }
 
-    spdlog::set_level(enableDiagnostics ? spdlog::level::debug : spdlog::level::warn);
+    spdlog::set_level(enableDiagnostics ? spdlog::level::debug :
+        (enableRuntimeLog ? spdlog::level::info : spdlog::level::warn));
     spdlog::info("===========================================");
     spdlog::info("  VENPOD - Voxel Physics Engine v0.1.0");
     spdlog::info("  Target: 100M+ Active Voxels @ 60 FPS");
@@ -291,21 +361,8 @@ int RunSandbox(int argc, char* argv[]) {
     Renderer::SparseFarField sparseFarField = {};
     if (enableFarSVO) {
         FarVoxelOctreeConfig farConfig;
-        auto farResult = farVoxelOctree.Initialize(
-            device->GetDevice(),
-            renderer->GetHeapManager(),
-            farConfig);
-        if (!farResult) {
-            spdlog::warn("Far sparse voxel octree disabled: {}", farResult.error());
-        } else {
-            const auto& farStats = farVoxelOctree.GetStats();
-            sparseFarField.nodeSRV = farVoxelOctree.GetNodeSRV();
-            sparseFarField.pageSRV = farVoxelOctree.GetPageSRV();
-            sparseFarField.nodeCount = farStats.nodeCount;
-            sparseFarField.pageCount = farStats.pageCount;
-            sparseFarField.pageSize = farStats.pageSize;
-            sparseFarField.enabled = true;
-        }
+        farVoxelOctree.BeginAsyncLoad(farConfig);
+        spdlog::info("Far sparse voxel octree async load started");
     }
 
     // =============================================================================
@@ -400,6 +457,66 @@ int RunSandbox(int argc, char* argv[]) {
         }
     }
 
+    ComPtr<ID3D12QueryHeap> gpuTimestampHeap;
+    ComPtr<ID3D12Resource> gpuTimestampReadback;
+    uint64_t gpuTimestampFrequency = 0;
+    GpuTimingStats gpuTiming = {};
+    {
+        HRESULT freqHr = commandQueue->GetCommandQueue()->GetTimestampFrequency(&gpuTimestampFrequency);
+        if (FAILED(freqHr) || gpuTimestampFrequency == 0) {
+            spdlog::warn("GPU timestamp frequency unavailable; GPU timing overlay disabled");
+        } else {
+            D3D12_QUERY_HEAP_DESC queryHeapDesc = {};
+            queryHeapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+            queryHeapDesc.Count = kFrameCount * kGpuTimestampCount;
+            queryHeapDesc.NodeMask = 0;
+            HRESULT queryHr = device->GetDevice()->CreateQueryHeap(
+                &queryHeapDesc,
+                IID_PPV_ARGS(&gpuTimestampHeap));
+            if (FAILED(queryHr)) {
+                spdlog::warn("Failed to create GPU timestamp query heap: 0x{:08X}", static_cast<unsigned int>(queryHr));
+                gpuTimestampFrequency = 0;
+            } else {
+                D3D12_HEAP_PROPERTIES heapProps = {};
+                heapProps.Type = D3D12_HEAP_TYPE_READBACK;
+                heapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+                heapProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+                heapProps.CreationNodeMask = 1;
+                heapProps.VisibleNodeMask = 1;
+
+                D3D12_RESOURCE_DESC bufferDesc = {};
+                bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                bufferDesc.Alignment = 0;
+                bufferDesc.Width = static_cast<UINT64>(kFrameCount) * kGpuTimestampCount * sizeof(uint64_t);
+                bufferDesc.Height = 1;
+                bufferDesc.DepthOrArraySize = 1;
+                bufferDesc.MipLevels = 1;
+                bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+                bufferDesc.SampleDesc.Count = 1;
+                bufferDesc.SampleDesc.Quality = 0;
+                bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                bufferDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+                HRESULT bufferHr = device->GetDevice()->CreateCommittedResource(
+                    &heapProps,
+                    D3D12_HEAP_FLAG_NONE,
+                    &bufferDesc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    nullptr,
+                    IID_PPV_ARGS(&gpuTimestampReadback));
+                if (FAILED(bufferHr)) {
+                    spdlog::warn("Failed to create GPU timestamp readback buffer: 0x{:08X}", static_cast<unsigned int>(bufferHr));
+                    gpuTimestampHeap.Reset();
+                    gpuTimestampFrequency = 0;
+                } else {
+                    gpuTimestampHeap->SetName(L"VENPOD_GPU_TimestampHeap");
+                    gpuTimestampReadback->SetName(L"VENPOD_GPU_TimestampReadback");
+                    spdlog::info("GPU timestamp timing enabled: {} Hz", gpuTimestampFrequency);
+                }
+            }
+        }
+    }
+
     // Initialize VoxelWorld
     auto voxelWorld = std::make_unique<Simulation::VoxelWorld>();
     Simulation::VoxelWorldConfig voxelConfig;
@@ -474,49 +591,11 @@ int RunSandbox(int argc, char* argv[]) {
         voxelWorld->SwapBuffers();
         spdlog::info("Initialized 256^3 voxel grid with procedural terrain (CS_Initialize)");
     } else {
-        // CRITICAL FIX: Clear both voxel buffers to air (0) before using infinite chunks!
-        // Without this, uninitialized GPU memory contains garbage that the raymarcher
-        // interprets as random terrain, causing terrain to appear in wrong locations.
-        spdlog::info("Clearing voxel buffers to air for infinite chunk mode...");
-
-        // Transition both buffers to UAV state for clearing
-        voxelWorld->TransitionReadBufferTo(initCommandList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        voxelWorld->TransitionWriteBufferTo(initCommandList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-        // Clear both buffers using ClearUnorderedAccessViewUint
-        // This sets all voxels to 0 (MAT_AIR)
-        UINT clearValues[4] = {0, 0, 0, 0};
-        auto& heapManager = renderer->GetHeapManager();
-        ID3D12DescriptorHeap* heaps[] = { heapManager.GetShaderVisibleCbvSrvUavHeap() };
-        initCommandList->SetDescriptorHeaps(1, heaps);
-
-        // Clear READ buffer
-        initCommandList->ClearUnorderedAccessViewUint(
-            voxelWorld->GetReadBufferUAV().gpu,
-            voxelWorld->GetReadBufferUAV().cpu,
-            voxelWorld->GetReadBuffer().GetResource(),
-            clearValues,
-            0, nullptr
-        );
-
-        // Clear WRITE buffer
-        initCommandList->ClearUnorderedAccessViewUint(
-            voxelWorld->GetWriteBufferUAV().gpu,
-            voxelWorld->GetWriteBufferUAV().cpu,
-            voxelWorld->GetWriteBuffer().GetResource(),
-            clearValues,
-            0, nullptr
-        );
-
-        // UAV barriers to ensure clears complete
-        D3D12_RESOURCE_BARRIER uavBarriers[2] = {};
-        uavBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        uavBarriers[0].UAV.pResource = voxelWorld->GetReadBuffer().GetResource();
-        uavBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        uavBarriers[1].UAV.pResource = voxelWorld->GetWriteBuffer().GetResource();
-        initCommandList->ResourceBarrier(2, uavBarriers);
-
-        spdlog::info("Both voxel buffers cleared to air - ready for infinite chunk streaming");
+        // Infinite streaming now gates dense-buffer reads through a tiny
+        // per-chunk valid mask. Startup only needs the masks cleared on the
+        // first active-region fill; clearing both multi-GB voxel buffers here
+        // caused a black-screen-scale launch stall on 8 GB GPUs.
+        spdlog::info("Infinite chunk mode: skipping dense voxel-buffer clear; chunk-valid masks gate startup reads");
     }
 
     initCommandList->Close();
@@ -645,7 +724,7 @@ int RunSandbox(int argc, char* argv[]) {
     pauseMenu.Initialize();
 
     spdlog::info("Initialization complete. Entering main loop...");
-    spdlog::info("Controls: ESC=Pause, WASD=Move, Mouse=Look, Space=Jump/Fly, Double-Space=Toggle Flight, V=Perspective, Tab=Toggle Mouse, LMB=Paint, RMB=Erase");
+    spdlog::info("Controls: P=Pause/Menu, ESC=Pause/Menu, WASD=Move, Mouse=Look, Space=Jump/Fly, Double-Space=Toggle Flight, V=Perspective, LMB=Paint, RMB=Erase");
 
     // Camera setup with pitch/yaw for mouse look
     const float fov = 60.0f * 3.14159f / 180.0f;
@@ -695,21 +774,50 @@ int RunSandbox(int argc, char* argv[]) {
     uint64_t physicsDispatchCount = 0;
     uint64_t physicsBudgetSkipCount = 0;
     uint32_t currentCopyBudget = voxelWorld->GetMaxChunkCopiesPerFrame();
+    uint32_t currentGenerationBudget = 3;
+    float currentRaymarchMaxDistance = 3000.0f;
+    uint32_t currentRaymarchMaxSteps = 2048;
+    float currentFarFieldQuality = 1.0f;
+    float currentRenderQuality = 1.0f;
+    float perfFenceWaitMs = 0.0f;
+    float perfChunkUpdateMs = 0.0f;
+    float perfPhysicsSubmitMs = 0.0f;
+    float perfBrushSubmitMs = 0.0f;
+    float perfRenderSubmitMs = 0.0f;
+    float perfPresentMs = 0.0f;
+    float schedulerPredictedFrameMs = 16.67f;
     bool hasCompletedGroundQuery = false;
     bool hasCompletedBrushQuery = false;
     glm::vec3 completedGroundQueryRegionOriginWorld(0.0f);
     glm::vec3 completedGroundQueryFeetWorld(0.0f);
     glm::vec3 completedBrushQueryRegionOriginWorld(0.0f);
     glm::vec3 completedBrushQueryOriginWorld(0.0f);
+    glm::vec3 completedBrushQueryDirectionWorld(0.0f, 0.0f, 1.0f);
     glm::vec3 nextGroundQueryRegionOriginWorld(0.0f);
     glm::vec3 nextGroundQueryFeetWorld(0.0f);
     glm::vec3 nextBrushQueryRegionOriginWorld(0.0f);
     glm::vec3 nextBrushQueryOriginWorld(0.0f);
+    glm::vec3 nextBrushQueryDirectionWorld(0.0f, 0.0f, 1.0f);
     std::array<GroundQueryMetadata, kFrameCount> groundQueryMetadata = {};
     std::array<BrushQueryMetadata, kFrameCount> brushQueryMetadata = {};
     BuildStrokeState buildStrokeState;
+    glm::vec3 physicsDirtyCenterWorld = cameraPos;
+    uint32_t physicsDirtyFramesRemaining = 0;
+    uint64_t physicsDirtyEvents = 0;
+    glm::vec3 lastPhysicsSchedulerCameraWorld = cameraPos;
     glm::vec3 lastBoundaryTestCameraWorld = cameraPos;
     float boundaryTestElapsedSeconds = 0.0f;
+
+    auto setPauseMenuOpen = [&](bool open) {
+        if (open) {
+            pauseMenu.Show();
+        } else {
+            pauseMenu.Hide();
+        }
+        paused = open;
+        inputManager.SetMouseCaptured(!open);
+        spdlog::info("Pause menu {}", open ? "opened" : "closed");
+    };
 
     while (running) {
         uint64_t currentFrameCounter = SDL_GetPerformanceCounter();
@@ -719,25 +827,120 @@ int RunSandbox(int argc, char* argv[]) {
         lastRawFrameMs = dt * 1000.0f;
         smoothedFrameMs = smoothedFrameMs * 0.92f + lastRawFrameMs * 0.08f;
         dt = std::clamp(dt, 1.0f / 240.0f, 1.0f / 30.0f);
+        const auto ticksToMs = [performanceFrequency](uint64_t ticks) {
+            return static_cast<float>(static_cast<double>(ticks) * 1000.0 / performanceFrequency);
+        };
+        perfFenceWaitMs = 0.0f;
+        perfChunkUpdateMs = 0.0f;
+        perfPhysicsSubmitMs = 0.0f;
+        perfBrushSubmitMs = 0.0f;
+        perfRenderSubmitMs = 0.0f;
+
+        if (enableFarSVO && !sparseFarField.enabled && farVoxelOctree.IsAsyncPending()) {
+            if (farVoxelOctree.TryFinalizeAsyncUpload(device->GetDevice(), renderer->GetHeapManager())) {
+                const auto& farStats = farVoxelOctree.GetStats();
+                sparseFarField.nodeSRV = farVoxelOctree.GetNodeSRV();
+                sparseFarField.pageSRV = farVoxelOctree.GetPageSRV();
+                sparseFarField.pageIndexSRV = farVoxelOctree.GetPageIndexSRV();
+                sparseFarField.nodeCount = farStats.nodeCount;
+                sparseFarField.pageCount = farStats.pageCount;
+                sparseFarField.pageIndexCount = farStats.pageIndexCount;
+                sparseFarField.pageRadius = farStats.pageRadius;
+                sparseFarField.pageSize = farStats.pageSize;
+                sparseFarField.rootMinY = farStats.rootMinY;
+                sparseFarField.enabled = true;
+                spdlog::info(
+                    "Far sparse voxel octree async ready: {} pages, {} nodes, source={}, cpu={:.1f} ms, gpuUpload={:.1f} ms",
+                    farStats.pageCount,
+                    farStats.nodeCount,
+                    farStats.loadedFromCache ? "cache" : "build",
+                    farStats.cpuBuildMs,
+                    farStats.gpuUploadMs);
+            }
+        }
 
         const auto& previousStreamingStats = voxelWorld->GetStreamingStats();
         const bool streamingStillFilling =
             previousStreamingStats.expectedVisibleChunks == 0 ||
             previousStreamingStats.cachedReadChunks < previousStreamingStats.expectedVisibleChunks ||
             previousStreamingStats.cachedWriteChunks < previousStreamingStats.expectedVisibleChunks;
+        const bool sourceStillFilling =
+            previousStreamingStats.expectedVisibleChunks == 0 ||
+            previousStreamingStats.generatedChunks < previousStreamingStats.expectedVisibleChunks ||
+            previousStreamingStats.queuedChunks > 0 ||
+            previousStreamingStats.chunksNotLoadedLastFrame > 0;
 
-        if (smoothedFrameMs > 19.0f) {
-            currentCopyBudget = 12;
-        } else if (smoothedFrameMs > 18.0f) {
-            currentCopyBudget = 16;
-        } else if (smoothedFrameMs > 17.0f) {
-            currentCopyBudget = 24;
+        const float schedulerPressureMs = std::max(smoothedFrameMs, schedulerPredictedFrameMs);
+
+        uint32_t targetCopyBudget = 40;
+        uint32_t targetGenerationBudget = 3;
+        float targetFarFieldQuality = 1.0f;
+        if (lastRawFrameMs > 30.0f || schedulerPressureMs > 21.0f) {
+            targetCopyBudget = 8;
+            targetGenerationBudget = 0;
+            targetFarFieldQuality = 0.45f;
+        } else if (lastRawFrameMs > 24.0f || schedulerPressureMs > 19.0f) {
+            targetCopyBudget = 12;
+            targetGenerationBudget = 1;
+            targetFarFieldQuality = 0.60f;
+        } else if (schedulerPressureMs > 18.0f) {
+            targetCopyBudget = 16;
+            targetGenerationBudget = 1;
+            targetFarFieldQuality = 0.75f;
+        } else if (schedulerPressureMs > 17.0f) {
+            targetCopyBudget = 24;
+            targetGenerationBudget = 3;
+            targetFarFieldQuality = 0.88f;
         } else if (streamingStillFilling) {
-            currentCopyBudget = 48;
+            targetCopyBudget = 48;
+            targetGenerationBudget = 8;
+            targetFarFieldQuality = 0.92f;
         } else {
-            currentCopyBudget = 40;
+            targetCopyBudget = 40;
+            targetGenerationBudget = 6;
+            targetFarFieldQuality = 1.0f;
         }
+        if (sourceStillFilling) {
+            // Do not starve visible chunk generation because of one bad frame.
+            // Generation now batches the frame's work into one command-list
+            // submission, so keeping the source queue moving is cheaper than
+            // letting missing visible pages linger for seconds.
+            const uint32_t backlogBoost =
+                previousStreamingStats.queuedChunks > 1500 ? 10u :
+                previousStreamingStats.queuedChunks > 700 ? 8u :
+                6u;
+            targetGenerationBudget = std::max<uint32_t>(targetGenerationBudget, backlogBoost);
+            if (streamingStillFilling) {
+                targetCopyBudget = std::max<uint32_t>(targetCopyBudget, 24u);
+            }
+        }
+        if (previousStreamingStats.readSlotMismatches > 0 ||
+            previousStreamingStats.chunksNotLoadedLastFrame > 0 ||
+            previousStreamingStats.chunksNotGeneratedLastFrame > 0) {
+            targetCopyBudget = std::max<uint32_t>(targetCopyBudget, 56u);
+            targetGenerationBudget = std::max<uint32_t>(targetGenerationBudget, 24u);
+        }
+
+        if (streamingStillFilling || sourceStillFilling) {
+            currentCopyBudget = std::max(currentCopyBudget, std::min<uint32_t>(targetCopyBudget, 56u));
+            currentGenerationBudget = std::max(currentGenerationBudget, std::min<uint32_t>(targetGenerationBudget, 24u));
+        } else if (targetCopyBudget < currentCopyBudget) {
+            currentCopyBudget = targetCopyBudget;
+        } else if (targetCopyBudget > currentCopyBudget && (frameCount % 8 == 0)) {
+            currentCopyBudget = std::min(targetCopyBudget, currentCopyBudget + 2u);
+        }
+        if (!streamingStillFilling && !sourceStillFilling && targetGenerationBudget < currentGenerationBudget) {
+            currentGenerationBudget = targetGenerationBudget;
+        } else if (!streamingStillFilling && !sourceStillFilling && targetGenerationBudget > currentGenerationBudget && (frameCount % 12 == 0)) {
+            currentGenerationBudget = std::min(targetGenerationBudget, currentGenerationBudget + 2u);
+        }
+        currentRaymarchMaxDistance = 3000.0f;
+        currentRaymarchMaxSteps = 2048;
+        currentFarFieldQuality += (targetFarFieldQuality - currentFarFieldQuality) * 0.08f;
+        currentRenderQuality = 1.0f;
         voxelWorld->SetMaxChunkCopiesPerFrame(currentCopyBudget);
+        const uint32_t trailingGenerationBudget = currentGenerationBudget;
+        voxelWorld->SetChunkGenerationBudget(0);
 
         // Process SDL events FIRST to update mouse/keyboard state
         SDL_Event event;
@@ -755,14 +958,7 @@ int RunSandbox(int argc, char* argv[]) {
 
                 case SDL_EVENT_KEY_DOWN:
                     if (event.key.key == SDLK_ESCAPE) {
-                        // Toggle pause menu instead of quitting
-                        pauseMenu.Toggle();
-                        // Release/capture mouse based on pause menu state
-                        inputManager.SetMouseCaptured(!pauseMenu.IsVisible());
-                    }
-                    else if (event.key.key == SDLK_TAB) {
-                        // Toggle mouse capture
-                        inputManager.SetMouseCaptured(!inputManager.IsMouseCaptured());
+                        setPauseMenuOpen(!pauseMenu.IsVisible());
                     }
                     break;
 
@@ -797,35 +993,35 @@ int RunSandbox(int argc, char* argv[]) {
 
         // Handle input actions
         if (inputManager.IsActionPressed(Input::KeyAction::TogglePause)) {
-            paused = !paused;
-            spdlog::info("Simulation {}", paused ? "paused" : "resumed");
+            setPauseMenuOpen(!pauseMenu.IsVisible());
         }
-        if (inputManager.IsActionPressed(Input::KeyAction::MaterialNext)) {
+        const bool gameplayInputEnabled = !pauseMenu.IsVisible();
+        if (gameplayInputEnabled && inputManager.IsActionPressed(Input::KeyAction::MaterialNext)) {
             brushController.NextMaterial();
             spdlog::info("Material: {}", brushController.GetMaterial());
         }
-        if (inputManager.IsActionPressed(Input::KeyAction::MaterialPrev)) {
+        if (gameplayInputEnabled && inputManager.IsActionPressed(Input::KeyAction::MaterialPrev)) {
             brushController.PrevMaterial();
             spdlog::info("Material: {}", brushController.GetMaterial());
         }
-        if (inputManager.IsActionPressed(Input::KeyAction::BrushIncrease)) {
+        if (gameplayInputEnabled && inputManager.IsActionPressed(Input::KeyAction::BrushIncrease)) {
             brushController.IncreaseRadius();
             spdlog::info("Brush radius: {:.1f}", brushController.GetRadius());
         }
-        if (inputManager.IsActionPressed(Input::KeyAction::BrushDecrease)) {
+        if (gameplayInputEnabled && inputManager.IsActionPressed(Input::KeyAction::BrushDecrease)) {
             brushController.DecreaseRadius();
             spdlog::info("Brush radius: {:.1f}", brushController.GetRadius());
         }
-        if (inputManager.IsActionPressed(Input::KeyAction::TogglePerspective)) {
+        if (gameplayInputEnabled && inputManager.IsActionPressed(Input::KeyAction::TogglePerspective)) {
             thirdPersonMode = !thirdPersonMode;
             spdlog::info("Perspective: {}", thirdPersonMode ? "third-person" : "first-person");
         }
 
-        const bool jumpPressed = inputManager.IsActionPressed(Input::KeyAction::CameraUp);
-        const bool flightTogglePressed = inputManager.IsActionDoubleClicked(Input::KeyAction::CameraUp);
+        const bool jumpPressed = gameplayInputEnabled && inputManager.IsActionPressed(Input::KeyAction::CameraUp);
+        const bool flightTogglePressed = gameplayInputEnabled && inputManager.IsActionDoubleClicked(Input::KeyAction::CameraUp);
 
         // Mouse look - update camera rotation
-        glm::vec2 mouseDelta = inputManager.GetMouseDelta();
+        glm::vec2 mouseDelta = gameplayInputEnabled ? inputManager.GetMouseDelta() : glm::vec2(0.0f);
         cameraYaw += mouseDelta.x * mouseSensitivity;  // Inverted from - to + for correct left/right
         cameraPitch -= mouseDelta.y * mouseSensitivity;
 
@@ -871,23 +1067,23 @@ int RunSandbox(int argc, char* argv[]) {
         glm::vec3 moveDirection(0.0f);
 
         // WASD for horizontal movement only
-        if (inputManager.IsActionDown(Input::KeyAction::CameraForward)) {
+        if (gameplayInputEnabled && inputManager.IsActionDown(Input::KeyAction::CameraForward)) {
             moveDirection += horizontalForward;
         }
-        if (inputManager.IsActionDown(Input::KeyAction::CameraBackward)) {
+        if (gameplayInputEnabled && inputManager.IsActionDown(Input::KeyAction::CameraBackward)) {
             moveDirection -= horizontalForward;
         }
-        if (inputManager.IsActionDown(Input::KeyAction::CameraLeft)) {
+        if (gameplayInputEnabled && inputManager.IsActionDown(Input::KeyAction::CameraLeft)) {
             moveDirection -= horizontalRight;
         }
-        if (inputManager.IsActionDown(Input::KeyAction::CameraRight)) {
+        if (gameplayInputEnabled && inputManager.IsActionDown(Input::KeyAction::CameraRight)) {
             moveDirection += horizontalRight;
         }
         if (glm::length(moveDirection) > 0.001f) {
             cameraPos += glm::normalize(moveDirection) * moveSpeed;
         }
 
-        if (flightMode && !enableBoundaryTest) {
+        if (gameplayInputEnabled && flightMode && !enableBoundaryTest) {
             if (inputManager.IsActionDown(Input::KeyAction::CameraUp)) {
                 cameraPos.y += moveSpeed * 2.0f;
             }
@@ -938,15 +1134,56 @@ int RunSandbox(int argc, char* argv[]) {
             lastBoundaryTestCameraWorld = cameraPos;
         }
 
+        // Walking physics must not advance downward into a streamed page that is
+        // not resident yet. Otherwise fast movement can outrun chunk upload, miss
+        // the ground raycast for a few frames, fall through the hole, and then
+        // crash/teleport when terrain catches up.
+        bool supportChunkReadyForWalking = true;
+        if (!flightMode && terrainReady && voxelWorld && voxelWorld->IsUsingInfiniteChunks()) {
+            const int32_t supportX = static_cast<int32_t>(std::floor(cameraPos.x));
+            const int32_t supportY = static_cast<int32_t>(std::floor(cameraPos.y - playerHeight - 1.0f));
+            const int32_t supportZ = static_cast<int32_t>(std::floor(cameraPos.z));
+            auto queueSupportFootprint = [&](const glm::vec3& worldCenter, int32_t priorityBase) {
+                auto* chunkManager = voxelWorld->GetChunkManager();
+                if (!chunkManager) {
+                    return;
+                }
+                const auto centerChunk = Simulation::ChunkCoord::FromWorldPosition(
+                    static_cast<int32_t>(std::floor(worldCenter.x)),
+                    supportY,
+                    static_cast<int32_t>(std::floor(worldCenter.z)),
+                    Simulation::CHUNK_SIZE_VOXELS);
+                for (int32_t dz = -1; dz <= 1; ++dz) {
+                    for (int32_t dx = -1; dx <= 1; ++dx) {
+                        const int32_t distance = dx * dx + dz * dz;
+                        chunkManager->QueueUrgentChunk(
+                            Simulation::ChunkCoord{centerChunk.x + dx, centerChunk.y, centerChunk.z + dz},
+                            priorityBase + distance);
+                    }
+                }
+            };
+
+            queueSupportFootprint(cameraPos, -3'000'000);
+            if (glm::length(moveDirection) > 0.001f) {
+                const glm::vec3 walkingDirection = glm::normalize(moveDirection);
+                queueSupportFootprint(cameraPos + walkingDirection * static_cast<float>(Simulation::CHUNK_SIZE_VOXELS * 2), -2'900'000);
+            }
+
+            supportChunkReadyForWalking = voxelWorld->IsWorldVoxelCachedForRead(supportX, supportY, supportZ);
+            if (!supportChunkReadyForWalking && cameraVelocityY < 0.0f) {
+                cameraVelocityY = 0.0f;
+            }
+        }
+
         // Apply gravity to vertical velocity (only when not in flight mode AND terrain is ready)
         // During startup, terrain might not be generated yet - disable gravity until
         // ground detection works to prevent falling through the world
-        if (!flightMode && terrainReady) {
+        if (gameplayInputEnabled && !flightMode && terrainReady && supportChunkReadyForWalking) {
             cameraVelocityY += gravity * dt;
         }
 
         // Apply vertical velocity to camera position (only if terrain ready or flying)
-        if (terrainReady || flightMode) {
+        if (gameplayInputEnabled && ((terrainReady && (supportChunkReadyForWalking || cameraVelocityY >= 0.0f)) || flightMode)) {
             cameraPos.y += cameraVelocityY * dt;
         }
 
@@ -975,9 +1212,9 @@ int RunSandbox(int argc, char* argv[]) {
             cameraUp,
             fov,
             aspectRatio,
-            inputManager.IsMouseButtonDown(Input::MouseButton::Left),
-            inputManager.IsMouseButtonDown(Input::MouseButton::Right),
-            inputManager.GetScrollDelta(),
+            gameplayInputEnabled && inputManager.IsMouseButtonDown(Input::MouseButton::Left),
+            gameplayInputEnabled && inputManager.IsMouseButtonDown(Input::MouseButton::Right),
+            gameplayInputEnabled ? inputManager.GetScrollDelta() : 0.0f,
             nullptr,  // No CPU voxel data (GPU raycasting now!)
             0
         );
@@ -987,7 +1224,12 @@ int RunSandbox(int argc, char* argv[]) {
         FrameContext& ctx = frameContexts[frameIndex];
 
         // Wait for this frame's previous work to complete
+        uint64_t perfPhaseStart = SDL_GetPerformanceCounter();
         commandQueue->WaitForFenceValue(ctx.fenceValue);
+        perfFenceWaitMs = ticksToMs(SDL_GetPerformanceCounter() - perfPhaseStart);
+        if (gpuTimestampReadback && gpuTimestampFrequency != 0) {
+            ReadGpuTiming(gpuTimestampReadback.Get(), gpuTimestampFrequency, frameIndex, gpuTiming);
+        }
         voxelWorld->RetireBrushEditFeedback(commandQueue->GetLastCompletedFenceValue());
         if (voxelWorld->RetireGroundRaycastReadback(frameIndex) && groundQueryMetadata[frameIndex].valid) {
             completedGroundQueryRegionOriginWorld = groundQueryMetadata[frameIndex].regionOriginWorld;
@@ -997,12 +1239,17 @@ int RunSandbox(int argc, char* argv[]) {
         if (voxelWorld->RetireBrushRaycastReadback(frameIndex) && brushQueryMetadata[frameIndex].valid) {
             completedBrushQueryRegionOriginWorld = brushQueryMetadata[frameIndex].regionOriginWorld;
             completedBrushQueryOriginWorld = brushQueryMetadata[frameIndex].originWorld;
+            completedBrushQueryDirectionWorld = brushQueryMetadata[frameIndex].directionWorld;
             hasCompletedBrushQuery = true;
         }
 
         // Reset command allocator and command list
         ctx.commandAllocator->Reset();
         commandList->Reset(ctx.commandAllocator.Get(), nullptr);
+        const uint32_t gpuTimestampBase = frameIndex * kGpuTimestampCount;
+        if (gpuTimestampHeap) {
+            commandList->EndQuery(gpuTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, gpuTimestampBase + 0);
+        }
 
         // ===== UPDATE VOXEL DATA SOURCE =====
         // In static layout mode, copy a fixed 2x2 patch of pre-generated chunks
@@ -1010,8 +1257,11 @@ int RunSandbox(int argc, char* argv[]) {
         // can validate copy/origin and rendering in isolation. Otherwise, use the
         // normal infinite chunk streaming path.
         if (useStaticChunkLayout) {
+            perfPhaseStart = SDL_GetPerformanceCounter();
             voxelWorld->CopyStatic2x2Chunks(commandQueue->GetCommandQueue());
+            perfChunkUpdateMs = ticksToMs(SDL_GetPerformanceCounter() - perfPhaseStart);
         } else if (voxelWorld->IsUsingInfiniteChunks()) {
+            perfPhaseStart = SDL_GetPerformanceCounter();
             const glm::vec3 cameraBeforeChunkUpdate = cameraPos;
             const glm::vec3 oldRegionOrigin = voxelWorld->GetRegionOriginWorld();
             const glm::vec3 recenterDelta = voxelWorld->UpdateChunks(
@@ -1028,19 +1278,21 @@ int RunSandbox(int argc, char* argv[]) {
                         cameraBeforeChunkUpdate.x, cameraBeforeChunkUpdate.y, cameraBeforeChunkUpdate.z,
                         cameraPos.x, cameraPos.y, cameraPos.z);
                 }
-                spdlog::info("RECENTER_INVARIANT oldOrigin=({:.0f},{:.0f},{:.0f}) newOrigin=({:.0f},{:.0f},{:.0f}) delta=({:.0f},{:.0f},{:.0f}) cameraBefore=({:.2f},{:.2f},{:.2f}) cameraAfter=({:.2f},{:.2f},{:.2f}) cameraLocalBefore=({:.2f},{:.2f},{:.2f}) cameraLocalAfter=({:.2f},{:.2f},{:.2f}) changed={}",
-                    oldRegionOrigin.x, oldRegionOrigin.y, oldRegionOrigin.z,
-                    newRegionOrigin.x, newRegionOrigin.y, newRegionOrigin.z,
-                    recenterDelta.x, recenterDelta.y, recenterDelta.z,
-                    cameraBeforeChunkUpdate.x, cameraBeforeChunkUpdate.y, cameraBeforeChunkUpdate.z,
-                    cameraPos.x, cameraPos.y, cameraPos.z,
-                    cameraBeforeChunkUpdate.x - oldRegionOrigin.x,
-                    cameraBeforeChunkUpdate.y - oldRegionOrigin.y,
-                    cameraBeforeChunkUpdate.z - oldRegionOrigin.z,
-                    cameraPos.x - newRegionOrigin.x,
-                    cameraPos.y - newRegionOrigin.y,
-                    cameraPos.z - newRegionOrigin.z,
-                    cameraChanged ? 1 : 0);
+                if (enableDiagnostics) {
+                    spdlog::debug("RECENTER_INVARIANT oldOrigin=({:.0f},{:.0f},{:.0f}) newOrigin=({:.0f},{:.0f},{:.0f}) delta=({:.0f},{:.0f},{:.0f}) cameraBefore=({:.2f},{:.2f},{:.2f}) cameraAfter=({:.2f},{:.2f},{:.2f}) cameraLocalBefore=({:.2f},{:.2f},{:.2f}) cameraLocalAfter=({:.2f},{:.2f},{:.2f}) changed={}",
+                        oldRegionOrigin.x, oldRegionOrigin.y, oldRegionOrigin.z,
+                        newRegionOrigin.x, newRegionOrigin.y, newRegionOrigin.z,
+                        recenterDelta.x, recenterDelta.y, recenterDelta.z,
+                        cameraBeforeChunkUpdate.x, cameraBeforeChunkUpdate.y, cameraBeforeChunkUpdate.z,
+                        cameraPos.x, cameraPos.y, cameraPos.z,
+                        cameraBeforeChunkUpdate.x - oldRegionOrigin.x,
+                        cameraBeforeChunkUpdate.y - oldRegionOrigin.y,
+                        cameraBeforeChunkUpdate.z - oldRegionOrigin.z,
+                        cameraPos.x - newRegionOrigin.x,
+                        cameraPos.y - newRegionOrigin.y,
+                        cameraPos.z - newRegionOrigin.z,
+                        cameraChanged ? 1 : 0);
+                }
             }
 
             // DEBUG: Track how many chunks have been copied into each buffer so far.
@@ -1052,6 +1304,7 @@ int RunSandbox(int argc, char* argv[]) {
                 spdlog::debug("Copied chunks: READ={} WRITE={} (readIdx={})",
                     copiedRead, copiedWrite, readIdx);
             }
+            perfChunkUpdateMs = ticksToMs(SDL_GetPerformanceCounter() - perfPhaseStart);
         }
 
         // Convert camera position into local 256^3-buffer coordinates. In static
@@ -1065,7 +1318,7 @@ int RunSandbox(int argc, char* argv[]) {
             cameraPosLocal = cameraPos;
         } else {
             regionOriginWorld = voxelWorld->GetRegionOriginWorld();
-            cameraPosLocal = cameraPos - regionOriginWorld;
+            cameraPosLocal = voxelWorld->WorldToRenderLocal(cameraPos);
         }
 
         nextGroundQueryRegionOriginWorld = regionOriginWorld;
@@ -1074,19 +1327,19 @@ int RunSandbox(int argc, char* argv[]) {
         brushRayOriginWorld = cameraPos;
         glm::vec3 brushRayOriginLocal = cameraPosLocal;
         nextBrushQueryOriginWorld = brushRayOriginWorld;
+        nextBrushQueryDirectionWorld = rayDir;
 
         // === GPU GROUND DETECTION RAYCAST (for player collision) ===
         // Cast a ray straight down from player FEET position to find ground
         // Camera is at eye level, so subtract playerHeight to get feet position
-        glm::vec3 playerFeetLocal = cameraPosLocal - glm::vec3(0, playerHeight, 0);
         glm::vec3 downDir = glm::vec3(0, -1, 0);
-        physicsDispatcher->DispatchGroundRaycast(commandList.Get(), *voxelWorld, playerFeetLocal, downDir);
+        physicsDispatcher->DispatchGroundRaycast(commandList.Get(), *voxelWorld, cameraPos - glm::vec3(0, playerHeight, 0), downDir);
 
         // === GPU BRUSH RAYCASTING ===
         // Target from the camera/crosshair. Traversal-friendly placement should
         // be handled as brush policy, not by moving the raw ray origin into the
         // collision body; doing that made empty-air strokes resolve underfoot.
-        physicsDispatcher->DispatchBrushRaycast(commandList.Get(), *voxelWorld, brushRayOriginLocal, rayDir);
+        physicsDispatcher->DispatchBrushRaycast(commandList.Get(), *voxelWorld, brushRayOriginWorld, rayDir);
 
         // Begin frame - transitions back buffer, sets render target, viewport, etc.
         renderer->BeginFrame(commandList.Get(), frameIndex);
@@ -1109,30 +1362,44 @@ int RunSandbox(int argc, char* argv[]) {
         glm::ivec3 brushHitNormal(0);
         bool brushHitNormalValid = false;
         bool brushHitValid = false;
+        bool brushHitTracksCurrentRay = false;
         if (hasCompletedBrushQuery && gpuRaycastResult.hasValidPosition) {
             brushHitNormal = DecodePackedNormal(gpuRaycastResult.normalPacked, brushHitNormalValid);
             brushHitWorld = glm::vec3(
                 gpuRaycastResult.posX,
                 gpuRaycastResult.posY,
                 gpuRaycastResult.posZ
-            ) + completedBrushQueryRegionOriginWorld;
+            );
 
             float hitDistance = glm::length(brushHitWorld - completedBrushQueryOriginWorld);
-            glm::vec3 brushHitCurrentLocal = brushHitWorld - regionOriginWorld;
-            glm::vec3 currentHitDelta = brushHitWorld - cameraPos;
-            float currentRayDistance = glm::dot(currentHitDelta, rayDir);
-            glm::vec3 currentRayClosest = cameraPos + rayDir * currentRayDistance;
-            float currentRayLateralError = glm::length(brushHitWorld - currentRayClosest);
-            float currentRayTolerance = std::max(brushController.GetRadius() * 1.25f, currentRayDistance * 0.08f + 2.0f);
+            glm::vec3 brushHitCurrentLocal = voxelWorld->WorldToRenderLocal(brushHitWorld);
+            glm::vec3 queryHitDelta = brushHitWorld - completedBrushQueryOriginWorld;
+            float queryRayDistance = glm::dot(queryHitDelta, completedBrushQueryDirectionWorld);
+            glm::vec3 queryRayClosest = completedBrushQueryOriginWorld + completedBrushQueryDirectionWorld * queryRayDistance;
+            float queryRayLateralError = glm::length(brushHitWorld - queryRayClosest);
+            float queryRayTolerance = std::max(brushController.GetRadius() * 1.5f, queryRayDistance * 0.04f + 2.0f);
             const float minBrushHitDistance = 1.0f;
             brushHitValid =
                 hitDistance > minBrushHitDistance &&
-                hitDistance < 768.0f &&
-                currentRayDistance > minBrushHitDistance &&
-                currentRayLateralError <= currentRayTolerance &&
+                hitDistance < kBrushMaxInteractionDistance &&
+                queryRayDistance > minBrushHitDistance &&
+                queryRayLateralError <= queryRayTolerance &&
                 brushHitCurrentLocal.x >= 0.0f && brushHitCurrentLocal.x < voxelWorld->GetGridSizeX() &&
                 brushHitCurrentLocal.y >= 0.0f && brushHitCurrentLocal.y < voxelWorld->GetGridSizeY() &&
                 brushHitCurrentLocal.z >= 0.0f && brushHitCurrentLocal.z < voxelWorld->GetGridSizeZ();
+            if (brushHitValid) {
+                buildStrokeState.hasStableAimDistance = true;
+                buildStrokeState.stableAimDistance = std::clamp(hitDistance, 4.0f, kBrushMaxInteractionDistance);
+                buildStrokeState.stableAimWorldPosition = brushHitWorld;
+                const glm::vec3 currentHitDelta = brushHitWorld - cameraPos;
+                const float currentRayDistance = glm::dot(currentHitDelta, rayDir);
+                const glm::vec3 currentRayClosest = cameraPos + rayDir * currentRayDistance;
+                const float currentRayLateralError = glm::length(brushHitWorld - currentRayClosest);
+                const float currentRayTolerance = std::max(brushController.GetRadius() * 1.5f, currentRayDistance * 0.05f + 3.0f);
+                brushHitTracksCurrentRay =
+                    currentRayDistance > minBrushHitDistance &&
+                    currentRayLateralError <= currentRayTolerance;
+            }
         }
         if (brushHitValid) {
             voxelWorld->UpdateTargetVoxelDebug(
@@ -1144,8 +1411,23 @@ int RunSandbox(int argc, char* argv[]) {
                 brushHitNormalValid ? brushHitNormal.z : 0);
         }
 
+        const bool brushInputActive = brushController.IsPainting() || brushController.IsErasing();
+        const float responsiveAimDistance = brushHitValid
+            ? buildStrokeState.stableAimDistance
+            : (buildStrokeState.hasStableAimDistance ? buildStrokeState.stableAimDistance : kBrushDefaultAimDistance);
+        glm::vec3 responsiveAimWorld = (brushHitValid && brushHitTracksCurrentRay)
+            ? brushHitWorld
+            : cameraPos + rayDir * responsiveAimDistance;
+        if (!brushHitValid && !brushInputActive && buildStrokeState.hasStableAimDistance) {
+            // While just previewing, keep a stable distance but update direction
+            // every frame. This makes the brush feel attached to the crosshair
+            // even when async GPU hit readback is one or two frames behind.
+            responsiveAimWorld = cameraPos + rayDir * buildStrokeState.stableAimDistance;
+        }
+        buildStrokeState.stableAimWorldPosition = responsiveAimWorld;
+
         // === COLLISION DETECTION ===
-        if (!flightMode) {
+        if (gameplayInputEnabled && !flightMode) {
             // Normal mode - ground collision and gravity
             // Ground raycast hit detection
             if (hasCompletedGroundQuery && groundRaycastResult.hasValidPosition) {
@@ -1155,7 +1437,7 @@ int RunSandbox(int argc, char* argv[]) {
                     groundRaycastResult.posX,
                     groundRaycastResult.posY,
                     groundRaycastResult.posZ
-                ) + completedGroundQueryRegionOriginWorld;
+                );
 
                 glm::vec2 groundXZ(groundHitWorld.x, groundHitWorld.z);
                 glm::vec2 lastFeetXZ(completedGroundQueryFeetWorld.x, completedGroundQueryFeetWorld.z);
@@ -1218,7 +1500,7 @@ int RunSandbox(int argc, char* argv[]) {
             // No ground detected - terrain not ready yet or in air above terrain
         }
 
-        cameraPosLocal = useStaticChunkLayout ? cameraPos : cameraPos - regionOriginWorld;
+        cameraPosLocal = useStaticChunkLayout ? cameraPos : voxelWorld->WorldToRenderLocal(cameraPos);
 
         // === HORIZONTAL COLLISION (Cave/Wall Detection) ===
         // Use brush raycast to check for walls/obstacles in movement direction
@@ -1264,8 +1546,8 @@ int RunSandbox(int argc, char* argv[]) {
         // Order matters! Physics copies READ->WRITE (via shader), then brush paints on top.
         // If brush was first, physics would overwrite painted voxels.
 
-        glm::vec3 brushPlacementWorld = brushHitWorld;
-        bool brushPlacementPreviewValid = false;
+        glm::vec3 brushPlacementWorld = responsiveAimWorld;
+        bool brushPlacementPreviewValid = true;
         bool brushPlacementCloseRamp = false;
 
         // Run physics simulation only after the streamed render window is
@@ -1277,16 +1559,33 @@ int RunSandbox(int argc, char* argv[]) {
         const auto& prePhysicsStats = voxelWorld->GetStreamingStats();
         const bool infinitePhysicsAllowed =
             !voxelWorld->IsUsingInfiniteChunks() || enableInfinitePhysics;
+        const uint32_t criticalPhysicsCoverage =
+            prePhysicsStats.expectedVisibleChunks == 0
+                ? 0
+                : (prePhysicsStats.expectedVisibleChunks * 3u) / 4u;
         const bool streamingReadyForPhysics =
             disablePhysics ||
             !voxelWorld->IsUsingInfiniteChunks() ||
             (prePhysicsStats.expectedVisibleChunks > 0 &&
-             prePhysicsStats.cachedReadChunks >= prePhysicsStats.expectedVisibleChunks &&
-             prePhysicsStats.cachedWriteChunks >= prePhysicsStats.expectedVisibleChunks &&
-             prePhysicsStats.queuedChunks == 0);
-        const uint32_t physicsInterval = (!streamingReadyForPhysics || smoothedFrameMs > 17.2f) ? 4u : 1u;
-        const uint32_t physicsScanBudgetChunks = smoothedFrameMs > 17.2f ? 256u : 512u;
+             prePhysicsStats.cachedReadChunks >= criticalPhysicsCoverage &&
+             prePhysicsStats.cachedWriteChunks >= criticalPhysicsCoverage);
+        const bool hasPhysicsDirtyRegion = physicsDirtyFramesRemaining > 0;
+        const float physicsCameraSpeed =
+            glm::length(cameraPos - lastPhysicsSchedulerCameraWorld) / std::max(dt, 0.001f);
+        lastPhysicsSchedulerCameraWorld = cameraPos;
+        const uint32_t physicsInterval =
+            hasPhysicsDirtyRegion ? 1u :
+            (!streamingReadyForPhysics || smoothedFrameMs > 17.2f) ? 8u :
+            (physicsCameraSpeed > 80.0f ? 4u : 6u);
+        const uint32_t physicsScanBudgetChunks =
+            hasPhysicsDirtyRegion ? 64u :
+            (smoothedFrameMs > 17.2f ? 64u : 128u);
+        glm::vec3 physicsScanCenterLocal = cameraPosLocal;
+        if (hasPhysicsDirtyRegion) {
+            physicsScanCenterLocal = physicsDirtyCenterWorld - voxelWorld->GetRegionOriginWorld();
+        }
         const bool physicsDueThisFrame = (frameCount % physicsInterval) == 0;
+        perfPhaseStart = SDL_GetPerformanceCounter();
         if (!paused && !disablePhysics && infinitePhysicsAllowed && streamingReadyForPhysics && physicsDueThisFrame) {
             // Scan chunks to determine which are active
             physicsDispatcher->DispatchChunkScan(
@@ -1294,7 +1593,7 @@ int RunSandbox(int argc, char* argv[]) {
                 *voxelWorld,
                 *chunkManager,
                 static_cast<uint32_t>(frameCount),
-                cameraPosLocal,
+                physicsScanCenterLocal,
                 physicsScanBudgetChunks
             );
 
@@ -1312,30 +1611,58 @@ int RunSandbox(int argc, char* argv[]) {
             physicsSkippedForBudget = true;
             physicsBudgetSkipCount++;
         }
+        perfPhysicsSubmitMs = ticksToMs(SDL_GetPerformanceCounter() - perfPhaseStart);
 
         // Apply brush painting AFTER physics (so brush changes aren't overwritten)
         // Use GPU raycast position, or fallback to fixed distance in empty air
+        perfPhaseStart = SDL_GetPerformanceCounter();
         if (brushController.IsPainting() || brushController.IsErasing()) {
             glm::vec3 brushPos;
+            glm::vec3 intendedBrushWorld = responsiveAimWorld;
             const bool buildStroke = brushController.IsPainting() && !brushController.IsErasing();
             if (!buildStroke) {
                 buildStrokeState.active = false;
-                buildStrokeState.rayDistance = 64.0f;
+                buildStrokeState.rayDistance = kBrushDefaultAimDistance;
                 buildStrokeState.closeRampActive = false;
                 buildStrokeState.closeRampHorizontalDistance = 0.0f;
+                buildStrokeState.hasLastBrushRayDirection = false;
             }
 
-            if (brushHitValid) {
-                // Use GPU raycast hit position (on solid voxel face).
-                // Convert the previous-frame world hit into the current render buffer.
-                brushPos = brushHitWorld - regionOriginWorld;
+            if (brushHitValid && brushHitTracksCurrentRay) {
                 if (buildStroke) {
+                    // Start held build strokes at the hit point, then actively
+                    // pull the brush back along the current line of sight. If
+                    // we reset to hitDistance every frame, the stroke only
+                    // advances when the ray hits the new blob, which feels
+                    // like a slow buffer/paint lag on long shots.
+                    const float hitDistance = glm::length(brushHitWorld - cameraPos);
+                    const float pullStep = std::max(
+                        kBrushStrokePullSpeed,
+                        brushController.GetRadius() * 38.0f) * std::max(dt, 0.0f);
+                    if (!buildStrokeState.active) {
+                        buildStrokeState.rayDistance = std::clamp(
+                            hitDistance,
+                            4.0f,
+                            kBrushMaxInteractionDistance);
+                    } else {
+                        const float currentDistance = std::min(buildStrokeState.rayDistance, hitDistance);
+                        buildStrokeState.rayDistance = std::clamp(
+                            currentDistance - pullStep,
+                            4.0f,
+                            kBrushMaxInteractionDistance);
+                    }
                     buildStrokeState.active = true;
-                    buildStrokeState.rayDistance = std::clamp(glm::length(brushHitWorld - cameraPos), 4.0f, 768.0f);
+                    intendedBrushWorld = cameraPos + rayDir * buildStrokeState.rayDistance;
+                    brushPos = voxelWorld->WorldToRenderLocal(intendedBrushWorld);
+                } else {
+                    // Use GPU raycast hit position (on solid voxel face).
+                    // Convert the previous-frame world hit into the current toroidal render slot.
+                    intendedBrushWorld = brushHitWorld;
+                    brushPos = voxelWorld->WorldToRenderLocal(brushHitWorld);
                 }
                 static int logCounter = 0;
-                if (logCounter++ % 60 == 0) {  // Log once per second
-                    spdlog::info("Painting at raycast pos: ({:.1f}, {:.1f}, {:.1f}), material={}",
+                if (enableDiagnostics && logCounter++ % 60 == 0) {
+                    spdlog::debug("Painting at raycast pos: ({:.1f}, {:.1f}, {:.1f}), material={}",
                         brushPos.x, brushPos.y, brushPos.z, brushController.GetMaterial());
                 }
             } else {
@@ -1343,13 +1670,23 @@ int RunSandbox(int argc, char* argv[]) {
                 // distance so turning left/right follows the line of sight
                 // instead of teleporting the brush back in front of the player.
                 const float fallbackDistance = buildStroke
-                    ? (buildStrokeState.active ? buildStrokeState.rayDistance : 64.0f)
+                    ? (buildStrokeState.active ? buildStrokeState.rayDistance : kBrushDefaultAimDistance)
                     : 12.0f;
                 if (buildStroke) {
                     buildStrokeState.active = true;
-                    buildStrokeState.rayDistance = fallbackDistance;
+                    const float pullStep = std::max(
+                        kBrushStrokePullSpeed,
+                        brushController.GetRadius() * 38.0f) * std::max(dt, 0.0f);
+                    buildStrokeState.rayDistance = std::clamp(
+                        fallbackDistance - pullStep,
+                        4.0f,
+                        kBrushMaxInteractionDistance);
                 }
-                brushPos = cameraPosLocal + rayDir * fallbackDistance;
+                const glm::vec3 fallbackWorld = buildStroke
+                    ? cameraPos + rayDir * buildStrokeState.rayDistance
+                    : cameraPos + rayDir * fallbackDistance;
+                intendedBrushWorld = fallbackWorld;
+                brushPos = useStaticChunkLayout ? fallbackWorld : voxelWorld->WorldToRenderLocal(fallbackWorld);
 
                 // Clamp to grid bounds
                 brushPos = glm::clamp(brushPos,
@@ -1359,24 +1696,32 @@ int RunSandbox(int argc, char* argv[]) {
                              voxelWorld->GetGridSizeZ() - 0.5f));
 
                 static int logCounter = 0;
-                if (logCounter++ % 60 == 0) {  // Log once per second
-                    spdlog::info("Painting in air at: ({:.1f}, {:.1f}, {:.1f}), material={}",
+                if (enableDiagnostics && logCounter++ % 60 == 0) {
+                    spdlog::debug("Painting in air at: ({:.1f}, {:.1f}, {:.1f}), material={}",
                         brushPos.x, brushPos.y, brushPos.z, brushController.GetMaterial());
                 }
             }
 
             bool closeRampAdjusted = false;
-            brushPos = ApplyCloseTraversalBrushFallback(
-                brushPos,
-                cameraPosLocal,
-                cameraForward,
-                playerHeight,
-                playerRadius,
-                brushController.GetRadius(),
-                dt,
-                buildStroke,
-                buildStrokeState,
-                &closeRampAdjusted);
+            const float intendedBrushEyeDistance = glm::length(intendedBrushWorld - cameraPos);
+            const float closeRampWorldEligibility =
+                std::max(16.0f, brushController.GetRadius() * 3.0f + playerHeight + playerRadius);
+            if (buildStroke && intendedBrushEyeDistance <= closeRampWorldEligibility) {
+                brushPos = ApplyCloseTraversalBrushFallback(
+                    brushPos,
+                    cameraPosLocal,
+                    cameraForward,
+                    playerHeight,
+                    playerRadius,
+                    brushController.GetRadius(),
+                    dt,
+                    buildStroke,
+                    buildStrokeState,
+                    &closeRampAdjusted);
+            } else {
+                buildStrokeState.closeRampActive = false;
+                buildStrokeState.closeRampHorizontalDistance = 0.0f;
+            }
 
             brushPos = glm::clamp(brushPos,
                 glm::vec3(0.5f),
@@ -1384,13 +1729,22 @@ int RunSandbox(int argc, char* argv[]) {
                          voxelWorld->GetGridSizeY() - 0.5f,
                          voxelWorld->GetGridSizeZ() - 0.5f));
 
-            brushPlacementWorld = brushPos + regionOriginWorld;
-            brushPlacementPreviewValid = true;
+            brushPlacementWorld = intendedBrushWorld;
+            if (closeRampAdjusted && !useStaticChunkLayout) {
+                glm::vec3 mappedWorld(0.0f);
+                if (voxelWorld->RenderLocalToWorld(brushPos, mappedWorld)) {
+                    brushPlacementWorld = mappedWorld;
+                } else {
+                    brushPlacementPreviewValid = false;
+                }
+            } else if (useStaticChunkLayout) {
+                brushPlacementWorld = brushPos + regionOriginWorld;
+            }
             brushPlacementCloseRamp = closeRampAdjusted;
             if (closeRampAdjusted) {
                 static int rampLogCounter = 0;
-                if (rampLogCounter++ % 60 == 0) {
-                    spdlog::info("Close traversal brush ramp: local=({:.1f},{:.1f},{:.1f}) world=({:.1f},{:.1f},{:.1f})",
+                if (enableDiagnostics && rampLogCounter++ % 60 == 0) {
+                    spdlog::debug("Close traversal brush ramp: local=({:.1f},{:.1f},{:.1f}) world=({:.1f},{:.1f},{:.1f})",
                         brushPos.x, brushPos.y, brushPos.z,
                         brushPlacementWorld.x, brushPlacementWorld.y, brushPlacementWorld.z);
                 }
@@ -1409,17 +1763,203 @@ int RunSandbox(int argc, char* argv[]) {
             brushConstants.gridSizeY = voxelWorld->GetGridSizeY();
             brushConstants.gridSizeZ = voxelWorld->GetGridSizeZ();
             brushConstants.seed = static_cast<uint32_t>(frameCount);
-            brushConstants.hitNormalX = brushHitNormalValid ? brushHitNormal.x : 0;
-            brushConstants.hitNormalY = brushHitNormalValid ? brushHitNormal.y : 0;
-            brushConstants.hitNormalZ = brushHitNormalValid ? brushHitNormal.z : 0;
-            brushConstants.hasHitNormal = brushHitNormalValid ? 1u : 0u;
+            const bool brushNormalUsable = brushHitValid && brushHitTracksCurrentRay && brushHitNormalValid;
+            brushConstants.hitNormalX = brushNormalUsable ? brushHitNormal.x : 0;
+            brushConstants.hitNormalY = brushNormalUsable ? brushHitNormal.y : 0;
+            brushConstants.hitNormalZ = brushNormalUsable ? brushHitNormal.z : 0;
+            brushConstants.hasHitNormal = brushNormalUsable ? 1u : 0u;
 
-            physicsDispatcher->DispatchBrush(commandList.Get(), *voxelWorld, brushConstants);
+            const uint32_t currentBrushKey =
+                (brushConstants.mode & 0xffu) |
+                ((brushConstants.shape & 0xffu) << 8) |
+                ((brushConstants.material & 0xffffu) << 16);
+            if (buildStrokeState.hasLastBrushWorldPosition &&
+                buildStrokeState.lastBrushMode != currentBrushKey) {
+                buildStrokeState.hasLastBrushWorldPosition = false;
+                buildStrokeState.hasLastBrushRayDirection = false;
+            }
+            if (buildStrokeState.hasLastBrushWorldPosition) {
+                const glm::vec3 toLastBrush = buildStrokeState.lastBrushWorldPosition - cameraPos;
+                const float lastAlongCurrentRay = glm::dot(toLastBrush, rayDir);
+                const glm::vec3 lastClosestOnCurrentRay = cameraPos + rayDir * lastAlongCurrentRay;
+                const float lastLateralError = glm::length(buildStrokeState.lastBrushWorldPosition - lastClosestOnCurrentRay);
+                const float rayDirectionDot = buildStrokeState.hasLastBrushRayDirection
+                    ? glm::dot(glm::normalize(buildStrokeState.lastBrushRayDirection), rayDir)
+                    : 1.0f;
+                const float maxTrustedLateralError = std::max(
+                    brushController.GetRadius() * 6.0f,
+                    std::max(32.0f, std::max(lastAlongCurrentRay, 0.0f) * 0.12f));
+
+                // A tiny angular mouse change at long brush distances can be
+                // tens of voxels laterally. Do not reset continuity for that,
+                // or held painting becomes a dotted line. Only break the sweep
+                // when the camera ray makes an abrupt turn, or when the old
+                // point is badly off the current ray and the ray direction also
+                // changed enough that interpolating would draw a cross-space rod.
+                if (lastAlongCurrentRay < -brushController.GetRadius() ||
+                    rayDirectionDot < 0.82f ||
+                    (lastLateralError > maxTrustedLateralError && rayDirectionDot < 0.94f)) {
+                    buildStrokeState.hasLastBrushWorldPosition = false;
+                    buildStrokeState.hasLastBrushRayDirection = false;
+                }
+            }
+
+            std::array<glm::vec3, 192> stampWorldPositions = {};
+            uint32_t stampCount = 0;
+            const float brushRadius = std::max(brushController.GetRadius(), 1.0f);
+            const float stampSpacing = std::max(1.0f, brushRadius * 0.45f);
+            if (buildStrokeState.hasLastBrushWorldPosition) {
+                const glm::vec3 segment = brushPlacementWorld - buildStrokeState.lastBrushWorldPosition;
+                const float segmentLength = glm::length(segment);
+                constexpr float kMaxTrustedBrushSweepDistance = 640.0f;
+                if (segmentLength > 0.01f && segmentLength <= kMaxTrustedBrushSweepDistance) {
+                    stampCount = std::clamp<uint32_t>(
+                        static_cast<uint32_t>(std::ceil(segmentLength / stampSpacing)),
+                        1u,
+                        static_cast<uint32_t>(stampWorldPositions.size()));
+                    for (uint32_t i = 0; i < stampCount; ++i) {
+                        const float t = static_cast<float>(i + 1) / static_cast<float>(stampCount);
+                        stampWorldPositions[i] = buildStrokeState.lastBrushWorldPosition + segment * t;
+                    }
+                } else {
+                    stampWorldPositions[0] = brushPlacementWorld;
+                    stampCount = 1;
+                }
+            } else {
+                stampWorldPositions[0] = brushPlacementWorld;
+                stampCount = 1;
+            }
+
+            uint32_t submittedBrushStamps = 0;
+            bool submittedAnyBrushStamp = false;
+            uint32_t acceptedBrushStamps = 0;
+            bool acceptedAnyBrushStamp = false;
+            glm::vec3 lastSubmittedBrushWorldPosition = buildStrokeState.hasLastBrushWorldPosition
+                ? buildStrokeState.lastBrushWorldPosition
+                : brushPlacementWorld;
+            for (uint32_t stampIndex = 0; stampIndex < stampCount; ++stampIndex) {
+                if (!useStaticChunkLayout && voxelWorld->IsUsingInfiniteChunks()) {
+                    if (!voxelWorld->EnsureWorldBrushVolumeCachedForReadWrite(
+                            stampWorldPositions[stampIndex].x,
+                            stampWorldPositions[stampIndex].y,
+                            stampWorldPositions[stampIndex].z,
+                            brushRadius)) {
+                        voxelWorld->RecordPersistentWorldBrushEdit(
+                            stampWorldPositions[stampIndex].x,
+                            stampWorldPositions[stampIndex].y,
+                            stampWorldPositions[stampIndex].z,
+                            brushConstants.radius,
+                            brushConstants.material,
+                            brushConstants.mode,
+                            brushConstants.shape,
+                            brushConstants.strength,
+                            static_cast<uint32_t>(frameCount + stampIndex),
+                            brushConstants.hitNormalX,
+                            brushConstants.hitNormalY,
+                            brushConstants.hitNormalZ,
+                            brushConstants.hasHitNormal != 0);
+                        ++acceptedBrushStamps;
+                        acceptedAnyBrushStamp = true;
+                        lastSubmittedBrushWorldPosition = stampWorldPositions[stampIndex];
+                        continue;
+                    }
+                }
+
+                glm::vec3 stampLocal = useStaticChunkLayout
+                    ? stampWorldPositions[stampIndex]
+                    : voxelWorld->WorldToRenderLocal(stampWorldPositions[stampIndex]);
+                if (stampLocal.x < 0.5f || stampLocal.y < 0.5f || stampLocal.z < 0.5f ||
+                    stampLocal.x > static_cast<float>(voxelWorld->GetGridSizeX()) - 0.5f ||
+                    stampLocal.y > static_cast<float>(voxelWorld->GetGridSizeY()) - 0.5f ||
+                    stampLocal.z > static_cast<float>(voxelWorld->GetGridSizeZ()) - 0.5f) {
+                    if (buildStroke) {
+                        voxelWorld->RecordPersistentWorldBrushEdit(
+                            stampWorldPositions[stampIndex].x,
+                            stampWorldPositions[stampIndex].y,
+                            stampWorldPositions[stampIndex].z,
+                            brushConstants.radius,
+                            brushConstants.material,
+                            brushConstants.mode,
+                            brushConstants.shape,
+                            brushConstants.strength,
+                            static_cast<uint32_t>(frameCount + stampIndex),
+                            brushConstants.hitNormalX,
+                            brushConstants.hitNormalY,
+                            brushConstants.hitNormalZ,
+                            brushConstants.hasHitNormal != 0);
+                        ++acceptedBrushStamps;
+                        acceptedAnyBrushStamp = true;
+                        lastSubmittedBrushWorldPosition = stampWorldPositions[stampIndex];
+                        continue;
+                    }
+                    continue;
+                }
+
+                brushConstants.positionX = stampLocal.x;
+                brushConstants.positionY = stampLocal.y;
+                brushConstants.positionZ = stampLocal.z;
+                brushConstants.seed = static_cast<uint32_t>(frameCount + stampIndex);
+                physicsDispatcher->DispatchBrush(commandList.Get(), *voxelWorld, brushConstants);
+                ++submittedBrushStamps;
+                submittedAnyBrushStamp = true;
+                ++acceptedBrushStamps;
+                acceptedAnyBrushStamp = true;
+                lastSubmittedBrushWorldPosition = stampWorldPositions[stampIndex];
+            }
+            if (acceptedAnyBrushStamp || !buildStrokeState.hasLastBrushWorldPosition) {
+                buildStrokeState.hasLastBrushWorldPosition = acceptedAnyBrushStamp;
+                buildStrokeState.lastBrushWorldPosition = lastSubmittedBrushWorldPosition;
+            }
+            if (acceptedAnyBrushStamp) {
+                buildStrokeState.hasLastBrushRayDirection = true;
+                buildStrokeState.lastBrushRayDirection = rayDir;
+            }
+            buildStrokeState.lastBrushMode = currentBrushKey;
+            buildStrokeState.sweepStampsLastFrame = acceptedBrushStamps;
         } else {
             buildStrokeState.active = false;
-            buildStrokeState.rayDistance = 64.0f;
+            buildStrokeState.rayDistance = kBrushDefaultAimDistance;
             buildStrokeState.closeRampActive = false;
             buildStrokeState.closeRampHorizontalDistance = 0.0f;
+            buildStrokeState.hasLastBrushWorldPosition = false;
+            buildStrokeState.hasLastBrushRayDirection = false;
+            buildStrokeState.lastBrushMode = UINT32_MAX;
+            buildStrokeState.sweepStampsLastFrame = 0;
+        }
+        if (brushPlacementPreviewValid) {
+            if (!buildStrokeState.hasPreviewWorldPosition) {
+                buildStrokeState.previewWorldPosition = brushPlacementWorld;
+                buildStrokeState.hasPreviewWorldPosition = true;
+            } else {
+                const float previewBlend = std::clamp(dt * 22.0f, 0.28f, 1.0f);
+                const float previewJump = glm::length(brushPlacementWorld - buildStrokeState.previewWorldPosition);
+                if (previewJump > 96.0f) {
+                    buildStrokeState.previewWorldPosition = brushPlacementWorld;
+                } else {
+                    buildStrokeState.previewWorldPosition =
+                        buildStrokeState.previewWorldPosition +
+                        (brushPlacementWorld - buildStrokeState.previewWorldPosition) * previewBlend;
+                }
+            }
+        } else {
+            buildStrokeState.hasPreviewWorldPosition = false;
+        }
+        perfBrushSubmitMs = ticksToMs(SDL_GetPerformanceCounter() - perfPhaseStart);
+        const auto& postBrushStreamingStats = voxelWorld->GetStreamingStats();
+        if ((brushController.IsPainting() || brushController.IsErasing()) && brushPlacementPreviewValid) {
+            physicsDirtyCenterWorld = brushPlacementWorld;
+            physicsDirtyFramesRemaining = std::max<uint32_t>(physicsDirtyFramesRemaining, 90u);
+            ++physicsDirtyEvents;
+        } else if (postBrushStreamingStats.gpuBrushEventsAppliedLastFrame > 0 ||
+                   postBrushStreamingStats.editsAppliedLastFrame > 0) {
+            physicsDirtyCenterWorld = cameraPos;
+            physicsDirtyFramesRemaining = std::max<uint32_t>(physicsDirtyFramesRemaining, 45u);
+            ++physicsDirtyEvents;
+        } else if (physicsDirtyFramesRemaining > 0) {
+            --physicsDirtyFramesRemaining;
+        }
+        if (gpuTimestampHeap) {
+            commandList->EndQuery(gpuTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, gpuTimestampBase + 1);
         }
 
         // Transition read buffer to pixel shader resource for rendering
@@ -1448,11 +1988,17 @@ int RunSandbox(int argc, char* argv[]) {
         cameraParams.upZ = cameraUp.z;
         cameraParams.fov = fov;
         cameraParams.aspectRatio = aspectRatio;
+        cameraParams.raymarchMaxDistance = currentRaymarchMaxDistance;
+        cameraParams.raymarchMaxSteps = currentRaymarchMaxSteps;
+        cameraParams.farFieldQuality = currentFarFieldQuality;
+        cameraParams.renderQuality = currentRenderQuality;
 
         // Build brush preview params from GPU raycast result (NEW!)
         Graphics::Renderer::BrushPreview brushPreview = {};
         if (brushPlacementPreviewValid || brushHitValid) {
-            const glm::vec3 previewWorld = brushPlacementPreviewValid ? brushPlacementWorld : brushHitWorld;
+            const glm::vec3 previewWorld = brushPlacementPreviewValid
+                ? (buildStrokeState.hasPreviewWorldPosition ? buildStrokeState.previewWorldPosition : brushPlacementWorld)
+                : brushHitWorld;
             brushPreview.posX = previewWorld.x;
             brushPreview.posY = previewWorld.y;
             brushPreview.posZ = previewWorld.z;
@@ -1474,7 +2020,7 @@ int RunSandbox(int argc, char* argv[]) {
         // Brush preview now uses GPU raycasting (2,000,000x less bandwidth!)
         glm::vec3 regionOrigin = voxelWorld->GetRegionOriginWorld();
         if (enableDiagnostics && frameCount % 60 == 0) {
-            spdlog::info(
+            spdlog::debug(
                 "[FRAME_DIAG] frame={} camWorld=({:.2f},{:.2f},{:.2f}) camLocal=({:.2f},{:.2f},{:.2f}) forward=({:.3f},{:.3f},{:.3f}) regionOrigin=({:.0f},{:.0f},{:.0f}) groundValid={} groundLocal=({:.2f},{:.2f},{:.2f}) brushValid={} brushLocal=({:.2f},{:.2f},{:.2f})",
                 frameCount,
                 cameraPos.x, cameraPos.y, cameraPos.z,
@@ -1486,9 +2032,11 @@ int RunSandbox(int argc, char* argv[]) {
                 brushHitValid ? 1 : 0,
                 gpuRaycastResult.posX, gpuRaycastResult.posY, gpuRaycastResult.posZ);
         }
+        perfPhaseStart = SDL_GetPerformanceCounter();
         renderer->RenderVoxels(
             commandList.Get(),
             voxelWorld->GetReadBufferSRV(),
+            voxelWorld->GetReadChunkValidMaskSRV(),
             voxelWorld->GetPaletteSRV(),
             voxelWorld->GetGridSizeX(),
             voxelWorld->GetGridSizeY(),
@@ -1501,6 +2049,10 @@ int RunSandbox(int argc, char* argv[]) {
             &characterPreview,
             &sparseFarField
         );
+        perfRenderSubmitMs = ticksToMs(SDL_GetPerformanceCounter() - perfPhaseStart);
+        if (gpuTimestampHeap) {
+            commandList->EndQuery(gpuTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, gpuTimestampBase + 2);
+        }
 
         // Always-on performance counters for the public tech demo. These are
         // intentionally cheap CPU-side counters: frame time, screen pixels,
@@ -1530,15 +2082,17 @@ int RunSandbox(int argc, char* argv[]) {
         const uint32_t playerLocalVoxelZ = Simulation::ChunkCoord::LocalCoord(
             static_cast<int32_t>(std::floor(playerFeetWorld.z)),
             Simulation::CHUNK_SIZE_VOXELS);
-        const glm::vec3 playerFeetRenderLocal = playerFeetWorld - regionOrigin;
+        const glm::vec3 playerFeetRenderLocal =
+            useStaticChunkLayout ? playerFeetWorld : voxelWorld->WorldToRenderLocal(playerFeetWorld);
         const glm::vec3 characterPreviewWorld(
             characterPreview.feetX,
             characterPreview.feetY,
             characterPreview.feetZ);
         const float terrainHeightAtPlayer =
             (hasCompletedGroundQuery && groundRaycastResult.hasValidPosition)
-                ? (groundRaycastResult.posY + completedGroundQueryRegionOriginWorld.y)
+                ? groundRaycastResult.posY
                 : -9999.0f;
+        const auto& physicsStats = physicsDispatcher->GetStats();
 
         ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowBgAlpha(0.72f);
@@ -1546,6 +2100,13 @@ int RunSandbox(int argc, char* argv[]) {
             ImGuiWindowFlags_AlwaysAutoResize |
             ImGuiWindowFlags_NoCollapse |
             ImGuiWindowFlags_NoSavedSettings;
+        if (!pauseMenu.IsVisible()) {
+            metricsFlags |=
+                ImGuiWindowFlags_NoMove |
+                ImGuiWindowFlags_NoInputs |
+                ImGuiWindowFlags_NoFocusOnAppearing |
+                ImGuiWindowFlags_NoNav;
+        }
         if (ImGui::Begin("VENPOD Metrics", nullptr, metricsFlags)) {
             ImGui::Text("FPS %.1f avg / %.1f now", smoothedFps, instantFps);
             ImGui::Text("Frame %.2f ms avg / %.2f ms now", smoothedFrameMs, lastRawFrameMs);
@@ -1565,10 +2126,11 @@ int RunSandbox(int argc, char* argv[]) {
                 streamingStats.queuedChunks);
             ImGui::Text("Generated voxels %llu",
                 static_cast<unsigned long long>(streamingStats.loadedVoxelCapacity));
-            ImGui::Text("Far SVO %s | pages %u | nodes %u | page %.0f | coverage %.0f",
-                sparseFarField.enabled ? "on" : "off",
+            ImGui::Text("Far SVO %s | pages %u | nodes %u | index %u | page %.0f | coverage %.0f",
+                sparseFarField.enabled ? "on" : (farVoxelOctree.IsAsyncPending() ? "loading" : "off"),
                 sparseFarField.pageCount,
                 sparseFarField.nodeCount,
+                sparseFarField.pageIndexCount,
                 sparseFarField.pageSize,
                 farVoxelOctree.GetStats().coveredWorldSize);
             ImGui::Text("World pos %.1f %.1f %.1f | chunk %d %d %d",
@@ -1629,12 +2191,17 @@ int RunSandbox(int argc, char* argv[]) {
                 streamingStats.cachedReadChunks,
                 streamingStats.cachedWriteChunks,
                 streamingStats.expectedVisibleChunks);
+            ImGui::Text("Toroidal page slots %u | misses R %u W %u",
+                streamingStats.toroidalSlotCount,
+                streamingStats.readSlotMismatches,
+                streamingStats.writeSlotMismatches);
             ImGui::Text("Chunk copies %u / budget %u",
                 streamingStats.chunksCopiedLastFrame,
                 streamingStats.copyBudget);
-            ImGui::Text("Missing gen %u load %u checked %u",
+            ImGui::Text("Missing gen %u load %u urgent %u checked %u",
                 streamingStats.chunksNotGeneratedLastFrame,
                 streamingStats.chunksNotLoadedLastFrame,
+                streamingStats.urgentVisibleChunksQueuedLastFrame,
                 streamingStats.chunksCheckedLastFrame);
             ImGui::Text("Edits chunks %u voxels %u | applied %u voxels / %u chunks",
                 streamingStats.editedChunks,
@@ -1670,32 +2237,102 @@ int RunSandbox(int argc, char* argv[]) {
                 brushPlacementPreviewValid ? brushPlacementWorld.x : brushHitWorld.x,
                 brushPlacementPreviewValid ? brushPlacementWorld.y : brushHitWorld.y,
                 brushPlacementPreviewValid ? brushPlacementWorld.z : brushHitWorld.z);
+            ImGui::Text("Brush sweep stamps %u | stroke cache %s",
+                buildStrokeState.sweepStampsLastFrame,
+                buildStrokeState.hasLastBrushWorldPosition ? "active" : "idle");
             ImGui::Text("GPU edit feedback queued %u pending %u applied %u drop %u overflow %u",
                 streamingStats.gpuBrushFeedbackQueued,
                 streamingStats.gpuBrushFeedbackPending,
                 streamingStats.gpuBrushEventsAppliedLastFrame,
                 streamingStats.gpuBrushEventsDroppedLastFrame,
                 streamingStats.gpuBrushEventsOverflowLastFrame);
-            ImGui::Text("Physics %s interval %u dispatches %llu skips %llu",
+            ImGui::Text("Physics %s interval %u dispatches %llu skips %llu dirty %u events %llu",
                 physicsRanThisFrame ? "ran" : (physicsSkippedForBudget ? "budget skip" : "idle"),
                 physicsInterval,
                 static_cast<unsigned long long>(physicsDispatchCount),
-                static_cast<unsigned long long>(physicsBudgetSkipCount));
-            const auto& physicsStats = physicsDispatcher->GetStats();
-            ImGui::Text("Physics scan %u/%u chunks skip %u region %ux%ux%u @ %d %d %d",
+                static_cast<unsigned long long>(physicsBudgetSkipCount),
+                physicsDirtyFramesRemaining,
+                static_cast<unsigned long long>(physicsDirtyEvents));
+            ImGui::Text("Physics scan %u/%u chunks skip %u universe %u region %ux%ux%u @ %d %d %d",
                 physicsStats.scannedChunksLastFrame,
                 physicsStats.scanBudgetChunks,
                 physicsStats.skippedScanChunksLastFrame,
+                physicsStats.theoreticalChunkUniverse,
                 physicsStats.dispatchX,
                 physicsStats.dispatchY,
                 physicsStats.dispatchZ,
                 physicsStats.offsetX,
                 physicsStats.offsetY,
                 physicsStats.offsetZ);
-            ImGui::Text("Copy-fence swap skips %u", streamingStats.swapSkippedForCopyFence);
-            ImGui::Text("Raymarch budget dense 2500 voxels / 2048 steps");
+            ImGui::Text("Copy budget %u | generation budget %u | copy-fence skips %u",
+                currentCopyBudget,
+                currentGenerationBudget,
+                streamingStats.swapSkippedForCopyFence);
+            ImGui::Text("Raymarch budget dense %.0f voxels / %u steps | far %.2f | quality %.2f",
+                currentRaymarchMaxDistance,
+                currentRaymarchMaxSteps,
+                currentFarFieldQuality,
+                currentRenderQuality);
+            ImGui::Text("CPU phases wait %.2f chunk %.2f phys %.2f brush %.2f render %.2f present %.2f ms",
+                perfFenceWaitMs,
+                perfChunkUpdateMs,
+                perfPhysicsSubmitMs,
+                perfBrushSubmitMs,
+                perfRenderSubmitMs,
+                perfPresentMs);
+            ImGui::Text("GPU frame %.2f ms | pre-render %.2f | raymarch %.2f | ui/readback %.2f",
+                gpuTiming.valid ? gpuTiming.frameMs : 0.0,
+                gpuTiming.valid ? gpuTiming.preRenderMs : 0.0,
+                gpuTiming.valid ? gpuTiming.raymarchMs : 0.0,
+                gpuTiming.valid ? gpuTiming.uiAndReadbackMs : 0.0);
+            ImGui::Text("Scheduler predicted %.2f ms | pressure %.2f ms",
+                schedulerPredictedFrameMs,
+                schedulerPressureMs);
         }
         ImGui::End();
+
+        if (enableRuntimeLog && (frameCount % 120 == 0)) {
+            spdlog::info(
+                "PERF frame={} fps={:.1f}/{:.1f} ms={:.2f}/{:.2f} wait={:.2f} chunk={:.2f} phys={:.2f} brush={:.2f} render={:.2f} present={:.2f} gpu={:.2f}/{:.2f}/{:.2f}/{:.2f} sched={:.2f} copy={}/{} genBudget={} generated={} records={} queue={} cached={}/{}/{} pageMiss={}/{} missingGen={} missingLoad={} urgent={} skipped={} checked={} physicsScan={}/{} skip={} universe={} dirty={} farQ={:.2f}",
+                frameCount,
+                smoothedFps,
+                instantFps,
+                smoothedFrameMs,
+                lastRawFrameMs,
+                perfFenceWaitMs,
+                perfChunkUpdateMs,
+                perfPhysicsSubmitMs,
+                perfBrushSubmitMs,
+                perfRenderSubmitMs,
+                perfPresentMs,
+                gpuTiming.valid ? gpuTiming.frameMs : 0.0,
+                gpuTiming.valid ? gpuTiming.preRenderMs : 0.0,
+                gpuTiming.valid ? gpuTiming.raymarchMs : 0.0,
+                gpuTiming.valid ? gpuTiming.uiAndReadbackMs : 0.0,
+                schedulerPredictedFrameMs,
+                streamingStats.chunksCopiedLastFrame,
+                streamingStats.copyBudget,
+                currentGenerationBudget,
+                streamingStats.generatedChunks,
+                streamingStats.loadedChunkRecords,
+                streamingStats.queuedChunks,
+                streamingStats.cachedReadChunks,
+                streamingStats.cachedWriteChunks,
+                streamingStats.expectedVisibleChunks,
+                streamingStats.readSlotMismatches,
+                streamingStats.writeSlotMismatches,
+                streamingStats.chunksNotGeneratedLastFrame,
+                streamingStats.chunksNotLoadedLastFrame,
+                streamingStats.urgentVisibleChunksQueuedLastFrame,
+                streamingStats.chunksSkippedLastFrame,
+                streamingStats.chunksCheckedLastFrame,
+                physicsStats.scannedChunksLastFrame,
+                physicsStats.scanBudgetChunks,
+                physicsStats.skippedScanChunksLastFrame,
+                physicsStats.theoreticalChunkUniverse,
+                physicsDirtyFramesRemaining,
+                currentFarFieldQuality);
+        }
 
         ImDrawList* foregroundDrawList = ImGui::GetForegroundDrawList();
         const ImVec2 displaySize = ImGui::GetIO().DisplaySize;
@@ -1723,7 +2360,8 @@ int RunSandbox(int argc, char* argv[]) {
         brushQueryMetadata[frameIndex] = BrushQueryMetadata{
             true,
             nextBrushQueryRegionOriginWorld,
-            nextBrushQueryOriginWorld
+            nextBrushQueryOriginWorld,
+            nextBrushQueryDirectionWorld
         };
         groundQueryMetadata[frameIndex] = GroundQueryMetadata{
             true,
@@ -1733,6 +2371,16 @@ int RunSandbox(int argc, char* argv[]) {
 
         // End frame - transitions back buffer to present state
         renderer->EndFrame(commandList.Get(), frameIndex);
+        if (gpuTimestampHeap && gpuTimestampReadback) {
+            commandList->EndQuery(gpuTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, gpuTimestampBase + 3);
+            commandList->ResolveQueryData(
+                gpuTimestampHeap.Get(),
+                D3D12_QUERY_TYPE_TIMESTAMP,
+                gpuTimestampBase,
+                kGpuTimestampCount,
+                gpuTimestampReadback.Get(),
+                static_cast<UINT64>(gpuTimestampBase) * sizeof(uint64_t));
+        }
 
         // Close and execute command list
         commandList->Close();
@@ -1750,11 +2398,27 @@ int RunSandbox(int argc, char* argv[]) {
         voxelWorld->SwapBuffers();
 
         // Present
+        perfPhaseStart = SDL_GetPerformanceCounter();
         window->Present();
+        perfPresentMs = ticksToMs(SDL_GetPerformanceCounter() - perfPhaseStart);
 
         // Signal fence for this frame
         ctx.fenceValue = commandQueue->Signal();
         voxelWorld->NotifyBrushEditFeedbackFence(ctx.fenceValue);
+
+        // Submit background chunk generation after the frame has been queued.
+        // This keeps generation from sitting in front of the render pass on the
+        // direct queue while still letting it use trailing GPU time.
+        voxelWorld->SetChunkGenerationBudget(trailingGenerationBudget);
+        voxelWorld->PumpChunkGeneration(device->GetDevice(), commandQueue->GetCommandQueue());
+        {
+            const float gpuFrameMs = gpuTiming.valid ? static_cast<float>(gpuTiming.frameMs) : 0.0f;
+            const float predictedWorkMs = std::max(
+                lastRawFrameMs,
+                gpuFrameMs + perfChunkUpdateMs + perfPhysicsSubmitMs + perfBrushSubmitMs + perfPresentMs);
+            schedulerPredictedFrameMs =
+                schedulerPredictedFrameMs * 0.82f + predictedWorkMs * 0.18f;
+        }
 
         // End input frame
         inputManager.EndFrame();

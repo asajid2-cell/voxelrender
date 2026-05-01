@@ -9,7 +9,7 @@ void BrushController::Initialize() {
     m_hasValidPosition = false;
     m_isPainting = false;
     m_isErasing = false;
-    m_material = 1;  // Sand
+    m_material = 3;  // Stone: static traversal material; concrete is simulated as an active liquid.
     m_radius = 5.0f;
     m_strength = 1.0f;
     m_mode = BrushMode::Paint;

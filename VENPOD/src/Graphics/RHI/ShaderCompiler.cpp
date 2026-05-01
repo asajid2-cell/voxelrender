@@ -1,8 +1,179 @@
 #include "ShaderCompiler.h"
 #include <spdlog/spdlog.h>
 #include <fstream>
+#include <iomanip>
+#include <regex>
+#include <sstream>
+#include <unordered_set>
 
 namespace VENPOD::Graphics {
+
+namespace {
+
+uint64_t AppendHash(uint64_t hash, const void* data, size_t size) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= static_cast<uint64_t>(bytes[i]);
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+uint64_t AppendHash(uint64_t hash, const std::string& value) {
+    return AppendHash(hash, value.data(), value.size());
+}
+
+uint64_t AppendHash(uint64_t hash, const std::wstring& value) {
+    return AppendHash(hash, value.data(), value.size() * sizeof(wchar_t));
+}
+
+std::string HashToHex(uint64_t hash) {
+    std::ostringstream stream;
+    stream << std::hex << std::setw(16) << std::setfill('0') << hash;
+    return stream.str();
+}
+
+std::string SanitizeCacheStem(std::string value) {
+    for (char& ch : value) {
+        const bool ok =
+            (ch >= 'a' && ch <= 'z') ||
+            (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') ||
+            ch == '_' || ch == '-';
+        if (!ok) {
+            ch = '_';
+        }
+    }
+    return value;
+}
+
+std::string NarrowAscii(const std::wstring& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (wchar_t ch : value) {
+        out.push_back(ch >= 0 && ch <= 127 ? static_cast<char>(ch) : '_');
+    }
+    return out;
+}
+
+bool ReadBinaryFile(const std::filesystem::path& path, std::vector<uint8_t>& out) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    const std::streamsize size = file.tellg();
+    if (size < 0) {
+        return false;
+    }
+    file.seekg(0, std::ios::beg);
+    out.resize(static_cast<size_t>(size));
+    return out.empty() || static_cast<bool>(file.read(reinterpret_cast<char*>(out.data()), size));
+}
+
+void WriteBinaryFileBestEffort(const std::filesystem::path& path, const std::vector<uint8_t>& bytes) {
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (ec) {
+        return;
+    }
+
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file.is_open() || bytes.empty()) {
+        return;
+    }
+    file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+}
+
+std::filesystem::path ResolveIncludePath(
+    const std::filesystem::path& includeName,
+    const std::filesystem::path& sourceDir,
+    const std::vector<std::wstring>& includePaths,
+    const std::filesystem::path& compilerIncludePath)
+{
+    std::vector<std::filesystem::path> searchPaths;
+    searchPaths.push_back(sourceDir);
+    for (const auto& includePath : includePaths) {
+        searchPaths.emplace_back(includePath);
+    }
+    if (!compilerIncludePath.empty()) {
+        searchPaths.push_back(compilerIncludePath);
+    }
+
+    for (const auto& root : searchPaths) {
+        const std::filesystem::path candidate = root / includeName;
+        if (std::filesystem::exists(candidate)) {
+            return candidate;
+        }
+    }
+
+    if (std::filesystem::exists(includeName)) {
+        return includeName;
+    }
+    return {};
+}
+
+void HashShaderFileRecursive(
+    const std::filesystem::path& path,
+    const std::vector<std::wstring>& includePaths,
+    const std::filesystem::path& compilerIncludePath,
+    std::unordered_set<std::string>& visited,
+    uint64_t& hash)
+{
+    std::error_code ec;
+    const std::filesystem::path canonical = std::filesystem::weakly_canonical(path, ec);
+    const std::string key = ec ? path.lexically_normal().string() : canonical.string();
+    if (!visited.insert(key).second) {
+        return;
+    }
+
+    std::vector<uint8_t> bytes;
+    if (!ReadBinaryFile(path, bytes)) {
+        return;
+    }
+
+    hash = AppendHash(hash, key);
+    hash = AppendHash(hash, bytes.data(), bytes.size());
+
+    const std::string source(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    static const std::regex includeRegex(R"(#\s*include\s*[<"]([^>"]+)[>"])");
+    for (std::sregex_iterator it(source.begin(), source.end(), includeRegex), end; it != end; ++it) {
+        const std::filesystem::path includeName((*it)[1].str());
+        const std::filesystem::path resolved = ResolveIncludePath(
+            includeName,
+            path.parent_path(),
+            includePaths,
+            compilerIncludePath);
+        if (!resolved.empty()) {
+            HashShaderFileRecursive(resolved, includePaths, compilerIncludePath, visited, hash);
+        }
+    }
+}
+
+uint64_t ComputeShaderCacheHash(
+    const std::filesystem::path& filePath,
+    const ShaderCompileOptions& options,
+    const std::filesystem::path& compilerIncludePath)
+{
+    uint64_t hash = 1469598103934665603ull;
+    hash = AppendHash(hash, options.entryPoint);
+    hash = AppendHash(hash, options.target);
+    hash = AppendHash(hash, options.debugInfo ? "debug" : "nodebug");
+    hash = AppendHash(hash, options.optimizationLevel3 ? "o3" : "o0");
+    for (const auto& define : options.defines) {
+        hash = AppendHash(hash, define);
+    }
+    for (const auto& includePath : options.includePaths) {
+        hash = AppendHash(hash, includePath);
+    }
+    hash = AppendHash(hash, compilerIncludePath.wstring());
+
+    std::unordered_set<std::string> visited;
+    HashShaderFileRecursive(filePath, options.includePaths, compilerIncludePath, visited, hash);
+    return hash;
+}
+
+} // namespace
 
 // =============================================================================
 // DxcIncludeHandler Implementation
@@ -170,12 +341,32 @@ Result<CompiledShader> ShaderCompiler::CompileFromFile(
     ShaderCompileOptions optionsWithBasePath = options;
     optionsWithBasePath.includePaths.push_back(basePath.wstring());
 
-    return CompileInternal(
+    const uint64_t cacheHash = ComputeShaderCacheHash(filePath, optionsWithBasePath, m_includePath);
+    const std::string cacheStem = SanitizeCacheStem(filePath.filename().string()) + "_" +
+        SanitizeCacheStem(NarrowAscii(options.target)) + "_" +
+        SanitizeCacheStem(NarrowAscii(options.entryPoint)) + "_" +
+        HashToHex(cacheHash);
+    const std::filesystem::path cachePath =
+        std::filesystem::current_path() / ".venpod_shader_cache" / (cacheStem + ".cso");
+
+    CompiledShader cached;
+    if (ReadBinaryFile(cachePath, cached.bytecode) && !cached.bytecode.empty()) {
+        cached.success = true;
+        spdlog::debug("Shader cache hit: {} -> {}", filePath.string(), cachePath.string());
+        return Result<CompiledShader>::Ok(std::move(cached));
+    }
+
+    auto compiled = CompileInternal(
         contents.data(),
         contents.size(),
         filePath.filename().wstring(),
         optionsWithBasePath
     );
+    if (compiled && compiled.value().IsValid()) {
+        WriteBinaryFileBestEffort(cachePath, compiled.value().bytecode);
+        spdlog::debug("Shader cache write: {} -> {}", filePath.string(), cachePath.string());
+    }
+    return compiled;
 }
 
 Result<CompiledShader> ShaderCompiler::CompileFromSource(
@@ -319,9 +510,9 @@ Result<CompiledShader> ShaderCompiler::CompileInternal(
             memcpy(result.bytecode.data(), shaderBlob->GetBufferPointer(), shaderBlob->GetBufferSize());
         }
 
-        spdlog::debug("Shader compiled successfully: {}", std::string(sourceName.begin(), sourceName.end()));
+        spdlog::debug("Shader compiled successfully: {}", NarrowAscii(sourceName));
     } else {
-        spdlog::error("Shader compilation failed: {}\n{}", std::string(sourceName.begin(), sourceName.end()), result.errors);
+        spdlog::error("Shader compilation failed: {}\n{}", NarrowAscii(sourceName), result.errors);
     }
 
     return Result<CompiledShader>::Ok(std::move(result));

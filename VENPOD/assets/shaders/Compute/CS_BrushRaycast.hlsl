@@ -17,26 +17,62 @@ cbuffer BrushRaycastConstants : register(b0) {
     uint gridSizeY;
     uint gridSizeZ;
     uint padding;
+
+    float4 regionOrigin;    // xyz = world-space dense render-window bounds minimum
 }
 
 // Input voxel grid (read-only)
 StructuredBuffer<uint> VoxelGrid : register(t0);
+StructuredBuffer<uint4> ChunkValidMask : register(t1);
 
 // Output: Brush raycast result (16 bytes total)
 // Format: [hitPosX, hitPosY, hitPosZ, hitNormalPacked]
 // hitNormalPacked: encodes normal vector + validity flag
 RWStructuredBuffer<float4> BrushRaycastResult : register(u0);
 
-// Safe voxel access
-uint GetVoxelSafe(int3 pos) {
-    if (pos.x < 0 || pos.x >= (int)gridSizeX ||
-        pos.y < 0 || pos.y >= (int)gridSizeY ||
-        pos.z < 0 || pos.z >= (int)gridSizeZ) {
-        return PackVoxel(MAT_AIR, 0, 0, 0);  // Out of bounds = air
-    }
+int FloorDiv64(int value) {
+    return value >= 0 ? value / 64 : -(((-value) + 63) / 64);
+}
 
+int FloorModInt(int value, int modulus) {
+    int r = value % modulus;
+    return r < 0 ? r + modulus : r;
+}
+
+uint RenderSlotIndex(int3 chunkCoord, out uint3 slotCoord) {
+    const int chunksX = (int)(gridSizeX / 64u);
+    const int chunksY = (int)(gridSizeY / 64u);
+    const int chunksZ = (int)(gridSizeZ / 64u);
+    slotCoord = uint3(
+        (uint)FloorModInt(chunkCoord.x, chunksX),
+        (uint)FloorModInt(chunkCoord.y, chunksY),
+        (uint)FloorModInt(chunkCoord.z, chunksZ));
+    return slotCoord.x + slotCoord.y * (uint)chunksX + slotCoord.z * (uint)chunksX * (uint)chunksY;
+}
+
+// Safe world-space voxel access through the toroidal near-field cache.
+uint GetVoxelSafe(int3 worldPos) {
+    int3 worldChunk = int3(
+        FloorDiv64(worldPos.x),
+        FloorDiv64(worldPos.y),
+        FloorDiv64(worldPos.z));
+    uint3 localVoxel = uint3(
+        (uint)FloorModInt(worldPos.x, 64),
+        (uint)FloorModInt(worldPos.y, 64),
+        (uint)FloorModInt(worldPos.z, 64));
+
+    uint3 slotCoord;
+    uint chunkIndex = RenderSlotIndex(worldChunk, slotCoord);
+    uint4 slotTag = ChunkValidMask[chunkIndex];
+    if (slotTag.w == 0u ||
+        slotTag.x != (uint)worldChunk.x ||
+        slotTag.y != (uint)worldChunk.y ||
+        slotTag.z != (uint)worldChunk.z) {
+        return PackVoxel(MAT_AIR, 0, 0, 0);
+    }
     uint3 gridSize = uint3(gridSizeX, gridSizeY, gridSizeZ);
-    uint idx = LinearIndex3D(uint3(pos), gridSize);
+    uint3 bufferPos = slotCoord * 64u + localVoxel;
+    uint idx = LinearIndex3D(bufferPos, gridSize);
     return VoxelGrid[idx];
 }
 
@@ -77,9 +113,10 @@ void main(uint3 DTid : SV_DispatchThreadID) {
     float3 origin = rayOrigin.xyz;
     float3 dir = normalize(rayDirection.xyz);
 
-    // Grid bounds
-    float3 gridMin = float3(0.0f, 0.0f, 0.0f);
-    float3 gridMax = float3(gridSizeX, gridSizeY, gridSizeZ);
+    // World-space render-window bounds. The lookup itself is toroidal, but
+    // bounds keep the one-thread DDA from marching outside the near field.
+    float3 gridMin = regionOrigin.xyz;
+    float3 gridMax = regionOrigin.xyz + float3(gridSizeX, gridSizeY, gridSizeZ);
 
     // Check ray-grid intersection
     float tMin, tMax;
@@ -108,8 +145,8 @@ void main(uint3 DTid : SV_DispatchThreadID) {
     int3 normal = int3(0, 1, 0);  // Default normal
     float dist = 0.0f;
 
-    const float maxDist = 1024.0f;
-    const int maxSteps = 512;
+    const float maxDist = 4096.0f;
+    const int maxSteps = 4096;
 
     // DDA traversal - find first solid voxel
     for (int i = 0; i < maxSteps; ++i) {

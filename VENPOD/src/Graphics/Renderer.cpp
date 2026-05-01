@@ -1,6 +1,7 @@
 #include "Renderer.h"
 #include "RHI/d3dx12.h"
 #include <spdlog/spdlog.h>
+#include <algorithm>
 
 namespace VENPOD::Graphics {
 
@@ -140,6 +141,7 @@ void Renderer::RenderFullscreen(ID3D12GraphicsCommandList* cmdList) {
 void Renderer::RenderVoxels(
     ID3D12GraphicsCommandList* cmdList,
     const DescriptorHandle& voxelGridSRV,
+    const DescriptorHandle& chunkValidMaskSRV,
     const DescriptorHandle& materialPaletteSRV,
     uint32_t gridSizeX,
     uint32_t gridSizeY,
@@ -182,6 +184,8 @@ void Renderer::RenderVoxels(
         float brushParams[4];         // x = material, y = shape, z = hasValidPosition, w = unused
         float characterPosition[4];   // xyz = feet position, w = visible flag
         float farFieldParams[4];      // x = enabled, y = page count, z = node count, w = page size
+        float renderBudgetParams[4];  // x = dense max dist, y = dense max steps, z = far quality, w = quality
+        float farFieldGridParams[4];  // x = page radius, y = index side, z = root min Y, w = unused
     } constants = {};
 
     // Fill in camera data
@@ -266,12 +270,24 @@ void Renderer::RenderVoxels(
         sparseFarField->enabled &&
         sparseFarField->nodeSRV.IsValid() &&
         sparseFarField->pageSRV.IsValid() &&
+        sparseFarField->pageIndexSRV.IsValid() &&
         sparseFarField->nodeCount > 0 &&
-        sparseFarField->pageCount > 0;
+        sparseFarField->pageCount > 0 &&
+        sparseFarField->pageIndexCount > 0 &&
+        sparseFarField->pageRadius > 0;
     constants.farFieldParams[0] = farFieldEnabled ? 1.0f : 0.0f;
     constants.farFieldParams[1] = farFieldEnabled ? static_cast<float>(sparseFarField->pageCount) : 0.0f;
     constants.farFieldParams[2] = farFieldEnabled ? static_cast<float>(sparseFarField->nodeCount) : 0.0f;
     constants.farFieldParams[3] = farFieldEnabled ? sparseFarField->pageSize : 0.0f;
+
+    constants.renderBudgetParams[0] = camera.raymarchMaxDistance > 0.0f ? camera.raymarchMaxDistance : 2500.0f;
+    constants.renderBudgetParams[1] = static_cast<float>(camera.raymarchMaxSteps > 0 ? camera.raymarchMaxSteps : 2048);
+    constants.renderBudgetParams[2] = farFieldEnabled ? std::clamp(camera.farFieldQuality, 0.0f, 1.0f) : 0.0f;
+    constants.renderBudgetParams[3] = std::clamp(camera.renderQuality, 0.0f, 1.0f);
+    constants.farFieldGridParams[0] = farFieldEnabled ? static_cast<float>(sparseFarField->pageRadius) : 0.0f;
+    constants.farFieldGridParams[1] = farFieldEnabled ? static_cast<float>(sparseFarField->pageRadius * 2 + 1) : 0.0f;
+    constants.farFieldGridParams[2] = farFieldEnabled ? sparseFarField->rootMinY : 0.0f;
+    constants.farFieldGridParams[3] = 0.0f;
 
     // Set root constants (b0)
     cmdList->SetGraphicsRoot32BitConstants(0, sizeof(constants) / 4, &constants, 0);
@@ -281,6 +297,8 @@ void Renderer::RenderVoxels(
     cmdList->SetGraphicsRootDescriptorTable(2, materialPaletteSRV.gpu);
     cmdList->SetGraphicsRootDescriptorTable(3, farFieldEnabled ? sparseFarField->nodeSRV.gpu : voxelGridSRV.gpu);
     cmdList->SetGraphicsRootDescriptorTable(4, farFieldEnabled ? sparseFarField->pageSRV.gpu : voxelGridSRV.gpu);
+    cmdList->SetGraphicsRootDescriptorTable(5, farFieldEnabled ? sparseFarField->pageIndexSRV.gpu : voxelGridSRV.gpu);
+    cmdList->SetGraphicsRootDescriptorTable(6, chunkValidMaskSRV.IsValid() ? chunkValidMaskSRV.gpu : voxelGridSRV.gpu);
 
     // Draw fullscreen triangle
     cmdList->DrawInstanced(3, 1, 0, 0);
@@ -332,13 +350,13 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
 
     // Root signature parameters (for voxel rendering)
     // b0: FrameConstants (inline 32-bit constants)
-    // Layout: camPos(4) + camFwd(4) + camRight(4) + camUp(4) + sunDir(4) + grid(4) + viewport(4) + regionOrigin(4) + brushPos(4) + brushParams(4) + character(4) + farField(4) = 48 DWORDs
+    // Layout: camPos(4) + camFwd(4) + camRight(4) + camUp(4) + sunDir(4) + grid(4) + viewport(4) + regionOrigin(4) + brushPos(4) + brushParams(4) + character(4) + farField(4) + renderBudget(4) + farFieldGrid(4) = 56 DWORDs
     RootParameter frameConstantsParam;
     frameConstantsParam.type = RootParamType::Constants32Bit;
     frameConstantsParam.shaderRegister = 0;  // register b0
     frameConstantsParam.registerSpace = 0;   // space 0
     frameConstantsParam.visibility = D3D12_SHADER_VISIBILITY_ALL;
-    frameConstantsParam.num32BitValues = 48;
+    frameConstantsParam.num32BitValues = 56;
     pipelineDesc.rootParams.push_back(frameConstantsParam);
 
     // t0: VoxelGrid SRV (descriptor table for structured buffer)
@@ -375,6 +393,26 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
     pipelineDesc.rootParams.push_back({
         RootParamType::DescriptorTable,
         3,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+
+    // t4: Far voxel octree page index grid
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        4,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+
+    // t5: Dense render-window chunk-valid mask
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        5,
         0,
         D3D12_SHADER_VISIBILITY_PIXEL,
         1,

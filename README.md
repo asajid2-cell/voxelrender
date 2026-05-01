@@ -47,7 +47,8 @@ added after the current checkpoint is captured.
 - Traversal brush handoff that finishes line-of-sight painting as a ramp near
   the player feet.
 - Chunk-budgeted physics path that avoids full vertical-buffer scans by default.
-- Experimental GPU-backed sparse voxel octree far field for visual distance.
+- Experimental GPU-backed sparse voxel octree far field with a page-index
+  accelerator for visual distance.
 - Dear ImGui runtime metrics overlay.
 
 ## Architecture
@@ -179,6 +180,8 @@ VENPOD is a graphics programming tech demo, not a packaged game engine.
 Current limitations:
 
 - Far SVO terrain is visual-only and static around origin in this checkpoint.
+  Its page index avoids full page-list scans, but pages are not streamed around
+  the camera yet.
 - Brush edits persist during a runtime session, but disk save/load for edited
   chunks is not the default public path yet.
 - Infinite physics remains conservative and budgeted; the stable demo favors

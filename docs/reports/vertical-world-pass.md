@@ -985,3 +985,122 @@ Next architecture note:
 - A practical next step is not "make the dense box enormous"; it is to keep a
   dense editable near field and add a sparse read-only far field built from
   chunk bricks, mips, or an SVO/DAG-like hierarchy for ray traversal.
+
+## Brush Flicker And Edit-State Follow-Up
+
+The painting flicker shown in the May 1 video was not a compression artifact.
+Frame-by-frame inspection showed a pale edited terrain section alternating
+between present and missing states. That points to render/edit state ownership,
+not terrain generation.
+
+Root causes found:
+
+- Infinite streaming still had old ping-pong assumptions in several comments
+  and code paths. The renderer presents READ, while older logic treated WRITE
+  as the future authoritative state after a swap.
+- Persistent edit replay applied READ and WRITE overlays through the same
+  upload buffer slot in the same command list. The second `memcpy` could
+  overwrite the first dispatch's upload data before the GPU consumed it. That
+  could leave READ and WRITE with different or wrong persistent edit overlays.
+- GPU brush feedback was recorded from WRITE even though the visible result was
+  rendered from READ. If the buffers diverged briefly, persistence could follow
+  a different edit set than the one the player saw.
+- Brush stroke advancement skipped uncached chunk stamps but still advanced
+  the cached stroke endpoint. That produced missing middle sections when
+  painting across chunk boundaries or while moving the camera quickly.
+- The default traversal brush used material `14` (`MAT_CONCRETE`), but the
+  physics shader treats concrete as an active liquid. With infinite physics
+  enabled, newly painted traversal geometry could enter active scans and be
+  rewritten instead of behaving like a stable bridge/platform.
+
+Fixes in this follow-up:
+
+- Infinite-mode `SwapBuffers()` remains a no-op. READ is the authoritative
+  presented dense cache; WRITE is maintained as a mirrored cache for brush,
+  copy, and local simulation safety.
+- Persistent edit replay now uses separate upload-buffer slots for READ and
+  WRITE on each copy allocator. The two GPU dispatches cannot observe
+  overwritten upload data from each other.
+- GPU brush feedback is now recorded from the READ brush pass, so exact edit
+  persistence follows the visible result.
+- Brush sweep stamping now only advances `lastBrushWorldPosition` through
+  successfully submitted GPU brush stamps. At the first uncached required
+  chunk, the stroke pauses instead of jumping over it and leaving a permanent
+  gap.
+- Brush sweep capacity was raised from 24 to 64 stamps per frame to better
+  cover high camera/brush motion without visible spacing gaps.
+- The default brush material is now `MAT_STONE` (`3`) instead of concrete, so
+  traversal painting is static unless the user explicitly chooses an active
+  material.
+
+Verification:
+
+- Release build passed after the fixes.
+- A diagnostics startup smoke showed no critical/error/failed/timeout/device
+  removed log lines.
+- Once startup streaming converged, logs showed READ and WRITE both reaching
+  full dense coverage: `cached=2527/2527/2527`.
+- The smoke run still shows startup cache fill over multiple frames; that is
+  expected in the current dense-cache architecture. The fixed issue here is
+  incorrect edit/render ownership and stroke gaps, not final streaming
+  architecture.
+
+Remaining risk:
+
+- This pass fixes the concrete bugs visible from code review, but the exact
+  video scenario should still be manually re-tested because it depends on live
+  camera motion and sustained painting. If flicker remains after this fix, the
+  next suspect is a slot-tag/copy-fence mismatch during active-region updates,
+  and the next diagnostic should log the READ/WRITE slot tag for the targeted
+  edited chunk every frame while the flicker occurs.
+
+## May 1 Follow-Up Video Analysis
+
+The `20260501-2055-09.6830023.mp4` recording was extracted at 60 FPS into
+`.codex-video-frames/20260501-2055-09_60fps`. The source video is 30 FPS, so
+the 60 FPS extraction contains duplicated adjacent frames but preserves stable
+frame numbering for inspection.
+
+Observed issues:
+
+- The line-of-sight build pullback was too fast. Around `2.0s` the brush
+  collapses from a distant target into the player almost immediately, making
+  deliberate path painting hard.
+- The selected material in the video is `MAT_SAND` (`1`). Brush-created sand
+  entered the active physics path, then the local physics shader rewrote it as
+  falling particles. The result looked like a broken sparse skeleton instead of
+  a stable painted bridge/platform.
+- In the pan-out section, dense chunk coverage was full (`READ=2527`,
+  `WRITE=2527`, expected `2527`), but rays that traversed the dense editable
+  AABB and found no voxel returned sky immediately. That made the world look
+  like it stopped halfway even though far terrain existed.
+- A first attempt to continue into the page-indexed SVO after every dense-cache
+  exit was too expensive. Diagnostics showed the GPU raymarch phase rising into
+  the 60-90 ms range. The final fix only uses the cheaper heightfield fallback
+  for narrow horizon-band continuation behind the editable window.
+
+Fixes:
+
+- Brush pullback speed was reduced from `960` to `320` world units/sec.
+- Brush-created add/replace/fill voxels now set `STATE_IS_STATIC`, so choosing
+  sand for path painting does not automatically opt the bridge into falling
+  particle simulation.
+- `CS_GravityChunk` now explicitly preserves static voxels before material
+  physics, so static painted sand/concrete/etc. cannot be rewritten by active
+  chunk simulation.
+- The dense raymarcher now resumes a cheap far-terrain fallback after cleanly
+  exiting the dense editable cache, but only for a narrow horizon band. This
+  restores some background continuity without reintroducing the expensive
+  full-screen SVO traversal.
+- `build.ps1` now refreshes runtime assets every build, even when Ninja reports
+  `no work to do`, so HLSL edits cannot be hidden by stale files in
+  `build/bin/assets`.
+
+Verification:
+
+- Release build passed.
+- Runtime shader compilation succeeded for the changed raymarch/brush/physics
+  shaders.
+- A diagnostics smoke run after the final far-continuation throttle stayed
+  responsive, with full dense coverage and no critical/error/failed/timeout or
+  device-removed log lines.

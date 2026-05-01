@@ -62,6 +62,10 @@ public:
         float upX, upY, upZ;
         float fov;
         float aspectRatio;
+        float raymarchMaxDistance = 2500.0f;
+        uint32_t raymarchMaxSteps = 2048;
+        float farFieldQuality = 1.0f;
+        float renderQuality = 1.0f;
     };
 
     // Brush preview parameters for rendering
@@ -81,9 +85,13 @@ public:
     struct SparseFarField {
         DescriptorHandle nodeSRV;
         DescriptorHandle pageSRV;
+        DescriptorHandle pageIndexSRV;
         uint32_t nodeCount = 0;
         uint32_t pageCount = 0;
+        uint32_t pageIndexCount = 0;
+        int32_t pageRadius = 0;
         float pageSize = 0.0f;
+        float rootMinY = 0.0f;
         bool enabled = false;
     };
 
@@ -91,6 +99,7 @@ public:
     void RenderVoxels(
         ID3D12GraphicsCommandList* cmdList,
         const DescriptorHandle& voxelGridSRV,
+        const DescriptorHandle& chunkValidMaskSRV,
         const DescriptorHandle& materialPaletteSRV,
         uint32_t gridSizeX,
         uint32_t gridSizeY,
