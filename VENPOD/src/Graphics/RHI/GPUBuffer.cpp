@@ -212,18 +212,23 @@ void GPUBuffer::Shutdown() {
     if (m_heapManager) {
         if (m_stagingSRV.IsValid()) {
             m_heapManager->FreeStagingCbvSrvUav(m_stagingSRV);
+            m_stagingSRV.Invalidate();
         }
         if (m_stagingUAV.IsValid()) {
             m_heapManager->FreeStagingCbvSrvUav(m_stagingUAV);
+            m_stagingUAV.Invalidate();
         }
         if (m_stagingCBV.IsValid()) {
             m_heapManager->FreeStagingCbvSrvUav(m_stagingCBV);
+            m_stagingCBV.Invalidate();
         }
         if (m_shaderVisibleSRV.IsValid()) {
             m_heapManager->FreeShaderVisibleCbvSrvUav(m_shaderVisibleSRV);
+            m_shaderVisibleSRV.Invalidate();
         }
         if (m_shaderVisibleUAV.IsValid()) {
             m_heapManager->FreeShaderVisibleCbvSrvUav(m_shaderVisibleUAV);
+            m_shaderVisibleUAV.Invalidate();
         }
     }
 
@@ -535,6 +540,7 @@ Result<void> ConstantBuffer::InitializeInternal(
 void ConstantBuffer::Shutdown() {
     if (m_heapManager && m_stagingCBV.IsValid()) {
         m_heapManager->FreeStagingCbvSrvUav(m_stagingCBV);
+        m_stagingCBV.Invalidate();
     }
 
     if (m_mappedData && m_resource) {

@@ -63,6 +63,16 @@ Result<void> PhysicsDispatcher::Initialize(
         spdlog::warn("Brush raycast pipeline not created: {}", result.error());
     }
 
+    result = CreateSparseRaycastPipeline(device, shaderCompiler, shaderPath);
+    if (!result) {
+        spdlog::warn("Sparse raycast pipeline not created: {}", result.error());
+    }
+
+    result = CreateSparseMissFeedbackPipeline(device, shaderCompiler, shaderPath);
+    if (!result) {
+        spdlog::warn("Sparse miss feedback pipeline not created: {}", result.error());
+    }
+
     // Create command signature for indirect dispatch
     result = CreateCommandSignature(device);
     if (!result) {
@@ -81,6 +91,8 @@ void PhysicsDispatcher::Shutdown() {
     m_prepareIndirectPipeline.Shutdown();
     m_gravityChunkPipeline.Shutdown();
     m_brushRaycastPipeline.Shutdown();
+    m_sparseRaycastPipeline.Shutdown();
+    m_sparseMissFeedbackPipeline.Shutdown();
     m_commandSignature.Reset();
     m_heapManager = nullptr;
     m_device = nullptr;
@@ -1191,6 +1203,146 @@ void PhysicsDispatcher::DispatchGroundRaycast(
     cmdList->ResourceBarrier(1, &uavBarrier);
 }
 
+void PhysicsDispatcher::DispatchSparseRaycast(
+    ID3D12GraphicsCommandList* cmdList,
+    VoxelWorld& world,
+    const Graphics::DescriptorHandle& sparseBrickPoolSRV,
+    const Graphics::DescriptorHandle& sparsePageTableSRV,
+    const Graphics::DescriptorHandle& sparseOccupancySRV,
+    uint32_t maxBrickPages,
+    uint32_t pageTableCapacity,
+    const glm::vec3& rayOrigin,
+    const glm::vec3& rayDirection,
+    float maxDistance,
+    bool writeGroundResult)
+{
+    if (!cmdList || !m_sparseRaycastPipeline.IsValid() || !m_heapManager ||
+        !sparseBrickPoolSRV.IsValid() || !sparsePageTableSRV.IsValid() || !sparseOccupancySRV.IsValid()) {
+        return;
+    }
+
+    ID3D12DescriptorHeap* heaps[] = { m_heapManager->GetShaderVisibleCbvSrvUavHeap() };
+    cmdList->SetDescriptorHeaps(1, heaps);
+
+    m_sparseRaycastPipeline.Bind(cmdList);
+
+    struct SparseRaycastConstants {
+        float rayOriginX, rayOriginY, rayOriginZ, maxDistance;
+        float rayDirX, rayDirY, rayDirZ, flags;
+        uint32_t maxBrickPages;
+        uint32_t pageTableCapacity;
+        uint32_t maxSteps;
+        uint32_t padding0;
+    } constants = {};
+
+    constants.rayOriginX = rayOrigin.x;
+    constants.rayOriginY = rayOrigin.y;
+    constants.rayOriginZ = rayOrigin.z;
+    constants.maxDistance = std::max(maxDistance, 0.0f);
+    constants.rayDirX = rayDirection.x;
+    constants.rayDirY = rayDirection.y;
+    constants.rayDirZ = rayDirection.z;
+    constants.flags = writeGroundResult ? 1.0f : 0.0f;
+    constants.maxBrickPages = maxBrickPages;
+    constants.pageTableCapacity = pageTableCapacity;
+    constants.maxSteps = static_cast<uint32_t>(std::clamp(maxDistance * 3.0f + 64.0f, 64.0f, 16384.0f));
+
+    m_sparseRaycastPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
+    m_sparseRaycastPipeline.SetRootDescriptorTable(cmdList, 1, sparseBrickPoolSRV.gpu);
+    m_sparseRaycastPipeline.SetRootDescriptorTable(cmdList, 2, sparsePageTableSRV.gpu);
+    m_sparseRaycastPipeline.SetRootDescriptorTable(cmdList, 3, sparseOccupancySRV.gpu);
+    m_sparseRaycastPipeline.SetRootDescriptorTable(
+        cmdList,
+        4,
+        writeGroundResult
+            ? world.GetGroundRaycastResultBuffer().GetShaderVisibleUAV().gpu
+            : world.GetBrushRaycastResultBuffer().GetShaderVisibleUAV().gpu);
+
+    cmdList->Dispatch(1, 1, 1);
+
+    D3D12_RESOURCE_BARRIER uavBarrier = {};
+    uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uavBarrier.UAV.pResource = writeGroundResult
+        ? world.GetGroundRaycastResultBuffer().GetResource()
+        : world.GetBrushRaycastResultBuffer().GetResource();
+    cmdList->ResourceBarrier(1, &uavBarrier);
+}
+
+void PhysicsDispatcher::DispatchSparseMissFeedback(
+    ID3D12GraphicsCommandList* cmdList,
+    const Graphics::DescriptorHandle& sparsePageTableSRV,
+    const Graphics::DescriptorHandle& sparseMissFeedbackUAV,
+    uint32_t maxBrickPages,
+    uint32_t pageTableCapacity,
+    const glm::vec3& cameraOrigin,
+    const glm::vec3& cameraForward,
+    const glm::vec3& cameraRight,
+    const glm::vec3& cameraUp,
+    float verticalFovRadians,
+    float aspectRatio,
+    float maxDistance,
+    float stepDistance,
+    uint32_t rayGrid,
+    uint32_t maxRecords,
+    uint32_t frameIndex)
+{
+    if (!cmdList || !m_sparseMissFeedbackPipeline.IsValid() || !m_heapManager ||
+        !sparsePageTableSRV.IsValid() || !sparseMissFeedbackUAV.IsValid() ||
+        pageTableCapacity == 0 || maxRecords == 0 || rayGrid == 0) {
+        return;
+    }
+
+    ID3D12DescriptorHeap* heaps[] = { m_heapManager->GetShaderVisibleCbvSrvUavHeap() };
+    cmdList->SetDescriptorHeaps(1, heaps);
+    m_sparseMissFeedbackPipeline.Bind(cmdList);
+
+    struct SparseMissFeedbackConstants {
+        float cameraOriginX, cameraOriginY, cameraOriginZ, maxDistance;
+        float cameraForwardX, cameraForwardY, cameraForwardZ, stepDistance;
+        float cameraRightX, cameraRightY, cameraRightZ, tanHalfFov;
+        float cameraUpX, cameraUpY, cameraUpZ, aspectRatio;
+        uint32_t maxBrickPages;
+        uint32_t pageTableCapacity;
+        uint32_t rayGrid;
+        uint32_t maxRecords;
+        uint32_t maxSteps;
+        uint32_t frameIndex;
+        uint32_t padding0;
+        uint32_t padding1;
+    } constants = {};
+
+    constants.cameraOriginX = cameraOrigin.x;
+    constants.cameraOriginY = cameraOrigin.y;
+    constants.cameraOriginZ = cameraOrigin.z;
+    constants.maxDistance = std::max(maxDistance, 0.0f);
+    constants.cameraForwardX = cameraForward.x;
+    constants.cameraForwardY = cameraForward.y;
+    constants.cameraForwardZ = cameraForward.z;
+    constants.stepDistance = std::max(stepDistance, 1.0f);
+    constants.cameraRightX = cameraRight.x;
+    constants.cameraRightY = cameraRight.y;
+    constants.cameraRightZ = cameraRight.z;
+    constants.tanHalfFov = std::tan(std::clamp(verticalFovRadians, 0.1f, 2.8f) * 0.5f);
+    constants.cameraUpX = cameraUp.x;
+    constants.cameraUpY = cameraUp.y;
+    constants.cameraUpZ = cameraUp.z;
+    constants.aspectRatio = std::clamp(aspectRatio, 0.25f, 4.0f);
+    constants.maxBrickPages = maxBrickPages;
+    constants.pageTableCapacity = pageTableCapacity;
+    constants.rayGrid = std::clamp(rayGrid, 1u, 8u);
+    constants.maxRecords = maxRecords;
+    constants.maxSteps = static_cast<uint32_t>(std::clamp(
+        constants.maxDistance / constants.stepDistance + 1.0f,
+        1.0f,
+        4096.0f));
+    constants.frameIndex = frameIndex;
+
+    m_sparseMissFeedbackPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
+    m_sparseMissFeedbackPipeline.SetRootDescriptorTable(cmdList, 1, sparsePageTableSRV.gpu);
+    m_sparseMissFeedbackPipeline.SetRootDescriptorTable(cmdList, 2, sparseMissFeedbackUAV.gpu);
+    cmdList->Dispatch(1, 1, 1);
+}
+
 Result<void> PhysicsDispatcher::CreateBrushRaycastPipeline(
     ID3D12Device* device,
     Graphics::ShaderCompiler& shaderCompiler,
@@ -1258,6 +1410,122 @@ Result<void> PhysicsDispatcher::CreateBrushRaycastPipeline(
     }
 
     spdlog::info("Brush raycast pipeline created successfully (GPU raycasting enabled)");
+    return {};
+}
+
+Result<void> PhysicsDispatcher::CreateSparseRaycastPipeline(
+    ID3D12Device* device,
+    Graphics::ShaderCompiler& shaderCompiler,
+    const std::filesystem::path& shaderPath)
+{
+    std::filesystem::path csPath = shaderPath / "Compute" / "CS_SparseRaycast.hlsl";
+
+    auto csResult = shaderCompiler.CompileComputeShader(csPath, L"main", true);
+    if (!csResult) {
+        return Error("Failed to compile CS_SparseRaycast.hlsl: {}", csResult.error());
+    }
+
+    Graphics::CompiledShader cs = csResult.value();
+    if (!cs.IsValid()) {
+        return Error("CS_SparseRaycast shader compilation failed: {}", cs.errors);
+    }
+
+    Graphics::ComputePipelineDesc pipelineDesc;
+    pipelineDesc.computeShader = cs;
+    pipelineDesc.debugName = "SparseRaycastPipeline";
+
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::Constants32Bit,
+        0,
+        0,
+        12
+    });
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        0,
+        0,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        1,
+        0,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        2,
+        0,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        0,
+        0,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+    });
+
+    auto result = m_sparseRaycastPipeline.Initialize(device, pipelineDesc);
+    if (!result) {
+        return Error("Failed to create sparse raycast pipeline: {}", result.error());
+    }
+
+    spdlog::info("Sparse raycast pipeline created successfully");
+    return {};
+}
+
+Result<void> PhysicsDispatcher::CreateSparseMissFeedbackPipeline(
+    ID3D12Device* device,
+    Graphics::ShaderCompiler& shaderCompiler,
+    const std::filesystem::path& shaderPath)
+{
+    std::filesystem::path csPath = shaderPath / "Compute" / "CS_SparseMissFeedback.hlsl";
+
+    auto csResult = shaderCompiler.CompileComputeShader(csPath, L"main", true);
+    if (!csResult) {
+        return Error("Failed to compile CS_SparseMissFeedback.hlsl: {}", csResult.error());
+    }
+
+    Graphics::CompiledShader cs = csResult.value();
+    if (!cs.IsValid()) {
+        return Error("CS_SparseMissFeedback shader compilation failed: {}", cs.errors);
+    }
+
+    Graphics::ComputePipelineDesc pipelineDesc;
+    pipelineDesc.computeShader = cs;
+    pipelineDesc.debugName = "SparseMissFeedbackPipeline";
+
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::Constants32Bit,
+        0,
+        0,
+        24
+    });
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        0,
+        0,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        0,
+        0,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+    });
+
+    auto result = m_sparseMissFeedbackPipeline.Initialize(device, pipelineDesc);
+    if (!result) {
+        return Error("Failed to create sparse miss feedback pipeline: {}", result.error());
+    }
+
+    spdlog::info("Sparse miss feedback pipeline created successfully");
     return {};
 }
 

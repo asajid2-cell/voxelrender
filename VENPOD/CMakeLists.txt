@@ -59,6 +59,9 @@ set(VENPOD_SOURCES
     # Graphics
     src/Graphics/FarVoxelOctree.cpp
     src/Graphics/Renderer.cpp
+    src/Graphics/SparseSurfaceGpuResources.cpp
+    src/Graphics/SparseVoxelGpuResources.cpp
+    src/Graphics/VoxelRenderBackend.cpp
     src/Graphics/VoxelRenderer.cpp
 
     # Simulation
@@ -69,6 +72,17 @@ set(VENPOD_SOURCES
     src/Simulation/InfiniteChunkManager.cpp
     src/Simulation/ChunkGenerationTest.cpp
     src/Simulation/ChunkStressTest.cpp
+    src/Simulation/SparseBrickPool.cpp
+    src/Simulation/SparseBrickRequestPlanner.cpp
+    src/Simulation/SparseClipmap.cpp
+    src/Simulation/SparseCollision.cpp
+    src/Simulation/SparseEditStore.cpp
+    src/Simulation/SparsePageTable.cpp
+    src/Simulation/SparseSurfaceCache.cpp
+    src/Simulation/SparseSurfaceExtractor.cpp
+    src/Simulation/SparseTerrainGenerator.cpp
+    src/Simulation/SparseVoxelTypes.cpp
+    src/Simulation/SparseVoxelWorld.cpp
 
     # Input
     src/Input/InputManager.cpp
@@ -108,6 +122,9 @@ set(VENPOD_HEADERS
     # Graphics
     src/Graphics/FarVoxelOctree.h
     src/Graphics/Renderer.h
+    src/Graphics/SparseSurfaceGpuResources.h
+    src/Graphics/SparseVoxelGpuResources.h
+    src/Graphics/VoxelRenderBackend.h
     src/Graphics/VoxelRenderer.h
 
     # Simulation
@@ -119,6 +136,17 @@ set(VENPOD_HEADERS
     src/Simulation/InfiniteChunkManager.h
     src/Simulation/ChunkGenerationTest.h
     src/Simulation/ChunkStressTest.h
+    src/Simulation/SparseBrickPool.h
+    src/Simulation/SparseBrickRequestPlanner.h
+    src/Simulation/SparseClipmap.h
+    src/Simulation/SparseCollision.h
+    src/Simulation/SparseEditStore.h
+    src/Simulation/SparsePageTable.h
+    src/Simulation/SparseSurfaceCache.h
+    src/Simulation/SparseSurfaceExtractor.h
+    src/Simulation/SparseTerrainGenerator.h
+    src/Simulation/SparseVoxelTypes.h
+    src/Simulation/SparseVoxelWorld.h
 
     # Input
     src/Input/InputManager.h
@@ -242,3 +270,39 @@ endif()
 # =============================================================================
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR}/src PREFIX "Source Files" FILES ${VENPOD_SOURCES})
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR}/src PREFIX "Header Files" FILES ${VENPOD_HEADERS})
+
+# =============================================================================
+# Tests
+# =============================================================================
+enable_testing()
+
+add_executable(VENPODTests
+    test/test_sparse_core.cpp
+    src/Graphics/VoxelRenderBackend.cpp
+    src/Simulation/SparseBrickPool.cpp
+    src/Simulation/SparseBrickRequestPlanner.cpp
+    src/Simulation/SparseClipmap.cpp
+    src/Simulation/SparseCollision.cpp
+    src/Simulation/SparseEditStore.cpp
+    src/Simulation/SparsePageTable.cpp
+    src/Simulation/SparseSurfaceCache.cpp
+    src/Simulation/SparseSurfaceExtractor.cpp
+    src/Simulation/SparseTerrainGenerator.cpp
+    src/Simulation/SparseVoxelTypes.cpp
+    src/Simulation/SparseVoxelWorld.cpp
+)
+
+target_include_directories(VENPODTests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+if(MSVC)
+    target_compile_options(VENPODTests PRIVATE /W4 /WX- /permissive- /Zc:__cplusplus)
+    target_compile_definitions(VENPODTests PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+    )
+endif()
+
+add_test(NAME VENPODSparseCore COMMAND VENPODTests)

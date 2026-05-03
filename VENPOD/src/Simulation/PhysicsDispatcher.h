@@ -160,6 +160,39 @@ public:
         const glm::vec3& rayDirection
     );
 
+    void DispatchSparseRaycast(
+        ID3D12GraphicsCommandList* cmdList,
+        VoxelWorld& world,
+        const Graphics::DescriptorHandle& sparseBrickPoolSRV,
+        const Graphics::DescriptorHandle& sparsePageTableSRV,
+        const Graphics::DescriptorHandle& sparseOccupancySRV,
+        uint32_t maxBrickPages,
+        uint32_t pageTableCapacity,
+        const glm::vec3& rayOrigin,
+        const glm::vec3& rayDirection,
+        float maxDistance,
+        bool writeGroundResult
+    );
+
+    void DispatchSparseMissFeedback(
+        ID3D12GraphicsCommandList* cmdList,
+        const Graphics::DescriptorHandle& sparsePageTableSRV,
+        const Graphics::DescriptorHandle& sparseMissFeedbackUAV,
+        uint32_t maxBrickPages,
+        uint32_t pageTableCapacity,
+        const glm::vec3& cameraOrigin,
+        const glm::vec3& cameraForward,
+        const glm::vec3& cameraRight,
+        const glm::vec3& cameraUp,
+        float verticalFovRadians,
+        float aspectRatio,
+        float maxDistance,
+        float stepDistance,
+        uint32_t rayGrid,
+        uint32_t maxRecords,
+        uint32_t frameIndex
+    );
+
     // Get command signature for indirect dispatch
     ID3D12CommandSignature* GetCommandSignature() const { return m_commandSignature.Get(); }
 
@@ -206,6 +239,18 @@ private:
         const std::filesystem::path& shaderPath
     );
 
+    Result<void> CreateSparseRaycastPipeline(
+        ID3D12Device* device,
+        Graphics::ShaderCompiler& shaderCompiler,
+        const std::filesystem::path& shaderPath
+    );
+
+    Result<void> CreateSparseMissFeedbackPipeline(
+        ID3D12Device* device,
+        Graphics::ShaderCompiler& shaderCompiler,
+        const std::filesystem::path& shaderPath
+    );
+
     Result<void> CreateCommandSignature(ID3D12Device* device);
 
     // Compute pipelines
@@ -216,6 +261,8 @@ private:
     Graphics::DX12ComputePipeline m_prepareIndirectPipeline;
     Graphics::DX12ComputePipeline m_gravityChunkPipeline;
     Graphics::DX12ComputePipeline m_brushRaycastPipeline;
+    Graphics::DX12ComputePipeline m_sparseRaycastPipeline;
+    Graphics::DX12ComputePipeline m_sparseMissFeedbackPipeline;
 
     // Command signature for indirect dispatch
     ComPtr<ID3D12CommandSignature> m_commandSignature;

@@ -11,10 +11,12 @@
 #include "RHI/DX12Device.h"
 #include "RHI/DX12CommandQueue.h"
 #include "RHI/DescriptorHeap.h"
+#include "RHI/GPUBuffer.h"
 #include "RHI/ShaderCompiler.h"
 #include "RHI/DX12GraphicsPipeline.h"
 #include "../Core/Window.h"
 #include "../Utils/Result.h"
+#include <array>
 
 using Microsoft::WRL::ComPtr;
 
@@ -66,6 +68,10 @@ public:
         uint32_t raymarchMaxSteps = 2048;
         float farFieldQuality = 1.0f;
         float renderQuality = 1.0f;
+        float midFieldStartDistance = 480.0f;
+        float midFieldEndDistance = 4200.0f;
+        float midFieldCellSize = 16.0f;
+        uint32_t debugMode = 0;
     };
 
     // Brush preview parameters for rendering
@@ -95,6 +101,35 @@ public:
         bool enabled = false;
     };
 
+    struct SparseNearField {
+        DescriptorHandle brickPoolSRV;
+        DescriptorHandle pageTableSRV;
+        DescriptorHandle occupancySRV;
+        DescriptorHandle pageGenerationSRV;
+        DescriptorHandle midClipmapMetadataSRV;
+        DescriptorHandle midClipmapLookupSRV;
+        DescriptorHandle midClipmapSamplesSRV;
+        DescriptorHandle midVoxelClipmapMetadataSRV;
+        DescriptorHandle midVoxelClipmapLookupSRV;
+        DescriptorHandle midVoxelClipmapSamplesSRV;
+        DescriptorHandle surfaceFacesSRV;
+        DescriptorHandle surfaceRangesSRV;
+        uint32_t maxBrickPages = 0;
+        uint32_t pageTableCapacity = 0;
+        uint32_t midClipmapTileCount = 0;
+        uint32_t midClipmapTileSampleSide = 0;
+        uint32_t midVoxelClipmapBrickCount = 0;
+        uint32_t surfaceFaceCount = 0;
+        uint32_t surfaceRangeCount = 0;
+        uint32_t surfaceRangeTableCapacity = 0;
+        uint32_t surfaceSerial = 0;
+        uint32_t bindingMask = 0x3FFu;
+        bool enabled = false;
+        bool sparseOnly = false;
+        bool midClipmapEnabled = false;
+        bool surfaceEnabled = false;
+    };
+
     // Render voxels with raymarch shader (binds voxel resources)
     void RenderVoxels(
         ID3D12GraphicsCommandList* cmdList,
@@ -110,7 +145,16 @@ public:
         float regionOriginZ,
         const BrushPreview* brushPreview = nullptr,
         const CharacterPreview* characterPreview = nullptr,
-        const SparseFarField* sparseFarField = nullptr
+        const SparseFarField* sparseFarField = nullptr,
+        const SparseNearField* sparseNearField = nullptr
+    );
+
+    void RenderSparseSurfaceFaces(
+        ID3D12GraphicsCommandList* cmdList,
+        const DescriptorHandle& surfaceFacesSRV,
+        const DescriptorHandle& materialPaletteSRV,
+        uint32_t surfaceFaceCount,
+        const CameraParams& camera
     );
 
     // Render crosshair at screen center
@@ -128,7 +172,9 @@ public:
 
 private:
     Result<void> CreateFullscreenPipeline(ID3D12Device* device);
+    Result<void> CreateSparseSurfacePipeline(ID3D12Device* device);
     Result<void> CreateRTVsForSwapchain();
+    Result<void> CreateDepthBuffer();
 
     // References to core systems (not owned)
     DX12Device* m_device = nullptr;
@@ -141,11 +187,20 @@ private:
 
     // Fullscreen rendering pipeline
     DX12GraphicsPipeline m_fullscreenPipeline;
+    DX12GraphicsPipeline m_sparseSurfacePipeline;
     CompiledShader m_fullscreenVS;
     CompiledShader m_fullscreenPS;
+    CompiledShader m_sparseSurfaceVS;
+    CompiledShader m_sparseSurfacePS;
+    std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_frameConstantUploads;
+    std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_sparseSurfaceConstantUploads;
+    uint32_t m_currentFrameIndex = 0;
+    static constexpr uint64_t kFrameConstantUploadBytes = 320;
 
     // RTV handles for swapchain buffers
     DescriptorHandle m_rtvHandles[VENPOD::Window::BUFFER_COUNT];
+    DescriptorHandle m_dsvHandle;
+    ComPtr<ID3D12Resource> m_depthBuffer;
 
     // Configuration
     RendererConfig m_config;

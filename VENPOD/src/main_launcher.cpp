@@ -8,12 +8,18 @@
 #include "Graphics/RHI/DX12CommandQueue.h"
 #include "Graphics/Renderer.h"
 #include "Graphics/FarVoxelOctree.h"
+#include "Graphics/SparseSurfaceGpuResources.h"
+#include "Graphics/SparseVoxelGpuResources.h"
+#include "Graphics/VoxelRenderBackend.h"
 #include "Simulation/VoxelWorld.h"
 #include "Simulation/TerrainConstants.h"
 #include "Simulation/PhysicsDispatcher.h"
 #include "Simulation/ChunkManager.h"
 #include "Simulation/ChunkGenerationTest.h"  // INFINITE CHUNK TEST HARNESS
 #include "Simulation/ChunkStressTest.h"      // STRESS TESTING FRAMEWORK
+#include "Simulation/SparseBrickRequestPlanner.h"
+#include "Simulation/SparseClipmap.h"
+#include "Simulation/SparseVoxelWorld.h"
 #include "Input/InputManager.h"
 #include "Input/BrushController.h"
 #include "UI/ImGuiBackend.h"
@@ -29,16 +35,21 @@
 #include <filesystem>
 #include <cmath>
 #include <cstring>
+#include <cstdint>
 #include <iostream>
 #include <cstdlib>
 #include <algorithm>
 #include <array>
+#include <deque>
+#include <unordered_set>
+#include <vector>
 
 using namespace VENPOD;
 using namespace VENPOD::Graphics;
 
 // Frame synchronization
 static constexpr uint32_t kFrameCount = Window::BUFFER_COUNT;
+static constexpr uint64_t kFrameStageTraceLimit = 512;
 static constexpr float kBrushDefaultAimDistance = 384.0f;
 static constexpr float kBrushMaxInteractionDistance = 4096.0f;
 static constexpr float kBrushStrokePullSpeed = 250.0f;
@@ -143,6 +154,15 @@ static glm::ivec3 DecodePackedNormal(uint32_t packedNormal, bool& valid) {
     );
 }
 
+static uint32_t PackNormalForReadback(const glm::ivec3& normal, bool valid) {
+    uint32_t packed = 0;
+    packed |= static_cast<uint32_t>(std::clamp(normal.x + 1, 0, 3));
+    packed |= static_cast<uint32_t>(std::clamp(normal.y + 1, 0, 3)) << 2;
+    packed |= static_cast<uint32_t>(std::clamp(normal.z + 1, 0, 3)) << 4;
+    packed |= (valid ? 1u : 0u) << 6;
+    return packed;
+}
+
 static glm::vec3 ApplyCloseTraversalBrushFallback(
     const glm::vec3& rawBrushLocal,
     const glm::vec3& cameraLocal,
@@ -241,6 +261,20 @@ static std::filesystem::path GetExecutableDirectorySandbox() {
     return std::filesystem::current_path();
 }
 
+static uint32_t ReadUIntEnv(const char* name, uint32_t fallbackValue) {
+    const char* value = std::getenv(name);
+    if (!value || value[0] == '\0') {
+        return fallbackValue;
+    }
+
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end == value || parsed > UINT32_MAX) {
+        return fallbackValue;
+    }
+    return static_cast<uint32_t>(parsed);
+}
+
 
 int RunSandbox(int argc, char* argv[]) {
     (void)argc;
@@ -255,8 +289,45 @@ int RunSandbox(int argc, char* argv[]) {
     const bool enableDiagnostics = std::getenv("VENPOD_DIAGNOSTICS") != nullptr;
     const bool enableRuntimeLog = enableDiagnostics || std::getenv("VENPOD_LOG_FILE") != nullptr;
     const bool enableD3DDebug = std::getenv("VENPOD_D3D_DEBUG") != nullptr;
-    const bool enableBoundaryTest = std::getenv("VENPOD_BOUNDARY_TEST") != nullptr;
+    const bool allowInternalTestModes = std::getenv("VENPOD_ENABLE_TEST_MODES") != nullptr;
+    const bool enableBoundaryTest =
+        allowInternalTestModes && std::getenv("VENPOD_BOUNDARY_TEST") != nullptr;
     const bool enableFarSVO = std::getenv("VENPOD_DISABLE_FAR_SVO") == nullptr;
+    const bool highDensityDenseWindow = std::getenv("VENPOD_HIGH_DENSITY") != nullptr;
+    const bool lowMemoryDenseWindow =
+        std::getenv("VENPOD_LOW_MEMORY_DENSE") != nullptr && !highDensityDenseWindow;
+    const bool allowExperimentalSparse = std::getenv("VENPOD_ENABLE_EXPERIMENTAL_SPARSE") != nullptr;
+    const VoxelRenderBackend environmentRenderBackend = RequestedVoxelRenderBackendFromEnvironment();
+    const VoxelRenderBackend requestedRenderBackend =
+        (environmentRenderBackend == VoxelRenderBackend::SparseBrick && !allowExperimentalSparse)
+            ? VoxelRenderBackend::DenseLegacy
+            : environmentRenderBackend;
+    const VoxelRenderBackend activeRenderBackend = VoxelRenderBackend::DenseLegacy;
+    const bool sparseBackendRequested = requestedRenderBackend == VoxelRenderBackend::SparseBrick;
+    const bool enableSparseRaymarch = sparseBackendRequested && std::getenv("VENPOD_SPARSE_RAYMARCH") != nullptr;
+    const bool enableSparseOnlyRaymarch = enableSparseRaymarch && std::getenv("VENPOD_SPARSE_ONLY") != nullptr;
+    const bool enableSparseNearBinding = ReadUIntEnv("VENPOD_SPARSE_BIND_NEAR", 1u) != 0u;
+    const uint32_t sparseNearBindingMask = ReadUIntEnv("VENPOD_SPARSE_BIND_MASK", 0xFFFu);
+    const uint32_t sparseRaymarchWindowVoxels =
+        std::max(64u, ReadUIntEnv("VENPOD_SPARSE_RAY_WINDOW", 64u));
+    const bool enableUnsafeSparseFullRaymarch =
+        ReadUIntEnv("VENPOD_SPARSE_FULL_RAYMARCH", 0u) != 0u;
+    const bool sparseRuntimeTestMode =
+        enableSparseOnlyRaymarch && std::getenv("VENPOD_SPARSE_LEGACY_RUNTIME") == nullptr;
+    const bool disableRuntimePhysics = disablePhysics || sparseRuntimeTestMode;
+    uint32_t sparseRaymarchDebugMode = enableSparseRaymarch
+        ? ReadUIntEnv("VENPOD_SPARSE_DEBUG_MODE", 0u)
+        : 0u;
+    if (enableSparseOnlyRaymarch &&
+        !enableUnsafeSparseFullRaymarch &&
+        sparseRaymarchDebugMode == 0u) {
+        // The temporary full-screen sparse DDA is intentionally gated while the
+        // brick renderer is being refactored; more than one sparse sample per
+        // pixel can still saturate the GPU on startup. Mode 45 keeps sparse
+        // resource binding and first-sample validation active without freezing
+        // the machine.
+        sparseRaymarchDebugMode = 45u;
+    }
 
     if (enableRuntimeLog) {
         auto logPath = GetExecutableDirectorySandbox() / "venpod_runtime.log";
@@ -273,11 +344,30 @@ int RunSandbox(int argc, char* argv[]) {
     spdlog::info("  Target: 100M+ Active Voxels @ 60 FPS");
     spdlog::info("  Static chunks: {} | Physics disabled: {} | Infinite physics: {} | Diagnostics: {} | Boundary test: {} | Far SVO: {}",
         useStaticChunkLayout ? "yes" : "no",
-        disablePhysics ? "yes" : "no",
+        disableRuntimePhysics ? "yes" : "no",
         enableInfinitePhysics ? "yes" : "no",
         enableDiagnostics ? "yes" : "no",
         enableBoundaryTest ? "yes" : "no",
         enableFarSVO ? "yes" : "no");
+    spdlog::info("  Render backend requested: {} | active: {}{}",
+        ToString(requestedRenderBackend),
+        ToString(activeRenderBackend),
+        sparseBackendRequested ? " (sparse backend scaffold active; dense renderer still displays final frame)" : "");
+    if (environmentRenderBackend == VoxelRenderBackend::SparseBrick && !allowExperimentalSparse) {
+        spdlog::warn("  Ignoring VENPOD_RENDER_BACKEND=sparse because VENPOD_ENABLE_EXPERIMENTAL_SPARSE is not set");
+    }
+    if (!allowInternalTestModes && std::getenv("VENPOD_BOUNDARY_TEST") != nullptr) {
+        spdlog::warn("  Ignoring VENPOD_BOUNDARY_TEST because VENPOD_ENABLE_TEST_MODES is not set");
+    }
+    spdlog::info("  Sparse raymarch visual path: {}", enableSparseRaymarch ? "enabled" : "disabled");
+    if (enableSparseRaymarch) {
+        spdlog::info("  Sparse raymarch debug mode: {} | sparse only: {}",
+            sparseRaymarchDebugMode,
+            enableSparseOnlyRaymarch ? "yes" : "no");
+        spdlog::info("  Sparse runtime test mode: {}{}",
+            sparseRuntimeTestMode ? "enabled" : "disabled",
+            sparseRuntimeTestMode ? " (legacy dense streaming bypassed)" : "");
+    }
     spdlog::info("===========================================");
 
     // Initialize DX12 Device
@@ -355,6 +445,205 @@ int RunSandbox(int argc, char* argv[]) {
     if (!rendererResult) {
         spdlog::critical("Failed to initialize renderer: {}", rendererResult.error());
         return 1;
+    }
+
+    SparseVoxelGpuResources sparseGpuResources;
+    SparseSurfaceGpuResources sparseSurfaceGpuResources;
+    Simulation::SparseVoxelWorld sparseVoxelWorld;
+    bool sparseVoxelWorldReady = false;
+    Simulation::SparseVoxelWorldConfig sparseWorldConfig;
+    sparseWorldConfig.maxBrickPages = ReadUIntEnv("VENPOD_SPARSE_MAX_PAGES", sparseWorldConfig.maxBrickPages);
+    sparseWorldConfig.pageTableCapacity = ReadUIntEnv("VENPOD_SPARSE_PAGE_TABLE", sparseWorldConfig.pageTableCapacity);
+    sparseWorldConfig.seed = ReadUIntEnv("VENPOD_SPARSE_SEED", sparseWorldConfig.seed);
+    const uint32_t sparseGenerationBudget = ReadUIntEnv("VENPOD_SPARSE_GENERATION_BUDGET", 4u);
+    const uint32_t sparseUploadBudget = ReadUIntEnv("VENPOD_SPARSE_UPLOAD_BUDGET", 8u);
+    const uint32_t sparseFeedbackGenerationBudget =
+        ReadUIntEnv("VENPOD_SPARSE_FEEDBACK_GENERATION_BUDGET", std::max(8u, sparseGenerationBudget));
+    const uint32_t sparseFeedbackUploadBudget =
+        ReadUIntEnv("VENPOD_SPARSE_FEEDBACK_UPLOAD_BUDGET", std::max(16u, sparseUploadBudget));
+    const uint32_t sparseBootstrapGenerationBudget =
+        ReadUIntEnv("VENPOD_SPARSE_BOOTSTRAP_GENERATION_BUDGET", 16u);
+    const uint32_t sparseBootstrapUploadBudget =
+        ReadUIntEnv("VENPOD_SPARSE_BOOTSTRAP_UPLOAD_BUDGET", 24u);
+    const uint32_t sparseBootstrapResidentTarget = std::min(
+        ReadUIntEnv("VENPOD_SPARSE_BOOTSTRAP_RESIDENT_TARGET", std::min(192u, sparseWorldConfig.maxBrickPages / 2u)),
+        sparseWorldConfig.maxBrickPages);
+    const uint32_t sparseRequestRadiusXz = ReadUIntEnv("VENPOD_SPARSE_REQUEST_RADIUS_XZ", 2u);
+    const uint32_t sparseRequestRadiusY = ReadUIntEnv("VENPOD_SPARSE_REQUEST_RADIUS_Y", 1u);
+    const uint32_t sparseTrimRadiusXz = ReadUIntEnv(
+        "VENPOD_SPARSE_TRIM_RADIUS_XZ",
+        sparseRequestRadiusXz + ReadUIntEnv("VENPOD_SPARSE_PREFETCH_BRICKS", 2u) + 3u);
+    const uint32_t sparseTrimRadiusY = ReadUIntEnv(
+        "VENPOD_SPARSE_TRIM_RADIUS_Y",
+        sparseRequestRadiusY + 2u);
+    const uint32_t sparseTrimBudget = ReadUIntEnv("VENPOD_SPARSE_TRIM_BUDGET", 8u);
+    const uint32_t sparsePressureTrimBudget =
+        ReadUIntEnv("VENPOD_SPARSE_PRESSURE_TRIM_BUDGET", sparseTrimBudget);
+    const uint32_t sparseInvalidationBudget = ReadUIntEnv("VENPOD_SPARSE_INVALIDATION_BUDGET", 16u);
+    const uint32_t sparsePageTablePublishBudget =
+        ReadUIntEnv("VENPOD_SPARSE_PAGE_TABLE_PUBLISH_BUDGET", sparseInvalidationBudget);
+    const uint32_t sparseCollisionShellRadiusXz = ReadUIntEnv("VENPOD_SPARSE_COLLISION_SHELL_XZ", 1u);
+    const uint32_t sparseCollisionShellRadiusY = ReadUIntEnv("VENPOD_SPARSE_COLLISION_SHELL_Y", 1u);
+    const uint32_t sparseNewRequestBudget = ReadUIntEnv("VENPOD_SPARSE_NEW_REQUEST_BUDGET", 16u);
+    const uint32_t sparseTotalRequestBudget =
+        ReadUIntEnv("VENPOD_SPARSE_TOTAL_REQUEST_BUDGET", sparseNewRequestBudget * 2u);
+    const uint32_t sparseSpeculativeRequestBudget =
+        ReadUIntEnv("VENPOD_SPARSE_SPECULATIVE_REQUEST_BUDGET", std::max(1u, sparseNewRequestBudget / 2u));
+    const uint32_t sparseSpeculativeBackpressureGenQueue =
+        ReadUIntEnv("VENPOD_SPARSE_SPEC_BACKPRESSURE_GEN_QUEUE",
+            std::max(32u, sparseWorldConfig.maxBrickPages / 8u));
+    const uint32_t sparseSpeculativeBackpressureMissPending =
+        ReadUIntEnv("VENPOD_SPARSE_SPEC_BACKPRESSURE_MISS_PENDING", 32u);
+    const uint32_t sparseVisibleRequestBudget =
+        ReadUIntEnv("VENPOD_SPARSE_VISIBLE_REQUEST_BUDGET", sparseNewRequestBudget);
+    const uint32_t sparseCollisionRequestBudget =
+        ReadUIntEnv("VENPOD_SPARSE_COLLISION_REQUEST_BUDGET", sparseNewRequestBudget);
+    const uint32_t sparseReplacementBudget =
+        ReadUIntEnv("VENPOD_SPARSE_REPLACEMENT_BUDGET", std::max(1u, sparseVisibleRequestBudget));
+    const uint32_t sparseMinFreePages = ReadUIntEnv(
+        "VENPOD_SPARSE_MIN_FREE_PAGES",
+        std::max(16u, sparseWorldConfig.maxBrickPages / 8u));
+    const uint32_t sparseTrimStartResident = std::min(
+        ReadUIntEnv(
+            "VENPOD_SPARSE_TRIM_START_RESIDENT",
+            sparseWorldConfig.maxBrickPages > sparseMinFreePages
+                ? sparseWorldConfig.maxBrickPages - sparseMinFreePages
+                : sparseWorldConfig.maxBrickPages),
+        sparseWorldConfig.maxBrickPages);
+    const uint32_t sparseRayPrefetchDistance = ReadUIntEnv("VENPOD_SPARSE_RAY_PREFETCH_DISTANCE", 192u);
+    const uint32_t sparseRayPrefetchStride = std::max(4u, ReadUIntEnv("VENPOD_SPARSE_RAY_PREFETCH_STRIDE", 16u));
+    const uint32_t sparseRayPrefetchMaxRequests = ReadUIntEnv("VENPOD_SPARSE_RAY_PREFETCH_MAX_REQUESTS", 16u);
+    const uint32_t sparseViewPrefetchRayGrid = ReadUIntEnv("VENPOD_SPARSE_VIEW_PREFETCH_RAYS", 3u);
+    const uint32_t sparsePredictivePrefetchMs = ReadUIntEnv("VENPOD_SPARSE_PREDICTIVE_PREFETCH_MS", 250u);
+    const bool enableSparseMissFeedback =
+        sparseBackendRequested && ReadUIntEnv("VENPOD_SPARSE_MISS_FEEDBACK", 0u) != 0u;
+    const uint32_t sparseMissFeedbackMaxRecords = ReadUIntEnv("VENPOD_SPARSE_MISS_FEEDBACK_RECORDS", 256u);
+    const uint32_t sparseMissFeedbackRayGrid = ReadUIntEnv("VENPOD_SPARSE_MISS_FEEDBACK_RAYS", 5u);
+    const uint32_t sparseMissFeedbackDistance = ReadUIntEnv("VENPOD_SPARSE_MISS_FEEDBACK_DISTANCE", 256u);
+    const uint32_t sparseMissFeedbackStride = std::max(4u, ReadUIntEnv("VENPOD_SPARSE_MISS_FEEDBACK_STRIDE", 16u));
+    const uint32_t sparseMissFeedbackInterval = std::max(1u, ReadUIntEnv(
+        "VENPOD_SPARSE_MISS_FEEDBACK_INTERVAL",
+        30u));
+    const bool enableSparseSurfaceUpload =
+        sparseBackendRequested && ReadUIntEnv("VENPOD_SPARSE_SURFACE_UPLOAD", 1u) != 0u;
+    const bool enableSparseSurfaceRaster =
+        sparseBackendRequested && ReadUIntEnv("VENPOD_SPARSE_SURFACE_RASTER", 1u) != 0u;
+    uint32_t sparseSurfaceUploadedSerial = 0;
+    uint32_t sparseSurfaceUploadRetriesLastFrame = 0;
+    uint32_t sparseSurfaceRasterFacesLastFrame = 0;
+    Simulation::SparseClipmapConfig sparseClipmapConfig;
+    sparseClipmapConfig.enabled =
+        sparseBackendRequested && ReadUIntEnv("VENPOD_SPARSE_MID_CLIPMAP", 1u) != 0u;
+    sparseClipmapConfig.startDistance =
+        static_cast<float>(ReadUIntEnv("VENPOD_SPARSE_MID_START", 520u));
+    sparseClipmapConfig.endDistance =
+        static_cast<float>(ReadUIntEnv("VENPOD_SPARSE_MID_END", 4200u));
+    sparseClipmapConfig.minCellSize =
+        static_cast<float>(ReadUIntEnv("VENPOD_SPARSE_MID_CELL", 16u));
+    sparseClipmapConfig.nearExitPadding =
+        static_cast<float>(ReadUIntEnv("VENPOD_SPARSE_MID_NEAR_PADDING", 12u));
+    sparseClipmapConfig.ringCount = ReadUIntEnv("VENPOD_SPARSE_MID_RINGS", 4u);
+    sparseClipmapConfig.tileRadius = ReadUIntEnv("VENPOD_SPARSE_MID_TILE_RADIUS", 2u);
+    sparseClipmapConfig.tileSampleSide = ReadUIntEnv("VENPOD_SPARSE_MID_TILE_SIDE", 33u);
+    sparseClipmapConfig.maxTiles = ReadUIntEnv("VENPOD_SPARSE_MID_MAX_TILES", 128u);
+    sparseClipmapConfig.voxelClipmapEnabled =
+        ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_CLIPMAP", 1u) != 0u;
+    sparseClipmapConfig.voxelBrickRadiusXz = ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ", 2u);
+    sparseClipmapConfig.voxelBrickRadiusY = ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_RADIUS_Y", 1u);
+    sparseClipmapConfig.maxVoxelBricks = ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_MAX_BRICKS", 128u);
+    sparseClipmapConfig.seed = sparseWorldConfig.seed;
+    const uint32_t sparseMidClipmapTileBudget = ReadUIntEnv("VENPOD_SPARSE_MID_TILE_BUDGET", 4u);
+    Simulation::SparseClipmapPolicy sparseClipmapPolicy(sparseClipmapConfig);
+    Simulation::SparseClipmapTileCache sparseClipmapTileCache;
+    bool sparseClipmapTileCacheReady = false;
+    uint32_t sparseMidClipmapUploadedHeightSerial = 0;
+    uint32_t sparseMidClipmapUploadedVoxelSerial = 0;
+    uint32_t sparseMidClipmapUploadRetriesLastFrame = 0;
+    if (sparseBackendRequested) {
+        sparseClipmapTileCacheReady = sparseClipmapTileCache.Initialize(sparseClipmapPolicy.Config());
+        spdlog::info(
+            "Sparse mid clipmap {}: start={:.0f} end={:.0f} cell={:.0f} rings={} tileRadius={} tileSide={} maxTiles={} budget={}",
+            sparseClipmapPolicy.IsEnabled() ? "enabled" : "disabled",
+            sparseClipmapPolicy.Config().startDistance,
+            sparseClipmapPolicy.Config().endDistance,
+            sparseClipmapPolicy.Config().minCellSize,
+            sparseClipmapPolicy.Config().ringCount,
+            sparseClipmapPolicy.Config().tileRadius,
+            sparseClipmapPolicy.Config().tileSampleSide,
+            sparseClipmapPolicy.Config().maxTiles,
+            sparseMidClipmapTileBudget);
+    }
+    Simulation::SparseBrickRequestPlanner sparseRequestPlanner({
+        sparseRequestRadiusXz,
+        sparseRequestRadiusY,
+        ReadUIntEnv("VENPOD_SPARSE_PREFETCH_BRICKS", 2u),
+        ReadUIntEnv("VENPOD_SPARSE_MAX_REQUESTS", 128u)
+    });
+    Simulation::BrickCoord lastSparseRequestCenter{
+        INT32_MIN,
+        INT32_MIN,
+        INT32_MIN
+    };
+    bool sparseGpuPageTableResetPending = false;
+
+    if (sparseBackendRequested) {
+        SparseVoxelGpuConfig sparseConfig;
+        sparseConfig.maxBrickPages = sparseWorldConfig.maxBrickPages;
+        sparseConfig.pageTableCapacity = sparseWorldConfig.pageTableCapacity;
+        sparseConfig.uploadBytesPerSlot = ReadUIntEnv("VENPOD_SPARSE_UPLOAD_SLOT_BYTES", sparseConfig.uploadBytesPerSlot);
+        sparseConfig.missFeedbackMaxRecords = sparseMissFeedbackMaxRecords;
+        sparseConfig.midClipmapMaxTiles = sparseClipmapPolicy.Config().maxTiles;
+        sparseConfig.midClipmapTileSampleSide = sparseClipmapPolicy.Config().tileSampleSide;
+        sparseConfig.midVoxelClipmapMaxBricks = sparseClipmapPolicy.Config().maxVoxelBricks;
+
+        sparseVoxelWorldReady = sparseVoxelWorld.Initialize(sparseWorldConfig);
+        if (!sparseVoxelWorldReady) {
+            spdlog::error("Sparse CPU world initialization failed");
+        } else {
+            spdlog::info(
+                "Sparse CPU world scaffold initialized: pages={} table={} genBudget={} uploadBudget={} requestRadius={}x{}",
+                sparseWorldConfig.maxBrickPages,
+                sparseWorldConfig.pageTableCapacity,
+                sparseGenerationBudget,
+                sparseUploadBudget,
+                sparseRequestRadiusXz,
+                sparseRequestRadiusY);
+        }
+
+        auto sparseGpuResult = sparseGpuResources.Initialize(
+            device->GetDevice(),
+            renderer->GetHeapManager(),
+            sparseConfig);
+        if (!sparseGpuResult) {
+            spdlog::error("Sparse GPU resource initialization failed: {}", sparseGpuResult.error());
+        } else {
+            spdlog::info("Sparse backend GPU resource scaffold is active; rendering still uses dense legacy fallback");
+            sparseGpuPageTableResetPending = true;
+        }
+
+        if (enableSparseSurfaceUpload) {
+            SparseSurfaceGpuConfig surfaceConfig;
+            surfaceConfig.maxFaces = ReadUIntEnv("VENPOD_SPARSE_SURFACE_MAX_FACES", surfaceConfig.maxFaces);
+            surfaceConfig.maxBrickRanges = ReadUIntEnv("VENPOD_SPARSE_SURFACE_MAX_RANGES", surfaceConfig.maxBrickRanges);
+            surfaceConfig.uploadBytesPerSlot =
+                ReadUIntEnv("VENPOD_SPARSE_SURFACE_UPLOAD_SLOT_BYTES", surfaceConfig.uploadBytesPerSlot);
+            auto surfaceGpuResult = sparseSurfaceGpuResources.Initialize(
+                device->GetDevice(),
+                renderer->GetHeapManager(),
+                surfaceConfig);
+            if (!surfaceGpuResult) {
+                spdlog::error("Sparse surface GPU resource initialization failed: {}", surfaceGpuResult.error());
+            } else {
+                spdlog::info(
+                    "Sparse surface GPU buffers initialized: faces={} ranges={} uploadSlotMB={:.2f}",
+                    surfaceConfig.maxFaces,
+                    surfaceConfig.maxBrickRanges,
+                    static_cast<double>(surfaceConfig.uploadBytesPerSlot) / (1024.0 * 1024.0));
+            }
+        } else if (sparseBackendRequested) {
+            spdlog::info("Sparse surface GPU upload disabled by VENPOD_SPARSE_SURFACE_UPLOAD=0");
+        }
+        spdlog::info("Sparse surface raster path: {}", enableSparseSurfaceRaster ? "enabled" : "disabled");
     }
 
     FarVoxelOctree farVoxelOctree;
@@ -520,13 +809,36 @@ int RunSandbox(int argc, char* argv[]) {
     // Initialize VoxelWorld
     auto voxelWorld = std::make_unique<Simulation::VoxelWorld>();
     Simulation::VoxelWorldConfig voxelConfig;
-    // Moving 3D render window: 15x7x15 chunks. This preserves the large-world
-    // feel while giving extreme terrain enough above-camera headroom to avoid
-    // visible clipping planes at spawn. Longer distance needs a future far-LOD
-    // pass rather than expanding the dense editable buffer horizontally.
+    // The dense streaming/copy path assumes the TerrainConstants render-window
+    // dimensions. Those constants are currently a temporary dev harness size;
+    // high effective render distance moves to sparse bricks and clipmaps.
     voxelConfig.gridSizeX = Simulation::RENDER_BUFFER_VOXELS_X;
     voxelConfig.gridSizeY = Simulation::RENDER_BUFFER_VOXELS_Y;
     voxelConfig.gridSizeZ = Simulation::RENDER_BUFFER_VOXELS_Z;
+    if (lowMemoryDenseWindow) {
+        voxelConfig.gridSizeX = ReadUIntEnv("VENPOD_DENSE_GRID_X", 832u);
+        voxelConfig.gridSizeY = ReadUIntEnv("VENPOD_DENSE_GRID_Y", 320u);
+        voxelConfig.gridSizeZ = ReadUIntEnv("VENPOD_DENSE_GRID_Z", 832u);
+        spdlog::warn(
+            "Low-memory dense profile: {}x{}x{}; dense copy constants still expect {}x{}x{}, so visual coverage is partial",
+            voxelConfig.gridSizeX,
+            voxelConfig.gridSizeY,
+            voxelConfig.gridSizeZ,
+            Simulation::RENDER_BUFFER_VOXELS_X,
+            Simulation::RENDER_BUFFER_VOXELS_Y,
+            Simulation::RENDER_BUFFER_VOXELS_Z);
+    }
+    if (sparseRuntimeTestMode) {
+        voxelWorld->SetUseInfiniteChunks(false);
+        voxelConfig.gridSizeX = ReadUIntEnv("VENPOD_SPARSE_TEST_GRID_X", 512u);
+        voxelConfig.gridSizeY = ReadUIntEnv("VENPOD_SPARSE_TEST_GRID_Y", 384u);
+        voxelConfig.gridSizeZ = ReadUIntEnv("VENPOD_SPARSE_TEST_GRID_Z", 512u);
+        spdlog::info(
+            "Sparse runtime test mode: dense VoxelWorld reduced to {}x{}x{} and infinite chunk streaming disabled",
+            voxelConfig.gridSizeX,
+            voxelConfig.gridSizeY,
+            voxelConfig.gridSizeZ);
+    }
 
     // Need a one-time command list for upload
     ComPtr<ID3D12GraphicsCommandList> initCommandList;
@@ -582,7 +894,7 @@ int RunSandbox(int argc, char* argv[]) {
 
     // Initialize voxels with test pattern (ONLY if NOT using infinite chunks)
     // When using infinite chunks, the chunk system manages terrain generation
-    if (!voxelWorld->IsUsingInfiniteChunks()) {
+    if (!voxelWorld->IsUsingInfiniteChunks() && !sparseRuntimeTestMode) {
         physicsDispatcher->DispatchInitialize(initCommandList.Get(), *voxelWorld, 12345);
 
         // CRITICAL: Swap buffers so the initialized data becomes the "read" buffer
@@ -590,6 +902,8 @@ int RunSandbox(int argc, char* argv[]) {
         // to make that data available as the READ buffer for rendering
         voxelWorld->SwapBuffers();
         spdlog::info("Initialized 256^3 voxel grid with procedural terrain (CS_Initialize)");
+    } else if (sparseRuntimeTestMode) {
+        spdlog::info("Sparse runtime test mode: skipping dense CS_Initialize; sparse pages are authoritative");
     } else {
         // Infinite streaming now gates dense-buffer reads through a tiny
         // per-chunk valid mask. Startup only needs the masks cleared on the
@@ -757,7 +1071,35 @@ int RunSandbox(int argc, char* argv[]) {
     // Terrain ready flag - don't apply gravity until ground detection works
     // This prevents the camera from falling through the world during startup
     // before chunks have been generated
-    bool terrainReady = false;
+    bool terrainReady = sparseRuntimeTestMode || (sparseBackendRequested && sparseVoxelWorldReady);
+
+    if (sparseBackendRequested && sparseVoxelWorldReady) {
+        const float spawnProbeY = std::max(cameraPos.y + 256.0f, 720.0f);
+        const auto spawnGround = sparseVoxelWorld.Raycast(
+            cameraPos.x,
+            spawnProbeY,
+            cameraPos.z,
+            0.0f,
+            -1.0f,
+            0.0f,
+            1400.0f);
+        if (spawnGround.hit) {
+            cameraPos.y = static_cast<float>(spawnGround.voxelY) + 1.0f + playerHeight;
+            cameraVelocityY = 0.0f;
+            spdlog::info(
+                "Sparse spawn placed on generated terrain at world=({:.1f},{:.1f},{:.1f}) groundY={}",
+                cameraPos.x,
+                cameraPos.y,
+                cameraPos.z,
+                spawnGround.voxelY);
+        } else {
+            spdlog::warn(
+                "Sparse spawn probe found no ground at xz=({:.1f},{:.1f}); keeping default Y {:.1f}",
+                cameraPos.x,
+                cameraPos.z,
+                cameraPos.y);
+        }
+    }
 
     // Player position represents feet/collision point
     // Camera rendering position is offset upward by playerHeight for natural eye-level view
@@ -766,6 +1108,8 @@ int RunSandbox(int argc, char* argv[]) {
     bool running = true;
     bool paused = false;
     uint64_t frameCount = 0;
+    const uint32_t exitAfterFrames = ReadUIntEnv("VENPOD_EXIT_AFTER_FRAMES", 0u);
+    const bool traceFrameStages = std::getenv("VENPOD_TRACE_FRAME_STAGES") != nullptr;
     bool mouseInitialized = false;  // Track if mouse capture has been enabled
     uint64_t lastFrameCounter = SDL_GetPerformanceCounter();
     const double performanceFrequency = static_cast<double>(SDL_GetPerformanceFrequency());
@@ -774,9 +1118,31 @@ int RunSandbox(int argc, char* argv[]) {
     uint64_t physicsDispatchCount = 0;
     uint64_t physicsBudgetSkipCount = 0;
     uint32_t currentCopyBudget = voxelWorld->GetMaxChunkCopiesPerFrame();
-    uint32_t currentGenerationBudget = 3;
-    float currentRaymarchMaxDistance = 3000.0f;
-    uint32_t currentRaymarchMaxSteps = 2048;
+    const uint32_t denseGenerationMax = ReadUIntEnv(
+        "VENPOD_DENSE_GENERATION_MAX",
+        highDensityDenseWindow ? 12u : 8u);
+    uint32_t currentGenerationBudget = std::min<uint32_t>(3u, denseGenerationMax);
+    const float denseRaymarchDefaultDistance = static_cast<float>(ReadUIntEnv(
+        "VENPOD_RAYMARCH_MAX_DISTANCE",
+        lowMemoryDenseWindow ? 1400u : 3000u));
+    const uint32_t denseRaymarchDefaultSteps = ReadUIntEnv(
+        "VENPOD_RAYMARCH_MAX_STEPS",
+        lowMemoryDenseWindow ? 1152u : 2048u);
+    const float sparseRaymarchDefaultDistance = static_cast<float>(ReadUIntEnv(
+        "VENPOD_SPARSE_RAYMARCH_MAX_DISTANCE",
+        64u));
+    const uint32_t sparseRaymarchDefaultSteps = ReadUIntEnv(
+        "VENPOD_SPARSE_RAYMARCH_MAX_STEPS",
+        16u);
+    const float sparseRaymarchMaxScale = std::max(
+        0.10f,
+        static_cast<float>(ReadUIntEnv("VENPOD_SPARSE_RAYMARCH_MAX_SCALE_PERCENT", 100u)) / 100.0f);
+    float currentRaymarchMaxDistance = enableSparseRaymarch
+        ? sparseRaymarchDefaultDistance
+        : denseRaymarchDefaultDistance;
+    uint32_t currentRaymarchMaxSteps = enableSparseRaymarch
+        ? sparseRaymarchDefaultSteps
+        : denseRaymarchDefaultSteps;
     float currentFarFieldQuality = 1.0f;
     float currentRenderQuality = 1.0f;
     float perfFenceWaitMs = 0.0f;
@@ -805,7 +1171,26 @@ int RunSandbox(int argc, char* argv[]) {
     uint32_t physicsDirtyFramesRemaining = 0;
     uint64_t physicsDirtyEvents = 0;
     glm::vec3 lastPhysicsSchedulerCameraWorld = cameraPos;
+    glm::vec3 lastSparseResidencyCameraWorld = cameraPos;
     glm::vec3 lastBoundaryTestCameraWorld = cameraPos;
+    std::vector<Simulation::BrickCoord> sparseMissFeedbackPending;
+    uint32_t sparseMissFeedbackConsumedLastFrame = 0;
+    uint32_t sparseSpeculativeRequestsLastFrame = 0;
+    uint32_t sparseVisibleRequestsLastFrame = 0;
+    uint32_t sparseCollisionRequestsLastFrame = 0;
+    uint32_t sparsePressureTrimLastFrame = 0;
+    uint32_t sparseReplacementEvictionsLastFrame = 0;
+    uint32_t sparseSpeculativeBackpressureSkipsLastFrame = 0;
+    uint32_t sparseDistanceTrimSkippedLastFrame = 0;
+    uint32_t sparseUploadRequeuesLastFrame = 0;
+    uint32_t sparseInvalidationRequeuesLastFrame = 0;
+    uint32_t sparsePageTablePublishRetriesLastFrame = 0;
+    uint32_t sparseGenerationBudgetLastFrame = 0;
+    uint32_t sparseUploadBudgetLastFrame = 0;
+    uint32_t sparseMidClipmapBudgetLastFrame = 0;
+    float sparseRuntimeBudgetScale = 1.0f;
+    float sparseRaymarchBudgetScale = 1.0f;
+    std::deque<uint32_t> sparsePendingPageTablePublishes;
     float boundaryTestElapsedSeconds = 0.0f;
 
     auto setPauseMenuOpen = [&](bool open) {
@@ -871,23 +1256,28 @@ int RunSandbox(int argc, char* argv[]) {
             previousStreamingStats.chunksNotLoadedLastFrame > 0;
 
         const float schedulerPressureMs = std::max(smoothedFrameMs, schedulerPredictedFrameMs);
+        const float gpuSchedulerPressureMs = gpuTiming.valid
+            ? std::max(static_cast<float>(gpuTiming.frameMs), static_cast<float>(gpuTiming.raymarchMs))
+            : 0.0f;
+        const float combinedSchedulerPressureMs =
+            std::max(schedulerPressureMs, gpuSchedulerPressureMs);
 
         uint32_t targetCopyBudget = 40;
         uint32_t targetGenerationBudget = 3;
         float targetFarFieldQuality = 1.0f;
-        if (lastRawFrameMs > 30.0f || schedulerPressureMs > 21.0f) {
+        if (lastRawFrameMs > 30.0f || combinedSchedulerPressureMs > 21.0f) {
             targetCopyBudget = 8;
             targetGenerationBudget = 0;
             targetFarFieldQuality = 0.45f;
-        } else if (lastRawFrameMs > 24.0f || schedulerPressureMs > 19.0f) {
+        } else if (lastRawFrameMs > 24.0f || combinedSchedulerPressureMs > 19.0f) {
             targetCopyBudget = 12;
             targetGenerationBudget = 1;
             targetFarFieldQuality = 0.60f;
-        } else if (schedulerPressureMs > 18.0f) {
+        } else if (combinedSchedulerPressureMs > 18.0f) {
             targetCopyBudget = 16;
             targetGenerationBudget = 1;
             targetFarFieldQuality = 0.75f;
-        } else if (schedulerPressureMs > 17.0f) {
+        } else if (combinedSchedulerPressureMs > 17.0f) {
             targetCopyBudget = 24;
             targetGenerationBudget = 3;
             targetFarFieldQuality = 0.88f;
@@ -920,10 +1310,11 @@ int RunSandbox(int argc, char* argv[]) {
             targetCopyBudget = std::max<uint32_t>(targetCopyBudget, 56u);
             targetGenerationBudget = std::max<uint32_t>(targetGenerationBudget, 24u);
         }
+        targetGenerationBudget = std::min<uint32_t>(targetGenerationBudget, denseGenerationMax);
 
         if (streamingStillFilling || sourceStillFilling) {
             currentCopyBudget = std::max(currentCopyBudget, std::min<uint32_t>(targetCopyBudget, 56u));
-            currentGenerationBudget = std::max(currentGenerationBudget, std::min<uint32_t>(targetGenerationBudget, 24u));
+            currentGenerationBudget = std::max(currentGenerationBudget, targetGenerationBudget);
         } else if (targetCopyBudget < currentCopyBudget) {
             currentCopyBudget = targetCopyBudget;
         } else if (targetCopyBudget > currentCopyBudget && (frameCount % 8 == 0)) {
@@ -934,13 +1325,65 @@ int RunSandbox(int argc, char* argv[]) {
         } else if (!streamingStillFilling && !sourceStillFilling && targetGenerationBudget > currentGenerationBudget && (frameCount % 12 == 0)) {
             currentGenerationBudget = std::min(targetGenerationBudget, currentGenerationBudget + 2u);
         }
-        currentRaymarchMaxDistance = 3000.0f;
-        currentRaymarchMaxSteps = 2048;
+        if (enableSparseRaymarch) {
+            float targetSparseRaymarchScale = sparseRaymarchMaxScale;
+            if (gpuTiming.valid && combinedSchedulerPressureMs > 19.0f) {
+                targetSparseRaymarchScale = std::min(targetSparseRaymarchScale, 0.45f);
+            } else if (gpuTiming.valid && combinedSchedulerPressureMs > 17.0f) {
+                targetSparseRaymarchScale = std::min(targetSparseRaymarchScale, 0.62f);
+            } else if (gpuTiming.valid && combinedSchedulerPressureMs > 15.5f) {
+                targetSparseRaymarchScale = std::min(targetSparseRaymarchScale, 0.78f);
+            }
+            const float sparseScaleStep = targetSparseRaymarchScale < sparseRaymarchBudgetScale ? 0.22f : 0.035f;
+            sparseRaymarchBudgetScale += (targetSparseRaymarchScale - sparseRaymarchBudgetScale) * sparseScaleStep;
+            sparseRaymarchBudgetScale = std::clamp(sparseRaymarchBudgetScale, 0.20f, sparseRaymarchMaxScale);
+
+            currentRaymarchMaxDistance = std::max(32.0f, sparseRaymarchDefaultDistance * sparseRaymarchBudgetScale);
+            currentRaymarchMaxSteps = std::max<uint32_t>(
+                4u,
+                static_cast<uint32_t>(std::floor(static_cast<float>(sparseRaymarchDefaultSteps) * sparseRaymarchBudgetScale + 0.5f)));
+        } else {
+            currentRaymarchMaxDistance = denseRaymarchDefaultDistance;
+            currentRaymarchMaxSteps = denseRaymarchDefaultSteps;
+        }
         currentFarFieldQuality += (targetFarFieldQuality - currentFarFieldQuality) * 0.08f;
         currentRenderQuality = 1.0f;
         voxelWorld->SetMaxChunkCopiesPerFrame(currentCopyBudget);
         const uint32_t trailingGenerationBudget = currentGenerationBudget;
         voxelWorld->SetChunkGenerationBudget(0);
+
+        sparseRuntimeBudgetScale = 1.0f;
+        if (sparseBackendRequested && sparseVoxelWorldReady) {
+            const auto& sparseStatsForScheduler = sparseVoxelWorld.GetStats();
+            const auto& sparseGpuStatsForScheduler = sparseGpuResources.GetStats();
+            const bool sparseQueueBacklog =
+                sparseStatsForScheduler.generationQueuedBricks > 0 ||
+                sparseStatsForScheduler.uploadQueuedBricks > 0 ||
+                !sparseMissFeedbackPending.empty() ||
+                sparseClipmapTileCache.GetStats().queuedTiles > 0 ||
+                sparseClipmapTileCache.GetStats().queuedVoxelBricks > 0;
+            const bool sparseUploadPressure =
+                sparseGpuStatsForScheduler.uploadRingOverflowLastFrame ||
+                sparseGpuStatsForScheduler.stagedBytesLastFrame >
+                    (sparseGpuStatsForScheduler.uploadRingBytes / std::max(1u, sparseWorldConfig.maxBrickPages / 512u));
+            if (lastRawFrameMs > 30.0f || combinedSchedulerPressureMs > 21.0f || sparseUploadPressure) {
+                sparseRuntimeBudgetScale = 0.35f;
+            } else if (combinedSchedulerPressureMs > 19.0f) {
+                sparseRuntimeBudgetScale = 0.55f;
+            } else if (combinedSchedulerPressureMs > 17.0f) {
+                sparseRuntimeBudgetScale = 0.75f;
+            } else if (sparseQueueBacklog && combinedSchedulerPressureMs < 14.5f) {
+                sparseRuntimeBudgetScale = 1.35f;
+            }
+        }
+
+        auto scaleRuntimeBudget = [](uint32_t budget, float scale, uint32_t minIfNonZero = 0u) -> uint32_t {
+            if (budget == 0) {
+                return 0;
+            }
+            const uint32_t scaled = static_cast<uint32_t>(std::floor(static_cast<float>(budget) * scale + 0.5f));
+            return std::max(minIfNonZero, scaled);
+        };
 
         // Process SDL events FIRST to update mouse/keyboard state
         SDL_Event event;
@@ -1134,12 +1577,257 @@ int RunSandbox(int argc, char* argv[]) {
             lastBoundaryTestCameraWorld = cameraPos;
         }
 
+        if (sparseBackendRequested && sparseVoxelWorldReady) {
+            const Simulation::BrickCoord sparseCenter =
+                Simulation::BrickCoord::FromWorldVoxel(
+                    static_cast<int32_t>(std::floor(cameraPos.x)),
+                    static_cast<int32_t>(std::floor(cameraPos.y - playerHeight)),
+                    static_cast<int32_t>(std::floor(cameraPos.z)));
+
+            uint32_t sparseNewRequestsThisFrame = 0;
+            uint32_t sparseSpeculativeRequestsThisFrame = 0;
+            uint32_t sparseVisibleRequestsThisFrame = 0;
+            uint32_t sparseCollisionRequestsThisFrame = 0;
+            const uint32_t sparseResidencyFrame =
+                static_cast<uint32_t>(std::min<uint64_t>(
+                    frameCount,
+                    static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())));
+            sparsePressureTrimLastFrame = 0;
+            sparseReplacementEvictionsLastFrame = 0;
+            sparseSpeculativeBackpressureSkipsLastFrame = 0;
+            sparseDistanceTrimSkippedLastFrame = 0;
+            sparseGenerationBudgetLastFrame = 0;
+            sparseMidClipmapBudgetLastFrame = 0;
+            if (sparsePressureTrimBudget > 0 &&
+                !sparseMissFeedbackPending.empty() &&
+                sparseVoxelWorld.GetStats().freePages <= sparseMinFreePages) {
+                sparsePressureTrimLastFrame = sparseVoxelWorld.TrimResidentBricks(
+                    sparseCenter,
+                    sparseTrimRadiusXz,
+                    sparseTrimRadiusY,
+                    sparsePressureTrimBudget);
+            }
+            auto requestSparseBrick = [&](
+                const Simulation::BrickCoord& coord,
+                bool urgent,
+                Simulation::SparseResidencyClass residencyClass = Simulation::SparseResidencyClass::Speculative) {
+                if (sparseVoxelWorld.GetPool().TryGetPage(coord)) {
+                    sparseVoxelWorld.TouchResidencyClass(coord, residencyClass, sparseResidencyFrame);
+                    return true;
+                }
+                const auto& stats = sparseVoxelWorld.GetStats();
+                const uint32_t minFreePages = urgent ? std::min(4u, sparseMinFreePages) : sparseMinFreePages;
+                if (residencyClass == Simulation::SparseResidencyClass::Speculative &&
+                    (stats.generationQueuedBricks >= sparseSpeculativeBackpressureGenQueue ||
+                     sparseMissFeedbackPending.size() >= sparseSpeculativeBackpressureMissPending ||
+                     stats.freePages <= sparseMinFreePages)) {
+                    ++sparseSpeculativeBackpressureSkipsLastFrame;
+                    return false;
+                }
+                uint32_t* classCounter = &sparseSpeculativeRequestsThisFrame;
+                uint32_t classBudget = sparseSpeculativeRequestBudget;
+                if (residencyClass == Simulation::SparseResidencyClass::Visible) {
+                    classCounter = &sparseVisibleRequestsThisFrame;
+                    classBudget = sparseVisibleRequestBudget;
+                } else if (residencyClass == Simulation::SparseResidencyClass::Collision ||
+                           residencyClass == Simulation::SparseResidencyClass::Edited) {
+                    classCounter = &sparseCollisionRequestsThisFrame;
+                    classBudget = sparseCollisionRequestBudget;
+                }
+                bool madeReplacementRoom = false;
+                if (stats.freePages <= minFreePages &&
+                    residencyClass != Simulation::SparseResidencyClass::Speculative &&
+                    sparseReplacementEvictionsLastFrame < sparseReplacementBudget) {
+                    const uint32_t evicted = sparseVoxelWorld.EvictLowerPriorityForRequest(
+                        sparseCenter,
+                        residencyClass,
+                        std::max(1u, sparseCollisionShellRadiusXz),
+                        sparseCollisionShellRadiusY,
+                        1u,
+                        sparseResidencyFrame);
+                    sparseReplacementEvictionsLastFrame += evicted;
+                    madeReplacementRoom = evicted > 0;
+                }
+                const auto& statsAfterReplacement = sparseVoxelWorld.GetStats();
+                if (statsAfterReplacement.freePages == 0 ||
+                    (statsAfterReplacement.freePages <= minFreePages && !madeReplacementRoom) ||
+                    sparseNewRequestsThisFrame >= sparseTotalRequestBudget ||
+                    *classCounter >= classBudget) {
+                    return false;
+                }
+                if (!sparseVoxelWorld.RequestBrick(coord)) {
+                    return false;
+                }
+                sparseVoxelWorld.TouchResidencyClass(coord, residencyClass, sparseResidencyFrame);
+                ++sparseNewRequestsThisFrame;
+                ++(*classCounter);
+                return true;
+            };
+
+            sparseMissFeedbackConsumedLastFrame = 0;
+            if (!sparseMissFeedbackPending.empty()) {
+                std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash> consumedThisFrame;
+                size_t readIndex = 0;
+                size_t writeIndex = 0;
+                for (; readIndex < sparseMissFeedbackPending.size(); ++readIndex) {
+                    const Simulation::BrickCoord coord = sparseMissFeedbackPending[readIndex];
+                    if (!consumedThisFrame.insert(coord).second) {
+                        ++sparseMissFeedbackConsumedLastFrame;
+                        continue;
+                    }
+                    if (!requestSparseBrick(coord, true, Simulation::SparseResidencyClass::Visible)) {
+                        break;
+                    }
+                    ++sparseMissFeedbackConsumedLastFrame;
+                }
+                for (; readIndex < sparseMissFeedbackPending.size(); ++readIndex) {
+                    sparseMissFeedbackPending[writeIndex++] = sparseMissFeedbackPending[readIndex];
+                }
+                sparseMissFeedbackPending.resize(writeIndex);
+            }
+
+            if (sparseCenter != lastSparseRequestCenter) {
+                const int32_t sparseForwardX = cameraForward.x > 0.35f ? 1 : (cameraForward.x < -0.35f ? -1 : 0);
+                const int32_t sparseForwardY = cameraForward.y > 0.45f ? 1 : (cameraForward.y < -0.45f ? -1 : 0);
+                const int32_t sparseForwardZ = cameraForward.z > 0.35f ? 1 : (cameraForward.z < -0.35f ? -1 : 0);
+                const auto sparseRequests = sparseRequestPlanner.Plan(
+                    sparseCenter,
+                    sparseForwardX,
+                    sparseForwardY,
+                    sparseForwardZ);
+                for (const auto& request : sparseRequests) {
+                    requestSparseBrick(request.coord, true, Simulation::SparseResidencyClass::Visible);
+                }
+                lastSparseRequestCenter = sparseCenter;
+            }
+
+            const int32_t collisionRadiusXz = static_cast<int32_t>(sparseCollisionShellRadiusXz);
+            const int32_t collisionRadiusY = static_cast<int32_t>(sparseCollisionShellRadiusY);
+                for (int32_t dz = -collisionRadiusXz; dz <= collisionRadiusXz; ++dz) {
+                for (int32_t dy = -collisionRadiusY; dy <= collisionRadiusY; ++dy) {
+                    for (int32_t dx = -collisionRadiusXz; dx <= collisionRadiusXz; ++dx) {
+                        requestSparseBrick(
+                            {sparseCenter.x + dx, sparseCenter.y + dy, sparseCenter.z + dz},
+                            true,
+                            Simulation::SparseResidencyClass::Collision);
+                    }
+                }
+            }
+
+            if (sparseRayPrefetchDistance > 0 && sparseRayPrefetchMaxRequests > 0) {
+                const glm::vec3 sparseCameraDelta = cameraPos - lastSparseResidencyCameraWorld;
+                const float sparseCameraSpeed = glm::length(sparseCameraDelta) / std::max(dt, 0.001f);
+                const bool usePredictivePrefetch =
+                    sparsePredictivePrefetchMs > 0 &&
+                    sparseCameraSpeed > 12.0f &&
+                    sparseRayPrefetchMaxRequests >= 4u;
+                const uint32_t currentViewBudget = usePredictivePrefetch
+                    ? std::max(1u, (sparseRayPrefetchMaxRequests * 2u) / 3u)
+                    : sparseRayPrefetchMaxRequests;
+                const uint32_t predictiveViewBudget = usePredictivePrefetch
+                    ? std::max(1u, sparseRayPrefetchMaxRequests - currentViewBudget)
+                    : 0u;
+
+                Simulation::SparseViewConeConfig viewPrefetch{};
+                viewPrefetch.originX = cameraPos.x;
+                viewPrefetch.originY = cameraPos.y;
+                viewPrefetch.originZ = cameraPos.z;
+                viewPrefetch.forwardX = cameraForward.x;
+                viewPrefetch.forwardY = cameraForward.y;
+                viewPrefetch.forwardZ = cameraForward.z;
+                viewPrefetch.rightX = cameraRight.x;
+                viewPrefetch.rightY = cameraRight.y;
+                viewPrefetch.rightZ = cameraRight.z;
+                viewPrefetch.upX = cameraUp.x;
+                viewPrefetch.upY = cameraUp.y;
+                viewPrefetch.upZ = cameraUp.z;
+                viewPrefetch.verticalFovRadians = fov;
+                viewPrefetch.aspectRatio = aspectRatio;
+                viewPrefetch.maxDistance = static_cast<float>(sparseRayPrefetchDistance);
+                viewPrefetch.stepDistance = static_cast<float>(sparseRayPrefetchStride);
+                viewPrefetch.rayGrid = sparseViewPrefetchRayGrid;
+                viewPrefetch.maxRequests = currentViewBudget;
+                for (const auto& request : sparseRequestPlanner.PlanViewCone(viewPrefetch)) {
+                    requestSparseBrick(request.coord, false, Simulation::SparseResidencyClass::Speculative);
+                }
+
+                if (usePredictivePrefetch && predictiveViewBudget > 0) {
+                    const float predictionSeconds =
+                        static_cast<float>(sparsePredictivePrefetchMs) * 0.001f;
+                    const glm::vec3 predictedCameraPos =
+                        cameraPos + sparseCameraDelta / std::max(dt, 0.001f) * predictionSeconds;
+                    viewPrefetch.originX = predictedCameraPos.x;
+                    viewPrefetch.originY = predictedCameraPos.y;
+                    viewPrefetch.originZ = predictedCameraPos.z;
+                    viewPrefetch.maxRequests = predictiveViewBudget;
+                    for (const auto& request : sparseRequestPlanner.PlanViewCone(viewPrefetch)) {
+                        requestSparseBrick(request.coord, false, Simulation::SparseResidencyClass::Speculative);
+                    }
+                }
+            }
+            lastSparseResidencyCameraWorld = cameraPos;
+            sparseSpeculativeRequestsLastFrame = sparseSpeculativeRequestsThisFrame;
+            sparseVisibleRequestsLastFrame = sparseVisibleRequestsThisFrame;
+            sparseCollisionRequestsLastFrame = sparseCollisionRequestsThisFrame;
+
+            const auto& sparseStatsBeforeGeneration = sparseVoxelWorld.GetStats();
+            const bool sparseFeedbackPressure =
+                sparseReplacementEvictionsLastFrame > 0 ||
+                sparseMissFeedbackConsumedLastFrame > 0 ||
+                !sparseMissFeedbackPending.empty();
+            uint32_t sparseGenerationBudgetThisFrame =
+                sparseStatsBeforeGeneration.residentBricks < sparseBootstrapResidentTarget
+                    ? std::max(sparseGenerationBudget, sparseBootstrapGenerationBudget)
+                    : sparseGenerationBudget;
+            if (sparseFeedbackPressure) {
+                sparseGenerationBudgetThisFrame =
+                    std::max(sparseGenerationBudgetThisFrame, sparseFeedbackGenerationBudget);
+            }
+            sparseGenerationBudgetThisFrame =
+                scaleRuntimeBudget(sparseGenerationBudgetThisFrame, sparseRuntimeBudgetScale, 1u);
+            sparseGenerationBudgetLastFrame = sparseGenerationBudgetThisFrame;
+            sparseVoxelWorld.PumpGeneration(sparseGenerationBudgetThisFrame, sparseResidencyFrame);
+            if (sparseClipmapTileCacheReady && sparseClipmapPolicy.IsEnabled()) {
+                sparseClipmapTileCache.UpdateInterest(
+                    cameraPos.x,
+                    cameraPos.y,
+                    cameraPos.z,
+                    sparseResidencyFrame,
+                    sparseClipmapPolicy);
+                const uint32_t sparseMidClipmapBudgetThisFrame =
+                    scaleRuntimeBudget(sparseMidClipmapTileBudget, sparseRuntimeBudgetScale, 1u);
+                sparseMidClipmapBudgetLastFrame = sparseMidClipmapBudgetThisFrame;
+                sparseClipmapTileCache.PumpGeneration(
+                    sparseMidClipmapBudgetThisFrame,
+                    sparseResidencyFrame,
+                    sparseClipmapPolicy);
+            }
+            const auto& sparseStatsBeforeDistanceTrim = sparseVoxelWorld.GetStats();
+            if (sparseStatsBeforeDistanceTrim.residentBricks >= sparseTrimStartResident ||
+                sparseStatsBeforeDistanceTrim.freePages <= sparseMinFreePages) {
+                sparseVoxelWorld.TrimResidentBricks(
+                    sparseCenter,
+                    sparseTrimRadiusXz,
+                    sparseTrimRadiusY,
+                    sparseTrimBudget);
+            } else {
+                sparseDistanceTrimSkippedLastFrame = 1;
+            }
+        }
+
         // Walking physics must not advance downward into a streamed page that is
         // not resident yet. Otherwise fast movement can outrun chunk upload, miss
         // the ground raycast for a few frames, fall through the hole, and then
         // crash/teleport when terrain catches up.
         bool supportChunkReadyForWalking = true;
-        if (!flightMode && terrainReady && voxelWorld && voxelWorld->IsUsingInfiniteChunks()) {
+        const bool sparseCollisionAuthoritative = sparseBackendRequested && sparseVoxelWorldReady;
+        if (!flightMode && terrainReady && sparseCollisionAuthoritative) {
+            // Sparse collision samples generated terrain plus persistent edits
+            // directly in world space. It is not tied to render-page residency,
+            // so walking does not fall through just because dense chunks or GPU
+            // sparse pages are still streaming.
+            supportChunkReadyForWalking = true;
+        } else if (!flightMode && terrainReady && voxelWorld && voxelWorld->IsUsingInfiniteChunks()) {
             const int32_t supportX = static_cast<int32_t>(std::floor(cameraPos.x));
             const int32_t supportY = static_cast<int32_t>(std::floor(cameraPos.y - playerHeight - 1.0f));
             const int32_t supportZ = static_cast<int32_t>(std::floor(cameraPos.z));
@@ -1222,11 +1910,25 @@ int RunSandbox(int argc, char* argv[]) {
         // Get current frame context
         uint32_t frameIndex = window->GetCurrentBackBufferIndex();
         FrameContext& ctx = frameContexts[frameIndex];
+        if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
+            spdlog::info(
+                "FRAME_STAGE {} wait-start backBuffer={} fence={}",
+                frameCount,
+                frameIndex,
+                ctx.fenceValue);
+        }
 
         // Wait for this frame's previous work to complete
         uint64_t perfPhaseStart = SDL_GetPerformanceCounter();
         commandQueue->WaitForFenceValue(ctx.fenceValue);
         perfFenceWaitMs = ticksToMs(SDL_GetPerformanceCounter() - perfPhaseStart);
+        if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
+            spdlog::info(
+                "FRAME_STAGE {} wait-done {:.2f}ms completedFence={}",
+                frameCount,
+                perfFenceWaitMs,
+                commandQueue->GetLastCompletedFenceValue());
+        }
         if (gpuTimestampReadback && gpuTimestampFrequency != 0) {
             ReadGpuTiming(gpuTimestampReadback.Get(), gpuTimestampFrequency, frameIndex, gpuTiming);
         }
@@ -1242,6 +1944,25 @@ int RunSandbox(int argc, char* argv[]) {
             completedBrushQueryDirectionWorld = brushQueryMetadata[frameIndex].directionWorld;
             hasCompletedBrushQuery = true;
         }
+        if (enableSparseMissFeedback && sparseGpuResources.IsInitialized()) {
+            sparseGpuResources.RetireMissFeedback(frameIndex, sparseMissFeedbackPending);
+            if (!sparseMissFeedbackPending.empty()) {
+                std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash> uniqueFeedback;
+                size_t writeIndex = 0;
+                for (const Simulation::BrickCoord& coord : sparseMissFeedbackPending) {
+                    if (uniqueFeedback.insert(coord).second) {
+                        sparseMissFeedbackPending[writeIndex++] = coord;
+                    }
+                }
+                sparseMissFeedbackPending.resize(writeIndex);
+            }
+            if (sparseMissFeedbackPending.size() > sparseMissFeedbackMaxRecords * 2ull) {
+                const size_t keepCount = static_cast<size_t>(sparseMissFeedbackMaxRecords) * 2u;
+                sparseMissFeedbackPending.erase(
+                    sparseMissFeedbackPending.begin(),
+                    sparseMissFeedbackPending.begin() + (sparseMissFeedbackPending.size() - keepCount));
+            }
+        }
 
         // Reset command allocator and command list
         ctx.commandAllocator->Reset();
@@ -1249,6 +1970,211 @@ int RunSandbox(int argc, char* argv[]) {
         const uint32_t gpuTimestampBase = frameIndex * kGpuTimestampCount;
         if (gpuTimestampHeap) {
             commandList->EndQuery(gpuTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, gpuTimestampBase + 0);
+        }
+
+        if (sparseBackendRequested && sparseVoxelWorldReady) {
+            sparseVoxelWorld.BeginFrame();
+            sparseGpuResources.BeginFrame(frameIndex);
+            if (sparseSurfaceGpuResources.IsInitialized()) {
+                sparseSurfaceGpuResources.BeginFrame(frameIndex);
+            }
+            sparseSurfaceRasterFacesLastFrame = 0;
+            sparseUploadRequeuesLastFrame = 0;
+            sparseInvalidationRequeuesLastFrame = 0;
+            sparsePageTablePublishRetriesLastFrame = 0;
+            sparseMidClipmapUploadRetriesLastFrame = 0;
+            sparseSurfaceUploadRetriesLastFrame = 0;
+            sparseUploadBudgetLastFrame = 0;
+            if (sparseGpuPageTableResetPending) {
+                SparsePageTableGpuUploadTicket resetTicket;
+                if (sparseGpuResources.StagePageTableReset(&resetTicket) &&
+                    sparseGpuResources.EmitPageTableCopy(commandList.Get(), resetTicket)) {
+                    sparseGpuPageTableResetPending = false;
+                    spdlog::info("Sparse GPU page table reset uploaded");
+                } else {
+                    spdlog::warn("Sparse GPU page table reset upload failed; sparse visual path remains unsafe");
+                }
+            }
+            for (uint32_t invalidationIndex = 0;
+                 invalidationIndex < sparseInvalidationBudget;
+                 ++invalidationIndex) {
+                Simulation::SparsePageInvalidationPacket invalidation;
+                if (!sparseVoxelWorld.PopNextInvalidation(&invalidation)) {
+                    break;
+                }
+
+                SparsePageTableGpuUploadTicket invalidationTicket;
+                if (!sparseGpuResources.StagePageTableInvalidation(
+                        invalidation.entryIndex,
+                        &invalidationTicket) ||
+                    !sparseGpuResources.EmitPageTableCopy(commandList.Get(), invalidationTicket)) {
+                    sparseVoxelWorld.RequeueInvalidationFront(invalidation);
+                    ++sparseInvalidationRequeuesLastFrame;
+                    spdlog::warn(
+                        "Sparse page-table invalidation upload failed for ({},{},{}) slot={} page={} generation={}",
+                        invalidation.coord.x,
+                        invalidation.coord.y,
+                        invalidation.coord.z,
+                        invalidation.entryIndex,
+                        invalidation.pageIndex,
+                        invalidation.generation);
+                    break;
+                }
+            }
+            for (uint32_t publishIndex = 0;
+                 publishIndex < sparsePageTablePublishBudget && !sparsePendingPageTablePublishes.empty();
+                 ++publishIndex) {
+                const uint32_t entryIndex = sparsePendingPageTablePublishes.front();
+                sparsePendingPageTablePublishes.pop_front();
+                const auto& sparsePageTable = sparseVoxelWorld.GetPool().PageTable();
+                if (entryIndex >= sparsePageTable.Entries().size()) {
+                    continue;
+                }
+
+                SparsePageTableGpuUploadTicket pageTableTicket;
+                if (!sparseGpuResources.StagePageTableEntry(
+                        entryIndex,
+                        sparsePageTable.Entries()[entryIndex],
+                        &pageTableTicket) ||
+                    !sparseGpuResources.EmitPageTableCopy(commandList.Get(), pageTableTicket)) {
+                    sparsePendingPageTablePublishes.push_front(entryIndex);
+                    ++sparsePageTablePublishRetriesLastFrame;
+                    break;
+                }
+            }
+            if (sparseClipmapTileCacheReady &&
+                sparseClipmapPolicy.IsEnabled()) {
+                const bool uploadHeightClipmap =
+                    sparseClipmapTileCache.HeightDirtySerial() != sparseMidClipmapUploadedHeightSerial;
+                const bool uploadVoxelClipmap =
+                    sparseClipmapTileCache.VoxelDirtySerial() != sparseMidClipmapUploadedVoxelSerial;
+                if (!uploadHeightClipmap && !uploadVoxelClipmap) {
+                    // Both clipmap layers already match the CPU cache.
+                } else {
+                Simulation::SparseClipmapGpuSnapshot midSnapshot;
+                if (sparseClipmapTileCache.BuildGpuSnapshot(midSnapshot)) {
+                    SparseMidClipmapGpuUploadTicket midTicket;
+                    if (sparseGpuResources.StageMidClipmapSnapshot(
+                            midSnapshot,
+                            &midTicket,
+                            uploadHeightClipmap,
+                            uploadVoxelClipmap) &&
+                        sparseGpuResources.EmitMidClipmapCopy(commandList.Get(), midTicket)) {
+                        if (uploadHeightClipmap) {
+                            sparseMidClipmapUploadedHeightSerial = sparseClipmapTileCache.HeightDirtySerial();
+                        }
+                        if (uploadVoxelClipmap) {
+                            sparseMidClipmapUploadedVoxelSerial = sparseClipmapTileCache.VoxelDirtySerial();
+                            sparseClipmapTileCache.ClearVoxelDirtyRange();
+                        }
+                    } else {
+                        ++sparseMidClipmapUploadRetriesLastFrame;
+                    }
+                }
+                }
+            }
+            const auto& sparseStatsBeforeUpload = sparseVoxelWorld.GetStats();
+            const bool sparseFeedbackUploadPressure =
+                sparseReplacementEvictionsLastFrame > 0 ||
+                sparseMissFeedbackConsumedLastFrame > 0 ||
+                !sparseMissFeedbackPending.empty();
+            uint32_t sparseUploadBudgetThisFrame =
+                sparseStatsBeforeUpload.residentBricks < sparseBootstrapResidentTarget
+                    ? std::max(sparseUploadBudget, sparseBootstrapUploadBudget)
+                    : sparseUploadBudget;
+            if (sparseFeedbackUploadPressure) {
+                sparseUploadBudgetThisFrame =
+                    std::max(sparseUploadBudgetThisFrame, sparseFeedbackUploadBudget);
+            }
+            sparseUploadBudgetThisFrame =
+                scaleRuntimeBudget(sparseUploadBudgetThisFrame, sparseRuntimeBudgetScale, 1u);
+            sparseUploadBudgetLastFrame = sparseUploadBudgetThisFrame;
+            for (uint32_t uploadIndex = 0; uploadIndex < sparseUploadBudgetThisFrame; ++uploadIndex) {
+                Simulation::SparseBrickUploadPacket packet;
+                if (!sparseVoxelWorld.PopNextUpload(&packet)) {
+                    break;
+                }
+                SparseBrickGpuUploadTicket uploadTicket;
+                if (!sparseGpuResources.StageBrickUpload(packet, &uploadTicket)) {
+                    if (sparseVoxelWorld.RequeueUploadFront(packet)) {
+                        ++sparseUploadRequeuesLastFrame;
+                    }
+                    spdlog::warn(
+                        "Sparse brick upload staging failed for ({},{},{}) page={} generation={}",
+                        packet.coord.x,
+                        packet.coord.y,
+                        packet.coord.z,
+                        packet.pageIndex,
+                        packet.generation);
+                    break;
+                }
+                if (!sparseGpuResources.EmitUploadCopy(commandList.Get(), uploadTicket)) {
+                    if (sparseVoxelWorld.RequeueUploadFront(packet)) {
+                        ++sparseUploadRequeuesLastFrame;
+                    }
+                    spdlog::warn(
+                        "Sparse brick upload copy failed for ({},{},{}) page={} generation={}",
+                        packet.coord.x,
+                        packet.coord.y,
+                        packet.coord.z,
+                        packet.pageIndex,
+                        packet.generation);
+                    break;
+                }
+                // The CPU table is published after brick and occupancy copies are
+                // queued. Then the matching GPU page-table entry is staged and
+                // copied last, so shader lookup cannot point at an uncopied page.
+                if (!sparseVoxelWorld.CompleteUpload(packet)) {
+                    if (sparseVoxelWorld.RequeueUploadFront(packet)) {
+                        ++sparseUploadRequeuesLastFrame;
+                    }
+                    spdlog::warn(
+                        "Sparse brick publish failed for ({},{},{}) page={} generation={}",
+                        packet.coord.x,
+                        packet.coord.y,
+                        packet.coord.z,
+                        packet.pageIndex,
+                        packet.generation);
+                    break;
+                }
+
+                uint32_t pageTableEntryIndex = UINT32_MAX;
+                const auto& sparsePageTable = sparseVoxelWorld.GetPool().PageTable();
+                if (!sparsePageTable.TryGetEntryIndex(packet.coord, &pageTableEntryIndex) ||
+                    pageTableEntryIndex >= sparsePageTable.Entries().size()) {
+                    spdlog::warn(
+                        "Sparse page-table slot lookup failed for ({},{},{})",
+                        packet.coord.x,
+                        packet.coord.y,
+                        packet.coord.z);
+                    break;
+                }
+
+                // Publish the page-table entry on a later command list. This
+                // keeps the renderer from seeing a BrickCoord until the payload,
+                // occupancy, and generation copies are safely ordered ahead of
+                // a subsequent frame's draw.
+                sparsePendingPageTablePublishes.push_back(pageTableEntryIndex);
+            }
+
+            if (sparseSurfaceGpuResources.IsInitialized()) {
+                const uint32_t surfaceSerial = sparseVoxelWorld.GetSurfaceCache().GetStats().serial;
+                if (surfaceSerial != sparseSurfaceUploadedSerial) {
+                    Simulation::SparseSurfaceGpuSnapshot surfaceSnapshot;
+                    if (sparseVoxelWorld.GetSurfaceCache().BuildGpuSnapshot(surfaceSnapshot)) {
+                        SparseSurfaceUploadTicket surfaceTicket;
+                        if (sparseSurfaceGpuResources.StageSnapshot(surfaceSnapshot, &surfaceTicket) &&
+                            sparseSurfaceGpuResources.EmitCopy(commandList.Get(), surfaceTicket)) {
+                            sparseSurfaceUploadedSerial = surfaceSnapshot.serial;
+                        } else {
+                            ++sparseSurfaceUploadRetriesLastFrame;
+                        }
+                    } else {
+                        ++sparseSurfaceUploadRetriesLastFrame;
+                        spdlog::warn("Sparse surface GPU snapshot build failed");
+                    }
+                }
+            }
         }
 
         // ===== UPDATE VOXEL DATA SOURCE =====
@@ -1260,7 +2186,7 @@ int RunSandbox(int argc, char* argv[]) {
             perfPhaseStart = SDL_GetPerformanceCounter();
             voxelWorld->CopyStatic2x2Chunks(commandQueue->GetCommandQueue());
             perfChunkUpdateMs = ticksToMs(SDL_GetPerformanceCounter() - perfPhaseStart);
-        } else if (voxelWorld->IsUsingInfiniteChunks()) {
+        } else if (!sparseRuntimeTestMode && voxelWorld->IsUsingInfiniteChunks()) {
             perfPhaseStart = SDL_GetPerformanceCounter();
             const glm::vec3 cameraBeforeChunkUpdate = cameraPos;
             const glm::vec3 oldRegionOrigin = voxelWorld->GetRegionOriginWorld();
@@ -1316,6 +2242,12 @@ int RunSandbox(int argc, char* argv[]) {
         if (useStaticChunkLayout) {
             regionOriginWorld = glm::vec3(0.0f);
             cameraPosLocal = cameraPos;
+        } else if (sparseRuntimeTestMode) {
+            regionOriginWorld = glm::floor(cameraPos - glm::vec3(
+                static_cast<float>(voxelWorld->GetGridSizeX()) * 0.5f,
+                static_cast<float>(voxelWorld->GetGridSizeY()) * 0.5f,
+                static_cast<float>(voxelWorld->GetGridSizeZ()) * 0.5f));
+            cameraPosLocal = cameraPos - regionOriginWorld;
         } else {
             regionOriginWorld = voxelWorld->GetRegionOriginWorld();
             cameraPosLocal = voxelWorld->WorldToRenderLocal(cameraPos);
@@ -1333,13 +2265,45 @@ int RunSandbox(int argc, char* argv[]) {
         // Cast a ray straight down from player FEET position to find ground
         // Camera is at eye level, so subtract playerHeight to get feet position
         glm::vec3 downDir = glm::vec3(0, -1, 0);
-        physicsDispatcher->DispatchGroundRaycast(commandList.Get(), *voxelWorld, cameraPos - glm::vec3(0, playerHeight, 0), downDir);
+        if (sparseRuntimeTestMode && sparseGpuResources.IsInitialized()) {
+            const auto& sparseStats = sparseGpuResources.GetStats();
+            physicsDispatcher->DispatchSparseRaycast(
+                commandList.Get(),
+                *voxelWorld,
+                sparseGpuResources.BrickPoolSRV(),
+                sparseGpuResources.PageTableSRV(),
+                sparseGpuResources.OccupancySRV(),
+                sparseStats.maxBrickPages,
+                sparseStats.pageTableCapacity,
+                cameraPos - glm::vec3(0, playerHeight - 2.0f, 0),
+                downDir,
+                512.0f,
+                true);
+        } else {
+            physicsDispatcher->DispatchGroundRaycast(commandList.Get(), *voxelWorld, cameraPos - glm::vec3(0, playerHeight, 0), downDir);
+        }
 
         // === GPU BRUSH RAYCASTING ===
         // Target from the camera/crosshair. Traversal-friendly placement should
         // be handled as brush policy, not by moving the raw ray origin into the
         // collision body; doing that made empty-air strokes resolve underfoot.
-        physicsDispatcher->DispatchBrushRaycast(commandList.Get(), *voxelWorld, brushRayOriginWorld, rayDir);
+        if (sparseRuntimeTestMode && sparseGpuResources.IsInitialized()) {
+            const auto& sparseStats = sparseGpuResources.GetStats();
+            physicsDispatcher->DispatchSparseRaycast(
+                commandList.Get(),
+                *voxelWorld,
+                sparseGpuResources.BrickPoolSRV(),
+                sparseGpuResources.PageTableSRV(),
+                sparseGpuResources.OccupancySRV(),
+                sparseStats.maxBrickPages,
+                sparseStats.pageTableCapacity,
+                brushRayOriginWorld,
+                rayDir,
+                kBrushMaxInteractionDistance,
+                false);
+        } else {
+            physicsDispatcher->DispatchBrushRaycast(commandList.Get(), *voxelWorld, brushRayOriginWorld, rayDir);
+        }
 
         // Begin frame - transitions back buffer, sets render target, viewport, etc.
         renderer->BeginFrame(commandList.Get(), frameIndex);
@@ -1357,6 +2321,33 @@ int RunSandbox(int argc, char* argv[]) {
         // Get GPU raycast results (16 bytes from previous frame)
         auto gpuRaycastResult = voxelWorld->GetBrushRaycastResult();
         auto groundRaycastResult = voxelWorld->GetGroundRaycastResult();
+        const bool sparseGroundAuthoritative = sparseBackendRequested && sparseVoxelWorldReady;
+        if (sparseGroundAuthoritative) {
+            const glm::vec3 feetWorld = cameraPos - glm::vec3(0.0f, playerHeight, 0.0f);
+            const auto sparseGround = sparseVoxelWorld.Raycast(
+                feetWorld.x,
+                feetWorld.y + 2.0f,
+                feetWorld.z,
+                0.0f,
+                -1.0f,
+                0.0f,
+                512.0f);
+            if (sparseGround.hit) {
+                groundRaycastResult.posX = static_cast<float>(sparseGround.voxelX) + 0.5f;
+                groundRaycastResult.posY = static_cast<float>(sparseGround.voxelY) + 1.0f;
+                groundRaycastResult.posZ = static_cast<float>(sparseGround.voxelZ) + 0.5f;
+                groundRaycastResult.normalPacked = PackNormalForReadback(glm::ivec3(0, 1, 0), true);
+                groundRaycastResult.hasValidPosition = true;
+                completedGroundQueryRegionOriginWorld = regionOriginWorld;
+                completedGroundQueryFeetWorld = feetWorld;
+                hasCompletedGroundQuery = true;
+            } else {
+                groundRaycastResult.hasValidPosition = false;
+                hasCompletedGroundQuery = false;
+            }
+        } else if (!hasCompletedGroundQuery || !groundRaycastResult.hasValidPosition) {
+            groundRaycastResult.hasValidPosition = false;
+        }
 
         glm::vec3 brushHitWorld(0.0f);
         glm::ivec3 brushHitNormal(0);
@@ -1399,6 +2390,32 @@ int RunSandbox(int argc, char* argv[]) {
                 brushHitTracksCurrentRay =
                     currentRayDistance > minBrushHitDistance &&
                     currentRayLateralError <= currentRayTolerance;
+            }
+        }
+        if (enableSparseOnlyRaymarch && sparseVoxelWorldReady && !brushHitValid) {
+            const auto sparseHit = sparseVoxelWorld.Raycast(
+                cameraPos.x,
+                cameraPos.y,
+                cameraPos.z,
+                rayDir.x,
+                rayDir.y,
+                rayDir.z,
+                kBrushMaxInteractionDistance);
+            if (sparseHit.hit && sparseHit.distance > 1.0f && sparseHit.distance < kBrushMaxInteractionDistance) {
+                brushHitWorld = glm::vec3(
+                    static_cast<float>(sparseHit.voxelX) + 0.5f,
+                    static_cast<float>(sparseHit.voxelY) + 0.5f,
+                    static_cast<float>(sparseHit.voxelZ) + 0.5f);
+                brushHitNormal = glm::ivec3(sparseHit.normalX, sparseHit.normalY, sparseHit.normalZ);
+                brushHitNormalValid =
+                    sparseHit.normalX != 0 ||
+                    sparseHit.normalY != 0 ||
+                    sparseHit.normalZ != 0;
+                brushHitValid = true;
+                brushHitTracksCurrentRay = true;
+                buildStrokeState.hasStableAimDistance = true;
+                buildStrokeState.stableAimDistance = std::clamp(sparseHit.distance, 4.0f, kBrushMaxInteractionDistance);
+                buildStrokeState.stableAimWorldPosition = brushHitWorld;
             }
         }
         if (brushHitValid) {
@@ -1500,7 +2517,9 @@ int RunSandbox(int argc, char* argv[]) {
             // No ground detected - terrain not ready yet or in air above terrain
         }
 
-        cameraPosLocal = useStaticChunkLayout ? cameraPos : voxelWorld->WorldToRenderLocal(cameraPos);
+        cameraPosLocal = (useStaticChunkLayout || sparseRuntimeTestMode)
+            ? cameraPos - regionOriginWorld
+            : voxelWorld->WorldToRenderLocal(cameraPos);
 
         // === HORIZONTAL COLLISION (Cave/Wall Detection) ===
         // Use brush raycast to check for walls/obstacles in movement direction
@@ -1564,7 +2583,7 @@ int RunSandbox(int argc, char* argv[]) {
                 ? 0
                 : (prePhysicsStats.expectedVisibleChunks * 3u) / 4u;
         const bool streamingReadyForPhysics =
-            disablePhysics ||
+            disableRuntimePhysics ||
             !voxelWorld->IsUsingInfiniteChunks() ||
             (prePhysicsStats.expectedVisibleChunks > 0 &&
              prePhysicsStats.cachedReadChunks >= criticalPhysicsCoverage &&
@@ -1586,7 +2605,7 @@ int RunSandbox(int argc, char* argv[]) {
         }
         const bool physicsDueThisFrame = (frameCount % physicsInterval) == 0;
         perfPhaseStart = SDL_GetPerformanceCounter();
-        if (!paused && !disablePhysics && infinitePhysicsAllowed && streamingReadyForPhysics && physicsDueThisFrame) {
+        if (!paused && !disableRuntimePhysics && infinitePhysicsAllowed && streamingReadyForPhysics && physicsDueThisFrame) {
             // Scan chunks to determine which are active
             physicsDispatcher->DispatchChunkScan(
                 commandList.Get(),
@@ -1607,7 +2626,7 @@ int RunSandbox(int argc, char* argv[]) {
             );
             physicsRanThisFrame = true;
             physicsDispatchCount++;
-        } else if (!paused && !disablePhysics) {
+        } else if (!paused && !disableRuntimePhysics) {
             physicsSkippedForBudget = true;
             physicsBudgetSkipCount++;
         }
@@ -1653,12 +2672,16 @@ int RunSandbox(int argc, char* argv[]) {
                     }
                     buildStrokeState.active = true;
                     intendedBrushWorld = cameraPos + rayDir * buildStrokeState.rayDistance;
-                    brushPos = voxelWorld->WorldToRenderLocal(intendedBrushWorld);
+                    brushPos = sparseRuntimeTestMode
+                        ? intendedBrushWorld - regionOriginWorld
+                        : voxelWorld->WorldToRenderLocal(intendedBrushWorld);
                 } else {
                     // Use GPU raycast hit position (on solid voxel face).
                     // Convert the previous-frame world hit into the current toroidal render slot.
                     intendedBrushWorld = brushHitWorld;
-                    brushPos = voxelWorld->WorldToRenderLocal(brushHitWorld);
+                    brushPos = sparseRuntimeTestMode
+                        ? brushHitWorld - regionOriginWorld
+                        : voxelWorld->WorldToRenderLocal(brushHitWorld);
                 }
                 static int logCounter = 0;
                 if (enableDiagnostics && logCounter++ % 60 == 0) {
@@ -1686,7 +2709,9 @@ int RunSandbox(int argc, char* argv[]) {
                     ? cameraPos + rayDir * buildStrokeState.rayDistance
                     : cameraPos + rayDir * fallbackDistance;
                 intendedBrushWorld = fallbackWorld;
-                brushPos = useStaticChunkLayout ? fallbackWorld : voxelWorld->WorldToRenderLocal(fallbackWorld);
+                brushPos = (useStaticChunkLayout || sparseRuntimeTestMode)
+                    ? fallbackWorld - regionOriginWorld
+                    : voxelWorld->WorldToRenderLocal(fallbackWorld);
 
                 // Clamp to grid bounds
                 brushPos = glm::clamp(brushPos,
@@ -1730,7 +2755,9 @@ int RunSandbox(int argc, char* argv[]) {
                          voxelWorld->GetGridSizeZ() - 0.5f));
 
             brushPlacementWorld = intendedBrushWorld;
-            if (closeRampAdjusted && !useStaticChunkLayout) {
+            if (closeRampAdjusted && sparseRuntimeTestMode) {
+                brushPlacementWorld = brushPos + regionOriginWorld;
+            } else if (closeRampAdjusted && !useStaticChunkLayout) {
                 glm::vec3 mappedWorld(0.0f);
                 if (voxelWorld->RenderLocalToWorld(brushPos, mappedWorld)) {
                     brushPlacementWorld = mappedWorld;
@@ -1837,7 +2864,35 @@ int RunSandbox(int argc, char* argv[]) {
             glm::vec3 lastSubmittedBrushWorldPosition = buildStrokeState.hasLastBrushWorldPosition
                 ? buildStrokeState.lastBrushWorldPosition
                 : brushPlacementWorld;
+            auto recordSparseBrushStamp = [&](const glm::vec3& worldPosition, uint32_t stampSeed) {
+                if (!sparseBackendRequested || !sparseVoxelWorldReady) {
+                    return;
+                }
+                sparseVoxelWorld.ApplyBrushEdit(
+                    worldPosition.x,
+                    worldPosition.y,
+                    worldPosition.z,
+                    brushConstants.radius,
+                    brushConstants.material,
+                    brushConstants.mode,
+                    brushConstants.shape,
+                    brushConstants.strength,
+                    stampSeed,
+                    brushConstants.hitNormalX,
+                    brushConstants.hitNormalY,
+                    brushConstants.hitNormalZ,
+                    brushConstants.hasHitNormal != 0,
+                    true);
+            };
             for (uint32_t stampIndex = 0; stampIndex < stampCount; ++stampIndex) {
+                const uint32_t stampSeed = static_cast<uint32_t>(frameCount + stampIndex);
+                if (sparseRuntimeTestMode) {
+                    recordSparseBrushStamp(stampWorldPositions[stampIndex], stampSeed);
+                    ++acceptedBrushStamps;
+                    acceptedAnyBrushStamp = true;
+                    lastSubmittedBrushWorldPosition = stampWorldPositions[stampIndex];
+                    continue;
+                }
                 if (!useStaticChunkLayout && voxelWorld->IsUsingInfiniteChunks()) {
                     if (!voxelWorld->EnsureWorldBrushVolumeCachedForReadWrite(
                             stampWorldPositions[stampIndex].x,
@@ -1858,6 +2913,7 @@ int RunSandbox(int argc, char* argv[]) {
                             brushConstants.hitNormalY,
                             brushConstants.hitNormalZ,
                             brushConstants.hasHitNormal != 0);
+                        recordSparseBrushStamp(stampWorldPositions[stampIndex], stampSeed);
                         ++acceptedBrushStamps;
                         acceptedAnyBrushStamp = true;
                         lastSubmittedBrushWorldPosition = stampWorldPositions[stampIndex];
@@ -1887,6 +2943,7 @@ int RunSandbox(int argc, char* argv[]) {
                             brushConstants.hitNormalY,
                             brushConstants.hitNormalZ,
                             brushConstants.hasHitNormal != 0);
+                        recordSparseBrushStamp(stampWorldPositions[stampIndex], stampSeed);
                         ++acceptedBrushStamps;
                         acceptedAnyBrushStamp = true;
                         lastSubmittedBrushWorldPosition = stampWorldPositions[stampIndex];
@@ -1898,8 +2955,9 @@ int RunSandbox(int argc, char* argv[]) {
                 brushConstants.positionX = stampLocal.x;
                 brushConstants.positionY = stampLocal.y;
                 brushConstants.positionZ = stampLocal.z;
-                brushConstants.seed = static_cast<uint32_t>(frameCount + stampIndex);
+                brushConstants.seed = stampSeed;
                 physicsDispatcher->DispatchBrush(commandList.Get(), *voxelWorld, brushConstants);
+                recordSparseBrushStamp(stampWorldPositions[stampIndex], stampSeed);
                 ++submittedBrushStamps;
                 submittedAnyBrushStamp = true;
                 ++acceptedBrushStamps;
@@ -1992,6 +3050,10 @@ int RunSandbox(int argc, char* argv[]) {
         cameraParams.raymarchMaxSteps = currentRaymarchMaxSteps;
         cameraParams.farFieldQuality = currentFarFieldQuality;
         cameraParams.renderQuality = currentRenderQuality;
+        cameraParams.midFieldStartDistance = sparseClipmapPolicy.Config().startDistance;
+        cameraParams.midFieldEndDistance = sparseClipmapPolicy.Config().endDistance;
+        cameraParams.midFieldCellSize = sparseClipmapPolicy.Config().minCellSize;
+        cameraParams.debugMode = sparseRaymarchDebugMode;
 
         // Build brush preview params from GPU raycast result (NEW!)
         Graphics::Renderer::BrushPreview brushPreview = {};
@@ -2018,7 +3080,7 @@ int RunSandbox(int argc, char* argv[]) {
 
         // Render voxels with raymarch shader (using persistent shader-visible descriptors)
         // Brush preview now uses GPU raycasting (2,000,000x less bandwidth!)
-        glm::vec3 regionOrigin = voxelWorld->GetRegionOriginWorld();
+        glm::vec3 regionOrigin = sparseRuntimeTestMode ? regionOriginWorld : voxelWorld->GetRegionOriginWorld();
         if (enableDiagnostics && frameCount % 60 == 0) {
             spdlog::debug(
                 "[FRAME_DIAG] frame={} camWorld=({:.2f},{:.2f},{:.2f}) camLocal=({:.2f},{:.2f},{:.2f}) forward=({:.3f},{:.3f},{:.3f}) regionOrigin=({:.0f},{:.0f},{:.0f}) groundValid={} groundLocal=({:.2f},{:.2f},{:.2f}) brushValid={} brushLocal=({:.2f},{:.2f},{:.2f})",
@@ -2033,22 +3095,117 @@ int RunSandbox(int argc, char* argv[]) {
                 gpuRaycastResult.posX, gpuRaycastResult.posY, gpuRaycastResult.posZ);
         }
         perfPhaseStart = SDL_GetPerformanceCounter();
+        Graphics::Renderer::SparseNearField sparseNearField = {};
+        if (sparseBackendRequested && sparseGpuResources.IsInitialized()) {
+            const auto& sparseStats = sparseGpuResources.GetStats();
+            sparseNearField.brickPoolSRV = sparseGpuResources.BrickPoolSRV();
+            sparseNearField.pageTableSRV = sparseGpuResources.PageTableSRV();
+            sparseNearField.occupancySRV = sparseGpuResources.OccupancySRV();
+            sparseNearField.pageGenerationSRV = sparseGpuResources.PageGenerationSRV();
+            sparseNearField.midClipmapMetadataSRV = sparseGpuResources.MidClipmapMetadataSRV();
+            sparseNearField.midClipmapLookupSRV = sparseGpuResources.MidClipmapLookupSRV();
+            sparseNearField.midClipmapSamplesSRV = sparseGpuResources.MidClipmapSamplesSRV();
+            sparseNearField.midVoxelClipmapMetadataSRV = sparseGpuResources.MidVoxelClipmapMetadataSRV();
+            sparseNearField.midVoxelClipmapLookupSRV = sparseGpuResources.MidVoxelClipmapLookupSRV();
+            sparseNearField.midVoxelClipmapSamplesSRV = sparseGpuResources.MidVoxelClipmapSamplesSRV();
+            if (sparseSurfaceGpuResources.IsInitialized()) {
+                const auto& sparseSurfaceStats = sparseSurfaceGpuResources.GetStats();
+                sparseNearField.surfaceFacesSRV = sparseSurfaceGpuResources.FaceBufferSRV();
+                sparseNearField.surfaceRangesSRV = sparseSurfaceGpuResources.RangeBufferSRV();
+                sparseNearField.surfaceFaceCount = sparseSurfaceStats.uploadedFaces;
+                sparseNearField.surfaceRangeCount = sparseSurfaceStats.uploadedRanges;
+                sparseNearField.surfaceRangeTableCapacity = sparseSurfaceStats.uploadedRangeTableCapacity;
+                sparseNearField.surfaceSerial = sparseSurfaceStats.uploadedSerial;
+                sparseNearField.surfaceEnabled = sparseSurfaceStats.uploadedSerial != 0;
+            }
+            sparseNearField.maxBrickPages = sparseStats.maxBrickPages;
+            sparseNearField.pageTableCapacity = sparseStats.pageTableCapacity;
+            sparseNearField.midClipmapTileCount = sparseClipmapTileCache.GetStats().snapshotTiles;
+            sparseNearField.midClipmapTileSampleSide = sparseClipmapPolicy.Config().tileSampleSide;
+            sparseNearField.midVoxelClipmapBrickCount = sparseClipmapTileCache.GetStats().residentVoxelBricks;
+            sparseNearField.bindingMask = sparseNearBindingMask;
+            sparseNearField.enabled = enableSparseRaymarch && enableSparseNearBinding;
+            sparseNearField.sparseOnly = enableSparseOnlyRaymarch;
+            sparseNearField.midClipmapEnabled =
+                sparseClipmapPolicy.IsEnabled() &&
+                sparseClipmapTileCacheReady &&
+                (sparseMidClipmapUploadedHeightSerial != 0 ||
+                 sparseMidClipmapUploadedVoxelSerial != 0);
+        }
+        const bool dispatchSparseMissFeedbackThisFrame =
+            enableSparseMissFeedback &&
+            (sparseMissFeedbackInterval <= 1u ||
+             (frameCount % sparseMissFeedbackInterval) == 0u);
+        if (dispatchSparseMissFeedbackThisFrame &&
+            enableSparseRaymarch &&
+            sparseGpuResources.IsInitialized() &&
+            sparseNearField.pageTableSRV.IsValid() &&
+            sparseGpuResources.MissFeedbackUAV().IsValid()) {
+            sparseGpuResources.PrepareMissFeedbackWrite(commandList.Get());
+            physicsDispatcher->DispatchSparseMissFeedback(
+                commandList.Get(),
+                sparseNearField.pageTableSRV,
+                sparseGpuResources.MissFeedbackUAV(),
+                sparseNearField.maxBrickPages,
+                sparseNearField.pageTableCapacity,
+                renderCameraPos,
+                cameraForward,
+                cameraRight,
+                cameraUp,
+                fov,
+                aspectRatio,
+                static_cast<float>(sparseMissFeedbackDistance),
+                static_cast<float>(sparseMissFeedbackStride),
+                sparseMissFeedbackRayGrid,
+                sparseMissFeedbackMaxRecords,
+                static_cast<uint32_t>(frameCount));
+            sparseGpuResources.QueueMissFeedbackReadback(commandList.Get(), frameIndex);
+        }
+        uint32_t renderGridSizeX = voxelWorld->GetGridSizeX();
+        uint32_t renderGridSizeY = voxelWorld->GetGridSizeY();
+        uint32_t renderGridSizeZ = voxelWorld->GetGridSizeZ();
+        glm::vec3 renderRegionOrigin = regionOrigin;
+        if (sparseBackendRequested && enableSparseOnlyRaymarch) {
+            const auto alignDown16 = [](float value) {
+                return std::floor(value / 16.0f) * 16.0f;
+            };
+            renderGridSizeX = sparseRaymarchWindowVoxels;
+            renderGridSizeY = sparseRaymarchWindowVoxels;
+            renderGridSizeZ = sparseRaymarchWindowVoxels;
+            const float halfWindow = static_cast<float>(sparseRaymarchWindowVoxels) * 0.5f;
+            renderRegionOrigin.x = alignDown16(renderCameraPos.x - halfWindow);
+            renderRegionOrigin.y = alignDown16(renderCameraPos.y - halfWindow);
+            renderRegionOrigin.z = alignDown16(renderCameraPos.z - halfWindow);
+        }
+
         renderer->RenderVoxels(
             commandList.Get(),
             voxelWorld->GetReadBufferSRV(),
             voxelWorld->GetReadChunkValidMaskSRV(),
             voxelWorld->GetPaletteSRV(),
-            voxelWorld->GetGridSizeX(),
-            voxelWorld->GetGridSizeY(),
-            voxelWorld->GetGridSizeZ(),
+            renderGridSizeX,
+            renderGridSizeY,
+            renderGridSizeZ,
             cameraParams,
-            regionOrigin.x,
-            regionOrigin.y,
-            regionOrigin.z,
+            renderRegionOrigin.x,
+            renderRegionOrigin.y,
+            renderRegionOrigin.z,
             &brushPreview,
             &characterPreview,
-            &sparseFarField
+            &sparseFarField,
+            &sparseNearField
         );
+        if (enableSparseSurfaceRaster &&
+            sparseNearField.surfaceEnabled &&
+            sparseNearField.surfaceFaceCount > 0) {
+            renderer->RenderSparseSurfaceFaces(
+                commandList.Get(),
+                sparseNearField.surfaceFacesSRV,
+                voxelWorld->GetPaletteSRV(),
+                sparseNearField.surfaceFaceCount,
+                cameraParams);
+            sparseSurfaceRasterFacesLastFrame = sparseNearField.surfaceFaceCount;
+        }
         perfRenderSubmitMs = ticksToMs(SDL_GetPerformanceCounter() - perfPhaseStart);
         if (gpuTimestampHeap) {
             commandList->EndQuery(gpuTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, gpuTimestampBase + 2);
@@ -2108,6 +3265,118 @@ int RunSandbox(int argc, char* argv[]) {
                 ImGuiWindowFlags_NoNav;
         }
         if (ImGui::Begin("VENPOD Metrics", nullptr, metricsFlags)) {
+            ImGui::Text("Backend %s%s",
+                ToString(activeRenderBackend),
+                sparseBackendRequested ? " | sparse requested, dense fallback active" : "");
+            if (sparseBackendRequested) {
+                const auto& sparseStats = sparseGpuResources.GetStats();
+                ImGui::Text("Sparse raymarch visual %s | debug %u | only %u",
+                    enableSparseRaymarch ? "on" : "off",
+                    sparseRaymarchDebugMode,
+                    enableSparseOnlyRaymarch ? 1u : 0u);
+                ImGui::Text("Sparse mid clipmap %s | %.0f..%.0f | cell %.0f",
+                    sparseClipmapPolicy.IsEnabled() ? "on" : "off",
+                    sparseClipmapPolicy.Config().startDistance,
+                    sparseClipmapPolicy.Config().endDistance,
+                    sparseClipmapPolicy.Config().minCellSize);
+                const auto& midStats = sparseClipmapTileCache.GetStats();
+                ImGui::Text("Sparse mid cache tiles %u resident / %u queued | gen %u evict %u | upload %u retry %u",
+                    midStats.residentTiles,
+                    midStats.queuedTiles,
+                    midStats.generatedTilesLastFrame,
+                    midStats.evictedTilesLastFrame,
+                    sparseStats.stagedMidClipmapTilesLastFrame,
+                    sparseMidClipmapUploadRetriesLastFrame);
+                ImGui::Text("Sparse mid voxel bricks %u resident / %u queued | gen %u evict %u | upload %u",
+                    midStats.residentVoxelBricks,
+                    midStats.queuedVoxelBricks,
+                    midStats.generatedVoxelBricksLastFrame,
+                    midStats.evictedVoxelBricksLastFrame,
+                    sparseStats.stagedMidVoxelClipmapBricksLastFrame);
+                ImGui::Text("Sparse GPU %s | pages %u | table %u | pool %.1f MB",
+                    sparseStats.initialized ? "ready" : "unavailable",
+                    sparseStats.maxBrickPages,
+                    sparseStats.pageTableCapacity,
+                    static_cast<double>(sparseStats.brickPoolBytes) / (1024.0 * 1024.0));
+                ImGui::Text("Sparse mid GPU height %.2f MB | voxel %.2f MB | staged %.2f MB",
+                    static_cast<double>(
+                        sparseStats.midClipmapMetadataBytes +
+                        sparseStats.midClipmapLookupBytes +
+                        sparseStats.midClipmapSampleBytes) / (1024.0 * 1024.0),
+                    static_cast<double>(
+                        sparseStats.midVoxelClipmapMetadataBytes +
+                        sparseStats.midVoxelClipmapLookupBytes +
+                        sparseStats.midVoxelClipmapSampleBytes) / (1024.0 * 1024.0),
+                    static_cast<double>(sparseStats.stagedMidClipmapBytesLastFrame) / (1024.0 * 1024.0));
+                ImGui::Text("Sparse upload staged %u bricks + %u page entries / %.2f MB | overflow %u",
+                    sparseStats.stagedBricksLastFrame,
+                    sparseStats.stagedPageEntriesLastFrame,
+                    static_cast<double>(sparseStats.stagedBytesLastFrame) / (1024.0 * 1024.0),
+                    sparseStats.uploadRingOverflowLastFrame ? 1u : 0u);
+                ImGui::Text("Sparse miss feedback %u retired | %zu pending | %u consumed",
+                    sparseStats.missFeedbackRecordsLastRetire,
+                    sparseMissFeedbackPending.size(),
+                    sparseMissFeedbackConsumedLastFrame);
+                ImGui::Text("Sparse requests spec/vis/coll %u/%u/%u | total budget %u",
+                    sparseSpeculativeRequestsLastFrame,
+                    sparseVisibleRequestsLastFrame,
+                    sparseCollisionRequestsLastFrame,
+                    sparseTotalRequestBudget);
+                ImGui::Text("Sparse runtime scale %.2f | gen/upload/mid budgets %u/%u/%u",
+                    sparseRuntimeBudgetScale,
+                    sparseGenerationBudgetLastFrame,
+                    sparseUploadBudgetLastFrame,
+                    sparseMidClipmapBudgetLastFrame);
+                ImGui::Text("Sparse ray budget scale %.2f | %.0f voxels / %u steps",
+                    sparseRaymarchBudgetScale,
+                    currentRaymarchMaxDistance,
+                    currentRaymarchMaxSteps);
+                ImGui::Text("Sparse speculative backpressure skips %u | genQ>%u miss>%u",
+                    sparseSpeculativeBackpressureSkipsLastFrame,
+                    sparseSpeculativeBackpressureGenQueue,
+                    sparseSpeculativeBackpressureMissPending);
+                ImGui::Text("Sparse pressure trim %u | budget %u",
+                    sparsePressureTrimLastFrame,
+                    sparsePressureTrimBudget);
+                ImGui::Text("Sparse distance trim %s | start %u | keep %u/%u",
+                    sparseDistanceTrimSkippedLastFrame ? "deferred" : "eligible",
+                    sparseTrimStartResident,
+                    sparseTrimRadiusXz,
+                    sparseTrimRadiusY);
+                ImGui::Text("Sparse replacement evict %u | budget %u",
+                    sparseReplacementEvictionsLastFrame,
+                    sparseReplacementBudget);
+                ImGui::Text("Sparse retry upload %u | invalidation %u",
+                    sparseUploadRequeuesLastFrame,
+                    sparseInvalidationRequeuesLastFrame);
+                ImGui::Text("Sparse page-table publish pending %zu | retries %u",
+                    sparsePendingPageTablePublishes.size(),
+                    sparsePageTablePublishRetriesLastFrame);
+                const auto& sparseWorldStats = sparseVoxelWorld.GetStats();
+                ImGui::Text("Sparse world %s | resident %u | tracked %u | queued gen %u | staged %u | queued upload %u | free %u",
+                    sparseVoxelWorldReady ? "ready" : "off",
+                    sparseWorldStats.residentBricks,
+                    sparseWorldStats.requestedBricks,
+                    sparseWorldStats.generationQueuedBricks,
+                    sparseWorldStats.generatedBricks,
+                    sparseWorldStats.uploadQueuedBricks,
+                    sparseWorldStats.freePages);
+                ImGui::Text("Sparse resident classes spec/vis/coll/edit %u/%u/%u/%u",
+                    sparseWorldStats.residentSpeculativeBricks,
+                    sparseWorldStats.residentVisibleBricks,
+                    sparseWorldStats.residentCollisionBricks,
+                    sparseWorldStats.residentEditedBricks);
+                ImGui::Text("Sparse eviction last %u | queued invalid %u | trim %u/%u",
+                    sparseWorldStats.evictedBricksLastFrame,
+                    sparseWorldStats.evictionQueuedBricks,
+                    sparseTrimRadiusXz,
+                    sparseTrimRadiusY);
+                ImGui::Text("Sparse brush eval %u | edited %u | bricks %u | uploads %u",
+                    sparseWorldStats.brushVoxelsEvaluatedLastStroke,
+                    sparseWorldStats.brushVoxelsEditedLastStroke,
+                    sparseWorldStats.brushBricksTouchedLastStroke,
+                    sparseWorldStats.brushBricksQueuedLastStroke);
+            }
             ImGui::Text("FPS %.1f avg / %.1f now", smoothedFps, instantFps);
             ImGui::Text("Frame %.2f ms avg / %.2f ms now", smoothedFrameMs, lastRawFrameMs);
             ImGui::Separator();
@@ -2332,6 +3601,100 @@ int RunSandbox(int argc, char* argv[]) {
                 physicsStats.theoreticalChunkUniverse,
                 physicsDirtyFramesRemaining,
                 currentFarFieldQuality);
+            if (sparseBackendRequested && sparseVoxelWorldReady) {
+                const auto& sparseWorldStats = sparseVoxelWorld.GetStats();
+                const auto& sparseGpuStats = sparseGpuResources.GetStats();
+                const auto& midStats = sparseClipmapTileCache.GetStats();
+                spdlog::info(
+                    "PERF_SPARSE frame={} runtimeTest={} resident={} tracked={} class={}/{}/{}/{} genQueued={} staged={} uploadQueued={} free={} evictLast={} invalidQueued={} edits={}/{} surface={}/{} surfUpd={} surfRm={} surfGenFaces={} surfSerial={} brushEval={} brushEdit={} brushBricks={} brushUploads={} gpuStaged={} pageEntries={} uploadMB={:.2f} overflow={} missRetired={} missPending={} missConsumed={} reqSpec={} reqVis={} reqColl={} scale={:.2f} rayScale={:.2f} rayBudget={:.0f}/{} budgetGen={} budgetUpload={} budgetMid={} specSkip={} pressureTrim={} distTrimSkip={} trimStart={} replaceEvict={} retryUpload={} retryInvalid={} publishPending={} publishRetry={} midClip={} midStart={} midEnd={} midTiles={}/{} midGen={} midUpload={} midRetry={} midVoxels={}/{} midVoxelGen={} midVoxelUpload={} midVoxelEvict={} midBytesMB={:.2f} midSerial={}",
+                    frameCount,
+                    sparseRuntimeTestMode ? 1 : 0,
+                    sparseWorldStats.residentBricks,
+                    sparseWorldStats.requestedBricks,
+                    sparseWorldStats.residentSpeculativeBricks,
+                    sparseWorldStats.residentVisibleBricks,
+                    sparseWorldStats.residentCollisionBricks,
+                    sparseWorldStats.residentEditedBricks,
+                    sparseWorldStats.generationQueuedBricks,
+                    sparseWorldStats.generatedBricks,
+                    sparseWorldStats.uploadQueuedBricks,
+                    sparseWorldStats.freePages,
+                    sparseWorldStats.evictedBricksLastFrame,
+                    sparseWorldStats.evictionQueuedBricks,
+                    sparseWorldStats.editedBricks,
+                    sparseWorldStats.editedVoxels,
+                    sparseWorldStats.surfaceCachedBricks,
+                    sparseWorldStats.surfaceFaces,
+                    sparseWorldStats.surfaceBricksUpdatedLastFrame,
+                    sparseWorldStats.surfaceBricksRemovedLastFrame,
+                    sparseWorldStats.surfaceFacesGeneratedLastFrame,
+                    sparseWorldStats.surfaceSerial,
+                    sparseWorldStats.brushVoxelsEvaluatedLastStroke,
+                    sparseWorldStats.brushVoxelsEditedLastStroke,
+                    sparseWorldStats.brushBricksTouchedLastStroke,
+                    sparseWorldStats.brushBricksQueuedLastStroke,
+                    sparseGpuStats.stagedBricksLastFrame,
+                    sparseGpuStats.stagedPageEntriesLastFrame,
+                    static_cast<double>(sparseGpuStats.stagedBytesLastFrame) / (1024.0 * 1024.0),
+                    sparseGpuStats.uploadRingOverflowLastFrame ? 1 : 0,
+                    sparseGpuStats.missFeedbackRecordsLastRetire,
+                    sparseMissFeedbackPending.size(),
+                    sparseMissFeedbackConsumedLastFrame,
+                    sparseSpeculativeRequestsLastFrame,
+                    sparseVisibleRequestsLastFrame,
+                    sparseCollisionRequestsLastFrame,
+                    sparseRuntimeBudgetScale,
+                    sparseRaymarchBudgetScale,
+                    currentRaymarchMaxDistance,
+                    currentRaymarchMaxSteps,
+                    sparseGenerationBudgetLastFrame,
+                    sparseUploadBudgetLastFrame,
+                    sparseMidClipmapBudgetLastFrame,
+                    sparseSpeculativeBackpressureSkipsLastFrame,
+                    sparsePressureTrimLastFrame,
+                    sparseDistanceTrimSkippedLastFrame,
+                    sparseTrimStartResident,
+                    sparseReplacementEvictionsLastFrame,
+                    sparseUploadRequeuesLastFrame,
+                    sparseInvalidationRequeuesLastFrame,
+                    sparsePendingPageTablePublishes.size(),
+                    sparsePageTablePublishRetriesLastFrame,
+                    sparseClipmapPolicy.IsEnabled() ? 1 : 0,
+                    static_cast<uint32_t>(sparseClipmapPolicy.Config().startDistance),
+                    static_cast<uint32_t>(sparseClipmapPolicy.Config().endDistance),
+                    midStats.residentTiles,
+                    midStats.queuedTiles,
+                    midStats.generatedTilesLastFrame,
+                    sparseGpuStats.stagedMidClipmapTilesLastFrame,
+                    sparseMidClipmapUploadRetriesLastFrame,
+                    midStats.residentVoxelBricks,
+                    midStats.queuedVoxelBricks,
+                    midStats.generatedVoxelBricksLastFrame,
+                    sparseGpuStats.stagedMidVoxelClipmapBricksLastFrame,
+                    midStats.evictedVoxelBricksLastFrame,
+                    static_cast<double>(sparseGpuStats.stagedMidClipmapBytesLastFrame) / (1024.0 * 1024.0),
+                    std::max(sparseMidClipmapUploadedHeightSerial, sparseMidClipmapUploadedVoxelSerial));
+                if (sparseSurfaceGpuResources.IsInitialized()) {
+                    const auto& sparseSurfaceGpuStats = sparseSurfaceGpuResources.GetStats();
+                    spdlog::info(
+                        "PERF_SPARSE_SURFACE frame={} cpuBricks={} cpuFaces={} cpuSerial={} gpuFaces={} gpuRanges={} gpuRangeTable={} gpuSerial={} stagedFaces={} stagedRanges={} stagedRangeTable={} stagedMB={:.2f} rasterFaces={} retry={} overflow={}",
+                        frameCount,
+                        sparseWorldStats.surfaceCachedBricks,
+                        sparseWorldStats.surfaceFaces,
+                        sparseWorldStats.surfaceSerial,
+                        sparseSurfaceGpuStats.uploadedFaces,
+                        sparseSurfaceGpuStats.uploadedRanges,
+                        sparseSurfaceGpuStats.uploadedRangeTableCapacity,
+                        sparseSurfaceGpuStats.uploadedSerial,
+                        sparseSurfaceGpuStats.stagedFacesLastFrame,
+                        sparseSurfaceGpuStats.stagedRangesLastFrame,
+                        sparseSurfaceGpuStats.stagedRangeTableCapacityLastFrame,
+                        static_cast<double>(sparseSurfaceGpuStats.stagedBytesLastFrame) / (1024.0 * 1024.0),
+                        sparseSurfaceRasterFacesLastFrame,
+                        sparseSurfaceUploadRetriesLastFrame,
+                        sparseSurfaceGpuStats.uploadOverflowLastFrame ? 1 : 0);
+                }
+            }
         }
 
         ImDrawList* foregroundDrawList = ImGui::GetForegroundDrawList();
@@ -2348,15 +3711,24 @@ int RunSandbox(int argc, char* argv[]) {
             ImVec2(center.x, center.y + 8.0f),
             crosshairColor,
             1.5f);
+        if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
+            spdlog::info("FRAME_STAGE {} imgui-built", frameCount);
+        }
 
         // Render ImGui draw data to command list
         imguiBackend.Render(commandList.Get());
+        if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
+            spdlog::info("FRAME_STAGE {} imgui-rendered", frameCount);
+        }
 
         // Queue tiny GPU->CPU raycast copies into a per-frame readback slot.
         // The slot is only mapped after this same frame index's fence completes,
         // so brush targeting/collision never consumes an in-flight GPU write.
         voxelWorld->QueueBrushRaycastReadback(commandList.Get(), frameIndex);
         voxelWorld->QueueGroundRaycastReadback(commandList.Get(), frameIndex);
+        if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
+            spdlog::info("FRAME_STAGE {} readbacks-queued", frameCount);
+        }
         brushQueryMetadata[frameIndex] = BrushQueryMetadata{
             true,
             nextBrushQueryRegionOriginWorld,
@@ -2371,6 +3743,9 @@ int RunSandbox(int argc, char* argv[]) {
 
         // End frame - transitions back buffer to present state
         renderer->EndFrame(commandList.Get(), frameIndex);
+        if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
+            spdlog::info("FRAME_STAGE {} render-end", frameCount);
+        }
         if (gpuTimestampHeap && gpuTimestampReadback) {
             commandList->EndQuery(gpuTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, gpuTimestampBase + 3);
             commandList->ResolveQueryData(
@@ -2381,10 +3756,19 @@ int RunSandbox(int argc, char* argv[]) {
                 gpuTimestampReadback.Get(),
                 static_cast<UINT64>(gpuTimestampBase) * sizeof(uint64_t));
         }
+        if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
+            spdlog::info("FRAME_STAGE {} timestamp-resolved", frameCount);
+        }
 
         // Close and execute command list
         commandList->Close();
+        if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
+            spdlog::info("FRAME_STAGE {} commandlist-closed", frameCount);
+        }
         commandQueue->ExecuteCommandList(commandList.Get());
+        if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
+            spdlog::info("FRAME_STAGE {} commandlist-executed", frameCount);
+        }
 
         // FIX #17: CRITICAL - Swap read/write buffers for next frame
         // The bug: Without this swap, chunks are copied to WRITE buffer every frame,
@@ -2396,14 +3780,23 @@ int RunSandbox(int argc, char* argv[]) {
         //   Swap -> buffer 1 becomes READ, buffer 0 becomes WRITE
         //   Frame N+1: chunks copied to WRITE (now buffer 0), physics writes to buffer 0, render reads buffer 1
         voxelWorld->SwapBuffers();
+        if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
+            spdlog::info("FRAME_STAGE {} buffers-swapped", frameCount);
+        }
 
         // Present
         perfPhaseStart = SDL_GetPerformanceCounter();
         window->Present();
         perfPresentMs = ticksToMs(SDL_GetPerformanceCounter() - perfPhaseStart);
+        if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
+            spdlog::info("FRAME_STAGE {} presented {:.2f}ms", frameCount, perfPresentMs);
+        }
 
         // Signal fence for this frame
         ctx.fenceValue = commandQueue->Signal();
+        if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
+            spdlog::info("FRAME_STAGE {} signaled fence {}", frameCount, ctx.fenceValue);
+        }
         voxelWorld->NotifyBrushEditFeedbackFence(ctx.fenceValue);
 
         // Submit background chunk generation after the frame has been queued.
@@ -2424,6 +3817,13 @@ int RunSandbox(int argc, char* argv[]) {
         inputManager.EndFrame();
 
         frameCount++;
+        if (traceFrameStages && frameCount <= kFrameStageTraceLimit) {
+            spdlog::info("FRAME_STAGE {} complete", frameCount - 1);
+        }
+        if (exitAfterFrames > 0u && frameCount >= exitAfterFrames) {
+            spdlog::info("VENPOD_EXIT_AFTER_FRAMES reached: {}", exitAfterFrames);
+            running = false;
+        }
 
         // Log FPS every 100 frames
         // if (frameCount % 100 == 0) {
@@ -2447,6 +3847,8 @@ int RunSandbox(int argc, char* argv[]) {
     chunkManager->Shutdown();
     voxelWorld->Shutdown();
     farVoxelOctree.Shutdown();
+    sparseSurfaceGpuResources.Shutdown();
+    sparseGpuResources.Shutdown();
 
     renderer->Shutdown();
     window->Shutdown();

@@ -232,10 +232,10 @@ Result<void> VoxelWorld::Initialize(
         //   - Chunks have time to generate before player reaches them
         //   - Includes a vertical buffer so climbing/falling has ready chunks
         //
-        // RENDER_DISTANCE: What's visible in the dense buffer (TerrainConstants.h)
-        //   - 19x7x19 = 2,527 chunks in the render buffer
-        //   - 1216x448x1216 moving voxel render buffer
-        //   - longer distance should come from a future far-LOD renderer
+        // RENDER_DISTANCE: What's visible in the dense buffer
+        // (TerrainConstants.h). This is currently a temporary dev harness size;
+        // the high-scale path is sparse bricks/clipmaps rather than a giant
+        // dense editable buffer.
         //
         // UNLOAD_DISTANCE: Chunks deleted at this distance
         //   - 4-chunk gap from LOAD prevents thrashing when moving back and forth
@@ -3125,7 +3125,8 @@ void VoxelWorld::UpdateActiveRegion(ID3D12Device* device, ID3D12CommandQueue* cm
 
     // ===== STEP 1: Determine which chunks to copy into the moving render buffer =====
     // The buffer dimensions come from TerrainConstants.h and currently hold
-    // 19x7x19 chunks, trading VRAM for a larger dense editable view.
+    // Dense dev-window chunks. The final scalable renderer should promote
+    // visible sparse bricks instead of expanding this dense cache.
     // We center on the camera's chunk and copy nearby chunks
 
     const auto& loadedChunks = m_chunkManager->GetLoadedChunks();

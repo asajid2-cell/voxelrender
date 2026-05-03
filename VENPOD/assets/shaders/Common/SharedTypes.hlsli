@@ -83,7 +83,19 @@ struct FrameConstants {
     // x = page radius, y = page-index side length, z = root min Y, w = reserved
     float4   farFieldGridParams;
 
-};
+    // Sparse near-field metadata (4 DWORDs)
+    // x = enabled, y = max brick pages, z = page-table capacity, w = flags
+    // flags bit 0 = sparse-only, no dense fallback for missing pages
+    float4   sparseNearParams;
+
+      // Mid-field procedural clipmap metadata (4 DWORDs)
+      // x = enabled, y = start distance, z = end distance, w = minimum cell size
+      float4   midFieldParams;
+
+      // Sparse extracted surface hierarchy metadata (4 DWORDs)
+      // x = enabled, y = face count, z = live range count, w = range hash-table capacity
+      float4   surfaceParams;
+  };
 
 // Chunk control structure for sparse optimization
 struct ChunkControl {
