@@ -17,6 +17,7 @@ constexpr uint32_t kMaterialStone = 3;
 constexpr uint32_t kMaterialDirt = 4;
 constexpr uint32_t kMaterialConcrete = 14;
 constexpr uint32_t kLeafFlag = 1;
+constexpr uint32_t kInteriorLeafFlag = 2;
 
 float Smooth01(float value) {
     value = std::clamp(value, 0.0f, 1.0f);
@@ -71,8 +72,95 @@ void FarVoxelOctree::BeginAsyncLoad(const FarVoxelOctreeConfig& config) {
     });
 }
 
-bool FarVoxelOctree::TryFinalizeAsyncUpload(ID3D12Device* device, DescriptorHeapManager& heapManager) {
+bool FarVoxelOctree::IsGpuUploadPending() const {
+    return m_gpuUploadStage != GpuUploadStage::Idle &&
+           m_gpuUploadStage != GpuUploadStage::Complete;
+}
+
+bool FarVoxelOctree::HasPendingGpuUploadCopies() const {
+    return !m_pendingGpuCopies.empty();
+}
+
+bool FarVoxelOctree::EmitPendingGpuUploadCopies(ID3D12GraphicsCommandList* commandList) {
+    if (!commandList || m_pendingGpuCopies.empty()) {
+        return false;
+    }
+
+    bool copiedAny = false;
+    for (const PendingGpuCopy& copy : m_pendingGpuCopies) {
+        GPUBuffer* dst = nullptr;
+        UploadBuffer* src = nullptr;
+        switch (copy.stage) {
+        case GpuUploadStage::Nodes:
+            dst = &m_nodeBuffer;
+            src = &m_nodeUploadBuffer;
+            break;
+        case GpuUploadStage::Pages:
+            dst = &m_pageBuffer;
+            src = &m_pageUploadBuffer;
+            break;
+        case GpuUploadStage::PageIndex:
+            dst = &m_pageIndexBuffer;
+            src = &m_pageIndexUploadBuffer;
+            break;
+        case GpuUploadStage::Idle:
+        case GpuUploadStage::Complete:
+            break;
+        }
+        if (!dst || !src || !dst->GetResource() || !src->GetResource() || copy.bytes == 0) {
+            continue;
+        }
+
+        dst->TransitionTo(commandList, D3D12_RESOURCE_STATE_COPY_DEST);
+        commandList->CopyBufferRegion(
+            dst->GetResource(),
+            copy.offset,
+            src->GetResource(),
+            copy.offset,
+            copy.bytes);
+        copiedAny = true;
+    }
+
+    if (m_nodeBuffer.GetResource()) {
+        m_nodeBuffer.TransitionTo(
+            commandList,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    if (m_pageBuffer.GetResource()) {
+        m_pageBuffer.TransitionTo(
+            commandList,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+    if (m_pageIndexBuffer.GetResource()) {
+        m_pageIndexBuffer.TransitionTo(
+            commandList,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+
+    m_pendingGpuCopies.clear();
+    return copiedAny;
+}
+
+const char* FarVoxelOctree::GetGpuUploadStageName() const {
+    switch (m_gpuUploadStage) {
+    case GpuUploadStage::Idle: return "idle";
+    case GpuUploadStage::Nodes: return "nodes";
+    case GpuUploadStage::Pages: return "pages";
+    case GpuUploadStage::PageIndex: return "page-index";
+    case GpuUploadStage::Complete: return "complete";
+    }
+    return "unknown";
+}
+
+bool FarVoxelOctree::TryFinalizeAsyncUpload(
+    ID3D12Device* device,
+    DescriptorHeapManager& heapManager,
+    uint64_t maxUploadBytes)
+{
     if (!m_asyncPending || !m_asyncBuild.valid()) {
+        if (IsGpuUploadPending()) {
+            return PumpGpuUpload(device, heapManager, maxUploadBytes);
+        }
         return IsValid();
     }
 
@@ -92,14 +180,18 @@ bool FarVoxelOctree::TryFinalizeAsyncUpload(ID3D12Device* device, DescriptorHeap
     m_nodes = std::move(built.nodes);
     m_pages = std::move(built.pages);
     m_pageIndex = std::move(built.pageIndex);
+    m_stats.gpuUploadBytesTotal =
+        static_cast<uint64_t>(m_nodes.size()) * sizeof(Node) +
+        static_cast<uint64_t>(m_pages.size()) * sizeof(Page) +
+        static_cast<uint64_t>(m_pageIndex.size()) * sizeof(uint32_t);
+    m_stats.gpuUploadBytesUploaded = 0;
+    m_stats.gpuUploadStageBytesTotal = 0;
+    m_stats.gpuUploadStageBytesUploaded = 0;
+    m_stats.gpuUploadMs = 0.0;
+    m_gpuUploadStage = GpuUploadStage::Nodes;
+    m_gpuUploadStageOffset = 0;
 
-    auto uploadResult = UploadToGpu(device, heapManager);
-    if (!uploadResult) {
-        spdlog::warn("Far sparse voxel octree async upload failed: {}", uploadResult.error());
-        Shutdown();
-        return false;
-    }
-    return true;
+    return PumpGpuUpload(device, heapManager, maxUploadBytes);
 }
 
 FarVoxelOctree::BuildResult FarVoxelOctree::BuildCpuData(const FarVoxelOctreeConfig& config) {
@@ -116,7 +208,7 @@ FarVoxelOctree::BuildResult FarVoxelOctree::BuildCpuData(const FarVoxelOctreeCon
 
     struct CacheHeader {
         uint32_t magic = 0x56534631u; // "VSF1"
-        uint32_t version = 2;
+        uint32_t version = 4;
         int32_t pageRadius = 0;
         uint32_t maxDepth = 0;
         uint32_t seed = 0;
@@ -138,7 +230,7 @@ FarVoxelOctree::BuildResult FarVoxelOctree::BuildCpuData(const FarVoxelOctreeCon
         CacheHeader header{};
         if (in.read(reinterpret_cast<char*>(&header), sizeof(header)) &&
             header.magic == 0x56534631u &&
-            header.version == 2 &&
+            header.version == 4 &&
             header.pageRadius == radius &&
             header.maxDepth == builder.m_config.maxDepth &&
             header.seed == builder.m_config.seed &&
@@ -241,7 +333,6 @@ FarVoxelOctree::BuildResult FarVoxelOctree::BuildCpuData(const FarVoxelOctreeCon
 }
 
 Result<void> FarVoxelOctree::UploadToGpu(ID3D12Device* device, DescriptorHeapManager& heapManager) {
-    const auto uploadStart = std::chrono::steady_clock::now();
     if (!device) {
         return Error("FarVoxelOctree::UploadToGpu - device is null");
     }
@@ -249,62 +340,179 @@ Result<void> FarVoxelOctree::UploadToGpu(ID3D12Device* device, DescriptorHeapMan
         return Error("FarVoxelOctree::UploadToGpu - CPU data is empty");
     }
 
-    auto nodeResult = m_nodeBuffer.Initialize(
-        device,
-        static_cast<uint64_t>(m_nodes.size() * sizeof(Node)),
-        BufferUsage::Upload | BufferUsage::StructuredBuffer,
-        sizeof(Node),
-        "FarVoxelOctree_Nodes");
-    if (!nodeResult) {
-        return Error("Failed to create far octree node buffer: {}", nodeResult.error());
+    m_stats.gpuUploadBytesTotal =
+        static_cast<uint64_t>(m_nodes.size()) * sizeof(Node) +
+        static_cast<uint64_t>(m_pages.size()) * sizeof(Page) +
+        static_cast<uint64_t>(m_pageIndex.size()) * sizeof(uint32_t);
+    m_stats.gpuUploadBytesUploaded = 0;
+    m_stats.gpuUploadStageBytesTotal = 0;
+    m_stats.gpuUploadStageBytesUploaded = 0;
+    m_stats.gpuUploadMs = 0.0;
+    m_gpuUploadStage = GpuUploadStage::Nodes;
+    m_gpuUploadStageOffset = 0;
+    if (!PumpGpuUpload(device, heapManager, UINT64_MAX)) {
+        return Error("FarVoxelOctree::UploadToGpu - staged upload did not complete");
     }
-    m_nodeBuffer.Upload(m_nodes.data(), m_nodes.size() * sizeof(Node));
-    nodeResult = m_nodeBuffer.CreateSRV(device, heapManager);
-    if (!nodeResult) {
-        return Error("Failed to create far octree node SRV: {}", nodeResult.error());
-    }
-
-    auto pageResult = m_pageBuffer.Initialize(
-        device,
-        static_cast<uint64_t>(m_pages.size() * sizeof(Page)),
-        BufferUsage::Upload | BufferUsage::StructuredBuffer,
-        sizeof(Page),
-        "FarVoxelOctree_Pages");
-    if (!pageResult) {
-        return Error("Failed to create far octree page buffer: {}", pageResult.error());
-    }
-    m_pageBuffer.Upload(m_pages.data(), m_pages.size() * sizeof(Page));
-    pageResult = m_pageBuffer.CreateSRV(device, heapManager);
-    if (!pageResult) {
-        return Error("Failed to create far octree page SRV: {}", pageResult.error());
-    }
-
-    auto indexResult = m_pageIndexBuffer.Initialize(
-        device,
-        static_cast<uint64_t>(m_pageIndex.size() * sizeof(uint32_t)),
-        BufferUsage::Upload | BufferUsage::StructuredBuffer,
-        sizeof(uint32_t),
-        "FarVoxelOctree_PageIndex");
-    if (!indexResult) {
-        return Error("Failed to create far octree page index buffer: {}", indexResult.error());
-    }
-    m_pageIndexBuffer.Upload(m_pageIndex.data(), m_pageIndex.size() * sizeof(uint32_t));
-    indexResult = m_pageIndexBuffer.CreateSRV(device, heapManager);
-    if (!indexResult) {
-        return Error("Failed to create far octree page index SRV: {}", indexResult.error());
-    }
-
-    m_stats.gpuUploadMs = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - uploadStart).count();
-    spdlog::info("Far voxel octree initialized: {} pages, {} nodes, {} page-index cells, pageSize={}, coverage={} world units, source={}, {:.1f} ms",
-        m_stats.pageCount,
-        m_stats.nodeCount,
-        m_stats.pageIndexCount,
-        m_stats.pageSize,
-        m_stats.coveredWorldSize,
-        m_stats.loadedFromCache ? "cache" : "build",
-        m_stats.cpuBuildMs + m_stats.gpuUploadMs);
     return {};
+}
+
+bool FarVoxelOctree::PumpGpuUpload(
+    ID3D12Device* device,
+    DescriptorHeapManager& heapManager,
+    uint64_t maxUploadBytes)
+{
+    if (!device || m_nodes.empty() || m_pages.empty() || m_pageIndex.empty()) {
+        return false;
+    }
+    if (m_gpuUploadStage == GpuUploadStage::Complete) {
+        return IsValid();
+    }
+    if (m_gpuUploadStage == GpuUploadStage::Idle) {
+        m_gpuUploadStage = GpuUploadStage::Nodes;
+        m_gpuUploadStageOffset = 0;
+    }
+    if (maxUploadBytes == 0) {
+        return false;
+    }
+
+    const auto uploadStart = std::chrono::steady_clock::now();
+    uint64_t budgetRemaining = maxUploadBytes;
+    m_stats.gpuUploadStage = static_cast<uint32_t>(m_gpuUploadStage);
+    const auto copyStage = [&](
+        GPUBuffer& buffer,
+        UploadBuffer& uploadBuffer,
+        const void* source,
+        uint64_t totalBytes,
+        uint32_t stride,
+        const char* name) -> bool {
+        if (!buffer.GetResource()) {
+            auto result = buffer.Initialize(
+                device,
+                totalBytes,
+                BufferUsage::Default | BufferUsage::StructuredBuffer,
+                stride,
+                name);
+            if (!result) {
+                spdlog::warn("Failed to create far octree default buffer {}: {}", name, result.error());
+                return false;
+            }
+        }
+        if (!uploadBuffer.GetResource()) {
+            const std::string uploadName = std::string(name) + "_Upload";
+            auto result = uploadBuffer.Initialize(device, totalBytes, uploadName.c_str());
+            if (!result) {
+                spdlog::warn("Failed to create far octree staging buffer {}: {}", uploadName, result.error());
+                return false;
+            }
+        }
+
+        m_stats.gpuUploadStage = static_cast<uint32_t>(m_gpuUploadStage);
+        m_stats.gpuUploadStageBytesTotal = totalBytes;
+        m_stats.gpuUploadStageBytesUploaded = m_gpuUploadStageOffset;
+        const uint64_t remaining = totalBytes - m_gpuUploadStageOffset;
+        const uint64_t bytesToCopy = std::min(remaining, budgetRemaining);
+        if (bytesToCopy > 0) {
+            const uint8_t* sourceBytes = static_cast<const uint8_t*>(source);
+            uint8_t* mappedUpload = static_cast<uint8_t*>(uploadBuffer.GetMappedData());
+            if (!mappedUpload) {
+                spdlog::warn("Far octree staging buffer {} is not mapped", name);
+                return false;
+            }
+            std::memcpy(mappedUpload + m_gpuUploadStageOffset, sourceBytes + m_gpuUploadStageOffset, static_cast<size_t>(bytesToCopy));
+            m_pendingGpuCopies.push_back(PendingGpuCopy{
+                m_gpuUploadStage,
+                m_gpuUploadStageOffset,
+                bytesToCopy
+            });
+            m_gpuUploadStageOffset += bytesToCopy;
+            m_stats.gpuUploadBytesUploaded += bytesToCopy;
+            m_stats.gpuUploadStageBytesUploaded = m_gpuUploadStageOffset;
+            budgetRemaining -= bytesToCopy;
+        }
+        return m_gpuUploadStageOffset == totalBytes;
+    };
+
+    while (budgetRemaining > 0 && m_gpuUploadStage != GpuUploadStage::Complete) {
+        switch (m_gpuUploadStage) {
+        case GpuUploadStage::Nodes: {
+            const uint64_t bytes = static_cast<uint64_t>(m_nodes.size()) * sizeof(Node);
+            if (!copyStage(m_nodeBuffer, m_nodeUploadBuffer, m_nodes.data(), bytes, sizeof(Node), "FarVoxelOctree_Nodes")) {
+                budgetRemaining = 0;
+                break;
+            }
+            auto srvResult = m_nodeBuffer.CreateSRV(device, heapManager);
+            if (!srvResult) {
+                spdlog::warn("Failed to create far octree node SRV: {}", srvResult.error());
+                m_gpuUploadStage = GpuUploadStage::Idle;
+                return false;
+            }
+            m_gpuUploadStage = GpuUploadStage::Pages;
+            m_gpuUploadStageOffset = 0;
+            m_stats.gpuUploadStage = static_cast<uint32_t>(m_gpuUploadStage);
+            m_stats.gpuUploadStageBytesTotal = 0;
+            m_stats.gpuUploadStageBytesUploaded = 0;
+            break;
+        }
+        case GpuUploadStage::Pages: {
+            const uint64_t bytes = static_cast<uint64_t>(m_pages.size()) * sizeof(Page);
+            if (!copyStage(m_pageBuffer, m_pageUploadBuffer, m_pages.data(), bytes, sizeof(Page), "FarVoxelOctree_Pages")) {
+                budgetRemaining = 0;
+                break;
+            }
+            auto srvResult = m_pageBuffer.CreateSRV(device, heapManager);
+            if (!srvResult) {
+                spdlog::warn("Failed to create far octree page SRV: {}", srvResult.error());
+                m_gpuUploadStage = GpuUploadStage::Idle;
+                return false;
+            }
+            m_gpuUploadStage = GpuUploadStage::PageIndex;
+            m_gpuUploadStageOffset = 0;
+            m_stats.gpuUploadStage = static_cast<uint32_t>(m_gpuUploadStage);
+            m_stats.gpuUploadStageBytesTotal = 0;
+            m_stats.gpuUploadStageBytesUploaded = 0;
+            break;
+        }
+        case GpuUploadStage::PageIndex: {
+            const uint64_t bytes = static_cast<uint64_t>(m_pageIndex.size()) * sizeof(uint32_t);
+            if (!copyStage(m_pageIndexBuffer, m_pageIndexUploadBuffer, m_pageIndex.data(), bytes, sizeof(uint32_t), "FarVoxelOctree_PageIndex")) {
+                budgetRemaining = 0;
+                break;
+            }
+            auto srvResult = m_pageIndexBuffer.CreateSRV(device, heapManager);
+            if (!srvResult) {
+                spdlog::warn("Failed to create far octree page index SRV: {}", srvResult.error());
+                m_gpuUploadStage = GpuUploadStage::Idle;
+                return false;
+            }
+            m_gpuUploadStage = GpuUploadStage::Complete;
+            m_gpuUploadStageOffset = 0;
+            m_stats.gpuUploadStage = static_cast<uint32_t>(m_gpuUploadStage);
+            m_stats.gpuUploadStageBytesTotal = 0;
+            m_stats.gpuUploadStageBytesUploaded = 0;
+            break;
+        }
+        case GpuUploadStage::Idle:
+        case GpuUploadStage::Complete:
+            m_gpuUploadStage = GpuUploadStage::Complete;
+            m_stats.gpuUploadStage = static_cast<uint32_t>(m_gpuUploadStage);
+            break;
+        }
+    }
+
+    m_stats.gpuUploadMs += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - uploadStart).count();
+    if (m_gpuUploadStage == GpuUploadStage::Complete) {
+        spdlog::info("Far voxel octree initialized: {} pages, {} nodes, {} page-index cells, pageSize={}, coverage={} world units, source={}, {:.1f} ms",
+            m_stats.pageCount,
+            m_stats.nodeCount,
+            m_stats.pageIndexCount,
+            m_stats.pageSize,
+            m_stats.coveredWorldSize,
+            m_stats.loadedFromCache ? "cache" : "build",
+            m_stats.cpuBuildMs + m_stats.gpuUploadMs);
+        return IsValid();
+    }
+    return false;
 }
 
 void FarVoxelOctree::Shutdown() {
@@ -316,10 +524,16 @@ void FarVoxelOctree::Shutdown() {
     m_nodeBuffer.Shutdown();
     m_pageBuffer.Shutdown();
     m_pageIndexBuffer.Shutdown();
+    m_nodeUploadBuffer.Shutdown();
+    m_pageUploadBuffer.Shutdown();
+    m_pageIndexUploadBuffer.Shutdown();
     m_nodes.clear();
     m_pages.clear();
     m_pageIndex.clear();
     m_stats = {};
+    m_pendingGpuCopies.clear();
+    m_gpuUploadStage = GpuUploadStage::Idle;
+    m_gpuUploadStageOffset = 0;
 }
 
 uint32_t FarVoxelOctree::BuildNode(const BuildBounds& bounds, uint32_t depth) {
@@ -336,7 +550,7 @@ void FarVoxelOctree::BuildNodeInto(uint32_t nodeIndex, const BuildBounds& bounds
         const float height = TerrainHeight(centerX, centerZ);
         Node& leaf = m_nodes[nodeIndex];
         leaf.material = DominantMaterial(centerX, centerZ, height);
-        leaf.flags = kLeafFlag;
+        leaf.flags = kLeafFlag | kInteriorLeafFlag;
         return;
     }
 
@@ -372,11 +586,11 @@ void FarVoxelOctree::BuildNodeInto(uint32_t nodeIndex, const BuildBounds& bounds
 
     Node& node = m_nodes[nodeIndex];
     if (childMask == 0) {
-        const float centerX = bounds.x + bounds.size * 0.5f;
-        const float centerZ = bounds.z + bounds.size * 0.5f;
-        const float height = TerrainHeight(centerX, centerZ);
-        node.material = DominantMaterial(centerX, centerZ, height);
-        node.flags = kLeafFlag;
+        // If no child survives the terrain-overlap test, this node is an
+        // empty/conservative skip region for visual far rendering. Treating it
+        // as a solid leaf created large synthetic slabs in the far SVO pass.
+        node.material = 0;
+        node.flags = kLeafFlag | kInteriorLeafFlag;
     } else {
         const uint32_t childBase = static_cast<uint32_t>(m_nodes.size());
         node.childBase = childBase;

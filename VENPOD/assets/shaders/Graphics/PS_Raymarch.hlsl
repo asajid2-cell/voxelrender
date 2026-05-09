@@ -70,8 +70,7 @@ struct SparseSurfaceFace {
     int voxelX;
     int voxelY;
     int voxelZ;
-    uint material;
-    uint normalAndDirection;
+    uint payload;
 };
 
 struct SparseSurfaceBrickRange {
@@ -83,6 +82,7 @@ struct SparseSurfaceBrickRange {
 
 StructuredBuffer<SparseSurfaceFace> SparseSurfaceFaces : register(t16);
 StructuredBuffer<SparseSurfaceBrickRange> SparseSurfaceRanges : register(t17);
+RWStructuredBuffer<uint> RenderOwnershipStats : register(u0);
 
 static const uint SPARSE_BRICK_SIZE = 16u;
 static const uint SPARSE_BRICK_VOXEL_COUNT = 4096u;
@@ -94,10 +94,10 @@ static const uint SPARSE_SAMPLE_EMPTY_SUBBRICK = 2u;
 static const uint SPARSE_SAMPLE_EMPTY_BRICK = 3u;
 static const uint MID_CLIPMAP_MAGIC = 0x56434C50u;
 static const uint MID_VOXEL_CLIPMAP_MAGIC = 0x56435658u;
-static const uint MID_CLIPMAP_MAX_SHADER_TILES = 128u;
+static const uint MID_CLIPMAP_MAX_SHADER_TILES = 256u;
 static const uint MID_CLIPMAP_MAX_SHADER_RINGS = 8u;
 static const uint MID_CLIPMAP_LOOKUP_PROBES = 8u;
-static const uint MID_VOXEL_CLIPMAP_MAX_BRICKS = 128u;
+static const uint MID_VOXEL_CLIPMAP_MAX_BRICKS = 512u;
 static const uint SPARSE_PAGE_TABLE_LOOKUP_PROBES = 8u;
 static const uint SPARSE_SURFACE_RANGE_LOOKUP_PROBES = 8u;
 
@@ -118,6 +118,10 @@ struct PSInput {
 struct RayHit {
     float4 color;
     float distance;
+};
+
+struct PSOutput {
+    float4 color : SV_Target;
 };
 
 int FloorDiv64(int value) {
@@ -437,6 +441,60 @@ RayHit MakeHit(float4 color, float distance) {
     return hit;
 }
 
+float BackgroundRenderQuality() {
+    return clamp(frame.renderBudgetParams.w, 0.25f, 1.0f);
+}
+
+int ScaleBackgroundStepBudget(int fullBudget, int mediumBudget, int lowBudget) {
+    const float quality = BackgroundRenderQuality();
+    if (quality < 0.62f) {
+        return lowBudget;
+    }
+    if (quality < 0.84f) {
+        return mediumBudget;
+    }
+    return fullBudget;
+}
+
+int ScaleBackgroundRefineBudget(int fullBudget, int mediumBudget, int lowBudget) {
+    return ScaleBackgroundStepBudget(fullBudget, mediumBudget, lowBudget);
+}
+
+float FarFieldRenderQuality() {
+    return min(BackgroundRenderQuality(), clamp(frame.renderBudgetParams.z, 0.25f, 1.0f));
+}
+
+int ScaleFarFieldStepBudget(int fullBudget, int mediumBudget, int lowBudget) {
+    const float quality = FarFieldRenderQuality();
+    if (quality < 0.62f) {
+        return lowBudget;
+    }
+    if (quality < 0.84f) {
+        return mediumBudget;
+    }
+    return fullBudget;
+}
+
+int ScaleFarFieldRefineBudget(int fullBudget, int mediumBudget, int lowBudget) {
+    return ScaleFarFieldStepBudget(fullBudget, mediumBudget, lowBudget);
+}
+
+float BackgroundMissingSampleSkipScale() {
+    const float quality = BackgroundRenderQuality();
+    if (quality < 0.62f) {
+        return 2.75f;
+    }
+    if (quality < 0.84f) {
+        return 2.20f;
+    }
+    return 1.55f;
+}
+
+bool BackgroundDebugLayerMode() {
+    return frame.debugMode == 8u || frame.debugMode == 9u ||
+        frame.debugMode == 49u || frame.debugMode == 50u;
+}
+
 float3 SkySunDirection() {
     return normalize(float3(0.45f, 0.72f, 0.28f));
 }
@@ -476,62 +534,137 @@ float FarRidged(float value, float power) {
     return pow(saturate(1.0f - abs(value)), power);
 }
 
+uint FarHash3D(int x, int y, int z, uint seed) {
+    uint h = seed ^ 2166136261u;
+    h = (h ^ (uint)x) * 16777619u;
+    h = (h ^ (uint)y) * 16777619u;
+    h = (h ^ (uint)z) * 16777619u;
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return h;
+}
+
+float FarValueNoise2D(float x, float z, uint seed) {
+    int x0 = (int)floor(x);
+    int z0 = (int)floor(z);
+    float fx = x - (float)x0;
+    float fz = z - (float)z0;
+    float sx = FarSmooth01(fx);
+    float sz = FarSmooth01(fz);
+
+    float s00 = (float)(FarHash3D(x0, 0, z0, seed) & 0xFFFFFFu) / 16777215.0f;
+    float s10 = (float)(FarHash3D(x0 + 1, 0, z0, seed) & 0xFFFFFFu) / 16777215.0f;
+    float s01 = (float)(FarHash3D(x0, 0, z0 + 1, seed) & 0xFFFFFFu) / 16777215.0f;
+    float s11 = (float)(FarHash3D(x0 + 1, 0, z0 + 1, seed) & 0xFFFFFFu) / 16777215.0f;
+    float a = lerp(s00, s10, sx);
+    float b = lerp(s01, s11, sx);
+    return lerp(a, b, sz) * 2.0f - 1.0f;
+}
+
 float FarTerrainHeight(float2 xz, out float mountainMask, out float spireMask, out float ravineMask) {
-    // Very cheap far-horizon proxy. This intentionally does not try to match
-    // editable near voxels exactly; it gives distant cliffs/spires a coherent
-    // silhouette without running the full chunk generator per pixel.
-    float n0 = sin(dot(xz, float2(0.00173f, 0.00091f)) + 2.1f);
-    float n1 = sin(dot(xz, float2(-0.00077f, 0.00148f)) + 5.7f);
-    float n2 = sin(dot(xz, float2(0.00320f, -0.00260f)) + 1.3f);
-    float n3 = sin(dot(xz, float2(-0.00510f, 0.00430f)) + 8.4f);
+    // Must match Simulation::SparseTerrainGenerator::HeightAt. Earlier far
+    // fallback used a separate sine heightfield, which composited a different
+    // world behind the sparse/mid layers and produced detached cliffs, holes,
+    // and corrupted-looking horizon transitions.
+    float broad = FarValueNoise2D(xz.x * 0.0045f, xz.y * 0.0045f, FAR_WORLD_SEED + 11u);
+    float ridgeSource = FarValueNoise2D(
+        xz.x * 0.0100f + 41.0f,
+        xz.y * 0.0100f - 17.0f,
+        FAR_WORLD_SEED + 23u);
+    float ridge = 1.0f - abs(ridgeSource);
+    float detail = FarValueNoise2D(
+        xz.x * 0.035f - 13.0f,
+        xz.y * 0.035f + 29.0f,
+        FAR_WORLD_SEED + 37u);
 
-    float continent = (n0 * 0.58f + n1 * 0.42f);
-    mountainMask = FarSmooth01((continent + 0.20f) * 0.95f);
+    float height = -64.0f;
+    height += broad * 155.0f;
+    height += ridge * ridge * 180.0f;
+    height += detail * 18.0f;
 
-    float ridgeA = FarRidged(n2, 1.35f);
-    float ridgeB = FarRidged(n3, 1.90f);
-    float broadValley = FarRidged(sin(dot(xz, float2(0.00092f, 0.00111f)) + 0.4f), 1.2f);
-    spireMask = pow(FarRidged(sin(dot(xz, float2(0.0078f, -0.0062f)) + n1), 2.0f), 3.5f) *
-        (0.25f + mountainMask * 0.85f);
-    ravineMask = 1.0f - smoothstep(0.02f, 0.12f, abs(sin(dot(xz, float2(0.00135f, -0.00105f)) + 2.6f)));
+    float2 originDelta = xz - float2(96.0f, 96.0f);
+    height += (1.0f - FarSmooth01(length(originDelta) / 420.0f)) * 120.0f;
 
-    float d = length(xz - float2(96.0f, 96.0f));
-    float originUplift = (1.0f - FarSmooth01(d / 420.0f)) * 170.0f;
-
-    float height = -85.0f;
-    height += continent * 175.0f;
-    height += ridgeA * (95.0f + mountainMask * 115.0f);
-    height += ridgeB * mountainMask * 62.0f;
-    height += spireMask * 150.0f;
-    height += originUplift;
-    height -= broadValley * (90.0f - mountainMask * 30.0f);
-    height -= ravineMask * 230.0f;
-
-    float terraceStep = lerp(10.0f, 22.0f, mountainMask);
-    float terraced = floor(height / terraceStep) * terraceStep;
-    height = lerp(height, terraced, 0.26f + mountainMask * 0.20f);
-
+    mountainMask = saturate((ridge * ridge * 180.0f + max(height - 160.0f, 0.0f)) / 300.0f);
+    spireMask = 0.0f;
+    ravineMask = 0.0f;
     return clamp(height, FAR_TERRAIN_MIN_HEIGHT, FAR_TERRAIN_MAX_HEIGHT);
 }
 
+float QuantizeTerrainHeight(float height, float verticalStep) {
+    verticalStep = max(verticalStep, 1.0f);
+    return floor(height / verticalStep) * verticalStep;
+}
+
+float FarFallbackCellSize(float distanceFromCamera) {
+    const float t = saturate((distanceFromCamera - 900.0f) / 6500.0f);
+    if (t < 0.18f) return 8.0f;
+    if (t < 0.42f) return 12.0f;
+    if (t < 0.68f) return 18.0f;
+    return 28.0f;
+}
+
+float2 FarFallbackCellCenter(float2 xz, float cellSize) {
+    return (floor(xz / cellSize) + 0.5f) * cellSize;
+}
+
+float FarTerrainHeightVoxelized(
+    float2 xz,
+    float distanceFromCamera,
+    out float mountainMask,
+    out float spireMask,
+    out float ravineMask)
+{
+    const float cellSize = FarFallbackCellSize(distanceFromCamera);
+    const float2 sampleXz = FarFallbackCellCenter(xz, cellSize);
+    const float rawHeight = FarTerrainHeight(sampleXz, mountainMask, spireMask, ravineMask);
+    return QuantizeTerrainHeight(rawHeight, max(4.0f, cellSize * 0.75f));
+}
+
 uint FarTerrainMaterial(float2 xz, float height, float mountainMask, float spireMask, float ravineMask) {
-    float materialNoise = sin(dot(xz, float2(0.013f, 0.017f)) + sin(dot(xz, float2(0.004f, -0.011f)))) * 0.5f + 0.5f;
-    if (height < FAR_SEA_LEVEL + 4.0f) {
+    // Match the generated top-surface material rule used by
+    // SparseTerrainGenerator::SampleGeneratedVoxel.
+    if (height < FAR_SEA_LEVEL + 6.0f) {
         return MAT_SAND;
     }
-    if (ravineMask > 0.55f && materialNoise > 0.35f) {
+    if (height > 260.0f) {
         return MAT_STONE;
-    }
-    if (spireMask > 0.28f || height > 430.0f) {
-        return MAT_STONE;
-    }
-    if (mountainMask > 0.70f || height > 220.0f) {
-        return (materialNoise > 0.45f) ? MAT_STONE : MAT_CONCRETE;
-    }
-    if (materialNoise > 0.84f) {
-        return MAT_CONCRETE;
     }
     return MAT_DIRT;
+}
+
+float3 FarTerrainVoxelNormal(float2 xz, float distanceFromCamera) {
+    const float cellSize = FarFallbackCellSize(distanceFromCamera);
+    float mountainMaskA, spireMaskA, ravineMaskA;
+    float mountainMaskB, spireMaskB, ravineMaskB;
+    float hx0 = FarTerrainHeightVoxelized(
+        xz - float2(cellSize, 0.0f),
+        distanceFromCamera,
+        mountainMaskA,
+        spireMaskA,
+        ravineMaskA);
+    float hx1 = FarTerrainHeightVoxelized(
+        xz + float2(cellSize, 0.0f),
+        distanceFromCamera,
+        mountainMaskB,
+        spireMaskB,
+        ravineMaskB);
+    float hz0 = FarTerrainHeightVoxelized(
+        xz - float2(0.0f, cellSize),
+        distanceFromCamera,
+        mountainMaskA,
+        spireMaskA,
+        ravineMaskA);
+    float hz1 = FarTerrainHeightVoxelized(
+        xz + float2(0.0f, cellSize),
+        distanceFromCamera,
+        mountainMaskB,
+        spireMaskB,
+        ravineMaskB);
+    return normalize(float3(hx0 - hx1, max(cellSize * 2.0f, 6.0f), hz0 - hz1));
 }
 
 float3 FarTerrainNormal(float2 xz) {
@@ -542,6 +675,16 @@ float3 FarTerrainNormal(float2 xz) {
     float hz0 = FarTerrainHeight(xz - float2(0.0f, 3.0f), mountainMaskA, spireMaskA, ravineMaskA);
     float hz1 = FarTerrainHeight(xz + float2(0.0f, 3.0f), mountainMaskB, spireMaskB, ravineMaskB);
     return normalize(float3(hx0 - hx1, 6.0f, hz0 - hz1));
+}
+
+float ProjectRayDepth(float rayDistance, float3 rayDir) {
+    static const float kNearPlane = 0.05f;
+    static const float kFarPlane = 10000.0f;
+    if (rayDistance >= 1e19f) {
+        return 0.999999f;
+    }
+    const float viewZ = max(dot(rayDir, frame.cameraForward.xyz) * rayDistance, kNearPlane);
+    return min(saturate((viewZ - kNearPlane) / (kFarPlane - kNearPlane)), 0.999999f);
 }
 
 float MidClipmapUnpackHeight(uint packedSample) {
@@ -612,6 +755,45 @@ bool LookupResidentMidClipmapTile(
     return false;
 }
 
+bool LookupResidentMidClipmapTileInRing(
+    float2 xz,
+    uint side,
+    uint tileCount,
+    uint lookupCapacity,
+    uint ring,
+    out uint tileIndex)
+{
+    tileIndex = 0u;
+    if (lookupCapacity == 0u || (lookupCapacity & (lookupCapacity - 1u)) != 0u) {
+        return false;
+    }
+
+    float cellSize = MidClipmapRingCellSize(ring);
+    float tileWorldSize = cellSize * (float)(side - 1u);
+    int tileX = (int)floor(xz.x / tileWorldSize);
+    int tileZ = (int)floor(xz.y / tileWorldSize);
+    uint slot = HashMidClipmapTileCoord((int)ring, tileX, tileZ) & (lookupCapacity - 1u);
+
+    [unroll]
+    for (uint probe = 0u; probe < MID_CLIPMAP_LOOKUP_PROBES; ++probe) {
+        uint4 entry = MidClipmapLookup[slot];
+        if (entry.w == 0u) {
+            return false;
+        }
+        if ((int)entry.x == (int)ring && (int)entry.y == tileX && (int)entry.z == tileZ) {
+            uint compactIndex = entry.w - 1u;
+            if (compactIndex < tileCount) {
+                tileIndex = compactIndex;
+                return true;
+            }
+            return false;
+        }
+        slot = (slot + 1u) & (lookupCapacity - 1u);
+    }
+
+    return false;
+}
+
 bool SampleResidentMidClipmap(float2 xz, out float height, out uint material) {
     height = 0.0f;
     material = MAT_AIR;
@@ -664,6 +846,117 @@ bool SampleResidentMidClipmap(float2 xz, out float height, out uint material) {
     height = lerp(h0, h1, fz);
     material = MidClipmapUnpackMaterial(s00);
     return true;
+}
+
+bool SampleResidentMidClipmapRing(
+    float2 xz,
+    uint ring,
+    out float height,
+    out uint material,
+    out float cellSize)
+{
+    height = 0.0f;
+    material = MAT_AIR;
+    cellSize = MidClipmapRingCellSize(ring);
+
+    uint4 header = MidClipmapTiles[0];
+    if (header.x != MID_CLIPMAP_MAGIC || header.y < 2u || header.z == 0u) {
+        return false;
+    }
+
+    uint side = min(header.y, 65u);
+    uint tileCount = min(header.z, MID_CLIPMAP_MAX_SHADER_TILES);
+    uint lookupCapacity = header.w & 0x00FFFFFFu;
+    uint ringCount = min(header.w >> 24u, MID_CLIPMAP_MAX_SHADER_RINGS);
+    if (ring >= ringCount) {
+        return false;
+    }
+
+    uint tileIndex = 0u;
+    if (!LookupResidentMidClipmapTileInRing(xz, side, tileCount, lookupCapacity, ring, tileIndex)) {
+        return false;
+    }
+
+    uint4 tile = MidClipmapTiles[tileIndex + 1u];
+    if (tile.w == 0u) {
+        return false;
+    }
+
+    int2 origin = int2((int)tile.x, (int)tile.y);
+    cellSize = (float)(tile.z >> 8u);
+    if (cellSize < 1.0f) {
+        return false;
+    }
+
+    float extent = cellSize * (float)(side - 1u);
+    float2 localWorld = xz - float2(origin);
+    if (localWorld.x < 0.0f || localWorld.y < 0.0f ||
+        localWorld.x > extent || localWorld.y > extent) {
+        return false;
+    }
+
+    float2 sampleCoord = localWorld / cellSize;
+    uint sx = (uint)clamp(floor(sampleCoord.x), 0.0f, (float)(side - 2u));
+    uint sz = (uint)clamp(floor(sampleCoord.y), 0.0f, (float)(side - 2u));
+    float fx = saturate(sampleCoord.x - (float)sx);
+    float fz = saturate(sampleCoord.y - (float)sz);
+    uint sampleBase = tileIndex * side * side;
+    uint s00 = MidClipmapSamples[sampleBase + sx + sz * side];
+    uint s10 = MidClipmapSamples[sampleBase + (sx + 1u) + sz * side];
+    uint s01 = MidClipmapSamples[sampleBase + sx + (sz + 1u) * side];
+    uint s11 = MidClipmapSamples[sampleBase + (sx + 1u) + (sz + 1u) * side];
+    float h0 = lerp(MidClipmapUnpackHeight(s00), MidClipmapUnpackHeight(s10), fx);
+    float h1 = lerp(MidClipmapUnpackHeight(s01), MidClipmapUnpackHeight(s11), fx);
+    height = lerp(h0, h1, fz);
+    material = MidClipmapUnpackMaterial(s00);
+    return true;
+}
+
+bool SampleResidentMidClipmapFallback(
+    float2 xz,
+    uint preferredRing,
+    out float height,
+    out uint material,
+    out float cellSize)
+{
+    height = 0.0f;
+    material = MAT_AIR;
+    cellSize = MidClipmapRingCellSize(preferredRing);
+
+    uint4 header = MidClipmapTiles[0];
+    const uint ringCount = min(header.w >> 24u, MID_CLIPMAP_MAX_SHADER_RINGS);
+    if (header.x != MID_CLIPMAP_MAGIC || header.z == 0u || ringCount == 0u) {
+        return false;
+    }
+
+    const uint clampedPreferred = min(preferredRing, ringCount - 1u);
+    if (SampleResidentMidClipmapRing(xz, clampedPreferred, height, material, cellSize)) {
+        return true;
+    }
+
+    [loop]
+    for (uint offset = 1u; offset < MID_CLIPMAP_MAX_SHADER_RINGS; ++offset) {
+        const uint coarserRing = clampedPreferred + offset;
+        if (coarserRing >= ringCount) {
+            break;
+        }
+        if (SampleResidentMidClipmapRing(xz, coarserRing, height, material, cellSize)) {
+            return true;
+        }
+    }
+
+    [loop]
+    for (uint offsetFine = 1u; offsetFine < MID_CLIPMAP_MAX_SHADER_RINGS; ++offsetFine) {
+        if (offsetFine > clampedPreferred) {
+            break;
+        }
+        const uint finerRing = clampedPreferred - offsetFine;
+        if (SampleResidentMidClipmapRing(xz, finerRing, height, material, cellSize)) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 bool LookupResidentMidVoxelBrick(
@@ -747,21 +1040,173 @@ bool SampleResidentMidVoxel(float3 worldPos, uint ring, out uint voxel) {
     return true;
 }
 
+bool SampleResidentMidVoxelFallback(
+    float3 worldPos,
+    uint preferredRing,
+    out uint voxel,
+    out uint actualRing,
+    out float actualCellSize)
+{
+    voxel = PackVoxel(MAT_AIR, 0, 0, 0);
+    actualRing = preferredRing;
+    actualCellSize = MidClipmapRingCellSize(preferredRing);
+
+    uint4 header = MidVoxelClipmapMetadata[0];
+    const uint ringCount = min(header.w >> 24u, MID_CLIPMAP_MAX_SHADER_RINGS);
+    if (header.x != MID_VOXEL_CLIPMAP_MAGIC || header.z == 0u || ringCount == 0u) {
+        return false;
+    }
+
+    const uint clampedPreferred = min(preferredRing, ringCount - 1u);
+    if (SampleResidentMidVoxel(worldPos, clampedPreferred, voxel)) {
+        actualRing = clampedPreferred;
+        actualCellSize = MidClipmapRingCellSize(actualRing);
+        return true;
+    }
+
+    // Missing preferred-ring data is a residency gap, not proof that the world
+    // is empty. Try progressively coarser rings first so the hierarchy degrades
+    // to stable context instead of flashing through to far/sky ownership.
+    [loop]
+    for (uint offset = 1u; offset < MID_CLIPMAP_MAX_SHADER_RINGS; ++offset) {
+        const uint coarserRing = clampedPreferred + offset;
+        if (coarserRing >= ringCount) {
+            break;
+        }
+        if (SampleResidentMidVoxel(worldPos, coarserRing, voxel)) {
+            actualRing = coarserRing;
+            actualCellSize = MidClipmapRingCellSize(actualRing);
+            return true;
+        }
+    }
+
+    // Finer rings are less likely in far segments, but using one if it is
+    // resident is still better than treating the segment as missing terrain.
+    [loop]
+    for (uint offsetFine = 1u; offsetFine < MID_CLIPMAP_MAX_SHADER_RINGS; ++offsetFine) {
+        if (offsetFine > clampedPreferred) {
+            break;
+        }
+        const uint finerRing = clampedPreferred - offsetFine;
+        if (SampleResidentMidVoxel(worldPos, finerRing, voxel)) {
+            actualRing = finerRing;
+            actualCellSize = MidClipmapRingCellSize(actualRing);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool IsMidVoxelAirOrMissing(float3 worldPos, uint ring) {
+    uint neighborVoxel;
+    if (!SampleResidentMidVoxel(worldPos, ring, neighborVoxel)) {
+        // A missing neighbor is an unknown residency boundary, not a real
+        // surface. Treat it as occupied so mid bricks do not draw artificial
+        // chunk shells while streaming catches up.
+        return false;
+    }
+    return GetMaterial(neighborVoxel) == MAT_AIR;
+}
+
+bool IsResidentMidVoxelExposed(float3 worldPos, uint ring, float cellSize, out float3 normal) {
+    normal = float3(0.0f, 0.0f, 0.0f);
+    const float3 dx = float3(cellSize, 0.0f, 0.0f);
+    const float3 dy = float3(0.0f, cellSize, 0.0f);
+    const float3 dz = float3(0.0f, 0.0f, cellSize);
+
+    if (IsMidVoxelAirOrMissing(worldPos + dx, ring)) normal += float3(1.0f, 0.0f, 0.0f);
+    if (IsMidVoxelAirOrMissing(worldPos - dx, ring)) normal += float3(-1.0f, 0.0f, 0.0f);
+    if (IsMidVoxelAirOrMissing(worldPos + dy, ring)) normal += float3(0.0f, 1.0f, 0.0f);
+    if (IsMidVoxelAirOrMissing(worldPos - dy, ring)) normal += float3(0.0f, -1.0f, 0.0f);
+    if (IsMidVoxelAirOrMissing(worldPos + dz, ring)) normal += float3(0.0f, 0.0f, 1.0f);
+    if (IsMidVoxelAirOrMissing(worldPos - dz, ring)) normal += float3(0.0f, 0.0f, -1.0f);
+
+    const float normalLength = length(normal);
+    if (normalLength <= 0.001f) {
+        normal = float3(0.0f, 1.0f, 0.0f);
+        return false;
+    }
+    normal /= normalLength;
+    return true;
+}
+
+bool IsResidentMidVoxelTaggedSurface(uint voxel) {
+    return (GetState(voxel) & STATE_VISUAL_SURFACE) != 0u;
+}
+
+float NextMidVoxelCellBoundaryT(float3 rayOrigin, float3 rayDir, float currentT, float cellSize) {
+    float3 pos = rayOrigin + rayDir * currentT;
+    float3 cell = floor(pos / cellSize);
+    float nextT = 1e20f;
+
+    if (abs(rayDir.x) > 0.0001f) {
+        float boundaryX = ((rayDir.x > 0.0f) ? (cell.x + 1.0f) : cell.x) * cellSize;
+        float tx = (boundaryX - rayOrigin.x) / rayDir.x;
+        if (tx > currentT + 0.01f) {
+            nextT = min(nextT, tx);
+        }
+    }
+    if (abs(rayDir.y) > 0.0001f) {
+        float boundaryY = ((rayDir.y > 0.0f) ? (cell.y + 1.0f) : cell.y) * cellSize;
+        float ty = (boundaryY - rayOrigin.y) / rayDir.y;
+        if (ty > currentT + 0.01f) {
+            nextT = min(nextT, ty);
+        }
+    }
+    if (abs(rayDir.z) > 0.0001f) {
+        float boundaryZ = ((rayDir.z > 0.0f) ? (cell.z + 1.0f) : cell.z) * cellSize;
+        float tz = (boundaryZ - rayOrigin.z) / rayDir.z;
+        if (tz > currentT + 0.01f) {
+            nextT = min(nextT, tz);
+        }
+    }
+
+    if (nextT >= 1e19f) {
+        return currentT + max(cellSize, 4.0f);
+    }
+    return max(nextT + 0.02f, currentT + 0.05f);
+}
+
 bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, out RayHit voxelHit) {
     voxelHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
+
+    const uint sparseNearFlags = (uint)frame.sparseNearParams.w;
+    if ((sparseNearFlags & 4u) == 0u) {
+        return false;
+    }
+    if (frame.midResidencyParams.y < 0.04f || frame.midResidencyParams.w < 1.0f) {
+        return false;
+    }
+    // Mid-voxel clipmaps are the most expensive background detail layer because
+    // a miss can still require many resident-brick probes. Keep them as a high
+    // quality detail path and let the cheaper height clipmap own continuity
+    // while the runtime scheduler is already downshifting background work.
+    if (((BackgroundRenderQuality() < 0.58f) ||
+         (frame.renderBudgetParams.z < 0.50f && BackgroundRenderQuality() < 0.90f)) &&
+        !BackgroundDebugLayerMode()) {
+        return false;
+    }
 
     uint4 header = MidVoxelClipmapMetadata[0];
     if (frame.midFieldParams.x < 0.5f || header.x != MID_VOXEL_CLIPMAP_MAGIC || header.z == 0u) {
         return false;
     }
-    if (rayDir.y > 0.42f || rayDir.y < -0.72f) {
+    // Mid voxel bricks are coarse context. They should extend the horizon, not
+    // become foreground cliffs/ceilings when the player looks up/down around the
+    // exact sparse-surface near field.
+    if (rayDir.y > 0.20f || rayDir.y < -0.68f) {
         return false;
     }
 
     const float startDistance = max(frame.midFieldParams.y, 1.0f);
     const float endDistance = max(frame.midFieldParams.z, startDistance + 1.0f);
     float t = max(startDist, startDistance);
-    int budget = frame.renderBudgetParams.z < 0.55f ? 56 : (frame.renderBudgetParams.z < 0.85f ? 88 : 128);
+    int budget = frame.renderBudgetParams.z < 0.55f
+        ? ScaleBackgroundStepBudget(56, 44, 32)
+        : (frame.renderBudgetParams.z < 0.85f
+            ? ScaleBackgroundStepBudget(88, 68, 48)
+            : ScaleBackgroundStepBudget(128, 96, 64));
 
     [loop]
     for (int i = 0; i < budget && t < endDistance; ++i) {
@@ -770,11 +1215,21 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
         float cellSize = MidClipmapRingCellSize(ring);
         float3 pos = rayOrigin + rayDir * t;
         uint voxel;
-        if (SampleResidentMidVoxel(pos, ring, voxel)) {
+        uint actualRing;
+        float actualCellSize;
+        if (SampleResidentMidVoxelFallback(pos, ring, voxel, actualRing, actualCellSize)) {
+            float nextCellT = NextMidVoxelCellBoundaryT(rayOrigin, rayDir, t, actualCellSize);
             uint material = GetMaterial(voxel);
             if (material != MAT_AIR) {
+                if (!IsResidentMidVoxelTaggedSurface(voxel)) {
+                    t = min(nextCellT, t + max(actualCellSize, 4.0f));
+                    continue;
+                }
+                float3 normal;
+                if (!IsResidentMidVoxelExposed(pos, actualRing, actualCellSize, normal)) {
+                    normal = FarTerrainNormal(pos.xz);
+                }
                 float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, (material + 0.5f) / 256.0f, 0);
-                float3 normal = FarTerrainNormal(pos.xz);
                 float ndotl = saturate(dot(normal, SkySunDirection()));
                 float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.34f + ndotl * 0.84f);
                 float fogFactor = saturate((t - startDistance) / max(endDistance - startDistance, 1.0f));
@@ -785,38 +1240,65 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
                 voxelHit = MakeHit(float4(color, baseColor.a), t);
                 return true;
             }
-            t += max(cellSize * 0.80f, 4.0f);
+            t = min(nextCellT, t + max(actualCellSize, 4.0f));
         } else {
-            t += max(cellSize * 1.50f, 12.0f);
+            t += max(cellSize * BackgroundMissingSampleSkipScale(), 12.0f);
         }
     }
 
     return false;
 }
 
-bool MidClipmapHeightMaterial(float2 xz, out float height, out uint material, out float mountainMask, out float spireMask, out float ravineMask) {
+bool MidClipmapResidentHeightMaterial(float2 xz, out float height, out uint material) {
     if (SampleResidentMidClipmap(xz, height, material)) {
-        mountainMask = 0.0f;
-        spireMask = 0.0f;
-        ravineMask = 0.0f;
         return true;
     }
 
-    height = FarTerrainHeight(xz, mountainMask, spireMask, ravineMask);
-    material = FarTerrainMaterial(xz, height, mountainMask, spireMask, ravineMask);
+    height = 0.0f;
+    material = MAT_AIR;
     return false;
 }
 
-float3 MidClipmapNormal(float2 xz) {
+bool MidClipmapResidentHeightMaterialForDistance(
+    float2 xz,
+    float distanceFromCamera,
+    out float height,
+    out uint material,
+    out float cellSize)
+{
+    const float startDistance = max(frame.midFieldParams.y, 1.0f);
+    const float endDistance = max(frame.midFieldParams.z, startDistance + 1.0f);
+    uint4 header = MidClipmapTiles[0];
+    const uint ringCount = max(header.w >> 24u, 1u);
+    const uint preferredRing = min((uint)floor(saturate((distanceFromCamera - startDistance) /
+        max(endDistance - startDistance, 1.0f)) * (float)ringCount), ringCount - 1u);
+
+    if (SampleResidentMidClipmapFallback(xz, preferredRing, height, material, cellSize)) {
+        return true;
+    }
+
+    height = 0.0f;
+    material = MAT_AIR;
+    cellSize = MidClipmapRingCellSize(preferredRing);
+    return false;
+}
+
+float3 MidClipmapNormal(float2 xz, float distanceFromCamera) {
     float hL, hR, hD, hU;
     uint mat;
-    if (SampleResidentMidClipmap(xz - float2(3.0f, 0.0f), hL, mat) &&
-        SampleResidentMidClipmap(xz + float2(3.0f, 0.0f), hR, mat) &&
-        SampleResidentMidClipmap(xz - float2(0.0f, 3.0f), hD, mat) &&
-        SampleResidentMidClipmap(xz + float2(0.0f, 3.0f), hU, mat)) {
-        return normalize(float3(hL - hR, 6.0f, hD - hU));
+    float cellSize;
+    if (!MidClipmapResidentHeightMaterialForDistance(xz, distanceFromCamera, hL, mat, cellSize)) {
+        return float3(0.0f, 1.0f, 0.0f);
     }
-    return FarTerrainNormal(xz);
+    const float offset = max(cellSize, 3.0f);
+    float unusedCell;
+    if (MidClipmapResidentHeightMaterialForDistance(xz - float2(offset, 0.0f), distanceFromCamera, hL, mat, unusedCell) &&
+        MidClipmapResidentHeightMaterialForDistance(xz + float2(offset, 0.0f), distanceFromCamera, hR, mat, unusedCell) &&
+        MidClipmapResidentHeightMaterialForDistance(xz - float2(0.0f, offset), distanceFromCamera, hD, mat, unusedCell) &&
+        MidClipmapResidentHeightMaterialForDistance(xz + float2(0.0f, offset), distanceFromCamera, hU, mat, unusedCell)) {
+        return normalize(float3(hL - hR, offset * 2.0f, hD - hU));
+    }
+    return float3(0.0f, 1.0f, 0.0f);
 }
 
 float MidClipmapCellSize(float distanceFromCamera) {
@@ -838,6 +1320,9 @@ bool RaymarchMidClipmap(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     if (frame.midFieldParams.x < 0.5f || frame.renderBudgetParams.z < 0.20f) {
         return false;
     }
+    if (frame.midResidencyParams.x < 0.04f || frame.midResidencyParams.z < 1.0f) {
+        return false;
+    }
 
     const float startDistance = max(frame.midFieldParams.y, 1.0f);
     const float endDistance = max(frame.midFieldParams.z, startDistance + 1.0f);
@@ -846,59 +1331,94 @@ bool RaymarchMidClipmap(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     // Transition contract: this layer is terrain context after the near sparse
     // window. Do not draw it for steep rays where it would appear as detached
     // ceilings or terrain punching through editable near holes.
-    if (rayDir.y > 0.30f || rayDir.y < -0.64f) {
+    if (rayDir.y > 0.12f || rayDir.y < -0.20f) {
         return false;
     }
 
     float3 previousPos = rayOrigin + rayDir * t;
-    float mountainMask, spireMask, ravineMask;
     uint previousMaterial;
     float previousHeight;
-    MidClipmapHeightMaterial(previousPos.xz, previousHeight, previousMaterial, mountainMask, spireMask, ravineMask);
+    float previousCellSize;
+    bool previousResident = MidClipmapResidentHeightMaterialForDistance(
+        previousPos.xz,
+        t,
+        previousHeight,
+        previousMaterial,
+        previousCellSize);
+    previousHeight = QuantizeTerrainHeight(previousHeight, previousCellSize);
     float previousSigned = previousPos.y - previousHeight;
 
-    int stepBudget = frame.renderBudgetParams.z < 0.55f ? 28 : (frame.renderBudgetParams.z < 0.85f ? 44 : 64);
+    int stepBudget = frame.renderBudgetParams.z < 0.55f
+        ? ScaleBackgroundStepBudget(28, 22, 16)
+        : (frame.renderBudgetParams.z < 0.85f
+            ? ScaleBackgroundStepBudget(44, 34, 24)
+            : ScaleBackgroundStepBudget(64, 48, 32));
     [loop]
     for (int i = 0; i < stepBudget && t < endDistance; ++i) {
         float cellSize = MidClipmapCellSize(t);
         float stepSize = max(cellSize * 0.90f, 8.0f);
+        if (previousResident && previousSigned > 0.0f && rayDir.y < -0.035f) {
+            const float verticalStep = previousSigned / max(-rayDir.y, 0.055f);
+            const float qualityStepCap = lerp(cellSize * 4.0f, cellSize * 7.0f, BackgroundRenderQuality());
+            stepSize = clamp(verticalStep * 0.62f, stepSize, max(stepSize, qualityStepCap));
+        }
         float nextT = min(t + stepSize, endDistance);
         float3 pos = rayOrigin + rayDir * nextT;
         uint material;
         float height;
-        bool residentSample = MidClipmapHeightMaterial(pos.xz, height, material, mountainMask, spireMask, ravineMask);
+        float sampleCellSize;
+        bool residentSample = MidClipmapResidentHeightMaterialForDistance(
+            pos.xz,
+            nextT,
+            height,
+            material,
+            sampleCellSize);
+        height = QuantizeTerrainHeight(height, sampleCellSize);
         float signedDistance = pos.y - height;
+
+        if (!residentSample) {
+            t = nextT;
+            previousResident = false;
+            continue;
+        }
+
+        if (!previousResident) {
+            t = nextT;
+            previousSigned = signedDistance;
+            previousResident = true;
+            continue;
+        }
 
         if (signedDistance <= 0.0f && previousSigned > 0.0f) {
             float lo = t;
             float hi = nextT;
-            [unroll]
-            for (int refine = 0; refine < 5; ++refine) {
+            const int refineBudget = ScaleBackgroundRefineBudget(5, 4, 3);
+            [loop]
+            for (int refine = 0; refine < refineBudget; ++refine) {
                 float mid = (lo + hi) * 0.5f;
                 float3 midPos = rayOrigin + rayDir * mid;
-                float mm, sm, rm;
                 uint midMaterial;
                 float midHeight;
-                bool midResident = MidClipmapHeightMaterial(midPos.xz, midHeight, midMaterial, mm, sm, rm);
-                if (midPos.y > midHeight) {
+                float midCellSize;
+                bool midResident = MidClipmapResidentHeightMaterialForDistance(
+                    midPos.xz,
+                    mid,
+                    midHeight,
+                    midMaterial,
+                    midCellSize);
+                midHeight = QuantizeTerrainHeight(midHeight, midCellSize);
+                if (!midResident || midPos.y > midHeight) {
                     lo = mid;
                 } else {
                     hi = mid;
-                    mountainMask = mm;
-                    spireMask = sm;
-                    ravineMask = rm;
                     height = midHeight;
                     material = midMaterial;
-                    residentSample = midResident;
                 }
             }
 
             float hitT = hi;
             float3 hitPos = rayOrigin + rayDir * hitT;
-            float3 normal = MidClipmapNormal(hitPos.xz);
-            if (!residentSample) {
-                material = FarTerrainMaterial(hitPos.xz, height, mountainMask, spireMask, ravineMask);
-            }
+            float3 normal = MidClipmapNormal(hitPos.xz, hitT);
             float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, (material + 0.5f) / 256.0f, 0);
 
             float3 lightDir = SkySunDirection();
@@ -918,6 +1438,7 @@ bool RaymarchMidClipmap(float3 rayOrigin, float3 rayDir, float startDist, out Ra
 
         t = nextT;
         previousSigned = signedDistance;
+        previousResident = true;
     }
 
     return false;
@@ -927,6 +1448,16 @@ uint FarVoxelChildNodeIndex(uint childBase, uint childMask, uint childOrdinal) {
     uint precedingMask = childMask & ((1u << childOrdinal) - 1u);
     return childBase + countbits(precedingMask);
 }
+
+bool FarSvoLeafSurfaceHit(
+    float3 rayOrigin,
+    float3 rayDir,
+    float leafT0,
+    float leafT1,
+    float nodeSize,
+    out float hitT,
+    out float3 hitNormal,
+    out uint hitMaterial);
 
 bool TraverseFarVoxelPage(
     float3 rayOrigin,
@@ -972,12 +1503,40 @@ bool TraverseFarVoxelPage(
 
         FarVoxelNode node = FarVoxelNodes[nodeIndex];
         if ((node.flags & 1u) != 0u || node.childMask == 0u || node.childBase == 0xFFFFFFFFu) {
-            float candidateT = max(tNear, startDist);
-            if (candidateT < nearestT) {
-                nearestT = candidateT;
-                nearestNormal = boxNormal;
-                nearestMaterial = node.material;
-                hit = true;
+            // Far SVO pages contain coarse solid-interior leaves so traversal can
+            // skip deep terrain volume. Those leaves are not visual surface
+            // geometry; drawing them caused huge rectangular slabs in high-angle
+            // captures. Surface/detail leaves remain renderable.
+            if ((node.flags & 2u) != 0u || node.material == MAT_AIR) {
+                continue;
+            }
+            if (nodeSize <= 40.0f) {
+                float candidateT = max(tNear, startDist);
+                if (candidateT < nearestT) {
+                    nearestT = candidateT;
+                    nearestNormal = boxNormal;
+                    nearestMaterial = node.material;
+                    hit = true;
+                }
+            } else {
+                float candidateT;
+                float3 candidateNormal;
+                uint candidateMaterial;
+                if (FarSvoLeafSurfaceHit(
+                    rayOrigin,
+                    rayDir,
+                    max(tNear, startDist),
+                    min(tFar, nearestT),
+                    nodeSize,
+                    candidateT,
+                    candidateNormal,
+                    candidateMaterial) &&
+                    candidateT < nearestT) {
+                    nearestT = candidateT;
+                    nearestNormal = candidateNormal;
+                    nearestMaterial = candidateMaterial;
+                    hit = true;
+                }
             }
             continue;
         }
@@ -1005,14 +1564,106 @@ bool TraverseFarVoxelPage(
     return hit;
 }
 
+bool FarSvoLeafSurfaceHit(
+    float3 rayOrigin,
+    float3 rayDir,
+    float leafT0,
+    float leafT1,
+    float nodeSize,
+    out float hitT,
+    out float3 hitNormal,
+    out uint hitMaterial)
+{
+    hitT = 1e20f;
+    hitNormal = float3(0.0f, 1.0f, 0.0f);
+    hitMaterial = MAT_STONE;
+
+    if (leafT1 <= leafT0) {
+        return false;
+    }
+
+    float t = leafT0;
+    float3 pos = rayOrigin + rayDir * t;
+    float mountainMask, spireMask, ravineMask;
+    float height = FarTerrainHeight(pos.xz, mountainMask, spireMask, ravineMask);
+    float previousSigned = pos.y - height;
+    float previousT = t;
+
+    // A raw SVO leaf AABB is only a conservative container. Drawing the AABB
+    // entry face creates the giant rectangular sheets seen in captures. Accept a
+    // leaf only where the ray actually crosses the far terrain surface.
+    const float stepSize = clamp(nodeSize * 0.55f, 16.0f, 96.0f);
+    const int sampleBudget = ScaleFarFieldStepBudget(8, 6, 5);
+    [loop]
+    for (int sample = 0; sample < sampleBudget && t < leafT1; ++sample) {
+        t = min(t + stepSize, leafT1);
+        pos = rayOrigin + rayDir * t;
+        height = FarTerrainHeight(pos.xz, mountainMask, spireMask, ravineMask);
+        const float signedDistance = pos.y - height;
+
+        if (signedDistance <= 0.0f && previousSigned > 0.0f) {
+            float lo = previousT;
+            float hi = t;
+            const int refineBudget = ScaleFarFieldRefineBudget(5, 4, 3);
+            [loop]
+            for (int refine = 0; refine < refineBudget; ++refine) {
+                const float mid = (lo + hi) * 0.5f;
+                const float3 midPos = rayOrigin + rayDir * mid;
+                float mm, sm, rm;
+                const float midHeight = FarTerrainHeight(midPos.xz, mm, sm, rm);
+                if (midPos.y > midHeight) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                    mountainMask = mm;
+                    spireMask = sm;
+                    ravineMask = rm;
+                    height = midHeight;
+                }
+            }
+
+            hitT = hi;
+            const float3 hitPos = rayOrigin + rayDir * hitT;
+            hitNormal = FarTerrainNormal(hitPos.xz);
+            hitMaterial = FarTerrainMaterial(hitPos.xz, height, mountainMask, spireMask, ravineMask);
+            return true;
+        }
+
+        previousSigned = signedDistance;
+        previousT = t;
+    }
+
+    return false;
+}
+
 bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, out RayHit farHit) {
     farHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
 
-    if (frame.farFieldParams.x < 0.5f || frame.renderBudgetParams.z < 0.25f ||
+    // The page-indexed far SVO is a high-detail distant voxel layer, not a
+    // guaranteed background fill. When the runtime budget is under pressure,
+    // the cheaper procedural far-height layer owns ordinary horizon continuity.
+    // Steep downward rays are the exception: the height fallback deliberately
+    // refuses them to avoid detached sheets, so SVO keeps a tiny coverage path
+    // there to prevent terrain-to-sky pops during high-altitude stress views.
+    if (frame.farOwnershipParams.x < 0.5f ||
+        frame.farOwnershipParams.y < 0.999f ||
+        frame.farOwnershipParams.z <= 0.0f) {
+        return false;
+    }
+
+    const float farQuality = min(frame.renderBudgetParams.z, frame.farOwnershipParams.w);
+    const bool steepDownCoverageRay = rayDir.y < -0.88f && rayDir.y > -0.95f;
+    const bool farSvoQualityAllowed = farQuality >= 0.35f ||
+        (steepDownCoverageRay && farQuality >= 0.25f);
+    if (frame.farFieldParams.x < 0.5f || !farSvoQualityAllowed ||
         frame.farFieldParams.y < 1.0f || frame.farFieldParams.z < 1.0f) {
         return false;
     }
-    if (rayDir.y > 0.18f || rayDir.y < -0.42f) {
+    // The far SVO is the authoritative distant voxel layer. It must be allowed
+    // to answer high/downward validation rays; otherwise those rays fall
+    // through to the procedural height fallback and produce huge sheet-like
+    // terrain bands.
+    if (rayDir.y > 0.18f || rayDir.y < -0.95f) {
         return false;
     }
 
@@ -1036,7 +1687,15 @@ bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, ou
 
     float2 rayXZ = rayDir.xz;
     float2 originXZ = rayOrigin.xz;
-    int maxPageSteps = frame.renderBudgetParams.z < 0.6f ? 18 : (frame.renderBudgetParams.z < 0.9f ? 28 : 40);
+    int maxPageSteps = farQuality < 0.55f
+        ? ScaleFarFieldStepBudget(6, 5, 4)
+        : (farQuality < 0.72f
+            ? ScaleFarFieldStepBudget(8, 6, 5)
+            : (farQuality < 0.85f
+                ? ScaleFarFieldStepBudget(10, 8, 6)
+                : (farQuality < 0.95f
+                    ? ScaleFarFieldStepBudget(16, 12, 8)
+                    : ScaleFarFieldStepBudget(24, 18, 12))));
 
     [loop]
     for (int stepIndex = 0; stepIndex < maxPageSteps && t < farMaxDist && t < nearestT; ++stepIndex) {
@@ -1164,25 +1823,85 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
         return false;
     }
 
-    // Keep the fallback in the horizon band. Steep downward/upward rays should
-    // show only the dense editable window or sky; otherwise the cheap heightfield
-    // can look like an overhead sheet when the dense window has an air gap.
-    if (rayDir.y > 0.18f || rayDir.y < -0.42f) {
+    // Keep this as a horizon/continuity fallback behind the caller-selected
+    // transition distance. Earlier versions rejected steep downward rays here,
+    // which made high-altitude stress views pop terrain pixels into miss/sky
+    // whenever Far SVO backed off under budget pressure.
+    if (rayDir.y > 0.24f) {
         return false;
     }
 
     const float farMaxDist = 10400.0f;
-    float t = max(startDist, 900.0f);
+    const float farTerrainCeiling = FAR_TERRAIN_MAX_HEIGHT + 64.0f;
+    float t = max(startDist, 160.0f);
+    if (rayOrigin.y > farTerrainCeiling) {
+        if (rayDir.y >= -0.001f) {
+            return false;
+        }
+        const float ceilingT = (farTerrainCeiling - rayOrigin.y) / rayDir.y;
+        if (ceilingT > farMaxDist) {
+            return false;
+        }
+        t = max(t, max(ceilingT, 0.0f));
+    }
     float previousT = t;
     float3 previousPos = rayOrigin + rayDir * t;
     float mountainMask, spireMask, ravineMask;
-    float previousHeight = FarTerrainHeight(previousPos.xz, mountainMask, spireMask, ravineMask);
+    float previousHeight = FarTerrainHeightVoxelized(previousPos.xz, previousT, mountainMask, spireMask, ravineMask);
     float previousSigned = previousPos.y - previousHeight;
+    if (previousSigned <= 0.0f) {
+        float originMountainMask, originSpireMask, originRavineMask;
+        float originHeight = FarTerrainHeightVoxelized(
+            rayOrigin.xz,
+            0.0f,
+            originMountainMask,
+            originSpireMask,
+            originRavineMask);
+        if (rayOrigin.y > originHeight) {
+            float lo = 0.0f;
+            float hi = t;
+            const int refineBudget = ScaleFarFieldRefineBudget(7, 5, 4);
+            [loop]
+            for (int refine = 0; refine < refineBudget; ++refine) {
+                float mid = (lo + hi) * 0.5f;
+                float3 midPos = rayOrigin + rayDir * mid;
+                float mm, sm, rm;
+                float midHeight = FarTerrainHeightVoxelized(midPos.xz, mid, mm, sm, rm);
+                if (midPos.y > midHeight) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                    mountainMask = mm;
+                    spireMask = sm;
+                    ravineMask = rm;
+                    previousHeight = midHeight;
+                }
+            }
+
+            float hitT = max(hi, 64.0f);
+            float3 hitPos = rayOrigin + rayDir * hitT;
+            float3 normal = FarTerrainVoxelNormal(hitPos.xz, hitT);
+            uint material = FarTerrainMaterial(hitPos.xz, previousHeight, mountainMask, spireMask, ravineMask);
+            float u = (material + 0.5f) / 256.0f;
+            float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, u, 0);
+            float3 lightDir = normalize(float3(0.5f, 1.0f, 0.3f));
+            float lighting = max(dot(normal, lightDir), 0.18f);
+            float3 color = baseColor.rgb * lighting;
+            float fogFactor = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
+            color = lerp(color, SkyColor(rayDir), fogFactor * 0.90f + 0.10f);
+            farHit = MakeHit(float4(color, 1.0f), hitT);
+            return true;
+        }
+    }
 
     // This is a continuity fallback behind the page-indexed SVO, not the main
     // far renderer. Keep it cheap enough that sky/horizon pixels cannot become
     // the frame-time bottleneck.
-    int farStepBudget = frame.renderBudgetParams.z < 0.6f ? 24 : (frame.renderBudgetParams.z < 0.9f ? 36 : 48);
+    int farStepBudget = frame.renderBudgetParams.z < 0.6f
+        ? ScaleFarFieldStepBudget(24, 18, 12)
+        : (frame.renderBudgetParams.z < 0.9f
+            ? ScaleFarFieldStepBudget(36, 28, 20)
+            : ScaleFarFieldStepBudget(48, 36, 26));
     [loop]
     for (int i = 0; i < farStepBudget && t < farMaxDist; ++i) {
         float distanceStep = lerp(96.0f, 360.0f, saturate(t / farMaxDist));
@@ -1190,21 +1909,27 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             ? FarSvoSuggestedStep(rayOrigin, rayDir, t)
             : distanceStep;
         float stepSize = max(FAR_SVO_MIN_CELL_SIZE, max(svoStep, distanceStep));
+        if (previousSigned > 0.0f && rayDir.y < -0.030f) {
+            const float verticalStep = previousSigned / max(-rayDir.y, 0.045f);
+            const float qualityStepCap = lerp(distanceStep * 1.50f, distanceStep * 3.25f, BackgroundRenderQuality());
+            stepSize = clamp(verticalStep * 0.68f, stepSize, max(stepSize, qualityStepCap));
+        }
         t += stepSize;
 
         float3 pos = rayOrigin + rayDir * t;
-        float height = FarTerrainHeight(pos.xz, mountainMask, spireMask, ravineMask);
+        float height = FarTerrainHeightVoxelized(pos.xz, t, mountainMask, spireMask, ravineMask);
         float signedDistance = pos.y - height;
 
         if (signedDistance <= 0.0f && previousSigned > 0.0f) {
             float lo = previousT;
             float hi = t;
-            [unroll]
-            for (int refine = 0; refine < 5; ++refine) {
+            const int refineBudget = ScaleFarFieldRefineBudget(5, 4, 3);
+            [loop]
+            for (int refine = 0; refine < refineBudget; ++refine) {
                 float mid = (lo + hi) * 0.5f;
                 float3 midPos = rayOrigin + rayDir * mid;
                 float mm, sm, rm;
-                float midHeight = FarTerrainHeight(midPos.xz, mm, sm, rm);
+                float midHeight = FarTerrainHeightVoxelized(midPos.xz, mid, mm, sm, rm);
                 if (midPos.y > midHeight) {
                     lo = mid;
                 } else {
@@ -1218,7 +1943,7 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
 
             float hitT = hi;
             float3 hitPos = rayOrigin + rayDir * hitT;
-            float3 normal = FarTerrainNormal(hitPos.xz);
+            float3 normal = FarTerrainVoxelNormal(hitPos.xz, hitT);
             uint material = FarTerrainMaterial(hitPos.xz, height, mountainMask, spireMask, ravineMask);
             float u = (material + 0.5f) / 256.0f;
             float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, u, 0);
@@ -1239,7 +1964,273 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
         previousSigned = signedDistance;
     }
 
+    // Last-resort downward continuity. If the coarse far heightfield misses,
+    // do not expose raw sky below the world during high-altitude motion; a
+    // fogged bedrock floor is visually safer and matches the vertical-world
+    // contract that there is a bottom layer beneath caverns and ravines.
+    if (rayDir.y < -0.035f) {
+        const float bedrockY = FAR_TERRAIN_MIN_HEIGHT - 8.0f;
+        float bedrockT = (bedrockY - rayOrigin.y) / rayDir.y;
+        if (bedrockT >= max(startDist, 160.0f) && bedrockT < farMaxDist) {
+            float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, (MAT_STONE + 0.5f) / 256.0f, 0);
+            float3 normal = float3(0.0f, 1.0f, 0.0f);
+            float lighting = max(dot(normal, SkySunDirection()), 0.16f);
+            float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.28f + lighting * 0.55f);
+            float fogFactor = saturate((bedrockT - 900.0f) / (farMaxDist - 900.0f));
+            color = lerp(color, SkyColor(rayDir), fogFactor * 0.94f + 0.06f);
+            farHit = MakeHit(float4(color, 1.0f), bedrockT);
+            return true;
+        }
+    }
+
     return false;
+}
+
+static const uint BACKGROUND_LAYER_NONE = 0u;
+static const uint BACKGROUND_LAYER_MID_VOXEL = 1u;
+static const uint BACKGROUND_LAYER_MID_HEIGHT = 2u;
+static const uint BACKGROUND_LAYER_FAR_SVO = 3u;
+static const uint BACKGROUND_LAYER_FAR_HEIGHT = 4u;
+
+static const uint RENDER_OWNER_TOTAL = 0u;
+static const uint RENDER_OWNER_NEAR = 1u;
+static const uint RENDER_OWNER_MID_VOXEL = 2u;
+static const uint RENDER_OWNER_MID_HEIGHT = 3u;
+static const uint RENDER_OWNER_FAR_SVO = 4u;
+static const uint RENDER_OWNER_FAR_HEIGHT = 5u;
+static const uint RENDER_OWNER_SKY = 6u;
+static const uint RENDER_OWNER_MISS = 7u;
+static const uint RENDER_OWNER_FRAME = 8u;
+static const uint RENDER_OWNER_SURFACE = 9u;
+static const uint RENDER_OWNER_UNSAFE_NEAR_MISS = 10u;
+
+bool RenderOwnershipEnabled() {
+    return frame.farFieldGridParams.w > 0.5f;
+}
+
+void RecordRenderOwnership(uint owner) {
+    if (!RenderOwnershipEnabled()) {
+        return;
+    }
+    InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_TOTAL], 1u);
+    if (owner <= RENDER_OWNER_MISS || owner == RENDER_OWNER_SURFACE || owner == RENDER_OWNER_UNSAFE_NEAR_MISS) {
+        InterlockedAdd(RenderOwnershipStats[owner], 1u);
+    }
+    RenderOwnershipStats[RENDER_OWNER_FRAME] = frame.frameIndex;
+}
+
+float NearBackgroundStartDistance() {
+    // The sparse surface pass owns the exact editable near field. The
+    // fullscreen pass should start close enough to prevent sky gaps behind
+    // resident surfaces, but not so close that procedural far terrain fills
+    // holes in the player's immediate editable/collision space.
+    if (frame.midFieldParams.x > 0.5f) {
+        return clamp(frame.midFieldParams.y * 0.30f, 96.0f, 192.0f);
+    }
+    return 160.0f;
+}
+
+float SurfaceAuthoritativeBackgroundStartDistance() {
+    // The raster sparse-surface pass owns the editable foreground. In this mode
+    // the fullscreen pass is only sky/horizon context, so it must not synthesize
+    // near terrain through temporary surface-cache holes.
+    if (frame.midFieldParams.x > 0.5f) {
+        return max(frame.midFieldParams.y, 896.0f);
+    }
+    return 896.0f;
+}
+
+bool IntersectSphere(float3 rayOrigin, float3 rayDir, float3 center, float radius, out float tNear, out float tFar) {
+    tNear = 0.0f;
+    tFar = 0.0f;
+    if (radius <= 0.0f) {
+        return false;
+    }
+
+    float3 oc = rayOrigin - center;
+    float b = dot(oc, rayDir);
+    float c = dot(oc, oc) - radius * radius;
+    float discriminant = b * b - c;
+    if (discriminant < 0.0f) {
+        return false;
+    }
+
+    float root = sqrt(discriminant);
+    tNear = -b - root;
+    tFar = -b + root;
+    return tFar >= max(tNear, 0.0f);
+}
+
+float SurfaceAuthoritativeBackgroundStartForRay(
+    float3 rayOrigin,
+    float3 rayDir,
+    float3 gridMin,
+    float3 gridMax)
+{
+    float startDistance = SurfaceAuthoritativeBackgroundStartDistance();
+    float nearEntry;
+    float nearExit;
+    if (IntersectBox(rayOrigin, rayDir, gridMin, gridMax, nearEntry, nearExit)) {
+        // The sparse raster surface pass owns this world-space near volume.
+        // Background layers are context behind it, not replacement terrain
+        // inside it. Starting after ray-box exit prevents far/mid terrain from
+        // drawing through resident-surface holes or late uploads.
+        startDistance = max(startDistance, max(nearExit, 0.0f) + 8.0f);
+    }
+    float sphereEntry;
+    float sphereExit;
+    if (IntersectSphere(
+            rayOrigin,
+            rayDir,
+            frame.nearOwnershipParams.xyz,
+            frame.nearOwnershipParams.w,
+            sphereEntry,
+            sphereExit)) {
+        // The raster sparse surface layer is culled by a stable world-space
+        // near radius, not by the legacy dense render AABB. This explicit
+        // ownership sphere prevents mid/far fallback from drawing through
+        // camera-centered near holes while sparse pages are still streaming.
+        startDistance = max(startDistance, max(sphereExit, 0.0f) + 8.0f);
+    }
+    return startDistance;
+}
+
+float SparseMissingPageBackgroundStartForRay(
+    float3 rayOrigin,
+    float3 rayDir,
+    float3 gridMin,
+    float3 gridMax)
+{
+    float startDistance = SurfaceAuthoritativeBackgroundStartDistance();
+    float nearEntry;
+    float nearExit;
+    if (IntersectBox(rayOrigin, rayDir, gridMin, gridMax, nearEntry, nearExit)) {
+        // Missing sparse pages are a residency problem, not ownership proof.
+        // Wait until the ray exits the dense editable cache, but do not require
+        // the larger spherical sparse-surface cull boundary here: that sphere
+        // is intentionally conservative for raster visibility and can suppress
+        // legitimate horizon continuity for too long during fast camera motion.
+        startDistance = max(startDistance, max(nearExit, 0.0f) + 8.0f);
+    }
+    return startDistance;
+}
+
+float FarLayerStartAfterBackground(float backgroundStartDistance) {
+    if (frame.midFieldParams.x < 0.5f) {
+        return max(backgroundStartDistance, 0.0f);
+    }
+
+    const float startDistance = max(frame.midFieldParams.y, 1.0f);
+    const float endDistance = max(frame.midFieldParams.z, startDistance + 1.0f);
+    float handoffDistance = startDistance + (endDistance - startDistance) * 0.62f;
+    if (frame.backgroundOwnershipParams.w > 0.5f) {
+        handoffDistance = frame.backgroundOwnershipParams.y;
+    }
+    return max(backgroundStartDistance, min(endDistance, handoffDistance));
+}
+
+bool RaymarchBackgroundField(
+    float3 rayOrigin,
+    float3 rayDir,
+    float startDist,
+    bool includeSparseFarField,
+    bool allowWideHeightAngles,
+    out RayHit backgroundHit,
+    out uint backgroundLayer)
+{
+    backgroundHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
+    backgroundLayer = BACKGROUND_LAYER_NONE;
+
+    if (RaymarchMidVoxelClipmap(rayOrigin, rayDir, startDist, backgroundHit)) {
+        backgroundLayer = BACKGROUND_LAYER_MID_VOXEL;
+        return true;
+    }
+    if (RaymarchMidClipmap(rayOrigin, rayDir, startDist, backgroundHit)) {
+        backgroundLayer = BACKGROUND_LAYER_MID_HEIGHT;
+        return true;
+    }
+    const float farStartDist = FarLayerStartAfterBackground(startDist);
+    if (includeSparseFarField && RaymarchSparseFarField(rayOrigin, rayDir, farStartDist, backgroundHit)) {
+        backgroundLayer = BACKGROUND_LAYER_FAR_SVO;
+        return true;
+    }
+
+    const bool heightAngleOk = allowWideHeightAngles
+        ? (rayDir.y < 0.24f)
+        : (rayDir.y > -0.28f && rayDir.y < 0.10f);
+    // Respect the ownership start chosen by the caller. Surface-authoritative
+    // mode deliberately pushes background layers behind the near sparse volume;
+    // pulling the far heightfield back toward the camera makes coarse terrain
+    // draw through near-surface holes as warped foreground sheets.
+    const float heightStart = farStartDist;
+    if (heightAngleOk && RaymarchFarTerrain(rayOrigin, rayDir, heightStart, backgroundHit)) {
+        backgroundLayer = BACKGROUND_LAYER_FAR_HEIGHT;
+        return true;
+    }
+
+    return false;
+}
+
+RayHit DebugBackgroundLayerHit(RayHit hit, uint layer) {
+    if (layer == BACKGROUND_LAYER_MID_VOXEL) {
+        RecordRenderOwnership(RENDER_OWNER_MID_VOXEL);
+    } else if (layer == BACKGROUND_LAYER_MID_HEIGHT) {
+        RecordRenderOwnership(RENDER_OWNER_MID_HEIGHT);
+    } else if (layer == BACKGROUND_LAYER_FAR_SVO) {
+        RecordRenderOwnership(RENDER_OWNER_FAR_SVO);
+    } else if (layer == BACKGROUND_LAYER_FAR_HEIGHT) {
+        RecordRenderOwnership(RENDER_OWNER_FAR_HEIGHT);
+    } else {
+        RecordRenderOwnership(RENDER_OWNER_MISS);
+    }
+    if (frame.debugMode != 49u && frame.debugMode != 50u) {
+        return hit;
+    }
+
+    float3 tint = float3(0.08f, 0.10f, 0.14f);
+    if (layer == BACKGROUND_LAYER_MID_VOXEL) {
+        tint = float3(1.0f, 0.52f, 0.10f);
+    } else if (layer == BACKGROUND_LAYER_MID_HEIGHT) {
+        tint = float3(0.15f, 0.75f, 1.0f);
+    } else if (layer == BACKGROUND_LAYER_FAR_SVO) {
+        tint = float3(0.85f, 0.24f, 1.0f);
+    } else if (layer == BACKGROUND_LAYER_FAR_HEIGHT) {
+        tint = float3(0.45f, 1.0f, 0.30f);
+    }
+    if (frame.debugMode == 50u) {
+        hit.color.rgb = tint;
+    } else {
+        hit.color.rgb = lerp(hit.color.rgb, tint, 0.58f);
+    }
+    return hit;
+}
+
+RayHit DebugBackgroundMissHit(float3 rayDir) {
+    const bool expectedSky = rayDir.y > -0.12f;
+    RecordRenderOwnership(expectedSky ? RENDER_OWNER_SKY : RENDER_OWNER_MISS);
+    if (frame.debugMode == 50u) {
+        if (expectedSky) {
+            return MakeHit(float4(0.18f, 0.42f, 0.95f, 1.0f), 1e20f);
+        }
+        // Pure red means the background ownership chain found no resident
+        // mid/far layer for this pixel. This is intentionally harsh: it makes
+        // clipmap residency gaps and fallback suppression visible in screenshots.
+        // Upward sky rays are shown blue instead, so real sky is not confused
+        // with missing terrain ownership.
+        return MakeHit(float4(1.0f, 0.05f, 0.02f, 1.0f), 1e20f);
+    }
+    return MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
+}
+
+RayHit DebugUnsafeNearMissHit(float3 rayDir) {
+    RecordRenderOwnership(RENDER_OWNER_UNSAFE_NEAR_MISS);
+    if (frame.debugMode == 50u) {
+        // Magenta marks a near-field ownership hole: the ray crossed missing
+        // sparse pages inside the editable/collision volume and no allowed
+        // background layer could safely take ownership behind the transition.
+        return MakeHit(float4(1.0f, 0.02f, 0.75f, 1.0f), 1e20f);
+    }
+    return MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
 }
 
 // DDA Raymarcher
@@ -1259,6 +2250,30 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
     // The buffer is a moving window, so grid bounds = regionOrigin + bufferSize
     float3 gridMin = frame.regionOrigin.xyz;
     float3 gridMax = frame.regionOrigin.xyz + float3(frame.gridSizeX, frame.gridSizeY, frame.gridSizeZ);
+    const uint sparseNearFlags = (uint)frame.sparseNearParams.w;
+    const bool sparseSurfaceAuthoritative = sparseNearActive && ((sparseNearFlags & 2u) != 0u);
+    const bool sparseSurfaceRaymarchFill = sparseNearActive && ((sparseNearFlags & 8u) != 0u);
+
+    if (sparseSurfaceAuthoritative && !sparseSurfaceRaymarchFill) {
+        RayHit backgroundHit;
+        uint backgroundLayer;
+        const float backgroundStart = SurfaceAuthoritativeBackgroundStartForRay(
+            rayOrigin,
+            rayDir,
+            gridMin,
+            gridMax);
+        if (RaymarchBackgroundField(
+            rayOrigin,
+            rayDir,
+            backgroundStart,
+            true,
+            true,
+            backgroundHit,
+            backgroundLayer)) {
+            return DebugBackgroundLayerHit(backgroundHit, backgroundLayer);
+        }
+        return DebugBackgroundMissHit(rayDir);
+    }
 
     // Find ray entry point into grid
     float tMin, tMax;
@@ -1267,19 +2282,11 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
             return MakeHit(float4(0.18f, 0.08f, 0.20f, 1.0f), 1e20f);
         }
         RayHit farHit;
-        if (RaymarchMidVoxelClipmap(rayOrigin, rayDir, 32.0f, farHit)) {
-            return farHit;
+        uint farLayer;
+        if (RaymarchBackgroundField(rayOrigin, rayDir, 32.0f, true, true, farHit, farLayer)) {
+            return DebugBackgroundLayerHit(farHit, farLayer);
         }
-        if (RaymarchMidClipmap(rayOrigin, rayDir, 32.0f, farHit)) {
-            return farHit;
-        }
-        if (RaymarchSparseFarField(rayOrigin, rayDir, 32.0f, farHit)) {
-            return farHit;
-        }
-        if (RaymarchFarTerrain(rayOrigin, rayDir, 32.0f, farHit)) {
-            return farHit;
-        }
-        return MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
+        return DebugBackgroundMissHit(rayDir);
     }
     if (frame.debugMode == 43u) {
         float shade = saturate((tMax - max(tMin, 0.0f)) / 1024.0f);
@@ -1313,7 +2320,7 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
 
     float3 normal = float3(0, 1, 0);
     float dist = 0.0f;
-    const bool sparseOnlyMode = frame.sparseNearParams.x > 0.5f && (((uint)frame.sparseNearParams.w & 1u) != 0u);
+    const bool sparseOnlyMode = frame.sparseNearParams.x > 0.5f && ((sparseNearFlags & 1u) != 0u);
     // Sparse mode must traverse in brick/subbrick-sized jumps. Per-voxel page
     // table probing across a full-screen raymarch can saturate the GPU before
     // the first frame fence retires.
@@ -1326,6 +2333,8 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
     sparseCache.generation = 0u;
     sparseCache.valid = 0u;
     sparseCache.hasEntry = 0u;
+    bool sawSparseMissing = false;
+    float firstSparseMissingDist = 1e20f;
 
     if (frame.debugMode == 44u) {
         bool voxelFromSparse = false;
@@ -1365,6 +2374,8 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
         uint material = GetMaterial(voxel);
 
         if (sparseSkipAcceleration && sparseMissing) {
+            sawSparseMissing = true;
+            firstSparseMissingDist = min(firstSparseMissingDist, dist);
             float3 currentPos = startPos + rayDir * dist;
             float skipDist = DistanceToSparseBrickExit(voxelPos, currentPos, rayDir);
             dist += skipDist;
@@ -1402,6 +2413,7 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
             finalColor = lerp(finalColor, fogColor, fogFactor * 0.5f);
 
             // Use material's alpha from palette (enables transparency for water, glass, etc.)
+            RecordRenderOwnership(RENDER_OWNER_NEAR);
             return MakeHit(float4(finalColor, baseColor.a), entryDist + dist);
         }
 
@@ -1456,30 +2468,43 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
         return MakeHit(float4(0.05f, 0.18f, 0.12f, 1.0f), 1e20f);
     }
 
+    if (sparseOnlyMode && sawSparseMissing) {
+        RayHit backgroundHit;
+        uint backgroundLayer;
+        // Missing sparse pages inside the editable/collision volume are not
+        // proof that far terrain owns that ray segment. Keep the background
+        // renderer behind the same transition band as the surface path so stale
+        // or late near pages cannot be filled by detached coarse terrain.
+        const float holeFillStart = max(
+            entryDist + firstSparseMissingDist + 24.0f,
+            SparseMissingPageBackgroundStartForRay(rayOrigin, rayDir, gridMin, gridMax));
+        if (RaymarchBackgroundField(
+            rayOrigin,
+            rayDir,
+            holeFillStart,
+            true,
+            true,
+            backgroundHit,
+            backgroundLayer)) {
+            return DebugBackgroundLayerHit(backgroundHit, backgroundLayer);
+        }
+        return DebugUnsafeNearMissHit(rayDir);
+    }
+
     // If the ray cleanly exits the dense editable cache, continue into the
     // far-field renderer from just beyond the cache. This preserves the earlier
     // protection against drawing far terrain through missing near chunks, while
     // avoiding a hard sky cutoff when the camera pans past the near window.
     if (entryDist + dist >= tMax - 1.0f) {
         RayHit farHit;
+        uint farLayer;
         float farStart = max(tMax + 8.0f, entryDist + dist);
-        if (RaymarchMidVoxelClipmap(rayOrigin, rayDir, farStart, farHit)) {
-            return farHit;
-        }
-        if (RaymarchMidClipmap(rayOrigin, rayDir, farStart, farHit)) {
-            return farHit;
-        }
-        // Do not invoke the page-indexed SVO for every sky pixel that has
-        // already crossed the dense cache; that path is correct but too costly
-        // as a background fill. The cheaper heightfield fallback is enough for
-        // continuity behind the editable window.
-        if (rayDir.y > -0.18f && rayDir.y < 0.10f &&
-            RaymarchFarTerrain(rayOrigin, rayDir, farStart, farHit)) {
-            return farHit;
+        if (RaymarchBackgroundField(rayOrigin, rayDir, farStart, true, false, farHit, farLayer)) {
+            return DebugBackgroundLayerHit(farHit, farLayer);
         }
     }
 
-    return MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
+    return DebugBackgroundMissHit(rayDir);
 }
 
 bool IntersectAvatarBox(float3 localOrigin, float3 localDir, float3 boxMin, float3 boxMax, out float tNear, out float3 normal) {
@@ -1573,15 +2598,29 @@ bool RenderBlockCharacter(float3 rayOrigin, float3 rayDir, out float tHit, out f
 
 // Render brush preview as semi-transparent overlay
 float4 RenderBrushPreview(float3 rayOrigin, float3 rayDir, float3 brushCenter, float brushRadius, uint brushShape, float3 baseColor) {
-    // Safety check: Don't render if camera is too close to or inside the brush
-    float distToCenter = length(rayOrigin - brushCenter);
-    if (distToCenter < brushRadius * 1.5f) {
-        // Camera is too close - don't render to avoid visual glitches
+    // The preview is a screen-space overlay on top of whatever world renderer is
+    // active. If stale brush state puts the preview very near the camera, the
+    // sphere projects as a giant fisheye dome and hides the sparse surface pass.
+    float3 toBrush = brushCenter - rayOrigin;
+    float distToCenter = length(toBrush);
+    if (brushRadius <= 0.0f || distToCenter < max(brushRadius * 3.75f, 12.0f)) {
+        return float4(0, 0, 0, 0);
+    }
+
+    float3 brushDir = toBrush / max(distToCenter, 0.001f);
+    if (dot(brushDir, rayDir) <= 0.0f) {
+        // Brush is behind this pixel ray; do not let behind-camera preview
+        // state leak into the visible frame.
+        return float4(0, 0, 0, 0);
+    }
+
+    const float angularRadius = asin(saturate(brushRadius / max(distToCenter, 0.001f)));
+    if (angularRadius > 0.34f) {
         return float4(0, 0, 0, 0);
     }
 
     // Ray-sphere intersection for brush preview
-    float3 oc = rayOrigin - brushCenter;
+    float3 oc = -toBrush;
     float b = dot(oc, rayDir);
     float c = dot(oc, oc) - brushRadius * brushRadius;
     float discriminant = b * b - c;
@@ -1621,7 +2660,11 @@ float4 RenderBrushPreview(float3 rayOrigin, float3 rayDir, float3 brushCenter, f
     }
 }
 
-float4 main(PSInput input) : SV_Target {
+[earlydepthstencil]
+PSOutput main(PSInput input) {
+    PSOutput output;
+    output.color = float4(0.0f, 0.0f, 0.0f, 1.0f);
+
     // Camera data from constant buffer
     float3 cameraPos = frame.cameraPosition.xyz;
     float3 forward = frame.cameraForward.xyz;
@@ -1643,23 +2686,27 @@ float4 main(PSInput input) : SV_Target {
     );
 
     if (frame.debugMode == 42u) {
-        return float4(0.08f, 0.16f, 0.22f, 1.0f);
+        output.color = float4(0.08f, 0.16f, 0.22f, 1.0f);
+        return output;
     }
     if (frame.debugMode == 48u) {
         uint voxel = SparseBrickVoxelPool[0];
         uint material = GetMaterial(voxel);
         float shade = saturate((float)material / 16.0f);
-        return float4(0.05f + shade, 0.10f, 0.18f, 1.0f);
+        output.color = float4(0.05f + shade, 0.10f, 0.18f, 1.0f);
+        return output;
     }
 
     // Render voxel world
     RayHit worldHit = Raymarch(cameraPos, rayDir);
     float4 voxelColor = worldHit.color;
+    float depthDistance = worldHit.distance;
 
     float avatarT;
     float4 avatarColor;
     if (RenderBlockCharacter(cameraPos, rayDir, avatarT, avatarColor) && avatarT < worldHit.distance) {
         voxelColor = avatarColor;
+        depthDistance = avatarT;
     }
 
     // Render brush preview overlay if valid position
@@ -1682,5 +2729,6 @@ float4 main(PSInput input) : SV_Target {
         }
     }
 
-    return voxelColor;
+    output.color = voxelColor;
+    return output;
 }

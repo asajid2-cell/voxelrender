@@ -9,7 +9,7 @@ Set `VENPOD_DIAGNOSTICS` before launching:
 ```powershell
 cd VENPOD
 $env:VENPOD_DIAGNOSTICS = "1"
-.\run.ps1
+.\rebrun.ps1
 ```
 
 This creates `build/bin/venpod_runtime.log` and enables debug-level engine logging.
@@ -26,7 +26,7 @@ DirectX validation is useful for resource-state bugs, but it can make the demo m
 
 ```powershell
 $env:VENPOD_D3D_DEBUG = "1"
-.\run.ps1
+.\rebrun.ps1
 ```
 
 Use this only while investigating rendering or synchronization issues.
@@ -35,50 +35,70 @@ Use this only while investigating rendering or synchronization issues.
 
 ```powershell
 $env:VENPOD_DISABLE_PHYSICS = "1"
-.\run.ps1
+.\rebrun.ps1
 ```
 
-If a bug disappears with physics disabled, start in `PhysicsDispatcher`, `CS_ChunkScanner.hlsl`, or `CS_GravityChunk.hlsl`.
+If a bug disappears with physics disabled, start in `SparseVoxelWorld`,
+`SparseRuntimeBudget`, `PhysicsDispatcher`, or `CS_SparsePhysicsPackets.hlsl`
+for sparse mode. Dense legacy physics still uses the older chunk scanner and
+gravity shaders.
 
-`VENPOD_ENABLE_INFINITE_PHYSICS=1` enables the experimental infinite-world
-physics path. It is useful for profiling, but the public demo keeps this
-conservative by default.
+Sparse local physics is default-on in sparse runtime mode. GPU sparse physics
+proposal application is still a guarded diagnostic path.
 
 ## Disable The Far SVO
 
 ```powershell
 $env:VENPOD_DISABLE_FAR_SVO = "1"
-.\run.ps1
+.\rebrun.ps1
 ```
 
-Use this to separate dense render-window issues from the visual sparse voxel
-octree far-field path.
+Use this to separate far SVO ownership from sparse near surfaces and mid
+clipmap/far-height fallback.
 
 ## Use Static Chunks
 
 ```powershell
 $env:VENPOD_STATIC_CHUNKS = "1"
-.\run.ps1
+.\rebrun.ps1 -DenseLegacy
 ```
 
 This bypasses the infinite streaming path and copies a fixed 2x2 chunk patch. It is useful for separating shader/camera issues from chunk streaming issues.
+
+## Run Sparse Regression
+
+```powershell
+.\sparse_regression.ps1 -Config Release
+```
+
+This runs the combined sparse gate: render/backend readiness, flicker stability,
+surface fragments, GPU raycast health, miss feedback, brush feedback/apply,
+sparse edit persistence, GPU physics diagnostics, and engine backbuffer capture.
 
 ## Common Symptoms
 
 Terrain starts far away:
 
-Check chunk queue ordering in `InfiniteChunkManager`. Nearby chunks should be queued before far-edge chunks.
+In sparse mode, check `SparseBrickRequestPlanner`, miss feedback telemetry, and
+`PERF_SPARSE_OWNERSHIP_PRESSURE`. In dense legacy mode, check chunk queue
+ordering in `InfiniteChunkManager`.
 
 A hitch appears after walking for a while:
 
-Check render-window recentering in `VoxelWorld`. Recentering clears chunk-copy caches and should not happen every few chunks.
+Check frame pressure, upload byte defers, page-table publish backlog, and
+surface extraction/culling counters in `PERF_SPARSE`. In dense legacy mode,
+check render-window recentering in `VoxelWorld`.
 
 Painting causes a stall:
 
-Check that `CS_Brush.hlsl` is dispatching over a brush-local bounding box, not the full render buffer.
+Check sparse brush feedback, dirty render regions, and local physics wakeup
+regions. Broad full-brick refreshes should be limited to first publication or
+broad edits.
 
 Far terrain looks wrong but nearby terrain is stable:
 
 Disable the SVO with `VENPOD_DISABLE_FAR_SVO=1`. If the issue disappears, start
 with `FarVoxelOctree` and the `RaymarchSparseFarField` path in
-`PS_Raymarch.hlsl`.
+`PS_Raymarch.hlsl`. If the issue remains, inspect mid clipmap coverage
+(`midCov`) and ownership counters for far-height fallback, sky, miss, and
+unsafe near miss.

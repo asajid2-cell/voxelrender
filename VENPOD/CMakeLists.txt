@@ -58,6 +58,7 @@ set(VENPOD_SOURCES
 
     # Graphics
     src/Graphics/FarVoxelOctree.cpp
+    src/Graphics/BackbufferCapture.cpp
     src/Graphics/Renderer.cpp
     src/Graphics/SparseSurfaceGpuResources.cpp
     src/Graphics/SparseVoxelGpuResources.cpp
@@ -74,12 +75,16 @@ set(VENPOD_SOURCES
     src/Simulation/ChunkStressTest.cpp
     src/Simulation/SparseBrickPool.cpp
     src/Simulation/SparseBrickRequestPlanner.cpp
+    src/Simulation/SparseCharacterController.cpp
     src/Simulation/SparseClipmap.cpp
     src/Simulation/SparseCollision.cpp
     src/Simulation/SparseEditStore.cpp
+    src/Simulation/SparsePagePublishQueue.cpp
     src/Simulation/SparsePageTable.cpp
+    src/Simulation/SparseRuntimeBudget.cpp
     src/Simulation/SparseSurfaceCache.cpp
     src/Simulation/SparseSurfaceExtractor.cpp
+    src/Simulation/SparseSurfaceRangeAllocator.cpp
     src/Simulation/SparseTerrainGenerator.cpp
     src/Simulation/SparseVoxelTypes.cpp
     src/Simulation/SparseVoxelWorld.cpp
@@ -121,6 +126,7 @@ set(VENPOD_HEADERS
 
     # Graphics
     src/Graphics/FarVoxelOctree.h
+    src/Graphics/BackbufferCapture.h
     src/Graphics/Renderer.h
     src/Graphics/SparseSurfaceGpuResources.h
     src/Graphics/SparseVoxelGpuResources.h
@@ -138,12 +144,16 @@ set(VENPOD_HEADERS
     src/Simulation/ChunkStressTest.h
     src/Simulation/SparseBrickPool.h
     src/Simulation/SparseBrickRequestPlanner.h
+    src/Simulation/SparseCharacterController.h
     src/Simulation/SparseClipmap.h
     src/Simulation/SparseCollision.h
     src/Simulation/SparseEditStore.h
+    src/Simulation/SparsePagePublishQueue.h
     src/Simulation/SparsePageTable.h
+    src/Simulation/SparseRuntimeBudget.h
     src/Simulation/SparseSurfaceCache.h
     src/Simulation/SparseSurfaceExtractor.h
+    src/Simulation/SparseSurfaceRangeAllocator.h
     src/Simulation/SparseTerrainGenerator.h
     src/Simulation/SparseVoxelTypes.h
     src/Simulation/SparseVoxelWorld.h
@@ -281,12 +291,16 @@ add_executable(VENPODTests
     src/Graphics/VoxelRenderBackend.cpp
     src/Simulation/SparseBrickPool.cpp
     src/Simulation/SparseBrickRequestPlanner.cpp
+    src/Simulation/SparseCharacterController.cpp
     src/Simulation/SparseClipmap.cpp
     src/Simulation/SparseCollision.cpp
     src/Simulation/SparseEditStore.cpp
+    src/Simulation/SparsePagePublishQueue.cpp
     src/Simulation/SparsePageTable.cpp
+    src/Simulation/SparseRuntimeBudget.cpp
     src/Simulation/SparseSurfaceCache.cpp
     src/Simulation/SparseSurfaceExtractor.cpp
+    src/Simulation/SparseSurfaceRangeAllocator.cpp
     src/Simulation/SparseTerrainGenerator.cpp
     src/Simulation/SparseVoxelTypes.cpp
     src/Simulation/SparseVoxelWorld.cpp
@@ -294,6 +308,12 @@ add_executable(VENPODTests
 
 target_include_directories(VENPODTests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(VENPODTests PRIVATE
+    spdlog::spdlog
+    Microsoft::DirectX-Headers
+    Microsoft::DirectX-Guids
 )
 
 if(MSVC)

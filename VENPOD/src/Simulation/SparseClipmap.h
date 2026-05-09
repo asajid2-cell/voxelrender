@@ -24,7 +24,10 @@ struct SparseClipmapConfig {
     bool voxelClipmapEnabled = true;
     uint32_t voxelBrickRadiusXz = 2;
     uint32_t voxelBrickRadiusY = 1;
-    uint32_t maxVoxelBricks = 128;
+    uint32_t maxVoxelBricks = 512;
+    uint32_t voxelInterestCapacityPercent = 75;
+    float motionLookaheadMinSpeed = 64.0f;
+    uint32_t motionLookaheadSteps = 3;
     uint32_t seed = 12345u;
 };
 
@@ -34,6 +37,14 @@ struct SparseClipmapRing {
     float cellSize = 0.0f;
 };
 
+struct SparseClipmapTransitionMetadata {
+    float startDistance = 0.0f;
+    float endDistance = 0.0f;
+    float farHandoffDistance = 0.0f;
+    float minCellSize = 0.0f;
+    bool enabled = false;
+};
+
 class SparseClipmapPolicy {
 public:
     explicit SparseClipmapPolicy(const SparseClipmapConfig& config = {});
@@ -41,9 +52,18 @@ public:
     const SparseClipmapConfig& Config() const { return m_config; }
     bool IsEnabled() const;
     float TransitionStartAfterNearExit(float nearExitDistance) const;
+    float BackgroundStartAfterNearVolumeExit(float nearVolumeExitDistance) const;
+    float FarLayerStartAfterBackground(float backgroundStartDistance) const;
+    float MissingNearPageBackgroundStart(
+        float firstMissingDistance,
+        float nearVolumeExitDistance,
+        float missingPagePadding = 24.0f) const;
+    bool AllowsBackgroundForMissingNearPage(float firstMissingDistance, float nearVolumeExitDistance) const;
     bool OwnsRaySegment(float segmentStartDistance, float segmentEndDistance, float nearExitDistance) const;
     float CellSizeForDistance(float distanceFromCamera) const;
     std::vector<SparseClipmapRing> BuildRings() const;
+    SparseClipmapTransitionMetadata BuildTransitionMetadata() const;
+    SparseClipmapTransitionMetadata BuildTransitionMetadataAfterNearExit(float nearVolumeExitDistance) const;
 
 private:
     SparseClipmapConfig m_config;
@@ -82,6 +102,8 @@ struct SparseClipmapGpuSnapshot {
     uint32_t tileCount = 0;
     uint32_t tileSampleSide = 0;
     uint32_t lookupCapacity = 0;
+    uint32_t heightDirtyStartSlot = 0;
+    uint32_t heightDirtySlotCount = 0;
     uint32_t voxelBrickCount = 0;
     uint32_t voxelLookupCapacity = 0;
     uint32_t voxelDirtyStartSlot = 0;
@@ -92,15 +114,30 @@ struct SparseClipmapGpuSnapshot {
 struct SparseClipmapCacheStats {
     uint32_t residentTiles = 0;
     uint32_t queuedTiles = 0;
+    uint32_t interestedTiles = 0;
+    uint32_t missingInterestedTiles = 0;
     uint32_t generatedTilesLastFrame = 0;
     uint32_t evictedTilesLastFrame = 0;
     uint32_t dirtySerial = 0;
     uint32_t snapshotTiles = 0;
     uint32_t residentVoxelBricks = 0;
     uint32_t queuedVoxelBricks = 0;
+    uint32_t interestedVoxelBricks = 0;
+    uint32_t missingInterestedVoxelBricks = 0;
     uint32_t generatedVoxelBricksLastFrame = 0;
     uint32_t evictedVoxelBricksLastFrame = 0;
+    uint32_t heightInterestAnchors = 0;
+    uint32_t voxelInterestAnchors = 0;
 };
+
+struct SparseClipmapResidencyMetadata {
+    float heightCoverageRatio = 0.0f;
+    float voxelCoverageRatio = 0.0f;
+    uint32_t residentHeightTiles = 0;
+    uint32_t residentVoxelBricks = 0;
+};
+
+SparseClipmapResidencyMetadata BuildClipmapResidencyMetadata(const SparseClipmapCacheStats& stats);
 
 struct SparseVoxelClipmapCoord {
     int32_t ring = 0;
@@ -125,7 +162,14 @@ public:
         float cameraY,
         float cameraZ,
         uint32_t frameIndex,
-        const SparseClipmapPolicy& policy);
+        const SparseClipmapPolicy& policy,
+        float forwardX = 0.0f,
+        float forwardY = 0.0f,
+        float forwardZ = 0.0f,
+        float velocityX = 0.0f,
+        float velocityY = 0.0f,
+        float velocityZ = 0.0f,
+        float predictionSeconds = 0.0f);
     uint32_t PumpGeneration(uint32_t maxTiles, uint32_t frameIndex, const SparseClipmapPolicy& policy);
     bool BuildGpuSnapshot(SparseClipmapGpuSnapshot& outSnapshot) const;
 
@@ -133,6 +177,7 @@ public:
     uint32_t DirtySerial() const { return m_dirtySerial; }
     uint32_t HeightDirtySerial() const { return m_heightDirtySerial; }
     uint32_t VoxelDirtySerial() const { return m_voxelDirtySerial; }
+    void ClearHeightDirtyRange();
     void ClearVoxelDirtyRange();
 
 private:
@@ -151,8 +196,16 @@ private:
         float cameraY,
         float cameraZ,
         uint32_t frameIndex,
-        const SparseClipmapPolicy& policy);
+        const SparseClipmapPolicy& policy,
+        float forwardX,
+        float forwardY,
+        float forwardZ,
+        float velocityX,
+        float velocityY,
+        float velocityZ,
+        float predictionSeconds);
     void MarkVoxelSlotDirty(uint32_t slot);
+    void MarkHeightSlotDirty(uint32_t slot);
     void RefreshStats(
         uint32_t generatedLastFrame = 0,
         uint32_t evictedLastFrame = 0,
@@ -187,6 +240,8 @@ private:
     uint32_t m_dirtySerial = 0;
     uint32_t m_heightDirtySerial = 0;
     uint32_t m_voxelDirtySerial = 0;
+    uint32_t m_dirtyHeightStartSlot = UINT32_MAX;
+    uint32_t m_dirtyHeightEndSlot = 0;
     uint32_t m_dirtyVoxelStartSlot = UINT32_MAX;
     uint32_t m_dirtyVoxelEndSlot = 0;
 };

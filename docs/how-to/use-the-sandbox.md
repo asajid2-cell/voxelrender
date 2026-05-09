@@ -1,22 +1,23 @@
 # Use The Sandbox
 
-The sandbox is the main VENPOD tech demo. It shows vertical terrain streaming,
-raymarched voxel rendering, persistent brush editing, chunk-budgeted physics,
-and runtime diagnostics.
+The sandbox is the main VENPOD tech demo. It shows sparse brick terrain,
+surface-authoritative near-field rendering, persistent brush editing, local
+sparse physics, mid/far continuity, and runtime diagnostics.
 
 ## Launch Sandbox Mode
 
 ```powershell
 cd VENPOD
-.\run.ps1
+.\rebrun.ps1
 ```
 
 In the launcher, select `Sandbox Mode`.
 
-For a rebuild-and-run loop:
+`rebrun.ps1` launches the sparse renderer by default. For dense legacy
+comparison:
 
 ```powershell
-.\rebrun.ps1
+.\rebrun.ps1 -DenseLegacy
 ```
 
 ## Move Around
@@ -42,8 +43,19 @@ For a rebuild-and-run loop:
 | `Q` / `E` | Change material |
 | `[` / `]` | Change brush radius |
 
-Painting uses GPU raycasting to find the target voxel. The brush compute shader
-dispatches over the brush bounds, not the full render buffer.
+Painting targets world-space sparse bricks. GPU sparse raycast and brush
+feedback diagnostics are available, while the CPU sparse path remains the
+resilient authority for ordinary interaction.
+
+To keep sparse edits across runs, launch with an edit file:
+
+```powershell
+.\rebrun.ps1 -SparseEditFile saves\review-edits.vsed
+```
+
+The file is loaded when the sparse sandbox starts and saved on shutdown.
+When the pause menu is open, the metrics panel also exposes a sparse edit path
+field with `Save Edits` and `Load Edits` buttons for manual save/load.
 
 For traversal, hold left mouse while aiming along a path. When the painted path
 gets close to the player, VENPOD hands off into a short foot-ramp placement so
@@ -53,13 +65,18 @@ the final painted voxels become walkable instead of blocking the camera.
 
 - Extreme vertical terrain: cliffs, shelves, spires, ravines, basins, and cave
   openings.
-- World-space chunk streaming while moving or flying.
-- Persistent runtime brush edits across render-window recentering.
-- The metrics overlay reporting visible chunks, loaded/generated chunks,
-  generated voxel capacity, brush feedback, physics budget, and far SVO state.
+- World-space sparse brick residency while moving or flying.
+- Persistent runtime brush edits across sparse brick eviction and reload.
+- The metrics overlay reporting resident/tracked pages, upload budgets,
+  ownership counters, mid/far coverage, brush feedback, physics budget, and far
+  SVO state.
 
 ## Current Limits
 
-- Brush edits persist during the session but are not saved to disk by default.
-- The sparse voxel octree far field is visual-only.
-- Infinite physics is conservative by default so the sandbox stays responsive.
+- Brush edits persist during the session and can be saved/loaded with
+  `.\rebrun.ps1 -SparseEditFile` or the pause-menu metrics panel.
+- Dense legacy remains available as a fallback and regression comparison.
+- GPU brush feedback and GPU physics proposal application are guarded hybrid
+  paths; CPU sparse authority remains the resilience fallback.
+- Mid/far terrain is visual continuity, while near sparse bricks remain the
+  editable and collision-critical authority.

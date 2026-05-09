@@ -11,7 +11,8 @@ Result<void> PhysicsDispatcher::Initialize(
     ID3D12Device* device,
     Graphics::ShaderCompiler& shaderCompiler,
     Graphics::DescriptorHeapManager& heapManager,
-    const std::filesystem::path& shaderPath)
+    const std::filesystem::path& shaderPath,
+    const PhysicsDispatcherConfig& config)
 {
     if (!device) {
         return Error("Device is null");
@@ -20,66 +21,91 @@ Result<void> PhysicsDispatcher::Initialize(
     m_device = device;
     m_heapManager = &heapManager;
 
-    // Create initialize pipeline
-    auto result = CreateInitializePipeline(device, shaderCompiler, shaderPath);
-    if (!result) {
-        return Error("Failed to create initialize pipeline: {}", result.error());
+    Result<void> result = {};
+
+    if (config.enableDenseSimulationPipelines) {
+        result = CreateInitializePipeline(device, shaderCompiler, shaderPath);
+        if (!result) {
+            return Error("Failed to create initialize pipeline: {}", result.error());
+        }
+
+        result = CreateGravityPipeline(device, shaderCompiler, shaderPath);
+        if (!result) {
+            spdlog::warn("Gravity pipeline not created (shader may not exist yet): {}", result.error());
+        }
+
+        result = CreateBrushPipeline(device, shaderCompiler, shaderPath);
+        if (!result) {
+            spdlog::warn("Brush pipeline not created: {}", result.error());
+        }
+
+        result = CreateChunkScanPipeline(device, shaderCompiler, shaderPath);
+        if (!result) {
+            spdlog::warn("Chunk scan pipeline not created: {}", result.error());
+        }
+
+        result = CreatePrepareIndirectPipeline(device, shaderCompiler, shaderPath);
+        if (!result) {
+            spdlog::warn("Prepare indirect pipeline not created: {}", result.error());
+        }
+
+        result = CreateGravityChunkPipeline(device, shaderCompiler, shaderPath);
+        if (!result) {
+            spdlog::warn("Gravity chunk pipeline not created: {}", result.error());
+        }
     }
 
-    // Create gravity pipeline (for Phase 2B)
-    result = CreateGravityPipeline(device, shaderCompiler, shaderPath);
-    if (!result) {
-        // Not fatal - gravity shader may not exist yet
-        spdlog::warn("Gravity pipeline not created (shader may not exist yet): {}", result.error());
+    if (config.enableDenseRaycastPipelines) {
+        result = CreateBrushRaycastPipeline(device, shaderCompiler, shaderPath);
+        if (!result) {
+            spdlog::warn("Brush raycast pipeline not created: {}", result.error());
+        }
     }
 
-    // Create brush pipeline (for Phase 3B)
-    result = CreateBrushPipeline(device, shaderCompiler, shaderPath);
-    if (!result) {
-        spdlog::warn("Brush pipeline not created: {}", result.error());
+    if (config.enableSparseRaycastPipeline) {
+        result = CreateSparseRaycastPipeline(device, shaderCompiler, shaderPath);
+        if (!result) {
+            spdlog::warn("Sparse raycast pipeline not created: {}", result.error());
+        }
     }
 
-    // Create chunk scan pipeline (for Phase 3A)
-    result = CreateChunkScanPipeline(device, shaderCompiler, shaderPath);
-    if (!result) {
-        spdlog::warn("Chunk scan pipeline not created: {}", result.error());
+    if (config.enableSparseMissFeedbackPipeline) {
+        result = CreateSparseMissFeedbackPipeline(device, shaderCompiler, shaderPath);
+        if (!result) {
+            spdlog::warn("Sparse miss feedback pipeline not created: {}", result.error());
+        }
     }
 
-    // Create prepare indirect pipeline
-    result = CreatePrepareIndirectPipeline(device, shaderCompiler, shaderPath);
-    if (!result) {
-        spdlog::warn("Prepare indirect pipeline not created: {}", result.error());
+    if (config.enableSparseBrushFeedbackPipeline) {
+        result = CreateSparseBrushFeedbackPipeline(device, shaderCompiler, shaderPath);
+        if (!result) {
+            spdlog::warn("Sparse brush feedback pipeline not created: {}", result.error());
+        }
     }
 
-    // Create chunk-based gravity pipeline
-    result = CreateGravityChunkPipeline(device, shaderCompiler, shaderPath);
-    if (!result) {
-        spdlog::warn("Gravity chunk pipeline not created: {}", result.error());
+    if (config.enableSparsePhysicsPacketPipeline) {
+        result = CreateSparsePhysicsPacketPipeline(device, shaderCompiler, shaderPath);
+        if (!result) {
+            spdlog::warn("Sparse physics packet pipeline not created: {}", result.error());
+        }
     }
 
-    // Create brush raycast pipeline (NEW - GPU raycasting)
-    result = CreateBrushRaycastPipeline(device, shaderCompiler, shaderPath);
-    if (!result) {
-        spdlog::warn("Brush raycast pipeline not created: {}", result.error());
+    if (config.enableIndirectCommandSignature) {
+        result = CreateCommandSignature(device);
+        if (!result) {
+            spdlog::warn("Command signature not created: {}", result.error());
+        }
     }
 
-    result = CreateSparseRaycastPipeline(device, shaderCompiler, shaderPath);
-    if (!result) {
-        spdlog::warn("Sparse raycast pipeline not created: {}", result.error());
-    }
-
-    result = CreateSparseMissFeedbackPipeline(device, shaderCompiler, shaderPath);
-    if (!result) {
-        spdlog::warn("Sparse miss feedback pipeline not created: {}", result.error());
-    }
-
-    // Create command signature for indirect dispatch
-    result = CreateCommandSignature(device);
-    if (!result) {
-        spdlog::warn("Command signature not created: {}", result.error());
-    }
-
-    spdlog::info("PhysicsDispatcher initialized");
+    spdlog::info(
+        "PhysicsDispatcher initialized (denseSim={} denseRaycast={} sparseRaycast={} sparseFeedback={} sparseBrushFeedback={} sparsePhysicsPackets={} indirect={})",
+        config.enableDenseSimulationPipelines ? 1 : 0,
+        config.enableDenseRaycastPipelines ? 1 : 0,
+        config.enableSparseRaycastPipeline ? 1 : 0,
+        config.enableSparseMissFeedbackPipeline ? 1 : 0,
+        config.enableSparseBrushFeedbackPipeline ? 1 : 0,
+        config.enableSparsePhysicsPacketPipeline ? 1 : 0,
+        config.enableIndirectCommandSignature ? 1 : 0);
     return {};
 }
 
@@ -93,6 +119,8 @@ void PhysicsDispatcher::Shutdown() {
     m_brushRaycastPipeline.Shutdown();
     m_sparseRaycastPipeline.Shutdown();
     m_sparseMissFeedbackPipeline.Shutdown();
+    m_sparseBrushFeedbackPipeline.Shutdown();
+    m_sparsePhysicsPacketPipeline.Shutdown();
     m_commandSignature.Reset();
     m_heapManager = nullptr;
     m_device = nullptr;
@@ -1209,6 +1237,7 @@ void PhysicsDispatcher::DispatchSparseRaycast(
     const Graphics::DescriptorHandle& sparseBrickPoolSRV,
     const Graphics::DescriptorHandle& sparsePageTableSRV,
     const Graphics::DescriptorHandle& sparseOccupancySRV,
+    const Graphics::DescriptorHandle& sparsePageGenerationSRV,
     uint32_t maxBrickPages,
     uint32_t pageTableCapacity,
     const glm::vec3& rayOrigin,
@@ -1217,7 +1246,8 @@ void PhysicsDispatcher::DispatchSparseRaycast(
     bool writeGroundResult)
 {
     if (!cmdList || !m_sparseRaycastPipeline.IsValid() || !m_heapManager ||
-        !sparseBrickPoolSRV.IsValid() || !sparsePageTableSRV.IsValid() || !sparseOccupancySRV.IsValid()) {
+        !sparseBrickPoolSRV.IsValid() || !sparsePageTableSRV.IsValid() ||
+        !sparseOccupancySRV.IsValid() || !sparsePageGenerationSRV.IsValid()) {
         return;
     }
 
@@ -1254,6 +1284,10 @@ void PhysicsDispatcher::DispatchSparseRaycast(
     m_sparseRaycastPipeline.SetRootDescriptorTable(
         cmdList,
         4,
+        sparsePageGenerationSRV.gpu);
+    m_sparseRaycastPipeline.SetRootDescriptorTable(
+        cmdList,
+        5,
         writeGroundResult
             ? world.GetGroundRaycastResultBuffer().GetShaderVisibleUAV().gpu
             : world.GetBrushRaycastResultBuffer().GetShaderVisibleUAV().gpu);
@@ -1341,6 +1375,170 @@ void PhysicsDispatcher::DispatchSparseMissFeedback(
     m_sparseMissFeedbackPipeline.SetRootDescriptorTable(cmdList, 1, sparsePageTableSRV.gpu);
     m_sparseMissFeedbackPipeline.SetRootDescriptorTable(cmdList, 2, sparseMissFeedbackUAV.gpu);
     cmdList->Dispatch(1, 1, 1);
+}
+
+void PhysicsDispatcher::DispatchSparseBrushFeedback(
+    ID3D12GraphicsCommandList* cmdList,
+    const Graphics::DescriptorHandle& sparseBrickPoolSRV,
+    const Graphics::DescriptorHandle& sparsePageTableSRV,
+    const Graphics::DescriptorHandle& sparseOccupancySRV,
+    const Graphics::DescriptorHandle& sparsePageGenerationSRV,
+    const Graphics::DescriptorHandle& sparseBrushFeedbackUAV,
+    uint32_t maxBrickPages,
+    uint32_t pageTableCapacity,
+    float worldPositionX,
+    float worldPositionY,
+    float worldPositionZ,
+    float radius,
+    uint32_t material,
+    uint32_t mode,
+    uint32_t shape,
+    float strength,
+    uint32_t seed,
+    int32_t hitNormalX,
+    int32_t hitNormalY,
+    int32_t hitNormalZ,
+    bool hasHitNormal,
+    uint32_t maxRecords,
+    uint32_t frameIndex)
+{
+    if (!cmdList || !m_sparseBrushFeedbackPipeline.IsValid() || !m_heapManager ||
+        !sparseBrickPoolSRV.IsValid() || !sparsePageTableSRV.IsValid() ||
+        !sparseOccupancySRV.IsValid() || !sparsePageGenerationSRV.IsValid() ||
+        !sparseBrushFeedbackUAV.IsValid() || maxBrickPages == 0 ||
+        pageTableCapacity == 0 || maxRecords == 0 || radius <= 0.0f) {
+        return;
+    }
+
+    const int32_t radiusCeil = static_cast<int32_t>(std::ceil(radius)) + 2;
+    const int32_t centerX = static_cast<int32_t>(std::floor(worldPositionX));
+    const int32_t centerY = static_cast<int32_t>(std::floor(worldPositionY));
+    const int32_t centerZ = static_cast<int32_t>(std::floor(worldPositionZ));
+    const int32_t startX = centerX - radiusCeil;
+    const int32_t startY = centerY - radiusCeil;
+    const int32_t startZ = centerZ - radiusCeil;
+    const int32_t endX = static_cast<int32_t>(std::ceil(worldPositionX)) + radiusCeil + 1;
+    const int32_t endY = static_cast<int32_t>(std::ceil(worldPositionY)) + radiusCeil + 1;
+    const int32_t endZ = static_cast<int32_t>(std::ceil(worldPositionZ)) + radiusCeil + 1;
+    const uint32_t volumeX = static_cast<uint32_t>(std::max(0, endX - startX));
+    const uint32_t volumeY = static_cast<uint32_t>(std::max(0, endY - startY));
+    const uint32_t volumeZ = static_cast<uint32_t>(std::max(0, endZ - startZ));
+    if (volumeX == 0 || volumeY == 0 || volumeZ == 0) {
+        return;
+    }
+
+    struct SparseBrushFeedbackConstants {
+        float positionX, positionY, positionZ, radius;
+        uint32_t material, mode, shape;
+        float strength;
+        int32_t startX, startY, startZ;
+        uint32_t volumeX;
+        uint32_t volumeY, volumeZ, seed, maxRecords;
+        int32_t hitNormalX, hitNormalY, hitNormalZ;
+        uint32_t hasHitNormal;
+        uint32_t maxBrickPages, pageTableCapacity, frameIndex, padding0;
+    } constants = {};
+
+    constants.positionX = worldPositionX;
+    constants.positionY = worldPositionY;
+    constants.positionZ = worldPositionZ;
+    constants.radius = radius;
+    constants.material = material;
+    constants.mode = mode;
+    constants.shape = shape;
+    constants.strength = strength;
+    constants.startX = startX;
+    constants.startY = startY;
+    constants.startZ = startZ;
+    constants.volumeX = volumeX;
+    constants.volumeY = volumeY;
+    constants.volumeZ = volumeZ;
+    constants.seed = seed;
+    constants.maxRecords = maxRecords;
+    constants.hitNormalX = hitNormalX;
+    constants.hitNormalY = hitNormalY;
+    constants.hitNormalZ = hitNormalZ;
+    constants.hasHitNormal = hasHitNormal ? 1u : 0u;
+    constants.maxBrickPages = maxBrickPages;
+    constants.pageTableCapacity = pageTableCapacity;
+    constants.frameIndex = frameIndex;
+
+    ID3D12DescriptorHeap* heaps[] = { m_heapManager->GetShaderVisibleCbvSrvUavHeap() };
+    cmdList->SetDescriptorHeaps(1, heaps);
+    m_sparseBrushFeedbackPipeline.Bind(cmdList);
+    m_sparseBrushFeedbackPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
+    m_sparseBrushFeedbackPipeline.SetRootDescriptorTable(cmdList, 1, sparseBrickPoolSRV.gpu);
+    m_sparseBrushFeedbackPipeline.SetRootDescriptorTable(cmdList, 2, sparsePageTableSRV.gpu);
+    m_sparseBrushFeedbackPipeline.SetRootDescriptorTable(cmdList, 3, sparseOccupancySRV.gpu);
+    m_sparseBrushFeedbackPipeline.SetRootDescriptorTable(cmdList, 4, sparsePageGenerationSRV.gpu);
+    m_sparseBrushFeedbackPipeline.SetRootDescriptorTable(cmdList, 5, sparseBrushFeedbackUAV.gpu);
+    cmdList->Dispatch(
+        (volumeX + 7u) / 8u,
+        (volumeY + 7u) / 8u,
+        (volumeZ + 7u) / 8u);
+}
+
+void PhysicsDispatcher::DispatchSparsePhysicsPackets(
+    ID3D12GraphicsCommandList* cmdList,
+    const Graphics::DescriptorHandle& sparsePhysicsPacketSRV,
+    const Graphics::DescriptorHandle& sparsePageTableSRV,
+    const Graphics::DescriptorHandle& sparseBrickPoolSRV,
+    const Graphics::DescriptorHandle& sparseEditDeltaSRV,
+    const Graphics::DescriptorHandle& sparseEditDeltaRangeSRV,
+    const Graphics::DescriptorHandle& sparseEditDeltaRangeTableSRV,
+    const Graphics::DescriptorHandle& sparsePhysicsPacketResultUAV,
+    const Graphics::DescriptorHandle& sparsePhysicsDiagnosticsUAV,
+    uint32_t pageTableCapacity,
+    uint32_t packetCount,
+    uint32_t editDeltaCount,
+    uint32_t editDeltaRangeCount,
+    uint32_t editDeltaRangeTableCapacity,
+    uint32_t frameIndex)
+{
+    if (!cmdList || !m_sparsePhysicsPacketPipeline.IsValid() || !m_heapManager ||
+        !sparsePhysicsPacketSRV.IsValid() || !sparsePageTableSRV.IsValid() ||
+        !sparseBrickPoolSRV.IsValid() || !sparseEditDeltaSRV.IsValid() ||
+        !sparseEditDeltaRangeSRV.IsValid() ||
+        !sparseEditDeltaRangeTableSRV.IsValid() ||
+        !sparsePhysicsPacketResultUAV.IsValid() ||
+        !sparsePhysicsDiagnosticsUAV.IsValid() ||
+        packetCount == 0) {
+        return;
+    }
+
+    ID3D12DescriptorHeap* heaps[] = { m_heapManager->GetShaderVisibleCbvSrvUavHeap() };
+    cmdList->SetDescriptorHeaps(1, heaps);
+    m_sparsePhysicsPacketPipeline.Bind(cmdList);
+
+    struct SparsePhysicsPacketConstants {
+        uint32_t packetCount;
+        uint32_t frameIndex;
+        uint32_t pageTableCapacity;
+        uint32_t editDeltaCount;
+        uint32_t editDeltaRangeCount;
+        uint32_t editDeltaRangeTableCapacity;
+        uint32_t padding1;
+        uint32_t padding2;
+    } constants = {};
+
+    constants.packetCount = packetCount;
+    constants.frameIndex = frameIndex;
+    constants.pageTableCapacity = pageTableCapacity;
+    constants.editDeltaCount = editDeltaCount;
+    constants.editDeltaRangeCount = editDeltaRangeCount;
+    constants.editDeltaRangeTableCapacity = editDeltaRangeTableCapacity;
+
+    m_sparsePhysicsPacketPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
+    m_sparsePhysicsPacketPipeline.SetRootDescriptorTable(cmdList, 1, sparsePhysicsPacketSRV.gpu);
+    m_sparsePhysicsPacketPipeline.SetRootDescriptorTable(cmdList, 2, sparsePageTableSRV.gpu);
+    m_sparsePhysicsPacketPipeline.SetRootDescriptorTable(cmdList, 3, sparseBrickPoolSRV.gpu);
+    m_sparsePhysicsPacketPipeline.SetRootDescriptorTable(cmdList, 4, sparseEditDeltaSRV.gpu);
+    m_sparsePhysicsPacketPipeline.SetRootDescriptorTable(cmdList, 5, sparseEditDeltaRangeSRV.gpu);
+    m_sparsePhysicsPacketPipeline.SetRootDescriptorTable(cmdList, 6, sparseEditDeltaRangeTableSRV.gpu);
+    m_sparsePhysicsPacketPipeline.SetRootDescriptorTable(cmdList, 7, sparsePhysicsPacketResultUAV.gpu);
+    m_sparsePhysicsPacketPipeline.SetRootDescriptorTable(cmdList, 8, sparsePhysicsDiagnosticsUAV.gpu);
+    const uint32_t groupsX = (packetCount + 63u) / 64u;
+    m_sparsePhysicsPacketPipeline.Dispatch(cmdList, groupsX, 1, 1);
 }
 
 Result<void> PhysicsDispatcher::CreateBrushRaycastPipeline(
@@ -1463,6 +1661,13 @@ Result<void> PhysicsDispatcher::CreateSparseRaycastPipeline(
     });
     pipelineDesc.rootParams.push_back({
         Graphics::RootParamType::DescriptorTable,
+        3,
+        0,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
         0,
         0,
         1,
@@ -1526,6 +1731,156 @@ Result<void> PhysicsDispatcher::CreateSparseMissFeedbackPipeline(
     }
 
     spdlog::info("Sparse miss feedback pipeline created successfully");
+    return {};
+}
+
+Result<void> PhysicsDispatcher::CreateSparseBrushFeedbackPipeline(
+    ID3D12Device* device,
+    Graphics::ShaderCompiler& shaderCompiler,
+    const std::filesystem::path& shaderPath)
+{
+    std::filesystem::path csPath = shaderPath / "Compute" / "CS_SparseBrushFeedback.hlsl";
+
+    auto csResult = shaderCompiler.CompileComputeShader(csPath, L"main", true);
+    if (!csResult) {
+        return Error("Failed to compile CS_SparseBrushFeedback.hlsl: {}", csResult.error());
+    }
+
+    Graphics::CompiledShader cs = csResult.value();
+    if (!cs.IsValid()) {
+        return Error("CS_SparseBrushFeedback shader compilation failed: {}", cs.errors);
+    }
+
+    Graphics::ComputePipelineDesc pipelineDesc;
+    pipelineDesc.computeShader = cs;
+    pipelineDesc.debugName = "SparseBrushFeedbackPipeline";
+
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::Constants32Bit,
+        0,
+        0,
+        24
+    });
+    for (uint32_t srvRegister = 0; srvRegister < 4; ++srvRegister) {
+        pipelineDesc.rootParams.push_back({
+            Graphics::RootParamType::DescriptorTable,
+            srvRegister,
+            0,
+            1,
+            D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+        });
+    }
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        0,
+        0,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+    });
+
+    auto result = m_sparseBrushFeedbackPipeline.Initialize(device, pipelineDesc);
+    if (!result) {
+        return Error("Failed to create sparse brush feedback pipeline: {}", result.error());
+    }
+
+    spdlog::info("Sparse brush feedback pipeline created successfully");
+    return {};
+}
+
+Result<void> PhysicsDispatcher::CreateSparsePhysicsPacketPipeline(
+    ID3D12Device* device,
+    Graphics::ShaderCompiler& shaderCompiler,
+    const std::filesystem::path& shaderPath)
+{
+    std::filesystem::path csPath = shaderPath / "Compute" / "CS_SparsePhysicsPackets.hlsl";
+
+    auto csResult = shaderCompiler.CompileComputeShader(csPath, L"main", true);
+    if (!csResult) {
+        return Error("Failed to compile CS_SparsePhysicsPackets.hlsl: {}", csResult.error());
+    }
+
+    Graphics::CompiledShader cs = csResult.value();
+    if (!cs.IsValid()) {
+        return Error("CS_SparsePhysicsPackets shader compilation failed: {}", cs.errors);
+    }
+
+    Graphics::ComputePipelineDesc pipelineDesc;
+    pipelineDesc.computeShader = cs;
+    pipelineDesc.debugName = "SparsePhysicsPacketPipeline";
+
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::Constants32Bit,
+        0,
+        0,
+        8
+    });
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        0,
+        0,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        1,
+        0,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    // t2: sparse brick voxel pool, used for packet-local proposal validation.
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        2,
+        0,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    // t3: same-frame sparse edit deltas overlaid on resident brick samples.
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        3,
+        0,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    // t4: compact per-brick ranges into t3 edit deltas.
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        4,
+        0,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    // t5: hash table mapping brickCoord to edit-delta range index.
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        5,
+        0,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        0,
+        0,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+    });
+    pipelineDesc.rootParams.push_back({
+        Graphics::RootParamType::DescriptorTable,
+        1,
+        0,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+    });
+
+    auto result = m_sparsePhysicsPacketPipeline.Initialize(device, pipelineDesc);
+    if (!result) {
+        return Error("Failed to create sparse physics packet pipeline: {}", result.error());
+    }
+
+    spdlog::info("Sparse physics packet pipeline created successfully");
     return {};
 }
 

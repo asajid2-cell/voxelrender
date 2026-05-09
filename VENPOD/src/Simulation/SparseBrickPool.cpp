@@ -1,8 +1,19 @@
 #include "SparseBrickPool.h"
 
 #include <algorithm>
+#include <vector>
 
 namespace VENPOD::Simulation {
+
+namespace {
+
+bool RequiresPublishedPageTableEntry(BrickLifecycleState state) {
+    return state == BrickLifecycleState::Resident ||
+           state == BrickLifecycleState::DirtyCPU ||
+           state == BrickLifecycleState::DirtyGPU;
+}
+
+} // namespace
 
 bool SparseBrickPool::Initialize(uint32_t maxPages, uint32_t pageTableCapacity) {
     if (maxPages == 0 || pageTableCapacity < maxPages * 2u) {
@@ -256,12 +267,12 @@ bool SparseBrickPool::TouchResidencyClass(
     SparseResidencyClass residencyClass,
     uint32_t frameIndex)
 {
-    uint32_t page = INVALID_BRICK_PAGE;
-    if (!TryGetPage(coord, &page)) {
+    auto it = m_resident.find(coord);
+    if (it == m_resident.end()) {
         return false;
     }
 
-    BrickResidentRecord& record = m_records[page];
+    BrickResidentRecord& record = m_records[it->second];
     if (frameIndex != 0) {
         record.lastTouchedFrame = std::max(record.lastTouchedFrame, frameIndex);
     }
@@ -306,12 +317,125 @@ bool SparseBrickPool::MarkDirty(const BrickCoord& coord) {
 }
 
 bool SparseBrickPool::MarkHasPersistentEdits(const BrickCoord& coord) {
-    uint32_t page = INVALID_BRICK_PAGE;
-    if (!TryGetPage(coord, &page)) {
+    auto it = m_resident.find(coord);
+    if (it == m_resident.end()) {
         return false;
     }
-    m_records[page].hasPersistentEdits = true;
+    m_records[it->second].hasPersistentEdits = true;
     return true;
+}
+
+SparseBrickPoolValidationResult SparseBrickPool::ValidateInvariants() const {
+    SparseBrickPoolValidationResult result;
+    result.freePages = static_cast<uint32_t>(m_freePages.size());
+
+    std::vector<bool> freeSeen(m_records.size(), false);
+    for (uint32_t page : m_freePages) {
+        if (page >= m_records.size() || freeSeen[page]) {
+            ++result.freeListErrors;
+            result.ok = false;
+            continue;
+        }
+        freeSeen[page] = true;
+        const BrickLifecycleState state = m_records[page].state;
+        if (state != BrickLifecycleState::Missing &&
+            state != BrickLifecycleState::Evicted) {
+            ++result.freeListErrors;
+            result.ok = false;
+        }
+    }
+
+    for (const auto& mapped : m_resident) {
+        const BrickCoord& coord = mapped.first;
+        const uint32_t page = mapped.second;
+        if (page >= m_records.size() || freeSeen[page]) {
+            ++result.residentMapErrors;
+            result.ok = false;
+            continue;
+        }
+
+        const BrickResidentRecord& record = m_records[page];
+        if (record.pageIndex != page ||
+            !(record.coord == coord) ||
+            record.state == BrickLifecycleState::Missing ||
+            record.state == BrickLifecycleState::Evicted) {
+            ++result.residentMapErrors;
+            result.ok = false;
+            continue;
+        }
+        ++result.activeRecords;
+    }
+
+    for (uint32_t page = 0; page < m_records.size(); ++page) {
+        if (freeSeen[page]) {
+            continue;
+        }
+        const BrickResidentRecord& record = m_records[page];
+        if (record.state == BrickLifecycleState::Missing ||
+            record.state == BrickLifecycleState::Evicted) {
+            continue;
+        }
+        auto it = m_resident.find(record.coord);
+        if (it == m_resident.end() || it->second != page) {
+            ++result.residentMapErrors;
+            result.ok = false;
+        }
+
+        if (RequiresPublishedPageTableEntry(record.state)) {
+            uint32_t pageTablePage = INVALID_BRICK_PAGE;
+            if (!m_pageTable.TryLookupExactGeneration(
+                    record.coord,
+                    record.generation,
+                    &pageTablePage,
+                    nullptr) ||
+                pageTablePage != page) {
+                ++result.pageTableErrors;
+                ++result.missingPublishedPageTableEntries;
+                result.ok = false;
+            }
+        }
+    }
+
+    uint32_t countedPageTableEntries = 0;
+    for (const BrickPageEntry& entry : m_pageTable.Entries()) {
+        if (entry.pageIndex == INVALID_BRICK_PAGE ||
+            entry.pageIndex == INVALID_BRICK_PAGE - 1u) {
+            continue;
+        }
+        ++countedPageTableEntries;
+        auto it = m_resident.find(entry.coord);
+        if (it == m_resident.end() ||
+            it->second >= m_records.size()) {
+            ++result.pageTableErrors;
+            result.ok = false;
+            continue;
+        }
+        const BrickResidentRecord& record = m_records[it->second];
+        if (record.pageIndex != entry.pageIndex ||
+            record.generation != entry.generation) {
+            ++result.pageTableErrors;
+            result.ok = false;
+            continue;
+        }
+
+        const bool stateCanHavePublishedPage =
+            record.state == BrickLifecycleState::Resident ||
+            record.state == BrickLifecycleState::DirtyCPU ||
+            record.state == BrickLifecycleState::DirtyGPU ||
+            record.state == BrickLifecycleState::UploadQueued ||
+            record.state == BrickLifecycleState::UploadingGPU;
+        if (!stateCanHavePublishedPage) {
+            ++result.pageTableErrors;
+            result.ok = false;
+        }
+    }
+    result.pageTableEntries = countedPageTableEntries;
+    if (countedPageTableEntries != m_pageTable.Count()) {
+        ++result.pageTableErrors;
+        result.ok = false;
+    }
+
+    return result;
 }
 
 bool SparseBrickPool::TransitionRecord(BrickResidentRecord& record, BrickLifecycleState nextState) {

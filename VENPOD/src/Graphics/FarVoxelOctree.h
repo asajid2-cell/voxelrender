@@ -3,6 +3,7 @@
 #include "RHI/GPUBuffer.h"
 #include "RHI/DescriptorHeap.h"
 #include "../Utils/Result.h"
+#include <algorithm>
 #include <cstdint>
 #include <future>
 #include <string>
@@ -29,8 +30,48 @@ struct FarVoxelOctreeStats {
     float coveredWorldSize = 0.0f;
     double cpuBuildMs = 0.0;
     double gpuUploadMs = 0.0;
+    uint64_t gpuUploadBytesTotal = 0;
+    uint64_t gpuUploadBytesUploaded = 0;
+    uint64_t gpuUploadStageBytesTotal = 0;
+    uint64_t gpuUploadStageBytesUploaded = 0;
+    uint32_t gpuUploadStage = 0;
     bool loadedFromCache = false;
 };
+
+struct FarVoxelOctreeResidencyMetadata {
+    float uploadCoverageRatio = 0.0f;
+    float pageCoverageRatio = 0.0f;
+    bool ready = false;
+};
+
+inline FarVoxelOctreeResidencyMetadata BuildFarVoxelOctreeResidencyMetadata(
+    const FarVoxelOctreeStats& stats,
+    bool buffersValid) {
+    FarVoxelOctreeResidencyMetadata metadata;
+    metadata.uploadCoverageRatio = stats.gpuUploadBytesTotal > 0
+        ? std::clamp(
+            static_cast<float>(
+                static_cast<double>(stats.gpuUploadBytesUploaded) /
+                static_cast<double>(stats.gpuUploadBytesTotal)),
+            0.0f,
+            1.0f)
+        : 0.0f;
+    metadata.pageCoverageRatio = stats.pageIndexCount > 0
+        ? std::clamp(
+            static_cast<float>(
+                static_cast<double>(stats.pageCount) /
+                static_cast<double>(stats.pageIndexCount)),
+            0.0f,
+            1.0f)
+        : 0.0f;
+    metadata.ready =
+        buffersValid &&
+        metadata.uploadCoverageRatio >= 0.999f &&
+        metadata.pageCoverageRatio > 0.0f &&
+        stats.nodeCount > 0 &&
+        stats.pageCount > 0;
+    return metadata;
+}
 
 class FarVoxelOctree {
 public:
@@ -46,7 +87,14 @@ public:
         const FarVoxelOctreeConfig& config = {});
     void BeginAsyncLoad(const FarVoxelOctreeConfig& config = {});
     bool IsAsyncPending() const { return m_asyncPending; }
-    bool TryFinalizeAsyncUpload(ID3D12Device* device, DescriptorHeapManager& heapManager);
+    bool IsGpuUploadPending() const;
+    bool HasPendingGpuUploadCopies() const;
+    bool EmitPendingGpuUploadCopies(ID3D12GraphicsCommandList* commandList);
+    const char* GetGpuUploadStageName() const;
+    bool TryFinalizeAsyncUpload(
+        ID3D12Device* device,
+        DescriptorHeapManager& heapManager,
+        uint64_t maxUploadBytes = UINT64_MAX);
 
     void Shutdown();
 
@@ -98,6 +146,7 @@ private:
     };
 
     static BuildResult BuildCpuData(const FarVoxelOctreeConfig& config);
+    bool PumpGpuUpload(ID3D12Device* device, DescriptorHeapManager& heapManager, uint64_t maxUploadBytes);
 
     FarVoxelOctreeConfig m_config;
     FarVoxelOctreeStats m_stats;
@@ -107,7 +156,25 @@ private:
     GPUBuffer m_nodeBuffer;
     GPUBuffer m_pageBuffer;
     GPUBuffer m_pageIndexBuffer;
+    UploadBuffer m_nodeUploadBuffer;
+    UploadBuffer m_pageUploadBuffer;
+    UploadBuffer m_pageIndexUploadBuffer;
     std::future<BuildResult> m_asyncBuild;
+    enum class GpuUploadStage {
+        Idle,
+        Nodes,
+        Pages,
+        PageIndex,
+        Complete
+    };
+    struct PendingGpuCopy {
+        GpuUploadStage stage = GpuUploadStage::Idle;
+        uint64_t offset = 0;
+        uint64_t bytes = 0;
+    };
+    std::vector<PendingGpuCopy> m_pendingGpuCopies;
+    GpuUploadStage m_gpuUploadStage = GpuUploadStage::Idle;
+    uint64_t m_gpuUploadStageOffset = 0;
     bool m_asyncPending = false;
 };
 

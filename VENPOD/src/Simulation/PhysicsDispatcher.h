@@ -83,6 +83,16 @@ struct PhysicsDispatcherStats {
     int32_t offsetZ = 0;
 };
 
+struct PhysicsDispatcherConfig {
+    bool enableDenseSimulationPipelines = true;
+    bool enableDenseRaycastPipelines = true;
+    bool enableSparseRaycastPipeline = true;
+    bool enableSparseMissFeedbackPipeline = true;
+    bool enableSparseBrushFeedbackPipeline = true;
+    bool enableSparsePhysicsPacketPipeline = false;
+    bool enableIndirectCommandSignature = true;
+};
+
 class PhysicsDispatcher {
 public:
     PhysicsDispatcher() = default;
@@ -96,7 +106,8 @@ public:
         ID3D12Device* device,
         Graphics::ShaderCompiler& shaderCompiler,
         Graphics::DescriptorHeapManager& heapManager,
-        const std::filesystem::path& shaderPath
+        const std::filesystem::path& shaderPath,
+        const PhysicsDispatcherConfig& config = {}
     );
 
     void Shutdown();
@@ -166,6 +177,7 @@ public:
         const Graphics::DescriptorHandle& sparseBrickPoolSRV,
         const Graphics::DescriptorHandle& sparsePageTableSRV,
         const Graphics::DescriptorHandle& sparseOccupancySRV,
+        const Graphics::DescriptorHandle& sparsePageGenerationSRV,
         uint32_t maxBrickPages,
         uint32_t pageTableCapacity,
         const glm::vec3& rayOrigin,
@@ -190,6 +202,50 @@ public:
         float stepDistance,
         uint32_t rayGrid,
         uint32_t maxRecords,
+        uint32_t frameIndex
+    );
+
+    void DispatchSparseBrushFeedback(
+        ID3D12GraphicsCommandList* cmdList,
+        const Graphics::DescriptorHandle& sparseBrickPoolSRV,
+        const Graphics::DescriptorHandle& sparsePageTableSRV,
+        const Graphics::DescriptorHandle& sparseOccupancySRV,
+        const Graphics::DescriptorHandle& sparsePageGenerationSRV,
+        const Graphics::DescriptorHandle& sparseBrushFeedbackUAV,
+        uint32_t maxBrickPages,
+        uint32_t pageTableCapacity,
+        float worldPositionX,
+        float worldPositionY,
+        float worldPositionZ,
+        float radius,
+        uint32_t material,
+        uint32_t mode,
+        uint32_t shape,
+        float strength,
+        uint32_t seed,
+        int32_t hitNormalX,
+        int32_t hitNormalY,
+        int32_t hitNormalZ,
+        bool hasHitNormal,
+        uint32_t maxRecords,
+        uint32_t frameIndex
+    );
+
+    void DispatchSparsePhysicsPackets(
+        ID3D12GraphicsCommandList* cmdList,
+        const Graphics::DescriptorHandle& sparsePhysicsPacketSRV,
+        const Graphics::DescriptorHandle& sparsePageTableSRV,
+        const Graphics::DescriptorHandle& sparseBrickPoolSRV,
+        const Graphics::DescriptorHandle& sparseEditDeltaSRV,
+        const Graphics::DescriptorHandle& sparseEditDeltaRangeSRV,
+        const Graphics::DescriptorHandle& sparseEditDeltaRangeTableSRV,
+        const Graphics::DescriptorHandle& sparsePhysicsPacketResultUAV,
+        const Graphics::DescriptorHandle& sparsePhysicsDiagnosticsUAV,
+        uint32_t pageTableCapacity,
+        uint32_t packetCount,
+        uint32_t editDeltaCount,
+        uint32_t editDeltaRangeCount,
+        uint32_t editDeltaRangeTableCapacity,
         uint32_t frameIndex
     );
 
@@ -251,6 +307,18 @@ private:
         const std::filesystem::path& shaderPath
     );
 
+    Result<void> CreateSparseBrushFeedbackPipeline(
+        ID3D12Device* device,
+        Graphics::ShaderCompiler& shaderCompiler,
+        const std::filesystem::path& shaderPath
+    );
+
+    Result<void> CreateSparsePhysicsPacketPipeline(
+        ID3D12Device* device,
+        Graphics::ShaderCompiler& shaderCompiler,
+        const std::filesystem::path& shaderPath
+    );
+
     Result<void> CreateCommandSignature(ID3D12Device* device);
 
     // Compute pipelines
@@ -263,6 +331,8 @@ private:
     Graphics::DX12ComputePipeline m_brushRaycastPipeline;
     Graphics::DX12ComputePipeline m_sparseRaycastPipeline;
     Graphics::DX12ComputePipeline m_sparseMissFeedbackPipeline;
+    Graphics::DX12ComputePipeline m_sparseBrushFeedbackPipeline;
+    Graphics::DX12ComputePipeline m_sparsePhysicsPacketPipeline;
 
     // Command signature for indirect dispatch
     ComPtr<ID3D12CommandSignature> m_commandSignature;

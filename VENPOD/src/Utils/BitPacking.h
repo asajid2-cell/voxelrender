@@ -32,6 +32,7 @@ namespace StateFlags {
     constexpr uint8_t IsStatic   = 0x80;  // Bit 7
     constexpr uint8_t IsIgnited  = 0x40;  // Bit 6
     constexpr uint8_t HasMoved   = 0x20;  // Bit 5
+    constexpr uint8_t VisualSurface = 0x10; // Bit 4, render LOD surface marker
     constexpr uint8_t LifeMask   = 0x0F;  // Bits 0-3 (life counter)
 }
 

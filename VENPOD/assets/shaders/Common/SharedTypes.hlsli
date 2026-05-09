@@ -36,9 +36,12 @@
 #define STATE_IS_STATIC  0x80
 #define STATE_IS_IGNITED 0x40
 #define STATE_HAS_MOVED  0x20
+#define STATE_VISUAL_SURFACE 0x10
 #define STATE_LIFE_MASK  0x0F
 
-// Frame constants passed from CPU (max 64 DWORDs total for root signature)
+// Frame constants passed from CPU through a CBV. This used to be root
+// constants; keep C++'s FrameConstantsCpu mirror in Renderer.cpp synchronized
+// with this exact layout.
 struct FrameConstants {
     // Camera (20 floats = 20 DWORDs)
     float4   cameraPosition;     // xyz = position, w = fov
@@ -86,6 +89,8 @@ struct FrameConstants {
     // Sparse near-field metadata (4 DWORDs)
     // x = enabled, y = max brick pages, z = page-table capacity, w = flags
     // flags bit 0 = sparse-only, no dense fallback for missing pages
+    // flags bit 1 = surface-authoritative near field; fullscreen pass renders background only
+    // flags bit 2 = mid voxel clipmap is resident and may own background rays
     float4   sparseNearParams;
 
       // Mid-field procedural clipmap metadata (4 DWORDs)
@@ -95,6 +100,31 @@ struct FrameConstants {
       // Sparse extracted surface hierarchy metadata (4 DWORDs)
       // x = enabled, y = face count, z = live range count, w = range hash-table capacity
       float4   surfaceParams;
+
+      // Sparse near-field ownership metadata (4 DWORDs)
+      // xyz = world-space ownership center, w = ownership radius in voxels.
+      // Background/mid/far layers may not draw before the ray exits this
+      // volume when the sparse surface layer is authoritative.
+      float4   nearOwnershipParams;
+
+      // Background ownership transition metadata (4 DWORDs)
+      // x = mid clipmap start, y = far handoff distance, z = mid clipmap end,
+      // w = metadata valid flag. CPU policy owns these distances; shaders may
+      // clamp per-ray starts later but should not invent transition fractions.
+      float4   backgroundOwnershipParams;
+
+      // Mid-layer residency coverage metadata (4 DWORDs)
+      // x = height tile coverage ratio, y = voxel brick coverage ratio,
+      // z = resident height tile count, w = resident voxel brick count.
+      // This lets shader ownership decisions distinguish a deliberately empty
+      // layer from a layer that is still streaming.
+      float4   midResidencyParams;
+
+      // Far-layer ownership metadata (4 DWORDs)
+      // x = SVO ready flag, y = SVO upload coverage ratio, z = SVO page
+      // coverage ratio, w = effective far quality. Far layers may provide
+      // continuity only when this metadata says they are resident enough.
+      float4   farOwnershipParams;
   };
 
 // Chunk control structure for sparse optimization
@@ -110,6 +140,65 @@ struct BrushInput {
     float4 rayOrigin;
     float4 rayDirection;
     float4 params;       // x = radius, y = material, z = strength, w = mode
+};
+
+// Sparse local physics packet ABI. Keep this layout matched with
+// Simulation::SparsePhysicsWorkPacket on the CPU side.
+#define SPARSE_PHYSICS_MATERIAL_SAND  0x1
+#define SPARSE_PHYSICS_MATERIAL_WATER 0x2
+#define SPARSE_PHYSICS_MATERIAL_LAVA  0x4
+
+struct SparsePhysicsWorkPacket {
+    int3  brickCoord;
+    uint  packedRegionMin; // local x/y/z packed into low three bytes
+    uint  packedRegionMax; // local x/y/z packed into low three bytes
+    uint  materialMask;
+    uint  priority;        // 0 = warm, 1 = hot
+    uint  generation;
+    uint  expectedPageIndex;
+    uint  expectedPageGeneration;
+};
+
+struct SparseEditDelta {
+    int3  brickCoord;
+    uint  packedLocal;     // local x/y/z packed into low three bytes
+    uint  voxel;
+    uint  revision;
+};
+
+struct SparseEditDeltaRange {
+    int3  brickCoord;
+    uint  firstDelta;
+    uint  deltaCount;
+    uint  latestRevision;
+};
+
+struct BrickPageEntry {
+    int3  coord;
+    uint  pageIndex;
+    uint  generation;
+    uint  flags;
+    uint  occupancyWord0;
+    uint  occupancyWord1;
+};
+
+struct SparsePhysicsPacketResult {
+    int3  brickCoord;
+    uint  packetIndex;
+    int3  destinationBrickCoord;
+    uint  destinationFlags;
+    uint  generation;
+    uint  materialMask;
+    uint  checksum;
+    uint  status;          // 1 = consumed by validation shader
+    uint  expectedPageIndex;
+    uint  expectedPageGeneration;
+    uint  packedSourceLocal;
+    uint  packedDestinationLocal;
+    uint  sourceVoxel;
+    uint  destinationVoxel;
+    uint  sourceRevision;
+    uint  destinationRevision;
 };
 
 #endif // SHARED_TYPES_HLSLI

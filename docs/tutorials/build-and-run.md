@@ -48,10 +48,23 @@ cmake --build build --config Release
 ## 4. Run The Demo
 
 ```powershell
-.\run.ps1
+.\rebrun.ps1
 ```
 
-Choose `Sandbox Mode` in the launcher.
+`rebrun.ps1` rebuilds when needed and launches the current sparse
+surface-authoritative sandbox path. Choose `Sandbox Mode` in the launcher.
+
+To run the old dense renderer for comparison:
+
+```powershell
+.\rebrun.ps1 -DenseLegacy
+```
+
+To persist sparse brush edits across runs:
+
+```powershell
+.\rebrun.ps1 -SparseEditFile saves\review-edits.vsed
+```
 
 ## 5. Rebuild After Edits
 
@@ -59,7 +72,7 @@ Choose `Sandbox Mode` in the launcher.
 .\build.ps1 -Config Release
 ```
 
-For the shortest local test loop:
+For the shortest local sparse test loop:
 
 ```powershell
 .\rebrun.ps1
@@ -73,9 +86,15 @@ Useful flags:
 .\rebrun.ps1 -D3DDebug
 ```
 
+For the full sparse regression gate:
+
+```powershell
+.\sparse_regression.ps1 -Config Release
+```
+
 ## Expected Result
 
-The sandbox opens in a first-person view above generated vertical voxel
-terrain. Nearby chunks stream into a dense local render window, while the
-diagnostics overlay reports frame time, voxel capacity, chunk queues, brush
-feedback, physics, and far SVO state.
+The sandbox opens in a first-person view above generated vertical voxel terrain.
+The sparse path should show editable near terrain, stable mid/far continuity,
+and diagnostics for sparse residency, page-table publication, ownership
+counters, brush feedback, physics, and far SVO state.

@@ -1,5 +1,11 @@
 # Sparse Voxel Octree Far-Field Plan
 
+> Historical report: this page documents the earlier dense-near-field plus
+> visual-far-SVO checkpoint. For the current sparse brick/surface-authoritative
+> architecture and review gates, see
+> [Engine architecture](../explanation/architecture.md) and
+> [Sparse refactor review checklist](../reference/sparse-refactor-review.md).
+
 VENPOD currently renders an editable dense near-field voxel window. That path
 is good for painting, collision, physics, and persistence, but it scales by
 volume. Increasing dense render distance from `+/-7` to `+/-14` would require

@@ -35,8 +35,16 @@ CMakeUserPresets.json
 *.log
 *.dmp
 *.pdb
+*.vsed
+imgui.ini
+.codex-video-frames/
+.venpod_shader_cache/
+**/.venpod_shader_cache/
+venpod_far_svo_cache_*.bin
+VENPOD/venpod_far_svo_cache_*.bin
 VENPOD/venpod_capture.png
 VENPOD/build/bin/venpod_runtime.log
+VENPOD/build/logs/
 
 # Local agent/editor state
 .claude/

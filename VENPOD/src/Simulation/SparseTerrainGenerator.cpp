@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace VENPOD::Simulation {
 
@@ -77,6 +78,216 @@ float SparseTerrainGenerator::HeightAt(int32_t worldX, int32_t worldZ) const {
     return std::clamp(height, static_cast<float>(TERRAIN_MIN_Y), static_cast<float>(TERRAIN_MAX_Y));
 }
 
+SparseTerrainGenerator::ScenicSpawn SparseTerrainGenerator::FindScenicSpawn(
+    int32_t originX,
+    int32_t originZ,
+    float playerHeight,
+    int32_t searchRadius,
+    int32_t sampleSpacing) const
+{
+    constexpr float kPi = 3.14159265358979323846f;
+    constexpr int32_t kDirectionCount = 16;
+    constexpr int32_t kNearViewDistance = 128;
+    constexpr int32_t kFarViewDistance = 640;
+    constexpr int32_t kViewStep = 32;
+
+    ScenicSpawn best;
+    best.score = -std::numeric_limits<float>::infinity();
+
+    searchRadius = std::max(sampleSpacing, searchRadius);
+    sampleSpacing = std::max(16, sampleSpacing);
+    const float safeEyeOffset = playerHeight + 3.0f;
+
+    for (int32_t z = originZ - searchRadius; z <= originZ + searchRadius; z += sampleSpacing) {
+        for (int32_t x = originX - searchRadius; x <= originX + searchRadius; x += sampleSpacing) {
+            const float height = HeightAt(x, z);
+            const int32_t groundY = static_cast<int32_t>(std::floor(height));
+            if (groundY <= SEA_LEVEL_Y + 6 || groundY >= TERRAIN_MAX_Y - 16) {
+                continue;
+            }
+
+            const uint32_t groundVoxel = SampleGeneratedVoxel(x, groundY, z);
+            const uint8_t groundMaterial = Utils::UnpackMaterial(groundVoxel);
+            if (groundMaterial == Utils::Material::Air ||
+                groundMaterial == Utils::Material::Water ||
+                groundMaterial == Utils::Material::Bedrock) {
+                continue;
+            }
+
+            bool hasHeadClearance = true;
+            const int32_t clearanceTop =
+                groundY + static_cast<int32_t>(std::ceil(playerHeight + 8.0f));
+            for (int32_t y = groundY + 1; y <= clearanceTop; ++y) {
+                if (Utils::UnpackMaterial(SampleGeneratedVoxel(x, y, z)) != Utils::Material::Air) {
+                    hasHeadClearance = false;
+                    break;
+                }
+            }
+            if (!hasHeadClearance) {
+                continue;
+            }
+
+            float localMin = height;
+            float localMax = height;
+            for (int32_t oz = -32; oz <= 32; oz += 16) {
+                for (int32_t ox = -32; ox <= 32; ox += 16) {
+                    const float h = HeightAt(x + ox, z + oz);
+                    localMin = std::min(localMin, h);
+                    localMax = std::max(localMax, h);
+                }
+            }
+            const float localRelief = localMax - localMin;
+            if (localRelief > 118.0f) {
+                continue;
+            }
+            const float eyeY = static_cast<float>(groundY) + safeEyeOffset;
+
+            float bestDirectionScore = -std::numeric_limits<float>::infinity();
+            float bestYaw = 0.0f;
+            float bestForwardClearance = 0.0f;
+            for (int32_t dirIndex = 0; dirIndex < kDirectionCount; ++dirIndex) {
+                const float yaw = (static_cast<float>(dirIndex) / static_cast<float>(kDirectionCount)) * kPi * 2.0f;
+
+                bool nearBlocked = false;
+                float openScore = 0.0f;
+                float scenicScore = 0.0f;
+                float directionReliefMin = height;
+                float directionReliefMax = height;
+                float forwardClearance = 0.0f;
+
+                constexpr float kViewConeOffsets[] = {
+                    -0.70f,
+                    -0.35f,
+                    0.0f,
+                    0.35f,
+                    0.70f,
+                };
+                for (float yawOffset : kViewConeOffsets) {
+                    const float coneYaw = yaw + yawOffset;
+                    const float dirX = std::cos(coneYaw);
+                    const float dirZ = std::sin(coneYaw);
+                    for (int32_t d = kViewStep; d <= kFarViewDistance; d += kViewStep) {
+                        const int32_t sx = static_cast<int32_t>(std::round(
+                            static_cast<float>(x) + dirX * static_cast<float>(d)));
+                        const int32_t sz = static_cast<int32_t>(std::round(
+                            static_cast<float>(z) + dirZ * static_cast<float>(d)));
+                        const float sampleHeight = HeightAt(sx, sz);
+                        directionReliefMin = std::min(directionReliefMin, sampleHeight);
+                        directionReliefMax = std::max(directionReliefMax, sampleHeight);
+
+                        const float dropBelowEye = eyeY - sampleHeight;
+                        if (d <= kNearViewDistance && dropBelowEye < 14.0f) {
+                            nearBlocked = true;
+                            break;
+                        }
+                        if (yawOffset == 0.0f && d <= kNearViewDistance) {
+                            forwardClearance = static_cast<float>(d);
+                        }
+
+                        openScore += std::clamp((dropBelowEye + 24.0f) / 128.0f, 0.0f, 1.0f);
+                        const float skylineBand = 1.0f -
+                            std::clamp(std::abs(dropBelowEye - 48.0f) / 192.0f, 0.0f, 1.0f);
+                        scenicScore += skylineBand * (d > kNearViewDistance ? 1.0f : 0.25f);
+                    }
+                    if (nearBlocked) {
+                        break;
+                    }
+                }
+
+                if (nearBlocked) {
+                    continue;
+                }
+
+                const float directionRelief = directionReliefMax - directionReliefMin;
+                const float directionScore =
+                    openScore * 0.42f +
+                    scenicScore * 0.62f +
+                    std::clamp(directionRelief / 260.0f, 0.0f, 1.0f) * 8.0f;
+                if (directionScore > bestDirectionScore) {
+                    bestDirectionScore = directionScore;
+                    bestYaw = yaw;
+                    bestForwardClearance = forwardClearance;
+                }
+            }
+
+            if (!std::isfinite(bestDirectionScore)) {
+                continue;
+            }
+
+            const float distanceFromOrigin =
+                std::sqrt(static_cast<float>((x - originX) * (x - originX) + (z - originZ) * (z - originZ)));
+            const float heightScore =
+                10.0f -
+                std::clamp(std::abs(height - 150.0f) / 180.0f, 0.0f, 1.0f) * 6.0f;
+            const float reliefScore = std::clamp(localRelief / 110.0f, 0.0f, 1.0f) * 5.0f;
+            const float slopePenalty = std::max(0.0f, localRelief - 72.0f) * 0.09f;
+            const float distancePenalty = distanceFromOrigin * 0.006f;
+            const float score =
+                bestDirectionScore +
+                heightScore +
+                reliefScore -
+                slopePenalty -
+                distancePenalty;
+
+            if (score > best.score) {
+                best.found = true;
+                best.worldX = x;
+                best.worldZ = z;
+                best.groundY = groundY;
+                best.eyeY = eyeY;
+                best.yaw = bestYaw;
+                best.pitch = -0.18f;
+                best.score = score;
+                best.forwardClearance = bestForwardClearance;
+                best.localRelief = localRelief;
+            }
+        }
+    }
+
+    if (best.found) {
+        return best;
+    }
+
+    const int32_t fallbackGround = static_cast<int32_t>(std::floor(HeightAt(originX, originZ)));
+    best.found = false;
+    best.worldX = originX;
+    best.worldZ = originZ;
+    best.groundY = fallbackGround;
+    best.eyeY = static_cast<float>(fallbackGround) + safeEyeOffset;
+    best.yaw = 0.0f;
+    best.pitch = -0.22f;
+    best.score = 0.0f;
+    return best;
+}
+
+bool SparseTerrainGenerator::IsDefinitelyEmptyBrick(
+    const BrickCoord& coord,
+    float verticalSafetyMargin) const
+{
+    const int32_t minY = coord.y * SPARSE_BRICK_SIZE;
+    if (minY <= SEA_LEVEL_Y || minY <= TERRAIN_MIN_Y + 2) {
+        return false;
+    }
+
+    const int32_t minX = coord.x * SPARSE_BRICK_SIZE;
+    const int32_t minZ = coord.z * SPARSE_BRICK_SIZE;
+    const int32_t maxX = minX + SPARSE_BRICK_SIZE - 1;
+    const int32_t maxZ = minZ + SPARSE_BRICK_SIZE - 1;
+    const int32_t midX = minX + SPARSE_BRICK_SIZE / 2;
+    const int32_t midZ = minZ + SPARSE_BRICK_SIZE / 2;
+
+    float maxHeight = static_cast<float>(TERRAIN_MIN_Y);
+    const int32_t sampleX[3] = {minX, midX, maxX};
+    const int32_t sampleZ[3] = {minZ, midZ, maxZ};
+    for (int32_t z : sampleZ) {
+        for (int32_t x : sampleX) {
+            maxHeight = std::max(maxHeight, HeightAt(x, z));
+        }
+    }
+
+    return static_cast<float>(minY) > maxHeight + verticalSafetyMargin;
+}
+
 uint32_t SparseTerrainGenerator::SampleGeneratedVoxel(int32_t worldX, int32_t worldY, int32_t worldZ) const {
     const uint8_t variant = static_cast<uint8_t>(Hash3D(worldX, worldY, worldZ, m_seed) & 0xFFu);
 
@@ -101,6 +312,61 @@ uint32_t SparseTerrainGenerator::SampleGeneratedVoxel(int32_t worldX, int32_t wo
         return Utils::PackVoxel(Utils::Material::Water, variant, 0, 0);
     }
 
+    return Utils::PackVoxel(Utils::Material::Air, 0, 0, 0);
+}
+
+uint32_t SparseTerrainGenerator::SampleGeneratedSurfaceVoxel(
+    int32_t worldX,
+    int32_t worldY,
+    int32_t worldZ,
+    int32_t sampleStep) const
+{
+    const uint32_t voxel = SampleGeneratedVoxel(worldX, worldY, worldZ);
+    const uint8_t material = Utils::UnpackMaterial(voxel);
+    if (material == Utils::Material::Air) {
+        return voxel;
+    }
+
+    const int32_t step = std::max(1, sampleStep);
+    const int32_t directions[6][3] = {
+        { 1, 0, 0 },
+        { -1, 0, 0 },
+        { 0, 1, 0 },
+        { 0, -1, 0 },
+        { 0, 0, 1 },
+        { 0, 0, -1 },
+    };
+
+    // Coarse mid-field rendering needs a visual shell, not a single sampled
+    // surface layer. A one-cell shell is easy for the mid raymarcher to skip,
+    // while a dense filled volume draws large slabs. Two coarse cells gives the
+    // renderer enough thickness to hit stable visual terrain without exposing
+    // deep interiors.
+    constexpr int32_t kShellSteps = 2;
+    for (int32_t shell = 1; shell <= kShellSteps; ++shell) {
+        const int32_t distance = step * shell;
+        for (const auto& direction : directions) {
+            const uint32_t neighbor = SampleGeneratedVoxel(
+                worldX + direction[0] * distance,
+                worldY + direction[1] * distance,
+                worldZ + direction[2] * distance);
+            const uint8_t neighborMaterial = Utils::UnpackMaterial(neighbor);
+            if (neighborMaterial == Utils::Material::Air) {
+                return voxel;
+            }
+            if (material == Utils::Material::Water && neighborMaterial != Utils::Material::Water) {
+                return voxel;
+            }
+            if (material != Utils::Material::Water && neighborMaterial == Utils::Material::Water) {
+                return voxel;
+            }
+        }
+    }
+
+    // Mid/far visual clipmaps should not carry dense interior volume. Rendering
+    // those coarse filled cells produces page-like slabs once traversal becomes
+    // more exact. The authoritative generated terrain function and near sparse
+    // bricks still retain the full solid volume for collision/editing.
     return Utils::PackVoxel(Utils::Material::Air, 0, 0, 0);
 }
 

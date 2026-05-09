@@ -143,66 +143,72 @@ Result<void> VoxelWorld::Initialize(
         return Error("Failed to create material palette: {}", result.error());
     }
 
-    // Create brush raycast result buffer (16 bytes GPU + 16 bytes CPU readback)
-    result = m_brushRaycastResult.Initialize(
-        device,
-        16,  // 4 floats = 16 bytes (posX, posY, posZ, normalPacked)
-        Graphics::BufferUsage::StructuredBuffer | Graphics::BufferUsage::UnorderedAccess,
-        16,  // stride = 16 bytes (entire structure)
-        "BrushRaycastResult"
-    );
-    if (!result) {
-        return Error("Failed to create brush raycast result buffer: {}", result.error());
-    }
-
-    // Create UAV for brush raycast result
-    result = m_brushRaycastResult.CreateUAV(device, heapManager);
-    if (!result) {
-        return Error("Failed to create UAV for brush raycast result: {}", result.error());
-    }
-
-    // Initialize CPU-side result to invalid
     m_brushRaycastCPU.posX = 0.0f;
     m_brushRaycastCPU.posY = 0.0f;
     m_brushRaycastCPU.posZ = 0.0f;
     m_brushRaycastCPU.normalPacked = 0;
     m_brushRaycastCPU.hasValidPosition = false;
-
-    // Create ground raycast result buffer (16 bytes GPU + 16 bytes CPU readback)
-    result = m_groundRaycastResult.Initialize(
-        device,
-        16,  // 4 floats = 16 bytes (posX, posY, posZ, normalPacked)
-        Graphics::BufferUsage::StructuredBuffer | Graphics::BufferUsage::UnorderedAccess,
-        16,  // stride = 16 bytes (entire structure)
-        "GroundRaycastResult"
-    );
-    if (!result) {
-        return Error("Failed to create ground raycast result buffer: {}", result.error());
-    }
-
-    // Create UAV for ground raycast result
-    result = m_groundRaycastResult.CreateUAV(device, heapManager);
-    if (!result) {
-        return Error("Failed to create UAV for ground raycast result: {}", result.error());
-    }
-
-    // Initialize CPU-side ground result to invalid
     m_groundRaycastCPU.posX = 0.0f;
     m_groundRaycastCPU.posY = 40.0f;  // Default to sea level
     m_groundRaycastCPU.posZ = 0.0f;
     m_groundRaycastCPU.normalPacked = 0;
     m_groundRaycastCPU.hasValidPosition = false;
 
-    result = CreateBrushEditFeedbackBuffers(device, heapManager);
-    if (!result) {
-        return Error("Failed to create brush edit feedback buffers: {}", result.error());
+    if (m_config.enableRaycastResultBuffers) {
+        // Create brush raycast result buffer (16 bytes GPU + 16 bytes CPU readback)
+        result = m_brushRaycastResult.Initialize(
+            device,
+            16,  // 4 floats = 16 bytes (posX, posY, posZ, normalPacked)
+            Graphics::BufferUsage::StructuredBuffer | Graphics::BufferUsage::UnorderedAccess,
+            16,  // stride = 16 bytes (entire structure)
+            "BrushRaycastResult"
+        );
+        if (!result) {
+            return Error("Failed to create brush raycast result buffer: {}", result.error());
+        }
+
+        result = m_brushRaycastResult.CreateUAV(device, heapManager);
+        if (!result) {
+            return Error("Failed to create UAV for brush raycast result: {}", result.error());
+        }
+
+        // Create ground raycast result buffer (16 bytes GPU + 16 bytes CPU readback)
+        result = m_groundRaycastResult.Initialize(
+            device,
+            16,  // 4 floats = 16 bytes (posX, posY, posZ, normalPacked)
+            Graphics::BufferUsage::StructuredBuffer | Graphics::BufferUsage::UnorderedAccess,
+            16,  // stride = 16 bytes (entire structure)
+            "GroundRaycastResult"
+        );
+        if (!result) {
+            return Error("Failed to create ground raycast result buffer: {}", result.error());
+        }
+
+        result = m_groundRaycastResult.CreateUAV(device, heapManager);
+        if (!result) {
+            return Error("Failed to create UAV for ground raycast result: {}", result.error());
+        }
+    } else {
+        spdlog::info("VoxelWorld compatibility mode: raycast result GPU buffers disabled");
+    }
+
+    if (m_config.enableBrushEditFeedbackBuffers) {
+        result = CreateBrushEditFeedbackBuffers(device, heapManager);
+        if (!result) {
+            return Error("Failed to create brush edit feedback buffers: {}", result.error());
+        }
+    } else {
+        m_brushEditFeedbackAvailable = false;
+        spdlog::info("VoxelWorld compatibility mode: brush edit feedback buffers disabled");
     }
 
     uint64_t totalMemoryMB = (GetTotalVoxels() * sizeof(uint32_t) * 2) / (1024 * 1024);
     spdlog::info("VoxelWorld initialized: {}x{}x{} grid ({} MB)",
         m_config.gridSizeX, m_config.gridSizeY, m_config.gridSizeZ, totalMemoryMB);
-    spdlog::info("GPU brush raycasting enabled (16 bytes readback vs 32 MB!)");
-    spdlog::info("GPU ground detection enabled for player collision");
+    if (m_config.enableRaycastResultBuffers) {
+        spdlog::info("GPU brush raycasting enabled (16 bytes readback vs 32 MB!)");
+        spdlog::info("GPU ground detection enabled for player collision");
+    }
 
     // ===== INITIALIZE INFINITE CHUNK SYSTEM =====
     if (m_useInfiniteChunks) {
@@ -820,6 +826,7 @@ Result<void> VoxelWorld::CreateMaterialPalette(
 
 void VoxelWorld::RequestBrushRaycastReadback(ID3D12GraphicsCommandList* cmdList) {
     if (!cmdList) return;
+    if (!m_config.enableRaycastResultBuffers || !m_brushRaycastResult.GetResource()) return;
 
     ID3D12Device* device = nullptr;
     m_brushRaycastResult.GetResource()->GetDevice(IID_PPV_ARGS(&device));
@@ -899,6 +906,7 @@ void VoxelWorld::RequestBrushRaycastReadback(ID3D12GraphicsCommandList* cmdList)
 
 void VoxelWorld::RequestGroundRaycastReadback(ID3D12GraphicsCommandList* cmdList) {
     if (!cmdList) return;
+    if (!m_config.enableRaycastResultBuffers || !m_groundRaycastResult.GetResource()) return;
 
     ID3D12Device* device = nullptr;
     m_groundRaycastResult.GetResource()->GetDevice(IID_PPV_ARGS(&device));
@@ -978,6 +986,7 @@ void VoxelWorld::RequestGroundRaycastReadback(ID3D12GraphicsCommandList* cmdList
 
 void VoxelWorld::QueueBrushRaycastReadback(ID3D12GraphicsCommandList* cmdList, uint32_t slotIndex) {
     if (!cmdList) return;
+    if (!m_config.enableRaycastResultBuffers || !m_brushRaycastResult.GetResource()) return;
     slotIndex %= RAYCAST_READBACK_SLOTS;
 
     ID3D12Device* device = nullptr;
@@ -1035,6 +1044,9 @@ void VoxelWorld::QueueBrushRaycastReadback(ID3D12GraphicsCommandList* cmdList, u
 
 bool VoxelWorld::RetireBrushRaycastReadback(uint32_t slotIndex) {
     slotIndex %= RAYCAST_READBACK_SLOTS;
+    if (!m_config.enableRaycastResultBuffers) {
+        return false;
+    }
     if (!m_brushRaycastReadbackReady[slotIndex] || !m_brushRaycastReadbackSlots[slotIndex]) {
         return false;
     }
@@ -1061,6 +1073,7 @@ bool VoxelWorld::RetireBrushRaycastReadback(uint32_t slotIndex) {
 
 void VoxelWorld::QueueGroundRaycastReadback(ID3D12GraphicsCommandList* cmdList, uint32_t slotIndex) {
     if (!cmdList) return;
+    if (!m_config.enableRaycastResultBuffers || !m_groundRaycastResult.GetResource()) return;
     slotIndex %= RAYCAST_READBACK_SLOTS;
 
     ID3D12Device* device = nullptr;
@@ -1118,6 +1131,9 @@ void VoxelWorld::QueueGroundRaycastReadback(ID3D12GraphicsCommandList* cmdList, 
 
 bool VoxelWorld::RetireGroundRaycastReadback(uint32_t slotIndex) {
     slotIndex %= RAYCAST_READBACK_SLOTS;
+    if (!m_config.enableRaycastResultBuffers) {
+        return false;
+    }
     if (!m_groundRaycastReadbackReady[slotIndex] || !m_groundRaycastReadbackSlots[slotIndex]) {
         return false;
     }

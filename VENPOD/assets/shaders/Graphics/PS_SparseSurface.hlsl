@@ -1,7 +1,15 @@
 #include "../Common/SharedTypes.hlsli"
 
+cbuffer FrameConstantsCB : register(b0) {
+    FrameConstants frame;
+}
+
 Texture1D<float4> MaterialPalette : register(t1);
 SamplerState PaletteSampler : register(s0);
+RWStructuredBuffer<uint> RenderOwnershipStats : register(u0);
+
+static const uint RENDER_OWNER_SURFACE = 9u;
+static const uint RENDER_OWNER_FRAME = 8u;
 
 struct PSInput {
     float4 position : SV_Position;
@@ -11,6 +19,11 @@ struct PSInput {
 };
 
 float4 main(PSInput input) : SV_Target {
+    if (frame.farFieldGridParams.w > 0.5f) {
+        InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_SURFACE], 1u);
+        RenderOwnershipStats[RENDER_OWNER_FRAME] = frame.frameIndex;
+    }
+
     const float u = ((float)input.material + 0.5f) / 256.0f;
     float3 baseColor = MaterialPalette.SampleLevel(PaletteSampler, u, 0).rgb;
 

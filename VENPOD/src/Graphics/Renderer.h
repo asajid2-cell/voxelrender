@@ -68,9 +68,16 @@ public:
         uint32_t raymarchMaxSteps = 2048;
         float farFieldQuality = 1.0f;
         float renderQuality = 1.0f;
+        uint32_t frameIndex = 0;
+        bool renderOwnershipStatsEnabled = false;
         float midFieldStartDistance = 480.0f;
         float midFieldEndDistance = 4200.0f;
         float midFieldCellSize = 16.0f;
+        float midFieldFarHandoffDistance = 2786.4f;
+        float midFieldHeightCoverage = 0.0f;
+        float midFieldVoxelCoverage = 0.0f;
+        uint32_t midFieldResidentHeightTiles = 0;
+        uint32_t midFieldResidentVoxelBricks = 0;
         uint32_t debugMode = 0;
     };
 
@@ -98,6 +105,9 @@ public:
         int32_t pageRadius = 0;
         float pageSize = 0.0f;
         float rootMinY = 0.0f;
+        float uploadCoverageRatio = 0.0f;
+        float pageCoverageRatio = 0.0f;
+        bool ready = false;
         bool enabled = false;
     };
 
@@ -114,6 +124,7 @@ public:
         DescriptorHandle midVoxelClipmapSamplesSRV;
         DescriptorHandle surfaceFacesSRV;
         DescriptorHandle surfaceRangesSRV;
+        DescriptorHandle renderOwnershipUAV;
         uint32_t maxBrickPages = 0;
         uint32_t pageTableCapacity = 0;
         uint32_t midClipmapTileCount = 0;
@@ -124,8 +135,14 @@ public:
         uint32_t surfaceRangeTableCapacity = 0;
         uint32_t surfaceSerial = 0;
         uint32_t bindingMask = 0x3FFu;
+        float ownershipCenterX = 0.0f;
+        float ownershipCenterY = 0.0f;
+        float ownershipCenterZ = 0.0f;
+        float ownershipRadius = 0.0f;
         bool enabled = false;
         bool sparseOnly = false;
+        bool surfaceAuthoritative = false;
+        bool surfaceRaymarchFill = true;
         bool midClipmapEnabled = false;
         bool surfaceEnabled = false;
     };
@@ -154,7 +171,24 @@ public:
         const DescriptorHandle& surfaceFacesSRV,
         const DescriptorHandle& materialPaletteSRV,
         uint32_t surfaceFaceCount,
-        const CameraParams& camera
+        const CameraParams& camera,
+        ID3D12Resource* indirectDrawArgs = nullptr,
+        uint32_t indirectDrawCommandCount = 0,
+        ID3D12Resource* indirectDrawCount = nullptr,
+        const D3D12_VERTEX_BUFFER_VIEW* surfaceVertexIdView = nullptr,
+        const D3D12_INDEX_BUFFER_VIEW* surfaceIndexView = nullptr,
+        uint32_t surfaceVertexIdCapacityFaces = 0,
+        const DescriptorHandle* surfaceRecordsSRV = nullptr,
+        const DescriptorHandle* surfaceClustersSRV = nullptr,
+        const DescriptorHandle* renderOwnershipUAV = nullptr
+    );
+
+    void RenderOverlays(
+        ID3D12GraphicsCommandList* cmdList,
+        const DescriptorHandle& materialPaletteSRV,
+        const CameraParams& camera,
+        const BrushPreview* brushPreview = nullptr,
+        const CharacterPreview* characterPreview = nullptr
     );
 
     // Render crosshair at screen center
@@ -173,6 +207,8 @@ public:
 private:
     Result<void> CreateFullscreenPipeline(ID3D12Device* device);
     Result<void> CreateSparseSurfacePipeline(ID3D12Device* device);
+    Result<void> CreateOverlayPipeline(ID3D12Device* device);
+    Result<void> CreateSparseSurfaceDrawCommandSignature(ID3D12Device* device);
     Result<void> CreateRTVsForSwapchain();
     Result<void> CreateDepthBuffer();
 
@@ -188,14 +224,19 @@ private:
     // Fullscreen rendering pipeline
     DX12GraphicsPipeline m_fullscreenPipeline;
     DX12GraphicsPipeline m_sparseSurfacePipeline;
+    DX12GraphicsPipeline m_overlayPipeline;
+    ComPtr<ID3D12CommandSignature> m_sparseSurfaceDrawSignature;
     CompiledShader m_fullscreenVS;
     CompiledShader m_fullscreenPS;
     CompiledShader m_sparseSurfaceVS;
     CompiledShader m_sparseSurfacePS;
+    CompiledShader m_overlayPS;
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_frameConstantUploads;
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_sparseSurfaceConstantUploads;
+    std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_overlayConstantUploads;
+    GPUBuffer m_dummyRenderOwnershipUAV;
     uint32_t m_currentFrameIndex = 0;
-    static constexpr uint64_t kFrameConstantUploadBytes = 320;
+    static constexpr uint64_t kFrameConstantUploadBytes = 512;
 
     // RTV handles for swapchain buffers
     DescriptorHandle m_rtvHandles[VENPOD::Window::BUFFER_COUNT];

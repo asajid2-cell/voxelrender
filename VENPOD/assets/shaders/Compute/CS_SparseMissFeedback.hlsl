@@ -38,6 +38,8 @@ RWStructuredBuffer<uint4> MissingBrickFeedback : register(u0);
 
 static const uint SPARSE_INVALID_PAGE = 0xFFFFFFFFu;
 static const uint SPARSE_TOMBSTONE_PAGE = 0xFFFFFFFEu;
+static const float SPARSE_BRICK_SIZE_F = 16.0f;
+static const float SPARSE_RAY_EPSILON = 0.0001f;
 
 int FloorDiv16(int value) {
     return value >= 0 ? value / 16 : -(((-value) + 15) / 16);
@@ -89,6 +91,36 @@ void RecordMissingBrick(int3 brickCoord, uint sampleIndex) {
         sampleIndex);
 }
 
+struct BrickDdaAxis {
+    int step;
+    float nextT;
+    float deltaT;
+};
+
+BrickDdaAxis BuildBrickDdaAxis(float origin, float direction, int brickCoord) {
+    BrickDdaAxis axis;
+    axis.step = 0;
+    axis.nextT = 1e30f;
+    axis.deltaT = 1e30f;
+
+    if (abs(direction) < 1e-6f) {
+        return axis;
+    }
+
+    if (direction > 0.0f) {
+        axis.step = 1;
+        float boundary = (float)(brickCoord + 1) * SPARSE_BRICK_SIZE_F;
+        axis.nextT = max((boundary - origin) / direction, 0.0f);
+        axis.deltaT = SPARSE_BRICK_SIZE_F / direction;
+    } else {
+        axis.step = -1;
+        float boundary = (float)brickCoord * SPARSE_BRICK_SIZE_F;
+        axis.nextT = max((boundary - origin) / direction, 0.0f);
+        axis.deltaT = -SPARSE_BRICK_SIZE_F / direction;
+    }
+    return axis;
+}
+
 [numthreads(8, 8, 1)]
 void main(uint3 dispatchThreadId : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex) {
     if (groupIndex == 0u) {
@@ -109,27 +141,46 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID, uint groupIndex : SV_Gro
         cameraRight * ndcX * tanHalfFov * aspectRatio +
         cameraUp * ndcY * tanHalfFov);
 
-    uint steps = min(maxSteps, 4096u);
+    int3 worldVoxel = int3(
+        (int)floor(cameraOrigin.x),
+        (int)floor(cameraOrigin.y),
+        (int)floor(cameraOrigin.z));
+    int3 brickCoord = int3(
+        FloorDiv16(worldVoxel.x),
+        FloorDiv16(worldVoxel.y),
+        FloorDiv16(worldVoxel.z));
+
+    BrickDdaAxis axisX = BuildBrickDdaAxis(cameraOrigin.x, rayDir.x, brickCoord.x);
+    BrickDdaAxis axisY = BuildBrickDdaAxis(cameraOrigin.y, rayDir.y, brickCoord.y);
+    BrickDdaAxis axisZ = BuildBrickDdaAxis(cameraOrigin.z, rayDir.z, brickCoord.z);
+
+    uint steps = min(max(maxSteps, (uint)ceil(maxDistance / SPARSE_BRICK_SIZE_F) * 4u + 8u), 4096u);
+    float distance = 0.0f;
     [loop]
-    for (uint step = 0u; step <= steps; ++step) {
-        float distance = (float)step * stepDistance;
-        if (distance > maxDistance) {
-            break;
-        }
-
-        float3 sampleWorld = cameraOrigin + rayDir * distance;
-        int3 worldVoxel = int3(
-            (int)floor(sampleWorld.x),
-            (int)floor(sampleWorld.y),
-            (int)floor(sampleWorld.z));
-        int3 brickCoord = int3(
-            FloorDiv16(worldVoxel.x),
-            FloorDiv16(worldVoxel.y),
-            FloorDiv16(worldVoxel.z));
-
+    for (uint step = 0u; step <= steps && distance <= maxDistance; ++step) {
         if (!HasSparseBrickPage(brickCoord)) {
             RecordMissingBrick(brickCoord, step);
             break;
         }
+
+        float nextDistance = min(axisX.nextT, min(axisY.nextT, axisZ.nextT));
+        if (!isfinite(nextDistance) || nextDistance > maxDistance) {
+            break;
+        }
+
+        const float tieEpsilon = 0.0005f;
+        if (axisX.nextT <= nextDistance + tieEpsilon) {
+            brickCoord.x += axisX.step;
+            axisX.nextT += axisX.deltaT;
+        }
+        if (axisY.nextT <= nextDistance + tieEpsilon) {
+            brickCoord.y += axisY.step;
+            axisY.nextT += axisY.deltaT;
+        }
+        if (axisZ.nextT <= nextDistance + tieEpsilon) {
+            brickCoord.z += axisZ.step;
+            axisZ.nextT += axisZ.deltaT;
+        }
+        distance = max(nextDistance + SPARSE_RAY_EPSILON, distance + SPARSE_RAY_EPSILON);
     }
 }

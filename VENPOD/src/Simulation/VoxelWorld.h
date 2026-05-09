@@ -28,6 +28,8 @@ struct VoxelWorldConfig {
     uint32_t gridSizeY = 256;
     uint32_t gridSizeZ = 256;
     float voxelScale = 1.0f;       // World units per voxel
+    bool enableRaycastResultBuffers = true;
+    bool enableBrushEditFeedbackBuffers = true;
 };
 
 // Material properties for simulation

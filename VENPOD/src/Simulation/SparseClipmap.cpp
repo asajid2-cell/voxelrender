@@ -40,6 +40,88 @@ uint32_t HashVoxelClipmapCoord(const SparseVoxelClipmapCoord& coord) {
     return hash;
 }
 
+struct GridDdaAxis {
+    int32_t step = 0;
+    float nextT = std::numeric_limits<float>::infinity();
+    float deltaT = std::numeric_limits<float>::infinity();
+};
+
+GridDdaAxis BuildGridDdaAxis(float origin, float direction, float cellSize, int32_t cellCoord) {
+    GridDdaAxis axis;
+    if (std::abs(direction) <= 0.00001f) {
+        return axis;
+    }
+    axis.step = direction > 0.0f ? 1 : -1;
+    const float boundary = axis.step > 0
+        ? static_cast<float>(cellCoord + 1) * cellSize
+        : static_cast<float>(cellCoord) * cellSize;
+    axis.nextT = (boundary - origin) / direction;
+    if (!std::isfinite(axis.nextT) || axis.nextT < 0.0f) {
+        axis.nextT = 0.0f;
+    }
+    axis.deltaT = cellSize / std::abs(direction);
+    return axis;
+}
+
+std::vector<SparseClipmapTileCoord> BuildTileLine2D(
+    int32_t ring,
+    float startX,
+    float startZ,
+    float endX,
+    float endZ,
+    float cellSize,
+    uint32_t maxCoords)
+{
+    std::vector<SparseClipmapTileCoord> coords;
+    if (maxCoords == 0 || cellSize <= 0.0f) {
+        return coords;
+    }
+
+    const float dx = endX - startX;
+    const float dz = endZ - startZ;
+    const float length = std::sqrt(dx * dx + dz * dz);
+    int32_t x = static_cast<int32_t>(std::floor(startX / cellSize));
+    int32_t z = static_cast<int32_t>(std::floor(startZ / cellSize));
+    coords.push_back({ring, x, z});
+    if (!std::isfinite(length) || length <= 0.0001f || maxCoords == 1u) {
+        return coords;
+    }
+
+    const float invLength = 1.0f / length;
+    const float dirX = dx * invLength;
+    const float dirZ = dz * invLength;
+    GridDdaAxis axisX = BuildGridDdaAxis(startX, dirX, cellSize, x);
+    GridDdaAxis axisZ = BuildGridDdaAxis(startZ, dirZ, cellSize, z);
+    float distance = 0.0f;
+    const uint32_t maxDdaSteps = std::clamp<uint32_t>(
+        static_cast<uint32_t>(std::ceil(length / cellSize)) * 4u + 8u,
+        1u,
+        std::max<uint32_t>(maxCoords * 4u, 8u));
+    for (uint32_t stepIndex = 0;
+         distance <= length && stepIndex < maxDdaSteps && coords.size() < maxCoords;
+         ++stepIndex) {
+        const float nextDistance = std::min(axisX.nextT, axisZ.nextT);
+        if (!std::isfinite(nextDistance) || nextDistance > length) {
+            break;
+        }
+        const float tieEpsilon = 0.0005f;
+        if (axisX.nextT <= nextDistance + tieEpsilon) {
+            x += axisX.step;
+            axisX.nextT += axisX.deltaT;
+        }
+        if (axisZ.nextT <= nextDistance + tieEpsilon) {
+            z += axisZ.step;
+            axisZ.nextT += axisZ.deltaT;
+        }
+        distance = std::max(nextDistance + 0.0001f, distance + 0.0001f);
+        const SparseClipmapTileCoord coord{ring, x, z};
+        if (coords.empty() || !(coords.back() == coord)) {
+            coords.push_back(coord);
+        }
+    }
+    return coords;
+}
+
 }
 
 SparseClipmapPolicy::SparseClipmapPolicy(const SparseClipmapConfig& config)
@@ -56,6 +138,12 @@ SparseClipmapPolicy::SparseClipmapPolicy(const SparseClipmapConfig& config)
     m_config.voxelBrickRadiusXz = std::clamp<uint32_t>(m_config.voxelBrickRadiusXz, 1u, 8u);
     m_config.voxelBrickRadiusY = std::clamp<uint32_t>(m_config.voxelBrickRadiusY, 0u, 4u);
     m_config.maxVoxelBricks = std::max(m_config.maxVoxelBricks, m_config.ringCount);
+    m_config.voxelInterestCapacityPercent = std::clamp<uint32_t>(
+        m_config.voxelInterestCapacityPercent,
+        25u,
+        100u);
+    m_config.motionLookaheadMinSpeed = std::max(0.0f, m_config.motionLookaheadMinSpeed);
+    m_config.motionLookaheadSteps = std::clamp<uint32_t>(m_config.motionLookaheadSteps, 1u, 8u);
 }
 
 bool SparseClipmapPolicy::IsEnabled() const {
@@ -67,6 +155,43 @@ float SparseClipmapPolicy::TransitionStartAfterNearExit(float nearExitDistance) 
         return m_config.endDistance;
     }
     return std::max(m_config.startDistance, nearExitDistance + m_config.nearExitPadding);
+}
+
+float SparseClipmapPolicy::BackgroundStartAfterNearVolumeExit(float nearVolumeExitDistance) const {
+    if (!IsEnabled()) {
+        return std::max(0.0f, nearVolumeExitDistance);
+    }
+    return std::max(m_config.startDistance, nearVolumeExitDistance + m_config.nearExitPadding);
+}
+
+float SparseClipmapPolicy::FarLayerStartAfterBackground(float backgroundStartDistance) const {
+    if (!IsEnabled()) {
+        return std::max(0.0f, backgroundStartDistance);
+    }
+
+    const float span = m_config.endDistance - m_config.startDistance;
+    const float handoffDistance = m_config.startDistance + span * 0.62f;
+    // Far layers are continuity behind the mid hierarchy, not a replacement
+    // for missing mid/near data. Clamp inside the clipmap range so unusually
+    // large near volumes can still push the handoff later.
+    return std::max(backgroundStartDistance, std::min(m_config.endDistance, handoffDistance));
+}
+
+float SparseClipmapPolicy::MissingNearPageBackgroundStart(
+    float firstMissingDistance,
+    float nearVolumeExitDistance,
+    float missingPagePadding) const
+{
+    const float paddedMissingDistance =
+        std::max(0.0f, firstMissingDistance) + std::max(0.0f, missingPagePadding);
+    return std::max(paddedMissingDistance, BackgroundStartAfterNearVolumeExit(nearVolumeExitDistance));
+}
+
+bool SparseClipmapPolicy::AllowsBackgroundForMissingNearPage(
+    float firstMissingDistance,
+    float nearVolumeExitDistance) const
+{
+    return firstMissingDistance >= MissingNearPageBackgroundStart(firstMissingDistance, nearVolumeExitDistance, 0.0f);
 }
 
 bool SparseClipmapPolicy::OwnsRaySegment(
@@ -115,8 +240,55 @@ std::vector<SparseClipmapRing> SparseClipmapPolicy::BuildRings() const {
     return rings;
 }
 
+SparseClipmapTransitionMetadata SparseClipmapPolicy::BuildTransitionMetadata() const {
+    SparseClipmapTransitionMetadata metadata;
+    metadata.startDistance = m_config.startDistance;
+    metadata.endDistance = m_config.endDistance;
+    metadata.minCellSize = m_config.minCellSize;
+    metadata.enabled = IsEnabled();
+    metadata.farHandoffDistance = metadata.enabled
+        ? FarLayerStartAfterBackground(m_config.startDistance)
+        : std::max(0.0f, m_config.startDistance);
+    return metadata;
+}
+
+SparseClipmapTransitionMetadata SparseClipmapPolicy::BuildTransitionMetadataAfterNearExit(
+    float nearVolumeExitDistance) const
+{
+    SparseClipmapTransitionMetadata metadata;
+    metadata.startDistance = BackgroundStartAfterNearVolumeExit(nearVolumeExitDistance);
+    metadata.endDistance = m_config.endDistance;
+    metadata.minCellSize = m_config.minCellSize;
+    metadata.enabled = IsEnabled();
+    metadata.farHandoffDistance = metadata.enabled
+        ? FarLayerStartAfterBackground(metadata.startDistance)
+        : std::max(0.0f, metadata.startDistance);
+    return metadata;
+}
+
 size_t SparseClipmapTileCoordHash::operator()(const SparseClipmapTileCoord& coord) const noexcept {
     return static_cast<size_t>(HashClipmapTileCoord(coord));
+}
+
+SparseClipmapResidencyMetadata BuildClipmapResidencyMetadata(const SparseClipmapCacheStats& stats) {
+    SparseClipmapResidencyMetadata metadata;
+    const uint32_t heightCovered =
+        stats.interestedTiles > stats.missingInterestedTiles
+            ? stats.interestedTiles - stats.missingInterestedTiles
+            : 0u;
+    const uint32_t voxelCovered =
+        stats.interestedVoxelBricks > stats.missingInterestedVoxelBricks
+            ? stats.interestedVoxelBricks - stats.missingInterestedVoxelBricks
+            : 0u;
+    metadata.heightCoverageRatio = stats.interestedTiles > 0
+        ? std::clamp(static_cast<float>(heightCovered) / static_cast<float>(stats.interestedTiles), 0.0f, 1.0f)
+        : 0.0f;
+    metadata.voxelCoverageRatio = stats.interestedVoxelBricks > 0
+        ? std::clamp(static_cast<float>(voxelCovered) / static_cast<float>(stats.interestedVoxelBricks), 0.0f, 1.0f)
+        : 0.0f;
+    metadata.residentHeightTiles = stats.residentTiles;
+    metadata.residentVoxelBricks = stats.residentVoxelBricks;
+    return metadata;
 }
 
 size_t SparseVoxelClipmapCoordHash::operator()(const SparseVoxelClipmapCoord& coord) const noexcept {
@@ -143,6 +315,8 @@ bool SparseClipmapTileCache::Initialize(const SparseClipmapConfig& config) {
     m_dirtySerial = 1;
     m_heightDirtySerial = 1;
     m_voxelDirtySerial = 1;
+    m_dirtyHeightStartSlot = UINT32_MAX;
+    m_dirtyHeightEndSlot = 0;
     m_dirtyVoxelStartSlot = UINT32_MAX;
     m_dirtyVoxelEndSlot = 0;
 
@@ -166,12 +340,21 @@ void SparseClipmapTileCache::UpdateInterest(
     float cameraY,
     float cameraZ,
     uint32_t frameIndex,
-    const SparseClipmapPolicy& policy)
+    const SparseClipmapPolicy& policy,
+    float forwardX,
+    float forwardY,
+    float forwardZ,
+    float velocityX,
+    float velocityY,
+    float velocityZ,
+    float predictionSeconds)
 {
     if (!policy.IsEnabled() || m_tiles.empty()) {
         m_interestSet.clear();
         m_voxelInterestSet.clear();
         RefreshStats();
+        m_stats.heightInterestAnchors = 0;
+        m_stats.voxelInterestAnchors = 0;
         return;
     }
 
@@ -179,34 +362,142 @@ void SparseClipmapTileCache::UpdateInterest(
     const auto rings = policy.BuildRings();
     const int32_t radius = static_cast<int32_t>(policy.Config().tileRadius);
     const float tileCells = static_cast<float>(policy.Config().tileSampleSide - 1u);
+
+    struct InterestAnchor {
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        int32_t radiusBias = 0;
+    };
+    const float forwardLenXz = std::sqrt(forwardX * forwardX + forwardZ * forwardZ);
+    const float invForwardLenXz = forwardLenXz > 0.001f ? 1.0f / forwardLenXz : 0.0f;
+    const float forwardNormX = forwardX * invForwardLenXz;
+    const float forwardNormZ = forwardZ * invForwardLenXz;
+    const float predictedX = cameraX + velocityX * std::max(0.0f, predictionSeconds);
+    const float predictedY = cameraY + velocityY * std::max(0.0f, predictionSeconds);
+    const float predictedZ = cameraZ + velocityZ * std::max(0.0f, predictionSeconds);
+    const float velocityLenXz = std::sqrt(velocityX * velocityX + velocityZ * velocityZ);
+    const bool useMotionLookahead =
+        predictionSeconds > 0.0f &&
+        velocityLenXz >= policy.Config().motionLookaheadMinSpeed;
+    uint32_t heightAnchorCount = 0;
     for (uint32_t ring = 0; ring < rings.size(); ++ring) {
         const float tileWorldSize = std::max(1.0f, rings[ring].cellSize * tileCells);
-        const int32_t centerX = static_cast<int32_t>(std::floor(cameraX / tileWorldSize));
-        const int32_t centerZ = static_cast<int32_t>(std::floor(cameraZ / tileWorldSize));
-        for (int32_t dz = -radius; dz <= radius; ++dz) {
-            for (int32_t dx = -radius; dx <= radius; ++dx) {
-                const SparseClipmapTileCoord coord{
-                    static_cast<int32_t>(ring),
-                    centerX + dx,
-                    centerZ + dz
-                };
-                m_interestSet.insert(coord);
+        std::vector<InterestAnchor> anchors;
+        anchors.reserve(3u + policy.Config().motionLookaheadSteps);
+        anchors.push_back({cameraX, cameraY, cameraZ, 0});
+        if (useMotionLookahead) {
+            const uint32_t steps = std::max(1u, policy.Config().motionLookaheadSteps);
+            for (uint32_t step = 1u; step <= steps; ++step) {
+                const float t = static_cast<float>(step) / static_cast<float>(steps);
+                anchors.push_back({
+                    cameraX + (predictedX - cameraX) * t,
+                    cameraY + (predictedY - cameraY) * t,
+                    cameraZ + (predictedZ - cameraZ) * t,
+                    -radius
+                });
+            }
+        }
+        anchors.push_back(
+            {
+                cameraX + forwardNormX * tileWorldSize * std::max(1.0f, static_cast<float>(radius)),
+                cameraY + forwardY * tileWorldSize * 0.25f,
+                cameraZ + forwardNormZ * tileWorldSize * std::max(1.0f, static_cast<float>(radius)),
+                -std::max(1, radius / 2)
+            });
+        anchors.push_back({predictedX, predictedY, predictedZ, -std::max(1, radius / 2)});
 
-                auto existing = m_slotByCoord.find(coord);
-                if (existing != m_slotByCoord.end()) {
-                    m_tiles[existing->second].record.lastTouchedFrame = frameIndex;
-                    continue;
-                }
+        const auto queueHeightCoord = [&](const SparseClipmapTileCoord& coord) {
+            m_interestSet.insert(coord);
 
-                if (m_queuedSet.insert(coord).second) {
-                    m_generationQueue.push_back(coord);
+            auto existing = m_slotByCoord.find(coord);
+            if (existing != m_slotByCoord.end()) {
+                m_tiles[existing->second].record.lastTouchedFrame = frameIndex;
+                return;
+            }
+
+            if (m_queuedSet.insert(coord).second) {
+                m_generationQueue.push_back(coord);
+            }
+        };
+
+        // Queue current/motion/forward centerline tiles before wider shells.
+        // With small per-frame clipmap budgets this gives the streamer a
+        // continuous visual breadcrumb path instead of spending the whole
+        // budget on the local shell and only discovering the far predicted
+        // tile later.
+        for (const InterestAnchor& anchor : anchors) {
+            const int32_t centerX = static_cast<int32_t>(std::floor(anchor.x / tileWorldSize));
+            const int32_t centerZ = static_cast<int32_t>(std::floor(anchor.z / tileWorldSize));
+            queueHeightCoord(SparseClipmapTileCoord{
+                static_cast<int32_t>(ring),
+                centerX,
+                centerZ
+            });
+        }
+        const uint32_t maxLineCoords = std::max<uint32_t>(
+            2u,
+            policy.Config().motionLookaheadSteps * 3u + 4u);
+        if (useMotionLookahead) {
+            for (const SparseClipmapTileCoord& coord : BuildTileLine2D(
+                     static_cast<int32_t>(ring),
+                     cameraX,
+                     cameraZ,
+                     predictedX,
+                     predictedZ,
+                     tileWorldSize,
+                     maxLineCoords)) {
+                queueHeightCoord(coord);
+            }
+        }
+        const float forwardAnchorX =
+            cameraX + forwardNormX * tileWorldSize * std::max(1.0f, static_cast<float>(radius));
+        const float forwardAnchorZ =
+            cameraZ + forwardNormZ * tileWorldSize * std::max(1.0f, static_cast<float>(radius));
+        for (const SparseClipmapTileCoord& coord : BuildTileLine2D(
+                 static_cast<int32_t>(ring),
+                 cameraX,
+                 cameraZ,
+                 forwardAnchorX,
+                 forwardAnchorZ,
+                 tileWorldSize,
+                 maxLineCoords)) {
+            queueHeightCoord(coord);
+        }
+
+        const std::vector<InterestAnchor> shellAnchors = anchors;
+        for (const InterestAnchor& anchor : shellAnchors) {
+            const int32_t anchorRadius = std::max(1, radius + anchor.radiusBias);
+            const int32_t centerX = static_cast<int32_t>(std::floor(anchor.x / tileWorldSize));
+            const int32_t centerZ = static_cast<int32_t>(std::floor(anchor.z / tileWorldSize));
+            ++heightAnchorCount;
+            for (int32_t dz = -anchorRadius; dz <= anchorRadius; ++dz) {
+                for (int32_t dx = -anchorRadius; dx <= anchorRadius; ++dx) {
+                    queueHeightCoord(SparseClipmapTileCoord{
+                        static_cast<int32_t>(ring),
+                        centerX + dx,
+                        centerZ + dz
+                    });
                 }
             }
         }
     }
 
     RefreshStats();
-    UpdateVoxelInterest(cameraX, cameraY, cameraZ, frameIndex, policy);
+    m_stats.heightInterestAnchors = heightAnchorCount;
+    UpdateVoxelInterest(
+        cameraX,
+        cameraY,
+        cameraZ,
+        frameIndex,
+        policy,
+        forwardX,
+        forwardY,
+        forwardZ,
+        velocityX,
+        velocityY,
+        velocityZ,
+        predictionSeconds);
 }
 
 uint32_t SparseClipmapTileCache::AllocateSlot(
@@ -246,6 +537,7 @@ uint32_t SparseClipmapTileCache::AllocateSlot(
     m_tiles[bestSlot].record.lastTouchedFrame = frameIndex;
     ++m_dirtySerial;
     ++m_heightDirtySerial;
+    MarkHeightSlotDirty(bestSlot);
     return bestSlot;
 }
 
@@ -288,6 +580,7 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
         ++generated;
         ++m_dirtySerial;
         ++m_heightDirtySerial;
+        MarkHeightSlotDirty(slot);
     }
 
     uint32_t generatedVoxel = 0;
@@ -362,11 +655,19 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
     float cameraY,
     float cameraZ,
     uint32_t frameIndex,
-    const SparseClipmapPolicy& policy)
+    const SparseClipmapPolicy& policy,
+    float forwardX,
+    float forwardY,
+    float forwardZ,
+    float velocityX,
+    float velocityY,
+    float velocityZ,
+    float predictionSeconds)
 {
     if (!policy.IsEnabled() || !policy.Config().voxelClipmapEnabled || m_voxelBricks.empty()) {
         m_voxelInterestSet.clear();
         RefreshStats();
+        m_stats.voxelInterestAnchors = 0;
         return;
     }
 
@@ -375,7 +676,11 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
     const int32_t radiusXz = static_cast<int32_t>(policy.Config().voxelBrickRadiusXz);
     const int32_t radiusY = static_cast<int32_t>(policy.Config().voxelBrickRadiusY);
     const uint32_t ringCount = std::max(1u, static_cast<uint32_t>(rings.size()));
-    const uint32_t maxResidentInterest = static_cast<uint32_t>(m_voxelBricks.size());
+    const uint32_t maxResidentInterest = std::max<uint32_t>(
+        ringCount,
+        static_cast<uint32_t>(
+            (static_cast<uint64_t>(m_voxelBricks.size()) *
+             static_cast<uint64_t>(policy.Config().voxelInterestCapacityPercent)) / 100u));
     const uint32_t baseQuotaPerRing = std::max(1u, maxResidentInterest / ringCount);
     uint32_t quotaRemainder = maxResidentInterest - baseQuotaPerRing * ringCount;
 
@@ -386,30 +691,200 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
         int32_t dz = 0;
         uint32_t distanceScore = 0;
     };
+    struct VoxelInterestAnchor {
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        uint32_t baseScore = 0;
+        int32_t radiusBias = 0;
+    };
+
+    const float forwardLen = std::sqrt(forwardX * forwardX + forwardY * forwardY + forwardZ * forwardZ);
+    const float invForwardLen = forwardLen > 0.001f ? 1.0f / forwardLen : 0.0f;
+    const float forwardNormX = forwardX * invForwardLen;
+    const float forwardNormY = forwardY * invForwardLen;
+    const float forwardNormZ = forwardZ * invForwardLen;
+    const float predictedX = cameraX + velocityX * std::max(0.0f, predictionSeconds);
+    const float predictedY = cameraY + velocityY * std::max(0.0f, predictionSeconds);
+    const float predictedZ = cameraZ + velocityZ * std::max(0.0f, predictionSeconds);
+    const float velocityLen = std::sqrt(velocityX * velocityX + velocityY * velocityY + velocityZ * velocityZ);
+    const bool useMotionLookahead =
+        predictionSeconds > 0.0f &&
+        velocityLen >= policy.Config().motionLookaheadMinSpeed;
+    uint32_t voxelAnchorCount = 0;
 
     for (uint32_t ring = 0; ring < rings.size(); ++ring) {
         const float brickWorldSize = std::max(1.0f, rings[ring].cellSize * static_cast<float>(SPARSE_BRICK_SIZE));
-        const int32_t centerX = static_cast<int32_t>(std::floor(cameraX / brickWorldSize));
-        const int32_t centerY = static_cast<int32_t>(std::floor(cameraY / brickWorldSize));
-        const int32_t centerZ = static_cast<int32_t>(std::floor(cameraZ / brickWorldSize));
+        std::vector<VoxelInterestAnchor> anchors;
+        anchors.reserve(3u + policy.Config().motionLookaheadSteps);
+        anchors.push_back({cameraX, cameraY, cameraZ, 0u, 0});
+        if (useMotionLookahead) {
+            const uint32_t steps = std::max(1u, policy.Config().motionLookaheadSteps);
+            for (uint32_t step = 1u; step <= steps; ++step) {
+                const float t = static_cast<float>(step) / static_cast<float>(steps);
+                anchors.push_back({
+                    cameraX + (predictedX - cameraX) * t,
+                    cameraY + (predictedY - cameraY) * t,
+                    cameraZ + (predictedZ - cameraZ) * t,
+                    120u + step * 25u,
+                    -radiusXz
+                });
+            }
+        }
+        anchors.push_back(
+            {
+                cameraX + forwardNormX * brickWorldSize * static_cast<float>(std::max<int32_t>(2, radiusXz)),
+                cameraY + forwardNormY * brickWorldSize * 0.5f,
+                cameraZ + forwardNormZ * brickWorldSize * static_cast<float>(std::max<int32_t>(2, radiusXz)),
+                650u,
+                -std::max(1, radiusXz / 2)
+            });
+        anchors.push_back({predictedX, predictedY, predictedZ, 900u, -std::max(1, radiusXz / 2)});
         std::vector<VoxelInterestCandidate> candidates;
+        std::unordered_set<SparseVoxelClipmapCoord, SparseVoxelClipmapCoordHash> candidateSet;
         candidates.reserve(
             static_cast<size_t>(radiusXz * 2 + 1) *
             static_cast<size_t>(radiusY * 2 + 1) *
-            static_cast<size_t>(radiusXz * 2 + 1));
+            static_cast<size_t>(radiusXz * 2 + 1) *
+            anchors.size() *
+            2u);
 
-        for (int32_t dz = -radiusXz; dz <= radiusXz; ++dz) {
-            for (int32_t dy = -radiusY; dy <= radiusY; ++dy) {
-                for (int32_t dx = -radiusXz; dx <= radiusXz; ++dx) {
-                    const SparseVoxelClipmapCoord coord{
-                        static_cast<int32_t>(ring),
-                        centerX + dx,
-                        centerY + dy,
-                        centerZ + dz
-                    };
-                    const uint32_t score =
-                        static_cast<uint32_t>(dx * dx * 4 + dy * dy * 9 + dz * dz * 4);
-                    candidates.push_back(VoxelInterestCandidate{coord, dx, dy, dz, score});
+        const auto addCandidate = [&](
+            int32_t x,
+            int32_t y,
+            int32_t z,
+            int32_t dx,
+            int32_t dy,
+            int32_t dz,
+            uint32_t baseScore) {
+            const SparseVoxelClipmapCoord coord{
+                static_cast<int32_t>(ring),
+                x,
+                y,
+                z
+            };
+            if (!candidateSet.insert(coord).second) {
+                return;
+            }
+            const uint32_t score =
+                baseScore +
+                static_cast<uint32_t>(dx * dx * 4 + dy * dy * 9 + dz * dz * 4);
+            candidates.push_back(VoxelInterestCandidate{coord, dx, dy, dz, score});
+        };
+        const auto addTerrainCenterlineCandidates = [&](
+            float startX,
+            float startZ,
+            float endX,
+            float endZ,
+            uint32_t baseScore) {
+            const uint32_t maxLineCoords = std::max<uint32_t>(
+                2u,
+                policy.Config().motionLookaheadSteps * 3u + 4u);
+            const std::vector<SparseClipmapTileCoord> lineCoords = BuildTileLine2D(
+                static_cast<int32_t>(ring),
+                startX,
+                startZ,
+                endX,
+                endZ,
+                brickWorldSize,
+                maxLineCoords);
+            std::vector<int32_t> terrainCenterYs;
+            terrainCenterYs.reserve(lineCoords.size());
+            for (const SparseClipmapTileCoord& lineCoord : lineCoords) {
+                const int32_t sampleX = static_cast<int32_t>(std::floor(
+                    (static_cast<float>(lineCoord.x) + 0.5f) * brickWorldSize));
+                const int32_t sampleZ = static_cast<int32_t>(std::floor(
+                    (static_cast<float>(lineCoord.z) + 0.5f) * brickWorldSize));
+                const float terrainY = m_terrain.HeightAt(sampleX, sampleZ);
+                terrainCenterYs.push_back(static_cast<int32_t>(std::floor(terrainY / brickWorldSize)));
+            }
+            for (size_t i = 0; i < lineCoords.size(); ++i) {
+                addCandidate(
+                    lineCoords[i].x,
+                    terrainCenterYs[i],
+                    lineCoords[i].z,
+                    0,
+                    0,
+                    0,
+                    baseScore + static_cast<uint32_t>(i) * 2u);
+            }
+            for (size_t i = 0; i < lineCoords.size(); ++i) {
+                const SparseClipmapTileCoord& lineCoord = lineCoords[i];
+                const int32_t terrainCenterY = terrainCenterYs[i];
+                for (int32_t dy = -radiusY; dy <= radiusY; ++dy) {
+                    if (dy == 0) {
+                        continue;
+                    }
+                    addCandidate(
+                        lineCoord.x,
+                        terrainCenterY + dy,
+                        lineCoord.z,
+                        0,
+                        dy,
+                        0,
+                        baseScore + 10u + static_cast<uint32_t>(i) * 2u);
+                }
+            }
+        };
+
+        if (useMotionLookahead) {
+            addTerrainCenterlineCandidates(
+                cameraX,
+                cameraZ,
+                predictedX,
+                predictedZ,
+                20u);
+        }
+        addTerrainCenterlineCandidates(
+            cameraX,
+            cameraZ,
+            cameraX + forwardNormX * brickWorldSize * static_cast<float>(std::max<int32_t>(2, radiusXz)),
+            cameraZ + forwardNormZ * brickWorldSize * static_cast<float>(std::max<int32_t>(2, radiusXz)),
+            45u);
+
+        for (const VoxelInterestAnchor& anchor : anchors) {
+            const int32_t anchorRadiusXz = std::max(1, radiusXz + anchor.radiusBias);
+            const int32_t centerX = static_cast<int32_t>(std::floor(anchor.x / brickWorldSize));
+            const int32_t centerY = static_cast<int32_t>(std::floor(anchor.y / brickWorldSize));
+            const int32_t centerZ = static_cast<int32_t>(std::floor(anchor.z / brickWorldSize));
+            ++voxelAnchorCount;
+            for (int32_t dz = -anchorRadiusXz; dz <= anchorRadiusXz; ++dz) {
+                for (int32_t dx = -anchorRadiusXz; dx <= anchorRadiusXz; ++dx) {
+                    const int32_t brickX = centerX + dx;
+                    const int32_t brickZ = centerZ + dz;
+                    const int32_t sampleX = static_cast<int32_t>(std::floor(
+                        (static_cast<float>(brickX) + 0.5f) * brickWorldSize));
+                    const int32_t sampleZ = static_cast<int32_t>(std::floor(
+                        (static_cast<float>(brickZ) + 0.5f) * brickWorldSize));
+                    const float terrainY = m_terrain.HeightAt(sampleX, sampleZ);
+                    const int32_t terrainCenterY = static_cast<int32_t>(std::floor(terrainY / brickWorldSize));
+                    for (int32_t dy = -radiusY; dy <= radiusY; ++dy) {
+                        // The mid voxel clipmap is primarily distant terrain
+                        // context. Anchor the vertical interest around generated
+                        // terrain height, not camera height, so high/flying cameras
+                        // stream terrain below them instead of empty air.
+                        addCandidate(
+                            brickX,
+                            terrainCenterY + dy,
+                            brickZ,
+                            dx,
+                            dy,
+                            dz,
+                            anchor.baseScore);
+
+                        // Keep a lower-priority camera-height band for cases where
+                        // the camera is inside tall/vertical formations. This should
+                        // not steal quota from terrain-surface bricks unless there
+                        // is spare capacity in the ring.
+                        addCandidate(
+                            brickX,
+                            centerY + dy,
+                            brickZ,
+                            dx,
+                            dy,
+                            dz,
+                            anchor.baseScore + 5000u);
+                    }
                 }
             }
         }
@@ -446,6 +921,7 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
     }
 
     RefreshStats();
+    m_stats.voxelInterestAnchors = voxelAnchorCount;
 }
 
 uint32_t SparseClipmapTileCache::AllocateVoxelSlot(
@@ -505,6 +981,7 @@ void SparseClipmapTileCache::GenerateVoxelBrick(uint32_t slot, const SparseClipm
     brick.originY = brick.coord.y * brickWorldSize;
     brick.originZ = brick.coord.z * brickWorldSize;
     brick.voxels.resize(SPARSE_BRICK_VOXEL_COUNT);
+    const int32_t sampleStep = std::max(1, static_cast<int32_t>(std::lround(ring.cellSize)));
 
     for (uint8_t z = 0; z < SPARSE_BRICK_SIZE; ++z) {
         for (uint8_t y = 0; y < SPARSE_BRICK_SIZE; ++y) {
@@ -515,7 +992,16 @@ void SparseClipmapTileCache::GenerateVoxelBrick(uint32_t slot, const SparseClipm
                     std::lround((static_cast<float>(y) + 0.5f) * ring.cellSize));
                 const int32_t worldZ = brick.originZ + static_cast<int32_t>(
                     std::lround((static_cast<float>(z) + 0.5f) * ring.cellSize));
-                brick.voxels[LocalVoxelIndex({x, y, z})] = m_terrain.SampleGeneratedVoxel(worldX, worldY, worldZ);
+                uint32_t voxel = m_terrain.SampleGeneratedVoxel(worldX, worldY, worldZ);
+                const uint32_t surfaceVoxel = m_terrain.SampleGeneratedSurfaceVoxel(
+                    worldX,
+                    worldY,
+                    worldZ,
+                    sampleStep);
+                if (Utils::UnpackMaterial(surfaceVoxel) != Utils::Material::Air) {
+                    voxel |= static_cast<uint32_t>(Utils::StateFlags::VisualSurface) << 24u;
+                }
+                brick.voxels[LocalVoxelIndex({x, y, z})] = voxel;
             }
         }
     }
@@ -559,23 +1045,27 @@ bool SparseClipmapTileCache::BuildGpuSnapshot(SparseClipmapGpuSnapshot& outSnaps
     outSnapshot.voxelMetadata[3] = (voxelLookupCapacity & 0x00FFFFFFu) |
         ((m_config.ringCount & 0xFFu) << 24u);
 
-    uint32_t compactIndex = 0;
-    for (const TilePayload& tile : m_tiles) {
+    uint32_t residentHeightEntries = 0;
+    uint32_t maxUsedTileSlot = 0;
+    for (uint32_t tileSlot = 0; tileSlot < static_cast<uint32_t>(m_tiles.size()); ++tileSlot) {
+        const TilePayload& tile = m_tiles[tileSlot];
         if (tile.record.slot == UINT32_MAX || tile.packedSamples.empty()) {
             continue;
         }
-        if (compactIndex >= maxTiles) {
+        if (tileSlot >= maxTiles) {
             break;
         }
+        maxUsedTileSlot = std::max(maxUsedTileSlot, tileSlot);
+        ++residentHeightEntries;
 
-        const size_t metadataBase = static_cast<size_t>(compactIndex + 1u) * 4u;
+        const size_t metadataBase = static_cast<size_t>(tileSlot + 1u) * 4u;
         outSnapshot.metadata[metadataBase + 0u] = static_cast<uint32_t>(tile.record.originX);
         outSnapshot.metadata[metadataBase + 1u] = static_cast<uint32_t>(tile.record.originZ);
         outSnapshot.metadata[metadataBase + 2u] = static_cast<uint32_t>(tile.record.coord.ring & 0xFF) |
             (static_cast<uint32_t>(tile.record.cellSize) << 8);
         outSnapshot.metadata[metadataBase + 3u] = 1u;
 
-        const size_t sampleBase = static_cast<size_t>(compactIndex) * sampleCountPerTile;
+        const size_t sampleBase = static_cast<size_t>(tileSlot) * sampleCountPerTile;
         std::copy(
             tile.packedSamples.begin(),
             tile.packedSamples.end(),
@@ -589,18 +1079,20 @@ bool SparseClipmapTileCache::BuildGpuSnapshot(SparseClipmapGpuSnapshot& outSnaps
                 outSnapshot.lookup[lookupBase + 0u] = static_cast<uint32_t>(tile.record.coord.ring);
                 outSnapshot.lookup[lookupBase + 1u] = static_cast<uint32_t>(tile.record.coord.x);
                 outSnapshot.lookup[lookupBase + 2u] = static_cast<uint32_t>(tile.record.coord.z);
-                outSnapshot.lookup[lookupBase + 3u] = compactIndex + 1u;
+                outSnapshot.lookup[lookupBase + 3u] = tileSlot + 1u;
                 break;
             }
             lookupSlot = (lookupSlot + 1u) & lookupMask;
         }
-
-        ++compactIndex;
     }
 
-    outSnapshot.tileCount = compactIndex;
+    outSnapshot.tileCount = residentHeightEntries == 0 ? 0u : maxUsedTileSlot + 1u;
     outSnapshot.tileSampleSide = side;
     outSnapshot.lookupCapacity = lookupCapacity;
+    if (m_dirtyHeightStartSlot != UINT32_MAX && m_dirtyHeightStartSlot <= m_dirtyHeightEndSlot) {
+        outSnapshot.heightDirtyStartSlot = m_dirtyHeightStartSlot;
+        outSnapshot.heightDirtySlotCount = m_dirtyHeightEndSlot - m_dirtyHeightStartSlot + 1u;
+    }
 
     uint32_t residentVoxelEntries = 0;
     uint32_t maxUsedVoxelSlot = 0;
@@ -652,13 +1144,26 @@ bool SparseClipmapTileCache::BuildGpuSnapshot(SparseClipmapGpuSnapshot& outSnaps
     }
     outSnapshot.voxelMetadata[2] = outSnapshot.voxelBrickCount;
     outSnapshot.frameIndex = m_dirtySerial;
-    outSnapshot.metadata[2] = compactIndex;
-    return compactIndex > 0 || residentVoxelEntries > 0;
+    outSnapshot.metadata[2] = outSnapshot.tileCount;
+    return residentHeightEntries > 0 || residentVoxelEntries > 0;
+}
+
+void SparseClipmapTileCache::ClearHeightDirtyRange() {
+    m_dirtyHeightStartSlot = UINT32_MAX;
+    m_dirtyHeightEndSlot = 0;
 }
 
 void SparseClipmapTileCache::ClearVoxelDirtyRange() {
     m_dirtyVoxelStartSlot = UINT32_MAX;
     m_dirtyVoxelEndSlot = 0;
+}
+
+void SparseClipmapTileCache::MarkHeightSlotDirty(uint32_t slot) {
+    if (slot == UINT32_MAX || slot >= m_tiles.size()) {
+        return;
+    }
+    m_dirtyHeightStartSlot = std::min(m_dirtyHeightStartSlot, slot);
+    m_dirtyHeightEndSlot = std::max(m_dirtyHeightEndSlot, slot);
 }
 
 void SparseClipmapTileCache::MarkVoxelSlotDirty(uint32_t slot) {
@@ -677,12 +1182,26 @@ void SparseClipmapTileCache::RefreshStats(
 {
     m_stats.residentTiles = static_cast<uint32_t>(m_slotByCoord.size());
     m_stats.queuedTiles = static_cast<uint32_t>(m_generationQueue.size());
+    m_stats.interestedTiles = static_cast<uint32_t>(m_interestSet.size());
+    m_stats.missingInterestedTiles = 0;
+    for (const SparseClipmapTileCoord& coord : m_interestSet) {
+        if (m_slotByCoord.find(coord) == m_slotByCoord.end()) {
+            ++m_stats.missingInterestedTiles;
+        }
+    }
     m_stats.generatedTilesLastFrame = generatedLastFrame;
     m_stats.evictedTilesLastFrame = evictedLastFrame;
     m_stats.dirtySerial = m_dirtySerial;
     m_stats.snapshotTiles = m_stats.residentTiles;
     m_stats.residentVoxelBricks = static_cast<uint32_t>(m_voxelSlotByCoord.size());
     m_stats.queuedVoxelBricks = static_cast<uint32_t>(m_voxelGenerationQueue.size());
+    m_stats.interestedVoxelBricks = static_cast<uint32_t>(m_voxelInterestSet.size());
+    m_stats.missingInterestedVoxelBricks = 0;
+    for (const SparseVoxelClipmapCoord& coord : m_voxelInterestSet) {
+        if (m_voxelSlotByCoord.find(coord) == m_voxelSlotByCoord.end()) {
+            ++m_stats.missingInterestedVoxelBricks;
+        }
+    }
     m_stats.generatedVoxelBricksLastFrame = generatedVoxelLastFrame;
     m_stats.evictedVoxelBricksLastFrame = evictedVoxelLastFrame;
 }

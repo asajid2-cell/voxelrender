@@ -1,5 +1,11 @@
 # VENPOD Vertical World Pass
 
+> Historical report: this page documents the vertical dense-window stabilization
+> pass that preceded the sparse brick refactor. For the current sparse
+> brick/surface-authoritative architecture and review gates, see
+> [Engine architecture](../explanation/architecture.md) and
+> [Sparse refactor review checklist](../reference/sparse-refactor-review.md).
+
 ## Summary
 
 This pass changes VENPOD from a shallow fixed-Y terrain demo into a moving

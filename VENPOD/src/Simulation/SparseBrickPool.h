@@ -9,6 +9,17 @@
 
 namespace VENPOD::Simulation {
 
+struct SparseBrickPoolValidationResult {
+    bool ok = true;
+    uint32_t activeRecords = 0;
+    uint32_t freePages = 0;
+    uint32_t pageTableEntries = 0;
+    uint32_t residentMapErrors = 0;
+    uint32_t freeListErrors = 0;
+    uint32_t pageTableErrors = 0;
+    uint32_t missingPublishedPageTableEntries = 0;
+};
+
 class SparseBrickPool {
 public:
     bool Initialize(uint32_t maxPages, uint32_t pageTableCapacity);
@@ -46,6 +57,7 @@ public:
     uint32_t FreePageCount() const { return static_cast<uint32_t>(m_freePages.size()); }
     const SparsePageTable& PageTable() const { return m_pageTable; }
     const std::vector<BrickResidentRecord>& Records() const { return m_records; }
+    SparseBrickPoolValidationResult ValidateInvariants() const;
 
 private:
     bool TransitionRecord(BrickResidentRecord& record, BrickLifecycleState nextState);

@@ -17,11 +17,16 @@ struct SparseVoxelGpuConfig {
     uint32_t maxBrickPages = 4096;
     uint32_t pageTableCapacity = 16384;
     uint32_t uploadRingSlots = 3;
-    uint32_t uploadBytesPerSlot = 4 * 1024 * 1024;
+    uint32_t uploadBytesPerSlot = 8 * 1024 * 1024;
     uint32_t missFeedbackMaxRecords = 256;
-    uint32_t midClipmapMaxTiles = 128;
+    uint32_t midClipmapMaxTiles = 256;
     uint32_t midClipmapTileSampleSide = 33;
-    uint32_t midVoxelClipmapMaxBricks = 128;
+    uint32_t midVoxelClipmapMaxBricks = 512;
+    uint32_t maxPhysicsWorkPackets = 2048;
+    uint32_t maxEditDeltas = 8192;
+    uint32_t maxEditDeltaRanges = 2048;
+    uint32_t editDeltaRangeTableCapacity = 4096;
+    uint32_t maxBrushFeedbackRecords = 8192;
 };
 
 struct SparseVoxelGpuStats {
@@ -39,16 +44,75 @@ struct SparseVoxelGpuStats {
     uint64_t midVoxelClipmapMetadataBytes = 0;
     uint64_t midVoxelClipmapLookupBytes = 0;
     uint64_t midVoxelClipmapSampleBytes = 0;
+    uint64_t physicsWorkPacketBytes = 0;
+    uint64_t physicsPacketResultBytes = 0;
+    uint64_t physicsDiagnosticBytes = 0;
+    uint64_t renderOwnershipBytes = 0;
+    uint64_t editDeltaBytes = 0;
+    uint64_t editDeltaRangeBytes = 0;
+    uint64_t editDeltaRangeTableBytes = 0;
+    uint64_t brushFeedbackBytes = 0;
     uint64_t totalGpuBytes = 0;
     uint32_t stagedBricksLastFrame = 0;
+    uint32_t stagedPartialBrickUploadsLastFrame = 0;
+    uint32_t stagedPartialCopyRangesLastFrame = 0;
+    uint64_t stagedPartialVoxelBytesLastFrame = 0;
     uint32_t stagedPageEntriesLastFrame = 0;
     uint64_t stagedBytesLastFrame = 0;
     bool uploadRingOverflowLastFrame = false;
     uint32_t stagedMidClipmapTilesLastFrame = 0;
     uint32_t stagedMidVoxelClipmapBricksLastFrame = 0;
     uint64_t stagedMidClipmapBytesLastFrame = 0;
+    uint32_t stagedPhysicsPacketsLastFrame = 0;
+    uint64_t stagedPhysicsPacketBytesLastFrame = 0;
+    bool physicsPacketUploadOverflowLastFrame = false;
+    uint32_t stagedEditDeltasLastFrame = 0;
+    uint32_t stagedEditDeltaRangesLastFrame = 0;
+    uint32_t stagedEditDeltaRangeTableEntriesLastFrame = 0;
+    uint64_t stagedEditDeltaBytesLastFrame = 0;
+    bool editDeltaUploadOverflowLastFrame = false;
+    uint32_t physicsGpuPacketsLastRetire = 0;
+    uint32_t physicsGpuMaterialMaskLastRetire = 0;
+    uint32_t physicsGpuChecksumLastRetire = 0;
+    uint32_t physicsGpuFrameLastRetire = 0;
+    uint32_t physicsGpuMaxPriorityLastRetire = 0;
+    uint32_t physicsGpuGenerationXorLastRetire = 0;
+    uint32_t physicsGpuResultCountLastRetire = 0;
+    uint32_t physicsGpuResultChecksumLastRetire = 0;
+    int32_t physicsGpuResultFirstBrickX = 0;
+    int32_t physicsGpuResultFirstBrickY = 0;
+    int32_t physicsGpuResultFirstBrickZ = 0;
+    uint32_t physicsGpuResultFirstGeneration = 0;
+    uint32_t physicsGpuResultFirstStatus = 0;
+    uint32_t physicsGpuProposalCountLastRetire = 0;
+    uint32_t physicsGpuMissingBelowCountLastRetire = 0;
     uint32_t missFeedbackRecordsLastRetire = 0;
+    uint32_t missFeedbackFrameLastRetire = 0;
+    uint32_t missFeedbackStaleFrameDropsLastRetire = 0;
+    bool missFeedbackOverflowLastRetire = false;
+    uint32_t brushFeedbackRecordsLastRetire = 0;
+    uint32_t brushFeedbackFrameLastRetire = 0;
+    uint32_t brushFeedbackMissingResidentLastRetire = 0;
+    uint32_t brushFeedbackStaleFrameDropsLastRetire = 0;
+    bool brushFeedbackOverflowLastRetire = false;
+    uint32_t renderOwnerTotalPixelsLastRetire = 0;
+    uint32_t renderOwnerNearPixelsLastRetire = 0;
+    uint32_t renderOwnerMidVoxelPixelsLastRetire = 0;
+    uint32_t renderOwnerMidHeightPixelsLastRetire = 0;
+    uint32_t renderOwnerFarSvoPixelsLastRetire = 0;
+    uint32_t renderOwnerFarHeightPixelsLastRetire = 0;
+    uint32_t renderOwnerSkyPixelsLastRetire = 0;
+    uint32_t renderOwnerMissPixelsLastRetire = 0;
+    uint32_t renderOwnerSurfacePixelsLastRetire = 0;
+    uint32_t renderOwnerUnsafeNearMissPixelsLastRetire = 0;
+    uint32_t renderOwnerFrameLastRetire = 0;
     bool initialized = false;
+};
+
+struct SparseBrickVoxelCopyRange {
+    uint64_t uploadOffset = 0;
+    uint64_t brickPoolOffset = 0;
+    uint64_t bytes = 0;
 };
 
 struct SparseBrickGpuUploadTicket {
@@ -63,6 +127,7 @@ struct SparseBrickGpuUploadTicket {
     uint64_t voxelBytes = 0;
     uint64_t occupancyBytes = 0;
     uint64_t generationBytes = 0;
+    std::vector<SparseBrickVoxelCopyRange> voxelCopyRanges;
     Simulation::BrickCoord coord;
     uint32_t pageIndex = Simulation::INVALID_BRICK_PAGE;
     uint32_t generation = 0;
@@ -85,6 +150,7 @@ struct SparseMidClipmapGpuUploadTicket {
     uint64_t metadataUploadOffset = 0;
     uint64_t lookupUploadOffset = 0;
     uint64_t samplesUploadOffset = 0;
+    uint64_t samplesDestOffset = 0;
     uint64_t metadataBytes = 0;
     uint64_t lookupBytes = 0;
     uint64_t sampleBytes = 0;
@@ -99,6 +165,28 @@ struct SparseMidClipmapGpuUploadTicket {
     uint32_t tileSampleSide = 0;
     uint32_t voxelBrickCount = 0;
     uint32_t snapshotSerial = 0;
+};
+
+struct SparsePhysicsPacketGpuUploadTicket {
+    bool valid = false;
+    uint32_t ringSlot = 0;
+    uint64_t uploadOffset = 0;
+    uint64_t bytes = 0;
+    uint32_t packetCount = 0;
+};
+
+struct SparseEditDeltaGpuUploadTicket {
+    bool valid = false;
+    uint32_t ringSlot = 0;
+    uint64_t uploadOffset = 0;
+    uint64_t rangeUploadOffset = 0;
+    uint64_t rangeTableUploadOffset = 0;
+    uint64_t bytes = 0;
+    uint64_t rangeBytes = 0;
+    uint64_t rangeTableBytes = 0;
+    uint32_t deltaCount = 0;
+    uint32_t rangeCount = 0;
+    uint32_t rangeTableCapacity = 0;
 };
 
 class SparseVoxelGpuResources {
@@ -117,7 +205,28 @@ public:
 
     bool IsInitialized() const { return m_stats.initialized; }
     const SparseVoxelGpuStats& GetStats() const { return m_stats; }
+    const std::vector<Simulation::SparsePhysicsPacketResult>& GetLastRetiredPhysicsProposals() const {
+        return m_lastRetiredPhysicsProposals;
+    }
     void BeginFrame(uint32_t frameIndex);
+    uint64_t ActiveUploadBytesUsed() const { return m_uploadWriteOffset; }
+    uint64_t ActiveUploadBytesCapacity() const;
+    bool CanStageBrickUpload() const;
+    bool CanStageBrickUpload(const Simulation::SparseBrickUploadPacket& packet) const;
+    bool CanStagePageTableEntry() const;
+    bool CanStagePageTableReset() const;
+    bool CanStageMidClipmapSnapshot(
+        const Simulation::SparseClipmapGpuSnapshot& snapshot,
+        bool uploadHeightLayer = true,
+        bool uploadVoxelLayer = true) const;
+    static uint64_t EstimateMidClipmapSnapshotUploadBytes(
+        const Simulation::SparseClipmapGpuSnapshot& snapshot,
+        bool uploadHeightLayer = true,
+        bool uploadVoxelLayer = true);
+    bool CanStagePhysicsWorkPackets(
+        const std::vector<Simulation::SparsePhysicsWorkPacket>& packets) const;
+    bool CanStageEditDeltas(
+        const std::vector<Simulation::SparseEditDelta>& deltas) const;
     bool StageBrickUpload(
         const Simulation::SparseBrickUploadPacket& packet,
         SparseBrickGpuUploadTicket* outTicket = nullptr);
@@ -137,6 +246,18 @@ public:
         bool uploadHeightLayer = true,
         bool uploadVoxelLayer = true);
     bool EmitMidClipmapCopy(ID3D12GraphicsCommandList* commandList, const SparseMidClipmapGpuUploadTicket& ticket);
+    bool StagePhysicsWorkPackets(
+        const std::vector<Simulation::SparsePhysicsWorkPacket>& packets,
+        SparsePhysicsPacketGpuUploadTicket* outTicket = nullptr);
+    bool EmitPhysicsPacketCopy(
+        ID3D12GraphicsCommandList* commandList,
+        const SparsePhysicsPacketGpuUploadTicket& ticket);
+    bool StageEditDeltas(
+        const std::vector<Simulation::SparseEditDelta>& deltas,
+        SparseEditDeltaGpuUploadTicket* outTicket = nullptr);
+    bool EmitEditDeltaCopy(
+        ID3D12GraphicsCommandList* commandList,
+        const SparseEditDeltaGpuUploadTicket& ticket);
 
     const DescriptorHandle& BrickPoolSRV() const { return m_brickPool.GetShaderVisibleSRV(); }
     const DescriptorHandle& BrickPoolUAV() const { return m_brickPool.GetShaderVisibleUAV(); }
@@ -151,11 +272,33 @@ public:
     const DescriptorHandle& MidVoxelClipmapMetadataSRV() const { return m_midVoxelClipmapMetadata.GetShaderVisibleSRV(); }
     const DescriptorHandle& MidVoxelClipmapLookupSRV() const { return m_midVoxelClipmapLookup.GetShaderVisibleSRV(); }
     const DescriptorHandle& MidVoxelClipmapSamplesSRV() const { return m_midVoxelClipmapSamples.GetShaderVisibleSRV(); }
+    const DescriptorHandle& PhysicsWorkPacketsSRV() const { return m_physicsWorkPackets.GetShaderVisibleSRV(); }
+    const DescriptorHandle& EditDeltasSRV() const { return m_editDeltas.GetShaderVisibleSRV(); }
+    const DescriptorHandle& EditDeltaRangesSRV() const { return m_editDeltaRanges.GetShaderVisibleSRV(); }
+    const DescriptorHandle& EditDeltaRangeTableSRV() const { return m_editDeltaRangeTable.GetShaderVisibleSRV(); }
+    const DescriptorHandle& PhysicsPacketResultsUAV() const { return m_physicsPacketResults.GetShaderVisibleUAV(); }
+    const DescriptorHandle& PhysicsDiagnosticsUAV() const { return m_physicsDiagnostics.GetShaderVisibleUAV(); }
     const DescriptorHandle& MissFeedbackUAV() const { return m_missFeedback.GetShaderVisibleUAV(); }
+    const DescriptorHandle& BrushFeedbackUAV() const { return m_brushFeedback.GetShaderVisibleUAV(); }
+    const DescriptorHandle& RenderOwnershipUAV() const { return m_renderOwnership.GetShaderVisibleUAV(); }
 
     void PrepareMissFeedbackWrite(ID3D12GraphicsCommandList* commandList);
     void QueueMissFeedbackReadback(ID3D12GraphicsCommandList* commandList, uint32_t frameIndex);
     bool RetireMissFeedback(uint32_t frameIndex, std::vector<Simulation::BrickCoord>& outMissingBricks);
+    void PrepareBrushFeedbackWrite(ID3D12GraphicsCommandList* commandList);
+    void QueueBrushFeedbackReadback(ID3D12GraphicsCommandList* commandList, uint32_t frameIndex);
+    bool RetireBrushFeedback(
+        uint32_t frameIndex,
+        std::vector<Simulation::SparseBrushFeedbackRecord>& outRecords);
+    void PrepareRenderOwnershipWrite(ID3D12GraphicsCommandList* commandList);
+    void QueueRenderOwnershipReadback(ID3D12GraphicsCommandList* commandList, uint32_t frameIndex);
+    bool RetireRenderOwnership(uint32_t frameIndex);
+    void PreparePhysicsDiagnosticsWrite(ID3D12GraphicsCommandList* commandList);
+    void QueuePhysicsDiagnosticsReadback(ID3D12GraphicsCommandList* commandList, uint32_t frameIndex);
+    bool RetirePhysicsDiagnostics(uint32_t frameIndex);
+    void PreparePhysicsPacketResultsWrite(ID3D12GraphicsCommandList* commandList);
+    void QueuePhysicsPacketResultsReadback(ID3D12GraphicsCommandList* commandList, uint32_t frameIndex);
+    bool RetirePhysicsPacketResults(uint32_t frameIndex);
 
     static SparseVoxelGpuStats ComputeStats(const SparseVoxelGpuConfig& config);
     static bool IsPowerOfTwo(uint32_t value);
@@ -174,11 +317,46 @@ private:
     GPUBuffer m_midVoxelClipmapMetadata;
     GPUBuffer m_midVoxelClipmapLookup;
     GPUBuffer m_midVoxelClipmapSamples;
+    GPUBuffer m_physicsWorkPackets;
+    GPUBuffer m_editDeltas;
+    GPUBuffer m_editDeltaRanges;
+    GPUBuffer m_editDeltaRangeTable;
+    GPUBuffer m_physicsPacketResults;
+    GPUBuffer m_physicsDiagnostics;
     GPUBuffer m_missFeedback;
+    GPUBuffer m_brushFeedback;
+    GPUBuffer m_renderOwnership;
+    std::vector<Simulation::SparsePhysicsPacketResult> m_lastRetiredPhysicsProposals;
+    std::array<GPUBuffer, 3> m_physicsPacketResultsReadback;
+    std::array<GPUBuffer, 3> m_physicsDiagnosticsReadback;
     std::array<GPUBuffer, 3> m_missFeedbackReadback;
+    std::array<GPUBuffer, 3> m_brushFeedbackReadback;
+    std::array<GPUBuffer, 3> m_renderOwnershipReadback;
+    std::array<uint32_t, 3> m_physicsPacketResultsQueuedFrames = {
+        UINT32_MAX, UINT32_MAX, UINT32_MAX
+    };
+    std::array<uint32_t, 3> m_physicsPacketResultCounts = {
+        0u, 0u, 0u
+    };
+    std::array<uint32_t, 3> m_physicsDiagnosticsQueuedFrames = {
+        UINT32_MAX, UINT32_MAX, UINT32_MAX
+    };
+    std::array<uint32_t, 3> m_missFeedbackQueuedFrames = {
+        UINT32_MAX, UINT32_MAX, UINT32_MAX
+    };
+    std::array<uint32_t, 3> m_brushFeedbackQueuedFrames = {
+        UINT32_MAX, UINT32_MAX, UINT32_MAX
+    };
+    std::array<uint32_t, 3> m_renderOwnershipQueuedFrames = {
+        UINT32_MAX, UINT32_MAX, UINT32_MAX
+    };
     std::array<UploadBuffer, 3> m_uploadRing;
     uint32_t m_activeUploadSlot = 0;
     uint64_t m_uploadWriteOffset = 0;
+    uint32_t m_lastLoggedPhysicsDiagnosticFrame = UINT32_MAX;
+    uint32_t m_lastLoggedPhysicsDiagnosticChecksum = 0;
+    uint32_t m_lastLoggedPhysicsResultGeneration = UINT32_MAX;
+    uint32_t m_lastLoggedPhysicsResultChecksum = 0;
 };
 
 } // namespace VENPOD::Graphics

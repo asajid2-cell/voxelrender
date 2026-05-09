@@ -1,5 +1,6 @@
 #include "DX12GraphicsPipeline.h"
 #include <spdlog/spdlog.h>
+#include <vector>
 
 namespace VENPOD::Graphics {
 
@@ -105,7 +106,9 @@ Result<void> DX12GraphicsPipeline::CreateRootSignature(ID3D12Device* device, con
                 range.NumDescriptors = param.numDescriptors;
                 range.BaseShaderRegister = param.shaderRegister;
                 range.RegisterSpace = param.registerSpace;
-                range.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE;
+                range.Flags = param.rangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+                    ? D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE
+                    : D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC_WHILE_SET_AT_EXECUTE;
                 range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
                 ranges.push_back(range);
 
@@ -201,7 +204,7 @@ Result<void> DX12GraphicsPipeline::CreatePSO(ID3D12Device* device, const Graphic
     // Rasterizer state
     psoDesc.RasterizerState.FillMode = desc.fillMode;
     psoDesc.RasterizerState.CullMode = desc.cullMode;
-    psoDesc.RasterizerState.FrontCounterClockwise = FALSE;
+    psoDesc.RasterizerState.FrontCounterClockwise = desc.frontCounterClockwise ? TRUE : FALSE;
     psoDesc.RasterizerState.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
     psoDesc.RasterizerState.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
     psoDesc.RasterizerState.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
@@ -229,9 +232,17 @@ Result<void> DX12GraphicsPipeline::CreatePSO(ID3D12Device* device, const Graphic
 
     // Depth stencil state
     psoDesc.DepthStencilState.DepthEnable = desc.depthEnable;
-    psoDesc.DepthStencilState.DepthWriteMask = desc.depthEnable ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-    psoDesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-    psoDesc.DepthStencilState.StencilEnable = FALSE;
+    psoDesc.DepthStencilState.DepthWriteMask =
+        desc.depthEnable ? desc.depthWriteMask : D3D12_DEPTH_WRITE_MASK_ZERO;
+    psoDesc.DepthStencilState.DepthFunc = desc.depthEnable ? desc.depthFunc : D3D12_COMPARISON_FUNC_ALWAYS;
+    psoDesc.DepthStencilState.StencilEnable = desc.stencilEnable;
+    psoDesc.DepthStencilState.StencilReadMask = desc.stencilReadMask;
+    psoDesc.DepthStencilState.StencilWriteMask = desc.stencilWriteMask;
+    psoDesc.DepthStencilState.FrontFace.StencilFunc = desc.frontStencilFunc;
+    psoDesc.DepthStencilState.FrontFace.StencilPassOp = desc.frontStencilPassOp;
+    psoDesc.DepthStencilState.FrontFace.StencilFailOp = desc.frontStencilFailOp;
+    psoDesc.DepthStencilState.FrontFace.StencilDepthFailOp = desc.frontStencilDepthFailOp;
+    psoDesc.DepthStencilState.BackFace = psoDesc.DepthStencilState.FrontFace;
 
     // Sample mask and sample count
     psoDesc.SampleMask = UINT_MAX;
@@ -267,6 +278,30 @@ Result<void> DX12GraphicsPipeline::CreatePSO(ID3D12Device* device, const Graphic
     // Create PSO
     HRESULT hr = device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&m_pso));
     if (FAILED(hr)) {
+        ComPtr<ID3D12InfoQueue> infoQueue;
+        if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&infoQueue)))) {
+            const uint64_t messageCount = infoQueue->GetNumStoredMessages();
+            const uint64_t firstMessage =
+                messageCount > 8u ? messageCount - 8u : 0u;
+            for (uint64_t i = firstMessage; i < messageCount; ++i) {
+                SIZE_T messageLength = 0;
+                if (FAILED(infoQueue->GetMessage(i, nullptr, &messageLength)) ||
+                    messageLength == 0) {
+                    continue;
+                }
+                std::vector<uint8_t> storage(messageLength);
+                auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+                if (SUCCEEDED(infoQueue->GetMessage(i, message, &messageLength)) &&
+                    message->pDescription) {
+                    spdlog::error(
+                        "D3D12 PSO message [{}] severity={} id={}: {}",
+                        i,
+                        static_cast<int>(message->Severity),
+                        static_cast<int>(message->ID),
+                        message->pDescription);
+                }
+            }
+        }
         return Error("Failed to create graphics pipeline state: 0x{:08X}", hr);
     }
 

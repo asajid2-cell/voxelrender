@@ -19,9 +19,34 @@ class SparseTerrainGenerator {
 public:
     explicit SparseTerrainGenerator(uint32_t seed = 12345u) : m_seed(seed) {}
 
+    struct ScenicSpawn {
+        bool found = false;
+        int32_t worldX = 96;
+        int32_t worldZ = 96;
+        int32_t groundY = 0;
+        float eyeY = 236.0f;
+        float yaw = 0.0f;
+        float pitch = -0.22f;
+        float score = 0.0f;
+        float forwardClearance = 0.0f;
+        float localRelief = 0.0f;
+    };
+
     uint32_t Seed() const { return m_seed; }
     float HeightAt(int32_t worldX, int32_t worldZ) const;
+    ScenicSpawn FindScenicSpawn(
+        int32_t originX,
+        int32_t originZ,
+        float playerHeight,
+        int32_t searchRadius = 448,
+        int32_t sampleSpacing = 32) const;
+    bool IsDefinitelyEmptyBrick(const BrickCoord& coord, float verticalSafetyMargin = 64.0f) const;
     uint32_t SampleGeneratedVoxel(int32_t worldX, int32_t worldY, int32_t worldZ) const;
+    uint32_t SampleGeneratedSurfaceVoxel(
+        int32_t worldX,
+        int32_t worldY,
+        int32_t worldZ,
+        int32_t sampleStep) const;
     GeneratedSparseBrick GenerateBrick(const BrickCoord& coord) const;
 
     static void ComputeOccupancyAndFlags(GeneratedSparseBrick& brick);
@@ -36,4 +61,3 @@ private:
 };
 
 } // namespace VENPOD::Simulation
-

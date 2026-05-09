@@ -35,6 +35,7 @@ struct SparseBrickPageEntry {
 StructuredBuffer<uint> SparseBrickVoxelPool : register(t0);
 StructuredBuffer<SparseBrickPageEntry> SparseBrickPageTable : register(t1);
 StructuredBuffer<uint2> SparseBrickOccupancy : register(t2);
+StructuredBuffer<uint> SparseBrickPageGenerations : register(t3);
 RWStructuredBuffer<float4> SparseRaycastResult : register(u0);
 
 static const uint SPARSE_BRICK_SIZE = 16u;
@@ -116,6 +117,9 @@ bool TrySampleSparseVoxel(int3 worldPos, out uint voxel) {
         return false;
     }
     if (entry.pageIndex >= maxBrickPages) {
+        return false;
+    }
+    if (SparseBrickPageGenerations[entry.pageIndex] != entry.generation) {
         return false;
     }
 

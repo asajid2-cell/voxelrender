@@ -64,8 +64,8 @@ Write-Info "Executable: $exePath"
 Write-Info "Working Dir: $exeDir"
 
 Push-Location $exeDir
-& $exePath
-$exitCode = $LASTEXITCODE
+$process = Start-Process -FilePath $exePath -WorkingDirectory $exeDir -Wait -PassThru
+$exitCode = $process.ExitCode
 Pop-Location
 
 if ($exitCode -ne 0) {

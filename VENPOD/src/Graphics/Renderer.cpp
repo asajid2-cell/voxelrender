@@ -7,6 +7,45 @@
 
 namespace VENPOD::Graphics {
 
+namespace {
+
+// Must match SharedTypes.hlsli FrameConstants exactly. Keeping the CPU mirror
+// in one place avoids the renderer and sparse-surface paths drifting as the
+// sparse backend adds ownership metadata.
+struct FrameConstantsCpu {
+    float cameraPosition[4];      // xyz = pos, w = fov
+    float cameraForward[4];       // xyz = forward, w = aspectRatio
+    float cameraRight[4];         // xyz = right, w = unused
+    float cameraUp[4];            // xyz = up, w = unused
+    float sunDirection[4];        // xyz = direction, w = intensity
+    uint32_t gridSizeX;
+    uint32_t gridSizeY;
+    uint32_t gridSizeZ;
+    float voxelScale;
+    float viewportWidth;
+    float viewportHeight;
+    uint32_t frameIndex;
+    uint32_t debugMode;
+    float regionOrigin[4];        // xyz = world origin, w = unused
+    float brushPosition[4];       // xyz = position, w = radius
+    float brushParams[4];         // x = material, y = shape, z = hasValidPosition, w = unused
+    float characterPosition[4];   // xyz = feet position, w = visible flag
+    float farFieldParams[4];      // x = enabled, y = page count, z = node count, w = page size
+    float renderBudgetParams[4];  // x = dense max dist, y = dense max steps, z = far quality, w = quality
+    float farFieldGridParams[4];  // x = page radius, y = index side, z = root min Y, w = ownership stats flag
+    float sparseNearParams[4];    // x = enabled, y = pages, z = table capacity, w = flags
+    float midFieldParams[4];      // x = enabled, y = start dist, z = end dist, w = min cell size
+    float surfaceParams[4];       // x = enabled, y = faces, z = ranges, w = range table capacity
+    float nearOwnershipParams[4]; // xyz = sparse near owner center, w = owner radius
+    float backgroundOwnershipParams[4]; // x = mid start, y = far handoff, z = mid end, w = valid
+    float midResidencyParams[4];  // x/y = height/voxel coverage, z/w = resident height/voxel counts
+    float farOwnershipParams[4];  // x = ready, y = upload coverage, z = page coverage, w = effective quality
+};
+
+static_assert(sizeof(FrameConstantsCpu) == 336);
+
+}
+
 Result<void> Renderer::Initialize(
     DX12Device& device,
     DX12CommandQueue& commandQueue,
@@ -68,6 +107,27 @@ Result<void> Renderer::Initialize(
         if (!result) {
             return Error("Failed to create sparse surface frame constants upload buffer: {}", result.error());
         }
+        std::snprintf(name, sizeof(name), "OverlayFrameConstants_%u", i);
+        result = m_overlayConstantUploads[i].Initialize(
+            device.GetDevice(),
+            kFrameConstantUploadBytes,
+            name);
+        if (!result) {
+            return Error("Failed to create overlay frame constants upload buffer: {}", result.error());
+        }
+    }
+    result = m_dummyRenderOwnershipUAV.Initialize(
+        device.GetDevice(),
+        sizeof(uint32_t) * 16u,
+        BufferUsage::StructuredBuffer | BufferUsage::UnorderedAccess,
+        sizeof(uint32_t),
+        "DummyRenderOwnershipUAV");
+    if (!result) {
+        return Error("Failed to create dummy render ownership UAV buffer: {}", result.error());
+    }
+    result = m_dummyRenderOwnershipUAV.CreateUAV(device.GetDevice(), m_heapManager);
+    if (!result) {
+        return Error("Failed to create dummy render ownership UAV: {}", result.error());
     }
 
     // Create fullscreen pipeline
@@ -79,7 +139,14 @@ Result<void> Renderer::Initialize(
     if (!result) {
         return Error("Failed to create sparse surface pipeline: {}", result.error());
     }
-
+    result = CreateOverlayPipeline(device.GetDevice());
+    if (!result) {
+        return Error("Failed to create overlay pipeline: {}", result.error());
+    }
+    result = CreateSparseSurfaceDrawCommandSignature(device.GetDevice());
+    if (!result) {
+        return Error("Failed to create sparse surface draw command signature: {}", result.error());
+    }
     spdlog::info("Renderer initialized ({}x{})", m_width, m_height);
     return {};
 }
@@ -91,6 +158,10 @@ void Renderer::Shutdown() {
     for (auto& upload : m_sparseSurfaceConstantUploads) {
         upload.Shutdown();
     }
+    for (auto& upload : m_overlayConstantUploads) {
+        upload.Shutdown();
+    }
+    m_dummyRenderOwnershipUAV.Shutdown();
 
     // Free RTV handles
     for (auto& handle : m_rtvHandles) {
@@ -105,6 +176,8 @@ void Renderer::Shutdown() {
 
     m_fullscreenPipeline.Shutdown();
     m_sparseSurfacePipeline.Shutdown();
+    m_overlayPipeline.Shutdown();
+    m_sparseSurfaceDrawSignature.Reset();
     m_shaderCompiler.Shutdown();
     m_heapManager.Shutdown();
 
@@ -153,7 +226,7 @@ void Renderer::BeginFrame(ID3D12GraphicsCommandList* cmdList, uint32_t frameInde
     if (m_dsvHandle.IsValid()) {
         cmdList->ClearDepthStencilView(
             m_dsvHandle.cpu,
-            D3D12_CLEAR_FLAG_DEPTH,
+            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
             1.0f,
             0,
             0,
@@ -216,34 +289,9 @@ void Renderer::RenderVoxels(
 
     // Bind fullscreen pipeline
     m_fullscreenPipeline.Bind(cmdList);
+    cmdList->OMSetStencilRef(0);
 
-    // Create frame constants on stack (will be passed as root constants)
-    // Must match SharedTypes.hlsli FrameConstants exactly.
-    struct FrameConstants {
-        float cameraPosition[4];      // xyz = pos, w = fov
-        float cameraForward[4];       // xyz = forward, w = aspectRatio
-        float cameraRight[4];         // xyz = right, w = unused
-        float cameraUp[4];            // xyz = up, w = unused
-        float sunDirection[4];        // xyz = direction, w = intensity
-        uint32_t gridSizeX;
-        uint32_t gridSizeY;
-        uint32_t gridSizeZ;
-        float voxelScale;
-        float viewportWidth;
-        float viewportHeight;
-        uint32_t frameIndex;
-        uint32_t debugMode;
-        float regionOrigin[4];        // xyz = world origin, w = unused - CRITICAL FOR INFINITE WORLD!
-        float brushPosition[4];       // xyz = position, w = radius
-        float brushParams[4];         // x = material, y = shape, z = hasValidPosition, w = unused
-        float characterPosition[4];   // xyz = feet position, w = visible flag
-        float farFieldParams[4];      // x = enabled, y = page count, z = node count, w = page size
-        float renderBudgetParams[4];  // x = dense max dist, y = dense max steps, z = far quality, w = quality
-        float farFieldGridParams[4];  // x = page radius, y = index side, z = root min Y, w = unused
-        float sparseNearParams[4];    // x = enabled, y = pages, z = table capacity, w = flags
-        float midFieldParams[4];      // x = enabled, y = start dist, z = end dist, w = min cell size
-        float surfaceParams[4];       // x = enabled, y = faces, z = ranges, w = range table capacity
-    } constants = {};
+    FrameConstantsCpu constants = {};
 
     // Fill in camera data
     constants.cameraPosition[0] = camera.posX;
@@ -279,7 +327,7 @@ void Renderer::RenderVoxels(
     constants.voxelScale = 1.0f;
     constants.viewportWidth = static_cast<float>(m_width);
     constants.viewportHeight = static_cast<float>(m_height);
-    constants.frameIndex = 0;
+    constants.frameIndex = camera.frameIndex;
     constants.debugMode = camera.debugMode;
 
     // CRITICAL FIX: Fill in region origin for infinite world
@@ -339,12 +387,34 @@ void Renderer::RenderVoxels(
 
     constants.renderBudgetParams[0] = camera.raymarchMaxDistance > 0.0f ? camera.raymarchMaxDistance : 2500.0f;
     constants.renderBudgetParams[1] = static_cast<float>(camera.raymarchMaxSteps > 0 ? camera.raymarchMaxSteps : 2048);
-    constants.renderBudgetParams[2] = farFieldEnabled ? std::clamp(camera.farFieldQuality, 0.0f, 1.0f) : 0.0f;
+    // Far height/clipmap fallback is independent from the experimental far-SVO
+    // buffers. Do not zero this when far-SVO is disabled, or the renderer loses
+    // all non-SVO horizon continuity and reports most pixels as misses.
+    constants.renderBudgetParams[2] = std::clamp(camera.farFieldQuality, 0.0f, 1.0f);
     constants.renderBudgetParams[3] = std::clamp(camera.renderQuality, 0.0f, 1.0f);
     constants.farFieldGridParams[0] = farFieldEnabled ? static_cast<float>(sparseFarField->pageRadius) : 0.0f;
     constants.farFieldGridParams[1] = farFieldEnabled ? static_cast<float>(sparseFarField->pageRadius * 2 + 1) : 0.0f;
     constants.farFieldGridParams[2] = farFieldEnabled ? sparseFarField->rootMinY : 0.0f;
-    constants.farFieldGridParams[3] = 0.0f;
+    const bool renderOwnershipEnabled =
+        camera.renderOwnershipStatsEnabled &&
+        sparseNearField &&
+        sparseNearField->renderOwnershipUAV.IsValid();
+    constants.farFieldGridParams[3] = renderOwnershipEnabled ? 1.0f : 0.0f;
+    const float farUploadCoverage = farFieldEnabled
+        ? std::clamp(sparseFarField->uploadCoverageRatio, 0.0f, 1.0f)
+        : 0.0f;
+    const float farPageCoverage = farFieldEnabled
+        ? std::clamp(sparseFarField->pageCoverageRatio, 0.0f, 1.0f)
+        : 0.0f;
+    const bool farReady =
+        farFieldEnabled &&
+        sparseFarField->ready &&
+        farUploadCoverage >= 0.999f &&
+        farPageCoverage > 0.0f;
+    constants.farOwnershipParams[0] = farReady ? 1.0f : 0.0f;
+    constants.farOwnershipParams[1] = farUploadCoverage;
+    constants.farOwnershipParams[2] = farPageCoverage;
+    constants.farOwnershipParams[3] = std::clamp(camera.farFieldQuality, 0.0f, 1.0f);
 
     const bool sparseNearEnabled =
         sparseNearField &&
@@ -358,7 +428,22 @@ void Renderer::RenderVoxels(
     constants.sparseNearParams[0] = sparseNearEnabled ? 1.0f : 0.0f;
     constants.sparseNearParams[1] = sparseNearEnabled ? static_cast<float>(sparseNearField->maxBrickPages) : 0.0f;
     constants.sparseNearParams[2] = sparseNearEnabled ? static_cast<float>(sparseNearField->pageTableCapacity) : 0.0f;
-    constants.sparseNearParams[3] = (sparseNearEnabled && sparseNearField->sparseOnly) ? 1.0f : 0.0f;
+    uint32_t sparseNearFlags = 0u;
+    if (sparseNearEnabled && sparseNearField->sparseOnly) {
+        sparseNearFlags |= 1u;
+    }
+    if (sparseNearEnabled && sparseNearField->surfaceAuthoritative) {
+        sparseNearFlags |= 2u;
+    }
+    if (sparseNearEnabled &&
+        sparseNearField->midClipmapEnabled &&
+        sparseNearField->midVoxelClipmapBrickCount > 0) {
+        sparseNearFlags |= 4u;
+    }
+    if (sparseNearEnabled && sparseNearField->surfaceRaymarchFill) {
+        sparseNearFlags |= 8u;
+    }
+    constants.sparseNearParams[3] = static_cast<float>(sparseNearFlags);
     const bool midClipmapEnabled =
         sparseNearEnabled &&
         sparseNearField->midClipmapEnabled &&
@@ -385,6 +470,24 @@ void Renderer::RenderVoxels(
     constants.surfaceParams[1] = surfaceEnabled ? static_cast<float>(sparseNearField->surfaceFaceCount) : 0.0f;
     constants.surfaceParams[2] = surfaceEnabled ? static_cast<float>(sparseNearField->surfaceRangeCount) : 0.0f;
     constants.surfaceParams[3] = surfaceEnabled ? static_cast<float>(sparseNearField->surfaceRangeTableCapacity) : 0.0f;
+    constants.nearOwnershipParams[0] = sparseNearEnabled ? sparseNearField->ownershipCenterX : camera.posX;
+    constants.nearOwnershipParams[1] = sparseNearEnabled ? sparseNearField->ownershipCenterY : camera.posY;
+    constants.nearOwnershipParams[2] = sparseNearEnabled ? sparseNearField->ownershipCenterZ : camera.posZ;
+    constants.nearOwnershipParams[3] = sparseNearEnabled ? std::max(0.0f, sparseNearField->ownershipRadius) : 0.0f;
+    const float midStartDistance = std::max(0.0f, camera.midFieldStartDistance);
+    const float midEndDistance = std::max(midStartDistance + 1.0f, camera.midFieldEndDistance);
+    const float fallbackFarHandoffDistance = midStartDistance + (midEndDistance - midStartDistance) * 0.62f;
+    const float farHandoffDistance = camera.midFieldFarHandoffDistance > 0.0f
+        ? std::clamp(camera.midFieldFarHandoffDistance, midStartDistance, midEndDistance)
+        : fallbackFarHandoffDistance;
+    constants.backgroundOwnershipParams[0] = midClipmapEnabled ? midStartDistance : 0.0f;
+    constants.backgroundOwnershipParams[1] = midClipmapEnabled ? farHandoffDistance : 0.0f;
+    constants.backgroundOwnershipParams[2] = midClipmapEnabled ? midEndDistance : 0.0f;
+    constants.backgroundOwnershipParams[3] = midClipmapEnabled ? 1.0f : 0.0f;
+    constants.midResidencyParams[0] = midClipmapEnabled ? std::clamp(camera.midFieldHeightCoverage, 0.0f, 1.0f) : 0.0f;
+    constants.midResidencyParams[1] = midClipmapEnabled ? std::clamp(camera.midFieldVoxelCoverage, 0.0f, 1.0f) : 0.0f;
+    constants.midResidencyParams[2] = midClipmapEnabled ? static_cast<float>(camera.midFieldResidentHeightTiles) : 0.0f;
+    constants.midResidencyParams[3] = midClipmapEnabled ? static_cast<float>(camera.midFieldResidentVoxelBricks) : 0.0f;
 
     static_assert(sizeof(constants) <= kFrameConstantUploadBytes);
     UploadBuffer& frameConstantsUpload = m_frameConstantUploads[m_currentFrameIndex];
@@ -413,6 +516,11 @@ void Renderer::RenderVoxels(
     cmdList->SetGraphicsRootDescriptorTable(16, (midClipmapEnabled && (sparseBindingMask & (1u << 9))) ? sparseNearField->midVoxelClipmapSamplesSRV.gpu : voxelGridSRV.gpu);
     cmdList->SetGraphicsRootDescriptorTable(17, (surfaceEnabled && (sparseBindingMask & (1u << 10))) ? sparseNearField->surfaceFacesSRV.gpu : voxelGridSRV.gpu);
     cmdList->SetGraphicsRootDescriptorTable(18, (surfaceEnabled && (sparseBindingMask & (1u << 11))) ? sparseNearField->surfaceRangesSRV.gpu : voxelGridSRV.gpu);
+    cmdList->SetGraphicsRootDescriptorTable(
+        19,
+        renderOwnershipEnabled
+            ? sparseNearField->renderOwnershipUAV.gpu
+            : m_dummyRenderOwnershipUAV.GetShaderVisibleUAV().gpu);
 
     // Draw fullscreen triangle
     cmdList->DrawInstanced(3, 1, 0, 0);
@@ -423,41 +531,40 @@ void Renderer::RenderSparseSurfaceFaces(
     const DescriptorHandle& surfaceFacesSRV,
     const DescriptorHandle& materialPaletteSRV,
     uint32_t surfaceFaceCount,
-    const CameraParams& camera)
+    const CameraParams& camera,
+    ID3D12Resource* indirectDrawArgs,
+    uint32_t indirectDrawCommandCount,
+    ID3D12Resource* indirectDrawCount,
+    const D3D12_VERTEX_BUFFER_VIEW* surfaceVertexIdView,
+    const D3D12_INDEX_BUFFER_VIEW* surfaceIndexView,
+    uint32_t surfaceVertexIdCapacityFaces,
+    const DescriptorHandle* surfaceRecordsSRV,
+    const DescriptorHandle* surfaceClustersSRV,
+    const DescriptorHandle* renderOwnershipUAV)
 {
     if (!cmdList || surfaceFaceCount == 0 || !surfaceFacesSRV.IsValid() || !materialPaletteSRV.IsValid()) {
+        return;
+    }
+    if (!surfaceVertexIdView ||
+        !surfaceIndexView ||
+        surfaceVertexIdView->BufferLocation == 0u ||
+        surfaceIndexView->BufferLocation == 0u ||
+        surfaceVertexIdCapacityFaces == 0u) {
+        return;
+    }
+    const uint32_t drawableFaceCount = std::min(surfaceFaceCount, surfaceVertexIdCapacityFaces);
+    if (drawableFaceCount == 0u) {
         return;
     }
 
     ID3D12DescriptorHeap* heaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
     cmdList->SetDescriptorHeaps(1, heaps);
     m_sparseSurfacePipeline.Bind(cmdList);
+    cmdList->OMSetStencilRef(1);
+    cmdList->IASetVertexBuffers(0, 1, surfaceVertexIdView);
+    cmdList->IASetIndexBuffer(surfaceIndexView);
 
-    struct FrameConstants {
-        float cameraPosition[4];
-        float cameraForward[4];
-        float cameraRight[4];
-        float cameraUp[4];
-        float sunDirection[4];
-        uint32_t gridSizeX;
-        uint32_t gridSizeY;
-        uint32_t gridSizeZ;
-        float voxelScale;
-        float viewportWidth;
-        float viewportHeight;
-        uint32_t frameIndex;
-        uint32_t debugMode;
-        float regionOrigin[4];
-        float brushPosition[4];
-        float brushParams[4];
-        float characterPosition[4];
-        float farFieldParams[4];
-        float renderBudgetParams[4];
-        float farFieldGridParams[4];
-        float sparseNearParams[4];
-        float midFieldParams[4];
-        float surfaceParams[4];
-    } constants = {};
+    FrameConstantsCpu constants = {};
 
     constants.cameraPosition[0] = camera.posX;
     constants.cameraPosition[1] = camera.posY;
@@ -483,8 +590,13 @@ void Renderer::RenderSparseSurfaceFaces(
     constants.renderBudgetParams[1] = static_cast<float>(camera.raymarchMaxSteps);
     constants.renderBudgetParams[2] = camera.farFieldQuality;
     constants.renderBudgetParams[3] = camera.renderQuality;
+    constants.frameIndex = camera.frameIndex;
+    constants.farFieldGridParams[3] =
+        (camera.renderOwnershipStatsEnabled && renderOwnershipUAV && renderOwnershipUAV->IsValid())
+            ? 1.0f
+            : 0.0f;
     constants.surfaceParams[0] = 1.0f;
-    constants.surfaceParams[1] = static_cast<float>(surfaceFaceCount);
+    constants.surfaceParams[1] = static_cast<float>(drawableFaceCount);
 
     static_assert(sizeof(constants) <= kFrameConstantUploadBytes);
     UploadBuffer& frameConstantsUpload = m_sparseSurfaceConstantUploads[m_currentFrameIndex];
@@ -495,7 +607,101 @@ void Renderer::RenderSparseSurfaceFaces(
     cmdList->SetGraphicsRootConstantBufferView(0, frameConstantsUpload.GetGPUVirtualAddress());
     cmdList->SetGraphicsRootDescriptorTable(1, surfaceFacesSRV.gpu);
     cmdList->SetGraphicsRootDescriptorTable(2, materialPaletteSRV.gpu);
-    cmdList->DrawInstanced(surfaceFaceCount * 6u, 1, 0, 0);
+    cmdList->SetGraphicsRootDescriptorTable(
+        3,
+        (camera.renderOwnershipStatsEnabled && renderOwnershipUAV && renderOwnershipUAV->IsValid())
+            ? renderOwnershipUAV->gpu
+            : m_dummyRenderOwnershipUAV.GetShaderVisibleUAV().gpu);
+    cmdList->SetGraphicsRootDescriptorTable(
+        4,
+        (surfaceRecordsSRV && surfaceRecordsSRV->IsValid())
+            ? surfaceRecordsSRV->gpu
+            : surfaceFacesSRV.gpu);
+    cmdList->SetGraphicsRootDescriptorTable(
+        5,
+        (surfaceClustersSRV && surfaceClustersSRV->IsValid())
+            ? surfaceClustersSRV->gpu
+            : surfaceFacesSRV.gpu);
+    if (indirectDrawArgs && indirectDrawCommandCount > 0 && m_sparseSurfaceDrawSignature) {
+        cmdList->ExecuteIndirect(
+            m_sparseSurfaceDrawSignature.Get(),
+            indirectDrawCommandCount,
+            indirectDrawArgs,
+            0,
+            indirectDrawCount,
+            0);
+    } else {
+        cmdList->DrawIndexedInstanced(drawableFaceCount * 6u, 1u, 0u, 0, 0u);
+    }
+}
+
+void Renderer::RenderOverlays(
+    ID3D12GraphicsCommandList* cmdList,
+    const DescriptorHandle& materialPaletteSRV,
+    const CameraParams& camera,
+    const BrushPreview* brushPreview,
+    const CharacterPreview* characterPreview)
+{
+    if (!cmdList || !materialPaletteSRV.IsValid()) {
+        return;
+    }
+    const bool hasBrush = brushPreview && brushPreview->hasValidPosition && brushPreview->radius > 0.0f;
+    const bool hasCharacter = characterPreview && characterPreview->visible;
+    if (!hasBrush && !hasCharacter) {
+        return;
+    }
+
+    ID3D12DescriptorHeap* heaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
+    cmdList->SetDescriptorHeaps(1, heaps);
+    m_overlayPipeline.Bind(cmdList);
+
+    FrameConstantsCpu constants = {};
+    constants.cameraPosition[0] = camera.posX;
+    constants.cameraPosition[1] = camera.posY;
+    constants.cameraPosition[2] = camera.posZ;
+    constants.cameraPosition[3] = camera.fov;
+    constants.cameraForward[0] = camera.forwardX;
+    constants.cameraForward[1] = camera.forwardY;
+    constants.cameraForward[2] = camera.forwardZ;
+    constants.cameraForward[3] = camera.aspectRatio;
+    constants.cameraRight[0] = camera.rightX;
+    constants.cameraRight[1] = camera.rightY;
+    constants.cameraRight[2] = camera.rightZ;
+    constants.cameraRight[3] = 0.0f;
+    constants.cameraUp[0] = camera.upX;
+    constants.cameraUp[1] = camera.upY;
+    constants.cameraUp[2] = camera.upZ;
+    constants.cameraUp[3] = 0.0f;
+    constants.viewportWidth = static_cast<float>(m_width);
+    constants.viewportHeight = static_cast<float>(m_height);
+    constants.frameIndex = camera.frameIndex;
+    constants.debugMode = camera.debugMode;
+
+    if (hasBrush) {
+        constants.brushPosition[0] = brushPreview->posX;
+        constants.brushPosition[1] = brushPreview->posY;
+        constants.brushPosition[2] = brushPreview->posZ;
+        constants.brushPosition[3] = brushPreview->radius;
+        constants.brushParams[0] = static_cast<float>(brushPreview->material);
+        constants.brushParams[1] = static_cast<float>(brushPreview->shape);
+        constants.brushParams[2] = 1.0f;
+    }
+    if (hasCharacter) {
+        constants.characterPosition[0] = characterPreview->feetX;
+        constants.characterPosition[1] = characterPreview->feetY;
+        constants.characterPosition[2] = characterPreview->feetZ;
+        constants.characterPosition[3] = 1.0f;
+    }
+
+    static_assert(sizeof(constants) <= kFrameConstantUploadBytes);
+    UploadBuffer& frameConstantsUpload = m_overlayConstantUploads[m_currentFrameIndex];
+    if (void* mapped = frameConstantsUpload.GetMappedData()) {
+        std::memcpy(mapped, &constants, sizeof(constants));
+    }
+
+    cmdList->SetGraphicsRootConstantBufferView(0, frameConstantsUpload.GetGPUVirtualAddress());
+    cmdList->SetGraphicsRootDescriptorTable(1, materialPaletteSRV.gpu);
+    cmdList->DrawInstanced(3, 1, 0, 0);
 }
 
 void Renderer::RenderCrosshair(ID3D12GraphicsCommandList* cmdList) {
@@ -735,6 +941,26 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
         D3D12_DESCRIPTOR_RANGE_TYPE_SRV
     });
 
+    // u0: Optional render ownership counters. This is sampled diagnostic
+    // instrumentation, not part of the renderer's correctness path.
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        0,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+    });
+    pipelineDesc.rootParams.push_back({
+        RootParamType::Constants32Bit,
+        1,
+        0,
+        D3D12_SHADER_VISIBILITY_ALL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        4
+    });
+
     // Static sampler s0
     pipelineDesc.staticSamplers.push_back({
         0,  // register s0
@@ -752,9 +978,26 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
     // No input layout needed for fullscreen triangle
     pipelineDesc.inputLayout.clear();
 
-    // No depth testing for fullscreen pass
-    pipelineDesc.depthEnable = false;
-    pipelineDesc.cullMode = D3D12_CULL_MODE_NONE;
+    // Sparse raster surfaces are the foreground owner and write depth/stencil
+    // first. The fullscreen raymarch is now a background/color pass only: it
+    // shades pixels whose stencil is still zero, but does not publish depth
+    // ownership because it no longer writes SV_Depth.
+    pipelineDesc.depthEnable = true;
+    pipelineDesc.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pipelineDesc.depthFunc = D3D12_COMPARISON_FUNC_LESS;
+    pipelineDesc.stencilEnable = true;
+    pipelineDesc.stencilReadMask = 0xFFu;
+    pipelineDesc.stencilWriteMask = 0x00u;
+    pipelineDesc.frontStencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
+    pipelineDesc.frontStencilPassOp = D3D12_STENCIL_OP_KEEP;
+    pipelineDesc.frontStencilFailOp = D3D12_STENCIL_OP_KEEP;
+    pipelineDesc.frontStencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    pipelineDesc.dsvFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    // Sparse extracted faces are emitted with outward CCW winding in the
+    // engine's world-space convention. Tell D3D about that contract so
+    // fixed-function backface culling can reject hidden faces before raster.
+    pipelineDesc.frontCounterClockwise = true;
+    pipelineDesc.cullMode = D3D12_CULL_MODE_BACK;
 
     auto result = m_fullscreenPipeline.Initialize(device, pipelineDesc);
     if (!result) {
@@ -814,6 +1057,110 @@ Result<void> Renderer::CreateSparseSurfacePipeline(ID3D12Device* device) {
         1,
         D3D12_DESCRIPTOR_RANGE_TYPE_SRV
     });
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        0,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+    });
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        2,
+        0,
+        D3D12_SHADER_VISIBILITY_VERTEX,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        3,
+        0,
+        D3D12_SHADER_VISIBILITY_VERTEX,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    pipelineDesc.staticSamplers.push_back({
+        0,
+        0,
+        D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_SHADER_VISIBILITY_PIXEL
+    });
+    pipelineDesc.rtvFormats.push_back(DXGI_FORMAT_R8G8B8A8_UNORM);
+    D3D12_INPUT_ELEMENT_DESC faceVertexElement = {};
+    faceVertexElement.SemanticName = "FACEVERTEX";
+    faceVertexElement.SemanticIndex = 0;
+    faceVertexElement.Format = DXGI_FORMAT_R32_UINT;
+    faceVertexElement.InputSlot = 0;
+    faceVertexElement.AlignedByteOffset = 0;
+    faceVertexElement.InputSlotClass = D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+    faceVertexElement.InstanceDataStepRate = 0;
+    pipelineDesc.inputLayout.push_back(faceVertexElement);
+    pipelineDesc.depthEnable = true;
+    pipelineDesc.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    pipelineDesc.depthFunc = D3D12_COMPARISON_FUNC_LESS;
+    pipelineDesc.stencilEnable = true;
+    pipelineDesc.stencilReadMask = 0xFFu;
+    pipelineDesc.stencilWriteMask = 0xFFu;
+    pipelineDesc.frontStencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    pipelineDesc.frontStencilPassOp = D3D12_STENCIL_OP_REPLACE;
+    pipelineDesc.frontStencilFailOp = D3D12_STENCIL_OP_KEEP;
+    pipelineDesc.frontStencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    pipelineDesc.dsvFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    pipelineDesc.cullMode = D3D12_CULL_MODE_NONE;
+
+    auto result = m_sparseSurfacePipeline.Initialize(device, pipelineDesc);
+    if (!result) {
+        return Error("Failed to create sparse surface pipeline: {}", result.error());
+    }
+    spdlog::info("Sparse surface pipeline created successfully");
+    return {};
+}
+
+Result<void> Renderer::CreateOverlayPipeline(ID3D12Device* device) {
+    std::filesystem::path vsPath = m_config.shaderPath / "Graphics" / "VS_Fullscreen.hlsl";
+    std::filesystem::path psPath = m_config.shaderPath / "Graphics" / "PS_Overlay.hlsl";
+
+    CompiledShader overlayVS = m_fullscreenVS;
+    if (!overlayVS.IsValid()) {
+        auto vsResult = m_shaderCompiler.CompileVertexShader(vsPath, L"main", m_config.debugShaders);
+        if (!vsResult) {
+            return Error("Failed to compile overlay vertex shader: {}", vsResult.error());
+        }
+        overlayVS = vsResult.value();
+    }
+
+    auto psResult = m_shaderCompiler.CompilePixelShader(psPath, L"main", m_config.debugShaders);
+    if (!psResult) {
+        return Error("Failed to compile overlay pixel shader: {}", psResult.error());
+    }
+    m_overlayPS = psResult.value();
+    if (!m_overlayPS.IsValid()) {
+        return Error("Overlay pixel shader compilation failed: {}", m_overlayPS.errors);
+    }
+
+    GraphicsPipelineDesc pipelineDesc;
+    pipelineDesc.vertexShader = overlayVS;
+    pipelineDesc.pixelShader = m_overlayPS;
+    pipelineDesc.debugName = "OverlayPipeline";
+    pipelineDesc.rootParams.push_back({
+        RootParamType::ConstantBuffer,
+        0,
+        0,
+        D3D12_SHADER_VISIBILITY_ALL
+    });
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        1,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
     pipelineDesc.staticSamplers.push_back({
         0,
         0,
@@ -825,15 +1172,46 @@ Result<void> Renderer::CreateSparseSurfacePipeline(ID3D12Device* device) {
     });
     pipelineDesc.rtvFormats.push_back(DXGI_FORMAT_R8G8B8A8_UNORM);
     pipelineDesc.inputLayout.clear();
-    pipelineDesc.depthEnable = true;
-    pipelineDesc.dsvFormat = DXGI_FORMAT_D32_FLOAT;
+    pipelineDesc.depthEnable = false;
+    pipelineDesc.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pipelineDesc.stencilEnable = false;
+    pipelineDesc.dsvFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
     pipelineDesc.cullMode = D3D12_CULL_MODE_NONE;
+    pipelineDesc.blendEnable = true;
 
-    auto result = m_sparseSurfacePipeline.Initialize(device, pipelineDesc);
+    auto result = m_overlayPipeline.Initialize(device, pipelineDesc);
     if (!result) {
-        return Error("Failed to create sparse surface pipeline: {}", result.error());
+        return Error("Failed to create overlay pipeline: {}", result.error());
     }
-    spdlog::info("Sparse surface pipeline created successfully");
+
+    spdlog::info("Overlay pipeline created successfully");
+    return {};
+}
+
+Result<void> Renderer::CreateSparseSurfaceDrawCommandSignature(ID3D12Device* device) {
+    if (!device) {
+        return Error("Renderer::CreateSparseSurfaceDrawCommandSignature - device is null");
+    }
+
+    D3D12_INDIRECT_ARGUMENT_DESC argument = {};
+    argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+
+    D3D12_COMMAND_SIGNATURE_DESC desc = {};
+    desc.ByteStride = sizeof(uint32_t) * 5u;
+    desc.NumArgumentDescs = 1u;
+    desc.pArgumentDescs = &argument;
+    desc.NodeMask = 0u;
+
+    HRESULT hr = device->CreateCommandSignature(
+        &desc,
+        nullptr,
+        IID_PPV_ARGS(&m_sparseSurfaceDrawSignature));
+    if (FAILED(hr)) {
+        return Error("Failed to create sparse surface draw command signature: HRESULT 0x{:08x}",
+            static_cast<uint32_t>(hr));
+    }
+
+    spdlog::info("Sparse surface indirect draw command signature created");
     return {};
 }
 
@@ -885,13 +1263,13 @@ Result<void> Renderer::CreateDepthBuffer() {
     m_depthBuffer.Reset();
 
     D3D12_CLEAR_VALUE clearValue = {};
-    clearValue.Format = DXGI_FORMAT_D32_FLOAT;
+    clearValue.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     clearValue.DepthStencil.Depth = 1.0f;
     clearValue.DepthStencil.Stencil = 0;
 
     auto heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
     auto depthDesc = CD3DX12_RESOURCE_DESC::Tex2D(
-        DXGI_FORMAT_D32_FLOAT,
+        DXGI_FORMAT_D24_UNORM_S8_UINT,
         static_cast<UINT64>(std::max(1u, m_width)),
         static_cast<UINT>(std::max(1u, m_height)),
         1,
@@ -912,11 +1290,11 @@ Result<void> Renderer::CreateDepthBuffer() {
     }
 
     D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
-    dsvDesc.Format = DXGI_FORMAT_D32_FLOAT;
+    dsvDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
     dsvDesc.Flags = D3D12_DSV_FLAG_NONE;
     device->CreateDepthStencilView(m_depthBuffer.Get(), &dsvDesc, m_dsvHandle.cpu);
-    spdlog::debug("Created sparse surface depth buffer {}x{}", m_width, m_height);
+    spdlog::debug("Created sparse surface depth/stencil buffer {}x{}", m_width, m_height);
     return {};
 }
 

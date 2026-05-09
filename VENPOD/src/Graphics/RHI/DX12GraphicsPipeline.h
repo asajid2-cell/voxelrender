@@ -72,7 +72,17 @@ struct GraphicsPipelineDesc {
     D3D12_PRIMITIVE_TOPOLOGY_TYPE primitiveTopology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     D3D12_CULL_MODE cullMode = D3D12_CULL_MODE_NONE;
     D3D12_FILL_MODE fillMode = D3D12_FILL_MODE_SOLID;
+    bool frontCounterClockwise = false;
     bool depthEnable = false;
+    D3D12_DEPTH_WRITE_MASK depthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+    D3D12_COMPARISON_FUNC depthFunc = D3D12_COMPARISON_FUNC_LESS;
+    bool stencilEnable = false;
+    UINT8 stencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    UINT8 stencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+    D3D12_COMPARISON_FUNC frontStencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    D3D12_STENCIL_OP frontStencilPassOp = D3D12_STENCIL_OP_KEEP;
+    D3D12_STENCIL_OP frontStencilFailOp = D3D12_STENCIL_OP_KEEP;
+    D3D12_STENCIL_OP frontStencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
     bool blendEnable = false;
 
     // Multi-sampling
