@@ -35,6 +35,7 @@ struct SparseSurfaceBrickRange {
 };
 
 constexpr uint32_t kSparseSurfaceRangeValid = 1u;
+constexpr uint32_t kSparseSurfaceRangeTombstone = 2u;
 constexpr uint32_t kSparseSurfaceDirectionMaskShift = 8u;
 constexpr uint32_t kSparseSurfaceDirectionMaskBits = 0x3Fu;
 
@@ -51,6 +52,7 @@ inline uint32_t SparseSurfaceRecordDirectionMask(uint32_t flags) {
     return (flags >> kSparseSurfaceDirectionMaskShift) & kSparseSurfaceDirectionMaskBits;
 }
 
+uint32_t BuildSparseSurfaceDirectionMask(const SparseSurfaceFace* faces, uint32_t faceCount);
 uint32_t BuildSparseSurfaceDirectionMask(const std::vector<SparseSurfaceFace>& faces);
 
 struct SparseSurfaceDrawArgs {
@@ -114,6 +116,7 @@ std::vector<SparseSurfaceClusterRecord> BuildSparseSurfaceClusters(
 
 struct SparseSurfaceDrawBatch {
     BrickCoord coord;
+    const SparseSurfaceFace* faces = nullptr;
     uint32_t firstFace = 0;
     uint32_t faceCount = 0;
 };
@@ -153,12 +156,14 @@ struct SparseSurfaceGpuSnapshot {
     // acknowledged after the GPU copy command was emitted successfully.
     std::vector<SparseSurfaceDirtyBrick> dirtyBricks;
     std::vector<SparseSurfaceDirtyBrick> removedBricks;
+    uint32_t deferredDirtyBricks = 0;
     uint32_t rangeCount = 0;
     uint32_t rangeTableCapacity = 0;
     uint32_t drawCommandCount = 0;
     uint32_t serial = 0;
     uint32_t candidateBricks = 0;
     uint32_t visibleBricks = 0;
+    uint32_t visibleFaceCount = 0;
     uint32_t culledBricks = 0;
     uint32_t lookaheadVisibleBricks = 0;
 };
@@ -189,6 +194,9 @@ struct SparseSurfaceVisibilityConfig {
     float lookaheadCameraX = 0.0f;
     float lookaheadCameraY = 0.0f;
     float lookaheadCameraZ = 0.0f;
+    // Prevent isolated extracted bricks from drawing as detached panels while
+    // the surrounding surface shell is still being generated/uploaded.
+    bool requireHorizontalNeighborCoverage = false;
 };
 
 class SparseSurfaceCache {
@@ -198,10 +206,14 @@ public:
     bool UpdateBrick(
         const GeneratedSparseBrick& brick,
         const SparseNeighborSampler& neighborSampler = {});
+    bool UpdateBrickWithExtractedFaces(
+        const GeneratedSparseBrick& brick,
+        SparseSurfaceExtractionResult&& extracted);
     bool UpdateBrickRegion(
         const GeneratedSparseBrick& brick,
         const SparseSurfaceLocalRegion& region,
         const SparseNeighborSampler& neighborSampler = {});
+    bool MarkKnownEmptySurface(const BrickCoord& coord);
     bool RemoveBrick(const BrickCoord& coord);
     void Clear();
 
@@ -210,7 +222,12 @@ public:
     bool BuildContiguousFaceList(std::vector<SparseSurfaceFace>& outFaces) const;
     bool BuildGpuSnapshot(
         SparseSurfaceGpuSnapshot& outSnapshot,
-        const SparseSurfaceVisibilityConfig* visibility = nullptr) const;
+        const SparseSurfaceVisibilityConfig* visibility = nullptr,
+        bool includeSurfaceRecords = true,
+        bool includeFacePayloads = true) const;
+    bool BuildDirtyPayloadGpuSnapshot(
+        SparseSurfaceGpuSnapshot& outSnapshot,
+        uint32_t maxDirtyBricks = 0) const;
     void MarkGpuUploadComplete(
         uint32_t completedSerial,
         const std::vector<BrickCoord>& uploadedPayloadBricks,

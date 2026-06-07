@@ -1,9 +1,13 @@
 #include "Renderer.h"
+#include "Graphics/BackbufferCapture.h"
 #include "RHI/d3dx12.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <type_traits>
 
 namespace VENPOD::Graphics {
 
@@ -40,9 +44,155 @@ struct FrameConstantsCpu {
     float backgroundOwnershipParams[4]; // x = mid start, y = far handoff, z = mid end, w = valid
     float midResidencyParams[4];  // x/y = height/voxel coverage, z/w = resident height/voxel counts
     float farOwnershipParams[4];  // x = ready, y = upload coverage, z = page coverage, w = effective quality
+    float exactNearParams[4];     // x = exact sparse voxel distance, y = world seed bits, z/w = mid voxel handoff coverage/worst ring
+    float surfaceRasterParams[4]; // x = public exact sparse surface draw/resolve distance, y/z = background stats/defer flags
 };
 
-static_assert(sizeof(FrameConstantsCpu) == 336);
+static_assert(sizeof(FrameConstantsCpu) == 368);
+static_assert(std::is_standard_layout_v<FrameConstantsCpu>);
+static_assert(offsetof(FrameConstantsCpu, cameraPosition) == 0u);
+static_assert(offsetof(FrameConstantsCpu, cameraForward) == 16u);
+static_assert(offsetof(FrameConstantsCpu, cameraRight) == 32u);
+static_assert(offsetof(FrameConstantsCpu, cameraUp) == 48u);
+static_assert(offsetof(FrameConstantsCpu, sunDirection) == 64u);
+static_assert(offsetof(FrameConstantsCpu, gridSizeX) == 80u);
+static_assert(offsetof(FrameConstantsCpu, gridSizeY) == 84u);
+static_assert(offsetof(FrameConstantsCpu, gridSizeZ) == 88u);
+static_assert(offsetof(FrameConstantsCpu, voxelScale) == 92u);
+static_assert(offsetof(FrameConstantsCpu, viewportWidth) == 96u);
+static_assert(offsetof(FrameConstantsCpu, viewportHeight) == 100u);
+static_assert(offsetof(FrameConstantsCpu, frameIndex) == 104u);
+static_assert(offsetof(FrameConstantsCpu, debugMode) == 108u);
+static_assert(offsetof(FrameConstantsCpu, regionOrigin) == 112u);
+static_assert(offsetof(FrameConstantsCpu, brushPosition) == 128u);
+static_assert(offsetof(FrameConstantsCpu, brushParams) == 144u);
+static_assert(offsetof(FrameConstantsCpu, characterPosition) == 160u);
+static_assert(offsetof(FrameConstantsCpu, farFieldParams) == 176u);
+static_assert(offsetof(FrameConstantsCpu, renderBudgetParams) == 192u);
+static_assert(offsetof(FrameConstantsCpu, farFieldGridParams) == 208u);
+static_assert(offsetof(FrameConstantsCpu, sparseNearParams) == 224u);
+static_assert(offsetof(FrameConstantsCpu, midFieldParams) == 240u);
+static_assert(offsetof(FrameConstantsCpu, surfaceParams) == 256u);
+static_assert(offsetof(FrameConstantsCpu, nearOwnershipParams) == 272u);
+static_assert(offsetof(FrameConstantsCpu, backgroundOwnershipParams) == 288u);
+static_assert(offsetof(FrameConstantsCpu, midResidencyParams) == 304u);
+static_assert(offsetof(FrameConstantsCpu, farOwnershipParams) == 320u);
+static_assert(offsetof(FrameConstantsCpu, exactNearParams) == 336u);
+static_assert(offsetof(FrameConstantsCpu, surfaceRasterParams) == 352u);
+
+float FiniteOr(float value, float fallback) {
+    return std::isfinite(value) ? value : fallback;
+}
+
+float ClampFinite(float value, float minValue, float maxValue, float fallback) {
+    return std::clamp(FiniteOr(value, fallback), minValue, maxValue);
+}
+
+float NonNegativeFiniteOr(float value, float fallback) {
+    return std::max(0.0f, FiniteOr(value, fallback));
+}
+
+float FloatBitsFromUint32(uint32_t value) {
+    float bits = 0.0f;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+float VectorLength(float x, float y, float z) {
+    return std::sqrt((x * x) + (y * y) + (z * z));
+}
+
+const Renderer::BrushPreview* SelectPublicBrushPreview(
+    const Renderer::BrushPreview* brushPreview,
+    const Renderer::CameraParams& camera)
+{
+    if (!brushPreview || !brushPreview->hasValidPosition) {
+        return nullptr;
+    }
+
+    constexpr float kMinBrushPreviewDistance = 16.0f;
+    constexpr float kBrushPreviewDistanceScale = 6.0f;
+    constexpr float kMaxBrushPreviewAngularRadius = 0.16f;
+    constexpr float kMaxBrushPreviewScreenHalfHeight = 0.22f;
+
+    const float radius = brushPreview->radius;
+    if (!std::isfinite(radius) || radius <= 0.0f) {
+        return nullptr;
+    }
+
+    const float toBrushX = brushPreview->posX - camera.posX;
+    const float toBrushY = brushPreview->posY - camera.posY;
+    const float toBrushZ = brushPreview->posZ - camera.posZ;
+    const float distToCenter = VectorLength(toBrushX, toBrushY, toBrushZ);
+    if (!std::isfinite(distToCenter) || distToCenter <= 0.001f) {
+        return nullptr;
+    }
+
+    const float minDistance = std::max(radius * kBrushPreviewDistanceScale, kMinBrushPreviewDistance);
+    if (distToCenter < minDistance) {
+        return nullptr;
+    }
+
+    const float forwardLength = VectorLength(camera.forwardX, camera.forwardY, camera.forwardZ);
+    if (!std::isfinite(forwardLength) || forwardLength <= 0.001f) {
+        return nullptr;
+    }
+
+    const float invDist = 1.0f / distToCenter;
+    const float invForwardLength = 1.0f / forwardLength;
+    const float forwardDot =
+        ((toBrushX * invDist) * (camera.forwardX * invForwardLength)) +
+        ((toBrushY * invDist) * (camera.forwardY * invForwardLength)) +
+        ((toBrushZ * invDist) * (camera.forwardZ * invForwardLength));
+    if (!std::isfinite(forwardDot) || forwardDot <= 0.05f) {
+        return nullptr;
+    }
+
+    const float radiusOverDistance = std::clamp(radius / distToCenter, 0.0f, 1.0f);
+    const float angularRadius = std::asin(radiusOverDistance);
+    if (!std::isfinite(angularRadius) || angularRadius > kMaxBrushPreviewAngularRadius) {
+        return nullptr;
+    }
+
+    const float tanHalfFov = std::tan(std::clamp(camera.fov, 0.1f, 3.0f) * 0.5f);
+    const float screenHalfHeight = std::tan(angularRadius) / std::max(tanHalfFov, 0.001f);
+    if (!std::isfinite(screenHalfHeight) || screenHalfHeight > kMaxBrushPreviewScreenHalfHeight) {
+        return nullptr;
+    }
+
+    return brushPreview;
+}
+
+void LogSuppressedBrushPreview(
+    const Renderer::BrushPreview* brushPreview,
+    const Renderer::CameraParams& camera,
+    const char* passName)
+{
+    if (!brushPreview || !brushPreview->hasValidPosition || (camera.frameIndex % 30u) != 0u) {
+        return;
+    }
+
+    const float toBrushX = brushPreview->posX - camera.posX;
+    const float toBrushY = brushPreview->posY - camera.posY;
+    const float toBrushZ = brushPreview->posZ - camera.posZ;
+    const float distToCenter = VectorLength(toBrushX, toBrushY, toBrushZ);
+    const float radiusOverDistance =
+        (std::isfinite(distToCenter) && distToCenter > 0.001f)
+            ? std::clamp(brushPreview->radius / distToCenter, 0.0f, 1.0f)
+            : 1.0f;
+    const float angularRadius = std::asin(radiusOverDistance);
+    const float tanHalfFov = std::tan(std::clamp(camera.fov, 0.1f, 3.0f) * 0.5f);
+    const float screenHalfHeight = std::tan(angularRadius) / std::max(tanHalfFov, 0.001f);
+    spdlog::warn(
+        "BRUSH_PREVIEW_SUPPRESSED pass={} frame={} radius={:.2f} dist={:.2f} angularRad={:.3f} screenHalfHeight={:.3f}",
+        passName,
+        camera.frameIndex,
+        brushPreview->radius,
+        distToCenter,
+        angularRadius,
+        screenHalfHeight);
+}
 
 }
 
@@ -69,6 +219,17 @@ Result<void> Renderer::Initialize(
     if (!result) {
         return Error("Failed to initialize descriptor heap manager: {}", result.error());
     }
+    m_imguiReservedSrv = m_heapManager.AllocateShaderVisibleCbvSrvUav();
+    if (!m_imguiReservedSrv.IsValid()) {
+        return Error("Failed to reserve shader-visible descriptor 0 for ImGui");
+    }
+    if (m_imguiReservedSrv.heapIndex != 0) {
+        spdlog::warn(
+            "Reserved shader-visible descriptor {} for ImGui; expected index 0",
+            m_imguiReservedSrv.heapIndex);
+    } else {
+        spdlog::info("Reserved shader-visible descriptor 0 for ImGui");
+    }
 
     // Initialize shader compiler
     result = m_shaderCompiler.Initialize();
@@ -87,6 +248,12 @@ Result<void> Renderer::Initialize(
     result = CreateDepthBuffer();
     if (!result) {
         return Error("Failed to create depth buffer: {}", result.error());
+    }
+    if (UseBackgroundPassSplit()) {
+        result = CreateBackgroundPassResources();
+        if (!result) {
+            return Error("Failed to create background pass resources: {}", result.error());
+        }
     }
 
     for (uint32_t i = 0; i < VENPOD::Window::BUFFER_COUNT; ++i) {
@@ -118,7 +285,7 @@ Result<void> Renderer::Initialize(
     }
     result = m_dummyRenderOwnershipUAV.Initialize(
         device.GetDevice(),
-        sizeof(uint32_t) * 16u,
+        sizeof(uint32_t) * 21u,
         BufferUsage::StructuredBuffer | BufferUsage::UnorderedAccess,
         sizeof(uint32_t),
         "DummyRenderOwnershipUAV");
@@ -143,6 +310,12 @@ Result<void> Renderer::Initialize(
     if (!result) {
         return Error("Failed to create overlay pipeline: {}", result.error());
     }
+    if (UseBackgroundPassSplit()) {
+        result = CreateBackgroundCompositePipeline(device.GetDevice());
+        if (!result) {
+            return Error("Failed to create background composite pipeline: {}", result.error());
+        }
+    }
     result = CreateSparseSurfaceDrawCommandSignature(device.GetDevice());
     if (!result) {
         return Error("Failed to create sparse surface draw command signature: {}", result.error());
@@ -162,6 +335,7 @@ void Renderer::Shutdown() {
         upload.Shutdown();
     }
     m_dummyRenderOwnershipUAV.Shutdown();
+    DestroyBackgroundPassResources();
 
     // Free RTV handles
     for (auto& handle : m_rtvHandles) {
@@ -177,13 +351,98 @@ void Renderer::Shutdown() {
     m_fullscreenPipeline.Shutdown();
     m_sparseSurfacePipeline.Shutdown();
     m_overlayPipeline.Shutdown();
+    m_backgroundCompositePipeline.Shutdown();
     m_sparseSurfaceDrawSignature.Reset();
     m_shaderCompiler.Shutdown();
+    if (m_imguiReservedSrv.IsValid()) {
+        m_heapManager.FreeShaderVisibleCbvSrvUav(m_imguiReservedSrv);
+    }
     m_heapManager.Shutdown();
 
     m_device = nullptr;
     m_commandQueue = nullptr;
     m_window = nullptr;
+}
+
+bool Renderer::UseBackgroundPassSplit() const {
+    return m_config.backgroundPassEnabled &&
+        std::isfinite(m_config.backgroundPassScale) &&
+        m_config.backgroundPassScale > 0.0f &&
+        m_config.backgroundPassScale < 0.999f;
+}
+
+Renderer::BackgroundPassInfo Renderer::GetBackgroundPassInfo() const {
+    BackgroundPassInfo info = {};
+    info.active = UseBackgroundPassSplit() && m_backgroundPassColor.Get() != nullptr;
+    info.fullWidth = m_width;
+    info.fullHeight = m_height;
+    info.backgroundWidth = info.active ? m_backgroundPassWidth : m_width;
+    info.backgroundHeight = info.active ? m_backgroundPassHeight : m_height;
+    info.scale = m_config.backgroundPassScale;
+    info.surfaceRaymarchFill = m_backgroundPassSurfaceRaymarchFillLastFrame;
+    info.clearProbe = m_config.backgroundPassClearProbe;
+    info.forceColor = m_config.backgroundPassForceColor;
+    info.compositeDebug = m_config.backgroundPassCompositeDebug;
+    info.compositeForceColor = m_config.backgroundPassCompositeForceColor;
+    return info;
+}
+
+bool Renderer::QueueBackgroundPassCapture(
+    ID3D12GraphicsCommandList* cmdList,
+    uint32_t frameNumber,
+    const std::filesystem::path& outputPath,
+    PendingBackbufferCapture& outCapture)
+{
+    if (!cmdList || !m_device || !UseBackgroundPassSplit() || !m_backgroundPassColor.Get()) {
+        return false;
+    }
+    return QueueTextureCapture(
+        m_device->GetDevice(),
+        cmdList,
+        m_backgroundPassColor.Get(),
+        m_backgroundPassColorState,
+        m_backgroundPassColorState,
+        frameNumber,
+        outputPath,
+        "background_pass_frame",
+        outCapture);
+}
+
+void Renderer::SetViewportAndScissor(
+    ID3D12GraphicsCommandList* cmdList,
+    uint32_t width,
+    uint32_t height)
+{
+    if (!cmdList) {
+        return;
+    }
+    const uint32_t safeWidth = std::max(1u, width);
+    const uint32_t safeHeight = std::max(1u, height);
+    D3D12_VIEWPORT viewport = {};
+    viewport.Width = static_cast<float>(safeWidth);
+    viewport.Height = static_cast<float>(safeHeight);
+    viewport.MinDepth = 0.0f;
+    viewport.MaxDepth = 1.0f;
+    cmdList->RSSetViewports(1, &viewport);
+
+    D3D12_RECT scissor = {};
+    scissor.right = static_cast<LONG>(safeWidth);
+    scissor.bottom = static_cast<LONG>(safeHeight);
+    cmdList->RSSetScissorRects(1, &scissor);
+}
+
+void Renderer::SetMainRenderTarget(ID3D12GraphicsCommandList* cmdList) {
+    if (!cmdList || !m_window) {
+        return;
+    }
+    const uint32_t frameIndex = m_currentFrameIndex % VENPOD::Window::BUFFER_COUNT;
+    if (!m_rtvHandles[frameIndex].IsValid()) {
+        return;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_rtvHandles[frameIndex].cpu;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = m_dsvHandle.cpu;
+    cmdList->OMSetRenderTargets(1, &rtvHandle, FALSE, m_dsvHandle.IsValid() ? &dsvHandle : nullptr);
+    SetViewportAndScissor(cmdList, m_width, m_height);
 }
 
 void Renderer::BeginFrame(ID3D12GraphicsCommandList* cmdList, uint32_t frameIndex) {
@@ -203,25 +462,11 @@ void Renderer::BeginFrame(ID3D12GraphicsCommandList* cmdList, uint32_t frameInde
     cmdList->ResourceBarrier(1, &barrier);
 
     // Set render target
-    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_rtvHandles[frameIndex].cpu;
-    D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = m_dsvHandle.cpu;
-    cmdList->OMSetRenderTargets(1, &rtvHandle, FALSE, m_dsvHandle.IsValid() ? &dsvHandle : nullptr);
-
-    // Set viewport and scissor
-    D3D12_VIEWPORT viewport = {};
-    viewport.Width = static_cast<float>(m_width);
-    viewport.Height = static_cast<float>(m_height);
-    viewport.MinDepth = 0.0f;
-    viewport.MaxDepth = 1.0f;
-    cmdList->RSSetViewports(1, &viewport);
-
-    D3D12_RECT scissor = {};
-    scissor.right = static_cast<LONG>(m_width);
-    scissor.bottom = static_cast<LONG>(m_height);
-    cmdList->RSSetScissorRects(1, &scissor);
+    SetMainRenderTarget(cmdList);
 
     // Clear render target
-    const float clearColor[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_rtvHandles[frameIndex].cpu;
+    const float clearColor[] = { 0.42f, 0.55f, 0.74f, 1.0f };
     cmdList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
     if (m_dsvHandle.IsValid()) {
         cmdList->ClearDepthStencilView(
@@ -287,31 +532,82 @@ void Renderer::RenderVoxels(
     ID3D12DescriptorHeap* heaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
     cmdList->SetDescriptorHeaps(1, heaps);
 
+    const bool useBackgroundPassSplit =
+        UseBackgroundPassSplit() &&
+        m_backgroundPassColor.Get() &&
+        m_backgroundPassDepth.Get() &&
+        m_backgroundPassRtv.IsValid() &&
+        m_backgroundPassDsv.IsValid() &&
+        m_backgroundPassSrv.IsValid() &&
+        m_backgroundCompositePipeline.GetPSO() != nullptr &&
+        m_backgroundCompositePipeline.GetRootSignature() != nullptr &&
+        m_backgroundPassWidth > 0 &&
+        m_backgroundPassHeight > 0;
+    const bool forceBackgroundPassColor =
+        useBackgroundPassSplit && m_config.backgroundPassForceColor;
+    const bool backgroundPassSurfaceRaymarchFillThisFrame =
+        useBackgroundPassSplit &&
+        (m_config.backgroundPassSurfaceRaymarchFill || camera.backgroundPassSurfaceRaymarchFill);
+    m_backgroundPassSurfaceRaymarchFillLastFrame = backgroundPassSurfaceRaymarchFillThisFrame;
+    if (useBackgroundPassSplit) {
+        if (m_backgroundPassColorState != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+            D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+                m_backgroundPassColor.Get(),
+                m_backgroundPassColorState,
+                D3D12_RESOURCE_STATE_RENDER_TARGET);
+            cmdList->ResourceBarrier(1, &barrier);
+            m_backgroundPassColorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        }
+
+        D3D12_CPU_DESCRIPTOR_HANDLE backgroundRtv = m_backgroundPassRtv.cpu;
+        D3D12_CPU_DESCRIPTOR_HANDLE backgroundDsv = m_backgroundPassDsv.cpu;
+        cmdList->OMSetRenderTargets(1, &backgroundRtv, FALSE, &backgroundDsv);
+        SetViewportAndScissor(cmdList, m_backgroundPassWidth, m_backgroundPassHeight);
+        const float defaultClearColor[] = { 0.42f, 0.55f, 0.74f, 1.0f };
+        const float probeClearColor[] = { 1.0f, 0.0f, 1.0f, 1.0f };
+        const float forceClearColor[] = { 0.0f, 0.95f, 0.28f, 1.0f };
+        const float* clearColor = forceBackgroundPassColor
+            ? forceClearColor
+            : (m_config.backgroundPassClearProbe ? probeClearColor : defaultClearColor);
+        cmdList->ClearRenderTargetView(backgroundRtv, clearColor, 0, nullptr);
+        cmdList->ClearDepthStencilView(
+            backgroundDsv,
+            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+            1.0f,
+            0,
+            0,
+            nullptr);
+    }
+
     // Bind fullscreen pipeline
     m_fullscreenPipeline.Bind(cmdList);
     cmdList->OMSetStencilRef(0);
 
     FrameConstantsCpu constants = {};
 
+    const float cameraPosX = FiniteOr(camera.posX, 0.0f);
+    const float cameraPosY = FiniteOr(camera.posY, 0.0f);
+    const float cameraPosZ = FiniteOr(camera.posZ, 0.0f);
+
     // Fill in camera data
-    constants.cameraPosition[0] = camera.posX;
-    constants.cameraPosition[1] = camera.posY;
-    constants.cameraPosition[2] = camera.posZ;
-    constants.cameraPosition[3] = camera.fov;
+    constants.cameraPosition[0] = cameraPosX;
+    constants.cameraPosition[1] = cameraPosY;
+    constants.cameraPosition[2] = cameraPosZ;
+    constants.cameraPosition[3] = ClampFinite(camera.fov, 1.0f, 175.0f, 75.0f);
 
-    constants.cameraForward[0] = camera.forwardX;
-    constants.cameraForward[1] = camera.forwardY;
-    constants.cameraForward[2] = camera.forwardZ;
-    constants.cameraForward[3] = camera.aspectRatio;
+    constants.cameraForward[0] = FiniteOr(camera.forwardX, 0.0f);
+    constants.cameraForward[1] = FiniteOr(camera.forwardY, 0.0f);
+    constants.cameraForward[2] = FiniteOr(camera.forwardZ, 1.0f);
+    constants.cameraForward[3] = std::max(0.001f, FiniteOr(camera.aspectRatio, 1.0f));
 
-    constants.cameraRight[0] = camera.rightX;
-    constants.cameraRight[1] = camera.rightY;
-    constants.cameraRight[2] = camera.rightZ;
+    constants.cameraRight[0] = FiniteOr(camera.rightX, 1.0f);
+    constants.cameraRight[1] = FiniteOr(camera.rightY, 0.0f);
+    constants.cameraRight[2] = FiniteOr(camera.rightZ, 0.0f);
     constants.cameraRight[3] = 0.0f;
 
-    constants.cameraUp[0] = camera.upX;
-    constants.cameraUp[1] = camera.upY;
-    constants.cameraUp[2] = camera.upZ;
+    constants.cameraUp[0] = FiniteOr(camera.upX, 0.0f);
+    constants.cameraUp[1] = FiniteOr(camera.upY, 1.0f);
+    constants.cameraUp[2] = FiniteOr(camera.upZ, 0.0f);
     constants.cameraUp[3] = 0.0f;
 
     // Sun direction (default lighting)
@@ -325,26 +621,31 @@ void Renderer::RenderVoxels(
     constants.gridSizeY = gridSizeY;
     constants.gridSizeZ = gridSizeZ;
     constants.voxelScale = 1.0f;
-    constants.viewportWidth = static_cast<float>(m_width);
-    constants.viewportHeight = static_cast<float>(m_height);
+    constants.viewportWidth = static_cast<float>(useBackgroundPassSplit ? m_backgroundPassWidth : m_width);
+    constants.viewportHeight = static_cast<float>(useBackgroundPassSplit ? m_backgroundPassHeight : m_height);
     constants.frameIndex = camera.frameIndex;
     constants.debugMode = camera.debugMode;
 
     // CRITICAL FIX: Fill in region origin for infinite world
     // Shader MUST subtract this from world coords to sample correct buffer location
-    constants.regionOrigin[0] = regionOriginX;
-    constants.regionOrigin[1] = regionOriginY;
-    constants.regionOrigin[2] = regionOriginZ;
+    constants.regionOrigin[0] = FiniteOr(regionOriginX, 0.0f);
+    constants.regionOrigin[1] = FiniteOr(regionOriginY, 0.0f);
+    constants.regionOrigin[2] = FiniteOr(regionOriginZ, 0.0f);
     constants.regionOrigin[3] = 0.0f;  // unused
 
-    // Fill in brush preview data (if provided)
-    if (brushPreview && brushPreview->hasValidPosition) {
-        constants.brushPosition[0] = brushPreview->posX;
-        constants.brushPosition[1] = brushPreview->posY;
-        constants.brushPosition[2] = brushPreview->posZ;
-        constants.brushPosition[3] = brushPreview->radius;
-        constants.brushParams[0] = static_cast<float>(brushPreview->material);
-        constants.brushParams[1] = static_cast<float>(brushPreview->shape);
+    // Fill in brush preview data only when its projection is small enough to
+    // be an edit affordance rather than a scene-covering dome.
+    const BrushPreview* visibleBrushPreview = SelectPublicBrushPreview(brushPreview, camera);
+    if (!visibleBrushPreview) {
+        LogSuppressedBrushPreview(brushPreview, camera, "raymarch");
+    }
+    if (visibleBrushPreview) {
+        constants.brushPosition[0] = visibleBrushPreview->posX;
+        constants.brushPosition[1] = visibleBrushPreview->posY;
+        constants.brushPosition[2] = visibleBrushPreview->posZ;
+        constants.brushPosition[3] = visibleBrushPreview->radius;
+        constants.brushParams[0] = static_cast<float>(visibleBrushPreview->material);
+        constants.brushParams[1] = static_cast<float>(visibleBrushPreview->shape);
         constants.brushParams[2] = 1.0f;  // hasValidPosition = true
         constants.brushParams[3] = 0.0f;
     } else {
@@ -383,28 +684,29 @@ void Renderer::RenderVoxels(
     constants.farFieldParams[0] = farFieldEnabled ? 1.0f : 0.0f;
     constants.farFieldParams[1] = farFieldEnabled ? static_cast<float>(sparseFarField->pageCount) : 0.0f;
     constants.farFieldParams[2] = farFieldEnabled ? static_cast<float>(sparseFarField->nodeCount) : 0.0f;
-    constants.farFieldParams[3] = farFieldEnabled ? sparseFarField->pageSize : 0.0f;
+    constants.farFieldParams[3] = farFieldEnabled ? NonNegativeFiniteOr(sparseFarField->pageSize, 0.0f) : 0.0f;
 
-    constants.renderBudgetParams[0] = camera.raymarchMaxDistance > 0.0f ? camera.raymarchMaxDistance : 2500.0f;
+    const float raymarchMaxDistance = FiniteOr(camera.raymarchMaxDistance, 2500.0f);
+    constants.renderBudgetParams[0] = raymarchMaxDistance > 0.0f ? raymarchMaxDistance : 2500.0f;
     constants.renderBudgetParams[1] = static_cast<float>(camera.raymarchMaxSteps > 0 ? camera.raymarchMaxSteps : 2048);
     // Far height/clipmap fallback is independent from the experimental far-SVO
     // buffers. Do not zero this when far-SVO is disabled, or the renderer loses
     // all non-SVO horizon continuity and reports most pixels as misses.
-    constants.renderBudgetParams[2] = std::clamp(camera.farFieldQuality, 0.0f, 1.0f);
-    constants.renderBudgetParams[3] = std::clamp(camera.renderQuality, 0.0f, 1.0f);
+    constants.renderBudgetParams[2] = ClampFinite(camera.farFieldQuality, 0.0f, 1.0f, 1.0f);
+    constants.renderBudgetParams[3] = ClampFinite(camera.renderQuality, 0.0f, 1.0f, 1.0f);
     constants.farFieldGridParams[0] = farFieldEnabled ? static_cast<float>(sparseFarField->pageRadius) : 0.0f;
     constants.farFieldGridParams[1] = farFieldEnabled ? static_cast<float>(sparseFarField->pageRadius * 2 + 1) : 0.0f;
-    constants.farFieldGridParams[2] = farFieldEnabled ? sparseFarField->rootMinY : 0.0f;
+    constants.farFieldGridParams[2] = farFieldEnabled ? FiniteOr(sparseFarField->rootMinY, 0.0f) : 0.0f;
     const bool renderOwnershipEnabled =
         camera.renderOwnershipStatsEnabled &&
         sparseNearField &&
         sparseNearField->renderOwnershipUAV.IsValid();
     constants.farFieldGridParams[3] = renderOwnershipEnabled ? 1.0f : 0.0f;
     const float farUploadCoverage = farFieldEnabled
-        ? std::clamp(sparseFarField->uploadCoverageRatio, 0.0f, 1.0f)
+        ? ClampFinite(sparseFarField->uploadCoverageRatio, 0.0f, 1.0f, 0.0f)
         : 0.0f;
     const float farPageCoverage = farFieldEnabled
-        ? std::clamp(sparseFarField->pageCoverageRatio, 0.0f, 1.0f)
+        ? ClampFinite(sparseFarField->pageCoverageRatio, 0.0f, 1.0f, 0.0f)
         : 0.0f;
     const bool farReady =
         farFieldEnabled &&
@@ -414,7 +716,14 @@ void Renderer::RenderVoxels(
     constants.farOwnershipParams[0] = farReady ? 1.0f : 0.0f;
     constants.farOwnershipParams[1] = farUploadCoverage;
     constants.farOwnershipParams[2] = farPageCoverage;
-    constants.farOwnershipParams[3] = std::clamp(camera.farFieldQuality, 0.0f, 1.0f);
+    constants.farOwnershipParams[3] = ClampFinite(camera.farFieldQuality, 0.0f, 1.0f, 1.0f);
+    constants.exactNearParams[0] = NonNegativeFiniteOr(camera.exactNearDistance, 0.0f);
+    constants.exactNearParams[1] = FloatBitsFromUint32(camera.worldSeed);
+    constants.exactNearParams[2] = ClampFinite(camera.midFieldVoxelInterestCoverage, 0.0f, 1.0f, 0.0f);
+    constants.exactNearParams[3] = ClampFinite(camera.midFieldVoxelWorstRingCoverage, 0.0f, 1.0f, 0.0f);
+    constants.surfaceRasterParams[0] = NonNegativeFiniteOr(camera.surfaceRasterMaxDistance, 0.0f);
+    constants.surfaceRasterParams[1] = 0.0f;
+    constants.surfaceRasterParams[2] = 0.0f;
 
     const bool sparseNearEnabled =
         sparseNearField &&
@@ -443,7 +752,20 @@ void Renderer::RenderVoxels(
     if (sparseNearEnabled && sparseNearField->surfaceRaymarchFill) {
         sparseNearFlags |= 8u;
     }
+    if (sparseNearField && sparseNearField->voxelTerrainOnly) {
+        sparseNearFlags |= 16u;
+    }
+    if (sparseNearEnabled && sparseNearField->walkingMidVoxelDda) {
+        sparseNearFlags |= 32u;
+    }
+    if (useBackgroundPassSplit && !backgroundPassSurfaceRaymarchFillThisFrame) {
+        sparseNearFlags &= ~8u;
+    }
     constants.sparseNearParams[3] = static_cast<float>(sparseNearFlags);
+    const float safeMidStartDistance = NonNegativeFiniteOr(camera.midFieldStartDistance, 480.0f);
+    const float safeMidEndDistance =
+        std::max(safeMidStartDistance + 1.0f, FiniteOr(camera.midFieldEndDistance, safeMidStartDistance + 1.0f));
+    const float safeMidCellSize = std::max(4.0f, FiniteOr(camera.midFieldCellSize, 16.0f));
     const bool midClipmapEnabled =
         sparseNearEnabled &&
         sparseNearField->midClipmapEnabled &&
@@ -455,7 +777,7 @@ void Renderer::RenderVoxels(
         sparseNearField->midVoxelClipmapSamplesSRV.IsValid() &&
         sparseNearField->midClipmapTileCount > 0 &&
         sparseNearField->midClipmapTileSampleSide > 0 &&
-        camera.midFieldEndDistance > camera.midFieldStartDistance;
+        safeMidEndDistance > safeMidStartDistance;
     const bool surfaceEnabled =
         sparseNearEnabled &&
         sparseNearField->surfaceEnabled &&
@@ -463,29 +785,35 @@ void Renderer::RenderVoxels(
         sparseNearField->surfaceRangesSRV.IsValid() &&
         sparseNearField->surfaceRangeCount > 0;
     constants.midFieldParams[0] = midClipmapEnabled ? 1.0f : 0.0f;
-    constants.midFieldParams[1] = midClipmapEnabled ? std::max(0.0f, camera.midFieldStartDistance) : 0.0f;
-    constants.midFieldParams[2] = midClipmapEnabled ? std::max(camera.midFieldStartDistance, camera.midFieldEndDistance) : 0.0f;
-    constants.midFieldParams[3] = midClipmapEnabled ? std::max(4.0f, camera.midFieldCellSize) : 0.0f;
+    constants.midFieldParams[1] = midClipmapEnabled ? safeMidStartDistance : 0.0f;
+    constants.midFieldParams[2] = midClipmapEnabled ? safeMidEndDistance : 0.0f;
+    constants.midFieldParams[3] = midClipmapEnabled ? safeMidCellSize : 0.0f;
     constants.surfaceParams[0] = surfaceEnabled ? 1.0f : 0.0f;
     constants.surfaceParams[1] = surfaceEnabled ? static_cast<float>(sparseNearField->surfaceFaceCount) : 0.0f;
     constants.surfaceParams[2] = surfaceEnabled ? static_cast<float>(sparseNearField->surfaceRangeCount) : 0.0f;
     constants.surfaceParams[3] = surfaceEnabled ? static_cast<float>(sparseNearField->surfaceRangeTableCapacity) : 0.0f;
-    constants.nearOwnershipParams[0] = sparseNearEnabled ? sparseNearField->ownershipCenterX : camera.posX;
-    constants.nearOwnershipParams[1] = sparseNearEnabled ? sparseNearField->ownershipCenterY : camera.posY;
-    constants.nearOwnershipParams[2] = sparseNearEnabled ? sparseNearField->ownershipCenterZ : camera.posZ;
-    constants.nearOwnershipParams[3] = sparseNearEnabled ? std::max(0.0f, sparseNearField->ownershipRadius) : 0.0f;
-    const float midStartDistance = std::max(0.0f, camera.midFieldStartDistance);
-    const float midEndDistance = std::max(midStartDistance + 1.0f, camera.midFieldEndDistance);
-    const float fallbackFarHandoffDistance = midStartDistance + (midEndDistance - midStartDistance) * 0.62f;
-    const float farHandoffDistance = camera.midFieldFarHandoffDistance > 0.0f
-        ? std::clamp(camera.midFieldFarHandoffDistance, midStartDistance, midEndDistance)
+    constants.nearOwnershipParams[0] =
+        sparseNearEnabled ? FiniteOr(sparseNearField->ownershipCenterX, cameraPosX) : cameraPosX;
+    constants.nearOwnershipParams[1] =
+        sparseNearEnabled ? FiniteOr(sparseNearField->ownershipCenterY, cameraPosY) : cameraPosY;
+    constants.nearOwnershipParams[2] =
+        sparseNearEnabled ? FiniteOr(sparseNearField->ownershipCenterZ, cameraPosZ) : cameraPosZ;
+    constants.nearOwnershipParams[3] =
+        sparseNearEnabled ? NonNegativeFiniteOr(sparseNearField->ownershipRadius, 0.0f) : 0.0f;
+    const float fallbackFarHandoffDistance =
+        safeMidStartDistance + (safeMidEndDistance - safeMidStartDistance) * 0.62f;
+    const float requestedFarHandoffDistance = FiniteOr(camera.midFieldFarHandoffDistance, fallbackFarHandoffDistance);
+    const float farHandoffDistance = requestedFarHandoffDistance > 0.0f
+        ? std::clamp(requestedFarHandoffDistance, safeMidStartDistance, safeMidEndDistance)
         : fallbackFarHandoffDistance;
-    constants.backgroundOwnershipParams[0] = midClipmapEnabled ? midStartDistance : 0.0f;
+    constants.backgroundOwnershipParams[0] = midClipmapEnabled ? safeMidStartDistance : 0.0f;
     constants.backgroundOwnershipParams[1] = midClipmapEnabled ? farHandoffDistance : 0.0f;
-    constants.backgroundOwnershipParams[2] = midClipmapEnabled ? midEndDistance : 0.0f;
+    constants.backgroundOwnershipParams[2] = midClipmapEnabled ? safeMidEndDistance : 0.0f;
     constants.backgroundOwnershipParams[3] = midClipmapEnabled ? 1.0f : 0.0f;
-    constants.midResidencyParams[0] = midClipmapEnabled ? std::clamp(camera.midFieldHeightCoverage, 0.0f, 1.0f) : 0.0f;
-    constants.midResidencyParams[1] = midClipmapEnabled ? std::clamp(camera.midFieldVoxelCoverage, 0.0f, 1.0f) : 0.0f;
+    constants.midResidencyParams[0] =
+        midClipmapEnabled ? ClampFinite(camera.midFieldHeightCoverage, 0.0f, 1.0f, 0.0f) : 0.0f;
+    constants.midResidencyParams[1] =
+        midClipmapEnabled ? ClampFinite(camera.midFieldVoxelCoverage, 0.0f, 1.0f, 0.0f) : 0.0f;
     constants.midResidencyParams[2] = midClipmapEnabled ? static_cast<float>(camera.midFieldResidentHeightTiles) : 0.0f;
     constants.midResidencyParams[3] = midClipmapEnabled ? static_cast<float>(camera.midFieldResidentVoxelBricks) : 0.0f;
 
@@ -522,8 +850,29 @@ void Renderer::RenderVoxels(
             ? sparseNearField->renderOwnershipUAV.gpu
             : m_dummyRenderOwnershipUAV.GetShaderVisibleUAV().gpu);
 
-    // Draw fullscreen triangle
-    cmdList->DrawInstanced(3, 1, 0, 0);
+    // Draw fullscreen triangle. The force-color probe intentionally leaves the
+    // lower-resolution target at a known clear color to test RTV/SRV/composite
+    // plumbing without touching PS_Raymarch.
+    if (!forceBackgroundPassColor) {
+        cmdList->DrawInstanced(3, 1, 0, 0);
+    }
+
+    if (useBackgroundPassSplit) {
+        D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_backgroundPassColor.Get(),
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        cmdList->ResourceBarrier(1, &barrier);
+        m_backgroundPassColorState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+        SetMainRenderTarget(cmdList);
+        m_backgroundCompositePipeline.Bind(cmdList);
+        ID3D12DescriptorHeap* compositeHeaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
+        cmdList->SetDescriptorHeaps(1, compositeHeaps);
+        cmdList->OMSetStencilRef(0);
+        cmdList->SetGraphicsRootDescriptorTable(0, m_backgroundPassSrv.gpu);
+        cmdList->DrawInstanced(3, 1, 0, 0);
+    }
 }
 
 void Renderer::RenderSparseSurfaceFaces(
@@ -591,12 +940,18 @@ void Renderer::RenderSparseSurfaceFaces(
     constants.renderBudgetParams[2] = camera.farFieldQuality;
     constants.renderBudgetParams[3] = camera.renderQuality;
     constants.frameIndex = camera.frameIndex;
+    constants.debugMode = camera.debugMode;
     constants.farFieldGridParams[3] =
         (camera.renderOwnershipStatsEnabled && renderOwnershipUAV && renderOwnershipUAV->IsValid())
             ? 1.0f
             : 0.0f;
     constants.surfaceParams[0] = 1.0f;
     constants.surfaceParams[1] = static_cast<float>(drawableFaceCount);
+    constants.exactNearParams[0] = NonNegativeFiniteOr(camera.exactNearDistance, 0.0f);
+    constants.nearOwnershipParams[3] = camera.surfaceRasterMaxDistance;
+    constants.surfaceRasterParams[0] = NonNegativeFiniteOr(camera.surfaceRasterMaxDistance, 0.0f);
+    constants.surfaceRasterParams[1] = 0.0f;
+    constants.surfaceRasterParams[2] = 0.0f;
 
     static_assert(sizeof(constants) <= kFrameConstantUploadBytes);
     UploadBuffer& frameConstantsUpload = m_sparseSurfaceConstantUploads[m_currentFrameIndex];
@@ -645,7 +1000,11 @@ void Renderer::RenderOverlays(
     if (!cmdList || !materialPaletteSRV.IsValid()) {
         return;
     }
-    const bool hasBrush = brushPreview && brushPreview->hasValidPosition && brushPreview->radius > 0.0f;
+    const BrushPreview* visibleBrushPreview = SelectPublicBrushPreview(brushPreview, camera);
+    if (!visibleBrushPreview) {
+        LogSuppressedBrushPreview(brushPreview, camera, "overlay");
+    }
+    const bool hasBrush = visibleBrushPreview != nullptr;
     const bool hasCharacter = characterPreview && characterPreview->visible;
     if (!hasBrush && !hasCharacter) {
         return;
@@ -678,12 +1037,12 @@ void Renderer::RenderOverlays(
     constants.debugMode = camera.debugMode;
 
     if (hasBrush) {
-        constants.brushPosition[0] = brushPreview->posX;
-        constants.brushPosition[1] = brushPreview->posY;
-        constants.brushPosition[2] = brushPreview->posZ;
-        constants.brushPosition[3] = brushPreview->radius;
-        constants.brushParams[0] = static_cast<float>(brushPreview->material);
-        constants.brushParams[1] = static_cast<float>(brushPreview->shape);
+        constants.brushPosition[0] = visibleBrushPreview->posX;
+        constants.brushPosition[1] = visibleBrushPreview->posY;
+        constants.brushPosition[2] = visibleBrushPreview->posZ;
+        constants.brushPosition[3] = visibleBrushPreview->radius;
+        constants.brushParams[0] = static_cast<float>(visibleBrushPreview->material);
+        constants.brushParams[1] = static_cast<float>(visibleBrushPreview->shape);
         constants.brushParams[2] = 1.0f;
     }
     if (hasCharacter) {
@@ -719,7 +1078,17 @@ Result<void> Renderer::OnResize(uint32_t width, uint32_t height) {
     if (!result) {
         return result;
     }
-    return CreateDepthBuffer();
+    result = CreateDepthBuffer();
+    if (!result) {
+        return result;
+    }
+    if (UseBackgroundPassSplit()) {
+        result = CreateBackgroundPassResources();
+        if (!result) {
+            return result;
+        }
+    }
+    return {};
 }
 
 Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
@@ -951,16 +1320,6 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
         1,
         D3D12_DESCRIPTOR_RANGE_TYPE_UAV
     });
-    pipelineDesc.rootParams.push_back({
-        RootParamType::Constants32Bit,
-        1,
-        0,
-        D3D12_SHADER_VISIBILITY_ALL,
-        1,
-        D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-        4
-    });
-
     // Static sampler s0
     pipelineDesc.staticSamplers.push_back({
         0,  // register s0
@@ -997,7 +1356,14 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
     // engine's world-space convention. Tell D3D about that contract so
     // fixed-function backface culling can reject hidden faces before raster.
     pipelineDesc.frontCounterClockwise = true;
-    pipelineDesc.cullMode = D3D12_CULL_MODE_BACK;
+    // The sparse-surface VS already rejects back-facing extracted faces using
+    // the packed face normal and SV_ClipDistance. Keep fixed-function culling
+    // disabled here: the generated quads are reconstructed in shader space,
+    // and a winding/clip convention mismatch can drop valid exact faces before
+    // they write the foreground stencil mask. When that happens, the later
+    // fullscreen mid/far raymarch owns pixels even though exact surface draw
+    // records exist and are closer.
+    pipelineDesc.cullMode = D3D12_CULL_MODE_NONE;
 
     auto result = m_fullscreenPipeline.Initialize(device, pipelineDesc);
     if (!result) {
@@ -1111,7 +1477,8 @@ Result<void> Renderer::CreateSparseSurfacePipeline(ID3D12Device* device) {
     pipelineDesc.frontStencilFailOp = D3D12_STENCIL_OP_KEEP;
     pipelineDesc.frontStencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
     pipelineDesc.dsvFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    pipelineDesc.cullMode = D3D12_CULL_MODE_NONE;
+    pipelineDesc.frontCounterClockwise = true;
+    pipelineDesc.cullMode = D3D12_CULL_MODE_BACK;
 
     auto result = m_sparseSurfacePipeline.Initialize(device, pipelineDesc);
     if (!result) {
@@ -1185,6 +1552,86 @@ Result<void> Renderer::CreateOverlayPipeline(ID3D12Device* device) {
     }
 
     spdlog::info("Overlay pipeline created successfully");
+    return {};
+}
+
+Result<void> Renderer::CreateBackgroundCompositePipeline(ID3D12Device* device) {
+    if (!UseBackgroundPassSplit()) {
+        return {};
+    }
+    std::filesystem::path psPath = m_config.shaderPath / "Graphics" / "PS_BackgroundComposite.hlsl";
+
+    CompiledShader compositeVS = m_fullscreenVS;
+    if (!compositeVS.IsValid()) {
+        std::filesystem::path vsPath = m_config.shaderPath / "Graphics" / "VS_Fullscreen.hlsl";
+        auto vsResult = m_shaderCompiler.CompileVertexShader(vsPath, L"main", m_config.debugShaders);
+        if (!vsResult) {
+            return Error("Failed to compile background composite vertex shader: {}", vsResult.error());
+        }
+        compositeVS = vsResult.value();
+    }
+
+    ShaderCompileOptions psOptions;
+    psOptions.entryPoint = L"main";
+    psOptions.target = L"ps_6_0";
+    psOptions.debugInfo = m_config.debugShaders;
+    psOptions.optimizationLevel3 = true;
+    if (m_config.backgroundPassCompositeForceColor) {
+        psOptions.defines.push_back(L"VENPOD_BACKGROUND_COMPOSITE_FORCE_COLOR=1");
+    }
+    auto psResult = m_shaderCompiler.CompileFromFile(psPath, psOptions);
+    if (!psResult) {
+        return Error("Failed to compile background composite pixel shader: {}", psResult.error());
+    }
+    m_backgroundCompositePS = psResult.value();
+    if (!m_backgroundCompositePS.IsValid()) {
+        return Error("Background composite pixel shader compilation failed: {}", m_backgroundCompositePS.errors);
+    }
+
+    GraphicsPipelineDesc pipelineDesc;
+    pipelineDesc.vertexShader = compositeVS;
+    pipelineDesc.pixelShader = m_backgroundCompositePS;
+    pipelineDesc.debugName = "BackgroundCompositePipeline";
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        0,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    pipelineDesc.staticSamplers.push_back({
+        0,
+        0,
+        D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_SHADER_VISIBILITY_PIXEL
+    });
+    pipelineDesc.rtvFormats.push_back(DXGI_FORMAT_R8G8B8A8_UNORM);
+    pipelineDesc.inputLayout.clear();
+    pipelineDesc.depthEnable = false;
+    pipelineDesc.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pipelineDesc.depthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    pipelineDesc.stencilEnable = !m_config.backgroundPassCompositeDebug;
+    pipelineDesc.stencilReadMask = 0xFFu;
+    pipelineDesc.stencilWriteMask = 0x00u;
+    pipelineDesc.frontStencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
+    pipelineDesc.frontStencilPassOp = D3D12_STENCIL_OP_KEEP;
+    pipelineDesc.frontStencilFailOp = D3D12_STENCIL_OP_KEEP;
+    pipelineDesc.frontStencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    pipelineDesc.dsvFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    pipelineDesc.cullMode = D3D12_CULL_MODE_NONE;
+
+    auto result = m_backgroundCompositePipeline.Initialize(device, pipelineDesc);
+    if (!result) {
+        return Error("Failed to create background composite pipeline: {}", result.error());
+    }
+
+    spdlog::info(
+        "Background composite pipeline created successfully forceColor={}",
+        m_config.backgroundPassCompositeForceColor ? 1 : 0);
     return {};
 }
 
@@ -1295,6 +1742,156 @@ Result<void> Renderer::CreateDepthBuffer() {
     dsvDesc.Flags = D3D12_DSV_FLAG_NONE;
     device->CreateDepthStencilView(m_depthBuffer.Get(), &dsvDesc, m_dsvHandle.cpu);
     spdlog::debug("Created sparse surface depth/stencil buffer {}x{}", m_width, m_height);
+    return {};
+}
+
+void Renderer::DestroyBackgroundPassResources() {
+    if (m_backgroundPassSrv.IsValid()) {
+        m_heapManager.FreeShaderVisibleCbvSrvUav(m_backgroundPassSrv);
+    }
+    if (m_backgroundPassStagingSrv.IsValid()) {
+        m_heapManager.FreeStagingCbvSrvUav(m_backgroundPassStagingSrv);
+    }
+    if (m_backgroundPassRtv.IsValid()) {
+        m_heapManager.FreeRtv(m_backgroundPassRtv);
+    }
+    if (m_backgroundPassDsv.IsValid()) {
+        m_heapManager.FreeDsv(m_backgroundPassDsv);
+    }
+    m_backgroundPassColor.Reset();
+    m_backgroundPassDepth.Reset();
+    m_backgroundPassColorState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_backgroundPassWidth = 0;
+    m_backgroundPassHeight = 0;
+}
+
+Result<void> Renderer::CreateBackgroundPassResources() {
+    if (!UseBackgroundPassSplit()) {
+        DestroyBackgroundPassResources();
+        return {};
+    }
+    if (!m_device) {
+        return Error("Device not initialized");
+    }
+    ID3D12Device* device = m_device->GetDevice();
+    if (!device) {
+        return Error("D3D12 device not initialized");
+    }
+
+    DestroyBackgroundPassResources();
+
+    const float scale = std::clamp(m_config.backgroundPassScale, 0.25f, 1.0f);
+    m_backgroundPassWidth = std::max(
+        1u,
+        static_cast<uint32_t>(std::lround(static_cast<float>(std::max(1u, m_width)) * scale)));
+    m_backgroundPassHeight = std::max(
+        1u,
+        static_cast<uint32_t>(std::lround(static_cast<float>(std::max(1u, m_height)) * scale)));
+
+    auto heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+    D3D12_CLEAR_VALUE colorClear = {};
+    colorClear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    colorClear.Color[0] = 0.42f;
+    colorClear.Color[1] = 0.55f;
+    colorClear.Color[2] = 0.74f;
+    colorClear.Color[3] = 1.0f;
+    auto colorDesc = CD3DX12_RESOURCE_DESC::Tex2D(
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        static_cast<UINT64>(m_backgroundPassWidth),
+        static_cast<UINT>(m_backgroundPassHeight),
+        1,
+        1,
+        1,
+        0,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    HRESULT hr = device->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &colorDesc,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        &colorClear,
+        IID_PPV_ARGS(&m_backgroundPassColor));
+    if (FAILED(hr)) {
+        DestroyBackgroundPassResources();
+        return Error("Failed to create background pass color target: 0x{:08X}", hr);
+    }
+    m_backgroundPassColor->SetName(L"BackgroundPassColor");
+    m_backgroundPassColorState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+    m_backgroundPassRtv = m_heapManager.AllocateRtv();
+    if (!m_backgroundPassRtv.IsValid()) {
+        DestroyBackgroundPassResources();
+        return Error("Failed to allocate background pass RTV");
+    }
+    device->CreateRenderTargetView(m_backgroundPassColor.Get(), nullptr, m_backgroundPassRtv.cpu);
+
+    m_backgroundPassStagingSrv = m_heapManager.AllocateStagingCbvSrvUav();
+    if (!m_backgroundPassStagingSrv.IsValid()) {
+        DestroyBackgroundPassResources();
+        return Error("Failed to allocate background pass staging SRV");
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+    srvDesc.Texture2D.MipLevels = 1;
+    srvDesc.Texture2D.PlaneSlice = 0;
+    srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+    device->CreateShaderResourceView(m_backgroundPassColor.Get(), &srvDesc, m_backgroundPassStagingSrv.cpu);
+    m_backgroundPassSrv = m_heapManager.CopyToShaderVisible(device, m_backgroundPassStagingSrv);
+    if (!m_backgroundPassSrv.IsValid()) {
+        DestroyBackgroundPassResources();
+        return Error("Failed to allocate background pass shader-visible SRV");
+    }
+    device->CreateShaderResourceView(m_backgroundPassColor.Get(), &srvDesc, m_backgroundPassSrv.cpu);
+
+    D3D12_CLEAR_VALUE depthClear = {};
+    depthClear.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    depthClear.DepthStencil.Depth = 1.0f;
+    depthClear.DepthStencil.Stencil = 0;
+    auto depthDesc = CD3DX12_RESOURCE_DESC::Tex2D(
+        DXGI_FORMAT_D24_UNORM_S8_UINT,
+        static_cast<UINT64>(m_backgroundPassWidth),
+        static_cast<UINT>(m_backgroundPassHeight),
+        1,
+        1,
+        1,
+        0,
+        D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+    hr = device->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &depthDesc,
+        D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        &depthClear,
+        IID_PPV_ARGS(&m_backgroundPassDepth));
+    if (FAILED(hr)) {
+        DestroyBackgroundPassResources();
+        return Error("Failed to create background pass depth target: 0x{:08X}", hr);
+    }
+    m_backgroundPassDepth->SetName(L"BackgroundPassDepth");
+
+    m_backgroundPassDsv = m_heapManager.AllocateDsv();
+    if (!m_backgroundPassDsv.IsValid()) {
+        DestroyBackgroundPassResources();
+        return Error("Failed to allocate background pass DSV");
+    }
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+    dsvDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    dsvDesc.Flags = D3D12_DSV_FLAG_NONE;
+    device->CreateDepthStencilView(m_backgroundPassDepth.Get(), &dsvDesc, m_backgroundPassDsv.cpu);
+
+    spdlog::info(
+        "Background pass resources created: {}x{} scale={:.3f} main={}x{} srvIndex={} stagingSrvIndex={}",
+        m_backgroundPassWidth,
+        m_backgroundPassHeight,
+        scale,
+        m_width,
+        m_height,
+        m_backgroundPassSrv.heapIndex,
+        m_backgroundPassStagingSrv.heapIndex);
     return {};
 }
 

@@ -1,11 +1,79 @@
 #include "PhysicsDispatcher.h"
+#include "SparseVoxelTypes.h"
 #include "TerrainConstants.h"
 #include "../Graphics/RHI/d3dx12.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace VENPOD::Simulation {
+
+namespace {
+
+constexpr float kMaxSparseDispatchRayDistance = 8192.0f;
+constexpr float kMaxSparseDispatchStepDistance = 512.0f;
+constexpr uint32_t kMaxSparseDispatchPhysicsPackets = 2048;
+constexpr uint32_t kMaxSparseDispatchEditDeltas = 8192;
+constexpr uint32_t kMaxSparseDispatchEditDeltaRanges = 2048;
+
+bool IsFiniteVec3(const glm::vec3& value) {
+    return std::isfinite(value.x) &&
+        std::isfinite(value.y) &&
+        std::isfinite(value.z);
+}
+
+bool CanFloorToInt32(float value) {
+    if (!std::isfinite(value)) {
+        return false;
+    }
+    const double floored = std::floor(static_cast<double>(value));
+    return floored >= static_cast<double>(std::numeric_limits<int32_t>::min()) &&
+        floored <= static_cast<double>(std::numeric_limits<int32_t>::max());
+}
+
+bool CanFloorVec3ToInt32(const glm::vec3& value) {
+    return CanFloorToInt32(value.x) &&
+        CanFloorToInt32(value.y) &&
+        CanFloorToInt32(value.z);
+}
+
+float ClampFinite(float value, float minValue, float maxValue, float fallback) {
+    return std::clamp(std::isfinite(value) ? value : fallback, minValue, maxValue);
+}
+
+bool IsPowerOfTwo(uint32_t value) {
+    return value != 0 && (value & (value - 1u)) == 0;
+}
+
+bool TryNormalizeFinite(const glm::vec3& value, glm::vec3& out) {
+    if (!IsFiniteVec3(value)) {
+        return false;
+    }
+    const double lengthSq =
+        static_cast<double>(value.x) * static_cast<double>(value.x) +
+        static_cast<double>(value.y) * static_cast<double>(value.y) +
+        static_cast<double>(value.z) * static_cast<double>(value.z);
+    if (!std::isfinite(lengthSq) || lengthSq <= 0.00000001) {
+        return false;
+    }
+    const double invLength = 1.0 / std::sqrt(lengthSq);
+    out = glm::vec3(
+        static_cast<float>(static_cast<double>(value.x) * invLength),
+        static_cast<float>(static_cast<double>(value.y) * invLength),
+        static_cast<float>(static_cast<double>(value.z) * invLength));
+    return true;
+}
+
+glm::vec3 NormalizeFiniteOr(const glm::vec3& value, const glm::vec3& fallback) {
+    glm::vec3 normalized;
+    if (TryNormalizeFinite(value, normalized)) {
+        return normalized;
+    }
+    return fallback;
+}
+
+} // namespace
 
 Result<void> PhysicsDispatcher::Initialize(
     ID3D12Device* device,
@@ -1247,7 +1315,20 @@ void PhysicsDispatcher::DispatchSparseRaycast(
 {
     if (!cmdList || !m_sparseRaycastPipeline.IsValid() || !m_heapManager ||
         !sparseBrickPoolSRV.IsValid() || !sparsePageTableSRV.IsValid() ||
-        !sparseOccupancySRV.IsValid() || !sparsePageGenerationSRV.IsValid()) {
+        !sparseOccupancySRV.IsValid() || !sparsePageGenerationSRV.IsValid() ||
+        maxBrickPages == 0 || pageTableCapacity == 0 ||
+        !IsFiniteVec3(rayOrigin) || !CanFloorVec3ToInt32(rayOrigin) ||
+        !std::isfinite(maxDistance) || maxDistance <= 0.0f) {
+        return;
+    }
+
+    glm::vec3 rayDir;
+    if (!TryNormalizeFinite(rayDirection, rayDir)) {
+        return;
+    }
+    const float boundedMaxDistance =
+        ClampFinite(maxDistance, 0.0f, kMaxSparseDispatchRayDistance, 192.0f);
+    if (boundedMaxDistance <= 0.0f) {
         return;
     }
 
@@ -1268,14 +1349,15 @@ void PhysicsDispatcher::DispatchSparseRaycast(
     constants.rayOriginX = rayOrigin.x;
     constants.rayOriginY = rayOrigin.y;
     constants.rayOriginZ = rayOrigin.z;
-    constants.maxDistance = std::max(maxDistance, 0.0f);
-    constants.rayDirX = rayDirection.x;
-    constants.rayDirY = rayDirection.y;
-    constants.rayDirZ = rayDirection.z;
+    constants.maxDistance = boundedMaxDistance;
+    constants.rayDirX = rayDir.x;
+    constants.rayDirY = rayDir.y;
+    constants.rayDirZ = rayDir.z;
     constants.flags = writeGroundResult ? 1.0f : 0.0f;
     constants.maxBrickPages = maxBrickPages;
     constants.pageTableCapacity = pageTableCapacity;
-    constants.maxSteps = static_cast<uint32_t>(std::clamp(maxDistance * 3.0f + 64.0f, 64.0f, 16384.0f));
+    constants.maxSteps = static_cast<uint32_t>(
+        std::clamp(boundedMaxDistance * 3.0f + 64.0f, 64.0f, 16384.0f));
 
     m_sparseRaycastPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
     m_sparseRaycastPipeline.SetRootDescriptorTable(cmdList, 1, sparseBrickPoolSRV.gpu);
@@ -1322,7 +1404,21 @@ void PhysicsDispatcher::DispatchSparseMissFeedback(
 {
     if (!cmdList || !m_sparseMissFeedbackPipeline.IsValid() || !m_heapManager ||
         !sparsePageTableSRV.IsValid() || !sparseMissFeedbackUAV.IsValid() ||
-        pageTableCapacity == 0 || maxRecords == 0 || rayGrid == 0) {
+        maxBrickPages == 0 || pageTableCapacity == 0 || maxRecords == 0 ||
+        rayGrid == 0 || !IsFiniteVec3(cameraOrigin) ||
+        !CanFloorVec3ToInt32(cameraOrigin) ||
+        !std::isfinite(maxDistance) || maxDistance <= 0.0f) {
+        return;
+    }
+
+    const glm::vec3 boundedForward = NormalizeFiniteOr(cameraForward, {0.0f, 0.0f, 1.0f});
+    const glm::vec3 boundedRight = NormalizeFiniteOr(cameraRight, {1.0f, 0.0f, 0.0f});
+    const glm::vec3 boundedUp = NormalizeFiniteOr(cameraUp, {0.0f, 1.0f, 0.0f});
+    const float boundedMaxDistance =
+        ClampFinite(maxDistance, 0.0f, kMaxSparseDispatchRayDistance, 192.0f);
+    const float boundedStepDistance =
+        ClampFinite(stepDistance, 1.0f, kMaxSparseDispatchStepDistance, 16.0f);
+    if (boundedMaxDistance <= 0.0f) {
         return;
     }
 
@@ -1348,22 +1444,23 @@ void PhysicsDispatcher::DispatchSparseMissFeedback(
     constants.cameraOriginX = cameraOrigin.x;
     constants.cameraOriginY = cameraOrigin.y;
     constants.cameraOriginZ = cameraOrigin.z;
-    constants.maxDistance = std::max(maxDistance, 0.0f);
-    constants.cameraForwardX = cameraForward.x;
-    constants.cameraForwardY = cameraForward.y;
-    constants.cameraForwardZ = cameraForward.z;
-    constants.stepDistance = std::max(stepDistance, 1.0f);
-    constants.cameraRightX = cameraRight.x;
-    constants.cameraRightY = cameraRight.y;
-    constants.cameraRightZ = cameraRight.z;
-    constants.tanHalfFov = std::tan(std::clamp(verticalFovRadians, 0.1f, 2.8f) * 0.5f);
-    constants.cameraUpX = cameraUp.x;
-    constants.cameraUpY = cameraUp.y;
-    constants.cameraUpZ = cameraUp.z;
-    constants.aspectRatio = std::clamp(aspectRatio, 0.25f, 4.0f);
+    constants.maxDistance = boundedMaxDistance;
+    constants.cameraForwardX = boundedForward.x;
+    constants.cameraForwardY = boundedForward.y;
+    constants.cameraForwardZ = boundedForward.z;
+    constants.stepDistance = boundedStepDistance;
+    constants.cameraRightX = boundedRight.x;
+    constants.cameraRightY = boundedRight.y;
+    constants.cameraRightZ = boundedRight.z;
+    constants.tanHalfFov =
+        std::tan(ClampFinite(verticalFovRadians, 0.1f, 2.8f, 1.04719755f) * 0.5f);
+    constants.cameraUpX = boundedUp.x;
+    constants.cameraUpY = boundedUp.y;
+    constants.cameraUpZ = boundedUp.z;
+    constants.aspectRatio = ClampFinite(aspectRatio, 0.25f, 4.0f, 1.7777778f);
     constants.maxBrickPages = maxBrickPages;
     constants.pageTableCapacity = pageTableCapacity;
-    constants.rayGrid = std::clamp(rayGrid, 1u, 8u);
+    constants.rayGrid = std::clamp(rayGrid, 1u, 16u);
     constants.maxRecords = maxRecords;
     constants.maxSteps = static_cast<uint32_t>(std::clamp(
         constants.maxDistance / constants.stepDistance + 1.0f,
@@ -1374,7 +1471,9 @@ void PhysicsDispatcher::DispatchSparseMissFeedback(
     m_sparseMissFeedbackPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
     m_sparseMissFeedbackPipeline.SetRootDescriptorTable(cmdList, 1, sparsePageTableSRV.gpu);
     m_sparseMissFeedbackPipeline.SetRootDescriptorTable(cmdList, 2, sparseMissFeedbackUAV.gpu);
-    cmdList->Dispatch(1, 1, 1);
+    const uint32_t groupCount =
+        std::max(1u, (constants.rayGrid + 7u) / 8u);
+    cmdList->Dispatch(groupCount, groupCount, 1);
 }
 
 void PhysicsDispatcher::DispatchSparseBrushFeedback(
@@ -1410,19 +1509,20 @@ void PhysicsDispatcher::DispatchSparseBrushFeedback(
         return;
     }
 
-    const int32_t radiusCeil = static_cast<int32_t>(std::ceil(radius)) + 2;
-    const int32_t centerX = static_cast<int32_t>(std::floor(worldPositionX));
-    const int32_t centerY = static_cast<int32_t>(std::floor(worldPositionY));
-    const int32_t centerZ = static_cast<int32_t>(std::floor(worldPositionZ));
-    const int32_t startX = centerX - radiusCeil;
-    const int32_t startY = centerY - radiusCeil;
-    const int32_t startZ = centerZ - radiusCeil;
-    const int32_t endX = static_cast<int32_t>(std::ceil(worldPositionX)) + radiusCeil + 1;
-    const int32_t endY = static_cast<int32_t>(std::ceil(worldPositionY)) + radiusCeil + 1;
-    const int32_t endZ = static_cast<int32_t>(std::ceil(worldPositionZ)) + radiusCeil + 1;
-    const uint32_t volumeX = static_cast<uint32_t>(std::max(0, endX - startX));
-    const uint32_t volumeY = static_cast<uint32_t>(std::max(0, endY - startY));
-    const uint32_t volumeZ = static_cast<uint32_t>(std::max(0, endZ - startZ));
+    SparseBrushVoxelBounds brushBounds;
+    if (!TryBuildSparseBrushVoxelBounds(
+            worldPositionX,
+            worldPositionY,
+            worldPositionZ,
+            radius,
+            strength,
+            &brushBounds)) {
+        return;
+    }
+
+    const uint32_t volumeX = static_cast<uint32_t>(brushBounds.endX - brushBounds.startX);
+    const uint32_t volumeY = static_cast<uint32_t>(brushBounds.endY - brushBounds.startY);
+    const uint32_t volumeZ = static_cast<uint32_t>(brushBounds.endZ - brushBounds.startZ);
     if (volumeX == 0 || volumeY == 0 || volumeZ == 0) {
         return;
     }
@@ -1442,14 +1542,14 @@ void PhysicsDispatcher::DispatchSparseBrushFeedback(
     constants.positionX = worldPositionX;
     constants.positionY = worldPositionY;
     constants.positionZ = worldPositionZ;
-    constants.radius = radius;
+    constants.radius = brushBounds.radius;
     constants.material = material;
     constants.mode = mode;
     constants.shape = shape;
-    constants.strength = strength;
-    constants.startX = startX;
-    constants.startY = startY;
-    constants.startZ = startZ;
+    constants.strength = brushBounds.strength;
+    constants.startX = brushBounds.startX;
+    constants.startY = brushBounds.startY;
+    constants.startZ = brushBounds.startZ;
     constants.volumeX = volumeX;
     constants.volumeY = volumeY;
     constants.volumeZ = volumeZ;
@@ -1502,7 +1602,15 @@ void PhysicsDispatcher::DispatchSparsePhysicsPackets(
         !sparseEditDeltaRangeTableSRV.IsValid() ||
         !sparsePhysicsPacketResultUAV.IsValid() ||
         !sparsePhysicsDiagnosticsUAV.IsValid() ||
-        packetCount == 0) {
+        packetCount == 0 ||
+        packetCount > kMaxSparseDispatchPhysicsPackets ||
+        pageTableCapacity == 0 ||
+        !IsPowerOfTwo(pageTableCapacity) ||
+        editDeltaCount > kMaxSparseDispatchEditDeltas ||
+        editDeltaRangeCount > kMaxSparseDispatchEditDeltaRanges ||
+        editDeltaRangeCount > editDeltaCount ||
+        (editDeltaRangeTableCapacity > 0 && !IsPowerOfTwo(editDeltaRangeTableCapacity)) ||
+        (editDeltaRangeCount > 0 && editDeltaRangeTableCapacity < editDeltaRangeCount)) {
         return;
     }
 

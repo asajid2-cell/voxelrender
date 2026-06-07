@@ -4,6 +4,7 @@
 
 #include <array>
 #include <algorithm>
+#include <limits>
 
 namespace VENPOD::Simulation {
 
@@ -33,6 +34,36 @@ uint32_t LocalVoxelAt(const GeneratedSparseBrick& brick, int32_t x, int32_t y, i
     return brick.voxels[index];
 }
 
+bool BrickHasFlag(const GeneratedSparseBrick& brick, BrickResidencyFlags flag) {
+    return (brick.flags & static_cast<uint32_t>(flag)) != 0u;
+}
+
+bool IsFullBrickRegion(
+    int32_t minX,
+    int32_t minY,
+    int32_t minZ,
+    int32_t maxX,
+    int32_t maxY,
+    int32_t maxZ)
+{
+    return minX == 0 &&
+        minY == 0 &&
+        minZ == 0 &&
+        maxX == SPARSE_BRICK_SIZE - 1 &&
+        maxY == SPARSE_BRICK_SIZE - 1 &&
+        maxZ == SPARSE_BRICK_SIZE - 1;
+}
+
+bool TryStepWorldVoxel(int32_t value, int32_t step, int32_t& out) {
+    const int64_t stepped = static_cast<int64_t>(value) + static_cast<int64_t>(step);
+    if (stepped < static_cast<int64_t>(std::numeric_limits<int32_t>::min()) ||
+        stepped > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+        return false;
+    }
+    out = static_cast<int32_t>(stepped);
+    return true;
+}
+
 uint32_t VoxelAtOrNeighbor(
     const GeneratedSparseBrick& brick,
     int32_t x,
@@ -49,9 +80,18 @@ uint32_t VoxelAtOrNeighbor(
         z >= 0 && z < SPARSE_BRICK_SIZE) {
         return LocalVoxelAt(brick, x, y, z);
     }
-    return neighborSampler
-        ? neighborSampler(worldX + dir.dx, worldY + dir.dy, worldZ + dir.dz)
-        : 0u;
+    if (!neighborSampler) {
+        return 0u;
+    }
+    int32_t neighborX = 0;
+    int32_t neighborY = 0;
+    int32_t neighborZ = 0;
+    if (!TryStepWorldVoxel(worldX, dir.dx, neighborX) ||
+        !TryStepWorldVoxel(worldY, dir.dy, neighborY) ||
+        !TryStepWorldVoxel(worldZ, dir.dz, neighborZ)) {
+        return 0u;
+    }
+    return neighborSampler(neighborX, neighborY, neighborZ);
 }
 
 void LocalFromFacePlane(
@@ -136,7 +176,41 @@ void AxisRangesForDirection(
 } // namespace
 
 bool SparseSurfaceExtractor::IsSolid(uint32_t voxel) {
-    return !VENPOD::Utils::IsAir(voxel);
+    const uint8_t material = VENPOD::Utils::UnpackMaterial(voxel);
+    return material != VENPOD::Utils::Material::Air &&
+        material != VENPOD::Utils::Material::Water;
+}
+
+bool IsWater(uint32_t voxel) {
+    return VENPOD::Utils::UnpackMaterial(voxel) == VENPOD::Utils::Material::Water;
+}
+
+bool IsAir(uint32_t voxel) {
+    return VENPOD::Utils::UnpackMaterial(voxel) == VENPOD::Utils::Material::Air;
+}
+
+bool IsRenderableSurfaceFace(
+    uint32_t voxel,
+    uint32_t neighborVoxel,
+    SparseFaceDirection direction)
+{
+    if (SparseSurfaceExtractor::IsSolid(voxel)) {
+        if (IsAir(neighborVoxel)) {
+            return true;
+        }
+        // Suppress solid top faces directly under water, but keep side/bottom
+        // banks so sparse terrain remains continuous where water coverage is
+        // not a complete screen-space owner.
+        return IsWater(neighborVoxel) && direction != SparseFaceDirection::PosY;
+    }
+
+    if (IsWater(voxel)) {
+        return (direction == SparseFaceDirection::PosY ||
+                direction == SparseFaceDirection::NegY) &&
+            IsAir(neighborVoxel);
+    }
+
+    return false;
 }
 
 SparseSurfaceExtractionResult SparseSurfaceExtractor::Extract(
@@ -155,21 +229,42 @@ SparseSurfaceExtractionResult SparseSurfaceExtractor::ExtractRegion(
     SparseSurfaceExtractionResult result;
     result.faces.reserve(256);
 
-    const int32_t baseX = brick.coord.x * SPARSE_BRICK_SIZE;
-    const int32_t baseY = brick.coord.y * SPARSE_BRICK_SIZE;
-    const int32_t baseZ = brick.coord.z * SPARSE_BRICK_SIZE;
     const int32_t minX = std::max<int32_t>(0, std::min<int32_t>(region.minX, SPARSE_BRICK_SIZE - 1));
     const int32_t minY = std::max<int32_t>(0, std::min<int32_t>(region.minY, SPARSE_BRICK_SIZE - 1));
     const int32_t minZ = std::max<int32_t>(0, std::min<int32_t>(region.minZ, SPARSE_BRICK_SIZE - 1));
     const int32_t maxX = std::max<int32_t>(minX, std::min<int32_t>(region.maxX, SPARSE_BRICK_SIZE - 1));
     const int32_t maxY = std::max<int32_t>(minY, std::min<int32_t>(region.maxY, SPARSE_BRICK_SIZE - 1));
     const int32_t maxZ = std::max<int32_t>(minZ, std::min<int32_t>(region.maxZ, SPARSE_BRICK_SIZE - 1));
+    int32_t baseX = 0;
+    int32_t baseY = 0;
+    int32_t baseZ = 0;
+    int32_t regionMaxWorldX = 0;
+    int32_t regionMaxWorldY = 0;
+    int32_t regionMaxWorldZ = 0;
+    if (!TryWorldVoxelFromBrickLocal(brick.coord.x, static_cast<uint8_t>(minX), &baseX) ||
+        !TryWorldVoxelFromBrickLocal(brick.coord.y, static_cast<uint8_t>(minY), &baseY) ||
+        !TryWorldVoxelFromBrickLocal(brick.coord.z, static_cast<uint8_t>(minZ), &baseZ) ||
+        !TryWorldVoxelFromBrickLocal(brick.coord.x, static_cast<uint8_t>(maxX), &regionMaxWorldX) ||
+        !TryWorldVoxelFromBrickLocal(brick.coord.y, static_cast<uint8_t>(maxY), &regionMaxWorldY) ||
+        !TryWorldVoxelFromBrickLocal(brick.coord.z, static_cast<uint8_t>(maxZ), &regionMaxWorldZ)) {
+        return result;
+    }
+    baseX -= minX;
+    baseY -= minY;
+    baseZ -= minZ;
 
-    for (int32_t z = minZ; z <= maxZ; ++z) {
-        for (int32_t y = minY; y <= maxY; ++y) {
-            for (int32_t x = minX; x <= maxX; ++x) {
-                if (IsSolid(LocalVoxelAt(brick, x, y, z))) {
-                    ++result.stats.solidVoxels;
+    const bool fullSolidBrick =
+        IsFullBrickRegion(minX, minY, minZ, maxX, maxY, maxZ) &&
+        BrickHasFlag(brick, BrickResidencyFlags::Solid);
+    if (fullSolidBrick) {
+        result.stats.solidVoxels = SPARSE_BRICK_VOXEL_COUNT;
+    } else {
+        for (int32_t z = minZ; z <= maxZ; ++z) {
+            for (int32_t y = minY; y <= maxY; ++y) {
+                for (int32_t x = minX; x <= maxX; ++x) {
+                    if (IsSolid(LocalVoxelAt(brick, x, y, z))) {
+                        ++result.stats.solidVoxels;
+                    }
                 }
             }
         }
@@ -200,6 +295,29 @@ SparseSurfaceExtractionResult SparseSurfaceExtractor::ExtractRegion(
             uMax,
             vMin,
             vMax);
+        if (fullSolidBrick) {
+            switch (dir.direction) {
+            case SparseFaceDirection::NegX:
+                fixedMin = fixedMax = 0;
+                break;
+            case SparseFaceDirection::PosX:
+                fixedMin = fixedMax = SPARSE_BRICK_SIZE - 1;
+                break;
+            case SparseFaceDirection::NegY:
+                fixedMin = fixedMax = 0;
+                break;
+            case SparseFaceDirection::PosY:
+                fixedMin = fixedMax = SPARSE_BRICK_SIZE - 1;
+                break;
+            case SparseFaceDirection::NegZ:
+                fixedMin = fixedMax = 0;
+                break;
+            case SparseFaceDirection::PosZ:
+            default:
+                fixedMin = fixedMax = SPARSE_BRICK_SIZE - 1;
+                break;
+            }
+        }
 
         for (int32_t fixed = fixedMin; fixed <= fixedMax; ++fixed) {
             for (auto& row : plane) {
@@ -216,7 +334,8 @@ SparseSurfaceExtractionResult SparseSurfaceExtractor::ExtractRegion(
                     int32_t z = 0;
                     LocalFromFacePlane(dir.direction, fixed, u, v, x, y, z);
                     const uint32_t voxel = LocalVoxelAt(brick, x, y, z);
-                    if (!IsSolid(voxel)) {
+                    if (!IsSolid(voxel) &&
+                        !(IsWater(voxel) && dir.direction == SparseFaceDirection::PosY)) {
                         continue;
                     }
 
@@ -233,7 +352,7 @@ SparseSurfaceExtractionResult SparseSurfaceExtractor::ExtractRegion(
                         worldZ,
                         dir,
                         neighborSampler);
-                    if (IsSolid(neighborVoxel)) {
+                    if (!IsRenderableSurfaceFace(voxel, neighborVoxel, dir.direction)) {
                         continue;
                     }
 
@@ -292,6 +411,22 @@ SparseSurfaceExtractionResult SparseSurfaceExtractor::ExtractRegion(
                         static_cast<uint32_t>(width),
                         static_cast<uint32_t>(height));
                     result.faces.push_back(face);
+
+                    if (dir.direction == SparseFaceDirection::PosY &&
+                        IsWater(SparseSurfacePayloadVoxel(payload)) &&
+                        face.worldY < std::numeric_limits<int32_t>::max()) {
+                        SparseSurfaceFace underside = face;
+                        underside.worldY = face.worldY + 1;
+                        underside.payload = PackSparseSurfacePayload(
+                            static_cast<uint32_t>(SparseFaceDirection::NegY),
+                            SparseSurfacePayloadVoxel(payload),
+                            static_cast<uint32_t>(width),
+                            static_cast<uint32_t>(height));
+                        result.faces.push_back(underside);
+                        result.stats.exposedFaces += static_cast<uint32_t>(width * height);
+                        result.stats.facesByDirection[static_cast<size_t>(SparseFaceDirection::NegY)] +=
+                            static_cast<uint32_t>(width * height);
+                    }
                 }
             }
         }

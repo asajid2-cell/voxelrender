@@ -2,8 +2,44 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace VENPOD::Simulation {
+
+namespace {
+
+uint32_t SaturatingAdd(uint32_t a, uint32_t b)
+{
+    return a > std::numeric_limits<uint32_t>::max() - b
+        ? std::numeric_limits<uint32_t>::max()
+        : a + b;
+}
+
+uint32_t SaturatingMul(uint32_t a, uint32_t b)
+{
+    return b != 0u && a > std::numeric_limits<uint32_t>::max() / b
+        ? std::numeric_limits<uint32_t>::max()
+        : a * b;
+}
+
+uint64_t SaturatingMul(uint64_t a, uint64_t b)
+{
+    return b != 0ull && a > std::numeric_limits<uint64_t>::max() / b
+        ? std::numeric_limits<uint64_t>::max()
+        : a * b;
+}
+
+uint32_t SaturatingScaleBudget(uint32_t budget, float scale)
+{
+    const long double scaled =
+        std::floor(static_cast<long double>(budget) * static_cast<long double>(scale) + 0.5L);
+    if (scaled >= static_cast<long double>(std::numeric_limits<uint32_t>::max())) {
+        return std::numeric_limits<uint32_t>::max();
+    }
+    return static_cast<uint32_t>(std::max(0.0L, scaled));
+}
+
+} // namespace
 
 SparseFramePressure SparseRuntimeBudgetScheduler::BuildFramePressure(
     const SparseFramePressureInput& input)
@@ -85,6 +121,14 @@ SparseOwnershipPressure SparseRuntimeBudgetScheduler::BuildOwnershipPressure(
         input.terrainPercent < input.minTerrainPercent
             ? input.minTerrainPercent - input.terrainPercent
             : 0u;
+    pressure.voxelTerrainDeficitPercent =
+        input.voxelTerrainPercent < input.minVoxelTerrainPercent
+            ? input.minVoxelTerrainPercent - input.voxelTerrainPercent
+            : 0u;
+    pressure.valleyAtmosphereExcessPercent =
+        input.valleyAtmospherePercent > input.maxValleyAtmospherePercent
+            ? input.valleyAtmospherePercent - input.maxValleyAtmospherePercent
+            : 0u;
     pressure.missExcessPercent =
         input.missPercent > input.maxMissPercent
             ? input.missPercent - input.maxMissPercent
@@ -95,6 +139,8 @@ SparseOwnershipPressure SparseRuntimeBudgetScheduler::BuildOwnershipPressure(
             : 0u;
 
     if (pressure.terrainDeficitPercent == 0u &&
+        pressure.voxelTerrainDeficitPercent == 0u &&
+        pressure.valleyAtmosphereExcessPercent == 0u &&
         pressure.missExcessPercent == 0u &&
         pressure.unsafeNearMissExcessPercent == 0u) {
         pressure.active = pressure.updatedCatchupFrames > 0;
@@ -105,11 +151,15 @@ SparseOwnershipPressure SparseRuntimeBudgetScheduler::BuildOwnershipPressure(
     pressure.level = 1u;
     if (pressure.missExcessPercent >= 10u ||
         pressure.unsafeNearMissExcessPercent >= 4u ||
+        pressure.valleyAtmosphereExcessPercent >= 4u ||
+        pressure.voxelTerrainDeficitPercent >= 8u ||
         pressure.terrainDeficitPercent >= 12u) {
         pressure.level = 2u;
     }
     if (pressure.missExcessPercent >= 24u ||
         pressure.unsafeNearMissExcessPercent >= 10u ||
+        pressure.valleyAtmosphereExcessPercent >= 12u ||
+        pressure.voxelTerrainDeficitPercent >= 20u ||
         pressure.terrainDeficitPercent >= 28u) {
         pressure.level = 3u;
     }
@@ -129,7 +179,7 @@ SparseMissFeedbackPlan SparseRuntimeBudgetScheduler::BuildMissFeedbackPlan(
     const SparseMissFeedbackPlanInput& input)
 {
     SparseMissFeedbackPlan plan;
-    plan.rayGrid = std::clamp(input.baseRayGrid, 1u, 8u);
+    plan.rayGrid = std::clamp(input.baseRayGrid, 1u, 16u);
     plan.distance = std::max(16u, input.baseDistance);
     plan.stride = std::max(4u, input.baseStride);
     plan.maxRecords = std::max(1u, input.maxRecords);
@@ -141,6 +191,12 @@ SparseMissFeedbackPlan SparseRuntimeBudgetScheduler::BuildMissFeedbackPlan(
     const uint32_t interval = std::max(1u, input.baseInterval);
     const bool intervalDue = interval <= 1u || (input.frameIndex % interval) == 0u;
     const bool unsafeNearMissObserved = input.unsafeNearMissPercent > 0u;
+    const uint32_t valleyAtmosphereExcess =
+        input.valleyAtmospherePercent > input.maxValleyAtmospherePercent
+            ? input.valleyAtmospherePercent - input.maxValleyAtmospherePercent
+            : 0u;
+    const bool valleyAtmosphereObserved =
+        input.allowValleyAtmosphereFeedback && valleyAtmosphereExcess > 0u;
     const bool feedbackReadbackUnhealthy =
         input.staleReadbackDrops > 0u || input.overflowLastRetire;
     const bool highOwnershipPressure = input.ownershipPressureLevel >= 2u;
@@ -148,19 +204,25 @@ SparseMissFeedbackPlan SparseRuntimeBudgetScheduler::BuildMissFeedbackPlan(
     const bool pendingBacklog =
         input.pendingRecords >= std::max(1u, plan.maxRecords / 2u);
 
-    plan.urgent = unsafeNearMissObserved || feedbackReadbackUnhealthy || highOwnershipPressure;
+    plan.urgent =
+        unsafeNearMissObserved ||
+        valleyAtmosphereObserved ||
+        feedbackReadbackUnhealthy ||
+        highOwnershipPressure;
     plan.dispatch =
         intervalDue ||
         plan.urgent ||
         (input.ownershipPressureLevel > 0u && pendingBacklog);
 
     if (plan.urgent) {
-        plan.rayGrid = std::max(plan.rayGrid, 7u);
-        plan.distance = std::max(plan.distance, 512u);
-        plan.stride = std::min(plan.stride, 8u);
+        plan.rayGrid = std::max(plan.rayGrid, 16u);
+        plan.distance = std::max(plan.distance, 768u);
+        plan.stride = std::min(plan.stride, 4u);
     }
-    if (severeOwnershipPressure || input.unsafeNearMissPercent >= 4u) {
-        plan.rayGrid = 8u;
+    if (severeOwnershipPressure ||
+        input.unsafeNearMissPercent >= 4u ||
+        valleyAtmosphereExcess >= 8u) {
+        plan.rayGrid = 16u;
         plan.distance = std::max(plan.distance, 768u);
         plan.stride = 4u;
     }
@@ -294,8 +356,7 @@ uint32_t SparseRuntimeBudgetScheduler::ScaleBudget(
         return 0;
     }
     const float safeScale = std::isfinite(scale) ? std::max(0.0f, scale) : 1.0f;
-    const uint32_t scaled =
-        static_cast<uint32_t>(std::floor(static_cast<float>(budget) * safeScale + 0.5f));
+    const uint32_t scaled = SaturatingScaleBudget(budget, safeScale);
     return std::max(minIfNonZero, scaled);
 }
 
@@ -322,7 +383,7 @@ uint32_t SparseRuntimeBudgetScheduler::BuildProcessingBudget(
         return budget;
     }
 
-    const uint32_t maxBudget = std::max(baseBudget, baseBudget * maxMultiplier);
+    const uint32_t maxBudget = std::max(baseBudget, SaturatingMul(baseBudget, maxMultiplier));
     if (budget >= maxBudget) {
         return budget;
     }
@@ -331,7 +392,7 @@ uint32_t SparseRuntimeBudgetScheduler::BuildProcessingBudget(
         runtimeDecision.pressureClass == SparseRuntimePressureClass::BacklogHeadroom;
     const bool idleWithLargeBacklog =
         runtimeDecision.pressureClass == SparseRuntimePressureClass::Idle &&
-        queuedWork > baseBudget * 16u;
+        queuedWork > SaturatingMul(baseBudget, 16u);
     if (!hasHeadroom && !idleWithLargeBacklog) {
         return budget;
     }
@@ -340,7 +401,7 @@ uint32_t SparseRuntimeBudgetScheduler::BuildProcessingBudget(
     const uint32_t catchup = std::min(
         maxBudget - budget,
         queuedWork / backlogDivisor);
-    return std::min(maxBudget, budget + catchup);
+    return std::min(maxBudget, SaturatingAdd(budget, catchup));
 }
 
 uint32_t SparseRuntimeBudgetScheduler::BuildEditedCatchupBudget(
@@ -394,10 +455,11 @@ SparseRequestBudgetDecision SparseRuntimeBudgetScheduler::BuildRequestBudgets(
     decision.visible = ScaleBudget(visibleBudget, runtimeDecision.protectedScale, 1u);
     decision.collision = ScaleBudget(collisionBudget, runtimeDecision.protectedScale, 1u);
     const uint32_t baseTotal = ScaleBudget(totalBudget, runtimeDecision.scale, 1u);
+    const uint32_t visibleAdmission = SaturatingAdd(decision.speculative, decision.visible);
     decision.total = std::max(
         baseTotal,
-        std::max(1u, decision.speculative + decision.visible));
-    decision.protectedHardTotal = decision.total + decision.collision;
+        std::max(1u, visibleAdmission));
+    decision.protectedHardTotal = SaturatingAdd(decision.total, decision.collision);
     return decision;
 }
 
@@ -424,7 +486,7 @@ SparseUploadBudgetDecision SparseRuntimeBudgetScheduler::BuildUploadBudgets(
 
     decision.hasProtectedBacklog = queuedEdited > 0 || queuedCollision > 0;
     const uint32_t protectedDesired = ScaleBudget(
-        std::max(queuedEdited + queuedCollision, 1u),
+        std::max(SaturatingAdd(queuedEdited, queuedCollision), 1u),
         runtimeDecision.protectedScale,
         decision.hasProtectedBacklog ? 1u : 0u);
     const uint32_t editedDesired = queuedEdited;
@@ -434,7 +496,7 @@ SparseUploadBudgetDecision SparseRuntimeBudgetScheduler::BuildUploadBudgets(
         ? protectedDesired - decision.edited
         : queuedCollision;
     decision.collision = reserve(queuedCollision, std::max(collisionDesired, queuedCollision));
-    decision.protectedTotal = decision.edited + decision.collision;
+    decision.protectedTotal = SaturatingAdd(decision.edited, decision.collision);
 
     const bool allowBackground =
         !decision.hasProtectedBacklog ||
@@ -466,7 +528,7 @@ SparseUploadBudgetDecision SparseRuntimeBudgetScheduler::BuildUploadBudgets(
                 std::max(speculativeDesired, onlySpeculativeBacklog ? 1u : 0u));
         }
     }
-    decision.backgroundTotal = decision.visible + decision.speculative;
+    decision.backgroundTotal = SaturatingAdd(decision.visible, decision.speculative);
     return decision;
 }
 
@@ -476,12 +538,13 @@ SparseFrameUploadPlan SparseRuntimeBudgetScheduler::BuildFrameUploadPlan(
     SparseFrameUploadPlan plan;
     plan.brickBudgets = input.brickBudgets;
     if (input.uploadBytesCapacity <= input.uploadBytesAlreadyUsed) {
-        plan.byteLimitedDefers =
-            (input.pageTableResetPending ? 1u : 0u) +
-            input.invalidationQueued +
-            input.publishQueued +
-            (input.midClipmapDirty ? 1u : 0u) +
-            plan.brickBudgets.total;
+        plan.byteLimitedDefers = SaturatingAdd(
+            SaturatingAdd(
+                SaturatingAdd(
+                    input.pageTableResetPending ? 1u : 0u,
+                    input.invalidationQueued),
+                SaturatingAdd(input.publishQueued, input.midClipmapDirty ? 1u : 0u)),
+            plan.brickBudgets.total);
         return plan;
     }
 
@@ -555,7 +618,7 @@ SparseFrameUploadPlan SparseRuntimeBudgetScheduler::BuildFrameUploadPlan(
         reserveBrickClass(plan.brickBudgets.collision);
     }
     plan.brickBudgets.protectedTotal =
-        plan.brickBudgets.edited + plan.brickBudgets.collision;
+        SaturatingAdd(plan.brickBudgets.edited, plan.brickBudgets.collision);
 
     if (!input.publishProtectedBacklog) {
         reservePublishes();
@@ -579,9 +642,9 @@ SparseFrameUploadPlan SparseRuntimeBudgetScheduler::BuildFrameUploadPlan(
         plan.brickBudgets.speculative = 0;
     }
     plan.brickBudgets.backgroundTotal =
-        plan.brickBudgets.visible + plan.brickBudgets.speculative;
+        SaturatingAdd(plan.brickBudgets.visible, plan.brickBudgets.speculative);
     plan.brickBudgets.total =
-        plan.brickBudgets.protectedTotal + plan.brickBudgets.backgroundTotal;
+        SaturatingAdd(plan.brickBudgets.protectedTotal, plan.brickBudgets.backgroundTotal);
 
     plan.remainingBytes = remaining;
     return plan;
@@ -614,11 +677,11 @@ SparsePhysicsBudgetDecision SparseRuntimeBudgetScheduler::BuildPhysicsBudgets(
     if (queuedBricks > baseBrickBudget &&
         (runtimeDecision.pressureClass == SparseRuntimePressureClass::Idle ||
          runtimeDecision.pressureClass == SparseRuntimePressureClass::BacklogHeadroom)) {
-        const uint32_t maxMoveBudget = std::max(baseMoveBudget, baseMoveBudget * 4u);
+        const uint32_t maxMoveBudget = std::max(baseMoveBudget, SaturatingMul(baseMoveBudget, 4u));
         const uint32_t catchup =
             std::min(maxMoveBudget - std::min(decision.moveBudget, maxMoveBudget),
-                     (queuedBricks / std::max(1u, baseBrickBudget)) * 32u);
-        decision.moveBudget = std::min(maxMoveBudget, decision.moveBudget + catchup);
+                     SaturatingMul(queuedBricks / std::max(1u, baseBrickBudget), 32u));
+        decision.moveBudget = std::min(maxMoveBudget, SaturatingAdd(decision.moveBudget, catchup));
     }
     return decision;
 }
@@ -646,6 +709,8 @@ SparseBackgroundRenderBudgetDecision SparseRuntimeBudgetScheduler::BuildBackgrou
         std::isfinite(input.midVoxelCoverage) ? std::clamp(input.midVoxelCoverage, 0.0f, 1.0f) : 0.0f);
     const float midVoxelPixelShare =
         std::isfinite(input.midVoxelPixelShare) ? std::clamp(input.midVoxelPixelShare, 0.0f, 1.0f) : 0.0f;
+    const float farSvoPixelShare =
+        std::isfinite(input.farSvoPixelShare) ? std::clamp(input.farSvoPixelShare, 0.0f, 1.0f) : 0.0f;
     const float farHeightPixelShare =
         std::isfinite(input.farHeightPixelShare) ? std::clamp(input.farHeightPixelShare, 0.0f, 1.0f) : 0.0f;
     const float skyPixelShare =
@@ -655,7 +720,7 @@ SparseBackgroundRenderBudgetDecision SparseRuntimeBudgetScheduler::BuildBackgrou
             ? std::clamp(input.backgroundPixelShare, 0.0f, 1.0f)
             : 1.0f;
     const float expensiveBackgroundPixelShare =
-        std::clamp(midVoxelPixelShare + farHeightPixelShare, 0.0f, 1.0f);
+        std::clamp(midVoxelPixelShare + farSvoPixelShare + farHeightPixelShare, 0.0f, 1.0f);
     const float expensiveScreenPixelShare =
         std::clamp(expensiveBackgroundPixelShare * backgroundPixelShare, 0.0f, 1.0f);
 
@@ -674,6 +739,11 @@ SparseBackgroundRenderBudgetDecision SparseRuntimeBudgetScheduler::BuildBackgrou
         backgroundPixelShare > 0.42f &&
         farHeightPixelShare > 0.42f &&
         gpuRaymarchMs > frameBudgetMs * 0.30f;
+    const bool farSvoDominantCost =
+        gpuTimingAvailable &&
+        backgroundPixelShare > 0.42f &&
+        farSvoPixelShare > 0.42f &&
+        gpuRaymarchMs > frameBudgetMs * 0.34f;
     const bool midVoxelDominantCost =
         gpuTimingAvailable &&
         backgroundPixelShare > 0.38f &&
@@ -693,19 +763,19 @@ SparseBackgroundRenderBudgetDecision SparseRuntimeBudgetScheduler::BuildBackgrou
     uint32_t tier = 0;
 
     if (gpuHardPressure || schedulerHardPressure) {
-        targetRayScale = 0.52f;
-        targetRenderQuality = 0.58f;
-        targetFarQuality = 0.50f;
+        targetRayScale = 0.38f;
+        targetRenderQuality = 0.50f;
+        targetFarQuality = 0.42f;
         tier = 3;
     } else if (gpuModeratePressure || schedulerModeratePressure) {
-        targetRayScale = 0.72f;
-        targetRenderQuality = 0.74f;
-        targetFarQuality = 0.68f;
+        targetRayScale = 0.66f;
+        targetRenderQuality = 0.68f;
+        targetFarQuality = 0.60f;
         tier = 2;
     } else if ((!gpuTimingAvailable && combinedPressureMs > frameBudgetMs * 0.92f) || gpuSoftPressure) {
-        targetRayScale = 0.88f;
-        targetRenderQuality = 0.88f;
-        targetFarQuality = 0.84f;
+        targetRayScale = 0.82f;
+        targetRenderQuality = 0.82f;
+        targetFarQuality = 0.76f;
         tier = 1;
     }
 
@@ -714,20 +784,34 @@ SparseBackgroundRenderBudgetDecision SparseRuntimeBudgetScheduler::BuildBackgrou
         // expensive before the total frame time fully collapses. Prefer a
         // shallow quality downshift over shrinking the world or starving near
         // residency.
-        targetRayScale = std::min(targetRayScale, 0.88f);
-        targetRenderQuality = std::min(targetRenderQuality, 0.88f);
-        targetFarQuality = std::min(targetFarQuality, 0.84f);
+        targetRayScale = std::min(targetRayScale, 0.78f);
+        targetRenderQuality = std::min(targetRenderQuality, 0.78f);
+        targetFarQuality = std::min(targetFarQuality, 0.72f);
         tier = std::max<uint32_t>(tier, 1u);
     }
     if (farHeightDominantCost) {
-        targetRenderQuality = std::min(targetRenderQuality, 0.84f);
-        targetFarQuality = std::min(targetFarQuality, 0.78f);
+        targetRenderQuality = std::min(targetRenderQuality, 0.74f);
+        targetFarQuality = std::min(targetFarQuality, 0.66f);
+        tier = std::max<uint32_t>(tier, 1u);
+    }
+    if (farSvoDominantCost) {
+        targetRenderQuality = std::min(targetRenderQuality, 0.72f);
+        targetFarQuality = std::min(targetFarQuality, 0.58f);
         tier = std::max<uint32_t>(tier, 1u);
     }
     if (midVoxelDominantCost) {
-        targetRenderQuality = std::min(targetRenderQuality, 0.86f);
-        targetFarQuality = std::min(targetFarQuality, 0.82f);
+        targetRenderQuality = std::min(targetRenderQuality, 0.74f);
+        targetFarQuality = std::min(targetFarQuality, 0.68f);
         tier = std::max<uint32_t>(tier, 1u);
+    }
+
+    if (input.farSvoReady &&
+        backgroundPixelShare > 0.58f &&
+        farSvoPixelShare > 0.50f &&
+        skyPixelShare < 0.55f) {
+        targetRenderQuality = std::max(targetRenderQuality, 0.62f);
+        targetFarQuality = std::max(targetFarQuality, 0.62f);
+        decision.preserveFarFieldQuality = true;
     }
 
     if (midCoverage < 0.35f && !input.farSvoReady) {
@@ -738,11 +822,17 @@ SparseBackgroundRenderBudgetDecision SparseRuntimeBudgetScheduler::BuildBackgrou
         targetFarQuality = std::max(targetFarQuality, 0.68f);
     }
     if (residencyCatchup) {
+        const uint32_t ownershipLevel = std::clamp(input.ownershipPressureLevel, 1u, 3u);
         const float catchupFloor = 0.70f + 0.06f * static_cast<float>(
-            std::clamp(input.ownershipPressureLevel, 1u, 3u) - 1u);
+            ownershipLevel - 1u);
+        const float farContinuityFloor =
+            ownershipLevel >= 3u ? 0.94f : (ownershipLevel >= 2u ? 0.86f : 0.72f);
+        const float renderContinuityFloor =
+            ownershipLevel >= 3u ? 0.92f : (ownershipLevel >= 2u ? 0.86f : catchupFloor);
         targetRayScale = std::max(targetRayScale, catchupFloor);
-        targetRenderQuality = std::max(targetRenderQuality, catchupFloor);
-        targetFarQuality = std::max(targetFarQuality, 0.62f);
+        targetRenderQuality = std::max(targetRenderQuality, renderContinuityFloor);
+        targetFarQuality = std::max(targetFarQuality, farContinuityFloor);
+        decision.preserveFarFieldQuality = true;
     }
 
     const auto smoothToward = [](float previous, float target, float downStep, float upStep) {
@@ -750,9 +840,11 @@ SparseBackgroundRenderBudgetDecision SparseRuntimeBudgetScheduler::BuildBackgrou
         return std::clamp(previous + (target - previous) * step, 0.20f, 1.35f);
     };
 
-    decision.raymarchScale = smoothToward(previousRaymarchScale, targetRayScale, 0.30f, 0.045f);
+    const float rayDownStep = tier >= 3u ? 0.45f : 0.30f;
+    const float qualityDownStep = tier >= 3u ? 0.38f : 0.26f;
+    decision.raymarchScale = smoothToward(previousRaymarchScale, targetRayScale, rayDownStep, 0.045f);
     decision.renderQuality = std::clamp(
-        smoothToward(previousRenderQuality, targetRenderQuality, 0.26f, 0.055f),
+        smoothToward(previousRenderQuality, targetRenderQuality, qualityDownStep, 0.055f),
         0.25f,
         1.0f);
     decision.farFieldQuality = std::clamp(targetFarQuality, 0.25f, 1.0f);
@@ -800,7 +892,11 @@ SparseFarUploadBudgetDecision SparseRuntimeBudgetScheduler::BuildFarUploadBudget
         predictedFrameMs > 18.5f;
 
     uint64_t desiredBudget = 0;
-    if (input.cheapFrame && !frameModeratePressure && !uploadModeratePressure) {
+    if (input.readinessDeadline) {
+        desiredBudget = std::max(fullBudget, SaturatingMul(trickleBudget, 16ull));
+        decision.uploadScale = 2.0f;
+        decision.pressureTier = 0u;
+    } else if (input.cheapFrame && !frameModeratePressure && !uploadModeratePressure) {
         desiredBudget = fullBudget;
         decision.uploadScale = 1.0f;
         decision.pressureTier = 0u;
@@ -821,7 +917,7 @@ SparseFarUploadBudgetDecision SparseRuntimeBudgetScheduler::BuildFarUploadBudget
             decision.uploadScale = frameHardPressure ? 0.70f : 1.0f;
             decision.pressureTier = frameHardPressure ? 2u : 1u;
         } else if (combinedPressureMs < 14.5f && predictedFrameMs < 15.5f) {
-            desiredBudget = std::min(fullBudget, std::max(trickleBudget, trickleBudget * 2ull));
+            desiredBudget = std::min(fullBudget, std::max(trickleBudget, SaturatingMul(trickleBudget, 2ull)));
             decision.uploadScale = 1.35f;
             decision.pressureTier = 0u;
         }

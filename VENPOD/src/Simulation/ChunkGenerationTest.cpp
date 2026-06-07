@@ -310,6 +310,8 @@ bool ChunkGenerationTest::TestWorldCoordinates(
     Graphics::DX12CommandQueue& commandQueue,
     Graphics::DescriptorHeapManager& heapManager)
 {
+    (void)device;
+    (void)commandQueue;
     (void)heapManager;  // Unused in this test
     spdlog::info("  Testing world coordinate mapping...");
 

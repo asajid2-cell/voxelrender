@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <unordered_set>
 #include <spdlog/spdlog.h>
 
@@ -12,10 +13,122 @@ namespace {
 
 constexpr uint32_t kMaxUploadRingSlots = 3;
 constexpr uint32_t kSparsePhysicsDiagnosticWords = 8;
-constexpr uint32_t kSparseRenderOwnershipWords = 16;
+constexpr uint32_t kSparseRenderOwnershipBaseWords = 40;
+constexpr uint32_t kSparseRenderOwnershipWords =
+    kSparseRenderOwnershipBaseWords +
+    kSparseRenderOwnershipUnsafeSampleCapacity * 4u +
+    kSparseRenderOwnershipFarHeightMidSampleCapacity * 4u;
+constexpr uint32_t kSparsePhysicsResultKnownStatusMask =
+    Simulation::SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+    Simulation::SPARSE_PHYSICS_PACKET_STATUS_HAS_EXPECTED_PAGE |
+    Simulation::SPARSE_PHYSICS_PACKET_STATUS_PAGE_MATCH |
+    Simulation::SPARSE_PHYSICS_PACKET_STATUS_PAGE_STALE |
+    Simulation::SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL |
+    Simulation::SPARSE_PHYSICS_PACKET_STATUS_MISSING_BELOW |
+    Simulation::SPARSE_PHYSICS_PACKET_STATUS_EDIT_DELTA_HIT;
 
 uint64_t AlignUp(uint64_t value, uint64_t alignment) {
+    if (alignment == 0) {
+        return value;
+    }
+    const uint64_t addend = alignment - 1u;
+    if (value > std::numeric_limits<uint64_t>::max() - addend) {
+        return std::numeric_limits<uint64_t>::max();
+    }
     return (value + alignment - 1u) & ~(alignment - 1u);
+}
+
+bool AddUint64(uint64_t a, uint64_t b, uint64_t* out) {
+    if (!out || a > std::numeric_limits<uint64_t>::max() - b) {
+        return false;
+    }
+    *out = a + b;
+    return true;
+}
+
+bool IsWellFormedSparsePhysicsResultStatus(uint32_t status) {
+    if ((status & Simulation::SPARSE_PHYSICS_PACKET_STATUS_CONSUMED) == 0u) {
+        return false;
+    }
+    return (status & ~kSparsePhysicsResultKnownStatusMask) == 0u;
+}
+
+bool AppendAlignedUploadRange(
+    uint64_t currentEnd,
+    uint64_t bytes,
+    uint64_t alignment,
+    uint64_t* outOffset,
+    uint64_t* outEnd)
+{
+    if (!outOffset || !outEnd) {
+        return false;
+    }
+    if (bytes == 0) {
+        *outOffset = currentEnd;
+        *outEnd = currentEnd;
+        return true;
+    }
+    const uint64_t alignedOffset = AlignUp(currentEnd, alignment);
+    uint64_t endOffset = 0;
+    if (!AddUint64(alignedOffset, bytes, &endOffset)) {
+        return false;
+    }
+    *outOffset = alignedOffset;
+    *outEnd = endOffset;
+    return true;
+}
+
+uint32_t BuildEditDeltaRangeTableCapacity(
+    size_t inputDeltaCount,
+    uint32_t maxEditDeltaRanges,
+    uint32_t configuredCapacity)
+{
+    const uint64_t estimatedRangeCount =
+        std::min<uint64_t>(
+            static_cast<uint64_t>(inputDeltaCount),
+            static_cast<uint64_t>(maxEditDeltaRanges));
+    const uint64_t targetRangeTableCapacity =
+        std::max<uint64_t>(16ull, estimatedRangeCount * 4ull);
+    const uint64_t clampedTarget =
+        std::min<uint64_t>(targetRangeTableCapacity, configuredCapacity);
+
+    uint32_t dynamicRangeTableCapacity = 16u;
+    while (dynamicRangeTableCapacity < clampedTarget &&
+           dynamicRangeTableCapacity < configuredCapacity) {
+        if (dynamicRangeTableCapacity > std::numeric_limits<uint32_t>::max() / 2u) {
+            dynamicRangeTableCapacity = configuredCapacity;
+            break;
+        }
+        dynamicRangeTableCapacity <<= 1u;
+    }
+
+    return std::min(dynamicRangeTableCapacity, configuredCapacity);
+}
+
+uint32_t SparsePhysicsPacketChecksum(
+    const Simulation::SparsePhysicsWorkPacket& packet,
+    uint32_t frameIndex,
+    uint32_t editDeltaCount,
+    uint32_t editDeltaRangeCount,
+    uint32_t editDeltaRangeTableCapacity,
+    uint32_t pageTableCapacity)
+{
+    return
+        static_cast<uint32_t>(packet.coord.x) ^
+        (static_cast<uint32_t>(packet.coord.y) * 1664525u) ^
+        (static_cast<uint32_t>(packet.coord.z) * 1013904223u) ^
+        packet.packedRegionMin ^
+        packet.packedRegionMax ^
+        packet.materialMask ^
+        packet.priority ^
+        packet.generation ^
+        packet.expectedPageIndex ^
+        packet.expectedPageGeneration ^
+        editDeltaCount ^
+        editDeltaRangeCount ^
+        editDeltaRangeTableCapacity ^
+        frameIndex ^
+        pageTableCapacity;
 }
 
 }
@@ -32,38 +145,8 @@ Result<void> SparseVoxelGpuResources::Initialize(
     if (!device) {
         return Error("SparseVoxelGpuResources::Initialize - device is null");
     }
-    if (config.maxBrickPages == 0) {
-        return Error("SparseVoxelGpuResources::Initialize - maxBrickPages must be > 0");
-    }
-    if (!IsPowerOfTwo(config.pageTableCapacity)) {
-        return Error("SparseVoxelGpuResources::Initialize - pageTableCapacity must be a power of two");
-    }
-    if (config.pageTableCapacity < config.maxBrickPages * 2u) {
-        return Error("SparseVoxelGpuResources::Initialize - pageTableCapacity must be at least 2x maxBrickPages");
-    }
-    if (config.uploadRingSlots == 0 || config.uploadRingSlots > kMaxUploadRingSlots) {
-        return Error("SparseVoxelGpuResources::Initialize - uploadRingSlots must be 1..{}", kMaxUploadRingSlots);
-    }
-    if (config.missFeedbackMaxRecords == 0) {
-        return Error("SparseVoxelGpuResources::Initialize - missFeedbackMaxRecords must be > 0");
-    }
-    if (config.maxPhysicsWorkPackets == 0) {
-        return Error("SparseVoxelGpuResources::Initialize - maxPhysicsWorkPackets must be > 0");
-    }
-    if (config.maxEditDeltas == 0) {
-        return Error("SparseVoxelGpuResources::Initialize - maxEditDeltas must be > 0");
-    }
-    if (config.maxBrushFeedbackRecords == 0) {
-        return Error("SparseVoxelGpuResources::Initialize - maxBrushFeedbackRecords must be > 0");
-    }
-    if (config.maxEditDeltaRanges == 0) {
-        return Error("SparseVoxelGpuResources::Initialize - maxEditDeltaRanges must be > 0");
-    }
-    if (!IsPowerOfTwo(config.editDeltaRangeTableCapacity)) {
-        return Error("SparseVoxelGpuResources::Initialize - editDeltaRangeTableCapacity must be a power of two");
-    }
-    if (config.editDeltaRangeTableCapacity < config.maxEditDeltaRanges * 2u) {
-        return Error("SparseVoxelGpuResources::Initialize - editDeltaRangeTableCapacity must be at least 2x maxEditDeltaRanges");
+    if (!ValidateSparseVoxelGpuConfigForStats(config)) {
+        return Error("SparseVoxelGpuResources::Initialize - config is outside sparse GPU runtime/stat limits");
     }
 
     Shutdown();
@@ -547,6 +630,10 @@ void SparseVoxelGpuResources::Shutdown() {
     m_lastRetiredPhysicsProposals.clear();
     m_physicsPacketResultsQueuedFrames.fill(UINT32_MAX);
     m_physicsPacketResultCounts.fill(0u);
+    for (auto& expectedChecksums : m_physicsPacketExpectedChecksums) {
+        expectedChecksums.clear();
+    }
+    m_pendingPhysicsPacketResultPackets.clear();
     m_physicsDiagnosticsQueuedFrames.fill(UINT32_MAX);
     m_missFeedbackQueuedFrames.fill(UINT32_MAX);
     m_brushFeedbackQueuedFrames.fill(UINT32_MAX);
@@ -614,18 +701,26 @@ bool CanReserveUploadRange(uint64_t currentOffset, uint64_t capacity, uint64_t b
     if (capacity == 0 || bytes == 0) {
         return false;
     }
-    const uint64_t uploadOffset = AlignUp(currentOffset, kUploadAlignment);
-    return uploadOffset <= capacity && bytes <= capacity - uploadOffset;
+    uint64_t uploadOffset = 0;
+    uint64_t endOffset = 0;
+    if (!AppendAlignedUploadRange(currentOffset, bytes, kUploadAlignment, &uploadOffset, &endOffset)) {
+        return false;
+    }
+    return endOffset <= capacity;
 }
 
 struct MidClipmapUploadPlan {
     bool valid = false;
     bool uploadHeightLayer = false;
     bool uploadVoxelLayer = false;
-    uint32_t heightSampleStartSlot = 0;
-    uint32_t heightSampleSlotCount = 0;
-    uint32_t voxelSampleStartSlot = 0;
-    uint32_t voxelSampleSlotCount = 0;
+    struct SampleRange {
+        uint32_t startSlot = 0;
+        uint32_t slotCount = 0;
+        uint64_t sourceUintOffset = 0;
+        uint64_t bytes = 0;
+    };
+    std::vector<SampleRange> heightSampleRanges;
+    std::vector<SampleRange> voxelSampleRanges;
     uint64_t metadataBytes = 0;
     uint64_t lookupBytes = 0;
     uint64_t sampleBytes = 0;
@@ -633,6 +728,52 @@ struct MidClipmapUploadPlan {
     uint64_t voxelLookupBytes = 0;
     uint64_t voxelSampleBytes = 0;
 };
+
+void BuildMidClipmapSampleRangePlan(
+    const std::vector<Simulation::SparseClipmapSampleRange>& snapshotRanges,
+    uint32_t fallbackStartSlot,
+    uint32_t fallbackSlotCount,
+    uint32_t maxSlots,
+    uint64_t sampleStrideUints,
+    uint64_t availableSampleUints,
+    std::vector<MidClipmapUploadPlan::SampleRange>& outRanges,
+    uint64_t& outBytes)
+{
+    outRanges.clear();
+    outBytes = 0;
+    if (maxSlots == 0 || sampleStrideUints == 0 || availableSampleUints == 0) {
+        return;
+    }
+
+    uint64_t payloadUintOffset = 0;
+    auto appendRange = [&](uint32_t startSlot, uint32_t slotCount) {
+        if (slotCount == 0 || startSlot >= maxSlots) {
+            return;
+        }
+        const uint32_t clampedSlotCount = std::min(slotCount, maxSlots - startSlot);
+        const uint64_t rangeUints =
+            static_cast<uint64_t>(clampedSlotCount) * sampleStrideUints;
+        if (payloadUintOffset + rangeUints > availableSampleUints) {
+            return;
+        }
+        MidClipmapUploadPlan::SampleRange range;
+        range.startSlot = startSlot;
+        range.slotCount = clampedSlotCount;
+        range.sourceUintOffset = payloadUintOffset;
+        range.bytes = rangeUints * sizeof(uint32_t);
+        outBytes += range.bytes;
+        outRanges.push_back(range);
+        payloadUintOffset += rangeUints;
+    };
+
+    if (!snapshotRanges.empty()) {
+        for (const Simulation::SparseClipmapSampleRange& range : snapshotRanges) {
+            appendRange(range.startSlot, range.slotCount);
+        }
+        return;
+    }
+    appendRange(fallbackStartSlot, fallbackSlotCount);
+}
 
 struct SparseBrickVoxelUploadPlan {
     bool valid = false;
@@ -710,20 +851,29 @@ MidClipmapUploadPlan BuildMidClipmapUploadPlan(
     const uint64_t lookupUints = plan.uploadHeightLayer
         ? static_cast<uint64_t>(snapshot.lookup.size())
         : 0u;
-    plan.heightSampleStartSlot = 0;
-    plan.heightSampleSlotCount = plan.uploadHeightLayer ? snapshot.tileCount : 0u;
-    if (plan.uploadHeightLayer && snapshot.heightDirtySlotCount > 0) {
-        plan.heightSampleStartSlot = std::min(snapshot.heightDirtyStartSlot, snapshot.tileCount);
-        const uint32_t maxDirtyCount = snapshot.tileCount - plan.heightSampleStartSlot;
-        plan.heightSampleSlotCount = std::min(snapshot.heightDirtySlotCount, maxDirtyCount);
-    }
-    const uint64_t sampleUints = plan.uploadHeightLayer
-        ? std::min<uint64_t>(
+    uint64_t sampleBytes = 0;
+    if (plan.uploadHeightLayer) {
+        const uint64_t heightSampleStride =
+            static_cast<uint64_t>(snapshot.tileSampleSide) *
+            static_cast<uint64_t>(snapshot.tileSampleSide);
+        uint32_t fallbackStartSlot = 0;
+        uint32_t fallbackSlotCount = snapshot.tileCount;
+        if (snapshot.heightDirtySlotCount > 0) {
+            fallbackStartSlot = std::min(snapshot.heightDirtyStartSlot, snapshot.tileCount);
+            fallbackSlotCount = fallbackStartSlot < snapshot.tileCount
+                ? std::min(snapshot.heightDirtySlotCount, snapshot.tileCount - fallbackStartSlot)
+                : 0u;
+        }
+        BuildMidClipmapSampleRangePlan(
+            snapshot.heightSampleRanges,
+            fallbackStartSlot,
+            fallbackSlotCount,
+            snapshot.tileCount,
+            heightSampleStride,
             static_cast<uint64_t>(snapshot.samples.size()),
-            static_cast<uint64_t>(plan.heightSampleSlotCount) *
-                static_cast<uint64_t>(snapshot.tileSampleSide) *
-                static_cast<uint64_t>(snapshot.tileSampleSide))
-        : 0u;
+            plan.heightSampleRanges,
+            sampleBytes);
+    }
     const uint64_t voxelMetadataUints = plan.uploadVoxelLayer
         ? std::min<uint64_t>(
             static_cast<uint64_t>(snapshot.voxelMetadata.size()),
@@ -732,26 +882,33 @@ MidClipmapUploadPlan BuildMidClipmapUploadPlan(
     const uint64_t voxelLookupUints = plan.uploadVoxelLayer
         ? static_cast<uint64_t>(snapshot.voxelLookup.size())
         : 0u;
-    plan.voxelSampleStartSlot = 0;
-    plan.voxelSampleSlotCount = plan.uploadVoxelLayer ? snapshot.voxelBrickCount : 0u;
-    if (plan.uploadVoxelLayer && snapshot.voxelDirtySlotCount > 0) {
-        plan.voxelSampleStartSlot = std::min(snapshot.voxelDirtyStartSlot, snapshot.voxelBrickCount);
-        const uint32_t maxDirtyCount = snapshot.voxelBrickCount - plan.voxelSampleStartSlot;
-        plan.voxelSampleSlotCount = std::min(snapshot.voxelDirtySlotCount, maxDirtyCount);
-    }
-    const uint64_t voxelSampleUints = plan.uploadVoxelLayer
-        ? std::min<uint64_t>(
+    uint64_t voxelSampleBytes = 0;
+    if (plan.uploadVoxelLayer) {
+        uint32_t fallbackStartSlot = 0;
+        uint32_t fallbackSlotCount = snapshot.voxelBrickCount;
+        if (snapshot.voxelDirtySlotCount > 0) {
+            fallbackStartSlot = std::min(snapshot.voxelDirtyStartSlot, snapshot.voxelBrickCount);
+            fallbackSlotCount = fallbackStartSlot < snapshot.voxelBrickCount
+                ? std::min(snapshot.voxelDirtySlotCount, snapshot.voxelBrickCount - fallbackStartSlot)
+                : 0u;
+        }
+        BuildMidClipmapSampleRangePlan(
+            snapshot.voxelSampleRanges,
+            fallbackStartSlot,
+            fallbackSlotCount,
+            snapshot.voxelBrickCount,
+            static_cast<uint64_t>(Simulation::SPARSE_BRICK_VOXEL_COUNT),
             static_cast<uint64_t>(snapshot.voxelSamples.size()),
-            static_cast<uint64_t>(plan.voxelSampleSlotCount) *
-                static_cast<uint64_t>(Simulation::SPARSE_BRICK_VOXEL_COUNT))
-        : 0u;
+            plan.voxelSampleRanges,
+            voxelSampleBytes);
+    }
 
     plan.metadataBytes = metadataUints * sizeof(uint32_t);
     plan.lookupBytes = lookupUints * sizeof(uint32_t);
-    plan.sampleBytes = sampleUints * sizeof(uint32_t);
+    plan.sampleBytes = sampleBytes;
     plan.voxelMetadataBytes = voxelMetadataUints * sizeof(uint32_t);
     plan.voxelLookupBytes = voxelLookupUints * sizeof(uint32_t);
-    plan.voxelSampleBytes = voxelSampleUints * sizeof(uint32_t);
+    plan.voxelSampleBytes = voxelSampleBytes;
     plan.valid = true;
     return plan;
 }
@@ -769,10 +926,17 @@ bool SparseVoxelGpuResources::CanStageBrickUpload() const {
         static_cast<uint64_t>(Simulation::SPARSE_BRICK_VOXEL_COUNT) * sizeof(uint32_t);
     const uint64_t occupancyBytes = sizeof(uint32_t) * 2u;
     const uint64_t generationBytes = sizeof(uint32_t);
-    const uint64_t voxelOffset = AlignUp(m_uploadWriteOffset, kUploadAlignment);
-    const uint64_t occupancyOffset = AlignUp(voxelOffset + voxelBytes, kUploadAlignment);
-    const uint64_t generationOffset = AlignUp(occupancyOffset + occupancyBytes, kUploadAlignment);
-    const uint64_t endOffset = generationOffset + generationBytes;
+    uint64_t voxelOffset = 0;
+    uint64_t occupancyOffset = 0;
+    uint64_t generationOffset = 0;
+    uint64_t afterVoxels = 0;
+    uint64_t afterOccupancy = 0;
+    uint64_t endOffset = 0;
+    if (!AppendAlignedUploadRange(m_uploadWriteOffset, voxelBytes, kUploadAlignment, &voxelOffset, &afterVoxels) ||
+        !AppendAlignedUploadRange(afterVoxels, occupancyBytes, kUploadAlignment, &occupancyOffset, &afterOccupancy) ||
+        !AppendAlignedUploadRange(afterOccupancy, generationBytes, kUploadAlignment, &generationOffset, &endOffset)) {
+        return false;
+    }
     return endOffset <= capacity;
 }
 
@@ -792,10 +956,17 @@ bool SparseVoxelGpuResources::CanStageBrickUpload(
 
     const uint64_t occupancyBytes = sizeof(uint32_t) * 2u;
     const uint64_t generationBytes = sizeof(uint32_t);
-    const uint64_t voxelOffset = AlignUp(m_uploadWriteOffset, kUploadAlignment);
-    const uint64_t occupancyOffset = AlignUp(voxelOffset + plan.voxelBytes, kUploadAlignment);
-    const uint64_t generationOffset = AlignUp(occupancyOffset + occupancyBytes, kUploadAlignment);
-    const uint64_t endOffset = generationOffset + generationBytes;
+    uint64_t voxelOffset = 0;
+    uint64_t occupancyOffset = 0;
+    uint64_t generationOffset = 0;
+    uint64_t afterVoxels = 0;
+    uint64_t afterOccupancy = 0;
+    uint64_t endOffset = 0;
+    if (!AppendAlignedUploadRange(m_uploadWriteOffset, plan.voxelBytes, kUploadAlignment, &voxelOffset, &afterVoxels) ||
+        !AppendAlignedUploadRange(afterVoxels, occupancyBytes, kUploadAlignment, &occupancyOffset, &afterOccupancy) ||
+        !AppendAlignedUploadRange(afterOccupancy, generationBytes, kUploadAlignment, &generationOffset, &endOffset)) {
+        return false;
+    }
     return endOffset <= capacity;
 }
 
@@ -836,13 +1007,26 @@ bool SparseVoxelGpuResources::CanStageMidClipmapSnapshot(
     }
 
     constexpr uint64_t kUploadAlignment = 256u;
-    const uint64_t metadataOffset = AlignUp(m_uploadWriteOffset, kUploadAlignment);
-    const uint64_t lookupOffset = AlignUp(metadataOffset + plan.metadataBytes, kUploadAlignment);
-    const uint64_t samplesOffset = AlignUp(lookupOffset + plan.lookupBytes, kUploadAlignment);
-    const uint64_t voxelMetadataOffset = AlignUp(samplesOffset + plan.sampleBytes, kUploadAlignment);
-    const uint64_t voxelLookupOffset = AlignUp(voxelMetadataOffset + plan.voxelMetadataBytes, kUploadAlignment);
-    const uint64_t voxelSamplesOffset = AlignUp(voxelLookupOffset + plan.voxelLookupBytes, kUploadAlignment);
-    const uint64_t endOffset = voxelSamplesOffset + plan.voxelSampleBytes;
+    uint64_t metadataOffset = 0;
+    uint64_t lookupOffset = 0;
+    uint64_t samplesOffset = 0;
+    uint64_t voxelMetadataOffset = 0;
+    uint64_t voxelLookupOffset = 0;
+    uint64_t voxelSamplesOffset = 0;
+    uint64_t afterMetadata = 0;
+    uint64_t afterLookup = 0;
+    uint64_t afterSamples = 0;
+    uint64_t afterVoxelMetadata = 0;
+    uint64_t afterVoxelLookup = 0;
+    uint64_t endOffset = 0;
+    if (!AppendAlignedUploadRange(m_uploadWriteOffset, plan.metadataBytes, kUploadAlignment, &metadataOffset, &afterMetadata) ||
+        !AppendAlignedUploadRange(afterMetadata, plan.lookupBytes, kUploadAlignment, &lookupOffset, &afterLookup) ||
+        !AppendAlignedUploadRange(afterLookup, plan.sampleBytes, kUploadAlignment, &samplesOffset, &afterSamples) ||
+        !AppendAlignedUploadRange(afterSamples, plan.voxelMetadataBytes, kUploadAlignment, &voxelMetadataOffset, &afterVoxelMetadata) ||
+        !AppendAlignedUploadRange(afterVoxelMetadata, plan.voxelLookupBytes, kUploadAlignment, &voxelLookupOffset, &afterVoxelLookup) ||
+        !AppendAlignedUploadRange(afterVoxelLookup, plan.voxelSampleBytes, kUploadAlignment, &voxelSamplesOffset, &endOffset)) {
+        return false;
+    }
     return endOffset <= ActiveUploadBytesCapacity();
 }
 
@@ -888,18 +1072,11 @@ bool SparseVoxelGpuResources::CanStageEditDeltas(
     if (!m_stats.initialized || deltas.empty() || m_activeUploadSlot >= m_config.uploadRingSlots) {
         return false;
     }
-    const uint32_t estimatedRangeCount = std::min<uint32_t>(
-        static_cast<uint32_t>(deltas.size()),
-        m_config.maxEditDeltaRanges);
-    uint32_t dynamicRangeTableCapacity = 16u;
-    const uint32_t targetRangeTableCapacity = std::max(16u, estimatedRangeCount * 4u);
-    while (dynamicRangeTableCapacity < targetRangeTableCapacity &&
-           dynamicRangeTableCapacity < m_config.editDeltaRangeTableCapacity) {
-        dynamicRangeTableCapacity <<= 1u;
-    }
-    dynamicRangeTableCapacity = std::min(
-        dynamicRangeTableCapacity,
-        m_config.editDeltaRangeTableCapacity);
+    const uint32_t dynamicRangeTableCapacity =
+        BuildEditDeltaRangeTableCapacity(
+            deltas.size(),
+            m_config.maxEditDeltaRanges,
+            m_config.editDeltaRangeTableCapacity);
 
     const Simulation::SparseEditDeltaBatch batch =
         Simulation::BuildSparseEditDeltaBatch(
@@ -926,10 +1103,17 @@ bool SparseVoxelGpuResources::CanStageEditDeltas(
     }
 
     constexpr uint64_t kUploadAlignment = 256u;
-    const uint64_t uploadOffset = AlignUp(m_uploadWriteOffset, kUploadAlignment);
-    const uint64_t rangeUploadOffset = AlignUp(uploadOffset + bytes, kUploadAlignment);
-    const uint64_t rangeTableUploadOffset = AlignUp(rangeUploadOffset + rangeBytes, kUploadAlignment);
-    const uint64_t endOffset = rangeTableUploadOffset + rangeTableBytes;
+    uint64_t uploadOffset = 0;
+    uint64_t rangeUploadOffset = 0;
+    uint64_t rangeTableUploadOffset = 0;
+    uint64_t afterDeltas = 0;
+    uint64_t afterRanges = 0;
+    uint64_t endOffset = 0;
+    if (!AppendAlignedUploadRange(m_uploadWriteOffset, bytes, kUploadAlignment, &uploadOffset, &afterDeltas) ||
+        !AppendAlignedUploadRange(afterDeltas, rangeBytes, kUploadAlignment, &rangeUploadOffset, &afterRanges) ||
+        !AppendAlignedUploadRange(afterRanges, rangeTableBytes, kUploadAlignment, &rangeTableUploadOffset, &endOffset)) {
+        return false;
+    }
     return endOffset <= ActiveUploadBytesCapacity();
 }
 
@@ -996,6 +1180,7 @@ bool SparseVoxelGpuResources::RetirePhysicsDiagnostics(uint32_t frameIndex) {
     m_stats.physicsGpuFrameLastRetire = 0;
     m_stats.physicsGpuMaxPriorityLastRetire = 0;
     m_stats.physicsGpuGenerationXorLastRetire = 0;
+    m_stats.physicsGpuStaleFrameDropsLastRetire = 0;
     if (!m_stats.initialized) {
         return false;
     }
@@ -1011,13 +1196,25 @@ bool SparseVoxelGpuResources::RetirePhysicsDiagnostics(uint32_t frameIndex) {
         return false;
     }
 
+    const uint32_t payloadFrame = mapped[3];
+    m_physicsDiagnosticsQueuedFrames[slot] = UINT32_MAX;
+    if (payloadFrame != queuedFrame) {
+        m_stats.physicsGpuStaleFrameDropsLastRetire = 1;
+        spdlog::warn(
+            "Sparse physics diagnostics dropped stale readback payload: retireFrame={} queuedFrame={} payloadFrame={} packets={}",
+            frameIndex,
+            queuedFrame,
+            payloadFrame,
+            mapped[0]);
+        return false;
+    }
+
     m_stats.physicsGpuPacketsLastRetire = mapped[0];
     m_stats.physicsGpuMaterialMaskLastRetire = mapped[1];
     m_stats.physicsGpuChecksumLastRetire = mapped[2];
-    m_stats.physicsGpuFrameLastRetire = mapped[3];
+    m_stats.physicsGpuFrameLastRetire = payloadFrame;
     m_stats.physicsGpuMaxPriorityLastRetire = mapped[4];
     m_stats.physicsGpuGenerationXorLastRetire = mapped[5];
-    m_physicsDiagnosticsQueuedFrames[slot] = UINT32_MAX;
     if (m_stats.physicsGpuPacketsLastRetire > 0 &&
         (m_stats.physicsGpuFrameLastRetire != m_lastLoggedPhysicsDiagnosticFrame ||
          m_stats.physicsGpuChecksumLastRetire != m_lastLoggedPhysicsDiagnosticChecksum)) {
@@ -1056,6 +1253,24 @@ void SparseVoxelGpuResources::QueuePhysicsPacketResultsReadback(
     m_physicsPacketResultsQueuedFrames[slot] = frameIndex;
     m_physicsPacketResultCounts[slot] =
         std::min(m_stats.stagedPhysicsPacketsLastFrame, m_config.maxPhysicsWorkPackets);
+    std::vector<uint32_t>& expectedChecksums = m_physicsPacketExpectedChecksums[slot];
+    expectedChecksums.clear();
+    expectedChecksums.reserve(m_physicsPacketResultCounts[slot]);
+    const uint32_t packetChecksumCount =
+        std::min<uint32_t>(
+            m_physicsPacketResultCounts[slot],
+            static_cast<uint32_t>(m_pendingPhysicsPacketResultPackets.size()));
+    for (uint32_t i = 0; i < packetChecksumCount; ++i) {
+        expectedChecksums.push_back(
+            SparsePhysicsPacketChecksum(
+                m_pendingPhysicsPacketResultPackets[i],
+                frameIndex,
+                m_stats.stagedEditDeltasLastFrame,
+                m_stats.stagedEditDeltaRangesLastFrame,
+                m_stats.stagedEditDeltaRangeTableEntriesLastFrame,
+                m_stats.pageTableCapacity));
+    }
+    m_pendingPhysicsPacketResultPackets.clear();
 }
 
 bool SparseVoxelGpuResources::RetirePhysicsPacketResults(uint32_t frameIndex) {
@@ -1069,6 +1284,9 @@ bool SparseVoxelGpuResources::RetirePhysicsPacketResults(uint32_t frameIndex) {
     m_stats.physicsGpuResultFirstStatus = 0;
     m_stats.physicsGpuProposalCountLastRetire = 0;
     m_stats.physicsGpuMissingBelowCountLastRetire = 0;
+    m_stats.physicsGpuMalformedStatusDropsLastRetire = 0;
+    m_stats.physicsGpuUnexpectedPacketDropsLastRetire = 0;
+    m_stats.physicsGpuChecksumDropsLastRetire = 0;
     if (!m_stats.initialized) {
         return false;
     }
@@ -1085,6 +1303,7 @@ bool SparseVoxelGpuResources::RetirePhysicsPacketResults(uint32_t frameIndex) {
     }
     const uint32_t queuedResultCount =
         std::min(m_physicsPacketResultCounts[slot], m_config.maxPhysicsWorkPackets);
+    const std::vector<uint32_t>& expectedChecksums = m_physicsPacketExpectedChecksums[slot];
     m_physicsPacketResultsQueuedFrames[slot] = UINT32_MAX;
     m_physicsPacketResultCounts[slot] = 0u;
 
@@ -1093,16 +1312,39 @@ bool SparseVoxelGpuResources::RetirePhysicsPacketResults(uint32_t frameIndex) {
     uint32_t validResults = 0;
     uint32_t proposals = 0;
     uint32_t missingBelow = 0;
+    uint32_t malformedStatusDrops = 0;
+    uint32_t unexpectedPacketDrops = 0;
+    uint32_t checksumDrops = 0;
+    uint32_t firstValidResultIndex = UINT32_MAX;
+    uint32_t firstProposalResultIndex = UINT32_MAX;
     for (uint32_t i = 0; i < resultCount; ++i) {
         if (mapped[i].status == 0) {
             continue;
         }
+        if (!IsWellFormedSparsePhysicsResultStatus(mapped[i].status)) {
+            ++malformedStatusDrops;
+            continue;
+        }
+        if (mapped[i].packetIndex != i || mapped[i].packetIndex >= expectedChecksums.size()) {
+            ++unexpectedPacketDrops;
+            continue;
+        }
+        if (mapped[i].checksum != expectedChecksums[mapped[i].packetIndex]) {
+            ++checksumDrops;
+            continue;
+        }
+        if (firstValidResultIndex == UINT32_MAX) {
+            firstValidResultIndex = i;
+        }
         ++validResults;
-        if ((mapped[i].status & 16u) != 0u) {
+        if ((mapped[i].status & Simulation::SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL) != 0u) {
+            if (firstProposalResultIndex == UINT32_MAX) {
+                firstProposalResultIndex = i;
+            }
             ++proposals;
             m_lastRetiredPhysicsProposals.push_back(mapped[i]);
         }
-        if ((mapped[i].status & 32u) != 0u) {
+        if ((mapped[i].status & Simulation::SPARSE_PHYSICS_PACKET_STATUS_MISSING_BELOW) != 0u) {
             ++missingBelow;
         }
         checksum += mapped[i].checksum ^ mapped[i].generation ^ mapped[i].packetIndex;
@@ -1111,12 +1353,27 @@ bool SparseVoxelGpuResources::RetirePhysicsPacketResults(uint32_t frameIndex) {
     m_stats.physicsGpuResultChecksumLastRetire = checksum;
     m_stats.physicsGpuProposalCountLastRetire = proposals;
     m_stats.physicsGpuMissingBelowCountLastRetire = missingBelow;
-    if (validResults > 0) {
-        m_stats.physicsGpuResultFirstBrickX = mapped[0].coord.x;
-        m_stats.physicsGpuResultFirstBrickY = mapped[0].coord.y;
-        m_stats.physicsGpuResultFirstBrickZ = mapped[0].coord.z;
-        m_stats.physicsGpuResultFirstGeneration = mapped[0].generation;
-        m_stats.physicsGpuResultFirstStatus = mapped[0].status;
+    m_stats.physicsGpuMalformedStatusDropsLastRetire = malformedStatusDrops;
+    m_stats.physicsGpuUnexpectedPacketDropsLastRetire = unexpectedPacketDrops;
+    m_stats.physicsGpuChecksumDropsLastRetire = checksumDrops;
+    if (unexpectedPacketDrops > 0 || checksumDrops > 0) {
+        spdlog::warn(
+            "Sparse physics result dropped stale or mismatched readback rows: retireFrame={} queuedFrame={} unexpectedPacketDrops={} checksumDrops={} expectedChecksums={}",
+            frameIndex,
+            queuedFrame,
+            unexpectedPacketDrops,
+            checksumDrops,
+            expectedChecksums.size());
+    }
+    if (validResults > 0 && firstValidResultIndex != UINT32_MAX) {
+        const uint32_t diagnosticResultIndex =
+            firstProposalResultIndex != UINT32_MAX ? firstProposalResultIndex : firstValidResultIndex;
+        const auto& firstResult = mapped[diagnosticResultIndex];
+        m_stats.physicsGpuResultFirstBrickX = firstResult.coord.x;
+        m_stats.physicsGpuResultFirstBrickY = firstResult.coord.y;
+        m_stats.physicsGpuResultFirstBrickZ = firstResult.coord.z;
+        m_stats.physicsGpuResultFirstGeneration = firstResult.generation;
+        m_stats.physicsGpuResultFirstStatus = firstResult.status;
     }
     if (validResults > 0 &&
         (m_stats.physicsGpuResultFirstGeneration != m_lastLoggedPhysicsResultGeneration ||
@@ -1136,6 +1393,7 @@ bool SparseVoxelGpuResources::RetirePhysicsPacketResults(uint32_t frameIndex) {
             m_stats.physicsGpuResultFirstGeneration,
             m_stats.physicsGpuResultFirstStatus);
     }
+    m_physicsPacketExpectedChecksums[slot].clear();
     return true;
 }
 
@@ -1251,6 +1509,7 @@ bool SparseVoxelGpuResources::RetireBrushFeedback(
 {
     m_stats.brushFeedbackRecordsLastRetire = 0;
     m_stats.brushFeedbackFrameLastRetire = 0;
+    m_stats.brushFeedbackQueuedFrameLastRetire = 0;
     m_stats.brushFeedbackMissingResidentLastRetire = 0;
     m_stats.brushFeedbackStaleFrameDropsLastRetire = 0;
     m_stats.brushFeedbackOverflowLastRetire = false;
@@ -1270,6 +1529,7 @@ bool SparseVoxelGpuResources::RetireBrushFeedback(
         return false;
     }
     m_brushFeedbackQueuedFrames[slot] = UINT32_MAX;
+    m_stats.brushFeedbackQueuedFrameLastRetire = queuedFrame;
 
     const uint32_t reported = mapped[0];
     const uint32_t count = std::min(reported, m_config.maxBrushFeedbackRecords);
@@ -1284,7 +1544,11 @@ bool SparseVoxelGpuResources::RetireBrushFeedback(
             reported);
         return false;
     }
-    m_stats.brushFeedbackOverflowLastRetire = reported > m_config.maxBrushFeedbackRecords;
+    m_stats.brushFeedbackOverflowLastRetire =
+        Simulation::SparseBrushFeedbackPayloadOverflowed(
+            reported,
+            m_config.maxBrushFeedbackRecords,
+            mapped[2]);
     m_stats.brushFeedbackMissingResidentLastRetire = mapped[3];
     outRecords.reserve(outRecords.size() + count);
     for (uint32_t i = 0; i < count; ++i) {
@@ -1339,6 +1603,7 @@ void SparseVoxelGpuResources::QueueRenderOwnershipReadback(
 }
 
 bool SparseVoxelGpuResources::RetireRenderOwnership(uint32_t frameIndex) {
+    m_stats.renderOwnerStaleFrameDropsLastRetire = 0;
     if (!m_stats.initialized) {
         return false;
     }
@@ -1355,6 +1620,19 @@ bool SparseVoxelGpuResources::RetireRenderOwnership(uint32_t frameIndex) {
         return false;
     }
 
+    const uint32_t payloadFrame = mapped[8];
+    m_renderOwnershipQueuedFrames[slot] = UINT32_MAX;
+    if (payloadFrame != queuedFrame) {
+        m_stats.renderOwnerStaleFrameDropsLastRetire = 1;
+        spdlog::warn(
+            "Sparse render ownership dropped stale readback payload: retireFrame={} queuedFrame={} payloadFrame={} total={}",
+            frameIndex,
+            queuedFrame,
+            payloadFrame,
+            mapped[0]);
+        return false;
+    }
+
     m_stats.renderOwnerTotalPixelsLastRetire = mapped[0];
     m_stats.renderOwnerNearPixelsLastRetire = mapped[1];
     m_stats.renderOwnerMidVoxelPixelsLastRetire = mapped[2];
@@ -1365,23 +1643,113 @@ bool SparseVoxelGpuResources::RetireRenderOwnership(uint32_t frameIndex) {
     m_stats.renderOwnerMissPixelsLastRetire = mapped[7];
     m_stats.renderOwnerSurfacePixelsLastRetire = mapped[9];
     m_stats.renderOwnerUnsafeNearMissPixelsLastRetire = mapped[10];
-    m_stats.renderOwnerFrameLastRetire = mapped[8];
-    m_renderOwnershipQueuedFrames[slot] = UINT32_MAX;
+    m_stats.renderOwnerFarWaterPixelsLastRetire = mapped[11];
+    m_stats.renderOwnerWaterContextPixelsLastRetire = mapped[12];
+    m_stats.renderOwnerValleyAtmospherePixelsLastRetire = mapped[13];
+    m_stats.renderOwnerLodParentHeldPixelsLastRetire = mapped[14];
+    m_stats.renderOwnerUnsafeMissSampleCountLastRetire = mapped[15];
+    m_stats.renderOwnerUnsafeMissSampleBrickX = static_cast<int32_t>(mapped[16]);
+    m_stats.renderOwnerUnsafeMissSampleBrickY = static_cast<int32_t>(mapped[17]);
+    m_stats.renderOwnerUnsafeMissSampleBrickZ = static_cast<int32_t>(mapped[18]);
+    m_stats.renderOwnerUnsafeMissSampleDistanceLastRetire = mapped[19];
+    m_stats.renderOwnerMidInteriorFallbackPixelsLastRetire = mapped[20];
+    m_stats.renderOwnerFarSurfacePixelsLastRetire = mapped[21];
+    m_stats.renderOwnerFarHeightContinuityPixelsLastRetire = mapped[22];
+    m_stats.renderOwnerFarHeightMidMissingPixelsLastRetire = mapped[23];
+    m_stats.renderOwnerFarHeightMidAirPixelsLastRetire = mapped[24];
+    m_stats.renderOwnerFarHeightMidSolidPixelsLastRetire = mapped[25];
+    m_stats.renderOwnerFarHeightFarPagePresentPixelsLastRetire = mapped[26];
+    m_stats.renderOwnerFarHeightFarPageMissingPixelsLastRetire = mapped[27];
+    m_stats.renderOwnerFarHeightFarPageOutOfGridPixelsLastRetire = mapped[28];
+    m_stats.renderOwnerFarHeightMidSampleCountLastRetire = mapped[29];
+    m_stats.renderOwnerUnsafeMissSampleStoredLastRetire = 0;
+    for (uint32_t sampleSlot = 0;
+         sampleSlot < kSparseRenderOwnershipUnsafeSampleCapacity &&
+         m_stats.renderOwnerUnsafeMissSampleStoredLastRetire < kSparseRenderOwnershipUnsafeSampleCapacity;
+         ++sampleSlot) {
+        const uint32_t base = kSparseRenderOwnershipBaseWords + sampleSlot * 4u;
+        const uint32_t distance = mapped[base + 3u];
+        if (distance == 0u && mapped[base + 0u] == 0u && mapped[base + 1u] == 0u && mapped[base + 2u] == 0u) {
+            continue;
+        }
+        const uint32_t outIndex = m_stats.renderOwnerUnsafeMissSampleStoredLastRetire++;
+        m_stats.renderOwnerUnsafeMissSampleBricksLastRetire[outIndex] = {
+            static_cast<int32_t>(mapped[base + 0u]),
+            static_cast<int32_t>(mapped[base + 1u]),
+            static_cast<int32_t>(mapped[base + 2u])
+        };
+        m_stats.renderOwnerUnsafeMissSampleDistancesLastRetire[outIndex] = distance;
+    }
+    const uint32_t farHeightMidSampleBase =
+        kSparseRenderOwnershipBaseWords + kSparseRenderOwnershipUnsafeSampleCapacity * 4u;
+    m_stats.renderOwnerFarHeightMidSampleStoredLastRetire = 0;
+    for (uint32_t sampleSlot = 0;
+         sampleSlot < kSparseRenderOwnershipFarHeightMidSampleCapacity &&
+         m_stats.renderOwnerFarHeightMidSampleStoredLastRetire < kSparseRenderOwnershipFarHeightMidSampleCapacity;
+         ++sampleSlot) {
+        const uint32_t base = farHeightMidSampleBase + sampleSlot * 4u;
+        if (mapped[base + 0u] == 0u &&
+            mapped[base + 1u] == 0u &&
+            mapped[base + 2u] == 0u &&
+            mapped[base + 3u] == 0u) {
+            continue;
+        }
+        const uint32_t outIndex = m_stats.renderOwnerFarHeightMidSampleStoredLastRetire++;
+        m_stats.renderOwnerFarHeightMidSamplesLastRetire[outIndex] = {
+            static_cast<int32_t>(mapped[base + 0u]),
+            static_cast<int32_t>(mapped[base + 1u]),
+            static_cast<int32_t>(mapped[base + 2u]),
+            static_cast<int32_t>(mapped[base + 3u])
+        };
+    }
+    for (uint32_t i = m_stats.renderOwnerUnsafeMissSampleStoredLastRetire;
+         i < kSparseRenderOwnershipUnsafeSampleCapacity;
+         ++i) {
+        m_stats.renderOwnerUnsafeMissSampleBricksLastRetire[i] = {};
+        m_stats.renderOwnerUnsafeMissSampleDistancesLastRetire[i] = 0u;
+    }
+    for (uint32_t i = m_stats.renderOwnerFarHeightMidSampleStoredLastRetire;
+         i < kSparseRenderOwnershipFarHeightMidSampleCapacity;
+         ++i) {
+        m_stats.renderOwnerFarHeightMidSamplesLastRetire[i] = {};
+    }
+    m_stats.renderOwnerFrameLastRetire = payloadFrame;
     if (m_stats.renderOwnerTotalPixelsLastRetire > 0) {
         spdlog::info(
-            "PERF_RENDER_OWNERSHIP retireFrame={} shaderFrame={} total={} near={} surfaceFragments={} midVoxel={} midHeight={} farSvo={} farHeight={} sky={} miss={} unsafeNearMiss={}",
+            "PERF_RENDER_OWNERSHIP retireFrame={} shaderFrame={} total={} near={} surfaceFragments={} farSurface={} midVoxel={} midVoxelInteriorFallback={} midHeight={} farSvo={} farHeight={} farWater={} waterContext={} valleyAtmosphere={} sky={} miss={} unsafeNearMiss={} lodParentHeld={} parentHeldUntilChildrenReady={} unsafeSample={}/{},{},{} dist={} farHeightReason=continuity/midMissing/midAir/midSolid/farPagePresent/farPageMissing/farPageOutGrid/midSamples/stored:{}/{}/{}/{}/{}/{}/{}/{}/{}",
             frameIndex,
             m_stats.renderOwnerFrameLastRetire,
             m_stats.renderOwnerTotalPixelsLastRetire,
             m_stats.renderOwnerNearPixelsLastRetire,
             m_stats.renderOwnerSurfacePixelsLastRetire,
+            m_stats.renderOwnerFarSurfacePixelsLastRetire,
             m_stats.renderOwnerMidVoxelPixelsLastRetire,
+            m_stats.renderOwnerMidInteriorFallbackPixelsLastRetire,
             m_stats.renderOwnerMidHeightPixelsLastRetire,
             m_stats.renderOwnerFarSvoPixelsLastRetire,
             m_stats.renderOwnerFarHeightPixelsLastRetire,
+            m_stats.renderOwnerFarWaterPixelsLastRetire,
+            m_stats.renderOwnerWaterContextPixelsLastRetire,
+            m_stats.renderOwnerValleyAtmospherePixelsLastRetire,
             m_stats.renderOwnerSkyPixelsLastRetire,
             m_stats.renderOwnerMissPixelsLastRetire,
-            m_stats.renderOwnerUnsafeNearMissPixelsLastRetire);
+            m_stats.renderOwnerUnsafeNearMissPixelsLastRetire,
+            m_stats.renderOwnerLodParentHeldPixelsLastRetire,
+            m_stats.renderOwnerLodParentHeldPixelsLastRetire,
+            m_stats.renderOwnerUnsafeMissSampleCountLastRetire,
+            m_stats.renderOwnerUnsafeMissSampleBrickX,
+            m_stats.renderOwnerUnsafeMissSampleBrickY,
+            m_stats.renderOwnerUnsafeMissSampleBrickZ,
+            m_stats.renderOwnerUnsafeMissSampleDistanceLastRetire,
+            m_stats.renderOwnerFarHeightContinuityPixelsLastRetire,
+            m_stats.renderOwnerFarHeightMidMissingPixelsLastRetire,
+            m_stats.renderOwnerFarHeightMidAirPixelsLastRetire,
+            m_stats.renderOwnerFarHeightMidSolidPixelsLastRetire,
+            m_stats.renderOwnerFarHeightFarPagePresentPixelsLastRetire,
+            m_stats.renderOwnerFarHeightFarPageMissingPixelsLastRetire,
+            m_stats.renderOwnerFarHeightFarPageOutOfGridPixelsLastRetire,
+            m_stats.renderOwnerFarHeightMidSampleCountLastRetire,
+            m_stats.renderOwnerFarHeightMidSampleStoredLastRetire);
     }
     return true;
 }
@@ -1450,12 +1818,20 @@ bool SparseVoxelGpuResources::StageBrickUpload(
         return false;
     }
 
-    const uint64_t occupancyBytes = sizeof(uint32_t) * 2u;
-    const uint64_t voxelOffset = AlignUp(m_uploadWriteOffset, kUploadAlignment);
-    const uint64_t occupancyOffset = AlignUp(voxelOffset + voxelBytes, kUploadAlignment);
-    const uint64_t generationOffset = AlignUp(occupancyOffset + occupancyBytes, kUploadAlignment);
     const uint64_t generationBytes = sizeof(uint32_t);
-    const uint64_t endOffset = generationOffset + generationBytes;
+    const uint64_t occupancyBytes = sizeof(uint32_t) * 2u;
+    uint64_t voxelOffset = 0;
+    uint64_t occupancyOffset = 0;
+    uint64_t generationOffset = 0;
+    uint64_t afterVoxels = 0;
+    uint64_t afterOccupancy = 0;
+    uint64_t endOffset = 0;
+    if (!AppendAlignedUploadRange(m_uploadWriteOffset, voxelBytes, kUploadAlignment, &voxelOffset, &afterVoxels) ||
+        !AppendAlignedUploadRange(afterVoxels, occupancyBytes, kUploadAlignment, &occupancyOffset, &afterOccupancy) ||
+        !AppendAlignedUploadRange(afterOccupancy, generationBytes, kUploadAlignment, &generationOffset, &endOffset)) {
+        m_stats.uploadRingOverflowLastFrame = true;
+        return false;
+    }
     if (endOffset > upload.GetSize()) {
         m_stats.uploadRingOverflowLastFrame = true;
         return false;
@@ -1479,7 +1855,10 @@ bool SparseVoxelGpuResources::StageBrickUpload(
             pageBaseOffset + static_cast<uint64_t>(range.localIndex) * sizeof(uint32_t),
             rangeBytes
         });
-        nextVoxelUploadOffset += rangeBytes;
+        if (!AddUint64(nextVoxelUploadOffset, rangeBytes, &nextVoxelUploadOffset)) {
+            m_stats.uploadRingOverflowLastFrame = true;
+            return false;
+        }
     }
     uint32_t occupancyWords[2] = {
         packet.brick.occupancyWord0,
@@ -1545,9 +1924,10 @@ bool SparseVoxelGpuResources::StagePageTableEntry(
 
     constexpr uint64_t kUploadAlignment = 256u;
     const uint64_t bytes = sizeof(Simulation::BrickPageEntry);
-    const uint64_t uploadOffset = AlignUp(m_uploadWriteOffset, kUploadAlignment);
-    const uint64_t endOffset = uploadOffset + bytes;
-    if (endOffset > upload.GetSize()) {
+    uint64_t uploadOffset = 0;
+    uint64_t endOffset = 0;
+    if (!AppendAlignedUploadRange(m_uploadWriteOffset, bytes, kUploadAlignment, &uploadOffset, &endOffset) ||
+        endOffset > upload.GetSize()) {
         m_stats.uploadRingOverflowLastFrame = true;
         return false;
     }
@@ -1581,7 +1961,11 @@ bool SparseVoxelGpuResources::StagePageTableInvalidation(
     }
 
     Simulation::BrickPageEntry invalidEntry = {};
-    invalidEntry.pageIndex = Simulation::INVALID_BRICK_PAGE;
+    // CPU-side sparse page-table removal leaves an open-addressing tombstone,
+    // not an empty slot. The shader lookup also has to see a tombstone here;
+    // writing INVALID would prematurely terminate the probe chain and make
+    // later resident bricks in that chain disappear on the GPU.
+    invalidEntry.pageIndex = Simulation::INVALID_BRICK_PAGE - 1u;
     invalidEntry.generation = 0;
 
     if (outTicket) {
@@ -1599,9 +1983,10 @@ bool SparseVoxelGpuResources::StagePageTableInvalidation(
 
     constexpr uint64_t kUploadAlignment = 256u;
     const uint64_t bytes = sizeof(Simulation::BrickPageEntry);
-    const uint64_t uploadOffset = AlignUp(m_uploadWriteOffset, kUploadAlignment);
-    const uint64_t endOffset = uploadOffset + bytes;
-    if (endOffset > upload.GetSize()) {
+    uint64_t uploadOffset = 0;
+    uint64_t endOffset = 0;
+    if (!AppendAlignedUploadRange(m_uploadWriteOffset, bytes, kUploadAlignment, &uploadOffset, &endOffset) ||
+        endOffset > upload.GetSize()) {
         m_stats.uploadRingOverflowLastFrame = true;
         return false;
     }
@@ -1639,9 +2024,10 @@ bool SparseVoxelGpuResources::StagePageTableReset(SparsePageTableGpuUploadTicket
 
     constexpr uint64_t kUploadAlignment = 256u;
     const uint64_t bytes = m_stats.pageTableBytes;
-    const uint64_t uploadOffset = AlignUp(m_uploadWriteOffset, kUploadAlignment);
-    const uint64_t endOffset = uploadOffset + bytes;
-    if (endOffset > upload.GetSize()) {
+    uint64_t uploadOffset = 0;
+    uint64_t endOffset = 0;
+    if (!AppendAlignedUploadRange(m_uploadWriteOffset, bytes, kUploadAlignment, &uploadOffset, &endOffset) ||
+        endOffset > upload.GetSize()) {
         m_stats.uploadRingOverflowLastFrame = true;
         return false;
     }
@@ -1724,13 +2110,27 @@ bool SparseVoxelGpuResources::StageMidClipmapSnapshot(
     }
 
     constexpr uint64_t kUploadAlignment = 256u;
-    const uint64_t metadataOffset = AlignUp(m_uploadWriteOffset, kUploadAlignment);
-    const uint64_t lookupOffset = AlignUp(metadataOffset + plan.metadataBytes, kUploadAlignment);
-    const uint64_t samplesOffset = AlignUp(lookupOffset + plan.lookupBytes, kUploadAlignment);
-    const uint64_t voxelMetadataOffset = AlignUp(samplesOffset + plan.sampleBytes, kUploadAlignment);
-    const uint64_t voxelLookupOffset = AlignUp(voxelMetadataOffset + plan.voxelMetadataBytes, kUploadAlignment);
-    const uint64_t voxelSamplesOffset = AlignUp(voxelLookupOffset + plan.voxelLookupBytes, kUploadAlignment);
-    const uint64_t endOffset = voxelSamplesOffset + plan.voxelSampleBytes;
+    uint64_t metadataOffset = 0;
+    uint64_t lookupOffset = 0;
+    uint64_t samplesOffset = 0;
+    uint64_t voxelMetadataOffset = 0;
+    uint64_t voxelLookupOffset = 0;
+    uint64_t voxelSamplesOffset = 0;
+    uint64_t afterMetadata = 0;
+    uint64_t afterLookup = 0;
+    uint64_t afterSamples = 0;
+    uint64_t afterVoxelMetadata = 0;
+    uint64_t afterVoxelLookup = 0;
+    uint64_t endOffset = 0;
+    if (!AppendAlignedUploadRange(m_uploadWriteOffset, plan.metadataBytes, kUploadAlignment, &metadataOffset, &afterMetadata) ||
+        !AppendAlignedUploadRange(afterMetadata, plan.lookupBytes, kUploadAlignment, &lookupOffset, &afterLookup) ||
+        !AppendAlignedUploadRange(afterLookup, plan.sampleBytes, kUploadAlignment, &samplesOffset, &afterSamples) ||
+        !AppendAlignedUploadRange(afterSamples, plan.voxelMetadataBytes, kUploadAlignment, &voxelMetadataOffset, &afterVoxelMetadata) ||
+        !AppendAlignedUploadRange(afterVoxelMetadata, plan.voxelLookupBytes, kUploadAlignment, &voxelLookupOffset, &afterVoxelLookup) ||
+        !AppendAlignedUploadRange(afterVoxelLookup, plan.voxelSampleBytes, kUploadAlignment, &voxelSamplesOffset, &endOffset)) {
+        m_stats.uploadRingOverflowLastFrame = true;
+        return false;
+    }
     if (endOffset > upload.GetSize()) {
         m_stats.uploadRingOverflowLastFrame = true;
         return false;
@@ -1739,30 +2139,27 @@ bool SparseVoxelGpuResources::StageMidClipmapSnapshot(
     if (plan.metadataBytes > 0) {
         std::memcpy(mapped + metadataOffset, snapshot.metadata.data(), static_cast<size_t>(plan.metadataBytes));
         std::memcpy(mapped + lookupOffset, snapshot.lookup.data(), static_cast<size_t>(plan.lookupBytes));
-        const size_t heightSampleSourceOffset =
-            static_cast<size_t>(plan.heightSampleStartSlot) *
-            static_cast<size_t>(snapshot.tileSampleSide) *
-            static_cast<size_t>(snapshot.tileSampleSide);
         std::memcpy(
             mapped + samplesOffset,
-            snapshot.samples.data() + heightSampleSourceOffset,
+            snapshot.samples.data(),
             static_cast<size_t>(plan.sampleBytes));
     }
     if (plan.voxelMetadataBytes > 0) {
         std::memcpy(mapped + voxelMetadataOffset, snapshot.voxelMetadata.data(), static_cast<size_t>(plan.voxelMetadataBytes));
         std::memcpy(mapped + voxelLookupOffset, snapshot.voxelLookup.data(), static_cast<size_t>(plan.voxelLookupBytes));
-        const size_t voxelSampleSourceOffset =
-            static_cast<size_t>(plan.voxelSampleStartSlot) *
-            static_cast<size_t>(Simulation::SPARSE_BRICK_VOXEL_COUNT);
         std::memcpy(
             mapped + voxelSamplesOffset,
-            snapshot.voxelSamples.data() + voxelSampleSourceOffset,
+            snapshot.voxelSamples.data(),
             static_cast<size_t>(plan.voxelSampleBytes));
     }
     m_uploadWriteOffset = endOffset;
     m_stats.stagedBytesLastFrame += endOffset - metadataOffset;
     m_stats.stagedMidClipmapTilesLastFrame = uploadHeightLayer ? snapshot.tileCount : 0u;
-    m_stats.stagedMidVoxelClipmapBricksLastFrame = uploadVoxelLayer ? plan.voxelSampleSlotCount : 0u;
+    uint32_t stagedVoxelSampleSlots = 0;
+    for (const MidClipmapUploadPlan::SampleRange& range : plan.voxelSampleRanges) {
+        stagedVoxelSampleSlots += range.slotCount;
+    }
+    m_stats.stagedMidVoxelClipmapBricksLastFrame = uploadVoxelLayer ? stagedVoxelSampleSlots : 0u;
     m_stats.stagedMidClipmapBytesLastFrame =
         plan.metadataBytes + plan.lookupBytes + plan.sampleBytes +
         plan.voxelMetadataBytes + plan.voxelLookupBytes + plan.voxelSampleBytes;
@@ -1775,21 +2172,43 @@ bool SparseVoxelGpuResources::StageMidClipmapSnapshot(
         outTicket->metadataUploadOffset = metadataOffset;
         outTicket->lookupUploadOffset = lookupOffset;
         outTicket->samplesUploadOffset = samplesOffset;
-        outTicket->samplesDestOffset =
-            static_cast<uint64_t>(plan.heightSampleStartSlot) *
-            static_cast<uint64_t>(snapshot.tileSampleSide) *
-            static_cast<uint64_t>(snapshot.tileSampleSide) *
-            sizeof(uint32_t);
+        outTicket->samplesDestOffset = 0;
+        outTicket->heightSampleCopyRanges.clear();
+        for (const MidClipmapUploadPlan::SampleRange& range : plan.heightSampleRanges) {
+            SparseMidClipmapSampleCopyRange copyRange;
+            copyRange.uploadOffset = samplesOffset + range.sourceUintOffset * sizeof(uint32_t);
+            copyRange.destinationOffset =
+                static_cast<uint64_t>(range.startSlot) *
+                static_cast<uint64_t>(snapshot.tileSampleSide) *
+                static_cast<uint64_t>(snapshot.tileSampleSide) *
+                sizeof(uint32_t);
+            copyRange.bytes = range.bytes;
+            if (outTicket->heightSampleCopyRanges.empty()) {
+                outTicket->samplesDestOffset = copyRange.destinationOffset;
+            }
+            outTicket->heightSampleCopyRanges.push_back(copyRange);
+        }
         outTicket->metadataBytes = plan.metadataBytes;
         outTicket->lookupBytes = plan.lookupBytes;
         outTicket->sampleBytes = plan.sampleBytes;
         outTicket->voxelMetadataUploadOffset = voxelMetadataOffset;
         outTicket->voxelLookupUploadOffset = voxelLookupOffset;
         outTicket->voxelSamplesUploadOffset = voxelSamplesOffset;
-        outTicket->voxelSamplesDestOffset =
-            static_cast<uint64_t>(plan.voxelSampleStartSlot) *
-            static_cast<uint64_t>(Simulation::SPARSE_BRICK_VOXEL_COUNT) *
-            sizeof(uint32_t);
+        outTicket->voxelSamplesDestOffset = 0;
+        outTicket->voxelSampleCopyRanges.clear();
+        for (const MidClipmapUploadPlan::SampleRange& range : plan.voxelSampleRanges) {
+            SparseMidClipmapSampleCopyRange copyRange;
+            copyRange.uploadOffset = voxelSamplesOffset + range.sourceUintOffset * sizeof(uint32_t);
+            copyRange.destinationOffset =
+                static_cast<uint64_t>(range.startSlot) *
+                static_cast<uint64_t>(Simulation::SPARSE_BRICK_VOXEL_COUNT) *
+                sizeof(uint32_t);
+            copyRange.bytes = range.bytes;
+            if (outTicket->voxelSampleCopyRanges.empty()) {
+                outTicket->voxelSamplesDestOffset = copyRange.destinationOffset;
+            }
+            outTicket->voxelSampleCopyRanges.push_back(copyRange);
+        }
         outTicket->voxelMetadataBytes = plan.voxelMetadataBytes;
         outTicket->voxelLookupBytes = plan.voxelLookupBytes;
         outTicket->voxelSampleBytes = plan.voxelSampleBytes;
@@ -1808,6 +2227,7 @@ bool SparseVoxelGpuResources::StagePhysicsWorkPackets(
     if (outTicket) {
         *outTicket = {};
     }
+    m_pendingPhysicsPacketResultPackets.clear();
     if (!m_stats.initialized || packets.empty()) {
         return false;
     }
@@ -1837,15 +2257,17 @@ bool SparseVoxelGpuResources::StagePhysicsWorkPackets(
     }
 
     constexpr uint64_t kUploadAlignment = 256u;
-    const uint64_t uploadOffset = AlignUp(m_uploadWriteOffset, kUploadAlignment);
-    const uint64_t endOffset = uploadOffset + bytes;
-    if (endOffset > upload.GetSize()) {
+    uint64_t uploadOffset = 0;
+    uint64_t endOffset = 0;
+    if (!AppendAlignedUploadRange(m_uploadWriteOffset, bytes, kUploadAlignment, &uploadOffset, &endOffset) ||
+        endOffset > upload.GetSize()) {
         m_stats.uploadRingOverflowLastFrame = true;
         m_stats.physicsPacketUploadOverflowLastFrame = true;
         return false;
     }
 
     std::memcpy(mapped + uploadOffset, packets.data(), static_cast<size_t>(bytes));
+    m_pendingPhysicsPacketResultPackets.assign(packets.begin(), packets.begin() + packetCount);
     m_uploadWriteOffset = endOffset;
     m_stats.stagedBytesLastFrame += endOffset - uploadOffset;
     m_stats.stagedPhysicsPacketsLastFrame = packetCount;
@@ -1875,18 +2297,11 @@ bool SparseVoxelGpuResources::StageEditDeltas(
         return false;
     }
 
-    const uint32_t estimatedRangeCount = std::min<uint32_t>(
-        static_cast<uint32_t>(deltas.size()),
-        m_config.maxEditDeltaRanges);
-    uint32_t dynamicRangeTableCapacity = 16u;
-    const uint32_t targetRangeTableCapacity = std::max(16u, estimatedRangeCount * 4u);
-    while (dynamicRangeTableCapacity < targetRangeTableCapacity &&
-           dynamicRangeTableCapacity < m_config.editDeltaRangeTableCapacity) {
-        dynamicRangeTableCapacity <<= 1u;
-    }
-    dynamicRangeTableCapacity = std::min(
-        dynamicRangeTableCapacity,
-        m_config.editDeltaRangeTableCapacity);
+    const uint32_t dynamicRangeTableCapacity =
+        BuildEditDeltaRangeTableCapacity(
+            deltas.size(),
+            m_config.maxEditDeltaRanges,
+            m_config.editDeltaRangeTableCapacity);
 
     const Simulation::SparseEditDeltaBatch batch =
         Simulation::BuildSparseEditDeltaBatch(
@@ -1894,7 +2309,7 @@ bool SparseVoxelGpuResources::StageEditDeltas(
             m_config.maxEditDeltas,
             m_config.maxEditDeltaRanges,
             dynamicRangeTableCapacity);
-    if (batch.overflow) {
+    if (batch.truncated) {
         m_stats.editDeltaUploadOverflowLastFrame = true;
     }
     const uint32_t deltaCount = static_cast<uint32_t>(batch.deltas.size());
@@ -1925,10 +2340,19 @@ bool SparseVoxelGpuResources::StageEditDeltas(
     }
 
     constexpr uint64_t kUploadAlignment = 256u;
-    const uint64_t uploadOffset = AlignUp(m_uploadWriteOffset, kUploadAlignment);
-    const uint64_t rangeUploadOffset = AlignUp(uploadOffset + bytes, kUploadAlignment);
-    const uint64_t rangeTableUploadOffset = AlignUp(rangeUploadOffset + rangeBytes, kUploadAlignment);
-    const uint64_t endOffset = rangeTableUploadOffset + rangeTableBytes;
+    uint64_t uploadOffset = 0;
+    uint64_t rangeUploadOffset = 0;
+    uint64_t rangeTableUploadOffset = 0;
+    uint64_t afterDeltas = 0;
+    uint64_t afterRanges = 0;
+    uint64_t endOffset = 0;
+    if (!AppendAlignedUploadRange(m_uploadWriteOffset, bytes, kUploadAlignment, &uploadOffset, &afterDeltas) ||
+        !AppendAlignedUploadRange(afterDeltas, rangeBytes, kUploadAlignment, &rangeUploadOffset, &afterRanges) ||
+        !AppendAlignedUploadRange(afterRanges, rangeTableBytes, kUploadAlignment, &rangeTableUploadOffset, &endOffset)) {
+        m_stats.uploadRingOverflowLastFrame = true;
+        m_stats.editDeltaUploadOverflowLastFrame = true;
+        return false;
+    }
     if (endOffset > upload.GetSize()) {
         m_stats.uploadRingOverflowLastFrame = true;
         m_stats.editDeltaUploadOverflowLastFrame = true;
@@ -1957,13 +2381,34 @@ bool SparseVoxelGpuResources::StageEditDeltas(
         outTicket->deltaCount = deltaCount;
         outTicket->rangeCount = rangeCount;
         outTicket->rangeTableCapacity = rangeTableCapacity;
+        outTicket->inputFullyRepresented = !batch.truncated;
     }
     return true;
 }
 
+bool SparseVoxelGpuResources::BeginPageTableCopyBatch(ID3D12GraphicsCommandList* commandList)
+{
+    if (!m_stats.initialized || !commandList || !m_pageTable.GetResource()) {
+        return false;
+    }
+    m_pageTable.TransitionTo(commandList, D3D12_RESOURCE_STATE_COPY_DEST);
+    return true;
+}
+
+void SparseVoxelGpuResources::EndPageTableCopyBatch(ID3D12GraphicsCommandList* commandList)
+{
+    if (!m_stats.initialized || !commandList || !m_pageTable.GetResource()) {
+        return;
+    }
+    m_pageTable.TransitionTo(
+        commandList,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
 bool SparseVoxelGpuResources::EmitPageTableCopy(
     ID3D12GraphicsCommandList* commandList,
-    const SparsePageTableGpuUploadTicket& ticket)
+    const SparsePageTableGpuUploadTicket& ticket,
+    bool manageResourceState)
 {
     if (!m_stats.initialized || !commandList || !ticket.valid) {
         return false;
@@ -1976,17 +2421,31 @@ bool SparseVoxelGpuResources::EmitPageTableCopy(
     if (!uploadResource || !m_pageTable.GetResource()) {
         return false;
     }
+    if (!IsSparseVoxelGpuCopyRangeInBounds(
+            ticket.uploadOffset,
+            ticket.pageTableOffset,
+            ticket.bytes,
+            m_uploadRing[ticket.ringSlot].GetSize(),
+            m_pageTable.GetSize())) {
+        spdlog::warn("SparseVoxelGpuResources::EmitPageTableCopy rejected out-of-bounds copy ticket");
+        m_stats.uploadRingOverflowLastFrame = true;
+        return false;
+    }
 
-    m_pageTable.TransitionTo(commandList, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (manageResourceState) {
+        m_pageTable.TransitionTo(commandList, D3D12_RESOURCE_STATE_COPY_DEST);
+    }
     commandList->CopyBufferRegion(
         m_pageTable.GetResource(),
         ticket.pageTableOffset,
         uploadResource,
         ticket.uploadOffset,
         ticket.bytes);
-    m_pageTable.TransitionTo(
-        commandList,
-        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (manageResourceState) {
+        m_pageTable.TransitionTo(
+            commandList,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
     return true;
 }
 
@@ -2004,6 +2463,16 @@ bool SparseVoxelGpuResources::EmitPhysicsPacketCopy(
 
     ID3D12Resource* uploadResource = m_uploadRing[ticket.ringSlot].GetResource();
     if (!uploadResource || !m_physicsWorkPackets.GetResource()) {
+        return false;
+    }
+    if (!IsSparseVoxelGpuCopyRangeInBounds(
+            ticket.uploadOffset,
+            0u,
+            ticket.bytes,
+            m_uploadRing[ticket.ringSlot].GetSize(),
+            m_physicsWorkPackets.GetSize())) {
+        spdlog::warn("SparseVoxelGpuResources::EmitPhysicsPacketCopy rejected out-of-bounds copy ticket");
+        m_stats.uploadRingOverflowLastFrame = true;
         return false;
     }
 
@@ -2039,6 +2508,29 @@ bool SparseVoxelGpuResources::EmitEditDeltaCopy(
         !m_editDeltas.GetResource() ||
         !m_editDeltaRanges.GetResource() ||
         !m_editDeltaRangeTable.GetResource()) {
+        return false;
+    }
+    const uint64_t uploadSize = m_uploadRing[ticket.ringSlot].GetSize();
+    if (!IsSparseVoxelGpuCopyRangeInBounds(
+            ticket.uploadOffset,
+            0u,
+            ticket.bytes,
+            uploadSize,
+            m_editDeltas.GetSize()) ||
+        !IsSparseVoxelGpuCopyRangeInBounds(
+            ticket.rangeUploadOffset,
+            0u,
+            ticket.rangeBytes,
+            uploadSize,
+            m_editDeltaRanges.GetSize()) ||
+        !IsSparseVoxelGpuCopyRangeInBounds(
+            ticket.rangeTableUploadOffset,
+            0u,
+            ticket.rangeTableBytes,
+            uploadSize,
+            m_editDeltaRangeTable.GetSize())) {
+        spdlog::warn("SparseVoxelGpuResources::EmitEditDeltaCopy rejected out-of-bounds copy ticket");
+        m_stats.uploadRingOverflowLastFrame = true;
         return false;
     }
 
@@ -2103,20 +2595,76 @@ bool SparseVoxelGpuResources::EmitMidClipmapCopy(
         return false;
     }
     if (ticket.uploadHeightLayer) {
-        if (ticket.metadataBytes > m_midClipmapMetadata.GetSize() ||
-            ticket.lookupBytes > m_midClipmapLookup.GetSize() ||
-            ticket.sampleBytes > m_midClipmapSamples.GetSize() ||
-            ticket.samplesDestOffset > m_midClipmapSamples.GetSize() ||
-            ticket.sampleBytes > m_midClipmapSamples.GetSize() - ticket.samplesDestOffset) {
+        const uint64_t uploadSize = m_uploadRing[ticket.ringSlot].GetSize();
+        bool heightSampleRangesValid = ticket.sampleBytes == 0;
+        uint64_t heightSampleRangeBytes = 0;
+        for (const SparseMidClipmapSampleCopyRange& range : ticket.heightSampleCopyRanges) {
+            heightSampleRangeBytes += range.bytes;
+            if (!IsSparseVoxelGpuCopyRangeInBounds(
+                    range.uploadOffset,
+                    range.destinationOffset,
+                    range.bytes,
+                    uploadSize,
+                    m_midClipmapSamples.GetSize())) {
+                heightSampleRangesValid = false;
+                break;
+            }
+        }
+        heightSampleRangesValid =
+            heightSampleRangesValid ||
+            (!ticket.heightSampleCopyRanges.empty() && heightSampleRangeBytes == ticket.sampleBytes);
+        if (!IsSparseVoxelGpuCopyRangeInBounds(
+                ticket.metadataUploadOffset,
+                0u,
+                ticket.metadataBytes,
+                uploadSize,
+                m_midClipmapMetadata.GetSize()) ||
+            !IsSparseVoxelGpuCopyRangeInBounds(
+                ticket.lookupUploadOffset,
+                0u,
+                ticket.lookupBytes,
+                uploadSize,
+                m_midClipmapLookup.GetSize()) ||
+            !heightSampleRangesValid) {
+            spdlog::warn("SparseVoxelGpuResources::EmitMidClipmapCopy rejected out-of-bounds height copy ticket");
+            m_stats.uploadRingOverflowLastFrame = true;
             return false;
         }
     }
     if (ticket.uploadVoxelLayer) {
-        if (ticket.voxelMetadataBytes > m_midVoxelClipmapMetadata.GetSize() ||
-            ticket.voxelLookupBytes > m_midVoxelClipmapLookup.GetSize() ||
-            ticket.voxelSampleBytes > m_midVoxelClipmapSamples.GetSize() ||
-            ticket.voxelSamplesDestOffset > m_midVoxelClipmapSamples.GetSize() ||
-            ticket.voxelSampleBytes > m_midVoxelClipmapSamples.GetSize() - ticket.voxelSamplesDestOffset) {
+        const uint64_t uploadSize = m_uploadRing[ticket.ringSlot].GetSize();
+        bool voxelSampleRangesValid = ticket.voxelSampleBytes == 0;
+        uint64_t voxelSampleRangeBytes = 0;
+        for (const SparseMidClipmapSampleCopyRange& range : ticket.voxelSampleCopyRanges) {
+            voxelSampleRangeBytes += range.bytes;
+            if (!IsSparseVoxelGpuCopyRangeInBounds(
+                    range.uploadOffset,
+                    range.destinationOffset,
+                    range.bytes,
+                    uploadSize,
+                    m_midVoxelClipmapSamples.GetSize())) {
+                voxelSampleRangesValid = false;
+                break;
+            }
+        }
+        voxelSampleRangesValid =
+            voxelSampleRangesValid ||
+            (!ticket.voxelSampleCopyRanges.empty() && voxelSampleRangeBytes == ticket.voxelSampleBytes);
+        if (!IsSparseVoxelGpuCopyRangeInBounds(
+                ticket.voxelMetadataUploadOffset,
+                0u,
+                ticket.voxelMetadataBytes,
+                uploadSize,
+                m_midVoxelClipmapMetadata.GetSize()) ||
+            !IsSparseVoxelGpuCopyRangeInBounds(
+                ticket.voxelLookupUploadOffset,
+                0u,
+                ticket.voxelLookupBytes,
+                uploadSize,
+                m_midVoxelClipmapLookup.GetSize()) ||
+            !voxelSampleRangesValid) {
+            spdlog::warn("SparseVoxelGpuResources::EmitMidClipmapCopy rejected out-of-bounds voxel copy ticket");
+            m_stats.uploadRingOverflowLastFrame = true;
             return false;
         }
     }
@@ -2137,12 +2685,14 @@ bool SparseVoxelGpuResources::EmitMidClipmapCopy(
             uploadResource,
             ticket.lookupUploadOffset,
             ticket.lookupBytes);
-        commandList->CopyBufferRegion(
-            m_midClipmapSamples.GetResource(),
-            ticket.samplesDestOffset,
-            uploadResource,
-            ticket.samplesUploadOffset,
-            ticket.sampleBytes);
+        for (const SparseMidClipmapSampleCopyRange& range : ticket.heightSampleCopyRanges) {
+            commandList->CopyBufferRegion(
+                m_midClipmapSamples.GetResource(),
+                range.destinationOffset,
+                uploadResource,
+                range.uploadOffset,
+                range.bytes);
+        }
         m_midClipmapMetadata.TransitionTo(
             commandList,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -2169,12 +2719,14 @@ bool SparseVoxelGpuResources::EmitMidClipmapCopy(
             uploadResource,
             ticket.voxelLookupUploadOffset,
             ticket.voxelLookupBytes);
-        commandList->CopyBufferRegion(
-            m_midVoxelClipmapSamples.GetResource(),
-            ticket.voxelSamplesDestOffset,
-            uploadResource,
-            ticket.voxelSamplesUploadOffset,
-            ticket.voxelSampleBytes);
+        for (const SparseMidClipmapSampleCopyRange& range : ticket.voxelSampleCopyRanges) {
+            commandList->CopyBufferRegion(
+                m_midVoxelClipmapSamples.GetResource(),
+                range.destinationOffset,
+                uploadResource,
+                range.uploadOffset,
+                range.bytes);
+        }
         m_midVoxelClipmapMetadata.TransitionTo(
             commandList,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -2202,6 +2754,41 @@ bool SparseVoxelGpuResources::EmitUploadCopy(
     ID3D12Resource* uploadResource = m_uploadRing[ticket.ringSlot].GetResource();
     if (!uploadResource || !m_brickPool.GetResource() || !m_occupancy.GetResource() ||
         !m_pageGeneration.GetResource()) {
+        return false;
+    }
+    const uint64_t uploadSize = m_uploadRing[ticket.ringSlot].GetSize();
+    if (!ticket.voxelCopyRanges.empty()) {
+        for (const SparseBrickVoxelCopyRange& range : ticket.voxelCopyRanges) {
+            if (!IsSparseVoxelGpuBrickCopyRangeInBounds(range, uploadSize, m_brickPool.GetSize())) {
+                spdlog::warn("SparseVoxelGpuResources::EmitUploadCopy rejected out-of-bounds partial brick copy ticket");
+                m_stats.uploadRingOverflowLastFrame = true;
+                return false;
+            }
+        }
+    } else if (!IsSparseVoxelGpuCopyRangeInBounds(
+            ticket.voxelUploadOffset,
+            ticket.brickPoolOffset,
+            ticket.voxelBytes,
+            uploadSize,
+            m_brickPool.GetSize())) {
+        spdlog::warn("SparseVoxelGpuResources::EmitUploadCopy rejected out-of-bounds brick copy ticket");
+        m_stats.uploadRingOverflowLastFrame = true;
+        return false;
+    }
+    if (!IsSparseVoxelGpuCopyRangeInBounds(
+            ticket.occupancyUploadOffset,
+            ticket.occupancyBufferOffset,
+            ticket.occupancyBytes,
+            uploadSize,
+            m_occupancy.GetSize()) ||
+        !IsSparseVoxelGpuCopyRangeInBounds(
+            ticket.generationUploadOffset,
+            ticket.pageGenerationBufferOffset,
+            ticket.generationBytes,
+            uploadSize,
+            m_pageGeneration.GetSize())) {
+        spdlog::warn("SparseVoxelGpuResources::EmitUploadCopy rejected out-of-bounds brick metadata copy ticket");
+        m_stats.uploadRingOverflowLastFrame = true;
         return false;
     }
 
@@ -2256,6 +2843,9 @@ bool SparseVoxelGpuResources::EmitUploadCopy(
 
 SparseVoxelGpuStats SparseVoxelGpuResources::ComputeStats(const SparseVoxelGpuConfig& config) {
     SparseVoxelGpuStats stats;
+    if (!ValidateSparseVoxelGpuConfigForStats(config)) {
+        return stats;
+    }
     stats.maxBrickPages = config.maxBrickPages;
     stats.pageTableCapacity = config.pageTableCapacity;
     stats.brickPoolBytes =

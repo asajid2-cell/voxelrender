@@ -9,9 +9,31 @@ constexpr int32_t SPARSE_BRICK_SIZE = 16;
 constexpr int32_t SPARSE_BRICK_VOXEL_COUNT =
     SPARSE_BRICK_SIZE * SPARSE_BRICK_SIZE * SPARSE_BRICK_SIZE;
 constexpr uint32_t INVALID_BRICK_PAGE = 0xFFFFFFFFu;
+constexpr float SPARSE_MAX_BRUSH_RADIUS = 32.0f;
+constexpr uint64_t SPARSE_MAX_BRUSH_VOXELS = 512000;
 
 int32_t FloorDiv(int32_t value, int32_t divisor);
 uint32_t FloorMod(int32_t value, uint32_t divisor);
+bool TryWorldVoxelFromBrickLocal(int32_t brickCoord, uint8_t local, int32_t* outWorldVoxel);
+
+struct SparseBrushVoxelBounds {
+    int32_t startX = 0;
+    int32_t startY = 0;
+    int32_t startZ = 0;
+    int32_t endX = 0;
+    int32_t endY = 0;
+    int32_t endZ = 0;
+    float radius = 0.0f;
+    float strength = 1.0f;
+};
+
+bool TryBuildSparseBrushVoxelBounds(
+    float worldPositionX,
+    float worldPositionY,
+    float worldPositionZ,
+    float radius,
+    float strength,
+    SparseBrushVoxelBounds* outBounds);
 
 struct BrickCoord {
     int32_t x = 0;
@@ -80,6 +102,14 @@ enum class SparseResidencyClass : uint8_t {
     Edited = 3
 };
 
+enum class SparseStreamingLane : uint8_t {
+    Cache = 0,
+    Prefetch = 1,
+    Repair = 2,
+    Visible = 3,
+    PublicCritical = 4
+};
+
 const char* ToString(BrickLifecycleState state);
 bool IsValidLifecycleTransition(BrickLifecycleState from, BrickLifecycleState to);
 
@@ -103,9 +133,12 @@ struct BrickResidentRecord {
     uint32_t lastCollisionFrame = 0;
     uint32_t lastEditedFrame = 0;
     uint32_t lastUploadedFrame = 0;
+    int32_t queuePriority = 0;
     SparseResidencyClass residencyClass = SparseResidencyClass::Speculative;
+    SparseStreamingLane streamingLane = SparseStreamingLane::Cache;
     bool dirtyCpu = false;
     bool dirtyGpu = false;
+    bool gpuPageTablePublished = false;
     bool hasPersistentEdits = false;
     bool physicsActive = false;
 };

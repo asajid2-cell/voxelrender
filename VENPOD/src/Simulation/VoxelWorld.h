@@ -8,6 +8,8 @@
 #include <wrl/client.h>
 #include <cstdint>
 #include <array>
+#include <cstring>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -28,9 +30,24 @@ struct VoxelWorldConfig {
     uint32_t gridSizeY = 256;
     uint32_t gridSizeZ = 256;
     float voxelScale = 1.0f;       // World units per voxel
+    uint32_t worldSeed = 12345;     // Dense fallback procedural seed
     bool enableRaycastResultBuffers = true;
     bool enableBrushEditFeedbackBuffers = true;
 };
+
+inline uint32_t InvalidVoxelRaycastReadbackFrame() {
+    return std::numeric_limits<uint32_t>::max();
+}
+
+inline bool IsVoxelRaycastReadbackRetirable(uint32_t queuedFrame, uint32_t retireFrame) {
+    return queuedFrame != InvalidVoxelRaycastReadbackFrame() && queuedFrame != retireFrame;
+}
+
+inline uint32_t DecodeVoxelRaycastPackedWord(float packedValue) {
+    uint32_t packed = 0;
+    std::memcpy(&packed, &packedValue, sizeof(packed));
+    return packed;
+}
 
 // Material properties for simulation
 struct MaterialProperties {
@@ -411,6 +428,16 @@ private:
     std::array<ComPtr<ID3D12Resource>, RAYCAST_READBACK_SLOTS> m_groundRaycastReadbackSlots;
     std::array<bool, RAYCAST_READBACK_SLOTS> m_brushRaycastReadbackReady = {};
     std::array<bool, RAYCAST_READBACK_SLOTS> m_groundRaycastReadbackReady = {};
+    std::array<uint32_t, RAYCAST_READBACK_SLOTS> m_brushRaycastReadbackQueuedFrame = {
+        InvalidVoxelRaycastReadbackFrame(),
+        InvalidVoxelRaycastReadbackFrame(),
+        InvalidVoxelRaycastReadbackFrame()
+    };
+    std::array<uint32_t, RAYCAST_READBACK_SLOTS> m_groundRaycastReadbackQueuedFrame = {
+        InvalidVoxelRaycastReadbackFrame(),
+        InvalidVoxelRaycastReadbackFrame(),
+        InvalidVoxelRaycastReadbackFrame()
+    };
 
     static constexpr uint32_t MAX_BRUSH_EDIT_FEEDBACK_EVENTS = 131072;
     static constexpr uint32_t BRUSH_EDIT_FEEDBACK_READBACK_SLOTS = 4;

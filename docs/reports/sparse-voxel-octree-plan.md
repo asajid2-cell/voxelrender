@@ -6,14 +6,17 @@
 > [Engine architecture](../explanation/architecture.md) and
 > [Sparse refactor review checklist](../reference/sparse-refactor-review.md).
 
-VENPOD currently renders an editable dense near-field voxel window. That path
-is good for painting, collision, physics, and persistence, but it scales by
-volume. Increasing dense render distance from `+/-7` to `+/-14` would require
-roughly four times the horizontal memory, before source chunks and transient
-GPU work.
+At this historical checkpoint, VENPOD still rendered an editable dense
+near-field voxel window. That path was good for painting, collision, physics,
+and persistence, but it scaled by volume. Increasing dense render distance from
+`+/-7` to `+/-14` would have required roughly four times the horizontal memory,
+before source chunks and transient GPU work.
 
-The sparse voxel octree direction is for visual far distance first. The dense
-near field remains the source of truth for gameplay.
+The sparse voxel octree direction was introduced for visual far distance first.
+The dense near field remained the source of truth for gameplay in this report.
+The current sparse refactor has since moved gameplay-critical residency,
+surface rendering, collision, edits, and physics toward sparse bricks; see
+[Sparse completion audit](../reference/sparse-completion-audit.md).
 
 ## Implemented GPU Node/Page Pass
 
@@ -202,6 +205,9 @@ Release build succeeded. A diagnostics runtime smoke test confirmed:
 
 ## Known Limitations
 
+These were limitations of the historical dense-near-field plus visual-far-SVO
+checkpoint:
+
 - The far SVO is static around origin; it is not camera-centered streamed yet.
 - The node data is built from a CPU approximation of the far terrain function,
   not directly from generated chunk buffers.
@@ -216,7 +222,13 @@ Release build succeeded. A diagnostics runtime smoke test confirmed:
   prevents stale rendering and removes the full-buffer clear, but a future
   two-window handoff would make fast-flight recentering visually smoother.
 
-## Next Implementation Pass
+Current sparse status: far SVO data is uploaded through default GPU buffers and
+published with readiness metadata, mid/far coverage is part of the sparse
+regression gate, and the dense moving-window renderer is no longer the active
+development path. Final long-distance LOD polish remains a known public-review
+limit rather than a hidden pass/fail gap.
+
+## Historical Next Implementation Pass
 
 1. Move far nodes/pages into default GPU buffers through a copy upload path.
 2. Stream/rebuild page rings around the camera instead of keeping a static
@@ -333,7 +345,7 @@ Verification:
   - steady frame logs around 6 ms on the test RTX 3070 Ti run, with physics
     default-on and dirty-region scheduled
 
-Remaining limitations:
+Historical remaining limitations:
 
 - The dense editable representation is still a large ping-pong voxel volume.
   The toroidal slot tags make it behave more like a page table, but the memory

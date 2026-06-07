@@ -9,15 +9,20 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace VENPOD::Graphics {
 
+static constexpr uint32_t kSparseRenderOwnershipUnsafeSampleCapacity = 256u;
+static constexpr uint32_t kSparseRenderOwnershipFarHeightMidSampleCapacity =
+    kSparseRenderOwnershipUnsafeSampleCapacity;
+
 struct SparseVoxelGpuConfig {
-    uint32_t maxBrickPages = 4096;
-    uint32_t pageTableCapacity = 16384;
+    uint32_t maxBrickPages = 24576;
+    uint32_t pageTableCapacity = 65536;
     uint32_t uploadRingSlots = 3;
-    uint32_t uploadBytesPerSlot = 8 * 1024 * 1024;
+    uint32_t uploadBytesPerSlot = 16 * 1024 * 1024;
     uint32_t missFeedbackMaxRecords = 256;
     uint32_t midClipmapMaxTiles = 256;
     uint32_t midClipmapTileSampleSide = 33;
@@ -28,6 +33,44 @@ struct SparseVoxelGpuConfig {
     uint32_t editDeltaRangeTableCapacity = 4096;
     uint32_t maxBrushFeedbackRecords = 8192;
 };
+
+inline bool IsSparseVoxelGpuPowerOfTwo(uint32_t value) {
+    return value != 0u && (value & (value - 1u)) == 0u;
+}
+
+inline bool ValidateSparseVoxelGpuConfigForStats(const SparseVoxelGpuConfig& config) {
+    constexpr uint32_t kMaxUploadRingSlots = 3;
+    constexpr uint32_t kMaxGpuPhysicsWorkPackets = 2048;
+    constexpr uint32_t kMaxGpuEditDeltas = 8192;
+    constexpr uint32_t kMaxGpuEditDeltaRanges = 2048;
+
+    if (config.maxBrickPages == 0 ||
+        config.maxBrickPages > std::numeric_limits<uint32_t>::max() / 2u ||
+        !IsSparseVoxelGpuPowerOfTwo(config.pageTableCapacity) ||
+        config.pageTableCapacity < config.maxBrickPages * 2u ||
+        config.uploadRingSlots == 0 ||
+        config.uploadRingSlots > kMaxUploadRingSlots ||
+        config.uploadBytesPerSlot == 0 ||
+        config.missFeedbackMaxRecords == 0 ||
+        config.missFeedbackMaxRecords == std::numeric_limits<uint32_t>::max() ||
+        config.midClipmapMaxTiles == 0 ||
+        config.midClipmapMaxTiles > std::numeric_limits<uint32_t>::max() / 4u ||
+        config.midVoxelClipmapMaxBricks == 0 ||
+        config.midVoxelClipmapMaxBricks > std::numeric_limits<uint32_t>::max() / 4u ||
+        config.maxPhysicsWorkPackets == 0 ||
+        config.maxPhysicsWorkPackets > kMaxGpuPhysicsWorkPackets ||
+        config.maxEditDeltas == 0 ||
+        config.maxEditDeltas > kMaxGpuEditDeltas ||
+        config.maxEditDeltaRanges == 0 ||
+        config.maxEditDeltaRanges > kMaxGpuEditDeltaRanges ||
+        !IsSparseVoxelGpuPowerOfTwo(config.editDeltaRangeTableCapacity) ||
+        config.editDeltaRangeTableCapacity < config.maxEditDeltaRanges * 2u ||
+        config.maxBrushFeedbackRecords == 0 ||
+        config.maxBrushFeedbackRecords == std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    return true;
+}
 
 struct SparseVoxelGpuStats {
     uint32_t maxBrickPages = 0;
@@ -77,6 +120,7 @@ struct SparseVoxelGpuStats {
     uint32_t physicsGpuFrameLastRetire = 0;
     uint32_t physicsGpuMaxPriorityLastRetire = 0;
     uint32_t physicsGpuGenerationXorLastRetire = 0;
+    uint32_t physicsGpuStaleFrameDropsLastRetire = 0;
     uint32_t physicsGpuResultCountLastRetire = 0;
     uint32_t physicsGpuResultChecksumLastRetire = 0;
     int32_t physicsGpuResultFirstBrickX = 0;
@@ -86,12 +130,16 @@ struct SparseVoxelGpuStats {
     uint32_t physicsGpuResultFirstStatus = 0;
     uint32_t physicsGpuProposalCountLastRetire = 0;
     uint32_t physicsGpuMissingBelowCountLastRetire = 0;
+    uint32_t physicsGpuMalformedStatusDropsLastRetire = 0;
+    uint32_t physicsGpuUnexpectedPacketDropsLastRetire = 0;
+    uint32_t physicsGpuChecksumDropsLastRetire = 0;
     uint32_t missFeedbackRecordsLastRetire = 0;
     uint32_t missFeedbackFrameLastRetire = 0;
     uint32_t missFeedbackStaleFrameDropsLastRetire = 0;
     bool missFeedbackOverflowLastRetire = false;
     uint32_t brushFeedbackRecordsLastRetire = 0;
     uint32_t brushFeedbackFrameLastRetire = 0;
+    uint32_t brushFeedbackQueuedFrameLastRetire = 0;
     uint32_t brushFeedbackMissingResidentLastRetire = 0;
     uint32_t brushFeedbackStaleFrameDropsLastRetire = 0;
     bool brushFeedbackOverflowLastRetire = false;
@@ -101,11 +149,39 @@ struct SparseVoxelGpuStats {
     uint32_t renderOwnerMidHeightPixelsLastRetire = 0;
     uint32_t renderOwnerFarSvoPixelsLastRetire = 0;
     uint32_t renderOwnerFarHeightPixelsLastRetire = 0;
+    uint32_t renderOwnerFarWaterPixelsLastRetire = 0;
     uint32_t renderOwnerSkyPixelsLastRetire = 0;
     uint32_t renderOwnerMissPixelsLastRetire = 0;
     uint32_t renderOwnerSurfacePixelsLastRetire = 0;
+    uint32_t renderOwnerFarSurfacePixelsLastRetire = 0;
     uint32_t renderOwnerUnsafeNearMissPixelsLastRetire = 0;
+    uint32_t renderOwnerWaterContextPixelsLastRetire = 0;
+    uint32_t renderOwnerValleyAtmospherePixelsLastRetire = 0;
+    uint32_t renderOwnerLodParentHeldPixelsLastRetire = 0;
+    uint32_t renderOwnerUnsafeMissSampleCountLastRetire = 0;
+    int32_t renderOwnerUnsafeMissSampleBrickX = 0;
+    int32_t renderOwnerUnsafeMissSampleBrickY = 0;
+    int32_t renderOwnerUnsafeMissSampleBrickZ = 0;
+    uint32_t renderOwnerUnsafeMissSampleDistanceLastRetire = 0;
+    uint32_t renderOwnerUnsafeMissSampleStoredLastRetire = 0;
+    std::array<Simulation::BrickCoord, kSparseRenderOwnershipUnsafeSampleCapacity>
+        renderOwnerUnsafeMissSampleBricksLastRetire{};
+    std::array<uint32_t, kSparseRenderOwnershipUnsafeSampleCapacity>
+        renderOwnerUnsafeMissSampleDistancesLastRetire{};
+    uint32_t renderOwnerMidInteriorFallbackPixelsLastRetire = 0;
+    uint32_t renderOwnerFarHeightContinuityPixelsLastRetire = 0;
+    uint32_t renderOwnerFarHeightMidMissingPixelsLastRetire = 0;
+    uint32_t renderOwnerFarHeightMidAirPixelsLastRetire = 0;
+    uint32_t renderOwnerFarHeightMidSolidPixelsLastRetire = 0;
+    uint32_t renderOwnerFarHeightFarPagePresentPixelsLastRetire = 0;
+    uint32_t renderOwnerFarHeightFarPageMissingPixelsLastRetire = 0;
+    uint32_t renderOwnerFarHeightFarPageOutOfGridPixelsLastRetire = 0;
+    uint32_t renderOwnerFarHeightMidSampleCountLastRetire = 0;
+    uint32_t renderOwnerFarHeightMidSampleStoredLastRetire = 0;
+    std::array<Simulation::SparseVoxelClipmapCoord, kSparseRenderOwnershipFarHeightMidSampleCapacity>
+        renderOwnerFarHeightMidSamplesLastRetire{};
     uint32_t renderOwnerFrameLastRetire = 0;
+    uint32_t renderOwnerStaleFrameDropsLastRetire = 0;
     bool initialized = false;
 };
 
@@ -114,6 +190,38 @@ struct SparseBrickVoxelCopyRange {
     uint64_t brickPoolOffset = 0;
     uint64_t bytes = 0;
 };
+
+inline bool IsSparseVoxelGpuByteRangeInBounds(
+    uint64_t offset,
+    uint64_t byteCount,
+    uint64_t capacityBytes)
+{
+    return offset <= capacityBytes && byteCount <= capacityBytes - offset;
+}
+
+inline bool IsSparseVoxelGpuCopyRangeInBounds(
+    uint64_t uploadOffset,
+    uint64_t destOffset,
+    uint64_t byteCount,
+    uint64_t uploadCapacityBytes,
+    uint64_t destCapacityBytes)
+{
+    return IsSparseVoxelGpuByteRangeInBounds(uploadOffset, byteCount, uploadCapacityBytes) &&
+        IsSparseVoxelGpuByteRangeInBounds(destOffset, byteCount, destCapacityBytes);
+}
+
+inline bool IsSparseVoxelGpuBrickCopyRangeInBounds(
+    const SparseBrickVoxelCopyRange& range,
+    uint64_t uploadCapacityBytes,
+    uint64_t brickPoolCapacityBytes)
+{
+    return IsSparseVoxelGpuCopyRangeInBounds(
+        range.uploadOffset,
+        range.brickPoolOffset,
+        range.bytes,
+        uploadCapacityBytes,
+        brickPoolCapacityBytes);
+}
 
 struct SparseBrickGpuUploadTicket {
     bool valid = false;
@@ -142,6 +250,12 @@ struct SparsePageTableGpuUploadTicket {
     uint64_t bytes = 0;
 };
 
+struct SparseMidClipmapSampleCopyRange {
+    uint64_t uploadOffset = 0;
+    uint64_t destinationOffset = 0;
+    uint64_t bytes = 0;
+};
+
 struct SparseMidClipmapGpuUploadTicket {
     bool valid = false;
     bool uploadHeightLayer = false;
@@ -161,6 +275,8 @@ struct SparseMidClipmapGpuUploadTicket {
     uint64_t voxelMetadataBytes = 0;
     uint64_t voxelLookupBytes = 0;
     uint64_t voxelSampleBytes = 0;
+    std::vector<SparseMidClipmapSampleCopyRange> heightSampleCopyRanges;
+    std::vector<SparseMidClipmapSampleCopyRange> voxelSampleCopyRanges;
     uint32_t tileCount = 0;
     uint32_t tileSampleSide = 0;
     uint32_t voxelBrickCount = 0;
@@ -187,6 +303,7 @@ struct SparseEditDeltaGpuUploadTicket {
     uint32_t deltaCount = 0;
     uint32_t rangeCount = 0;
     uint32_t rangeTableCapacity = 0;
+    bool inputFullyRepresented = false;
 };
 
 class SparseVoxelGpuResources {
@@ -239,7 +356,12 @@ public:
         uint32_t entryIndex,
         SparsePageTableGpuUploadTicket* outTicket = nullptr);
     bool StagePageTableReset(SparsePageTableGpuUploadTicket* outTicket = nullptr);
-    bool EmitPageTableCopy(ID3D12GraphicsCommandList* commandList, const SparsePageTableGpuUploadTicket& ticket);
+    bool BeginPageTableCopyBatch(ID3D12GraphicsCommandList* commandList);
+    void EndPageTableCopyBatch(ID3D12GraphicsCommandList* commandList);
+    bool EmitPageTableCopy(
+        ID3D12GraphicsCommandList* commandList,
+        const SparsePageTableGpuUploadTicket& ticket,
+        bool manageResourceState = true);
     bool StageMidClipmapSnapshot(
         const Simulation::SparseClipmapGpuSnapshot& snapshot,
         SparseMidClipmapGpuUploadTicket* outTicket = nullptr,
@@ -338,6 +460,8 @@ private:
     std::array<uint32_t, 3> m_physicsPacketResultCounts = {
         0u, 0u, 0u
     };
+    std::array<std::vector<uint32_t>, 3> m_physicsPacketExpectedChecksums;
+    std::vector<Simulation::SparsePhysicsWorkPacket> m_pendingPhysicsPacketResultPackets;
     std::array<uint32_t, 3> m_physicsDiagnosticsQueuedFrames = {
         UINT32_MAX, UINT32_MAX, UINT32_MAX
     };

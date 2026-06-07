@@ -1,6 +1,7 @@
 #include "SparseBrickPool.h"
 
 #include <algorithm>
+#include <limits>
 #include <vector>
 
 namespace VENPOD::Simulation {
@@ -13,10 +14,32 @@ bool RequiresPublishedPageTableEntry(BrickLifecycleState state) {
            state == BrickLifecycleState::DirtyGPU;
 }
 
+SparseStreamingLane DefaultStreamingLaneForResidencyClass(SparseResidencyClass residencyClass) {
+    switch (residencyClass) {
+        case SparseResidencyClass::Edited:
+        case SparseResidencyClass::Collision:
+            return SparseStreamingLane::PublicCritical;
+        case SparseResidencyClass::Visible:
+            return SparseStreamingLane::Visible;
+        case SparseResidencyClass::Speculative:
+        default:
+            return SparseStreamingLane::Cache;
+    }
+}
+
+void PromoteStreamingLane(BrickResidentRecord& record, SparseStreamingLane lane) {
+    if (static_cast<uint8_t>(lane) > static_cast<uint8_t>(record.streamingLane)) {
+        record.streamingLane = lane;
+    }
+}
+
 } // namespace
 
 bool SparseBrickPool::Initialize(uint32_t maxPages, uint32_t pageTableCapacity) {
-    if (maxPages == 0 || pageTableCapacity < maxPages * 2u) {
+    const uint64_t requiredPageTableCapacity = static_cast<uint64_t>(maxPages) * 2ull;
+    if (maxPages == 0 ||
+        requiredPageTableCapacity > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) ||
+        static_cast<uint64_t>(pageTableCapacity) < requiredPageTableCapacity) {
         return false;
     }
 
@@ -151,6 +174,35 @@ bool SparseBrickPool::PublishResident(
 
     record.dirtyCpu = false;
     record.dirtyGpu = false;
+    record.gpuPageTablePublished = false;
+    return true;
+}
+
+bool SparseBrickPool::MarkGpuPageTablePublished(
+    const BrickCoord& coord,
+    uint32_t pageIndex,
+    uint32_t generation)
+{
+    auto it = m_resident.find(coord);
+    if (it == m_resident.end()) {
+        return false;
+    }
+
+    BrickResidentRecord& record = m_records[it->second];
+    if (!(record.coord == coord) ||
+        record.pageIndex != pageIndex ||
+        record.generation != generation ||
+        record.state != BrickLifecycleState::Resident) {
+        return false;
+    }
+
+    uint32_t pageTablePage = INVALID_BRICK_PAGE;
+    if (!m_pageTable.TryLookupExactGeneration(coord, generation, &pageTablePage, nullptr) ||
+        pageTablePage != pageIndex) {
+        return false;
+    }
+
+    record.gpuPageTablePublished = true;
     return true;
 }
 
@@ -262,10 +314,15 @@ bool SparseBrickPool::MarkResidencyClass(const BrickCoord& coord, SparseResidenc
     return TouchResidencyClass(coord, residencyClass, 0);
 }
 
+bool SparseBrickPool::MarkStreamingLane(const BrickCoord& coord, SparseStreamingLane lane) {
+    return TouchStreamingLane(coord, lane, 0);
+}
+
 bool SparseBrickPool::TouchResidencyClass(
     const BrickCoord& coord,
     SparseResidencyClass residencyClass,
-    uint32_t frameIndex)
+    uint32_t frameIndex,
+    int32_t queuePriority)
 {
     auto it = m_resident.find(coord);
     if (it == m_resident.end()) {
@@ -279,6 +336,8 @@ bool SparseBrickPool::TouchResidencyClass(
     if (static_cast<uint8_t>(residencyClass) > static_cast<uint8_t>(record.residencyClass)) {
         record.residencyClass = residencyClass;
     }
+    PromoteStreamingLane(record, DefaultStreamingLaneForResidencyClass(residencyClass));
+    record.queuePriority = std::max(record.queuePriority, queuePriority);
 
     switch (residencyClass) {
         case SparseResidencyClass::Edited:
@@ -295,6 +354,177 @@ bool SparseBrickPool::TouchResidencyClass(
             record.lastSpeculativeFrame = std::max(record.lastSpeculativeFrame, frameIndex);
             break;
     }
+    return true;
+}
+
+bool SparseBrickPool::TouchResidencyClassWithStreamingLane(
+    const BrickCoord& coord,
+    SparseResidencyClass residencyClass,
+    SparseStreamingLane streamingLane,
+    uint32_t frameIndex,
+    int32_t queuePriority)
+{
+    auto it = m_resident.find(coord);
+    if (it == m_resident.end()) {
+        return false;
+    }
+
+    BrickResidentRecord& record = m_records[it->second];
+    if (frameIndex != 0) {
+        record.lastTouchedFrame = std::max(record.lastTouchedFrame, frameIndex);
+    }
+    if (static_cast<uint8_t>(residencyClass) > static_cast<uint8_t>(record.residencyClass)) {
+        record.residencyClass = residencyClass;
+    }
+    PromoteStreamingLane(record, streamingLane);
+    record.queuePriority = std::max(record.queuePriority, queuePriority);
+
+    switch (residencyClass) {
+        case SparseResidencyClass::Edited:
+            record.lastEditedFrame = std::max(record.lastEditedFrame, frameIndex);
+            break;
+        case SparseResidencyClass::Collision:
+            record.lastCollisionFrame = std::max(record.lastCollisionFrame, frameIndex);
+            break;
+        case SparseResidencyClass::Visible:
+            record.lastVisibleFrame = std::max(record.lastVisibleFrame, frameIndex);
+            break;
+        case SparseResidencyClass::Speculative:
+        default:
+            record.lastSpeculativeFrame = std::max(record.lastSpeculativeFrame, frameIndex);
+            break;
+    }
+    return true;
+}
+
+bool SparseBrickPool::TouchStreamingLane(
+    const BrickCoord& coord,
+    SparseStreamingLane lane,
+    uint32_t frameIndex,
+    int32_t queuePriority)
+{
+    auto it = m_resident.find(coord);
+    if (it == m_resident.end()) {
+        return false;
+    }
+
+    BrickResidentRecord& record = m_records[it->second];
+    if (frameIndex != 0) {
+        record.lastTouchedFrame = std::max(record.lastTouchedFrame, frameIndex);
+    }
+    PromoteStreamingLane(record, lane);
+    record.queuePriority = std::max(record.queuePriority, queuePriority);
+    return true;
+}
+
+bool SparseBrickPool::TouchResidencyClassKnownPage(
+    uint32_t pageIndex,
+    const BrickCoord& coord,
+    SparseResidencyClass residencyClass,
+    uint32_t frameIndex,
+    int32_t queuePriority)
+{
+    if (pageIndex >= m_records.size()) {
+        return false;
+    }
+
+    BrickResidentRecord& record = m_records[pageIndex];
+    if (record.pageIndex != pageIndex || record.coord != coord) {
+        return false;
+    }
+
+    if (frameIndex != 0) {
+        record.lastTouchedFrame = std::max(record.lastTouchedFrame, frameIndex);
+    }
+    if (static_cast<uint8_t>(residencyClass) > static_cast<uint8_t>(record.residencyClass)) {
+        record.residencyClass = residencyClass;
+    }
+    PromoteStreamingLane(record, DefaultStreamingLaneForResidencyClass(residencyClass));
+    record.queuePriority = std::max(record.queuePriority, queuePriority);
+
+    switch (residencyClass) {
+        case SparseResidencyClass::Edited:
+            record.lastEditedFrame = std::max(record.lastEditedFrame, frameIndex);
+            break;
+        case SparseResidencyClass::Collision:
+            record.lastCollisionFrame = std::max(record.lastCollisionFrame, frameIndex);
+            break;
+        case SparseResidencyClass::Visible:
+            record.lastVisibleFrame = std::max(record.lastVisibleFrame, frameIndex);
+            break;
+        case SparseResidencyClass::Speculative:
+        default:
+            record.lastSpeculativeFrame = std::max(record.lastSpeculativeFrame, frameIndex);
+            break;
+    }
+    return true;
+}
+
+bool SparseBrickPool::TouchResidencyClassWithStreamingLaneKnownPage(
+    uint32_t pageIndex,
+    const BrickCoord& coord,
+    SparseResidencyClass residencyClass,
+    SparseStreamingLane streamingLane,
+    uint32_t frameIndex,
+    int32_t queuePriority)
+{
+    if (pageIndex >= m_records.size()) {
+        return false;
+    }
+
+    BrickResidentRecord& record = m_records[pageIndex];
+    if (record.pageIndex != pageIndex || record.coord != coord) {
+        return false;
+    }
+
+    if (frameIndex != 0) {
+        record.lastTouchedFrame = std::max(record.lastTouchedFrame, frameIndex);
+    }
+    if (static_cast<uint8_t>(residencyClass) > static_cast<uint8_t>(record.residencyClass)) {
+        record.residencyClass = residencyClass;
+    }
+    PromoteStreamingLane(record, streamingLane);
+    record.queuePriority = std::max(record.queuePriority, queuePriority);
+
+    switch (residencyClass) {
+        case SparseResidencyClass::Edited:
+            record.lastEditedFrame = std::max(record.lastEditedFrame, frameIndex);
+            break;
+        case SparseResidencyClass::Collision:
+            record.lastCollisionFrame = std::max(record.lastCollisionFrame, frameIndex);
+            break;
+        case SparseResidencyClass::Visible:
+            record.lastVisibleFrame = std::max(record.lastVisibleFrame, frameIndex);
+            break;
+        case SparseResidencyClass::Speculative:
+        default:
+            record.lastSpeculativeFrame = std::max(record.lastSpeculativeFrame, frameIndex);
+            break;
+    }
+    return true;
+}
+
+bool SparseBrickPool::TouchStreamingLaneKnownPage(
+    uint32_t pageIndex,
+    const BrickCoord& coord,
+    SparseStreamingLane lane,
+    uint32_t frameIndex,
+    int32_t queuePriority)
+{
+    if (pageIndex >= m_records.size()) {
+        return false;
+    }
+
+    BrickResidentRecord& record = m_records[pageIndex];
+    if (record.pageIndex != pageIndex || record.coord != coord) {
+        return false;
+    }
+
+    if (frameIndex != 0) {
+        record.lastTouchedFrame = std::max(record.lastTouchedFrame, frameIndex);
+    }
+    PromoteStreamingLane(record, lane);
+    record.queuePriority = std::max(record.queuePriority, queuePriority);
     return true;
 }
 

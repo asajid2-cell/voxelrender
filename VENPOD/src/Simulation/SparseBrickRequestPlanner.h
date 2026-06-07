@@ -14,11 +14,25 @@ struct SparseBrickRequestPlannerConfig {
     uint32_t maxRequests = 128;
 };
 
+enum class SparseBrickRequestSource : uint8_t {
+    Generic = 0,
+    ViewCone = 1,
+    Collision = 2,
+    NearVisible = 3,
+    MotionVisible = 4,
+    OwnershipRecovery = 5,
+    SpeculativeView = 6,
+    Stress = 7
+};
+
+static constexpr uint32_t kSparseBrickRequestSourceCount = 8u;
+
 struct SparseBrickRequest {
     BrickCoord coord;
     int32_t priority = 0;
     SparseResidencyClass residencyClass = SparseResidencyClass::Speculative;
     bool urgent = false;
+    SparseBrickRequestSource source = SparseBrickRequestSource::Generic;
 };
 
 struct SparseViewConeConfig {

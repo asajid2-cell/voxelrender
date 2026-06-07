@@ -119,7 +119,7 @@ float4 RenderBrushPreviewOverlay(float3 rayOrigin, float3 rayDir) {
 
     float3 toBrush = brushCenter - rayOrigin;
     float distToCenter = length(toBrush);
-    if (brushRadius <= 0.0f || distToCenter < max(brushRadius * 3.75f, 12.0f)) {
+    if (brushRadius <= 0.0f || distToCenter < max(brushRadius * 6.0f, 16.0f)) {
         return float4(0, 0, 0, 0);
     }
 
@@ -129,7 +129,7 @@ float4 RenderBrushPreviewOverlay(float3 rayOrigin, float3 rayDir) {
     }
 
     const float angularRadius = asin(saturate(brushRadius / max(distToCenter, 0.001f)));
-    if (angularRadius > 0.34f) {
+    if (angularRadius > 0.16f) {
         return float4(0, 0, 0, 0);
     }
 
@@ -152,16 +152,17 @@ float4 RenderBrushPreviewOverlay(float3 rayOrigin, float3 rayDir) {
     float u = (float(brushMaterial) + 0.5f) / 256.0f;
     float3 materialColor = MaterialPalette.SampleLevel(PaletteSampler, u, 0).rgb;
     if (brushShape != 0u) {
-        return float4(materialColor, 0.25f);
+        return float4(materialColor, 0.10f);
     }
 
     float3 hitPoint = rayOrigin + rayDir * t;
-    float dist = length(hitPoint - brushCenter);
-    float normalizedDist = dist / brushRadius;
-    float edgeFactor = abs(normalizedDist - 0.95f) < 0.05f ? 0.6f : 0.15f;
     float3 normal = normalize(hitPoint - brushCenter);
     float fresnel = pow(1.0f - abs(dot(normal, rayDir)), 2.0f);
-    float alpha = lerp(edgeFactor, 0.4f, fresnel);
+    float rim = smoothstep(0.42f, 0.88f, fresnel);
+    if (rim <= 0.02f) {
+        return float4(0, 0, 0, 0);
+    }
+    float alpha = rim * 0.24f;
     return float4(materialColor, alpha);
 }
 
@@ -183,6 +184,18 @@ PSOutput main(PSInput input) {
 
     float4 avatar = RenderBlockCharacterOverlay(cameraPos, rayDir);
     float4 brush = RenderBrushPreviewOverlay(cameraPos, rayDir);
+
+    if (frame.debugMode == 53u) {
+        if (brush.a > 0.0f) {
+            output.color = float4(1.0f, 0.20f, 0.80f, 1.0f);
+            return output;
+        }
+        if (avatar.a > 0.0f) {
+            output.color = float4(0.20f, 1.0f, 0.80f, 1.0f);
+            return output;
+        }
+        return output;
+    }
 
     float3 color = avatar.rgb;
     float alpha = avatar.a;

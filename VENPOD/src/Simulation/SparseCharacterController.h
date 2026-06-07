@@ -20,6 +20,7 @@ struct SparseCharacterMoveRequest {
     SparseCharacterBody targetBody{};
     float verticalVelocity = 0.0f;
     bool allowStepUp = true;
+    bool liquidsSupport = false;
     uint32_t maxSweepSteps = 16;
 };
 
@@ -39,6 +40,7 @@ struct SparseCharacterVerticalMoveRequest {
     SparseCharacterBody startBody{};
     SparseCharacterBody targetBody{};
     float verticalVelocity = 0.0f;
+    bool liquidsSupport = false;
     uint32_t maxSweepSteps = 16;
 };
 

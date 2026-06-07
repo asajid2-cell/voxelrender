@@ -131,6 +131,44 @@ cd VENPOD
 .\rebrun.ps1 -SparseEditFile saves\review-edits.vsed
 ```
 
+To generate public review media from the in-engine DX12 capture path:
+
+```powershell
+cd VENPOD
+.\public_demo_capture.ps1 -Config Release
+```
+
+To generate one review reel that combines normal, high-flight, and
+waterline/submerged validated segments:
+
+```powershell
+cd VENPOD
+.\public_demo_capture.ps1 -Config Release -ReviewReel
+```
+
+To regenerate the broader visual review suite used by the completion ledger:
+
+```powershell
+cd VENPOD
+.\visual_review_capture.ps1 -Config Release
+```
+
+This produces normal, walk, long-walk, fast-flight, long-fast-flight,
+fast water-transition, long fast-water transition, waterline, and
+long-waterline contact sheets plus a manual checklist and CSV summary under
+`VENPOD/build/logs/visual_review_capture/`. Passing this
+wrapper does not by itself mean the visuals are accepted for release; it creates
+the evidence reviewers use for that decision.
+
+The full sparse regression gate also runs a short dense legacy fallback smoke so
+that comparison path stays covered. It also verifies the public demo capture
+runtime log for terrain ownership, mid/far ownership, visible far-SVO pixels,
+surface fragments, and zero sparse miss/unsafe-near-miss pixels:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 -Config Release
+```
+
 Choose `Sandbox Mode` in the launcher.
 
 ## Controls
@@ -157,12 +195,16 @@ The docs are organized using the Diataxis model:
 
 - Tutorial: [Build and run VENPOD](docs/tutorials/build-and-run.md)
 - How-to: [Use the sandbox](docs/how-to/use-the-sandbox.md)
+- How-to: [Capture a public demo](docs/how-to/capture-public-demo.md)
 - How-to: [Debug runtime behavior](docs/how-to/debug-runtime.md)
 - Explanation: [Engine architecture](docs/explanation/architecture.md)
 - Reference: [Runtime reference](docs/reference/runtime.md)
 - Reference: [Sparse refactor review checklist](docs/reference/sparse-refactor-review.md)
-- Report: [Vertical world pass](docs/reports/vertical-world-pass.md)
-- Report: [Sparse voxel octree far-field plan](docs/reports/sparse-voxel-octree-plan.md)
+- Reference: [Public review manifest](docs/reference/public-review-manifest.md)
+- Reference: [Sparse completion audit](docs/reference/sparse-completion-audit.md)
+- Reference: [Asset credits](docs/reference/asset-credits.md)
+- Historical report: [Vertical world pass](docs/reports/vertical-world-pass.md)
+- Historical report: [Sparse voxel octree far-field plan](docs/reports/sparse-voxel-octree-plan.md)
 
 ## Project Layout
 
@@ -180,7 +222,7 @@ docs/
   how-to/               task-oriented docs
   explanation/          design and architecture docs
   reference/            controls and runtime details
-  reports/              implementation reports and future work
+  reports/              historical implementation reports
 ```
 
 ## Known Limits
@@ -197,7 +239,8 @@ Current limitations:
   paths; CPU sparse authority remains the resilience fallback.
 - Mid/far terrain is coherent enough for smoke/regression gates, but the final
   long-distance hierarchy still needs visual polish and more LOD work.
-- A polished demo video is still pending for the public repo.
+- Public review media is generated on demand by `.\public_demo_capture.ps1`;
+  large MP4 artifacts are not checked into git.
 
 Generated build outputs are intentionally excluded from version control.
 

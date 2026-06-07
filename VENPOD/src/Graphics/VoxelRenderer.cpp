@@ -125,8 +125,8 @@ Result<void> VoxelRenderer::CreateMaterialPalette(ID3D12Device* device, Descript
 
     device->CreateShaderResourceView(m_materialPalette.Get(), &srvDesc, m_paletteSRV.cpu);
 
-    // TODO: Initialize palette with default material colors via upload buffer
-    // For now, the palette will be black (uninitialized)
+    // Legacy renderer shim only creates the descriptor; the active dense path
+    // uploads its material palette through VoxelWorld::CreateMaterialPalette.
 
     spdlog::debug("Created material palette texture ({} entries)", paletteSize);
     return {};

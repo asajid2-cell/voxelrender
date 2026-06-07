@@ -38,6 +38,7 @@ RWStructuredBuffer<uint4> MissingBrickFeedback : register(u0);
 
 static const uint SPARSE_INVALID_PAGE = 0xFFFFFFFFu;
 static const uint SPARSE_TOMBSTONE_PAGE = 0xFFFFFFFEu;
+static const uint SPARSE_PAGE_TABLE_LOOKUP_PROBES = 256u;
 static const float SPARSE_BRICK_SIZE_F = 16.0f;
 static const float SPARSE_RAY_EPSILON = 0.0001f;
 
@@ -61,7 +62,7 @@ bool HasSparseBrickPage(int3 brickCoord) {
     uint mask = pageTableCapacity - 1u;
     uint start = HashSparseBrickCoord(brickCoord) & mask;
     [loop]
-    for (uint probe = 0u; probe < 64u; ++probe) {
+    for (uint probe = 0u; probe < SPARSE_PAGE_TABLE_LOOKUP_PROBES; ++probe) {
         uint slot = (start + probe) & mask;
         SparseBrickPageEntry entry = SparseBrickPageTable[slot];
         if (entry.pageIndex == SPARSE_INVALID_PAGE) {

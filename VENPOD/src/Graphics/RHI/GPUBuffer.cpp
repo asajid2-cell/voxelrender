@@ -1,8 +1,46 @@
 #include "GPUBuffer.h"
 #include <spdlog/spdlog.h>
 #include <cstring>
+#include <limits>
 
 namespace VENPOD::Graphics {
+
+namespace {
+
+bool AddUint64(uint64_t a, uint64_t b, uint64_t* out) {
+    if (!out || a > std::numeric_limits<uint64_t>::max() - b) {
+        return false;
+    }
+    *out = a + b;
+    return true;
+}
+
+bool AlignUpUint64(uint64_t value, uint64_t alignment, uint64_t* out) {
+    if (!out || alignment == 0) {
+        return false;
+    }
+    uint64_t withPadding = 0;
+    if (!AddUint64(value, alignment - 1u, &withPadding)) {
+        return false;
+    }
+    *out = withPadding & ~(alignment - 1u);
+    return true;
+}
+
+bool FitsUint32(uint64_t value) {
+    return value <= static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+}
+
+bool IsValidByteRange(uint64_t offset, uint64_t bytes, uint64_t capacity) {
+    uint64_t end = 0;
+    return AddUint64(offset, bytes, &end) && end <= capacity;
+}
+
+uint64_t StructuredElementCount(uint64_t bytes, uint32_t stride) {
+    return stride > 0 ? bytes / static_cast<uint64_t>(stride) : 0u;
+}
+
+} // namespace
 
 // =============================================================================
 // GPUBuffer Implementation
@@ -14,6 +52,7 @@ GPUBuffer::~GPUBuffer() {
 
 GPUBuffer::GPUBuffer(GPUBuffer&& other) noexcept
     : m_resource(std::move(other.m_resource))
+    , m_pendingInitializationUpload(std::move(other.m_pendingInitializationUpload))
     , m_sizeBytes(other.m_sizeBytes)
     , m_stride(other.m_stride)
     , m_usage(other.m_usage)
@@ -42,6 +81,7 @@ GPUBuffer& GPUBuffer::operator=(GPUBuffer&& other) noexcept {
         Shutdown();
 
         m_resource = std::move(other.m_resource);
+        m_pendingInitializationUpload = std::move(other.m_pendingInitializationUpload);
         m_sizeBytes = other.m_sizeBytes;
         m_stride = other.m_stride;
         m_usage = other.m_usage;
@@ -82,6 +122,7 @@ Result<void> GPUBuffer::Initialize(
         return Error("GPUBuffer::Initialize - sizeBytes must be > 0");
     }
 
+    m_pendingInitializationUpload.Reset();
     m_sizeBytes = sizeBytes;
     m_stride = stride;
     m_usage = usage;
@@ -143,6 +184,10 @@ Result<void> GPUBuffer::InitializeWithData(
     uint32_t stride,
     const char* debugName)
 {
+    if (!data && sizeBytes > 0) {
+        return Error("GPUBuffer::InitializeWithData - data is null");
+    }
+
     // First create the buffer
     auto result = Initialize(device, sizeBytes, usage, stride, debugName);
     if (!result) {
@@ -199,9 +244,9 @@ Result<void> GPUBuffer::InitializeWithData(
     // Copy from upload to default buffer
     cmdList->CopyResource(m_resource.Get(), uploadBuffer.Get());
 
-    // Note: The upload buffer will be released when this function returns.
-    // The command list must be executed before the upload buffer is released.
-    // In a real engine, you'd use a staging buffer manager that keeps upload buffers alive.
+    // Keep the upload resource alive until this GPUBuffer is reset or destroyed.
+    // The command list may execute after this helper returns.
+    m_pendingInitializationUpload = uploadBuffer;
 
     return {};
 }
@@ -238,6 +283,7 @@ void GPUBuffer::Shutdown() {
     }
 
     m_resource.Reset();
+    m_pendingInitializationUpload.Reset();
     m_sizeBytes = 0;
     m_stride = 0;
     m_heapManager = nullptr;
@@ -291,7 +337,7 @@ void GPUBuffer::Upload(const void* data, uint64_t sizeBytes, uint64_t destOffset
         return;
     }
 
-    if (destOffset + sizeBytes > m_sizeBytes) {
+    if (!IsValidByteRange(destOffset, sizeBytes, m_sizeBytes)) {
         spdlog::error("GPUBuffer::Upload - Data exceeds buffer size");
         return;
     }
@@ -310,6 +356,10 @@ Result<void> GPUBuffer::CreateSRV(ID3D12Device* device, DescriptorHeapManager& h
     if (!device || !m_resource) {
         return Error("GPUBuffer::CreateSRV - Invalid device or resource");
     }
+    const uint64_t elementCount = StructuredElementCount(m_sizeBytes, m_stride);
+    if (!FitsUint32(elementCount)) {
+        return Error("GPUBuffer::CreateSRV - element count exceeds D3D12 view limit");
+    }
 
     m_heapManager = &heapManager;
 
@@ -324,7 +374,7 @@ Result<void> GPUBuffer::CreateSRV(ID3D12Device* device, DescriptorHeapManager& h
     srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srvDesc.Buffer.FirstElement = 0;
-    srvDesc.Buffer.NumElements = GetElementCount();
+    srvDesc.Buffer.NumElements = static_cast<UINT>(elementCount);
     srvDesc.Buffer.StructureByteStride = m_stride;
     srvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
 
@@ -344,6 +394,10 @@ Result<void> GPUBuffer::CreateUAV(ID3D12Device* device, DescriptorHeapManager& h
     if (!HasFlag(m_usage, BufferUsage::UnorderedAccess)) {
         return Error("GPUBuffer::CreateUAV - Buffer was not created with UnorderedAccess flag");
     }
+    const uint64_t elementCount = StructuredElementCount(m_sizeBytes, m_stride);
+    if (!FitsUint32(elementCount)) {
+        return Error("GPUBuffer::CreateUAV - element count exceeds D3D12 view limit");
+    }
 
     m_heapManager = &heapManager;
 
@@ -357,7 +411,7 @@ Result<void> GPUBuffer::CreateUAV(ID3D12Device* device, DescriptorHeapManager& h
     uavDesc.Format = DXGI_FORMAT_UNKNOWN;
     uavDesc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
     uavDesc.Buffer.FirstElement = 0;
-    uavDesc.Buffer.NumElements = GetElementCount();
+    uavDesc.Buffer.NumElements = static_cast<UINT>(elementCount);
     uavDesc.Buffer.StructureByteStride = m_stride;
     uavDesc.Buffer.CounterOffsetInBytes = 0;
     uavDesc.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
@@ -374,6 +428,11 @@ Result<void> GPUBuffer::CreateCBV(ID3D12Device* device, DescriptorHeapManager& h
     if (!device || !m_resource) {
         return Error("GPUBuffer::CreateCBV - Invalid device or resource");
     }
+    uint64_t alignedSize = 0;
+    if (!AlignUpUint64(m_sizeBytes, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, &alignedSize) ||
+        !FitsUint32(alignedSize)) {
+        return Error("GPUBuffer::CreateCBV - aligned size exceeds D3D12 CBV limit");
+    }
 
     m_heapManager = &heapManager;
 
@@ -385,7 +444,7 @@ Result<void> GPUBuffer::CreateCBV(ID3D12Device* device, DescriptorHeapManager& h
 
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
     cbvDesc.BufferLocation = GetGPUVirtualAddress();
-    cbvDesc.SizeInBytes = static_cast<UINT>((m_sizeBytes + 255) & ~255);  // Align to 256 bytes
+    cbvDesc.SizeInBytes = static_cast<UINT>(alignedSize);
 
     device->CreateConstantBufferView(&cbvDesc, m_stagingCBV.cpu);
 
@@ -489,6 +548,9 @@ Result<void> ConstantBuffer::InitializeInternal(
 {
     if (!device) {
         return Error("ConstantBuffer::Initialize - device is null");
+    }
+    if (alignedSize == 0 || !FitsUint32(alignedSize)) {
+        return Error("ConstantBuffer::Initialize - aligned size must fit in a D3D12 CBV");
     }
 
     m_sizeBytes = alignedSize;

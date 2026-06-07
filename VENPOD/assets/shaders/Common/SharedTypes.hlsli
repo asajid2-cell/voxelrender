@@ -83,7 +83,7 @@ struct FrameConstants {
     float4   renderBudgetParams;
 
     // Far-field page index metadata (4 DWORDs)
-    // x = page radius, y = page-index side length, z = root min Y, w = reserved
+    // x = page radius, y = page-index side length, z = root min Y, w = ownership stats flag
     float4   farFieldGridParams;
 
     // Sparse near-field metadata (4 DWORDs)
@@ -91,6 +91,7 @@ struct FrameConstants {
     // flags bit 0 = sparse-only, no dense fallback for missing pages
     // flags bit 1 = surface-authoritative near field; fullscreen pass renders background only
     // flags bit 2 = mid voxel clipmap is resident and may own background rays
+    // flags bit 4 = voxel terrain only; disable procedural height/water fallback terrain
     float4   sparseNearParams;
 
       // Mid-field procedural clipmap metadata (4 DWORDs)
@@ -125,6 +126,19 @@ struct FrameConstants {
       // coverage ratio, w = effective far quality. Far layers may provide
       // continuity only when this metadata says they are resident enough.
       float4   farOwnershipParams;
+
+      // Exact near-field contract metadata (4 DWORDs)
+      // x = distance from camera inside which background/proxy layers may not
+      // satisfy terrain/water ownership. Missing exact sparse voxels must stay
+      // visible to diagnostics instead of being hidden by fallback heightfields.
+      float4   exactNearParams;      // x = exact sparse voxel distance, y = world seed bits, z/w = mid voxel handoff coverage/worst ring
+
+      // Public exact-surface drawing contract (4 DWORDs)
+      // x = maximum distance where the public frame may draw exact sparse
+      // surface hits. This is intentionally separate from the wider sparse
+      // ownership/feedback radius so lower LOD can remain coherent until exact
+      // terrain is ready for a deliberate foreground promotion.
+      float4   surfaceRasterParams;
   };
 
 // Chunk control structure for sparse optimization

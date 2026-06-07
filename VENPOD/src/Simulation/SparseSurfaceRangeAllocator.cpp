@@ -1,8 +1,38 @@
 #include "SparseSurfaceRangeAllocator.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace VENPOD::Simulation {
+
+namespace {
+
+uint64_t SaturatingAddUint64(uint64_t a, uint64_t b) {
+    if (a > std::numeric_limits<uint64_t>::max() - b) {
+        return std::numeric_limits<uint64_t>::max();
+    }
+    return a + b;
+}
+
+uint32_t SaturatingAddUint32(uint32_t a, uint32_t b) {
+    if (a > std::numeric_limits<uint32_t>::max() - b) {
+        return std::numeric_limits<uint32_t>::max();
+    }
+    return a + b;
+}
+
+uint32_t SaturatingSizeToUint32(size_t value) {
+    return value > static_cast<size_t>(std::numeric_limits<uint32_t>::max())
+        ? std::numeric_limits<uint32_t>::max()
+        : static_cast<uint32_t>(value);
+}
+
+uint32_t NextNonZeroGeneration(uint32_t generation) {
+    const uint32_t next = generation + 1u;
+    return next == 0u ? 1u : next;
+}
+
+} // namespace
 
 void SparseSurfaceRangeAllocator::Initialize(uint32_t maxFaces, uint32_t retirementDelayFrames) {
     Clear();
@@ -23,22 +53,26 @@ void SparseSurfaceRangeAllocator::Clear() {
     m_freeRanges.clear();
     m_retiredRanges.clear();
     m_stats = {};
+    m_statsRefreshBatchDepth = 0;
+    m_statsRefreshDirty = false;
 }
 
 void SparseSurfaceRangeAllocator::BeginFrame(uint64_t frameIndex) {
     BeginFrame(
         frameIndex,
-        frameIndex + static_cast<uint64_t>(m_retirementDelayFrames));
+        SaturatingAddUint64(frameIndex, static_cast<uint64_t>(m_retirementDelayFrames)));
 }
 
 void SparseSurfaceRangeAllocator::BeginFrame(
     uint64_t completedRetirementToken,
     uint64_t currentRetirementToken)
 {
-    m_completedRetirementToken = completedRetirementToken;
-    m_currentRetirementToken = std::max(completedRetirementToken, currentRetirementToken);
+    m_completedRetirementToken = std::max(m_completedRetirementToken, completedRetirementToken);
+    m_currentRetirementToken = std::max(
+        m_currentRetirementToken,
+        std::max(m_completedRetirementToken, currentRetirementToken));
     for (auto it = m_retiredRanges.begin(); it != m_retiredRanges.end();) {
-        if (it->retireToken > completedRetirementToken) {
+        if (it->retireToken > m_completedRetirementToken) {
             ++it;
             continue;
         }
@@ -46,6 +80,21 @@ void SparseSurfaceRangeAllocator::BeginFrame(
         it = m_retiredRanges.erase(it);
     }
     RefreshStats();
+}
+
+void SparseSurfaceRangeAllocator::BeginStatsRefreshBatch() {
+    ++m_statsRefreshBatchDepth;
+}
+
+void SparseSurfaceRangeAllocator::EndStatsRefreshBatch() {
+    if (m_statsRefreshBatchDepth == 0) {
+        return;
+    }
+    --m_statsRefreshBatchDepth;
+    if (m_statsRefreshBatchDepth == 0 && m_statsRefreshDirty) {
+        m_statsRefreshDirty = false;
+        RecomputeStats();
+    }
 }
 
 bool SparseSurfaceRangeAllocator::AllocateOrResize(
@@ -64,7 +113,7 @@ bool SparseSurfaceRangeAllocator::AllocateOrResize(
     auto existing = m_allocations.find(coord);
     if (existing != m_allocations.end() && existing->second.capacity >= faceCount) {
         existing->second.faceCount = faceCount;
-        ++existing->second.generation;
+        existing->second.generation = NextNonZeroGeneration(existing->second.generation);
         if (outAllocation) {
             *outAllocation = existing->second;
         }
@@ -75,6 +124,11 @@ bool SparseSurfaceRangeAllocator::AllocateOrResize(
     uint32_t firstFace = UINT32_MAX;
     for (auto it = m_freeRanges.begin(); it != m_freeRanges.end(); ++it) {
         if (it->count < faceCount) {
+            continue;
+        }
+        const uint64_t allocationEnd =
+            static_cast<uint64_t>(it->firstFace) + static_cast<uint64_t>(faceCount);
+        if (allocationEnd > static_cast<uint64_t>(m_maxFaces)) {
             continue;
         }
         firstFace = it->firstFace;
@@ -93,7 +147,7 @@ bool SparseSurfaceRangeAllocator::AllocateOrResize(
 
     uint32_t generation = 1;
     if (existing != m_allocations.end()) {
-        generation = existing->second.generation + 1u;
+        generation = NextNonZeroGeneration(existing->second.generation);
         RetireRange(existing->second.firstFace, existing->second.capacity);
         existing->second = {firstFace, faceCount, faceCount, generation};
         if (outAllocation) {
@@ -154,10 +208,32 @@ void SparseSurfaceRangeAllocator::RetireRange(uint32_t firstFace, uint32_t count
     if (count == 0) {
         return;
     }
+    if (firstFace >= m_maxFaces) {
+        return;
+    }
+    const uint64_t maxCount =
+        static_cast<uint64_t>(m_maxFaces) - static_cast<uint64_t>(firstFace);
+    if (static_cast<uint64_t>(count) > maxCount) {
+        count = static_cast<uint32_t>(maxCount);
+    }
+    if (count == 0) {
+        return;
+    }
     m_retiredRanges.push_back({firstFace, count, m_currentRetirementToken});
 }
 
 void SparseSurfaceRangeAllocator::AddFreeRange(uint32_t firstFace, uint32_t count) {
+    if (count == 0) {
+        return;
+    }
+    if (firstFace >= m_maxFaces) {
+        return;
+    }
+    const uint64_t maxCount =
+        static_cast<uint64_t>(m_maxFaces) - static_cast<uint64_t>(firstFace);
+    if (static_cast<uint64_t>(count) > maxCount) {
+        count = static_cast<uint32_t>(maxCount);
+    }
     if (count == 0) {
         return;
     }
@@ -174,10 +250,22 @@ void SparseSurfaceRangeAllocator::AddFreeRange(uint32_t firstFace, uint32_t coun
             continue;
         }
         FreeRange& back = merged.back();
-        const uint32_t backEnd = back.firstFace + back.count;
+        const uint64_t backEnd =
+            static_cast<uint64_t>(back.firstFace) + static_cast<uint64_t>(back.count);
         if (range.firstFace <= backEnd) {
-            const uint32_t rangeEnd = range.firstFace + range.count;
-            back.count = std::max(backEnd, rangeEnd) - back.firstFace;
+            const uint64_t rangeEnd =
+                static_cast<uint64_t>(range.firstFace) + static_cast<uint64_t>(range.count);
+            const uint64_t mergedEnd =
+                std::min<uint64_t>(
+                    std::max(backEnd, rangeEnd),
+                    static_cast<uint64_t>(m_maxFaces));
+            const uint64_t mergedCount =
+                mergedEnd > static_cast<uint64_t>(back.firstFace)
+                    ? mergedEnd - static_cast<uint64_t>(back.firstFace)
+                    : 0u;
+            back.count = mergedCount > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())
+                ? std::numeric_limits<uint32_t>::max()
+                : static_cast<uint32_t>(mergedCount);
         } else {
             merged.push_back(range);
         }
@@ -186,9 +274,17 @@ void SparseSurfaceRangeAllocator::AddFreeRange(uint32_t firstFace, uint32_t coun
 }
 
 void SparseSurfaceRangeAllocator::RefreshStats() {
+    if (m_statsRefreshBatchDepth > 0) {
+        m_statsRefreshDirty = true;
+        return;
+    }
+    RecomputeStats();
+}
+
+void SparseSurfaceRangeAllocator::RecomputeStats() {
     uint32_t allocatedCapacity = 0;
     for (const auto& item : m_allocations) {
-        allocatedCapacity += item.second.capacity;
+        allocatedCapacity = SaturatingAddUint32(allocatedCapacity, item.second.capacity);
     }
     uint32_t largestFree = 0;
     for (const FreeRange& range : m_freeRanges) {
@@ -196,17 +292,17 @@ void SparseSurfaceRangeAllocator::RefreshStats() {
     }
     uint32_t pendingRetiredCapacity = 0;
     for (const RetiredRange& range : m_retiredRanges) {
-        pendingRetiredCapacity += range.count;
+        pendingRetiredCapacity = SaturatingAddUint32(pendingRetiredCapacity, range.count);
     }
 
     const uint32_t failures = m_stats.allocationFailures;
     m_stats = {};
     m_stats.allocationFailures = failures;
-    m_stats.allocationCount = static_cast<uint32_t>(m_allocations.size());
+    m_stats.allocationCount = SaturatingSizeToUint32(m_allocations.size());
     m_stats.allocatedCapacity = allocatedCapacity;
-    m_stats.freeRangeCount = static_cast<uint32_t>(m_freeRanges.size());
+    m_stats.freeRangeCount = SaturatingSizeToUint32(m_freeRanges.size());
     m_stats.largestFreeRange = largestFree;
-    m_stats.pendingRetiredRangeCount = static_cast<uint32_t>(m_retiredRanges.size());
+    m_stats.pendingRetiredRangeCount = SaturatingSizeToUint32(m_retiredRanges.size());
     m_stats.pendingRetiredCapacity = pendingRetiredCapacity;
 }
 

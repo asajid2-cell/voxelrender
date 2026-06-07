@@ -98,6 +98,9 @@ uint ClassifyClusterCull(SparseSurfaceClusterRecord cluster) {
     const float3 rel = center - cameraPosition.xyz;
     const float viewZ = dot(rel, cameraForward.xyz);
     const float maxDistance = max(params.z, 1.0f) + params.w + radius;
+    if (dot(rel, rel) > maxDistance * maxDistance) {
+        return kClusterOutside;
+    }
     if (viewZ < -radius || viewZ > maxDistance) {
         return kClusterOutside;
     }
@@ -142,6 +145,9 @@ uint ClassifyRecordCull(SparseSurfaceRecord record) {
     const float3 rel = center - cameraPosition.xyz;
     const float viewZ = dot(rel, cameraForward.xyz);
     const float maxDistance = max(params.z, 1.0f) + params.w + radius;
+    if (dot(rel, rel) > maxDistance * maxDistance) {
+        return kStatRejectDistance;
+    }
     if (viewZ < -radius || viewZ > maxDistance) {
         return kStatRejectDistance;
     }

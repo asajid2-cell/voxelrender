@@ -1,4 +1,6 @@
 #include "Graphics/FarVoxelOctree.h"
+#include "Graphics/SparseSurfaceGpuResources.h"
+#include "Graphics/SparseVoxelGpuResources.h"
 #include "Graphics/VoxelRenderBackend.h"
 #include "Simulation/SparseBrickPool.h"
 #include "Simulation/SparseBrickRequestPlanner.h"
@@ -16,20 +18,26 @@
 #include "Simulation/SparseTerrainGenerator.h"
 #include "Simulation/SparseVoxelTypes.h"
 #include "Simulation/SparseVoxelWorld.h"
+#include "Simulation/VoxelWorld.h"
 #include "Utils/BitPacking.h"
 
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
 using VENPOD::Graphics::ParseVoxelRenderBackend;
+using VENPOD::Graphics::SparseSurfaceIaStreamSizing;
 using VENPOD::Graphics::ToString;
+using VENPOD::Graphics::TryBuildSparseSurfaceIaStreamSizing;
 using VENPOD::Graphics::VoxelRenderBackend;
 using namespace VENPOD::Simulation;
 
@@ -55,6 +63,23 @@ void TestBackendParsing() {
     Check(ParseVoxelRenderBackend("sparse") == VoxelRenderBackend::SparseBrick, "sparse backend parse");
     Check(ParseVoxelRenderBackend("sparse-brick") == VoxelRenderBackend::SparseBrick, "sparse-brick backend parse");
     Check(std::string(ToString(VoxelRenderBackend::SparseBrick)) == "sparse-brick", "sparse backend string");
+}
+
+void TestVoxelWorldRaycastReadbackLifecycle() {
+    Check(!IsVoxelRaycastReadbackRetirable(InvalidVoxelRaycastReadbackFrame(), 10u),
+        "dense raycast readback rejects unqueued slot");
+    Check(!IsVoxelRaycastReadbackRetirable(10u, 10u),
+        "dense raycast readback rejects same-frame retire");
+    Check(IsVoxelRaycastReadbackRetirable(10u, 13u),
+        "dense raycast readback accepts older queued frame");
+    Check(IsVoxelRaycastReadbackRetirable(std::numeric_limits<uint32_t>::max() - 1u, 0u),
+        "dense raycast readback handles frame wrap without using invalid sentinel");
+
+    const uint32_t packedBits = 0xDEADBEEFu;
+    float packedAsFloat = 0.0f;
+    std::memcpy(&packedAsFloat, &packedBits, sizeof(packedBits));
+    Check(DecodeVoxelRaycastPackedWord(packedAsFloat) == packedBits,
+        "dense raycast readback decodes packed word without float aliasing");
 }
 
 void TestFarVoxelOctreeResidencyMetadata() {
@@ -88,6 +113,304 @@ void TestFarVoxelOctreeResidencyMetadata() {
 
     metadata = VENPOD::Graphics::BuildFarVoxelOctreeResidencyMetadata(complete, false);
     Check(!metadata.ready, "far octree complete stats without GPU buffers are not ready");
+
+    VENPOD::Graphics::FarVoxelOctreeConfig invalidPageSize;
+    invalidPageSize.pageSize = std::numeric_limits<float>::quiet_NaN();
+    Check(!VENPOD::Graphics::ValidateFarVoxelOctreeConfigForBuild(invalidPageSize),
+        "far octree build config rejects non-finite page size");
+
+    VENPOD::Graphics::FarVoxelOctreeConfig hugePageOrigin;
+    hugePageOrigin.pageRadius = 2;
+    hugePageOrigin.pageSize = 2.0e9f;
+    Check(!VENPOD::Graphics::ValidateFarVoxelOctreeConfigForBuild(hugePageOrigin),
+        "far octree build config rejects page origins outside int32 range");
+
+    VENPOD::Graphics::FarVoxelOctreeConfig excessiveDepth;
+    excessiveDepth.maxDepth = 64;
+    Check(!VENPOD::Graphics::ValidateFarVoxelOctreeConfigForBuild(excessiveDepth),
+        "far octree build config rejects excessive max depth");
+}
+
+void TestSparseSurfaceIaStreamSizing() {
+    SparseSurfaceIaStreamSizing sizing;
+    Check(!TryBuildSparseSurfaceIaStreamSizing(0u, sizing),
+        "surface IA sizing rejects zero faces");
+
+    Check(TryBuildSparseSurfaceIaStreamSizing(1u, sizing),
+        "surface IA sizing accepts one face");
+    Check(sizing.vertexCount == 4u, "surface IA one face vertex count");
+    Check(sizing.indexCount == 6u, "surface IA one face index count");
+    Check(sizing.vertexBytes == 16u, "surface IA one face vertex bytes");
+    Check(sizing.indexBytes == 24u, "surface IA one face index bytes");
+
+    constexpr uint32_t maxIndexViewFaces =
+        std::numeric_limits<uint32_t>::max() / (6u * static_cast<uint32_t>(sizeof(uint32_t)));
+    Check(TryBuildSparseSurfaceIaStreamSizing(maxIndexViewFaces, sizing),
+        "surface IA sizing accepts largest 32-bit index-view byte capacity");
+    Check(sizing.indexBytes <= std::numeric_limits<uint32_t>::max(),
+        "surface IA accepted index bytes fit D3D12 view size");
+    Check(sizing.vertexBytes <= std::numeric_limits<uint32_t>::max(),
+        "surface IA accepted vertex bytes fit D3D12 view size");
+
+    Check(!TryBuildSparseSurfaceIaStreamSizing(maxIndexViewFaces + 1u, sizing),
+        "surface IA sizing rejects index view byte overflow");
+}
+
+void TestSparseSurfaceGpuConfigValidation() {
+    VENPOD::Graphics::SparseSurfaceGpuConfig config;
+    Check(VENPOD::Graphics::ValidateSparseSurfaceGpuConfigForStats(config),
+        "sparse surface GPU default config validates");
+
+    VENPOD::Graphics::SparseSurfaceGpuConfig zeroFaces = config;
+    zeroFaces.maxFaces = 0u;
+    Check(!VENPOD::Graphics::ValidateSparseSurfaceGpuConfigForStats(zeroFaces),
+        "sparse surface GPU config rejects zero face capacity");
+
+    VENPOD::Graphics::SparseSurfaceGpuConfig iaOverflow = config;
+    iaOverflow.maxFaces =
+        std::numeric_limits<uint32_t>::max() / (6u * static_cast<uint32_t>(sizeof(uint32_t))) + 1u;
+    Check(!VENPOD::Graphics::ValidateSparseSurfaceGpuConfigForStats(iaOverflow),
+        "sparse surface GPU config rejects IA stream view overflow");
+
+    VENPOD::Graphics::SparseSurfaceGpuConfig hugeFaceCapacity = config;
+    hugeFaceCapacity.maxFaces = (1u << 23) + 1u;
+    Check(!VENPOD::Graphics::ValidateSparseSurfaceGpuConfigForStats(hugeFaceCapacity),
+        "sparse surface GPU config rejects excessive face capacity before allocation");
+
+    VENPOD::Graphics::SparseSurfaceGpuConfig hugeRangeCapacity = config;
+    hugeRangeCapacity.maxBrickRanges = (1u << 21);
+    Check(!VENPOD::Graphics::ValidateSparseSurfaceGpuConfigForStats(hugeRangeCapacity),
+        "sparse surface GPU config rejects excessive range-table capacity before allocation");
+
+    VENPOD::Graphics::SparseSurfaceGpuConfig oversizedRangeToDrawRatio = config;
+    oversizedRangeToDrawRatio.maxDrawCommands = 1024u;
+    oversizedRangeToDrawRatio.maxBrickRanges = 4096u;
+    Check(!VENPOD::Graphics::ValidateSparseSurfaceGpuConfigForStats(oversizedRangeToDrawRatio),
+        "sparse surface GPU config rejects fixed range tables beyond draw-command capacity");
+
+    VENPOD::Graphics::SparseSurfaceGpuConfig nonPowerOfTwoRanges = config;
+    nonPowerOfTwoRanges.maxBrickRanges = 12345u;
+    Check(!VENPOD::Graphics::ValidateSparseSurfaceGpuConfigForStats(nonPowerOfTwoRanges),
+        "sparse surface GPU config rejects fixed non-power-of-two range table capacity");
+
+    VENPOD::Graphics::SparseSurfaceGpuConfig tooManyUploadSlots = config;
+    tooManyUploadSlots.uploadRingSlots = 4u;
+    Check(!VENPOD::Graphics::ValidateSparseSurfaceGpuConfigForStats(tooManyUploadSlots),
+        "sparse surface GPU config rejects upload ring slot overflow");
+
+    VENPOD::Graphics::SparseSurfaceGpuConfig zeroUploadBytes = config;
+    zeroUploadBytes.uploadBytesPerSlot = 0u;
+    Check(!VENPOD::Graphics::ValidateSparseSurfaceGpuConfigForStats(zeroUploadBytes),
+        "sparse surface GPU config rejects zero upload slot bytes");
+
+    VENPOD::Graphics::SparseSurfaceGpuConfig hugeUploadBytes = config;
+    hugeUploadBytes.uploadBytesPerSlot = 512u * 1024u * 1024u;
+    Check(!VENPOD::Graphics::ValidateSparseSurfaceGpuConfigForStats(hugeUploadBytes),
+        "sparse surface GPU config rejects excessive upload slot bytes before allocation");
+
+    VENPOD::Graphics::SparseSurfaceGpuConfig tooManyDrawCommands = config;
+    tooManyDrawCommands.maxDrawCommands = 65536u;
+    Check(!VENPOD::Graphics::ValidateSparseSurfaceGpuConfigForStats(tooManyDrawCommands),
+        "sparse surface GPU config rejects cull dispatch group overflow");
+
+    VENPOD::Graphics::SparseSurfaceGpuConfig oversizedCluster = config;
+    oversizedCluster.surfaceRecordsPerCluster = 65u;
+    Check(!VENPOD::Graphics::ValidateSparseSurfaceGpuConfigForStats(oversizedCluster),
+        "sparse surface GPU config rejects oversized surface clusters");
+
+    VENPOD::Graphics::SparseSurfaceGpuConfig oversizedClusterExtent = config;
+    oversizedClusterExtent.surfaceClusterMaxExtentVoxels = 4097u;
+    Check(!VENPOD::Graphics::ValidateSparseSurfaceGpuConfigForStats(oversizedClusterExtent),
+        "sparse surface GPU config rejects oversized surface-cluster extent");
+
+    VENPOD::Graphics::SparseSurfaceGpuConfig disabledClusterExtent = config;
+    disabledClusterExtent.surfaceClusterMaxExtentVoxels = 0u;
+    Check(VENPOD::Graphics::ValidateSparseSurfaceGpuConfigForStats(disabledClusterExtent),
+        "sparse surface GPU config preserves count-only cluster extent mode");
+
+    VENPOD::Graphics::SparseSurfaceGpuConfig excessiveFastAcceptRecords = config;
+    excessiveFastAcceptRecords.surfaceClusterFastAcceptMaxRecords =
+        excessiveFastAcceptRecords.surfaceRecordsPerCluster + 1u;
+    Check(!VENPOD::Graphics::ValidateSparseSurfaceGpuConfigForStats(excessiveFastAcceptRecords),
+        "sparse surface GPU config rejects fast-accept record count beyond cluster size");
+
+    VENPOD::Graphics::SparseSurfaceGpuConfig excessivePayloadCopyFaces = config;
+    excessivePayloadCopyFaces.maxPayloadCopyFacesPerFrame = config.maxFaces + 1u;
+    Check(!VENPOD::Graphics::ValidateSparseSurfaceGpuConfigForStats(excessivePayloadCopyFaces),
+        "sparse surface GPU config rejects payload copy face budget beyond capacity");
+}
+
+void TestSparseSurfaceGpuCopyRangeValidation() {
+    Check(VENPOD::Graphics::IsSparseSurfaceGpuByteRangeInBounds(8u, 16u, 24u),
+        "sparse surface GPU copy range accepts exact end");
+    Check(!VENPOD::Graphics::IsSparseSurfaceGpuByteRangeInBounds(9u, 16u, 24u),
+        "sparse surface GPU copy range rejects end overflow");
+    Check(VENPOD::Graphics::IsSparseSurfaceGpuByteRangeInBounds(24u, 0u, 24u),
+        "sparse surface GPU copy range accepts zero-byte end cursor");
+    Check(!VENPOD::Graphics::IsSparseSurfaceGpuByteRangeInBounds(25u, 0u, 24u),
+        "sparse surface GPU copy range rejects zero-byte cursor past capacity");
+
+    const uint64_t faceBytes = sizeof(VENPOD::Simulation::SparseSurfaceFace);
+    VENPOD::Graphics::SparseSurfaceFaceCopyRegion faceRegion;
+    faceRegion.uploadOffset = 16u;
+    faceRegion.destFirstFace = 2u;
+    faceRegion.faceCount = 3u;
+    Check(VENPOD::Graphics::IsSparseSurfaceGpuFaceCopyRegionInBounds(
+            faceRegion,
+            16u + 3u * faceBytes,
+            5u * faceBytes),
+        "sparse surface GPU face copy validator accepts exact upload and destination bounds");
+    Check(!VENPOD::Graphics::IsSparseSurfaceGpuFaceCopyRegionInBounds(
+            faceRegion,
+            16u + 3u * faceBytes - 1u,
+            5u * faceBytes),
+        "sparse surface GPU face copy validator rejects upload overflow");
+    Check(!VENPOD::Graphics::IsSparseSurfaceGpuFaceCopyRegionInBounds(
+            faceRegion,
+            16u + 3u * faceBytes,
+            5u * faceBytes - 1u),
+        "sparse surface GPU face copy validator rejects destination overflow");
+
+    VENPOD::Graphics::SparseSurfaceBufferCopyRegion bufferRegion;
+    bufferRegion.uploadOffset = 64u;
+    bufferRegion.destOffset = 128u;
+    bufferRegion.byteCount = 256u;
+    Check(VENPOD::Graphics::IsSparseSurfaceGpuBufferCopyRegionInBounds(
+            bufferRegion,
+            320u,
+            384u),
+        "sparse surface GPU metadata copy validator accepts exact bounds");
+    Check(!VENPOD::Graphics::IsSparseSurfaceGpuBufferCopyRegionInBounds(
+            bufferRegion,
+            319u,
+            384u),
+        "sparse surface GPU metadata copy validator rejects upload overflow");
+    Check(!VENPOD::Graphics::IsSparseSurfaceGpuBufferCopyRegionInBounds(
+            bufferRegion,
+            320u,
+            383u),
+        "sparse surface GPU metadata copy validator rejects destination overflow");
+
+    Check(!VENPOD::Graphics::IsSparseSurfaceCullStatsReadbackRetirable(false, 10u, 13u),
+        "sparse surface cull stats readback rejects unqueued slot");
+    Check(!VENPOD::Graphics::IsSparseSurfaceCullStatsReadbackRetirable(true, 10u, 10u),
+        "sparse surface cull stats readback rejects same-frame retire");
+    Check(VENPOD::Graphics::IsSparseSurfaceCullStatsReadbackRetirable(true, 10u, 13u),
+        "sparse surface cull stats readback accepts older queued frame");
+}
+
+void TestSparseSurfaceGpuAbiLayout() {
+    Check(std::is_standard_layout_v<SparseSurfaceDrawArgs>,
+        "surface draw args remain standard-layout for GPU ABI");
+    Check(sizeof(SparseSurfaceDrawArgs) == 20u, "surface draw args GPU ABI size");
+    Check(alignof(SparseSurfaceDrawArgs) == alignof(uint32_t),
+        "surface draw args GPU ABI alignment");
+    Check(offsetof(SparseSurfaceDrawArgs, indexCountPerInstance) == 0u,
+        "surface draw args indexCountPerInstance offset");
+    Check(offsetof(SparseSurfaceDrawArgs, instanceCount) == 4u,
+        "surface draw args instanceCount offset");
+    Check(offsetof(SparseSurfaceDrawArgs, startIndexLocation) == 8u,
+        "surface draw args startIndexLocation offset");
+    Check(offsetof(SparseSurfaceDrawArgs, baseVertexLocation) == 12u,
+        "surface draw args baseVertexLocation offset");
+    Check(offsetof(SparseSurfaceDrawArgs, startInstanceLocation) == 16u,
+        "surface draw args startInstanceLocation offset");
+
+    Check(std::is_standard_layout_v<SparseSurfaceRecord>,
+        "surface record remains standard-layout for GPU ABI");
+    Check(sizeof(SparseSurfaceRecord) == 52u, "surface record GPU ABI size");
+    Check(alignof(SparseSurfaceRecord) == alignof(uint32_t),
+        "surface record GPU ABI alignment");
+    Check(offsetof(SparseSurfaceRecord, coord) == 0u, "surface record coord offset");
+    Check(offsetof(SparseSurfaceRecord, firstFace) == 12u, "surface record firstFace offset");
+    Check(offsetof(SparseSurfaceRecord, faceCount) == 16u, "surface record faceCount offset");
+    Check(offsetof(SparseSurfaceRecord, flags) == 20u, "surface record flags offset");
+    Check(offsetof(SparseSurfaceRecord, generation) == 24u, "surface record generation offset");
+    Check(offsetof(SparseSurfaceRecord, minX) == 28u, "surface record minX offset");
+    Check(offsetof(SparseSurfaceRecord, minY) == 32u, "surface record minY offset");
+    Check(offsetof(SparseSurfaceRecord, minZ) == 36u, "surface record minZ offset");
+    Check(offsetof(SparseSurfaceRecord, maxX) == 40u, "surface record maxX offset");
+    Check(offsetof(SparseSurfaceRecord, maxY) == 44u, "surface record maxY offset");
+    Check(offsetof(SparseSurfaceRecord, maxZ) == 48u, "surface record maxZ offset");
+
+    Check(std::is_standard_layout_v<SparseSurfaceClusterRecord>,
+        "surface cluster record remains standard-layout for GPU ABI");
+    Check(sizeof(SparseSurfaceClusterRecord) == 40u, "surface cluster record GPU ABI size");
+    Check(alignof(SparseSurfaceClusterRecord) == alignof(uint32_t),
+        "surface cluster record GPU ABI alignment");
+    Check(offsetof(SparseSurfaceClusterRecord, minX) == 0u, "surface cluster minX offset");
+    Check(offsetof(SparseSurfaceClusterRecord, minY) == 4u, "surface cluster minY offset");
+    Check(offsetof(SparseSurfaceClusterRecord, minZ) == 8u, "surface cluster minZ offset");
+    Check(offsetof(SparseSurfaceClusterRecord, firstRecord) == 12u,
+        "surface cluster firstRecord offset");
+    Check(offsetof(SparseSurfaceClusterRecord, maxX) == 16u, "surface cluster maxX offset");
+    Check(offsetof(SparseSurfaceClusterRecord, maxY) == 20u, "surface cluster maxY offset");
+    Check(offsetof(SparseSurfaceClusterRecord, maxZ) == 24u, "surface cluster maxZ offset");
+    Check(offsetof(SparseSurfaceClusterRecord, recordCount) == 28u,
+        "surface cluster recordCount offset");
+    Check(offsetof(SparseSurfaceClusterRecord, faceCount) == 32u,
+        "surface cluster faceCount offset");
+    Check(offsetof(SparseSurfaceClusterRecord, flags) == 36u, "surface cluster flags offset");
+}
+
+void TestSparseVoxelGpuConfigValidation() {
+    VENPOD::Graphics::SparseVoxelGpuConfig config;
+    Check(VENPOD::Graphics::ValidateSparseVoxelGpuConfigForStats(config),
+        "sparse voxel GPU default config validates");
+
+    VENPOD::Graphics::SparseVoxelGpuConfig hugeMidTiles = config;
+    hugeMidTiles.midClipmapMaxTiles = std::numeric_limits<uint32_t>::max();
+    Check(!VENPOD::Graphics::ValidateSparseVoxelGpuConfigForStats(hugeMidTiles),
+        "sparse voxel GPU config rejects mid clipmap lookup overflow");
+
+    VENPOD::Graphics::SparseVoxelGpuConfig hugeVoxelBricks = config;
+    hugeVoxelBricks.midVoxelClipmapMaxBricks = std::numeric_limits<uint32_t>::max();
+    Check(!VENPOD::Graphics::ValidateSparseVoxelGpuConfigForStats(hugeVoxelBricks),
+        "sparse voxel GPU config rejects mid voxel lookup overflow");
+
+    VENPOD::Graphics::SparseVoxelGpuConfig feedbackWrap = config;
+    feedbackWrap.missFeedbackMaxRecords = std::numeric_limits<uint32_t>::max();
+    Check(!VENPOD::Graphics::ValidateSparseVoxelGpuConfigForStats(feedbackWrap),
+        "sparse voxel GPU config rejects miss feedback count wrap");
+
+    VENPOD::Graphics::SparseVoxelGpuConfig oversizedPhysics = config;
+    oversizedPhysics.maxPhysicsWorkPackets = 2049u;
+    Check(!VENPOD::Graphics::ValidateSparseVoxelGpuConfigForStats(oversizedPhysics),
+        "sparse voxel GPU config rejects physics packet count beyond shader dispatch cap");
+
+    VENPOD::Graphics::SparseVoxelGpuConfig oversizedEditDeltas = config;
+    oversizedEditDeltas.maxEditDeltas = 8193u;
+    Check(!VENPOD::Graphics::ValidateSparseVoxelGpuConfigForStats(oversizedEditDeltas),
+        "sparse voxel GPU config rejects edit deltas beyond shader dispatch cap");
+}
+
+void TestSparseVoxelGpuCopyRangeValidation() {
+    Check(VENPOD::Graphics::IsSparseVoxelGpuByteRangeInBounds(16u, 32u, 48u),
+        "sparse voxel GPU copy range accepts exact end");
+    Check(!VENPOD::Graphics::IsSparseVoxelGpuByteRangeInBounds(17u, 32u, 48u),
+        "sparse voxel GPU copy range rejects end overflow");
+    Check(VENPOD::Graphics::IsSparseVoxelGpuByteRangeInBounds(48u, 0u, 48u),
+        "sparse voxel GPU copy range accepts zero-byte end cursor");
+    Check(!VENPOD::Graphics::IsSparseVoxelGpuByteRangeInBounds(49u, 0u, 48u),
+        "sparse voxel GPU copy range rejects zero-byte cursor past capacity");
+
+    Check(VENPOD::Graphics::IsSparseVoxelGpuCopyRangeInBounds(64u, 128u, 256u, 320u, 384u),
+        "sparse voxel GPU copy validator accepts exact upload and destination bounds");
+    Check(!VENPOD::Graphics::IsSparseVoxelGpuCopyRangeInBounds(65u, 128u, 256u, 320u, 384u),
+        "sparse voxel GPU copy validator rejects upload overflow");
+    Check(!VENPOD::Graphics::IsSparseVoxelGpuCopyRangeInBounds(64u, 129u, 256u, 320u, 384u),
+        "sparse voxel GPU copy validator rejects destination overflow");
+
+    VENPOD::Graphics::SparseBrickVoxelCopyRange brickRange;
+    brickRange.uploadOffset = 4u;
+    brickRange.brickPoolOffset = 12u;
+    brickRange.bytes = 20u;
+    Check(VENPOD::Graphics::IsSparseVoxelGpuBrickCopyRangeInBounds(brickRange, 24u, 32u),
+        "sparse voxel GPU brick copy validator accepts exact partial range bounds");
+    Check(!VENPOD::Graphics::IsSparseVoxelGpuBrickCopyRangeInBounds(brickRange, 23u, 32u),
+        "sparse voxel GPU brick copy validator rejects partial upload overflow");
+    Check(!VENPOD::Graphics::IsSparseVoxelGpuBrickCopyRangeInBounds(brickRange, 24u, 31u),
+        "sparse voxel GPU brick copy validator rejects partial destination overflow");
 }
 
 void TestCoordinateConversion() {
@@ -109,6 +432,9 @@ void TestCoordinateConversion() {
         {-17, -2, 15},
         {1024, 64, 0},
         {-1025, -65, 15},
+        {std::numeric_limits<int32_t>::min(), -134217728, 0},
+        {std::numeric_limits<int32_t>::min() + 1, -134217728, 1},
+        {std::numeric_limits<int32_t>::max(), 134217727, 15},
     };
 
     for (const auto& c : cases) {
@@ -121,6 +447,64 @@ void TestCoordinateConversion() {
 
     LocalVoxelCoord local = LocalVoxelFromWorld(-1, -16, -17);
     Check(local == LocalVoxelCoord{15, 0, 15}, "negative world voxel to local coord");
+
+    BrickCoord extremeBrick = BrickCoord::FromWorldVoxel(
+        std::numeric_limits<int32_t>::min(),
+        std::numeric_limits<int32_t>::min() + 1,
+        std::numeric_limits<int32_t>::max());
+    Check(extremeBrick == BrickCoord{-134217728, -134217728, 134217727},
+        "extreme world voxel to brick coord does not overflow");
+
+    LocalVoxelCoord extremeLocal = LocalVoxelFromWorld(
+        std::numeric_limits<int32_t>::min(),
+        std::numeric_limits<int32_t>::min() + 1,
+        std::numeric_limits<int32_t>::max());
+    Check(extremeLocal == LocalVoxelCoord{0, 1, 15},
+        "extreme world voxel to local coord does not overflow");
+
+    int32_t checkedWorld = 0;
+    Check(TryWorldVoxelFromBrickLocal(-134217728, 0, &checkedWorld) &&
+          checkedWorld == std::numeric_limits<int32_t>::min(),
+        "checked brick/local conversion accepts minimum world voxel");
+    Check(TryWorldVoxelFromBrickLocal(134217727, 15, &checkedWorld) &&
+          checkedWorld == std::numeric_limits<int32_t>::max(),
+        "checked brick/local conversion accepts maximum world voxel");
+    Check(!TryWorldVoxelFromBrickLocal(std::numeric_limits<int32_t>::max(), 0, &checkedWorld),
+        "checked brick/local conversion rejects positive overflow");
+    Check(!TryWorldVoxelFromBrickLocal(std::numeric_limits<int32_t>::min(), 15, &checkedWorld),
+        "checked brick/local conversion rejects negative overflow");
+
+    SparseBrushVoxelBounds brushBounds;
+    Check(TryBuildSparseBrushVoxelBounds(10.25f, 20.5f, -30.75f, 2.2f, 0.5f, &brushBounds) &&
+          brushBounds.startX == 5 &&
+          brushBounds.startY == 15 &&
+          brushBounds.startZ == -36 &&
+          brushBounds.endX == 17 &&
+          brushBounds.endY == 27 &&
+          brushBounds.endZ == -24 &&
+          brushBounds.radius == 2.2f &&
+          brushBounds.strength == 0.5f,
+        "sparse brush voxel bounds build stable checked dispatch volume");
+    Check(TryBuildSparseBrushVoxelBounds(0.0f, 0.0f, 0.0f, 2048.0f, 2.0f, &brushBounds) &&
+          brushBounds.radius == SPARSE_MAX_BRUSH_RADIUS &&
+          brushBounds.strength == 1.0f,
+        "sparse brush voxel bounds clamp radius and strength");
+    Check(!TryBuildSparseBrushVoxelBounds(
+            std::numeric_limits<float>::quiet_NaN(),
+            0.0f,
+            0.0f,
+            1.0f,
+            1.0f,
+            &brushBounds),
+        "sparse brush voxel bounds reject non-finite position");
+    Check(!TryBuildSparseBrushVoxelBounds(
+            static_cast<float>(std::numeric_limits<int32_t>::max()),
+            0.0f,
+            0.0f,
+            4.0f,
+            1.0f,
+            &brushBounds),
+        "sparse brush voxel bounds reject positive world-coordinate overflow boundary");
 
     for (uint16_t i = 0; i < SPARSE_BRICK_VOXEL_COUNT; ++i) {
         LocalVoxelCoord decoded = LocalVoxelFromIndex(i);
@@ -182,6 +566,32 @@ void TestGpuPageEntryLayout() {
     Check(IsSparseBrushFeedbackMissingResident(
               SparseBrushFeedbackRecord{0, 0, 0, SPARSE_BRUSH_FEEDBACK_MISSING_RESIDENT}),
         "SparseBrushFeedback missing-resident sentinel detected");
+    Check(CanApplySparseBrushFeedbackPayload(0u, 0u, false),
+        "SparseBrushFeedback complete payload can apply");
+    Check(!CanApplySparseBrushFeedbackPayload(1u, 0u, false),
+        "SparseBrushFeedback missing resident blocks apply");
+    Check(!CanApplySparseBrushFeedbackPayload(0u, 1u, false),
+        "SparseBrushFeedback missing-resident hint record blocks apply");
+    Check(!CanApplySparseBrushFeedbackPayload(1u, 0u, false),
+        "SparseBrushFeedback missing-resident header count blocks apply");
+    Check(!CanApplySparseBrushFeedbackPayload(0u, 0u, true),
+        "SparseBrushFeedback overflow blocks partial apply");
+    Check(!SparseBrushFeedbackPayloadOverflowed(8u, 8u, 0u),
+        "SparseBrushFeedback exact-capacity payload is not overflowed");
+    Check(SparseBrushFeedbackPayloadOverflowed(9u, 8u, 0u),
+        "SparseBrushFeedback record count beyond capacity is overflowed");
+    Check(SparseBrushFeedbackPayloadOverflowed(8u, 8u, 1u),
+        "SparseBrushFeedback shader header overflow flag blocks apply");
+    Check(!HasDuplicateSparseBrushFeedbackVoxels({
+              SparseBrushFeedbackRecord{1, 2, 3, 4},
+              SparseBrushFeedbackRecord{1, 2, 4, 5},
+              SparseBrushFeedbackRecord{1, 2, 3, SPARSE_BRUSH_FEEDBACK_MISSING_RESIDENT}}),
+        "SparseBrushFeedback duplicate detector ignores unique voxels and missing-resident hints");
+    Check(HasDuplicateSparseBrushFeedbackVoxels({
+              SparseBrushFeedbackRecord{1, 2, 3, 4},
+              SparseBrushFeedbackRecord{-1, 2, 3, 5},
+              SparseBrushFeedbackRecord{1, 2, 3, 6}}),
+        "SparseBrushFeedback duplicate detector rejects repeated edit voxels");
 
     Check(sizeof(SparseEditDeltaRange) == 24, "SparseEditDeltaRange GPU layout is 24 bytes");
     Check(offsetof(SparseEditDeltaRange, coord) == 0, "SparseEditDeltaRange coord offset");
@@ -190,6 +600,20 @@ void TestGpuPageEntryLayout() {
     Check(offsetof(SparseEditDeltaRange, latestRevision) == 20, "SparseEditDeltaRange latestRevision offset");
 
     Check(sizeof(SparsePhysicsPacketResult) == 80, "SparsePhysicsPacketResult GPU layout is 80 bytes");
+    Check(SPARSE_PHYSICS_PACKET_STATUS_CONSUMED == 1u,
+        "SparsePhysicsPacketResult consumed status ABI");
+    Check(SPARSE_PHYSICS_PACKET_STATUS_HAS_EXPECTED_PAGE == 2u,
+        "SparsePhysicsPacketResult expected-page status ABI");
+    Check(SPARSE_PHYSICS_PACKET_STATUS_PAGE_MATCH == 4u,
+        "SparsePhysicsPacketResult page-match status ABI");
+    Check(SPARSE_PHYSICS_PACKET_STATUS_PAGE_STALE == 8u,
+        "SparsePhysicsPacketResult page-stale status ABI");
+    Check(SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL == 16u,
+        "SparsePhysicsPacketResult proposal status ABI");
+    Check(SPARSE_PHYSICS_PACKET_STATUS_MISSING_BELOW == 32u,
+        "SparsePhysicsPacketResult missing-below status ABI");
+    Check(SPARSE_PHYSICS_PACKET_STATUS_EDIT_DELTA_HIT == 64u,
+        "SparsePhysicsPacketResult edit-delta status ABI");
     Check(offsetof(SparsePhysicsPacketResult, coord) == 0,
         "SparsePhysicsPacketResult coord offset");
     Check(offsetof(SparsePhysicsPacketResult, packetIndex) == 12,
@@ -258,12 +682,33 @@ void TestPageTable() {
     Check(table.TryLookup({0, 0, 0}, &page, &flags, &generation), "lookup reassigned page");
     Check(page == 11 && flags == 13 && generation == 3, "reassigned page data");
 
+    SparsePageTable saturatedTable(16);
+    for (int32_t i = 0; i < 11; ++i) {
+        Check(
+            saturatedTable.InsertOrAssign({i, 0, 0}, static_cast<uint32_t>(i + 1), 1u, 0u),
+            "page table accepts inserts up to load threshold");
+    }
+    Check(!saturatedTable.InsertOrAssign({99, 0, 0}, 99u, 1u, 0u),
+        "page table rejects new inserts past load threshold");
+    Check(saturatedTable.InsertOrAssign({3, 0, 0}, 77u, 2u, 5u),
+        "page table allows existing entry update at load threshold");
+    Check(saturatedTable.TryLookup({3, 0, 0}, &page, &flags, &generation),
+        "lookup saturated table updated entry");
+    Check(page == 77u && flags == 5u && generation == 2u,
+        "saturated table update preserves new page data");
+
     Check(table.Remove({0, 0, 0}), "remove origin page");
     Check(!table.TryLookup({0, 0, 0}), "removed page missing");
     Check(table.TryLookup({-1, 2, -3}), "tombstone does not break probe chain");
 }
 
 void TestBrickPool() {
+    SparseBrickPool invalidPool;
+    Check(!invalidPool.Initialize(0, 16),
+        "brick pool rejects zero page capacity");
+    Check(!invalidPool.Initialize(std::numeric_limits<uint32_t>::max(), std::numeric_limits<uint32_t>::max()),
+        "brick pool rejects page table capacity validation overflow");
+
     SparseBrickPool pool;
     Check(pool.Initialize(4, 16), "brick pool initialize");
     Check(pool.MaxPages() == 4, "brick pool page count");
@@ -372,6 +817,43 @@ void TestTerrainGeneration() {
         }
     }
 
+    const BrickCoord sampleCoords[] = {
+        {14, 4, 14},
+        {12, -2, 15},
+        {-1, 0, -1},
+        {0, -4, 0}
+    };
+    for (const BrickCoord& sampleCoord : sampleCoords) {
+        const GeneratedSparseBrick generated = terrain.GenerateBrick(sampleCoord);
+        for (uint8_t z = 0; z < SPARSE_BRICK_SIZE; ++z) {
+            for (uint8_t y = 0; y < SPARSE_BRICK_SIZE; ++y) {
+                for (uint8_t x = 0; x < SPARSE_BRICK_SIZE; ++x) {
+                    int32_t worldX = 0;
+                    int32_t worldY = 0;
+                    int32_t worldZ = 0;
+                    const bool validCoord =
+                        TryWorldVoxelFromBrickLocal(sampleCoord.x, x, &worldX) &&
+                        TryWorldVoxelFromBrickLocal(sampleCoord.y, y, &worldY) &&
+                        TryWorldVoxelFromBrickLocal(sampleCoord.z, z, &worldZ);
+                    Check(validCoord, "sample terrain test coord is representable");
+                    if (!validCoord) {
+                        continue;
+                    }
+                    const uint32_t expected = terrain.SampleGeneratedVoxel(worldX, worldY, worldZ);
+                    const uint32_t columnExpected = terrain.SampleGeneratedVoxelWithColumn(
+                        worldX,
+                        worldY,
+                        worldZ,
+                        terrain.HeightAt(worldX, worldZ),
+                        terrain.SurfaceReliefAt(worldX, worldZ, 4));
+                    const uint32_t actual = generated.voxels[LocalVoxelIndex({x, y, z})];
+                    Check(columnExpected == expected, "column-cached terrain sample equals authoritative sample");
+                    Check(actual == expected, "optimized generated brick equals world sample");
+                }
+            }
+        }
+    }
+
     const BrickCoord right{1, 0, 0};
     GeneratedSparseBrick rightBrick = terrain.GenerateBrick(right);
     const uint32_t rightEdgeSample = terrain.SampleGeneratedVoxel(16, 0, 0);
@@ -383,6 +865,19 @@ void TestTerrainGeneration() {
         "very high brick classified empty");
     Check(highAir.occupancyWord0 == 0 && highAir.occupancyWord1 == 0,
         "empty brick has no occupancy bits");
+    Check(terrain.IsDefinitelyEmptyBrick(BrickCoord::FromWorldVoxel(0, 384, 0)),
+        "terrain empty-brick fast path accepts bricks above procedural height bound");
+    Check(!terrain.IsDefinitelyEmptyBrick(BrickCoord::FromWorldVoxel(0, SEA_LEVEL_Y, 0)),
+        "terrain empty-brick fast path keeps low and water-adjacent bricks resident-eligible");
+    Check(!terrain.IsDefinitelyEmptyBrick({std::numeric_limits<int32_t>::max(), 1000, 0}),
+        "terrain empty-brick fast path rejects overflowing X coord");
+
+    GeneratedSparseBrick overflowGenerated = terrain.GenerateBrick(
+        {std::numeric_limits<int32_t>::max(), 0, 0});
+    Check((overflowGenerated.flags & static_cast<uint32_t>(BrickResidencyFlags::Empty)) != 0 &&
+          overflowGenerated.occupancyWord0 == 0 &&
+          overflowGenerated.occupancyWord1 == 0,
+        "terrain generation rejects overflowing brick coord as empty fail-closed brick");
 
     GeneratedSparseBrick bedrock = terrain.GenerateBrick({0, -64, 0});
     Check((bedrock.flags & static_cast<uint32_t>(BrickResidencyFlags::Solid)) != 0,
@@ -417,13 +912,92 @@ void TestTerrainGeneration() {
     Check(VENPOD::Utils::UnpackMaterial(regularInteriorVoxel) != VENPOD::Utils::Material::Air,
         "authoritative generated terrain still retains interior volume");
 
+    bool foundWaterBasin = false;
+    int32_t waterBasinX = 0;
+    int32_t waterBasinZ = 0;
+    for (int32_t z = -256; z <= 256 && !foundWaterBasin; z += 16) {
+        for (int32_t x = -256; x <= 256 && !foundWaterBasin; x += 16) {
+            const float basinHeight = terrain.HeightAt(x, z);
+            if (basinHeight >= static_cast<float>(SEA_LEVEL_Y - 4)) {
+                continue;
+            }
+            const int32_t basinFloorY = static_cast<int32_t>(std::floor(basinHeight));
+            const uint32_t basinFloorVoxel = terrain.SampleGeneratedVoxel(x, basinFloorY, z);
+            Check(VENPOD::Utils::UnpackMaterial(basinFloorVoxel) != VENPOD::Utils::Material::Sand,
+                "authoritative submerged terrain floor does not masquerade as beach sand");
+            const uint32_t basinFloorSurface = terrain.SampleGeneratedSurfaceVoxel(x, basinFloorY, z, 1);
+            Check(VENPOD::Utils::UnpackMaterial(basinFloorSurface) == VENPOD::Utils::Material::Air,
+                "visual surface sample suppresses terrain faces owned by water");
+            const uint32_t basinWaterSurface = terrain.SampleGeneratedSurfaceVoxel(x, SEA_LEVEL_Y, z, 1);
+            Check(VENPOD::Utils::UnpackMaterial(basinWaterSurface) == VENPOD::Utils::Material::Water,
+                "visual surface sample keeps the exposed water surface over basins");
+            waterBasinX = x;
+            waterBasinZ = z;
+            foundWaterBasin = true;
+        }
+    }
+    Check(foundWaterBasin, "terrain test found a deterministic below-sea basin");
+
+    bool foundShallowSubmergedColumn = false;
+    for (int32_t z = -512; z <= 512 && !foundShallowSubmergedColumn; z += 4) {
+        for (int32_t x = -512; x <= 512 && !foundShallowSubmergedColumn; x += 4) {
+            const float shallowHeight = terrain.HeightAt(x, z);
+            if (shallowHeight < static_cast<float>(SEA_LEVEL_Y - 2) ||
+                shallowHeight >= static_cast<float>(SEA_LEVEL_Y)) {
+                continue;
+            }
+            const int32_t shallowFloorY = static_cast<int32_t>(std::floor(shallowHeight));
+            const uint32_t shallowFloorVoxel = terrain.SampleGeneratedVoxel(x, shallowFloorY, z);
+            Check(VENPOD::Utils::UnpackMaterial(shallowFloorVoxel) != VENPOD::Utils::Material::Air,
+                "shallow submerged terrain keeps its solid floor below water");
+            const uint32_t shallowSeaVoxel = terrain.SampleGeneratedVoxel(x, SEA_LEVEL_Y, z);
+            Check(VENPOD::Utils::UnpackMaterial(shallowSeaVoxel) == VENPOD::Utils::Material::Water,
+                "shallow below-sea columns are water-owned at sea level");
+            const uint32_t shallowFloorSurface = terrain.SampleGeneratedSurfaceVoxel(x, shallowFloorY, z, 1);
+            Check(VENPOD::Utils::UnpackMaterial(shallowFloorSurface) == VENPOD::Utils::Material::Air,
+                "visual surface suppresses shallow submerged terrain floor");
+            const uint32_t shallowWaterSurface = terrain.SampleGeneratedSurfaceVoxel(x, SEA_LEVEL_Y, z, 1);
+            Check(VENPOD::Utils::UnpackMaterial(shallowWaterSurface) == VENPOD::Utils::Material::Water,
+                "visual surface renders water over shallow submerged terrain");
+            foundShallowSubmergedColumn = true;
+        }
+    }
+    Check(foundShallowSubmergedColumn, "terrain test found a deterministic shallow below-sea column");
+
+    const BrickCoord buriedCoord =
+        BrickCoord::FromWorldVoxel(sampleX, terrainSurfaceY - coarseStep * 6, sampleZ);
+    Check(terrain.IsDefinitelyBuriedSolidBrick(buriedCoord),
+        "terrain buried-solid fast path identifies render-invisible interior bricks");
+    const BrickCoord surfaceCoord = BrickCoord::FromWorldVoxel(sampleX, terrainSurfaceY, sampleZ);
+    Check(!terrain.IsDefinitelyBuriedSolidBrick(surfaceCoord),
+        "terrain buried-solid fast path keeps surface bricks resident-eligible");
+    Check(!terrain.IsDefinitelyBuriedSolidBrick(BrickCoord::FromWorldVoxel(0, 384, 0)),
+        "terrain buried-solid fast path rejects air bricks");
+    Check(terrain.MayContainExposedSurfaceBrick(surfaceCoord),
+        "terrain surface classifier keeps exposed terrain bricks protected");
+    Check(!terrain.MayContainExposedSurfaceBrick(buriedCoord),
+        "terrain surface classifier demotes deeply buried interior bricks");
+    Check(!terrain.MayContainExposedSurfaceBrick(BrickCoord::FromWorldVoxel(0, 384, 0)),
+        "terrain surface classifier demotes high air bricks");
+    Check(terrain.MayContainExposedSurfaceBrick(
+            BrickCoord::FromWorldVoxel(waterBasinX, SEA_LEVEL_Y, waterBasinZ)),
+        "terrain surface classifier keeps exposed water-surface bricks protected");
+
+    SparseTerrainGenerator publicTerrain(1337u);
+    Check(publicTerrain.HeightAt(192, 224) <= 112.0f,
+        "public sparse basin caps the scenic spawn below overhead-slab height");
+    Check(publicTerrain.HeightAt(144, 80) <= 140.0f,
+        "public sparse basin caps near-origin ridges below overhead-slab height");
+    Check(publicTerrain.HeightAt(128, 288) <= 80.0f,
+        "public sparse basin keeps the walk-test route in a grounded midland band");
+
     const auto spawn = terrain.FindScenicSpawn(96, 96, 6.0f);
     Check(spawn.found, "scenic sparse spawn finds a validated spawn near origin");
     Check(spawn.groundY > SEA_LEVEL_Y + 6, "scenic sparse spawn avoids water basin starts");
     Check(spawn.eyeY > static_cast<float>(spawn.groundY) + 6.0f,
         "scenic sparse spawn places eye above player clearance");
     Check(spawn.localRelief <= 118.0f,
-        "scenic sparse spawn avoids high-relief wall pockets");
+        "scenic sparse spawn avoids unwalkable wall pockets while preserving vertical terrain");
     const uint8_t spawnGroundMaterial =
         VENPOD::Utils::UnpackMaterial(terrain.SampleGeneratedVoxel(spawn.worldX, spawn.groundY, spawn.worldZ));
     Check(spawnGroundMaterial != VENPOD::Utils::Material::Air &&
@@ -444,10 +1018,22 @@ void TestTerrainGeneration() {
                 static_cast<int32_t>(std::round(static_cast<float>(spawn.worldX) + spawnDirX * static_cast<float>(d)));
             const int32_t sz =
                 static_cast<int32_t>(std::round(static_cast<float>(spawn.worldZ) + spawnDirZ * static_cast<float>(d)));
-            Check(spawn.eyeY - terrain.HeightAt(sx, sz) >= 14.0f,
-                "scenic sparse spawn view cone avoids immediate wall");
+            const float dropBelowEye = spawn.eyeY - terrain.HeightAt(sx, sz);
+            Check(dropBelowEye >= 14.0f,
+                "scenic sparse spawn view cone keeps immediate terrain below the eye line");
         }
     }
+
+    const auto extremeSpawn = terrain.FindScenicSpawn(
+        std::numeric_limits<int32_t>::max(),
+        std::numeric_limits<int32_t>::min(),
+        std::numeric_limits<float>::infinity(),
+        std::numeric_limits<int32_t>::max(),
+        std::numeric_limits<int32_t>::max());
+    Check(std::isfinite(extremeSpawn.eyeY) && std::isfinite(extremeSpawn.score),
+        "scenic sparse spawn clamps malformed inputs to finite fallback data");
+    Check(extremeSpawn.groundY >= TERRAIN_MIN_Y && extremeSpawn.groundY <= TERRAIN_MAX_Y,
+        "scenic sparse spawn keeps extreme-origin fallback ground in terrain bounds");
 }
 
 void TestEditStoreAndCollision() {
@@ -515,6 +1101,31 @@ void TestEditStoreAndCollision() {
     Check(carvedGround.status == CollisionSampleStatus::KnownAir,
         "edit overlay can carve generated solid for collision");
 
+    Check(IsSparseEditPersistencePathAllowed("review-edits.vsed"),
+        "sparse edit persistence accepts .vsed paths");
+    Check(IsSparseEditPersistencePathAllowed("review-edits.VSED"),
+        "sparse edit persistence accepts uppercase .vsed extension");
+    Check(!IsSparseEditPersistencePathAllowed("review-edits.txt"),
+        "sparse edit persistence rejects non-vsed paths");
+    const std::filesystem::path rejectedEditPath =
+        std::filesystem::temp_directory_path() / "venpod_sparse_edit_store_reject.txt";
+    {
+        std::ofstream rejected(rejectedEditPath, std::ios::binary | std::ios::trunc);
+        rejected << "keep";
+    }
+    Check(!edits.SaveToFile(rejectedEditPath),
+        "sparse edit store refuses to save over non-vsed path");
+    {
+        std::ifstream rejected(rejectedEditPath, std::ios::binary);
+        std::string preserved;
+        rejected >> preserved;
+        Check(preserved == "keep",
+            "sparse edit store leaves rejected non-vsed file untouched");
+    }
+    SparseEditStore rejectedLoadEdits;
+    Check(!rejectedLoadEdits.LoadFromFile(rejectedEditPath),
+        "sparse edit store refuses to load non-vsed path");
+
     const std::filesystem::path editPath =
         std::filesystem::temp_directory_path() / "venpod_sparse_edit_store_roundtrip.vsed";
     std::filesystem::remove(editPath);
@@ -556,6 +1167,26 @@ void TestEditStoreAndCollision() {
         "failed sparse edit load preserves previous overlays");
 
     {
+        std::ofstream impossibleLength(corruptPath, std::ios::binary | std::ios::trunc);
+        const uint32_t magic = 0x44455356u;
+        const uint32_t version = 1u;
+        const uint32_t brickSize = SPARSE_BRICK_SIZE;
+        const uint32_t reserved = 0u;
+        const uint64_t overlayCount = 1u;
+        const uint64_t totalVoxelCount = 128'000'000ull;
+        WriteTestBinary(impossibleLength, magic);
+        WriteTestBinary(impossibleLength, version);
+        WriteTestBinary(impossibleLength, brickSize);
+        WriteTestBinary(impossibleLength, reserved);
+        WriteTestBinary(impossibleLength, overlayCount);
+        WriteTestBinary(impossibleLength, totalVoxelCount);
+    }
+    Check(!loadedEdits.LoadFromFile(corruptPath),
+        "sparse edit store rejects header counts that exceed file length before allocation");
+    Check(loadedEdits.TryGetVoxel(groundX, groundY, groundZ, &stored) && stored == air,
+        "impossible-length load failure preserves previous carved edit");
+
+    {
         std::ofstream duplicate(corruptPath, std::ios::binary | std::ios::trunc);
         const uint32_t magic = 0x44455356u;
         const uint32_t version = 1u;
@@ -587,6 +1218,117 @@ void TestEditStoreAndCollision() {
         "sparse edit store rejects duplicate local entries in one overlay");
     Check(loadedEdits.TryGetVoxel(groundX, groundY, groundZ, &stored) && stored == air,
         "duplicate-entry load failure preserves previous carved edit");
+
+    {
+        std::ofstream zeroRevision(corruptPath, std::ios::binary | std::ios::trunc);
+        const uint32_t magic = 0x44455356u;
+        const uint32_t version = 1u;
+        const uint32_t brickSize = SPARSE_BRICK_SIZE;
+        const uint32_t reserved = 0u;
+        const uint64_t overlayCount = 1u;
+        const uint64_t totalVoxelCount = 1u;
+        const BrickCoord coord{1, 2, 3};
+        const uint32_t zeroRevisionValue = 0u;
+        const uint32_t voxelCount = 1u;
+        const uint16_t local = 0u;
+        WriteTestBinary(zeroRevision, magic);
+        WriteTestBinary(zeroRevision, version);
+        WriteTestBinary(zeroRevision, brickSize);
+        WriteTestBinary(zeroRevision, reserved);
+        WriteTestBinary(zeroRevision, overlayCount);
+        WriteTestBinary(zeroRevision, totalVoxelCount);
+        WriteTestBinary(zeroRevision, coord.x);
+        WriteTestBinary(zeroRevision, coord.y);
+        WriteTestBinary(zeroRevision, coord.z);
+        WriteTestBinary(zeroRevision, zeroRevisionValue);
+        WriteTestBinary(zeroRevision, voxelCount);
+        WriteTestBinary(zeroRevision, local);
+        WriteTestBinary(zeroRevision, stone);
+    }
+    Check(!loadedEdits.LoadFromFile(corruptPath),
+        "sparse edit store rejects non-empty overlay with zero revision");
+    Check(loadedEdits.TryGetVoxel(-1, -1, -1, &stored) && stored == stone,
+        "zero-revision load failure preserves previous negative edit");
+
+    {
+        std::ofstream emptyOverlay(corruptPath, std::ios::binary | std::ios::trunc);
+        const uint32_t magic = 0x44455356u;
+        const uint32_t version = 1u;
+        const uint32_t brickSize = SPARSE_BRICK_SIZE;
+        const uint32_t reserved = 0u;
+        const uint64_t overlayCount = 1u;
+        const uint64_t totalVoxelCount = 0u;
+        const BrickCoord coord{4, 5, 6};
+        const uint32_t revision = 1u;
+        const uint32_t voxelCount = 0u;
+        WriteTestBinary(emptyOverlay, magic);
+        WriteTestBinary(emptyOverlay, version);
+        WriteTestBinary(emptyOverlay, brickSize);
+        WriteTestBinary(emptyOverlay, reserved);
+        WriteTestBinary(emptyOverlay, overlayCount);
+        WriteTestBinary(emptyOverlay, totalVoxelCount);
+        WriteTestBinary(emptyOverlay, coord.x);
+        WriteTestBinary(emptyOverlay, coord.y);
+        WriteTestBinary(emptyOverlay, coord.z);
+        WriteTestBinary(emptyOverlay, revision);
+        WriteTestBinary(emptyOverlay, voxelCount);
+    }
+    Check(!loadedEdits.LoadFromFile(corruptPath),
+        "sparse edit store rejects empty overlay records");
+    Check(loadedEdits.TryGetVoxel(groundX, groundY, groundZ, &stored) && stored == air,
+        "empty-overlay load failure preserves previous carved edit");
+
+    {
+        std::ofstream nearWrap(corruptPath, std::ios::binary | std::ios::trunc);
+        const uint32_t magic = 0x44455356u;
+        const uint32_t version = 1u;
+        const uint32_t brickSize = SPARSE_BRICK_SIZE;
+        const uint32_t reserved = 0u;
+        const uint64_t overlayCount = 1u;
+        const uint64_t totalVoxelCount = 1u;
+        const BrickCoord coord{7, 8, 9};
+        const uint32_t revision = std::numeric_limits<uint32_t>::max() - 1u;
+        const uint32_t voxelCount = 1u;
+        const uint16_t local = 0u;
+        WriteTestBinary(nearWrap, magic);
+        WriteTestBinary(nearWrap, version);
+        WriteTestBinary(nearWrap, brickSize);
+        WriteTestBinary(nearWrap, reserved);
+        WriteTestBinary(nearWrap, overlayCount);
+        WriteTestBinary(nearWrap, totalVoxelCount);
+        WriteTestBinary(nearWrap, coord.x);
+        WriteTestBinary(nearWrap, coord.y);
+        WriteTestBinary(nearWrap, coord.z);
+        WriteTestBinary(nearWrap, revision);
+        WriteTestBinary(nearWrap, voxelCount);
+        WriteTestBinary(nearWrap, local);
+        WriteTestBinary(nearWrap, stone);
+    }
+    SparseEditStore wrapEdits;
+    Check(wrapEdits.LoadFromFile(corruptPath),
+        "sparse edit store loads near-saturated overlay revision");
+    const int32_t wrapWorldX = 7 * SPARSE_BRICK_SIZE;
+    const int32_t wrapWorldY = 8 * SPARSE_BRICK_SIZE;
+    const int32_t wrapWorldZ = 9 * SPARSE_BRICK_SIZE;
+    wrapEdits.SetVoxel(wrapWorldX, wrapWorldY, wrapWorldZ, air);
+    Check(wrapEdits.GetOverlayRevision({7, 8, 9}) == std::numeric_limits<uint32_t>::max(),
+        "sparse edit store can advance to maximum revision");
+    Check(wrapEdits.PendingGpuDeltas().size() == 1 &&
+          wrapEdits.PendingGpuDeltas()[0].revision == std::numeric_limits<uint32_t>::max(),
+        "sparse edit store queues maximum-revision GPU delta");
+    wrapEdits.SetVoxel(wrapWorldX + 1, wrapWorldY, wrapWorldZ, stone);
+    Check(wrapEdits.GetOverlayRevision({7, 8, 9}) == 1u,
+        "sparse edit store wraps saturated revision to nonzero epoch");
+    bool sawResetLocal0 = false;
+    bool sawResetLocal1 = false;
+    for (const SparseEditDelta& delta : wrapEdits.PendingGpuDeltas()) {
+        sawResetLocal0 = sawResetLocal0 ||
+            (delta.revision == 1u && delta.packedLocal == PackSparseEditLocal({0, 0, 0}));
+        sawResetLocal1 = sawResetLocal1 ||
+            (delta.revision == 1u && delta.packedLocal == PackSparseEditLocal({1, 0, 0}));
+    }
+    Check(wrapEdits.PendingGpuDeltas().size() == 2 && sawResetLocal0 && sawResetLocal1,
+        "sparse edit store republishes complete overlay deltas on revision epoch reset");
 
     SparseVoxelWorld savedWorld;
     Check(savedWorld.Initialize({16, 64, 12345u}), "sparse world for edit persistence initializes");
@@ -664,6 +1406,29 @@ void TestSparseCollisionVolumesAndSweeps() {
     Check(stationary.blocked && stationary.safeFraction == 0.0f,
         "sparse collision zero sweep reports initial overlap");
 
+    const float inf = std::numeric_limits<float>::infinity();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    SparseCollisionVolumeResult nanVolume =
+        collision.TestAabb({nan, 900.0f, 100.0f, 101.0f, 901.0f, 101.0f});
+    Check(nanVolume.blocked && nanVolume.hasUnknown && nanVolume.unknownVoxels == 1,
+        "sparse collision AABB rejects non-finite bounds as unknown blocked");
+    SparseCollisionVolumeResult outOfRangeVolume =
+        collision.TestAabb({0.0f, 0.0f, 0.0f, inf, 1.0f, 1.0f});
+    Check(outOfRangeVolume.blocked && outOfRangeVolume.hasUnknown && outOfRangeVolume.sampledVoxels == 1,
+        "sparse collision AABB rejects out-of-range bounds without scanning");
+    SparseCollisionVolumeResult oversizedVolume =
+        collision.TestAabb({0.0f, 900.0f, 0.0f, 200.0f, 1100.0f, 200.0f});
+    Check(oversizedVolume.blocked && oversizedVolume.hasUnknown && oversizedVolume.sampledVoxels == 1,
+        "sparse collision AABB rejects oversized queries without unbounded scans");
+    SparseCollisionSweepResult invalidSweep = collision.SweepAabb(sweepStart, inf, 0.0f, 0.0f, 8);
+    Check(invalidSweep.blocked && invalidSweep.safeFraction == 0.0f &&
+            invalidSweep.hitVolume.hasUnknown,
+        "sparse collision sweep rejects non-finite deltas as unknown blocked");
+    SparseCollisionSweepResult hugeStepSweep =
+        collision.SweepAabb(sweepStart, 0.0f, 0.0f, 4.0f, std::numeric_limits<uint32_t>::max());
+    Check(!hugeStepSweep.blocked && hugeStepSweep.safeFraction == 1.0f,
+        "sparse collision sweep clamps huge step counts without blocking an open path");
+
     SparseEditStore supportEdits;
     SparseCollisionQuery supportCollision(terrain, &supportEdits);
     supportEdits.SetVoxel(200, 1395, 200, stone);
@@ -679,6 +1444,14 @@ void TestSparseCollisionVolumesAndSweeps() {
     SparseCollisionSupportResult liquidSupport = supportCollision.FindSupportBelow(supportFootprint, 8.0f, true);
     Check(liquidSupport.found && liquidSupport.supportY == 1396,
         "sparse collision support can accept liquid when requested");
+    SparseCollisionSupportResult invalidSupport =
+        supportCollision.FindSupportBelow({nan, 1400.0f, 199.4f, 200.6f, 1400.1f, 200.6f}, 8.0f);
+    Check(!invalidSupport.found && invalidSupport.sampledVoxels == 0,
+        "sparse collision support rejects non-finite footprints without scanning");
+    SparseCollisionSupportResult oversizedSupport =
+        supportCollision.FindSupportBelow({0.0f, 1400.0f, 0.0f, 400.0f, 1400.1f, 400.0f}, 500.0f);
+    Check(!oversizedSupport.found && oversizedSupport.sampledVoxels == 0,
+        "sparse collision support rejects oversized footprints without unbounded scans");
 }
 
 void TestSparseCharacterController() {
@@ -687,6 +1460,11 @@ void TestSparseCharacterController() {
         1,
         0,
         VENPOD::Utils::StateFlags::IsStatic);
+    const uint32_t water = VENPOD::Utils::PackVoxel(
+        VENPOD::Utils::Material::Water,
+        1,
+        0,
+        0);
 
     SparseVoxelWorld blockedWorld;
     Check(blockedWorld.Initialize({16, 64, 12345u}), "character controller blocked world initializes");
@@ -734,6 +1512,22 @@ void TestSparseCharacterController() {
     Check(landed.eyeY == 1001.0f && landed.verticalVelocity == 0.0f,
         "sparse character controller clamps downward sweep to support");
 
+    SparseVoxelWorld liquidVerticalWorld;
+    Check(liquidVerticalWorld.Initialize({16, 64, 12345u}), "character controller liquid vertical world initializes");
+    liquidVerticalWorld.SetEditedVoxel(0, 995, 0, water);
+    SparseCharacterVerticalMoveRequest liquidFallRequest = fallRequest;
+    liquidFallRequest.liquidsSupport = false;
+    SparseCharacterVerticalMoveResult liquidFallIgnored =
+        ResolveSparseCharacterVerticalMove(liquidVerticalWorld, liquidFallRequest);
+    Check(!liquidFallIgnored.blocked && liquidFallIgnored.liquidVoxels > 0,
+        "sparse character controller vertical sweep ignores liquid support by default");
+    liquidFallRequest.liquidsSupport = true;
+    SparseCharacterVerticalMoveResult liquidFallLanded =
+        ResolveSparseCharacterVerticalMove(liquidVerticalWorld, liquidFallRequest);
+    Check(liquidFallLanded.blocked && liquidFallLanded.landed &&
+              liquidFallLanded.liquidVoxels > 0 && liquidFallLanded.eyeY == 1001.0f,
+        "sparse character controller vertical sweep can land on temporary liquid support");
+
     verticalWorld.SetEditedVoxel(0, 1004, 0, stone);
     SparseCharacterVerticalMoveRequest ceilingRequest;
     ceilingRequest.startBody = {0.0f, 1000.0f, 0.0f, 5.0f, 0.4f, 2.5f};
@@ -773,6 +1567,56 @@ void TestSparseCharacterController() {
         ResolveSparseCharacterGrounding(groundWorld, penetrationRequest);
     Check(penetration.grounded && penetration.eyeY == 1001.0f,
         "sparse character controller resolves small upward ground penetration");
+
+    SparseVoxelWorld liquidGroundWorld;
+    Check(liquidGroundWorld.Initialize({16, 64, 12345u}), "character controller liquid ground world initializes");
+    liquidGroundWorld.SetEditedVoxel(0, 995, 0, water);
+    SparseCharacterGroundRequest liquidRequest = groundRequest;
+    liquidRequest.liquidsSupport = false;
+    SparseCharacterGroundResult liquidIgnored =
+        ResolveSparseCharacterGrounding(liquidGroundWorld, liquidRequest);
+    Check(!liquidIgnored.grounded,
+        "sparse character controller ignores liquid support by default");
+    liquidRequest.liquidsSupport = true;
+    SparseCharacterGroundResult liquidGrounded =
+        ResolveSparseCharacterGrounding(liquidGroundWorld, liquidRequest);
+    Check(liquidGrounded.grounded && liquidGrounded.liquidVoxels > 0 && liquidGrounded.eyeY == 1001.0f,
+        "sparse character controller can treat liquid as temporary walking support");
+
+    SparseCharacterMoveRequest malformedHorizontal = blockedRequest;
+    malformedHorizontal.targetBody.eyeX = std::numeric_limits<float>::quiet_NaN();
+    malformedHorizontal.maxSweepSteps = std::numeric_limits<uint32_t>::max();
+    SparseCharacterMoveResult malformedHorizontalResult =
+        ResolveSparseCharacterHorizontalMove(blockedWorld, malformedHorizontal);
+    Check(malformedHorizontalResult.blocked &&
+          malformedHorizontalResult.safeFraction == 0.0f &&
+          malformedHorizontalResult.eyeX == malformedHorizontal.startBody.eyeX &&
+          malformedHorizontalResult.sampledVoxels == 0,
+        "sparse character horizontal move rejects malformed target without collision scan");
+
+    SparseCharacterVerticalMoveRequest malformedVertical = fallRequest;
+    malformedVertical.targetBody.eyeY = std::numeric_limits<float>::infinity();
+    malformedVertical.verticalVelocity = std::numeric_limits<float>::quiet_NaN();
+    malformedVertical.maxSweepSteps = std::numeric_limits<uint32_t>::max();
+    SparseCharacterVerticalMoveResult malformedVerticalResult =
+        ResolveSparseCharacterVerticalMove(verticalWorld, malformedVertical);
+    Check(malformedVerticalResult.blocked &&
+          malformedVerticalResult.safeFraction == 0.0f &&
+          malformedVerticalResult.eyeY == malformedVertical.startBody.eyeY &&
+          malformedVerticalResult.verticalVelocity == 0.0f &&
+          malformedVerticalResult.sampledVoxels == 0,
+        "sparse character vertical move rejects malformed target without collision scan");
+
+    SparseCharacterGroundRequest malformedGround = groundRequest;
+    malformedGround.body.eyeY = std::numeric_limits<float>::quiet_NaN();
+    malformedGround.maxSnapUp = std::numeric_limits<float>::infinity();
+    malformedGround.maxSnapDown = std::numeric_limits<float>::infinity();
+    SparseCharacterGroundResult malformedGroundResult =
+        ResolveSparseCharacterGrounding(groundWorld, malformedGround);
+    Check(!malformedGroundResult.grounded &&
+          malformedGroundResult.sampledVoxels == 0 &&
+          malformedGroundResult.verticalVelocity == 0.0f,
+        "sparse character grounding rejects malformed body without support scan");
 }
 
 void TestSparseEditDeltaBatching() {
@@ -831,13 +1675,51 @@ void TestSparseEditDeltaBatching() {
 
     SparseEditDeltaBatch rangeCapped = BuildSparseEditDeltaBatch(deltas, 16, 1);
     Check(rangeCapped.overflow, "edit delta batch reports range overflow");
+    Check(rangeCapped.truncated, "edit delta batch reports truncation when range cap omits bricks");
     Check(rangeCapped.ranges.size() == 1, "edit delta range cap limits uploaded ranges");
     Check(rangeCapped.deltas.size() == rangeCapped.ranges[0].deltaCount,
         "edit delta overflow keeps range and delta arrays consistent");
 
     SparseEditDeltaBatch deltaCapped = BuildSparseEditDeltaBatch(deltas, 2, 16);
     Check(deltaCapped.overflow, "edit delta batch reports delta overflow");
+    Check(deltaCapped.truncated, "edit delta batch reports true truncation under hard delta cap");
     Check(deltaCapped.deltas.size() == 2, "edit delta cap limits uploaded deltas");
+
+    std::vector<SparseEditDelta> duplicateOverflowDeltas = {
+        {BrickCoord{0, 0, 0}, 5u, stone, 1u},
+        {BrickCoord{0, 0, 0}, 5u, sand, 9u},
+        {BrickCoord{0, 0, 0}, 6u, stone, 2u},
+    };
+    SparseEditDeltaBatch duplicateOverflow =
+        BuildSparseEditDeltaBatch(duplicateOverflowDeltas, 2, 16);
+    Check(duplicateOverflow.overflow, "edit delta batch reports overflow after duplicate coalescing");
+    Check(!duplicateOverflow.truncated,
+        "edit delta duplicate coalescing can fully represent oversized duplicate input");
+    Check(duplicateOverflow.deltas.size() == 2,
+        "edit delta duplicate coalescing preserves capped upload size");
+    bool sawNewestDuplicate = false;
+    bool sawStaleDuplicate = false;
+    for (const SparseEditDelta& delta : duplicateOverflow.deltas) {
+        sawNewestDuplicate = sawNewestDuplicate ||
+            (delta.packedLocal == 5u && delta.revision == 9u && delta.voxel == sand);
+        sawStaleDuplicate = sawStaleDuplicate ||
+            (delta.packedLocal == 5u && delta.revision == 1u);
+    }
+    Check(sawNewestDuplicate && !sawStaleDuplicate,
+        "edit delta overflow keeps newest duplicate voxel revision");
+
+    SparseEditDeltaBatch invalidRangeTable =
+        BuildSparseEditDeltaBatch(deltas, 16, 16, 7);
+    Check(invalidRangeTable.overflow && invalidRangeTable.truncated &&
+          invalidRangeTable.deltas.empty() && invalidRangeTable.ranges.empty(),
+        "edit delta batch treats invalid range table capacity as unrepresented input");
+
+    SparseEditDeltaBatch tinyRangeTable =
+        BuildSparseEditDeltaBatch(deltas, 16, 16, 1);
+    Check(tinyRangeTable.overflow && tinyRangeTable.truncated,
+        "edit delta batch treats range-table insertion failure as unrepresented input");
+    Check(tinyRangeTable.ranges.size() == 2 && tinyRangeTable.rangeTable.size() == 1,
+        "edit delta batch keeps CPU ranges visible when tiny range table overflows");
 }
 
 void TestSparseCollisionSupportRequests() {
@@ -869,12 +1751,6 @@ void TestSparseCollisionSupportRequests() {
 }
 
 void TestSparseGpuPhysicsProposalApply() {
-    constexpr uint32_t kProposalStatusHasExpectedPage = 2u;
-    constexpr uint32_t kProposalStatusPageMatch = 4u;
-    constexpr uint32_t kProposalStatusPageStale = 8u;
-    constexpr uint32_t kProposalStatusProposal = 16u;
-    constexpr uint32_t kProposalStatusEditDeltaHit = 64u;
-
     SparseVoxelWorld world;
     Check(world.Initialize({8, 32, 12345u}), "gpu proposal world initialize");
 
@@ -891,7 +1767,9 @@ void TestSparseGpuPhysicsProposalApply() {
     proposal.destinationCoord = BrickCoord{0, 1, 0};
     proposal.generation = 1;
     proposal.materialMask = 1u;
-    proposal.status = 16u;
+    proposal.status =
+        SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+        SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL;
     proposal.packedSourceLocal = 0u | (1u << 8u) | 0u;
     proposal.packedDestinationLocal = 0u | (0u << 8u) | 0u;
     proposal.sourceVoxel = sand;
@@ -916,12 +1794,54 @@ void TestSparseGpuPhysicsProposalApply() {
           world.GetStats().physicsGpuRejectedProposalsLastFrame == 0,
         "empty gpu proposal batch resets gpu proposal stats");
 
+    SparseVoxelWorld zeroGenerationWorld;
+    Check(zeroGenerationWorld.Initialize({8, 32, 12345u}),
+        "gpu proposal zero-generation world initialize");
+    zeroGenerationWorld.SetEditedVoxel(0, 17, 0, sand);
+    zeroGenerationWorld.SetEditedVoxel(0, 16, 0, air);
+    SparsePhysicsPacketResult zeroGenerationProposal = proposal;
+    zeroGenerationProposal.generation = 0u;
+    Check(zeroGenerationWorld.ApplyGpuPhysicsProposals({zeroGenerationProposal}, 4, true) == 0,
+        "gpu proposal rejects zero work generation");
+    Check(zeroGenerationWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 1,
+        "zero-generation gpu proposal is counted as rejected");
+    Check(zeroGenerationWorld.GetEdits().TryGetVoxel(0, 17, 0, &sourceAfter) &&
+          sourceAfter == sand,
+        "zero-generation gpu proposal leaves source voxel unchanged");
+
+    SparseVoxelWorld malformedStatusWorld;
+    Check(malformedStatusWorld.Initialize({8, 32, 12345u}),
+        "gpu proposal malformed status world initialize");
+    malformedStatusWorld.SetEditedVoxel(0, 17, 0, sand);
+    malformedStatusWorld.SetEditedVoxel(0, 16, 0, air);
+    SparsePhysicsPacketResult missingConsumedStatusProposal = proposal;
+    missingConsumedStatusProposal.status = SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL;
+    Check(malformedStatusWorld.ApplyGpuPhysicsProposals({missingConsumedStatusProposal}, 4, true) == 0,
+        "gpu proposal rejects proposal status without consumed bit");
+    Check(malformedStatusWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 1,
+        "missing-consumed gpu proposal is counted as rejected");
+    Check(malformedStatusWorld.GetEdits().TryGetVoxel(0, 17, 0, &sourceAfter) &&
+          sourceAfter == sand,
+        "missing-consumed gpu proposal leaves source voxel unchanged");
+    SparsePhysicsPacketResult unknownStatusProposal = proposal;
+    unknownStatusProposal.status |= 0x80000000u;
+    Check(malformedStatusWorld.ApplyGpuPhysicsProposals({unknownStatusProposal}, 4, true) == 0,
+        "gpu proposal rejects unknown status bits");
+    Check(malformedStatusWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 1,
+        "unknown-status gpu proposal is counted as rejected");
+    Check(malformedStatusWorld.GetEdits().TryGetVoxel(0, 17, 0, &sourceAfter) &&
+          sourceAfter == sand,
+        "unknown-status gpu proposal leaves source voxel unchanged");
+
     SparseVoxelWorld editRevisionWorld;
     Check(editRevisionWorld.Initialize({8, 32, 12345u}),
         "gpu proposal edit-revision world initialize");
     editRevisionWorld.SetEditedVoxel(0, 17, 0, sand);
     SparsePhysicsPacketResult editRevisionProposal = proposal;
-    editRevisionProposal.status = kProposalStatusProposal | kProposalStatusEditDeltaHit;
+    editRevisionProposal.status =
+        SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+        SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL |
+        SPARSE_PHYSICS_PACKET_STATUS_EDIT_DELTA_HIT;
     editRevisionProposal.sourceRevision = 1u;
     editRevisionProposal.destinationRevision = 0u;
     editRevisionWorld.SetEditedVoxel(1, 17, 0, sand);
@@ -937,7 +1857,10 @@ void TestSparseGpuPhysicsProposalApply() {
     destinationRevisionWorld.SetEditedVoxel(0, 17, 0, sand);
     destinationRevisionWorld.SetEditedVoxel(0, 16, 0, air);
     SparsePhysicsPacketResult destinationRevisionProposal = proposal;
-    destinationRevisionProposal.status = kProposalStatusProposal | kProposalStatusEditDeltaHit;
+    destinationRevisionProposal.status =
+        SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+        SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL |
+        SPARSE_PHYSICS_PACKET_STATUS_EDIT_DELTA_HIT;
     destinationRevisionProposal.sourceRevision = 1u;
     destinationRevisionProposal.destinationRevision = 1u;
     destinationRevisionWorld.SetEditedVoxel(1, 16, 0, air);
@@ -949,6 +1872,207 @@ void TestSparseGpuPhysicsProposalApply() {
     Check(destinationRevisionWorld.GetEdits().TryGetVoxel(0, 16, 0, &destinationAfter) &&
           VENPOD::Utils::UnpackMaterial(destinationAfter) == VENPOD::Utils::Material::Air,
         "stale destination edit-delta gpu proposal leaves destination voxel unchanged");
+
+    SparseVoxelWorld crossBrickDestinationRevisionWorld;
+    Check(crossBrickDestinationRevisionWorld.Initialize({8, 32, 12345u}),
+        "gpu proposal cross-brick destination edit-revision world initialize");
+    crossBrickDestinationRevisionWorld.SetEditedVoxel(15, 17, 0, sand);
+    crossBrickDestinationRevisionWorld.SetEditedVoxel(16, 17, 0, air);
+    SparsePhysicsPacketResult crossBrickDestinationRevisionProposal = proposal;
+    crossBrickDestinationRevisionProposal.status =
+        SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+        SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL |
+        SPARSE_PHYSICS_PACKET_STATUS_EDIT_DELTA_HIT;
+    crossBrickDestinationRevisionProposal.packedSourceLocal = 15u | (1u << 8u) | 0u;
+    crossBrickDestinationRevisionProposal.packedDestinationLocal = 0u | (1u << 8u) | 0u;
+    crossBrickDestinationRevisionProposal.destinationCoord = BrickCoord{1, 1, 0};
+    crossBrickDestinationRevisionProposal.sourceRevision = 1u;
+    crossBrickDestinationRevisionProposal.destinationRevision = 1u;
+    crossBrickDestinationRevisionWorld.SetEditedVoxel(17, 17, 0, water);
+    Check(crossBrickDestinationRevisionWorld.ApplyGpuPhysicsProposals(
+              {crossBrickDestinationRevisionProposal},
+              4,
+              true) == 0,
+        "gpu proposal rejects edit-delta result after cross-brick destination revision advanced");
+    Check(crossBrickDestinationRevisionWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 1,
+        "cross-brick stale destination edit-delta proposal is counted as rejected");
+    Check(crossBrickDestinationRevisionWorld.GetEdits().TryGetVoxel(15, 17, 0, &sourceAfter) &&
+          sourceAfter == sand,
+        "cross-brick stale destination edit-delta proposal leaves source voxel unchanged");
+    Check(crossBrickDestinationRevisionWorld.GetEdits().TryGetVoxel(16, 17, 0, &destinationAfter) &&
+          destinationAfter == air,
+        "cross-brick stale destination edit-delta proposal leaves destination voxel unchanged");
+
+    SparseVoxelWorld staleDestinationVoxelWorld;
+    Check(staleDestinationVoxelWorld.Initialize({8, 32, 12345u}),
+        "gpu proposal stale-destination world initialize");
+    staleDestinationVoxelWorld.SetEditedVoxel(0, 17, 0, sand);
+    staleDestinationVoxelWorld.SetEditedVoxel(0, 16, 0, air);
+    SparsePhysicsPacketResult staleDestinationVoxelProposal = proposal;
+    staleDestinationVoxelProposal.destinationVoxel = water;
+    Check(staleDestinationVoxelWorld.ApplyGpuPhysicsProposals({staleDestinationVoxelProposal}, 4, true) == 0,
+        "gpu proposal rejects destination voxel mismatch before mutation");
+    Check(staleDestinationVoxelWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 1,
+        "destination mismatch gpu proposal is counted as rejected");
+    Check(staleDestinationVoxelWorld.GetEdits().TryGetVoxel(0, 17, 0, &sourceAfter) &&
+          sourceAfter == sand,
+        "destination mismatch gpu proposal leaves source voxel unchanged");
+    Check(staleDestinationVoxelWorld.GetEdits().TryGetVoxel(0, 16, 0, &destinationAfter) &&
+          destinationAfter == air,
+        "destination mismatch gpu proposal leaves destination voxel unchanged");
+
+    SparseVoxelWorld futureRevisionWorld;
+    Check(futureRevisionWorld.Initialize({8, 32, 12345u}),
+        "gpu proposal future edit-revision world initialize");
+    futureRevisionWorld.SetEditedVoxel(0, 17, 0, sand);
+    futureRevisionWorld.SetEditedVoxel(0, 16, 0, air);
+    SparsePhysicsPacketResult futureRevisionProposal = proposal;
+    futureRevisionProposal.status =
+        SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+        SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL |
+        SPARSE_PHYSICS_PACKET_STATUS_EDIT_DELTA_HIT;
+    futureRevisionProposal.sourceRevision = 99u;
+    futureRevisionProposal.destinationRevision = 1u;
+    Check(futureRevisionWorld.ApplyGpuPhysicsProposals({futureRevisionProposal}, 4, true) == 0,
+        "gpu proposal rejects edit-delta result whose source revision does not exactly match CPU overlay");
+    Check(futureRevisionWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 1,
+        "future edit-delta gpu proposal is counted as rejected");
+    Check(futureRevisionWorld.GetEdits().TryGetVoxel(0, 17, 0, &sourceAfter) &&
+          sourceAfter == sand,
+        "future edit-delta gpu proposal leaves source voxel unchanged");
+
+    SparseVoxelWorld inconsistentRevisionWorld;
+    Check(inconsistentRevisionWorld.Initialize({8, 32, 12345u}),
+        "gpu proposal inconsistent edit-revision world initialize");
+    inconsistentRevisionWorld.SetEditedVoxel(0, 17, 0, sand);
+    inconsistentRevisionWorld.SetEditedVoxel(0, 16, 0, air);
+    SparsePhysicsPacketResult inconsistentRevisionProposal = proposal;
+    inconsistentRevisionProposal.status =
+        SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+        SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL |
+        SPARSE_PHYSICS_PACKET_STATUS_EDIT_DELTA_HIT;
+    inconsistentRevisionProposal.sourceRevision = 0u;
+    inconsistentRevisionProposal.destinationRevision = 0u;
+    Check(inconsistentRevisionWorld.ApplyGpuPhysicsProposals({inconsistentRevisionProposal}, 4, true) == 0,
+        "gpu proposal rejects edit-delta status without any sampled edit revision");
+    Check(inconsistentRevisionWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 1,
+        "inconsistent edit-delta gpu proposal is counted as rejected");
+    Check(inconsistentRevisionWorld.GetEdits().TryGetVoxel(0, 17, 0, &sourceAfter) &&
+          sourceAfter == sand,
+        "inconsistent edit-delta gpu proposal leaves source voxel unchanged");
+
+    SparseVoxelWorld malformedExpectedPageWorld;
+    Check(malformedExpectedPageWorld.Initialize({8, 32, 12345u}),
+        "gpu proposal malformed expected-page world initialize");
+    malformedExpectedPageWorld.SetEditedVoxel(0, 17, 0, sand);
+    malformedExpectedPageWorld.SetEditedVoxel(0, 16, 0, air);
+    SparsePhysicsPacketResult malformedExpectedPageProposal = proposal;
+    malformedExpectedPageProposal.status =
+        SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+        SPARSE_PHYSICS_PACKET_STATUS_HAS_EXPECTED_PAGE |
+        SPARSE_PHYSICS_PACKET_STATUS_PAGE_MATCH |
+        SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL;
+    malformedExpectedPageProposal.expectedPageIndex = INVALID_BRICK_PAGE;
+    malformedExpectedPageProposal.expectedPageGeneration = 0u;
+    Check(malformedExpectedPageWorld.ApplyGpuPhysicsProposals({malformedExpectedPageProposal}, 4, true) == 0,
+        "gpu proposal rejects expected-page status without expected page data");
+    Check(malformedExpectedPageWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 1,
+        "malformed expected-page gpu proposal is counted as rejected");
+    Check(malformedExpectedPageWorld.GetEdits().TryGetVoxel(0, 17, 0, &sourceAfter) &&
+          sourceAfter == sand,
+        "malformed expected-page gpu proposal leaves source voxel unchanged");
+
+    SparseVoxelWorld inconsistentExpectedPageStatusWorld;
+    Check(inconsistentExpectedPageStatusWorld.Initialize({8, 32, 12345u}),
+        "gpu proposal inconsistent expected-page status world initialize");
+    inconsistentExpectedPageStatusWorld.SetEditedVoxel(0, 17, 0, sand);
+    inconsistentExpectedPageStatusWorld.SetEditedVoxel(0, 16, 0, air);
+    Check(inconsistentExpectedPageStatusWorld.RequestBrick(BrickCoord{0, 1, 0}),
+        "gpu proposal inconsistent expected-page status source request");
+    Check(inconsistentExpectedPageStatusWorld.PumpGeneration(1) == 1,
+        "gpu proposal inconsistent expected-page status source generation");
+    SparseBrickUploadPacket inconsistentExpectedPagePacket;
+    Check(inconsistentExpectedPageStatusWorld.PopNextUpload(&inconsistentExpectedPagePacket),
+        "gpu proposal inconsistent expected-page status upload packet");
+    Check(inconsistentExpectedPageStatusWorld.CompleteUpload(inconsistentExpectedPagePacket),
+        "gpu proposal inconsistent expected-page status complete upload");
+
+    SparsePhysicsPacketResult pageMatchWithoutHasProposal = proposal;
+    pageMatchWithoutHasProposal.status =
+        SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+        SPARSE_PHYSICS_PACKET_STATUS_PAGE_MATCH |
+        SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL;
+    pageMatchWithoutHasProposal.expectedPageIndex = inconsistentExpectedPagePacket.pageIndex;
+    pageMatchWithoutHasProposal.expectedPageGeneration = inconsistentExpectedPagePacket.generation;
+    Check(inconsistentExpectedPageStatusWorld.ApplyGpuPhysicsProposals(
+              {pageMatchWithoutHasProposal},
+              4,
+              true) == 0,
+        "gpu proposal rejects page-match status without has-expected-page status");
+    Check(inconsistentExpectedPageStatusWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 1,
+        "page-match without has-expected-page gpu proposal is counted as rejected");
+    Check(inconsistentExpectedPageStatusWorld.GetEdits().TryGetVoxel(0, 17, 0, &sourceAfter) &&
+          sourceAfter == sand,
+        "page-match without has-expected-page gpu proposal leaves source voxel unchanged");
+
+    SparsePhysicsPacketResult conflictingPageStatusProposal = proposal;
+    conflictingPageStatusProposal.status =
+        SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+        SPARSE_PHYSICS_PACKET_STATUS_HAS_EXPECTED_PAGE |
+        SPARSE_PHYSICS_PACKET_STATUS_PAGE_MATCH |
+        SPARSE_PHYSICS_PACKET_STATUS_PAGE_STALE |
+        SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL;
+    conflictingPageStatusProposal.expectedPageIndex = inconsistentExpectedPagePacket.pageIndex;
+    conflictingPageStatusProposal.expectedPageGeneration = inconsistentExpectedPagePacket.generation;
+    Check(inconsistentExpectedPageStatusWorld.ApplyGpuPhysicsProposals(
+              {conflictingPageStatusProposal},
+              4,
+              true) == 0,
+        "gpu proposal rejects mutually exclusive page-match and page-stale status");
+    Check(inconsistentExpectedPageStatusWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 1,
+        "conflicting expected-page status gpu proposal is counted as rejected");
+    Check(inconsistentExpectedPageStatusWorld.GetEdits().TryGetVoxel(0, 17, 0, &sourceAfter) &&
+          sourceAfter == sand,
+        "conflicting expected-page status gpu proposal leaves source voxel unchanged");
+
+    SparseVoxelWorld malformedLocalWorld;
+    Check(malformedLocalWorld.Initialize({8, 32, 12345u}),
+        "gpu proposal malformed local-coordinate world initialize");
+    malformedLocalWorld.SetEditedVoxel(255, 17, 0, sand);
+    malformedLocalWorld.SetEditedVoxel(255, 16, 0, air);
+    SparsePhysicsPacketResult malformedLocalProposal = proposal;
+    malformedLocalProposal.packedSourceLocal = 255u | (1u << 8u) | 0u;
+    malformedLocalProposal.packedDestinationLocal = 255u | (0u << 8u) | 0u;
+    Check(malformedLocalWorld.ApplyGpuPhysicsProposals({malformedLocalProposal}, 4, true) == 0,
+        "gpu proposal rejects local coordinates outside sparse brick bounds");
+    Check(malformedLocalWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 1 &&
+          malformedLocalWorld.GetStats().physicsCandidateBricks >= 1,
+        "malformed local-coordinate gpu proposal is counted and requeued safely");
+    Check(malformedLocalWorld.GetEdits().TryGetVoxel(255, 17, 0, &sourceAfter) &&
+          sourceAfter == sand,
+        "malformed local-coordinate gpu proposal leaves outside source voxel unchanged");
+    Check(malformedLocalWorld.GetEdits().TryGetVoxel(255, 16, 0, &destinationAfter) &&
+          VENPOD::Utils::UnpackMaterial(destinationAfter) == VENPOD::Utils::Material::Air,
+        "malformed local-coordinate gpu proposal leaves outside destination voxel unchanged");
+
+    SparseVoxelWorld overflowCoordWorld;
+    Check(overflowCoordWorld.Initialize({8, 32, 12345u}),
+        "gpu proposal overflow-coordinate world initialize");
+    SparsePhysicsPacketResult overflowSourceCoordProposal = proposal;
+    overflowSourceCoordProposal.coord = BrickCoord{std::numeric_limits<int32_t>::max(), 1, 0};
+    Check(overflowCoordWorld.ApplyGpuPhysicsProposals({overflowSourceCoordProposal}, 4, true) == 0,
+        "gpu proposal rejects source coordinate that would overflow world voxel conversion");
+    Check(overflowCoordWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 1 &&
+          overflowCoordWorld.GetStats().physicsCandidateBricks >= 1,
+        "overflow source-coordinate gpu proposal is counted and requeued safely");
+    SparsePhysicsPacketResult overflowDestinationCoordProposal = proposal;
+    overflowDestinationCoordProposal.destinationCoord =
+        BrickCoord{0, std::numeric_limits<int32_t>::min(), 0};
+    Check(overflowCoordWorld.ApplyGpuPhysicsProposals({overflowDestinationCoordProposal}, 4, true) == 0,
+        "gpu proposal rejects destination coordinate that would overflow world voxel conversion");
+    Check(overflowCoordWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 1 &&
+          overflowCoordWorld.GetStats().physicsCandidateBricks >= 1,
+        "overflow destination-coordinate gpu proposal is counted and requeued safely");
 
     Check(world.ApplyGpuPhysicsProposals({proposal}, 4, true) == 0,
         "stale gpu proposal is rejected after source changed");
@@ -973,9 +2097,13 @@ void TestSparseGpuPhysicsProposalApply() {
     SparsePhysicsPacketResult expectedPageProposal;
     expectedPageProposal.coord = residencyCoord;
     expectedPageProposal.destinationCoord = residencyCoord;
+    expectedPageProposal.generation = 1u;
     expectedPageProposal.materialMask = 1u;
     expectedPageProposal.status =
-        kProposalStatusHasExpectedPage | kProposalStatusPageMatch | kProposalStatusProposal;
+        SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+        SPARSE_PHYSICS_PACKET_STATUS_HAS_EXPECTED_PAGE |
+        SPARSE_PHYSICS_PACKET_STATUS_PAGE_MATCH |
+        SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL;
     expectedPageProposal.expectedPageIndex = residencyPacket.pageIndex;
     expectedPageProposal.expectedPageGeneration = residencyPacket.generation;
     expectedPageProposal.packedSourceLocal = 0u | (1u << 8u) | 0u;
@@ -985,7 +2113,10 @@ void TestSparseGpuPhysicsProposalApply() {
 
     SparsePhysicsPacketResult stalePageProposal = expectedPageProposal;
     stalePageProposal.status =
-        kProposalStatusHasExpectedPage | kProposalStatusPageStale | kProposalStatusProposal;
+        SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+        SPARSE_PHYSICS_PACKET_STATUS_HAS_EXPECTED_PAGE |
+        SPARSE_PHYSICS_PACKET_STATUS_PAGE_STALE |
+        SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL;
     stalePageProposal.expectedPageGeneration = residencyPacket.generation + 1u;
     Check(residencyWorld.ApplyGpuPhysicsProposals({stalePageProposal}, 4, true) == 0,
         "gpu proposal rejects stale expected page generation before voxel mutation");
@@ -1000,6 +2131,91 @@ void TestSparseGpuPhysicsProposalApply() {
     Check(residencyWorld.GetEdits().TryGetVoxel(residencyDestX, residencyDestY, residencyDestZ, &destinationAfter) &&
           destinationAfter == sand,
         "expected-page gpu proposal writes destination voxel after generation validation");
+
+    SparseVoxelWorld expectedPageDestinationResidencyWorld;
+    Check(expectedPageDestinationResidencyWorld.Initialize({8, 32, 12345u}),
+        "gpu proposal expected-page destination residency world initialize");
+    const BrickCoord expectedSourceCoord{2, 1, 0};
+    const BrickCoord expectedDestinationCoord{2, 0, 0};
+    const int32_t expectedSourceX = expectedSourceCoord.x * SPARSE_BRICK_SIZE + 4;
+    const int32_t expectedSourceY = expectedSourceCoord.y * SPARSE_BRICK_SIZE;
+    const int32_t expectedSourceZ = expectedSourceCoord.z * SPARSE_BRICK_SIZE + 4;
+    const int32_t expectedDestX = expectedDestinationCoord.x * SPARSE_BRICK_SIZE + 4;
+    const int32_t expectedDestY =
+        expectedDestinationCoord.y * SPARSE_BRICK_SIZE + (SPARSE_BRICK_SIZE - 1);
+    const int32_t expectedDestZ = expectedDestinationCoord.z * SPARSE_BRICK_SIZE + 4;
+    expectedPageDestinationResidencyWorld.SetEditedVoxel(
+        expectedSourceX,
+        expectedSourceY,
+        expectedSourceZ,
+        sand);
+    expectedPageDestinationResidencyWorld.SetEditedVoxel(
+        expectedDestX,
+        expectedDestY,
+        expectedDestZ,
+        air);
+    Check(expectedPageDestinationResidencyWorld.RequestBrick(expectedSourceCoord),
+        "gpu proposal expected-page destination residency source request");
+    Check(expectedPageDestinationResidencyWorld.PumpGeneration(1) == 1,
+        "gpu proposal expected-page destination residency source generation");
+    SparseBrickUploadPacket expectedSourcePacket;
+    Check(expectedPageDestinationResidencyWorld.PopNextUpload(&expectedSourcePacket),
+        "gpu proposal expected-page destination residency source upload packet");
+    Check(expectedPageDestinationResidencyWorld.CompleteUpload(expectedSourcePacket),
+        "gpu proposal expected-page destination residency source complete upload");
+
+    SparsePhysicsPacketResult expectedPageDestinationResidencyProposal = expectedPageProposal;
+    expectedPageDestinationResidencyProposal.coord = expectedSourceCoord;
+    expectedPageDestinationResidencyProposal.destinationCoord = expectedDestinationCoord;
+    expectedPageDestinationResidencyProposal.status =
+        SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+        SPARSE_PHYSICS_PACKET_STATUS_HAS_EXPECTED_PAGE |
+        SPARSE_PHYSICS_PACKET_STATUS_PAGE_MATCH |
+        SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL;
+    expectedPageDestinationResidencyProposal.expectedPageIndex = expectedSourcePacket.pageIndex;
+    expectedPageDestinationResidencyProposal.expectedPageGeneration = expectedSourcePacket.generation;
+    expectedPageDestinationResidencyProposal.packedSourceLocal = 4u | (0u << 8u) | (4u << 16u);
+    expectedPageDestinationResidencyProposal.packedDestinationLocal =
+        4u | ((SPARSE_BRICK_SIZE - 1u) << 8u) | (4u << 16u);
+    expectedPageDestinationResidencyProposal.sourceVoxel = sand;
+    expectedPageDestinationResidencyProposal.destinationVoxel = air;
+    Check(expectedPageDestinationResidencyWorld.ApplyGpuPhysicsProposals(
+              {expectedPageDestinationResidencyProposal},
+              4,
+              true) == 1,
+        "gpu proposal applies page-validated source into nonresident destination brick");
+    Check(expectedPageDestinationResidencyWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 0,
+        "page-validated destination residency proposal is not counted as rejected");
+    Check(expectedPageDestinationResidencyWorld.GetEdits().TryGetVoxel(
+              expectedSourceX,
+              expectedSourceY,
+              expectedSourceZ,
+              &sourceAfter) &&
+          VENPOD::Utils::UnpackMaterial(sourceAfter) == VENPOD::Utils::Material::Air,
+        "page-validated destination residency proposal clears source voxel");
+    Check(expectedPageDestinationResidencyWorld.GetEdits().TryGetVoxel(
+              expectedDestX,
+              expectedDestY,
+              expectedDestZ,
+              &destinationAfter) &&
+          destinationAfter == sand,
+        "page-validated destination residency proposal writes destination voxel");
+    Check(expectedPageDestinationResidencyWorld.GenerationQueueSize() >= 1,
+        "page-validated destination residency proposal requests missing destination render brick");
+    Check(expectedPageDestinationResidencyWorld.PumpGenerationAround(1, expectedDestinationCoord) >= 1,
+        "page-validated destination residency proposal generates requested destination render brick");
+    SparseBrickUploadPacket expectedDestinationUpload;
+    bool completedExpectedDestinationUpload = false;
+    while (expectedPageDestinationResidencyWorld.PopNextUpload(&expectedDestinationUpload)) {
+        Check(expectedPageDestinationResidencyWorld.CompleteUpload(expectedDestinationUpload),
+            "page-validated destination residency proposal completes queued upload");
+        completedExpectedDestinationUpload =
+            completedExpectedDestinationUpload ||
+            expectedDestinationUpload.coord == expectedDestinationCoord;
+    }
+    Check(completedExpectedDestinationUpload &&
+          expectedPageDestinationResidencyWorld.GetPool().IsResident(expectedDestinationCoord),
+        "page-validated destination residency proposal makes destination render brick resident");
 
     SparseVoxelWorld chainWorld;
     Check(chainWorld.Initialize({8, 32, 12345u}), "gpu chained proposal world initialize");
@@ -1042,6 +2258,33 @@ void TestSparseGpuPhysicsProposalApply() {
           destinationAfter == sand,
         "same-destination proposal batch writes exactly one destination voxel");
 
+    SparseVoxelWorld duplicateSourceWorld;
+    Check(duplicateSourceWorld.Initialize({8, 32, 12345u}),
+        "gpu proposal duplicate-source world initialize");
+    duplicateSourceWorld.SetEditedVoxel(7, 17, 0, sand);
+    duplicateSourceWorld.SetEditedVoxel(7, 16, 0, air);
+    duplicateSourceWorld.SetEditedVoxel(8, 16, 0, air);
+    SparsePhysicsPacketResult duplicateSourceA = proposal;
+    duplicateSourceA.packedSourceLocal = 7u | (1u << 8u) | 0u;
+    duplicateSourceA.packedDestinationLocal = 7u | (0u << 8u) | 0u;
+    SparsePhysicsPacketResult duplicateSourceB = proposal;
+    duplicateSourceB.packedSourceLocal = 7u | (1u << 8u) | 0u;
+    duplicateSourceB.packedDestinationLocal = 8u | (0u << 8u) | 0u;
+    Check(duplicateSourceWorld.ApplyGpuPhysicsProposals(
+              {duplicateSourceA, duplicateSourceB},
+              4,
+              false) == 1,
+        "gpu proposal apply rejects competing same-batch reads from one source voxel");
+    Check(duplicateSourceWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 1 &&
+          duplicateSourceWorld.GetStats().physicsCandidateBricks >= 1,
+        "same-source gpu proposal conflict requeues the rejected source voxel");
+    Check(duplicateSourceWorld.GetEdits().TryGetVoxel(7, 16, 0, &destinationAfter) &&
+          destinationAfter == sand,
+        "same-source proposal batch writes the first destination voxel");
+    Check(duplicateSourceWorld.GetEdits().TryGetVoxel(8, 16, 0, &destinationAfter) &&
+          VENPOD::Utils::UnpackMaterial(destinationAfter) == VENPOD::Utils::Material::Air,
+        "same-source proposal batch leaves the second destination voxel unchanged");
+
     SparseVoxelWorld materialWorld;
     Check(materialWorld.Initialize({8, 32, 12345u}), "gpu proposal material world initialize");
     materialWorld.SetEditedVoxel(4, 17, 0, water);
@@ -1079,11 +2322,61 @@ void TestSparseGpuPhysicsProposalApply() {
           sourceAfter == sand,
         "material-masked gpu proposal leaves rejected sand source in place");
 
+    SparseVoxelWorld mixedConflictWorld;
+    Check(mixedConflictWorld.Initialize({8, 32, 12345u}),
+        "gpu proposal mixed apply/reject world initialize");
+    mixedConflictWorld.SetEditedVoxel(4, 17, 0, water);
+    mixedConflictWorld.SetEditedVoxel(4, 16, 0, air);
+    mixedConflictWorld.SetEditedVoxel(32, 17, 0, sand);
+    mixedConflictWorld.SetEditedVoxel(32, 16, 0, air);
+    SparsePhysicsPacketResult validMixedWaterProposal = proposal;
+    validMixedWaterProposal.materialMask = 2u;
+    validMixedWaterProposal.packedSourceLocal = 4u | (1u << 8u) | 0u;
+    validMixedWaterProposal.packedDestinationLocal = 4u | (0u << 8u) | 0u;
+    validMixedWaterProposal.sourceVoxel = water;
+    SparsePhysicsPacketResult staleMixedSandProposal = proposal;
+    staleMixedSandProposal.coord = BrickCoord{2, 1, 0};
+    staleMixedSandProposal.destinationCoord = BrickCoord{2, 1, 0};
+    staleMixedSandProposal.status =
+        SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+        SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL |
+        SPARSE_PHYSICS_PACKET_STATUS_EDIT_DELTA_HIT;
+    staleMixedSandProposal.sourceRevision = 1u;
+    staleMixedSandProposal.destinationRevision = 1u;
+    staleMixedSandProposal.packedSourceLocal = 0u | (1u << 8u) | 0u;
+    staleMixedSandProposal.packedDestinationLocal = 0u | (0u << 8u) | 0u;
+    staleMixedSandProposal.sourceVoxel = sand;
+    staleMixedSandProposal.destinationVoxel = air;
+    mixedConflictWorld.SetEditedVoxel(33, 16, 0, air);
+    Check(mixedConflictWorld.ApplyGpuPhysicsProposals(
+              {validMixedWaterProposal, staleMixedSandProposal},
+              8,
+              false) == 1,
+        "mixed gpu proposal batch applies valid fluid and rejects stale edit-delta material");
+    Check(mixedConflictWorld.GetStats().physicsGpuAppliedMovesLastFrame == 1 &&
+          mixedConflictWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 1,
+        "mixed gpu proposal batch records one applied move and one rejected proposal");
+    Check(mixedConflictWorld.GetEdits().TryGetVoxel(4, 16, 0, &destinationAfter) &&
+          destinationAfter == water,
+        "mixed gpu proposal batch writes valid fluid destination");
+    Check(mixedConflictWorld.GetEdits().TryGetVoxel(4, 17, 0, &sourceAfter) &&
+          VENPOD::Utils::UnpackMaterial(sourceAfter) == VENPOD::Utils::Material::Air,
+        "mixed gpu proposal batch clears valid fluid source");
+    Check(mixedConflictWorld.GetEdits().TryGetVoxel(32, 17, 0, &sourceAfter) &&
+          sourceAfter == sand,
+        "mixed gpu proposal batch preserves stale material source");
+    Check(mixedConflictWorld.GetEdits().TryGetVoxel(32, 16, 0, &destinationAfter) &&
+          VENPOD::Utils::UnpackMaterial(destinationAfter) == VENPOD::Utils::Material::Air,
+        "mixed gpu proposal batch leaves stale material destination unchanged");
+
     SparsePhysicsPacketResult boundaryProposal;
     boundaryProposal.coord = BrickCoord{0, 1, 0};
     boundaryProposal.destinationCoord = BrickCoord{0, 0, 0};
+    boundaryProposal.generation = 1u;
     boundaryProposal.materialMask = 1u;
-    boundaryProposal.status = 16u;
+    boundaryProposal.status =
+        SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+        SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL;
     boundaryProposal.packedSourceLocal = 0u | (0u << 8u) | 0u;
     boundaryProposal.packedDestinationLocal = 0u | (15u << 8u) | 0u;
     boundaryProposal.sourceVoxel = sand;
@@ -1123,7 +2416,10 @@ void TestSparseGpuPhysicsProposalApply() {
         "gpu proposal destination brick becomes resident after queued generation/upload");
 
     SparsePhysicsPacketResult missingSupportProposal = boundaryProposal;
-    missingSupportProposal.status = 16u | 32u;
+    missingSupportProposal.status =
+        SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+        SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL |
+        SPARSE_PHYSICS_PACKET_STATUS_MISSING_BELOW;
     missingSupportProposal.packedSourceLocal = 2u | (0u << 8u) | (2u << 16u);
     missingSupportProposal.packedDestinationLocal = 2u | (15u << 8u) | (2u << 16u);
     world.SetEditedVoxel(2, 16, 2, sand);
@@ -1151,6 +2447,22 @@ void TestSparseGpuPhysicsProposalApply() {
     Check(budgetWorld.GetStats().physicsCandidateBricks >= 2,
         "unprocessed gpu proposal is requeued instead of dropped");
 
+    SparseVoxelWorld zeroBudgetWorld;
+    Check(zeroBudgetWorld.Initialize({8, 32, 12345u}), "gpu proposal zero-budget world initialize");
+    zeroBudgetWorld.SetEditedVoxel(0, 17, 0, sand);
+    zeroBudgetWorld.SetEditedVoxel(0, 16, 0, air);
+    Check(zeroBudgetWorld.ApplyGpuPhysicsProposals({proposal}, 0, false) == 0,
+        "zero-budget gpu proposal batch applies no moves");
+    Check(zeroBudgetWorld.GetStats().physicsCandidateBricks >= 1 &&
+          zeroBudgetWorld.GetStats().physicsGpuRejectedProposalsLastFrame == 0,
+        "zero-budget gpu proposal is requeued without being rejected");
+    Check(zeroBudgetWorld.GetEdits().TryGetVoxel(0, 17, 0, &sourceAfter) &&
+          sourceAfter == sand,
+        "zero-budget gpu proposal leaves source voxel unchanged");
+    Check(zeroBudgetWorld.GetEdits().TryGetVoxel(0, 16, 0, &destinationAfter) &&
+          VENPOD::Utils::UnpackMaterial(destinationAfter) == VENPOD::Utils::Material::Air,
+        "zero-budget gpu proposal leaves destination voxel unchanged");
+
     SparseVoxelWorld lateralWorld;
     Check(lateralWorld.Initialize({8, 32, 12345u}), "gpu lateral proposal world initialize");
     const uint32_t stone = VENPOD::Utils::PackVoxel(VENPOD::Utils::Material::Stone, 0, 0, 0);
@@ -1160,8 +2472,11 @@ void TestSparseGpuPhysicsProposalApply() {
     SparsePhysicsPacketResult lateralProposal;
     lateralProposal.coord = BrickCoord{0, 1, 0};
     lateralProposal.destinationCoord = BrickCoord{0, 1, 0};
+    lateralProposal.generation = 1u;
     lateralProposal.materialMask = 2u;
-    lateralProposal.status = 16u;
+    lateralProposal.status =
+        SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+        SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL;
     lateralProposal.packedSourceLocal = 1u | (1u << 8u) | (1u << 16u);
     lateralProposal.packedDestinationLocal = 2u | (1u << 8u) | (1u << 16u);
     lateralProposal.sourceVoxel = water;
@@ -1171,6 +2486,30 @@ void TestSparseGpuPhysicsProposalApply() {
     Check(lateralWorld.GetEdits().TryGetVoxel(2, 17, 1, &destinationAfter) &&
           destinationAfter == water,
         "gpu lateral fluid proposal writes destination voxel");
+
+    SparseVoxelWorld lateralSnapshotWorld;
+    Check(lateralSnapshotWorld.Initialize({8, 32, 12345u}),
+        "gpu physics lateral snapshot world initialize");
+    lateralSnapshotWorld.SetEditedVoxel(15, 17, 1, water);
+    lateralSnapshotWorld.SetEditedVoxel(16, 17, 1, air);
+    Check(lateralSnapshotWorld.StageLocalPhysicsWork(1) == 1,
+        "gpu physics lateral snapshot stages only the source edge packet");
+    const std::vector<SparseEditDelta> lateralSnapshot =
+        lateralSnapshotWorld.BuildGpuEditDeltaSnapshotForPhysicsWork(16);
+    bool sawSourceBrickDelta = false;
+    bool sawPositiveXNeighborDelta = false;
+    for (const SparseEditDelta& delta : lateralSnapshot) {
+        if (delta.coord == BrickCoord{0, 1, 0}) {
+            sawSourceBrickDelta = true;
+        }
+        if (delta.coord == BrickCoord{1, 1, 0}) {
+            sawPositiveXNeighborDelta = true;
+        }
+    }
+    Check(sawSourceBrickDelta,
+        "gpu physics edit-delta snapshot includes the staged source brick");
+    Check(sawPositiveXNeighborDelta,
+        "gpu physics edit-delta snapshot includes lateral neighbor edits for edge fluid proposals");
 }
 
 void TestSparseVoxelWorldLifecycle() {
@@ -1279,6 +2618,13 @@ void TestSparseVoxelWorldLifecycle() {
         "cached known empty high-air request is still skipped");
     Check(emptyUploadWorld.GetStats().knownEmptyGeneratedBricks == 1,
         "known empty cache deduplicates repeated skips");
+    const BrickCoord secondHighAirCoord{1, 1000, 0};
+    Check(emptyUploadWorld.TrySkipKnownEmptyRequest(secondHighAirCoord),
+        "known empty fast path skips high-air brick before allocation");
+    Check(emptyUploadWorld.GetStats().knownEmptyGeneratedBricks == 2,
+        "known empty fast path records skipped high-air brick");
+    Check(!emptyUploadWorld.GetPool().IsResident(secondHighAirCoord),
+        "known empty fast path does not allocate a resident page");
     Check(emptyUploadWorld.PumpGeneration(1) == 0,
         "known empty high-air request creates no generation work");
     SparseBrickUploadPacket emptyPacket;
@@ -1295,8 +2641,10 @@ void TestSparseVoxelWorldLifecycle() {
         highAirCoord.y * SPARSE_BRICK_SIZE,
         highAirCoord.z * SPARSE_BRICK_SIZE,
         stone);
-    Check(emptyUploadWorld.GetStats().knownEmptyGeneratedBricks == 0,
-        "editing a known empty brick invalidates the empty cache entry");
+    Check(emptyUploadWorld.GetStats().knownEmptyGeneratedBricks == 1,
+        "editing a known empty brick invalidates only that empty cache entry");
+    Check(!emptyUploadWorld.TrySkipKnownEmptyRequest(highAirCoord),
+        "known empty fast path refuses edited high-air brick");
     Check(emptyUploadWorld.RequestBrickDetailed(highAirCoord) == SparseBrickRequestResult::Allocated,
         "edited high-air brick allocates despite generated-empty cache history");
 
@@ -1307,6 +2655,99 @@ void TestSparseVoxelWorldLifecycle() {
         "collision samples persistent edit without render residency");
     Check(collisionOnly.GetPool().PageTable().Count() == 0,
         "collision edit did not require resident render page");
+}
+
+void TestSparseFixedGridReadiness() {
+    SparseVoxelWorld world;
+    Check(world.Initialize({96, 256, 12345u}), "fixed-grid sparse world initialize");
+
+    const uint32_t stone = VENPOD::Utils::PackVoxel(
+        VENPOD::Utils::Material::Stone,
+        5,
+        0,
+        VENPOD::Utils::StateFlags::IsStatic);
+    const BrickCoord center{0, 64, 0};
+    Check(world.GetRenderReadinessState(center) == SparseRenderReadinessState::Missing,
+        "fixed-grid readiness reports missing before request");
+    std::vector<BrickCoord> grid;
+    grid.reserve(27);
+    for (int32_t z = -1; z <= 1; ++z) {
+        for (int32_t y = -1; y <= 1; ++y) {
+            for (int32_t x = -1; x <= 1; ++x) {
+                const BrickCoord coord{center.x + x, center.y + y, center.z + z};
+                grid.push_back(coord);
+                world.SetEditedVoxel(
+                    coord.x * SPARSE_BRICK_SIZE + 8,
+                    coord.y * SPARSE_BRICK_SIZE + 8,
+                    coord.z * SPARSE_BRICK_SIZE + 8,
+                    stone);
+                Check(world.RequestBrickDetailed(coord, false) == SparseBrickRequestResult::Allocated,
+                    "fixed-grid request allocates exact sparse brick");
+                Check(world.TouchResidencyClass(coord, SparseResidencyClass::Visible, 1),
+                    "fixed-grid marks requested brick visible");
+            }
+        }
+    }
+    for (const BrickCoord& coord : grid) {
+        Check(world.GetRenderReadinessState(coord) != SparseRenderReadinessState::ReadyToRender,
+            "fixed-grid target brick is not ready before generation/upload");
+    }
+
+    Check(world.PumpGenerationAround(static_cast<uint32_t>(grid.size()), center, 1) == grid.size(),
+        "fixed-grid synchronous generation completes target set");
+    Check(world.GetStats().generationQueuedBricks == 0,
+        "fixed-grid generation queue drains before render");
+    for (const BrickCoord& coord : grid) {
+        Check(world.GetRenderReadinessState(coord) == SparseRenderReadinessState::UploadQueued,
+            "fixed-grid readiness reports upload-queued target after generation");
+    }
+
+    SparseBrickUploadPacket packet;
+    uint32_t uploaded = 0;
+    while (world.PopBestUploadForClass(&packet, SparseResidencyClass::Visible, center, 1)) {
+        Check(world.GetRenderReadinessState(packet.coord) == SparseRenderReadinessState::UploadingGPU,
+            "fixed-grid readiness reports uploading while packet is in flight");
+        Check(world.CompleteUpload(packet),
+            "fixed-grid upload completion publishes resident sparse brick");
+        Check(world.GetRenderReadinessState(packet.coord) == SparseRenderReadinessState::UploadingGPU,
+            "fixed-grid readiness waits for GPU page-table publish after upload completion");
+        Check(world.MarkGpuPageTablePublished(packet.coord, packet.pageIndex, packet.generation),
+            "fixed-grid marks GPU page table entry published");
+        ++uploaded;
+    }
+    Check(uploaded == grid.size(),
+        "fixed-grid synchronous upload publishes every target brick");
+    Check(world.GetStats().uploadQueuedBricks == 0,
+        "fixed-grid upload queue drains before render");
+    Check(world.GetStats().residentRenderableBricks == grid.size(),
+        "fixed-grid target set is resident and renderable before surface extraction");
+    Check(world.GetStats().surfaceExtractionQueuedBricks == grid.size(),
+        "fixed-grid target surfaces are queued before render");
+    for (const BrickCoord& coord : grid) {
+        Check(world.GetRenderReadinessState(coord) == SparseRenderReadinessState::ResidentMissingSurface,
+            "fixed-grid readiness reports resident-missing-surface before extraction");
+    }
+
+    Check(world.PumpSurfaceExtractionAround(static_cast<uint32_t>(grid.size()), center, 1) == grid.size(),
+        "fixed-grid synchronous surface extraction completes target set");
+    Check(world.GetStats().surfaceExtractionQueuedBricks == 0,
+        "fixed-grid surface queue drains before render");
+    Check(world.GetStats().surfaceCachedBricks == grid.size(),
+        "fixed-grid surface cache has every target brick");
+    Check(world.GetStats().residentRenderableMissingSurfaces == 0,
+        "fixed-grid ready-to-render contract has no resident bricks missing surfaces");
+    const SparseRenderReadinessStats readiness = world.BuildRenderReadinessStats();
+    Check(readiness.readyToRender >= grid.size(),
+        "fixed-grid readiness stats count target bricks as ready to render");
+
+    for (const BrickCoord& coord : grid) {
+        Check(world.GetPool().IsResident(coord),
+            "fixed-grid target brick remains resident");
+        Check(world.GetSurfaceCache().FindFaces(coord) != nullptr,
+            "fixed-grid target brick has cached surface faces");
+        Check(world.GetRenderReadinessState(coord) == SparseRenderReadinessState::ReadyToRender,
+            "fixed-grid target brick reaches renderer-facing ready state");
+    }
 }
 
 void TestSparseRenderDirtyRegions() {
@@ -1484,6 +2925,46 @@ void TestSparseLocalPhysics() {
         "sparse physics brick budget keeps dirty-region work narrow");
     Check(budget.GetStats().physicsCandidateBricks >= 1,
         "sparse physics leaves remaining candidate queued under brick budget");
+
+    SparseVoxelWorld zeroMoveBudget;
+    Check(zeroMoveBudget.Initialize({8, 64, 12345u}),
+        "zero-move sparse physics world initialize");
+    zeroMoveBudget.SetEditedVoxel(96, 900, 96, sand);
+    Check(zeroMoveBudget.StageLocalPhysicsWork(1) == 1,
+        "zero-move sparse physics stages one work packet");
+    Check(zeroMoveBudget.ExecuteStagedLocalPhysics(0, false) == 0,
+        "zero-move sparse physics applies no moves");
+    Check(zeroMoveBudget.GetStats().physicsCandidateBricks >= 1,
+        "zero-move sparse physics requeues staged work");
+    Check(zeroMoveBudget.SampleCollisionStatus(96, 900, 96) == CollisionSampleStatus::KnownSolid,
+        "zero-move sparse physics leaves source voxel unchanged");
+    Check(zeroMoveBudget.SampleCollisionStatus(96, 899, 96) == CollisionSampleStatus::KnownAir,
+        "zero-move sparse physics leaves destination voxel unchanged");
+
+    SparseVoxelWorld boundaryRequest;
+    Check(boundaryRequest.Initialize({8, 64, 12345u}),
+        "boundary-request sparse physics world initialize");
+    boundaryRequest.QueuePhysicsCandidate(BrickCoord{0, std::numeric_limits<int32_t>::min(), 0});
+    Check(boundaryRequest.StageLocalPhysicsWork(UINT32_MAX) == 1,
+        "boundary sparse physics caps oversized staging request");
+    Check(boundaryRequest.GetStats().physicsSupportBricksRequestedLastFrame == 0,
+        "boundary sparse physics skips overflowing support brick request");
+    Check(boundaryRequest.GetStats().requestedBricks == 0,
+        "boundary sparse physics does not wrap below-brick request");
+
+    SparseVoxelWorld bottomBoundary;
+    Check(bottomBoundary.Initialize({8, 64, 12345u}),
+        "bottom-boundary sparse physics world initialize");
+    const int32_t bottomY = std::numeric_limits<int32_t>::min();
+    bottomBoundary.SetEditedVoxel(0, bottomY, 0, sand);
+    Check(bottomBoundary.StageLocalPhysicsWork(UINT32_MAX) == 1,
+        "bottom-boundary sparse physics stages capped work");
+    Check(bottomBoundary.ExecuteStagedLocalPhysics(1, false) == 0,
+        "bottom-boundary sparse physics does not move through int32 minimum");
+    Check(bottomBoundary.SampleCollisionStatus(0, bottomY, 0) == CollisionSampleStatus::KnownSolid,
+        "bottom-boundary sparse physics leaves source voxel in place");
+    Check(bottomBoundary.GetStats().physicsSkippedVoxelsLastFrame > 0,
+        "bottom-boundary sparse physics reports skipped overflowing move");
 }
 
 struct TestFloat3 {
@@ -1587,6 +3068,7 @@ void TestSparseSurfaceWindingContract() {
 void TestSparseSurfaceExtraction() {
     const uint32_t air = VENPOD::Utils::PackVoxel(VENPOD::Utils::Material::Air, 0, 0, 0);
     const uint32_t stone = VENPOD::Utils::PackVoxel(VENPOD::Utils::Material::Stone, 7, 0, 0);
+    const uint32_t water = VENPOD::Utils::PackVoxel(VENPOD::Utils::Material::Water, 3, 0, 0);
 
     GeneratedSparseBrick single;
     single.coord = BrickCoord{-2, 3, -4};
@@ -1606,6 +3088,71 @@ void TestSparseSurfaceExtraction() {
     Check(SparseSurfacePayloadDirection(singleResult.faces.front().payload) <=
             static_cast<uint32_t>(SparseFaceDirection::PosZ),
         "surface face packs direction into compact surface record");
+
+    GeneratedSparseBrick liquidOnly;
+    liquidOnly.coord = BrickCoord{0, 0, 0};
+    liquidOnly.voxels.fill(air);
+    liquidOnly.voxels[LocalVoxelIndex(LocalVoxelCoord{1, 2, 3})] = water;
+    auto liquidOnlyResult = SparseSurfaceExtractor::Extract(liquidOnly);
+    Check(liquidOnlyResult.stats.solidVoxels == 0,
+        "surface extractor does not count liquid as solid terrain");
+    Check(liquidOnlyResult.stats.exposedFaces == 2 && liquidOnlyResult.faces.size() == 2,
+        "surface extractor emits exposed liquid top and underwater underside faces");
+    bool foundWaterTop = false;
+    bool foundWaterUnderside = false;
+    for (const SparseSurfaceFace& face : liquidOnlyResult.faces) {
+        const uint32_t direction = SparseSurfacePayloadDirection(face.payload);
+        foundWaterTop = foundWaterTop || direction == static_cast<uint32_t>(SparseFaceDirection::PosY);
+        foundWaterUnderside = foundWaterUnderside || direction == static_cast<uint32_t>(SparseFaceDirection::NegY);
+        Check(SparseSurfacePayloadVoxel(face.payload) == (water & kSparseSurfaceVoxelPayloadMask),
+            "surface extractor preserves liquid material payload");
+    }
+    Check(foundWaterTop && foundWaterUnderside,
+        "surface extractor keeps liquid surfaces visible from above and below for sparse raster");
+
+    GeneratedSparseBrick waterOverTerrain;
+    waterOverTerrain.coord = BrickCoord{0, 0, 0};
+    waterOverTerrain.voxels.fill(air);
+    waterOverTerrain.voxels[LocalVoxelIndex(LocalVoxelCoord{1, 1, 1})] = stone;
+    waterOverTerrain.voxels[LocalVoxelIndex(LocalVoxelCoord{1, 2, 1})] = water;
+    const auto waterOverTerrainResult = SparseSurfaceExtractor::Extract(waterOverTerrain);
+    bool foundStoneFaceAgainstWater = false;
+    bool foundOwnedWaterTop = false;
+    for (const SparseSurfaceFace& face : waterOverTerrainResult.faces) {
+        const uint32_t direction = SparseSurfacePayloadDirection(face.payload);
+        const uint32_t payloadVoxel = SparseSurfacePayloadVoxel(face.payload);
+        if (payloadVoxel == (stone & kSparseSurfaceVoxelPayloadMask) &&
+            direction == static_cast<uint32_t>(SparseFaceDirection::PosY)) {
+            foundStoneFaceAgainstWater = true;
+        }
+        if (payloadVoxel == (water & kSparseSurfaceVoxelPayloadMask) &&
+            direction == static_cast<uint32_t>(SparseFaceDirection::PosY)) {
+            foundOwnedWaterTop = true;
+        }
+    }
+    Check(!foundStoneFaceAgainstWater,
+        "surface extractor suppresses solid faces whose visible boundary is owned by water");
+    Check(foundOwnedWaterTop,
+        "surface extractor keeps water as the visible owner above submerged terrain");
+
+    GeneratedSparseBrick waterBesideTerrain;
+    waterBesideTerrain.coord = BrickCoord{0, 0, 0};
+    waterBesideTerrain.voxels.fill(air);
+    waterBesideTerrain.voxels[LocalVoxelIndex(LocalVoxelCoord{1, 1, 1})] = stone;
+    waterBesideTerrain.voxels[LocalVoxelIndex(LocalVoxelCoord{2, 1, 1})] = water;
+    const auto waterBesideTerrainResult = SparseSurfaceExtractor::Extract(waterBesideTerrain);
+    bool foundStoneBankAgainstWater = false;
+    for (const SparseSurfaceFace& face : waterBesideTerrainResult.faces) {
+        const uint32_t direction = SparseSurfacePayloadDirection(face.payload);
+        const uint32_t payloadVoxel = SparseSurfacePayloadVoxel(face.payload);
+        if (payloadVoxel == (stone & kSparseSurfaceVoxelPayloadMask) &&
+            direction == static_cast<uint32_t>(SparseFaceDirection::PosX)) {
+            foundStoneBankAgainstWater = true;
+        }
+    }
+    Check(foundStoneBankAgainstWater,
+        "surface extractor keeps solid side banks against water so shoreline terrain remains continuous");
+
     auto singleRegionResult = SparseSurfaceExtractor::ExtractRegion(
         single,
         SparseSurfaceLocalRegion{1, 2, 3, 1, 2, 3});
@@ -1676,6 +3223,56 @@ void TestSparseSurfaceExtraction() {
         "neighbor sampler suppresses cross-brick exposed faces");
     Check(posXBlocked.stats.facesByDirection[static_cast<size_t>(SparseFaceDirection::PosX)] == 0,
         "positive X sheet is fully occluded by neighbor brick");
+
+    GeneratedSparseBrick negativeFull;
+    negativeFull.coord = BrickCoord{-1, -1, -1};
+    negativeFull.voxels.fill(stone);
+    auto allBoundaryNeighborsSolid = SparseSurfaceExtractor::Extract(
+        negativeFull,
+        [stone](int32_t, int32_t, int32_t) {
+            return stone;
+        });
+    Check(allBoundaryNeighborsSolid.stats.exposedFaces == 0,
+        "neighbor sampler suppresses all exterior sheets at negative brick coordinates");
+    Check(allBoundaryNeighborsSolid.faces.empty(),
+        "negative-coordinate halo samples prevent fabricated air gaps at every brick boundary");
+
+    auto negXBlocked = SparseSurfaceExtractor::Extract(
+        negativeFull,
+        [stone](int32_t worldX, int32_t, int32_t) {
+            return worldX == -17 ? stone : 0u;
+        });
+    Check(negXBlocked.stats.exposedFaces == fullResult.stats.exposedFaces -
+            SPARSE_BRICK_SIZE * SPARSE_BRICK_SIZE,
+        "negative X deterministic neighbor sample suppresses one exterior sheet");
+    Check(negXBlocked.stats.facesByDirection[static_cast<size_t>(SparseFaceDirection::NegX)] == 0,
+        "negative X sheet is fully occluded by halo/world sampling");
+
+    GeneratedSparseBrick overflowCoordBrick;
+    overflowCoordBrick.coord = BrickCoord{std::numeric_limits<int32_t>::max(), 0, 0};
+    overflowCoordBrick.voxels.fill(stone);
+    auto overflowCoordResult = SparseSurfaceExtractor::Extract(overflowCoordBrick);
+    Check(overflowCoordResult.faces.empty() &&
+          overflowCoordResult.stats.solidVoxels == 0 &&
+          overflowCoordResult.stats.exposedFaces == 0,
+        "surface extractor rejects brick coords that would overflow world voxels");
+
+    GeneratedSparseBrick maxBoundaryBrick;
+    maxBoundaryBrick.coord = BrickCoord{134217727, 0, 0};
+    maxBoundaryBrick.voxels.fill(stone);
+    uint32_t wrappedNeighborCalls = 0;
+    auto maxBoundaryResult = SparseSurfaceExtractor::Extract(
+        maxBoundaryBrick,
+        [&wrappedNeighborCalls](int32_t worldX, int32_t, int32_t) {
+            if (worldX == std::numeric_limits<int32_t>::min()) {
+                ++wrappedNeighborCalls;
+            }
+            return 0u;
+        });
+    Check(wrappedNeighborCalls == 0,
+        "surface extractor skips overflowing neighbor samples at signed world boundary");
+    Check(maxBoundaryResult.stats.exposedFaces == fullResult.stats.exposedFaces,
+        "surface extractor still exposes boundary faces when neighbor sample overflows");
 }
 
 void TestSparseSurfaceCache() {
@@ -1960,6 +3557,32 @@ void TestSparseSurfaceCache() {
         "culled snapshot contains visible brick range");
     Check(!SparseSurfaceCache::TryLookupRangeInSnapshot(culledSnapshot, farBrick.coord),
         "culled snapshot omits distant brick range");
+
+    SparseSurfaceVisibilityConfig coveredVisibility = visibility;
+    coveredVisibility.requireHorizontalNeighborCoverage = true;
+    SparseSurfaceGpuSnapshot isolatedCoverageSnapshot;
+    Check(cache.BuildGpuSnapshot(isolatedCoverageSnapshot, &coveredVisibility),
+        "surface cache builds neighbor-coverage visibility snapshot");
+    Check(isolatedCoverageSnapshot.visibleBricks == 0,
+        "surface neighbor-coverage visibility rejects isolated surface islands");
+    auto addKnownEmptySurfaceBrick = [&](BrickCoord coord) {
+        GeneratedSparseBrick knownEmpty;
+        knownEmpty.coord = coord;
+        knownEmpty.voxels.fill(air);
+        SparseTerrainGenerator::ComputeOccupancyAndFlags(knownEmpty);
+        Check(cache.UpdateBrick(knownEmpty), "surface cache accepts known empty neighbor coverage brick");
+    };
+    addKnownEmptySurfaceBrick(BrickCoord{brick.coord.x - 1, brick.coord.y, brick.coord.z});
+    addKnownEmptySurfaceBrick(BrickCoord{brick.coord.x + 1, brick.coord.y, brick.coord.z});
+    addKnownEmptySurfaceBrick(BrickCoord{brick.coord.x, brick.coord.y, brick.coord.z - 1});
+    addKnownEmptySurfaceBrick(BrickCoord{brick.coord.x, brick.coord.y, brick.coord.z + 1});
+    SparseSurfaceGpuSnapshot neighborCoverageSnapshot;
+    Check(cache.BuildGpuSnapshot(neighborCoverageSnapshot, &coveredVisibility),
+        "surface cache builds neighbor-covered visibility snapshot");
+    Check(neighborCoverageSnapshot.visibleBricks == 1,
+        "surface neighbor-coverage visibility keeps brick once horizontal neighbors are known");
+    Check(SparseSurfaceCache::TryLookupRangeInSnapshot(neighborCoverageSnapshot, brick.coord),
+        "surface neighbor-coverage snapshot publishes covered brick range");
     cache.MarkGpuUploadComplete(culledSnapshot.serial, std::vector<BrickCoord>{brick.coord}, {});
     Check(cache.GetStats().pendingGpuDirtyBricks == 1,
         "surface cache does not clear culled dirty brick without payload upload");
@@ -1992,6 +3615,20 @@ void TestSparseSurfaceCache() {
     Check(cache.GetStats().cachedBricks == 0, "surface cache removes all brick ranges");
     Check(cache.GetStats().totalFaces == 0, "surface cache removes all face data");
     Check(!cache.RemoveBrick(brick.coord), "surface cache remove missing brick returns false");
+
+    SparseSurfaceCache boundaryCache;
+    GeneratedSparseBrick boundaryBrick;
+    boundaryBrick.coord = BrickCoord{134217727, 0, 0};
+    boundaryBrick.voxels.fill(stone);
+    Check(boundaryCache.UpdateBrick(boundaryBrick),
+        "surface cache accepts max-world boundary brick");
+    SparseSurfaceGpuSnapshot boundarySnapshot;
+    Check(boundaryCache.BuildGpuSnapshot(boundarySnapshot),
+        "surface cache builds max-world boundary snapshot");
+    Check(boundarySnapshot.surfaceRecords.size() == 1,
+        "surface cache emits max-world boundary record");
+    Check(boundarySnapshot.surfaceRecords[0].maxX == std::numeric_limits<int32_t>::max(),
+        "surface cache clamps max-world boundary face bounds");
 
     SparseSurfaceCache stableVisibilityCache;
     auto makeSingleVoxelBrick = [stone](BrickCoord coord) {
@@ -2063,6 +3700,18 @@ void TestSparseSurfaceCache() {
         "surface motion-lookahead keeps predicted brick even when outside current frustum");
     Check(motionFrustumSnapshot.lookaheadVisibleBricks == 1,
         "surface motion-lookahead frustum snapshot reports predicted-only visible brick count");
+
+    SparseSurfaceVisibilityConfig malformedVisibility = stableVisibility;
+    malformedVisibility.cameraX = std::numeric_limits<float>::quiet_NaN();
+    malformedVisibility.useFrustum = true;
+    malformedVisibility.useMotionLookahead = true;
+    malformedVisibility.lookaheadCameraX = std::numeric_limits<float>::infinity();
+    SparseSurfaceGpuSnapshot malformedVisibilitySnapshot;
+    Check(stableVisibilityCache.BuildGpuSnapshot(malformedVisibilitySnapshot, &malformedVisibility),
+        "surface cache builds malformed visibility snapshot");
+    Check(malformedVisibilitySnapshot.visibleBricks == 3 &&
+          SparseSurfaceCache::TryLookupRangeInSnapshot(malformedVisibilitySnapshot, farVisibilityBrick.coord),
+        "surface visibility culling fails open for malformed camera inputs");
 }
 
 void TestSparseSurfaceClusterRecords() {
@@ -2091,6 +3740,69 @@ void TestSparseSurfaceClusterRecords() {
             SparseSurfaceMortonKey(records[i - 1].coord) <= SparseSurfaceMortonKey(records[i].coord),
             "surface records sort by signed morton key for spatial clusters");
     }
+
+    Check(SparseSurfaceMortonKey({std::numeric_limits<int32_t>::max(), 0, 0}) ==
+          SparseSurfaceMortonKey({-1, 0, 0}),
+        "surface morton key handles positive int32 boundary without signed overflow");
+    Check(SparseSurfaceMortonKey({std::numeric_limits<int32_t>::min(), 0, 0}) ==
+          SparseSurfaceMortonKey({0, 0, 0}),
+        "surface morton key handles negative int32 boundary without signed overflow");
+
+    std::vector<SparseSurfaceRecord> extremeSortRecords = {
+        {
+            BrickCoord{std::numeric_limits<int32_t>::max(), 0, 0},
+            0u,
+            1u,
+            recordFlags,
+            17u,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+        },
+        {
+            BrickCoord{std::numeric_limits<int32_t>::min(), 0, 0},
+            1u,
+            1u,
+            recordFlags,
+            17u,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+        },
+        {
+            BrickCoord{0, 0, 0},
+            2u,
+            1u,
+            recordFlags,
+            17u,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+        },
+    };
+    SortSparseSurfaceRecordsForClusters(extremeSortRecords);
+    bool extremeSortOrdered = true;
+    for (size_t i = 1; i < extremeSortRecords.size(); ++i) {
+        const BrickCoord& prev = extremeSortRecords[i - 1].coord;
+        const BrickCoord& next = extremeSortRecords[i].coord;
+        const uint64_t prevKey = SparseSurfaceMortonKey(prev);
+        const uint64_t nextKey = SparseSurfaceMortonKey(next);
+        const bool prevCoordLess =
+            prev.x < next.x ||
+            (prev.x == next.x && (prev.y < next.y || (prev.y == next.y && prev.z < next.z)));
+        extremeSortOrdered = extremeSortOrdered && (prevKey < nextKey || (prevKey == nextKey && prevCoordLess));
+    }
+    Check(extremeSortOrdered,
+        "surface record sort remains deterministic for extreme int32 brick coords");
 
     const auto clusters = BuildSparseSurfaceClusters(records, 2u);
     Check(clusters.size() == 3, "surface cluster builder groups records by requested size");
@@ -2145,6 +3857,75 @@ void TestSparseSurfaceClusterRecords() {
     const auto countOnlyClusters = BuildSparseSurfaceClusters(extentRecords, 64u, 0u);
     Check(countOnlyClusters.size() == 1,
         "surface cluster extent limit is opt-in and preserves count-only behavior when disabled");
+
+    std::vector<SparseSurfaceRecord> extremeBoundsRecords = {
+        {
+            BrickCoord{-134217728, 0, 0},
+            0u,
+            1u,
+            recordFlags,
+            11u,
+            std::numeric_limits<int32_t>::min(),
+            0,
+            0,
+            std::numeric_limits<int32_t>::min() + 16,
+            16,
+            16,
+        },
+        {
+            BrickCoord{134217727, 0, 0},
+            1u,
+            1u,
+            recordFlags,
+            11u,
+            std::numeric_limits<int32_t>::max() - 16,
+            0,
+            0,
+            std::numeric_limits<int32_t>::max(),
+            16,
+            16,
+        },
+    };
+    const auto extremeBoundsClusters = BuildSparseSurfaceClusters(extremeBoundsRecords, 64u, 64u);
+    Check(extremeBoundsClusters.size() == 2,
+        "surface cluster extent test uses 64-bit math for extreme int32 bounds");
+    for (const SparseSurfaceClusterRecord& cluster : extremeBoundsClusters) {
+        Check(cluster.recordCount == 1u,
+            "surface cluster extreme bounds do not merge through wrapped extent");
+    }
+
+    std::vector<SparseSurfaceRecord> faceSaturationRecords = {
+        {
+            BrickCoord{0, 0, 0},
+            0u,
+            std::numeric_limits<uint32_t>::max() - 3u,
+            recordFlags,
+            13u,
+            0,
+            0,
+            0,
+            16,
+            16,
+            16,
+        },
+        {
+            BrickCoord{1, 0, 0},
+            1u,
+            10u,
+            recordFlags,
+            13u,
+            16,
+            0,
+            0,
+            32,
+            16,
+            16,
+        },
+    };
+    const auto faceSaturationClusters = BuildSparseSurfaceClusters(faceSaturationRecords, 2u, 0u);
+    Check(faceSaturationClusters.size() == 1 &&
+          faceSaturationClusters[0].faceCount == std::numeric_limits<uint32_t>::max(),
+        "surface cluster face count saturates instead of wrapping");
 }
 
 void TestSparseSurfaceRangeAllocator() {
@@ -2169,12 +3950,16 @@ void TestSparseSurfaceRangeAllocator() {
         "surface range allocator shrinks in place");
     Check(shrunk.firstFace == a.firstFace && shrunk.capacity == a.capacity && shrunk.faceCount == 8,
         "surface range allocator preserves capacity on shrink");
+    Check(shrunk.generation == a.generation + 1u,
+        "surface range allocator advances generation on in-place resize");
 
     SparseSurfaceFaceAllocation grown;
     Check(allocator.AllocateOrResize(BrickCoord{0, 0, 0}, 40, &grown),
         "surface range allocator grows into new range");
     Check(grown.firstFace >= b.firstFace + b.capacity && grown.capacity == 40,
         "surface range allocator moved grown allocation");
+    Check(grown.generation == shrunk.generation + 1u,
+        "surface range allocator advances generation on moved resize");
     Check(allocator.GetStats().pendingRetiredRangeCount == 1 &&
         allocator.GetStats().pendingRetiredCapacity == a.capacity,
         "surface range allocator defers old grown allocation retirement");
@@ -2241,6 +4026,60 @@ void TestSparseSurfaceRangeAllocator() {
     fenceAllocator.BeginFrame(10, 12);
     Check(fenceAllocator.AllocateOrResize(BrickCoord{1, 1, 0}, 32, nullptr),
         "surface range allocator reuses after completed fence reaches retire token");
+
+    SparseSurfaceRangeAllocator monotonicAllocator;
+    monotonicAllocator.Initialize(32, 3);
+    monotonicAllocator.BeginFrame(10);
+    Check(monotonicAllocator.AllocateOrResize(BrickCoord{2, 1, 0}, 32, nullptr),
+        "surface range allocator fills monotonic-token heap");
+    monotonicAllocator.BeginFrame(9, 9);
+    monotonicAllocator.Free(BrickCoord{2, 1, 0});
+    monotonicAllocator.BeginFrame(12, 12);
+    Check(!monotonicAllocator.AllocateOrResize(BrickCoord{3, 1, 0}, 32, nullptr),
+        "surface range allocator ignores regressed retirement tokens before reusing freed range");
+    monotonicAllocator.BeginFrame(13, 13);
+    Check(monotonicAllocator.AllocateOrResize(BrickCoord{3, 1, 0}, 32, nullptr),
+        "surface range allocator releases monotonic-token range at original safe horizon");
+
+    SparseSurfaceRangeAllocator saturatedTokenAllocator;
+    saturatedTokenAllocator.Initialize(32, std::numeric_limits<uint32_t>::max());
+    saturatedTokenAllocator.BeginFrame(std::numeric_limits<uint64_t>::max() - 2ull);
+    Check(saturatedTokenAllocator.AllocateOrResize(BrickCoord{0, 2, 0}, 32, nullptr),
+        "surface range allocator fills saturated-token heap");
+    saturatedTokenAllocator.Free(BrickCoord{0, 2, 0});
+    saturatedTokenAllocator.BeginFrame(
+        std::numeric_limits<uint64_t>::max() - 1ull,
+        std::numeric_limits<uint64_t>::max() - 1ull);
+    Check(!saturatedTokenAllocator.AllocateOrResize(BrickCoord{1, 2, 0}, 32, nullptr),
+        "surface range allocator does not release saturated retire token early");
+    saturatedTokenAllocator.BeginFrame(
+        std::numeric_limits<uint64_t>::max(),
+        std::numeric_limits<uint64_t>::max());
+    Check(saturatedTokenAllocator.AllocateOrResize(BrickCoord{1, 2, 0}, 32, nullptr),
+        "surface range allocator releases range when saturated retire token completes");
+
+    SparseSurfaceRangeAllocator signedBoundaryAllocator;
+    signedBoundaryAllocator.Initialize(std::numeric_limits<uint32_t>::max(), 0);
+    signedBoundaryAllocator.BeginFrame(0);
+    Check(signedBoundaryAllocator.AllocateOrResize(
+              BrickCoord{0, 3, 0},
+              std::numeric_limits<uint32_t>::max() - 8u,
+              nullptr),
+        "surface range allocator accepts large boundary allocation");
+    SparseSurfaceFaceAllocation boundaryAllocation;
+    Check(signedBoundaryAllocator.AllocateOrResize(
+              BrickCoord{1, 3, 0},
+              8u,
+              &boundaryAllocation),
+        "surface range allocator accepts final boundary allocation");
+    Check(boundaryAllocation.firstFace == std::numeric_limits<uint32_t>::max() - 8u,
+        "surface range allocator final boundary allocation does not wrap first face");
+    signedBoundaryAllocator.Free(BrickCoord{0, 3, 0});
+    signedBoundaryAllocator.Free(BrickCoord{1, 3, 0});
+    signedBoundaryAllocator.BeginFrame(0);
+    Check(signedBoundaryAllocator.GetStats().freeRangeCount == 1u &&
+          signedBoundaryAllocator.GetStats().largestFreeRange == std::numeric_limits<uint32_t>::max(),
+        "surface range allocator coalesces uint32 boundary ranges without wrapping");
 }
 
 void TestSparsePagePublishQueue() {
@@ -2256,6 +4095,43 @@ void TestSparsePagePublishQueue() {
             0u,
             SparseResidencyClass::Visible) == SparsePagePublishQueueEvent::IgnoredInvalid,
         "page publish queue rejects invalid table slot");
+    Check(
+        queue.Enqueue(
+            4u,
+            BrickCoord{0, 0, 0},
+            INVALID_BRICK_PAGE,
+            1u,
+            0u,
+            0u,
+            SparseResidencyClass::Visible) == SparsePagePublishQueueEvent::IgnoredInvalid,
+        "page publish queue rejects invalid page index");
+    Check(
+        queue.Enqueue(
+            4u,
+            BrickCoord{0, 0, 0},
+            INVALID_BRICK_PAGE - 1u,
+            1u,
+            0u,
+            0u,
+            SparseResidencyClass::Visible) == SparsePagePublishQueueEvent::IgnoredInvalid,
+        "page publish queue rejects tombstone page index");
+    Check(
+        queue.Enqueue(
+            4u,
+            BrickCoord{0, 0, 0},
+            1u,
+            0u,
+            0u,
+            0u,
+            SparseResidencyClass::Visible) == SparsePagePublishQueueEvent::IgnoredInvalid,
+        "page publish queue rejects zero generation");
+    SparsePendingPageTablePublish invalidRetry;
+    invalidRetry.entryIndex = 4u;
+    invalidRetry.coord = BrickCoord{0, 0, 0};
+    invalidRetry.pageIndex = INVALID_BRICK_PAGE - 1u;
+    invalidRetry.generation = 1u;
+    queue.RequeueFront(invalidRetry);
+    Check(queue.Empty(), "page publish queue ignores invalid retry publishes");
     Check(
         queue.Enqueue(
             5u,
@@ -2298,8 +4174,8 @@ void TestSparsePagePublishQueue() {
     invalidationInput.replacementPublishPending = true;
     Check(
         DecideSparseDelayedInvalidation(invalidationInput) ==
-            SparseDelayedInvalidationDecision::Stage,
-        "delayed invalidation stages reused slots while a replacement publish is pending");
+            SparseDelayedInvalidationDecision::SkipAlreadyReplaced,
+        "delayed invalidation skips reused slots while a replacement publish is pending");
     invalidationInput.replacementPublishPending = false;
     Check(
         DecideSparseDelayedInvalidation(invalidationInput) ==
@@ -2320,6 +4196,36 @@ void TestSparsePagePublishQueue() {
             99u,
             SparseResidencyClass::Visible) == SparsePagePublishQueueEvent::Replaced,
         "page publish queue replaces stale same-slot publish with newer generation");
+    Check(
+        queue.Enqueue(
+            5u,
+            BrickCoord{9, 8, 7},
+            12u,
+            12u,
+            0u,
+            0u,
+            SparseResidencyClass::Visible) == SparsePagePublishQueueEvent::IgnoredStale,
+        "page publish queue rejects older same-page generation replacement");
+    Check(
+        queue.Enqueue(
+            5u,
+            BrickCoord{8, 8, 7},
+            14u,
+            12u,
+            0u,
+            0u,
+            SparseResidencyClass::Visible) == SparsePagePublishQueueEvent::IgnoredStale,
+        "page publish queue rejects older different-page generation replacement");
+    Check(
+        queue.Enqueue(
+            5u,
+            BrickCoord{8, 8, 7},
+            14u,
+            13u,
+            0u,
+            0u,
+            SparseResidencyClass::Visible) == SparsePagePublishQueueEvent::IgnoredStale,
+        "page publish queue rejects ambiguous same-generation different-page replacement");
     Check(queue.Size() == 1, "page publish replacement does not duplicate table slots");
     Check(queue.ReadyCount(5u, 98u) == 0,
         "page publish queue withholds publishes before ready fence");
@@ -2342,6 +4248,78 @@ void TestSparsePagePublishQueue() {
         publish.readyFenceValue == 99u,
         "page publish queue returns latest coord/page/generation/readiness for reused slot");
     Check(queue.Empty(), "page publish queue is empty after pop");
+
+    Check(
+        queue.Enqueue(
+            5u,
+            BrickCoord{9, 8, 7},
+            12u,
+            13u,
+            0u,
+            0u,
+            SparseResidencyClass::Visible) == SparsePagePublishQueueEvent::Queued,
+        "page publish queue accepts older slot reuse baseline");
+    Check(
+        queue.Enqueue(
+            5u,
+            BrickCoord{10, 8, 7},
+            15u,
+            14u,
+            0u,
+            0u,
+            SparseResidencyClass::Visible) == SparsePagePublishQueueEvent::Replaced,
+        "page publish queue replaces reused slot only with a newer generation");
+    Check(queue.PopReady(0u, 0u, &publish) &&
+          publish.coord == BrickCoord{10, 8, 7} &&
+          publish.pageIndex == 15u &&
+          publish.generation == 14u,
+        "page publish queue returns newer different-page slot publish");
+    Check(queue.Empty(), "page publish queue empties after newer different-page replacement pop");
+
+    Check(
+        queue.Enqueue(
+            6u,
+            BrickCoord{4, 4, 4},
+            22u,
+            7u,
+            0u,
+            0u,
+            SparseResidencyClass::Visible) == SparsePagePublishQueueEvent::Queued,
+        "page publish queue accepts retry guard baseline publish");
+    SparsePendingPageTablePublish staleRetry;
+    staleRetry.entryIndex = 6u;
+    staleRetry.coord = BrickCoord{4, 4, 4};
+    staleRetry.pageIndex = 22u;
+    staleRetry.generation = 6u;
+    queue.RequeueFront(staleRetry);
+    Check(queue.PopReady(0u, 0u, &publish) && publish.entryIndex == 6u &&
+          publish.pageIndex == 22u && publish.generation == 7u,
+        "page publish queue ignores stale same-page retry publish");
+    Check(queue.Empty(), "page publish queue empties after stale retry guard pop");
+
+    Check(
+        queue.Enqueue(
+            7u,
+            BrickCoord{7, 7, 7},
+            33u,
+            9u,
+            0u,
+            0u,
+            SparseResidencyClass::Visible) == SparsePagePublishQueueEvent::Queued,
+        "page publish queue accepts replacement-publish retry guard baseline");
+    SparsePendingPageTablePublish staleDifferentPageRetry;
+    staleDifferentPageRetry.entryIndex = 7u;
+    staleDifferentPageRetry.coord = BrickCoord{6, 6, 6};
+    staleDifferentPageRetry.pageIndex = 32u;
+    staleDifferentPageRetry.generation = 20u;
+    queue.RequeueFront(staleDifferentPageRetry);
+    Check(queue.PopReady(0u, 0u, &publish) &&
+          publish.entryIndex == 7u &&
+          publish.coord == BrickCoord{7, 7, 7} &&
+          publish.pageIndex == 33u &&
+          publish.generation == 9u,
+        "page publish queue does not let stale different-page retry replace pending slot publish");
+    Check(queue.Empty(), "page publish queue empties after different-page retry guard pop");
 
     Check(
         queue.Enqueue(
@@ -2424,6 +4402,121 @@ void TestSparseBrushEditSemantics() {
         Check(!world.GetEdits().TryGetVoxel(worldX, worldY, worldZ, &overlayVoxel),
             "sparse brush preview does not write persistent overlay voxels");
     }
+    std::vector<SparseEditDelta> malformedPreviewDeltas;
+    Check(world.PreviewBrushEdit(
+            airX,
+            airY,
+            airZ,
+            std::numeric_limits<float>::infinity(),
+            VENPOD::Utils::Material::Stone,
+            0,
+            0,
+            1.0f,
+            77u,
+            0,
+            0,
+            0,
+            false,
+            &malformedPreviewDeltas) == 0 &&
+          malformedPreviewDeltas.empty(),
+        "sparse brush preview rejects non-finite radius without deltas");
+    Check(world.ApplyBrushEdit(
+            std::numeric_limits<float>::quiet_NaN(),
+            airY,
+            airZ,
+            1.1f,
+            VENPOD::Utils::Material::Stone,
+            0,
+            0,
+            1.0f,
+            77u,
+            0,
+            0,
+            0,
+            false,
+            true) == 0 &&
+          world.GetStats().brushVoxelsEditedLastStroke == 0,
+        "sparse brush commit rejects non-finite world position without edits");
+    Check(world.ApplyBrushEdit(
+            static_cast<float>(std::numeric_limits<int32_t>::max()),
+            airY,
+            airZ,
+            4.0f,
+            VENPOD::Utils::Material::Stone,
+            0,
+            0,
+            1.0f,
+            77u,
+            0,
+            0,
+            0,
+            false,
+            true) == 0 &&
+          world.GetStats().brushVoxelsEditedLastStroke == 0,
+        "sparse brush commit fails closed near positive world-coordinate overflow boundary");
+
+    const std::filesystem::path saturatedPreviewPath =
+        std::filesystem::temp_directory_path() / "venpod_sparse_brush_saturated_preview.vsed";
+    {
+        std::ofstream saturatedPreview(saturatedPreviewPath, std::ios::binary | std::ios::trunc);
+        const uint32_t magic = 0x44455356u;
+        const uint32_t version = 1u;
+        const uint32_t brickSize = SPARSE_BRICK_SIZE;
+        const uint32_t reserved = 0u;
+        const uint64_t overlayCount = 1u;
+        const uint64_t totalVoxelCount = 1u;
+        const BrickCoord coord{1, 250, 1};
+        const uint32_t revision = std::numeric_limits<uint32_t>::max();
+        const uint32_t voxelCount = 1u;
+        const uint16_t local = 0u;
+        const uint32_t previewStone = VENPOD::Utils::PackVoxel(
+            VENPOD::Utils::Material::Stone,
+            1,
+            0,
+            VENPOD::Utils::StateFlags::IsStatic);
+        WriteTestBinary(saturatedPreview, magic);
+        WriteTestBinary(saturatedPreview, version);
+        WriteTestBinary(saturatedPreview, brickSize);
+        WriteTestBinary(saturatedPreview, reserved);
+        WriteTestBinary(saturatedPreview, overlayCount);
+        WriteTestBinary(saturatedPreview, totalVoxelCount);
+        WriteTestBinary(saturatedPreview, coord.x);
+        WriteTestBinary(saturatedPreview, coord.y);
+        WriteTestBinary(saturatedPreview, coord.z);
+        WriteTestBinary(saturatedPreview, revision);
+        WriteTestBinary(saturatedPreview, voxelCount);
+        WriteTestBinary(saturatedPreview, local);
+        WriteTestBinary(saturatedPreview, previewStone);
+    }
+    SparseVoxelWorld saturatedPreviewWorld;
+    Check(saturatedPreviewWorld.Initialize({8, 32, 12345u}),
+        "sparse brush saturated-preview world initializes");
+    Check(saturatedPreviewWorld.LoadEditsFromFile(saturatedPreviewPath, false),
+        "sparse brush saturated-preview world loads max-revision overlay");
+    std::vector<SparseEditDelta> saturatedPreviewDeltas;
+    const uint32_t saturatedPreviewErased = saturatedPreviewWorld.PreviewBrushEdit(
+        16.5f,
+        4000.5f,
+        16.5f,
+        0.6f,
+        VENPOD::Utils::Material::Air,
+        1,
+        0,
+        1.0f,
+        82u,
+        0,
+        0,
+        0,
+        false,
+        &saturatedPreviewDeltas);
+    Check(saturatedPreviewErased == 1u && saturatedPreviewDeltas.size() == 1u,
+        "sparse brush preview can edit a saturated overlay voxel");
+    Check(saturatedPreviewDeltas[0].revision == 1u,
+        "sparse brush preview wraps saturated overlay revision to nonzero epoch");
+    Check(saturatedPreviewWorld.GetEdits().GetOverlayRevision({1, 250, 1}) ==
+              std::numeric_limits<uint32_t>::max(),
+        "sparse brush preview does not mutate saturated overlay revision");
+    std::filesystem::remove(saturatedPreviewPath);
 
     std::vector<SparseEditDelta> paintDeltas;
     const uint32_t painted = world.ApplyBrushEdit(
@@ -2733,6 +4826,43 @@ void TestSparseRaycast() {
     Check(negativeEditHit.voxelX == -32 && negativeEditHit.voxelY == 480 && negativeEditHit.voxelZ == -33,
         "negative-coordinate raycast returns exact world voxel");
     Check(negativeEditHit.normalZ == 1, "negative-coordinate raycast normal enters from positive Z");
+
+    Check(!world.Raycast(
+            std::numeric_limits<float>::quiet_NaN(),
+            500.0f,
+            100.0f,
+            0.0f,
+            0.0f,
+            1.0f,
+            80.0f).hit,
+        "sparse CPU raycast rejects non-finite origins");
+    Check(!world.Raycast(
+            128.5f,
+            500.5f,
+            100.0f,
+            0.0f,
+            std::numeric_limits<float>::infinity(),
+            1.0f,
+            80.0f).hit,
+        "sparse CPU raycast rejects non-finite directions");
+    Check(!world.Raycast(
+            128.5f,
+            500.5f,
+            100.0f,
+            0.0f,
+            0.0f,
+            1.0f,
+            std::numeric_limits<float>::infinity()).hit,
+        "sparse CPU raycast rejects non-finite max distance");
+    Check(!world.Raycast(
+            static_cast<float>(std::numeric_limits<int32_t>::max()),
+            500.0f,
+            100.0f,
+            1.0f,
+            0.0f,
+            0.0f,
+            std::numeric_limits<float>::max()).hit,
+        "sparse CPU raycast fails closed at positive world-coordinate overflow boundary");
 }
 
 void TestSparseVoxelWorldEviction() {
@@ -2832,11 +4962,16 @@ void TestSparseVoxelWorldEviction() {
     const BrickCoord bgVisible{13, 0, 0};
     const BrickCoord bgCollision{14, 0, 0};
     const BrickCoord bgEdited{15, 0, 0};
-    Check(backgroundWorld.RequestBrick(bgCenter), "background trim request center");
-    Check(backgroundWorld.RequestBrick(bgSpeculative), "background trim request speculative");
-    Check(backgroundWorld.RequestBrick(bgVisible), "background trim request visible");
-    Check(backgroundWorld.RequestBrick(bgCollision), "background trim request collision");
-    Check(backgroundWorld.RequestBrick(bgEdited), "background trim request edited");
+    Check(backgroundWorld.RequestBrickDetailed(bgCenter, false) == SparseBrickRequestResult::Allocated,
+        "background trim request center");
+    Check(backgroundWorld.RequestBrickDetailed(bgSpeculative, false) == SparseBrickRequestResult::Allocated,
+        "background trim request speculative");
+    Check(backgroundWorld.RequestBrickDetailed(bgVisible, false) == SparseBrickRequestResult::Allocated,
+        "background trim request visible");
+    Check(backgroundWorld.RequestBrickDetailed(bgCollision, false) == SparseBrickRequestResult::Allocated,
+        "background trim request collision");
+    Check(backgroundWorld.RequestBrickDetailed(bgEdited, false) == SparseBrickRequestResult::Allocated,
+        "background trim request edited");
     Check(backgroundWorld.MarkResidencyClass(bgVisible, SparseResidencyClass::Visible),
         "background trim marks visible");
     Check(backgroundWorld.MarkResidencyClass(bgCollision, SparseResidencyClass::Collision),
@@ -2889,6 +5024,53 @@ void TestSparseVoxelWorldEviction() {
         "queued trim protects collision requested page");
     Check(queuedTrimWorld.GenerationQueueSize() == 2,
         "queued trim removes evicted pages from generation queue accounting");
+
+    SparseVoxelWorld boundaryQueuedTrimWorld;
+    Check(boundaryQueuedTrimWorld.Initialize({2, 32, 12345u}),
+        "boundary queued trim world initialize");
+    const BrickCoord boundaryQueuedCoord{
+        std::numeric_limits<int32_t>::max(),
+        0,
+        0};
+    const BrickCoord boundaryQueuedCenter{
+        std::numeric_limits<int32_t>::min(),
+        0,
+        0};
+    Check(boundaryQueuedTrimWorld.RequestBrick(boundaryQueuedCoord),
+        "boundary queued trim request extreme page");
+    const uint32_t boundaryQueuedEvicted =
+        boundaryQueuedTrimWorld.TrimQueuedBackgroundBricks(boundaryQueuedCenter, 0, 0, 1, 700);
+    Check(boundaryQueuedEvicted == 1,
+        "boundary queued trim evicts extreme queued page without signed delta overflow");
+    Check(!boundaryQueuedTrimWorld.GetPool().TryGetPage(boundaryQueuedCoord),
+        "boundary queued trim frees extreme requested page");
+
+    SparseVoxelWorld largeDistanceTrimWorld;
+    Check(largeDistanceTrimWorld.Initialize({3, 64, 12345u}),
+        "large-distance trim world initialize");
+    const BrickCoord largeTrimCenter{-100000, 16, 0};
+    const BrickCoord largeTrimNear{-99999, 16, 0};
+    const BrickCoord largeTrimFar{100000, 16, 0};
+    Check(largeDistanceTrimWorld.RequestBrickDetailed(largeTrimCenter, false) == SparseBrickRequestResult::Allocated,
+        "large-distance trim request center");
+    Check(largeDistanceTrimWorld.RequestBrickDetailed(largeTrimNear, false) == SparseBrickRequestResult::Allocated,
+        "large-distance trim request near");
+    Check(largeDistanceTrimWorld.RequestBrickDetailed(largeTrimFar, false) == SparseBrickRequestResult::Allocated,
+        "large-distance trim request far");
+    Check(largeDistanceTrimWorld.PumpGeneration(3) == 3,
+        "large-distance trim generates pages");
+    while (largeDistanceTrimWorld.PopNextUpload(&packet)) {
+        Check(largeDistanceTrimWorld.CompleteUpload(packet),
+            "large-distance trim complete upload");
+    }
+    const uint32_t largeDistanceEvicted =
+        largeDistanceTrimWorld.TrimResidentBricks(largeTrimCenter, 2, 2, 1);
+    Check(largeDistanceEvicted == 1,
+        "large-distance trim evicts with saturating distance score");
+    Check(!largeDistanceTrimWorld.GetPool().IsResident(largeTrimFar),
+        "large-distance trim evicts far page");
+    Check(largeDistanceTrimWorld.GetPool().IsResident(largeTrimNear),
+        "large-distance trim keeps near page");
 }
 
 void TestSparsePriorityReplacement() {
@@ -2899,10 +5081,14 @@ void TestSparsePriorityReplacement() {
     const BrickCoord speculativeFar{8, 0, 0};
     const BrickCoord visibleFar{9, 0, 0};
     const BrickCoord editedFar{10, 0, 0};
-    Check(world.RequestBrick(center), "replacement request center");
-    Check(world.RequestBrick(speculativeFar), "replacement request speculative");
-    Check(world.RequestBrick(visibleFar), "replacement request visible");
-    Check(world.RequestBrick(editedFar), "replacement request edited");
+    Check(world.RequestBrickDetailed(center, false) == SparseBrickRequestResult::Allocated,
+        "replacement request center");
+    Check(world.RequestBrickDetailed(speculativeFar, false) == SparseBrickRequestResult::Allocated,
+        "replacement request speculative");
+    Check(world.RequestBrickDetailed(visibleFar, false) == SparseBrickRequestResult::Allocated,
+        "replacement request visible");
+    Check(world.RequestBrickDetailed(editedFar, false) == SparseBrickRequestResult::Allocated,
+        "replacement request edited");
     Check(world.MarkResidencyClass(center, SparseResidencyClass::Collision),
         "replacement center marked collision");
     Check(world.MarkResidencyClass(visibleFar, SparseResidencyClass::Visible),
@@ -2942,7 +5128,8 @@ void TestSparsePriorityReplacement() {
     Check(invalidation.coord == speculativeFar, "replacement invalidation targets evicted page");
 
     const BrickCoord newVisible{20, 0, 0};
-    Check(world.RequestBrick(newVisible), "replacement request can reuse freed page");
+    Check(world.RequestBrickDetailed(newVisible, false) == SparseBrickRequestResult::Allocated,
+        "replacement request can reuse freed page");
     Check(world.MarkResidencyClass(newVisible, SparseResidencyClass::Visible),
         "replacement new page marked visible");
 
@@ -2951,9 +5138,12 @@ void TestSparsePriorityReplacement() {
     const BrickCoord visibleA{0, 0, 0};
     const BrickCoord visibleB{6, 0, 0};
     const BrickCoord visibleC{12, 0, 0};
-    Check(visibleWorld.RequestBrick(visibleA), "same-class request visible A");
-    Check(visibleWorld.RequestBrick(visibleB), "same-class request visible B");
-    Check(visibleWorld.RequestBrick(visibleC), "same-class request visible C");
+    Check(visibleWorld.RequestBrickDetailed(visibleA, false) == SparseBrickRequestResult::Allocated,
+        "same-class request visible A");
+    Check(visibleWorld.RequestBrickDetailed(visibleB, false) == SparseBrickRequestResult::Allocated,
+        "same-class request visible B");
+    Check(visibleWorld.RequestBrickDetailed(visibleC, false) == SparseBrickRequestResult::Allocated,
+        "same-class request visible C");
     Check(visibleWorld.MarkResidencyClass(visibleA, SparseResidencyClass::Visible),
         "same-class mark visible A");
     Check(visibleWorld.MarkResidencyClass(visibleB, SparseResidencyClass::Visible),
@@ -2980,10 +5170,14 @@ void TestSparsePriorityReplacement() {
     const BrickCoord oldVisible{8, 0, 0};
     const BrickCoord newVisibleSameDistance{-8, 0, 0};
     const BrickCoord collisionTouched{0, 4, 0};
-    Check(ageWorld.RequestBrick(ageCenter), "age request center");
-    Check(ageWorld.RequestBrick(oldVisible), "age request old visible");
-    Check(ageWorld.RequestBrick(newVisibleSameDistance), "age request new visible");
-    Check(ageWorld.RequestBrick(collisionTouched), "age request collision touched");
+    Check(ageWorld.RequestBrickDetailed(ageCenter, false) == SparseBrickRequestResult::Allocated,
+        "age request center");
+    Check(ageWorld.RequestBrickDetailed(oldVisible, false) == SparseBrickRequestResult::Allocated,
+        "age request old visible");
+    Check(ageWorld.RequestBrickDetailed(newVisibleSameDistance, false) == SparseBrickRequestResult::Allocated,
+        "age request new visible");
+    Check(ageWorld.RequestBrickDetailed(collisionTouched, false) == SparseBrickRequestResult::Allocated,
+        "age request collision touched");
     Check(ageWorld.TouchResidencyClass(ageCenter, SparseResidencyClass::Collision, 10),
         "age center touched collision");
     Check(ageWorld.TouchResidencyClass(oldVisible, SparseResidencyClass::Visible, 20),
@@ -3009,6 +5203,47 @@ void TestSparsePriorityReplacement() {
         "age-aware replacement preserves newer visible page at same distance");
     Check(ageWorld.GetPool().IsResident(collisionTouched),
         "visible replacement does not evict higher collision residency");
+
+    SparseVoxelWorld largeDistanceReplacementWorld;
+    Check(largeDistanceReplacementWorld.Initialize({3, 64, 12345u}),
+        "large-distance replacement world initialize");
+    const BrickCoord largeReplacementCenter{-100000, 16, 0};
+    const BrickCoord largeReplacementSpeculative{100000, 16, 0};
+    const BrickCoord largeReplacementVisible{-99999, 16, 0};
+    Check(largeDistanceReplacementWorld.RequestBrickDetailed(largeReplacementCenter, false) == SparseBrickRequestResult::Allocated,
+        "large-distance replacement request center");
+    Check(largeDistanceReplacementWorld.RequestBrickDetailed(largeReplacementSpeculative, false) == SparseBrickRequestResult::Allocated,
+        "large-distance replacement request speculative");
+    Check(largeDistanceReplacementWorld.RequestBrickDetailed(largeReplacementVisible, false) == SparseBrickRequestResult::Allocated,
+        "large-distance replacement request visible");
+    Check(largeDistanceReplacementWorld.MarkResidencyClass(
+            largeReplacementCenter,
+            SparseResidencyClass::Collision),
+        "large-distance replacement marks center collision");
+    Check(largeDistanceReplacementWorld.MarkResidencyClass(
+            largeReplacementVisible,
+            SparseResidencyClass::Visible),
+        "large-distance replacement marks visible");
+    Check(largeDistanceReplacementWorld.PumpGeneration(3) == 3,
+        "large-distance replacement generates pages");
+    while (largeDistanceReplacementWorld.PopNextUpload(&packet)) {
+        Check(largeDistanceReplacementWorld.CompleteUpload(packet),
+            "large-distance replacement complete upload");
+    }
+    const uint32_t largeReplacementEvicted =
+        largeDistanceReplacementWorld.EvictLowerPriorityForRequest(
+            largeReplacementCenter,
+            SparseResidencyClass::Visible,
+            2,
+            2,
+            1,
+            900);
+    Check(largeReplacementEvicted == 1,
+        "large-distance replacement evicts with saturating distance score");
+    Check(!largeDistanceReplacementWorld.GetPool().IsResident(largeReplacementSpeculative),
+        "large-distance replacement evicts far speculative page");
+    Check(largeDistanceReplacementWorld.GetPool().IsResident(largeReplacementVisible),
+        "large-distance replacement keeps protected visible page");
 }
 
 void TestSparsePriorityQueues() {
@@ -3105,6 +5340,8 @@ void TestSparsePriorityQueues() {
         "generation class upgrade initially speculative");
     Check(generationUpgradeWorld.TouchResidencyClass(upgradeGeneration, SparseResidencyClass::Collision, 20),
         "generation class upgrade retouches requested brick as collision");
+    Check(generationUpgradeWorld.GenerationClassQueueSize() == 1,
+        "generation class upgrade removes stale class aliases before requeue");
     Check(generationUpgradeWorld.PumpGenerationAround(1, upgradeGeneration, 20) == 1,
         "generation class upgrade generates retouched collision request through class bucket");
     Check(generationUpgradeWorld.PopNextUploadForClass(&packet, SparseResidencyClass::Collision, 20),
@@ -3188,6 +5425,8 @@ void TestSparsePriorityQueues() {
         "class upload upgrade generates speculative upload");
     Check(uploadUpgradeWorld.TouchResidencyClass(upgradeCoord, SparseResidencyClass::Visible, 20),
         "class upload upgrade retouches queued upload as visible");
+    Check(uploadUpgradeWorld.UploadClassQueueSize() == 1,
+        "class upload upgrade removes stale class aliases before requeue");
     Check(uploadUpgradeWorld.PopNextUploadForClass(&packet, SparseResidencyClass::Visible, 20),
         "class upload upgrade can pop retouched visible upload from class bucket");
     Check(packet.coord == upgradeCoord,
@@ -3215,6 +5454,43 @@ void TestSparsePriorityQueues() {
         "value upload pops best visible by focus");
     Check(packet.coord == nearVisible,
         "value upload chooses nearer visible brick over much newer far brick");
+
+    SparseVoxelWorld repeatedValueUploadWorld;
+    Check(repeatedValueUploadWorld.Initialize({8, 32, 12345u}),
+        "repeated value upload world initialize");
+    const BrickCoord repeatedFar{2200, -64, 0};
+    const BrickCoord repeatedMid{12, -64, 0};
+    const BrickCoord repeatedNear{1, -64, 0};
+    Check(repeatedValueUploadWorld.RequestBrickDetailed(repeatedFar, false) == SparseBrickRequestResult::Allocated,
+        "repeated value upload request far visible");
+    Check(repeatedValueUploadWorld.TouchResidencyClass(repeatedFar, SparseResidencyClass::Visible, 300),
+        "repeated value upload touch far visible");
+    Check(repeatedValueUploadWorld.RequestBrickDetailed(repeatedMid, false) == SparseBrickRequestResult::Allocated,
+        "repeated value upload request mid visible");
+    Check(repeatedValueUploadWorld.TouchResidencyClass(repeatedMid, SparseResidencyClass::Visible, 300),
+        "repeated value upload touch mid visible");
+    Check(repeatedValueUploadWorld.RequestBrickDetailed(repeatedNear, false) == SparseBrickRequestResult::Allocated,
+        "repeated value upload request near visible");
+    Check(repeatedValueUploadWorld.TouchResidencyClass(repeatedNear, SparseResidencyClass::Visible, 300),
+        "repeated value upload touch near visible");
+    Check(repeatedValueUploadWorld.PumpGeneration(3, 300) == 3,
+        "repeated value upload generates all visible candidates");
+    Check(repeatedValueUploadWorld.PopBestUploadForClass(
+            &packet,
+            SparseResidencyClass::Visible,
+            BrickCoord{0, -64, 0},
+            300),
+        "repeated value upload pops first focused visible");
+    Check(packet.coord == repeatedNear,
+        "repeated value upload first pop chooses nearest visible brick");
+    Check(repeatedValueUploadWorld.PopBestUploadForClass(
+            &packet,
+            SparseResidencyClass::Visible,
+            BrickCoord{0, -64, 0},
+            300),
+        "repeated value upload pops second focused visible without queue mutation");
+    Check(packet.coord == repeatedMid,
+        "repeated value upload preserves cached value order after first pop");
 
     SparseVoxelWorld surfaceWorld;
     Check(surfaceWorld.Initialize({8, 32, 12345u}), "surface extraction priority world initialize");
@@ -3320,6 +5596,8 @@ void TestSparsePriorityQueues() {
         "surface class upgrade queues pending surface");
     Check(surfaceUpgradeWorld.TouchResidencyClass(surfaceUpgrade, SparseResidencyClass::Collision, 20),
         "surface class upgrade retouches pending surface as collision");
+    Check(surfaceUpgradeWorld.SurfaceClassQueueSize() == 1,
+        "surface class upgrade removes stale class aliases before requeue");
     Check(surfaceUpgradeWorld.GetStats().surfaceQueuedCollisionBricks == 1,
         "surface class upgrade cached stats count collision pending surface");
     Check(surfaceUpgradeWorld.PumpSurfaceExtractionAround(1, surfaceUpgrade, 20) == 1,
@@ -3493,6 +5771,44 @@ void TestSparseBrickRequestPlanner() {
     Check(cappedCone.size() == 4, "view-cone planner respects max request cap");
     Check(cappedCone.front().coord == BrickCoord{0, 0, 0},
         "view-cone planner keeps center ray origin as highest-priority request");
+
+    SparseViewConeConfig malformedCone = cone;
+    malformedCone.originX = std::numeric_limits<float>::quiet_NaN();
+    malformedCone.maxRequests = std::numeric_limits<uint32_t>::max();
+    Check(planner.PlanViewCone(malformedCone).empty(),
+        "view-cone planner rejects non-finite origin input");
+
+    SparseViewConeConfig clampedCone = cone;
+    clampedCone.verticalFovRadians = std::numeric_limits<float>::infinity();
+    clampedCone.aspectRatio = -std::numeric_limits<float>::infinity();
+    clampedCone.maxDistance = std::numeric_limits<float>::max();
+    clampedCone.stepDistance = std::numeric_limits<float>::min();
+    clampedCone.coverageRadiusXz = std::numeric_limits<uint32_t>::max();
+    clampedCone.coverageRadiusY = std::numeric_limits<uint32_t>::max();
+    clampedCone.maxRequests = std::numeric_limits<uint32_t>::max();
+    const std::vector<SparseBrickRequest> clampedConeRequests = planner.PlanViewCone(clampedCone);
+    Check(!clampedConeRequests.empty(),
+        "view-cone planner clamps malformed optional view parameters");
+    Check(clampedConeRequests.size() <= 4096,
+        "view-cone planner caps malformed max request counts");
+    std::unordered_set<BrickCoord, BrickCoordHash> clampedConeUnique;
+    for (const auto& request : clampedConeRequests) {
+        Check(clampedConeUnique.insert(request.coord).second,
+            "view-cone planner keeps malformed-clamped requests unique");
+    }
+
+    SparseViewConeConfig boundaryCone = cone;
+    boundaryCone.originX = static_cast<float>(std::numeric_limits<int32_t>::max());
+    boundaryCone.originY = 0.0f;
+    boundaryCone.originZ = static_cast<float>(std::numeric_limits<int32_t>::max());
+    boundaryCone.forwardX = 1.0f;
+    boundaryCone.forwardY = 0.0f;
+    boundaryCone.forwardZ = 1.0f;
+    boundaryCone.rayGrid = 1;
+    boundaryCone.maxDistance = 8192.0f;
+    boundaryCone.maxRequests = 32;
+    Check(planner.PlanViewCone(boundaryCone).empty(),
+        "view-cone planner rejects positive signed-coordinate overflow boundary origins");
 
     SparseHierarchicalRequestConfig hierarchy{};
     hierarchy.center = BrickCoord{0, 0, 0};
@@ -3706,6 +6022,68 @@ void TestSparseBrickRequestPlanner() {
     Check(recoveryAllUrgentVisible,
         "ownership-pressure recovery requests are protected visible work");
 
+    SparseHierarchicalRequestConfig malformedHierarchy = hierarchy;
+    malformedHierarchy.cameraX = std::numeric_limits<float>::infinity();
+    malformedHierarchy.cameraY = std::numeric_limits<float>::quiet_NaN();
+    malformedHierarchy.cameraZ = -std::numeric_limits<float>::infinity();
+    malformedHierarchy.velocityX = std::numeric_limits<float>::infinity();
+    malformedHierarchy.velocityY = std::numeric_limits<float>::quiet_NaN();
+    malformedHierarchy.velocityZ = -std::numeric_limits<float>::infinity();
+    malformedHierarchy.predictionSeconds = std::numeric_limits<float>::infinity();
+    malformedHierarchy.visibleDistance = std::numeric_limits<float>::infinity();
+    malformedHierarchy.speculativeDistance = std::numeric_limits<float>::quiet_NaN();
+    malformedHierarchy.stepDistance = std::numeric_limits<float>::min();
+    malformedHierarchy.verticalFovRadians = std::numeric_limits<float>::infinity();
+    malformedHierarchy.aspectRatio = -std::numeric_limits<float>::infinity();
+    malformedHierarchy.motionVisibleRadiusXz = std::numeric_limits<uint32_t>::max();
+    malformedHierarchy.motionVisibleRadiusY = std::numeric_limits<uint32_t>::max();
+    malformedHierarchy.maxMotionVisibleRequests = std::numeric_limits<uint32_t>::max();
+    malformedHierarchy.maxVisibleRequests = std::numeric_limits<uint32_t>::max();
+    malformedHierarchy.maxSpeculativeRequests = std::numeric_limits<uint32_t>::max();
+    malformedHierarchy.maxRequests = 32;
+    const std::vector<SparseBrickRequest> malformedHierarchyRequests =
+        planner.PlanHierarchical(malformedHierarchy);
+    Check(!malformedHierarchyRequests.empty(),
+        "hierarchical planner sanitizes malformed camera/motion inputs");
+    Check(malformedHierarchyRequests.size() <= malformedHierarchy.maxRequests,
+        "hierarchical planner caps malformed request counts");
+    std::unordered_set<BrickCoord, BrickCoordHash> malformedHierarchyUnique;
+    for (const SparseBrickRequest& request : malformedHierarchyRequests) {
+        Check(malformedHierarchyUnique.insert(request.coord).second,
+            "hierarchical planner keeps malformed requests unique");
+    }
+
+    SparseHierarchicalRequestConfig boundaryHierarchy = hierarchy;
+    boundaryHierarchy.center = BrickCoord{
+        std::numeric_limits<int32_t>::max(),
+        0,
+        std::numeric_limits<int32_t>::max()};
+    boundaryHierarchy.cameraX = static_cast<float>(std::numeric_limits<int32_t>::max());
+    boundaryHierarchy.cameraY = 0.0f;
+    boundaryHierarchy.cameraZ = static_cast<float>(std::numeric_limits<int32_t>::max());
+    boundaryHierarchy.velocityX = 512.0f;
+    boundaryHierarchy.velocityY = 0.0f;
+    boundaryHierarchy.velocityZ = 512.0f;
+    boundaryHierarchy.collisionRadiusXz = std::numeric_limits<uint32_t>::max();
+    boundaryHierarchy.collisionRadiusY = std::numeric_limits<uint32_t>::max();
+    boundaryHierarchy.nearVisibleRadiusXz = std::numeric_limits<uint32_t>::max();
+    boundaryHierarchy.nearVisibleRadiusY = 0;
+    boundaryHierarchy.maxNearVisibleRequests = 16;
+    boundaryHierarchy.maxMotionVisibleRequests = 16;
+    boundaryHierarchy.maxVisibleRequests = 16;
+    boundaryHierarchy.maxSpeculativeRequests = 16;
+    boundaryHierarchy.maxRequests = 32;
+    const std::vector<SparseBrickRequest> boundaryHierarchyRequests =
+        planner.PlanHierarchical(boundaryHierarchy);
+    Check(boundaryHierarchyRequests.size() <= boundaryHierarchy.maxRequests,
+        "hierarchical planner caps signed-boundary requests");
+    const int32_t boundaryMin = std::numeric_limits<int32_t>::max() - 128;
+    for (const SparseBrickRequest& request : boundaryHierarchyRequests) {
+        Check(request.coord.x >= boundaryMin &&
+              request.coord.z >= boundaryMin,
+            "hierarchical planner does not wrap signed-boundary request coordinates");
+    }
+
     SparseHierarchicalRequestConfig tightBrushHierarchy = fastHierarchy;
     tightBrushHierarchy.brushIntentValid = true;
     tightBrushHierarchy.brushStartX = 192.0f;
@@ -3809,6 +6187,38 @@ void TestSparseBrickRequestPlanner() {
     Check(collisionOnlyBody, "collision residency planner protects immediate body/support shell");
     Check(collisionOnlyBrush, "collision residency planner protects active brush corridor independently");
 
+    SparseCollisionResidencyConfig malformedCollision = brushLineCollision;
+    malformedCollision.cameraX = std::numeric_limits<float>::infinity();
+    malformedCollision.cameraY = std::numeric_limits<float>::quiet_NaN();
+    malformedCollision.cameraZ = -std::numeric_limits<float>::infinity();
+    malformedCollision.velocityX = std::numeric_limits<float>::infinity();
+    malformedCollision.velocityY = std::numeric_limits<float>::quiet_NaN();
+    malformedCollision.velocityZ = -std::numeric_limits<float>::infinity();
+    malformedCollision.predictionSeconds = std::numeric_limits<float>::infinity();
+    malformedCollision.bodyRadius = std::numeric_limits<float>::infinity();
+    malformedCollision.bodyHeight = std::numeric_limits<float>::quiet_NaN();
+    malformedCollision.stepHeight = std::numeric_limits<float>::infinity();
+    malformedCollision.supportDrop = std::numeric_limits<float>::infinity();
+    malformedCollision.brushStartX = std::numeric_limits<float>::quiet_NaN();
+    malformedCollision.brushEndX = std::numeric_limits<float>::infinity();
+    malformedCollision.brushRadius = std::numeric_limits<float>::infinity();
+    malformedCollision.maxRequests = 16;
+    const std::vector<SparseBrickRequest> malformedCollisionRequests =
+        planner.PlanCollisionResidency(malformedCollision);
+    Check(!malformedCollisionRequests.empty(),
+        "collision residency planner falls back to body requests for malformed motion/brush input");
+    Check(malformedCollisionRequests.size() <= malformedCollision.maxRequests,
+        "collision residency planner keeps malformed input inside request cap");
+    bool malformedAllNearCenter = true;
+    for (const SparseBrickRequest& request : malformedCollisionRequests) {
+        malformedAllNearCenter =
+            malformedAllNearCenter &&
+            std::abs(request.coord.x - malformedCollision.center.x) <= 2 &&
+            std::abs(request.coord.z - malformedCollision.center.z) <= 2;
+    }
+    Check(malformedAllNearCenter,
+        "collision residency planner sanitizes malformed input near the configured center");
+
     SparseStressRequestConfig stress{};
     stress.center = BrickCoord{4, -2, 7};
     stress.radiusXz = 4;
@@ -3850,6 +6260,55 @@ void TestSparseBrickRequestPlanner() {
             stressUnique.find(request.coord) == stressUnique.end();
     }
     Check(rotatedDiffers, "stress planner cursor can sample a different pressure slice");
+
+    SparseBrickRequestPlannerConfig extremePlannerConfig{};
+    extremePlannerConfig.radiusXz = std::numeric_limits<uint32_t>::max();
+    extremePlannerConfig.radiusY = std::numeric_limits<uint32_t>::max();
+    extremePlannerConfig.forwardPrefetchBricks = std::numeric_limits<uint32_t>::max();
+    extremePlannerConfig.maxRequests = 32;
+    SparseBrickRequestPlanner extremePlanner(extremePlannerConfig);
+    const std::vector<SparseBrickRequest> extremeBasicRequests = extremePlanner.Plan(
+        {std::numeric_limits<int32_t>::max(), 0, std::numeric_limits<int32_t>::max()},
+        1,
+        0,
+        1);
+    Check(!extremeBasicRequests.empty() && extremeBasicRequests.size() <= extremePlannerConfig.maxRequests,
+        "basic planner clamps extreme radii and request count");
+    bool extremeBasicValid = true;
+    std::unordered_set<BrickCoord, BrickCoordHash> extremeBasicUnique;
+    for (const SparseBrickRequest& request : extremeBasicRequests) {
+        extremeBasicValid =
+            extremeBasicValid &&
+            request.coord.x <= std::numeric_limits<int32_t>::max() &&
+            request.coord.z <= std::numeric_limits<int32_t>::max() &&
+            extremeBasicUnique.insert(request.coord).second;
+    }
+    Check(extremeBasicValid, "basic planner skips overflowing extreme-coordinate requests");
+
+    SparseStressRequestConfig extremeStress{};
+    extremeStress.center = {
+        std::numeric_limits<int32_t>::max(),
+        0,
+        std::numeric_limits<int32_t>::min()
+    };
+    extremeStress.radiusXz = std::numeric_limits<uint32_t>::max();
+    extremeStress.radiusY = std::numeric_limits<uint32_t>::max();
+    extremeStress.maxRequests = 32;
+    extremeStress.cursor = std::numeric_limits<uint32_t>::max();
+    const std::vector<SparseBrickRequest> extremeStressRequests =
+        planner.PlanStressVolume(extremeStress);
+    Check(!extremeStressRequests.empty() && extremeStressRequests.size() <= extremeStress.maxRequests,
+        "stress planner clamps extreme radii and request count");
+    bool extremeStressValid = true;
+    std::unordered_set<BrickCoord, BrickCoordHash> extremeStressUnique;
+    for (const SparseBrickRequest& request : extremeStressRequests) {
+        extremeStressValid =
+            extremeStressValid &&
+            request.coord.x <= std::numeric_limits<int32_t>::max() &&
+            request.coord.z >= std::numeric_limits<int32_t>::min() &&
+            extremeStressUnique.insert(request.coord).second;
+    }
+    Check(extremeStressValid, "stress planner skips overflowing extreme-coordinate requests");
 }
 
 void TestSparseRuntimeBudgetScheduler() {
@@ -3960,6 +6419,16 @@ void TestSparseRuntimeBudgetScheduler() {
     Check(!ownershipPressure.triggered && ownershipPressure.active &&
           ownershipPressure.updatedCatchupFrames == 9,
         "ownership pressure preserves existing catch-up window after sample recovers");
+    ownershipInput.currentCatchupFrames = 0;
+    ownershipInput.terrainPercent = 92;
+    ownershipInput.voxelTerrainPercent = 44;
+    ownershipInput.minVoxelTerrainPercent = 68;
+    ownershipInput.missPercent = 0;
+    ownershipInput.unsafeNearMissPercent = 0;
+    ownershipPressure = SparseRuntimeBudgetScheduler::BuildOwnershipPressure(ownershipInput);
+    Check(ownershipPressure.triggered && ownershipPressure.level == 3 &&
+          ownershipPressure.voxelTerrainDeficitPercent == 24,
+        "ownership pressure escalates when proxy terrain hides low voxel-terrain coverage");
 
     SparseMissFeedbackPlanInput missPlanInput{};
     missPlanInput.enabled = true;
@@ -3978,10 +6447,28 @@ void TestSparseRuntimeBudgetScheduler() {
     Check(missPlan.dispatch && missPlan.urgent && missPlan.rayGrid >= 7 &&
           missPlan.distance >= 512 && missPlan.stride <= 8,
         "miss feedback plan immediately escalates sampling for unsafe near holes");
+    missPlanInput.unsafeNearMissPercent = 0;
+    missPlanInput.valleyAtmospherePercent = 10;
+    missPlanInput.maxValleyAtmospherePercent = 8;
+    missPlan = SparseRuntimeBudgetScheduler::BuildMissFeedbackPlan(missPlanInput);
+    Check(missPlan.dispatch && missPlan.urgent && missPlan.rayGrid >= 7 &&
+          missPlan.distance >= 512 && missPlan.stride <= 8,
+        "miss feedback plan treats excess valley atmosphere as visible residency pressure");
+    missPlanInput.valleyAtmospherePercent = 18;
+    missPlan = SparseRuntimeBudgetScheduler::BuildMissFeedbackPlan(missPlanInput);
+    Check(missPlan.dispatch && missPlan.rayGrid == 16 &&
+          missPlan.distance >= 768 && missPlan.stride == 4,
+        "miss feedback plan uses maximum sampling when valley atmosphere is far above target");
+    missPlanInput.allowValleyAtmosphereFeedback = false;
+    missPlan = SparseRuntimeBudgetScheduler::BuildMissFeedbackPlan(missPlanInput);
+    Check(!missPlan.dispatch && !missPlan.urgent,
+        "miss feedback plan does not spend valley-atmosphere feedback while generation is backlogged");
+    missPlanInput.allowValleyAtmosphereFeedback = true;
+    missPlanInput.valleyAtmospherePercent = 0;
     missPlanInput.unsafeNearMissPercent = 5;
     missPlanInput.ownershipPressureLevel = 3;
     missPlan = SparseRuntimeBudgetScheduler::BuildMissFeedbackPlan(missPlanInput);
-    Check(missPlan.dispatch && missPlan.rayGrid == 8 &&
+    Check(missPlan.dispatch && missPlan.rayGrid == 16 &&
           missPlan.distance >= 768 && missPlan.stride == 4,
         "miss feedback plan uses maximum safe sampling under severe ownership pressure");
     missPlanInput.unsafeNearMissPercent = 0;
@@ -4087,6 +6574,8 @@ void TestSparseRuntimeBudgetScheduler() {
         "runtime scheduler preserves nonzero minimum");
     Check(SparseRuntimeBudgetScheduler::ScaleBudget(0, 10.0f, 1u) == 0,
         "runtime scheduler keeps zero budget at zero");
+    Check(SparseRuntimeBudgetScheduler::ScaleBudget(UINT32_MAX, 2.0f, 1u) == UINT32_MAX,
+        "runtime scheduler saturates scaled budgets instead of wrapping");
 
     SparseRuntimeBudgetDecision headroom{};
     headroom.backgroundScale = 1.35f;
@@ -4231,7 +6720,40 @@ void TestSparseRuntimeBudgetScheduler() {
           backgroundBudget.farFieldQuality < 1.0f,
         "background renderer uses ownership mix to downshift expensive far/mid pixel dominance");
 
+    backgroundInput.midVoxelPixelShare = 0.04f;
+    backgroundInput.farSvoPixelShare = 0.54f;
+    backgroundInput.farHeightPixelShare = 0.02f;
+    backgroundInput.skyPixelShare = 0.12f;
+    backgroundInput.backgroundPixelShare = 1.0f;
+    backgroundBudget =
+        SparseRuntimeBudgetScheduler::BuildBackgroundRenderBudget(backgroundInput);
+    Check(backgroundBudget.qualityTier >= 1 &&
+          backgroundBudget.renderQuality <= 0.99f &&
+          backgroundBudget.farFieldQuality < 1.0f,
+        "background renderer reacts to far-SVO dominant GPU ray cost");
+
+    backgroundInput.combinedPressureMs = 28.0f;
+    backgroundInput.gpuRaymarchMs = 11.5f;
+    backgroundInput.previousRenderQuality = 1.0f;
+    backgroundInput.farSvoPixelShare = 0.84f;
+    backgroundInput.backgroundPixelShare = 0.96f;
+    backgroundInput.skyPixelShare = 0.13f;
+    backgroundInput.farSvoReady = true;
+    backgroundBudget =
+        SparseRuntimeBudgetScheduler::BuildBackgroundRenderBudget(backgroundInput);
+    Check(backgroundBudget.qualityTier == 3 &&
+          backgroundBudget.raymarchScale < 0.90f &&
+          backgroundBudget.renderQuality >= 0.62f &&
+          backgroundBudget.farFieldQuality >= 0.62f &&
+          backgroundBudget.preserveFarFieldQuality,
+        "background renderer preserves a medium far-SVO quality floor when far voxels own the view");
+
     backgroundInput.backgroundPixelShare = 0.20f;
+    backgroundInput.midVoxelPixelShare = 0.34f;
+    backgroundInput.farSvoPixelShare = 0.0f;
+    backgroundInput.farHeightPixelShare = 0.44f;
+    backgroundInput.combinedPressureMs = 14.0f;
+    backgroundInput.gpuRaymarchMs = 6.2f;
     backgroundBudget =
         SparseRuntimeBudgetScheduler::BuildBackgroundRenderBudget(backgroundInput);
     Check(backgroundBudget.qualityTier == 0 &&
@@ -4264,8 +6786,10 @@ void TestSparseRuntimeBudgetScheduler() {
     backgroundBudget =
         SparseRuntimeBudgetScheduler::BuildBackgroundRenderBudget(backgroundInput);
     Check(backgroundBudget.raymarchScale >= 0.80f &&
-          backgroundBudget.farFieldQuality >= 0.62f,
-        "background renderer preserves terrain ownership work during visible miss catch-up");
+          backgroundBudget.renderQuality >= 0.92f &&
+          backgroundBudget.farFieldQuality >= 0.94f &&
+          backgroundBudget.preserveFarFieldQuality,
+        "background renderer preserves terrain ownership quality during visible miss catch-up");
 
     SparseFarUploadBudgetInput farUploadInput{};
     farUploadInput.fullBudgetBytes = 2ull * 1024ull * 1024ull;
@@ -4291,6 +6815,22 @@ void TestSparseRuntimeBudgetScheduler() {
           farUploadBudget.pressureTier == 0,
         "far upload scheduler opportunistically expands trickle upload under clear headroom");
 
+    SparseFarUploadBudgetInput hugeFarUploadInput{};
+    hugeFarUploadInput.fullBudgetBytes = std::numeric_limits<uint64_t>::max();
+    hugeFarUploadInput.trickleBudgetBytes = std::numeric_limits<uint64_t>::max() - 7ull;
+    hugeFarUploadInput.totalBytes = std::numeric_limits<uint64_t>::max();
+    hugeFarUploadInput.uploadedBytes = 0ull;
+    hugeFarUploadInput.combinedPressureMs = 13.0f;
+    hugeFarUploadInput.predictedFrameMs = 13.5f;
+    hugeFarUploadInput.lastUploadMs = 0.4f;
+    hugeFarUploadInput.smoothedUploadMs = 0.5f;
+    hugeFarUploadInput.targetUploadMs = 1.25f;
+    hugeFarUploadInput.canTrickle = true;
+    farUploadBudget = SparseRuntimeBudgetScheduler::BuildFarUploadBudget(hugeFarUploadInput);
+    Check(farUploadBudget.budgetBytes == std::numeric_limits<uint64_t>::max() &&
+          farUploadBudget.pressureTier == 0,
+        "far upload scheduler saturates opportunistic trickle expansion instead of wrapping");
+
     farUploadInput.combinedPressureMs = 16.67f;
     farUploadInput.predictedFrameMs = 16.67f;
     farUploadBudget = SparseRuntimeBudgetScheduler::BuildFarUploadBudget(farUploadInput);
@@ -4304,6 +6844,13 @@ void TestSparseRuntimeBudgetScheduler() {
     Check(farUploadBudget.budgetBytes == 128ull * 1024ull &&
           farUploadBudget.pressureTier == 3,
         "far upload scheduler clamps upload when measured upload cost is high");
+
+    farUploadInput.readinessDeadline = true;
+    farUploadBudget = SparseRuntimeBudgetScheduler::BuildFarUploadBudget(farUploadInput);
+    Check(farUploadBudget.budgetBytes == 8ull * 1024ull * 1024ull &&
+          farUploadBudget.pressureTier == 0,
+        "far upload scheduler protects pipe-readiness deadline uploads despite prior measured upload pressure");
+    farUploadInput.readinessDeadline = false;
 
     farUploadInput.lastUploadMs = 0.4f;
     farUploadInput.smoothedUploadMs = 0.5f;
@@ -4346,6 +6893,11 @@ void TestSparseRuntimeBudgetScheduler() {
           requestBudget.collision == 16 &&
           requestBudget.total == 32,
         "request scheduler preserves configured budgets when runtime scale is neutral");
+    SparseRequestBudgetDecision saturatedRequestBudget =
+        SparseRuntimeBudgetScheduler::BuildRequestBudgets(UINT32_MAX - 10u, 32u, 32u, 1u, neutral);
+    Check(saturatedRequestBudget.total == UINT32_MAX &&
+          saturatedRequestBudget.protectedHardTotal == UINT32_MAX,
+        "request scheduler saturates extreme admission totals instead of wrapping");
 
     SparseUploadBudgetDecision uploadBudget =
         SparseRuntimeBudgetScheduler::BuildUploadBudgets(
@@ -4476,6 +7028,18 @@ void TestSparseRuntimeBudgetScheduler() {
         "frame upload plan reserves ready page publishes before protected brick payloads");
     Check(framePlan.brickBudgets.edited == 0 && framePlan.brickBudgets.visible == 0,
         "frame upload plan prefers cheap visibility publication over another brick when bytes are tight");
+
+    framePlanInput = {};
+    framePlanInput.uploadBytesCapacity = 0;
+    framePlanInput.uploadBytesAlreadyUsed = 1;
+    framePlanInput.pageTableResetPending = true;
+    framePlanInput.midClipmapDirty = true;
+    framePlanInput.invalidationQueued = UINT32_MAX;
+    framePlanInput.publishQueued = UINT32_MAX;
+    framePlanInput.brickBudgets.total = UINT32_MAX;
+    framePlan = SparseRuntimeBudgetScheduler::BuildFrameUploadPlan(framePlanInput);
+    Check(framePlan.byteLimitedDefers == UINT32_MAX,
+        "frame upload plan saturates byte-limited defer accounting instead of wrapping");
 }
 
 void TestSparseClipmapPolicy() {
@@ -4502,6 +7066,33 @@ void TestSparseClipmapPolicy() {
         "clipmap policy clamps low voxel interest reserve");
     Check(clampedInterestPolicy.Config().motionLookaheadSteps == 8u,
         "clipmap policy clamps excessive motion lookahead steps");
+    SparseClipmapConfig nonFiniteConfig;
+    nonFiniteConfig.startDistance = std::numeric_limits<float>::quiet_NaN();
+    nonFiniteConfig.endDistance = std::numeric_limits<float>::infinity();
+    nonFiniteConfig.minCellSize = -std::numeric_limits<float>::infinity();
+    nonFiniteConfig.nearExitPadding = std::numeric_limits<float>::quiet_NaN();
+    nonFiniteConfig.motionLookaheadMinSpeed = std::numeric_limits<float>::quiet_NaN();
+    SparseClipmapPolicy nonFinitePolicy(nonFiniteConfig);
+    Check(std::isfinite(nonFinitePolicy.Config().startDistance) &&
+          std::isfinite(nonFinitePolicy.Config().endDistance) &&
+          std::isfinite(nonFinitePolicy.Config().minCellSize) &&
+          std::isfinite(nonFinitePolicy.Config().nearExitPadding) &&
+          std::isfinite(nonFinitePolicy.Config().motionLookaheadMinSpeed),
+        "clipmap policy sanitizes non-finite configuration values");
+    Check(nonFinitePolicy.Config().endDistance > nonFinitePolicy.Config().startDistance,
+        "clipmap policy keeps sanitized transition range valid");
+    Check(nonFinitePolicy.CellSizeForDistance(std::numeric_limits<float>::quiet_NaN()) ==
+          nonFinitePolicy.Config().minCellSize,
+        "clipmap policy maps non-finite distance to minimum cell size");
+    Check(!nonFinitePolicy.OwnsRaySegment(
+              std::numeric_limits<float>::quiet_NaN(),
+              200.0f,
+              100.0f),
+        "clipmap policy rejects non-finite segment ownership checks");
+    Check(!nonFinitePolicy.AllowsBackgroundForMissingNearPage(
+              std::numeric_limits<float>::quiet_NaN(),
+              100.0f),
+        "clipmap policy rejects non-finite missing-near fallback distance");
     Check(policy.TransitionStartAfterNearExit(40.0f) == 100.0f,
         "clipmap starts at configured start when near exit is close");
     Check(policy.TransitionStartAfterNearExit(200.0f) == 212.0f,
@@ -4528,6 +7119,8 @@ void TestSparseClipmapPolicy() {
         "clipmap owns segment beyond padded near exit");
     Check(!policy.OwnsRaySegment(120.0f, 180.0f, 200.0f),
         "clipmap does not draw through near-owned segment");
+    Check(!policy.OwnsRaySegment(800.0f, 1100.0f, 900.0f),
+        "clipmap owns no segment when near exit is beyond the mid range");
     Check(policy.CellSizeForDistance(100.0f) == 8.0f,
         "clipmap first ring cell size");
     Check(policy.CellSizeForDistance(350.0f) == 16.0f,
@@ -4561,6 +7154,12 @@ void TestSparseClipmapPolicy() {
     Check(nearExitMetadata.farHandoffDistance ==
           policy.FarLayerStartAfterBackground(nearExitMetadata.startDistance),
         "ray-aware clipmap transition metadata keeps far handoff after adjusted background start");
+    const SparseClipmapTransitionMetadata exhaustedNearExitMetadata =
+        policy.BuildTransitionMetadataAfterNearExit(900.0f);
+    Check(!exhaustedNearExitMetadata.enabled &&
+          exhaustedNearExitMetadata.startDistance == exhaustedNearExitMetadata.endDistance &&
+          exhaustedNearExitMetadata.farHandoffDistance == exhaustedNearExitMetadata.endDistance,
+        "ray-aware clipmap transition metadata disables inverted mid ranges");
 
     SparseClipmapPolicy disabled({false, 100.0f, 900.0f, 8.0f, 12.0f, 4});
     Check(!disabled.IsEnabled(), "disabled clipmap policy");
@@ -4642,8 +7241,13 @@ void TestSparseClipmapTileCache() {
         "clipmap snapshot lookup capacity is power-of-two");
     Check(snapshot.lookup.size() == static_cast<size_t>(snapshot.lookupCapacity) * 4u,
         "clipmap snapshot lookup storage matches capacity");
-    Check(snapshot.samples.size() == static_cast<size_t>(config.maxTiles) * config.tileSampleSide * config.tileSampleSide,
-        "clipmap snapshot sample capacity");
+    Check(snapshot.heightSamplePayloadStartSlot == snapshot.heightDirtyStartSlot,
+        "clipmap dirty height payload starts at dirty slot");
+    Check(snapshot.samples.size() ==
+            static_cast<size_t>(snapshot.heightDirtySlotCount) *
+            config.tileSampleSide *
+            config.tileSampleSide,
+        "clipmap dirty height sample payload is compact");
     Check(snapshot.metadata[0] == 0x56434C50u, "clipmap snapshot magic");
     Check(snapshot.metadata[2] == snapshot.tileCount, "clipmap snapshot header tile count");
     Check((snapshot.metadata[3] & 0x00FFFFFFu) == snapshot.lookupCapacity,
@@ -4662,10 +7266,23 @@ void TestSparseClipmapTileCache() {
     Check(cache.BuildGpuSnapshot(cleanHeightSnapshot), "clipmap snapshot rebuilds after height dirty clear");
     Check(cleanHeightSnapshot.heightDirtySlotCount == 0u,
         "clipmap height dirty slot span clears after upload ack");
+    Check(cleanHeightSnapshot.heightSamplePayloadStartSlot == 0u,
+        "clipmap clean height payload starts at zero");
+    Check(cleanHeightSnapshot.samples.size() ==
+            static_cast<size_t>(config.maxTiles) *
+            config.tileSampleSide *
+            config.tileSampleSide,
+        "clipmap clean height sample payload remains full");
     Check(snapshot.voxelBrickCount > 0, "voxel clipmap generates coarse 3D bricks");
     Check(!snapshot.voxelMetadata.empty(), "voxel clipmap metadata exists");
     Check(!snapshot.voxelLookup.empty(), "voxel clipmap lookup exists");
     Check(!snapshot.voxelSamples.empty(), "voxel clipmap samples exist");
+    Check(snapshot.voxelSamplePayloadStartSlot == snapshot.voxelDirtyStartSlot,
+        "voxel clipmap dirty payload starts at dirty slot");
+    Check(snapshot.voxelSamples.size() ==
+            static_cast<size_t>(snapshot.voxelDirtySlotCount) *
+            SPARSE_BRICK_VOXEL_COUNT,
+        "voxel clipmap dirty sample payload is compact");
     Check(snapshot.voxelMetadata[0] == 0x56435658u, "voxel clipmap snapshot magic");
     Check((snapshot.voxelMetadata[3] & 0x00FFFFFFu) == snapshot.voxelLookupCapacity,
         "voxel clipmap header stores lookup capacity");
@@ -4696,6 +7313,218 @@ void TestSparseClipmapTileCache() {
     Check(nonAirMidSamples > 0, "voxel clipmap snapshot carries non-air coarse samples");
     Check(taggedSurfaceMidSamples > 0, "voxel clipmap tags renderable visual surface samples");
     Check(invalidTaggedAirSamples == 0, "voxel clipmap never tags air as a visual surface");
+
+    auto voxelSampleAt = [](
+        const SparseClipmapGpuSnapshot& gpuSnapshot,
+        uint32_t slot,
+        uint32_t localIndex,
+        uint32_t* outSample) {
+        if (!outSample || localIndex >= SPARSE_BRICK_VOXEL_COUNT) {
+            return false;
+        }
+        uint32_t payloadSlotBase = 0;
+        for (const SparseClipmapSampleRange& range : gpuSnapshot.voxelSampleRanges) {
+            if (slot >= range.startSlot && slot < range.startSlot + range.slotCount) {
+                const uint32_t payloadSlot = payloadSlotBase + (slot - range.startSlot);
+                const size_t sampleIndex =
+                    static_cast<size_t>(payloadSlot) * SPARSE_BRICK_VOXEL_COUNT + localIndex;
+                if (sampleIndex >= gpuSnapshot.voxelSamples.size()) {
+                    return false;
+                }
+                *outSample = gpuSnapshot.voxelSamples[sampleIndex];
+                return true;
+            }
+            payloadSlotBase += range.slotCount;
+        }
+        return false;
+    };
+
+    uint32_t editTargetSlot = UINT32_MAX;
+    uint32_t editTargetLocal = UINT32_MAX;
+    int32_t editTargetOriginX = 0;
+    int32_t editTargetOriginY = 0;
+    int32_t editTargetOriginZ = 0;
+    uint32_t editTargetCellSize = 0;
+    for (uint32_t slot = 0; slot < snapshot.voxelBrickCount && editTargetSlot == UINT32_MAX; ++slot) {
+        const size_t metadataBase = static_cast<size_t>(slot + 1u) * 4u;
+        if (metadataBase + 3u >= snapshot.voxelMetadata.size()) {
+            break;
+        }
+        const uint32_t cellSize = snapshot.voxelMetadata[metadataBase + 3u] >> 8u;
+        if (cellSize <= 1u) {
+            continue;
+        }
+        for (uint32_t local = 0; local < SPARSE_BRICK_VOXEL_COUNT; ++local) {
+            uint32_t sample = 0;
+            if (!voxelSampleAt(snapshot, slot, local, &sample)) {
+                continue;
+            }
+            const uint8_t material = VENPOD::Utils::UnpackMaterial(sample);
+            const bool taggedSurface =
+                (VENPOD::Utils::UnpackState(sample) & VENPOD::Utils::StateFlags::VisualSurface) != 0;
+            if (material != VENPOD::Utils::Material::Air &&
+                material != VENPOD::Utils::Material::Water &&
+                taggedSurface) {
+                editTargetSlot = slot;
+                editTargetLocal = local;
+                editTargetOriginX = static_cast<int32_t>(snapshot.voxelMetadata[metadataBase + 0u]);
+                editTargetOriginY = static_cast<int32_t>(snapshot.voxelMetadata[metadataBase + 1u]);
+                editTargetOriginZ = static_cast<int32_t>(snapshot.voxelMetadata[metadataBase + 2u]);
+                editTargetCellSize = cellSize;
+                break;
+            }
+        }
+    }
+    Check(editTargetSlot != UINT32_MAX, "voxel clipmap test finds coarse editable surface sample");
+    if (editTargetSlot != UINT32_MAX) {
+        const uint32_t localX = editTargetLocal % SPARSE_BRICK_SIZE;
+        const uint32_t localY = (editTargetLocal / SPARSE_BRICK_SIZE) % SPARSE_BRICK_SIZE;
+        const uint32_t localZ = editTargetLocal / (SPARSE_BRICK_SIZE * SPARSE_BRICK_SIZE);
+        const int32_t cellMinX = editTargetOriginX + static_cast<int32_t>(localX * editTargetCellSize);
+        const int32_t cellMinY = editTargetOriginY + static_cast<int32_t>(localY * editTargetCellSize);
+        const int32_t cellMinZ = editTargetOriginZ + static_cast<int32_t>(localZ * editTargetCellSize);
+        const uint32_t air = VENPOD::Utils::PackVoxel(VENPOD::Utils::Material::Air, 0, 0, 0);
+
+        SparseEditStore singleAirEdit;
+        singleAirEdit.SetVoxel(cellMinX, cellMinY, cellMinZ, air);
+        cache.SetEditStore(&singleAirEdit);
+        Check(cache.InvalidateEditedOverlays(singleAirEdit, policy) > 0u,
+            "single air edit invalidates overlapping coarse voxel brick");
+        SparseClipmapGpuSnapshot singleAirSnapshot;
+        Check(cache.BuildGpuSnapshot(singleAirSnapshot, false, true),
+            "single air edit coarse voxel snapshot builds");
+        uint32_t singleAirSample = air;
+        Check(voxelSampleAt(singleAirSnapshot, editTargetSlot, editTargetLocal, &singleAirSample),
+            "single air edit target sample is present in dirty voxel payload");
+        Check(VENPOD::Utils::UnpackMaterial(singleAirSample) != VENPOD::Utils::Material::Air,
+            "single air edit does not collapse a coarse mid-clipmap cell");
+
+        SparseEditStore clusteredAirEdits;
+        const uint32_t clusterCount = std::max<uint32_t>(8u, editTargetCellSize);
+        for (uint32_t i = 0; i < clusterCount; ++i) {
+            clusteredAirEdits.SetVoxel(
+                cellMinX + static_cast<int32_t>(i % editTargetCellSize),
+                cellMinY,
+                cellMinZ + static_cast<int32_t>(i / editTargetCellSize),
+                air);
+        }
+        cache.SetEditStore(&clusteredAirEdits);
+        Check(cache.InvalidateEditedOverlays(clusteredAirEdits, policy) > 0u,
+            "clustered air edits invalidate overlapping coarse voxel brick");
+        SparseClipmapGpuSnapshot clusteredAirSnapshot;
+        Check(cache.BuildGpuSnapshot(clusteredAirSnapshot, false, true),
+            "clustered air edit coarse voxel snapshot builds");
+        uint32_t clusteredAirSample = 0;
+        Check(voxelSampleAt(clusteredAirSnapshot, editTargetSlot, editTargetLocal, &clusteredAirSample),
+            "clustered air edit target sample is present in dirty voxel payload");
+        Check(VENPOD::Utils::UnpackMaterial(clusteredAirSample) == VENPOD::Utils::Material::Air,
+            "clustered air edits collapse stale coarse procedural terrain to air");
+        cache.SetEditStore(nullptr);
+    }
+
+    SparseClipmapTileCache nonFiniteInterestCache;
+    Check(nonFiniteInterestCache.Initialize(policy.Config()),
+        "clipmap non-finite interest cache initializes");
+    nonFiniteInterestCache.UpdateInterest(
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+        3u,
+        policy,
+        std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::quiet_NaN(),
+        -std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::infinity(),
+        -std::numeric_limits<float>::infinity(),
+        std::numeric_limits<float>::quiet_NaN(),
+        std::numeric_limits<float>::infinity());
+    Check(nonFiniteInterestCache.GetStats().interestedTiles > 0,
+        "clipmap non-finite interest sanitizes height anchors");
+    Check(nonFiniteInterestCache.GetStats().interestedVoxelBricks > 0,
+        "clipmap non-finite interest sanitizes voxel anchors");
+    Check(nonFiniteInterestCache.PumpGeneration(8u, 3u, policy) > 0,
+        "clipmap non-finite interest generates sanitized requests");
+    SparseClipmapGpuSnapshot nonFiniteInterestSnapshot;
+    Check(nonFiniteInterestCache.BuildGpuSnapshot(nonFiniteInterestSnapshot),
+        "clipmap non-finite interest snapshot builds");
+    for (size_t i = 4; i + 3u < nonFiniteInterestSnapshot.metadata.size(); i += 4u) {
+        if (nonFiniteInterestSnapshot.metadata[i + 3u] == 0u) {
+            continue;
+        }
+        const int32_t originX = static_cast<int32_t>(nonFiniteInterestSnapshot.metadata[i + 0u]);
+        const int32_t originZ = static_cast<int32_t>(nonFiniteInterestSnapshot.metadata[i + 1u]);
+        Check(std::abs(originX) < 4096 && std::abs(originZ) < 4096,
+            "clipmap non-finite height interest stays near sanitized origin");
+    }
+    for (size_t i = 4; i + 3u < nonFiniteInterestSnapshot.voxelMetadata.size(); i += 4u) {
+        if ((nonFiniteInterestSnapshot.voxelMetadata[i + 3u] & 0xFFu) == 0u &&
+            nonFiniteInterestSnapshot.voxelMetadata[i + 0u] == 0u &&
+            nonFiniteInterestSnapshot.voxelMetadata[i + 1u] == 0u &&
+            nonFiniteInterestSnapshot.voxelMetadata[i + 2u] == 0u) {
+            continue;
+        }
+        const int32_t originX = static_cast<int32_t>(nonFiniteInterestSnapshot.voxelMetadata[i + 0u]);
+        const int32_t originY = static_cast<int32_t>(nonFiniteInterestSnapshot.voxelMetadata[i + 1u]);
+        const int32_t originZ = static_cast<int32_t>(nonFiniteInterestSnapshot.voxelMetadata[i + 2u]);
+        Check(std::abs(originX) < 4096 && std::abs(originY) < 4096 && std::abs(originZ) < 4096,
+            "clipmap non-finite voxel interest stays near sanitized origin");
+    }
+
+    SparseClipmapTileCache extremeFiniteInterestCache;
+    Check(extremeFiniteInterestCache.Initialize(policy.Config()),
+        "clipmap extreme finite interest cache initializes");
+    extremeFiniteInterestCache.UpdateInterest(
+        1.0e30f,
+        -1.0e30f,
+        1.0e30f,
+        4u,
+        policy,
+        1.0e30f,
+        -1.0e30f,
+        1.0e30f,
+        -1.0e30f,
+        1.0e30f,
+        -1.0e30f,
+        2.0f);
+    Check(extremeFiniteInterestCache.GetStats().interestedTiles > 0,
+        "clipmap extreme finite interest sanitizes height anchors");
+    Check(extremeFiniteInterestCache.GetStats().interestedVoxelBricks > 0,
+        "clipmap extreme finite interest sanitizes voxel anchors");
+    Check(extremeFiniteInterestCache.PumpGeneration(8u, 4u, policy) > 0,
+        "clipmap extreme finite interest generates clamped requests");
+    SparseClipmapGpuSnapshot extremeFiniteInterestSnapshot;
+    Check(extremeFiniteInterestCache.BuildGpuSnapshot(extremeFiniteInterestSnapshot),
+        "clipmap extreme finite interest snapshot builds");
+    for (size_t i = 4; i + 3u < extremeFiniteInterestSnapshot.metadata.size(); i += 4u) {
+        if (extremeFiniteInterestSnapshot.metadata[i + 3u] == 0u) {
+            continue;
+        }
+        const int32_t originX = static_cast<int32_t>(extremeFiniteInterestSnapshot.metadata[i + 0u]);
+        const int32_t originZ = static_cast<int32_t>(extremeFiniteInterestSnapshot.metadata[i + 1u]);
+        Check(originX != std::numeric_limits<int32_t>::min() &&
+              originX != std::numeric_limits<int32_t>::max() &&
+              originZ != std::numeric_limits<int32_t>::min() &&
+              originZ != std::numeric_limits<int32_t>::max(),
+            "clipmap extreme finite height interest avoids saturated origins");
+    }
+    for (size_t i = 4; i + 3u < extremeFiniteInterestSnapshot.voxelMetadata.size(); i += 4u) {
+        if ((extremeFiniteInterestSnapshot.voxelMetadata[i + 3u] & 0xFFu) == 0u &&
+            extremeFiniteInterestSnapshot.voxelMetadata[i + 0u] == 0u &&
+            extremeFiniteInterestSnapshot.voxelMetadata[i + 1u] == 0u &&
+            extremeFiniteInterestSnapshot.voxelMetadata[i + 2u] == 0u) {
+            continue;
+        }
+        const int32_t originX = static_cast<int32_t>(extremeFiniteInterestSnapshot.voxelMetadata[i + 0u]);
+        const int32_t originY = static_cast<int32_t>(extremeFiniteInterestSnapshot.voxelMetadata[i + 1u]);
+        const int32_t originZ = static_cast<int32_t>(extremeFiniteInterestSnapshot.voxelMetadata[i + 2u]);
+        Check(originX != std::numeric_limits<int32_t>::min() &&
+              originX != std::numeric_limits<int32_t>::max() &&
+              originY != std::numeric_limits<int32_t>::min() &&
+              originY != std::numeric_limits<int32_t>::max() &&
+              originZ != std::numeric_limits<int32_t>::min() &&
+              originZ != std::numeric_limits<int32_t>::max(),
+            "clipmap extreme finite voxel interest avoids saturated origins");
+    }
 
     SparseClipmapConfig tightVoxelConfig = config;
     tightVoxelConfig.ringCount = 4;
@@ -4756,21 +7585,189 @@ void TestSparseClipmapTileCache() {
         "clipmap records camera-forward height interest anchors");
     Check(lookAheadCache.GetStats().voxelInterestAnchors >= 2u,
         "clipmap records camera-forward voxel interest anchors");
+    auto sortVoxelCoords = [](std::vector<SparseVoxelClipmapCoord>& coords) {
+        std::sort(
+            coords.begin(),
+            coords.end(),
+            [](const SparseVoxelClipmapCoord& lhs, const SparseVoxelClipmapCoord& rhs) {
+                if (lhs.ring != rhs.ring) return lhs.ring < rhs.ring;
+                if (lhs.x != rhs.x) return lhs.x < rhs.x;
+                if (lhs.y != rhs.y) return lhs.y < rhs.y;
+                return lhs.z < rhs.z;
+            });
+    };
+    std::vector<SparseVoxelClipmapCoord> debugMissingBeforeCollection;
+    lookAheadCache.CollectMissingVoxelInterest(debugMissingBeforeCollection);
+    sortVoxelCoords(debugMissingBeforeCollection);
+    const uint32_t debugInterestedBeforeCollection =
+        lookAheadCache.GetStats().interestedVoxelBricks;
+    const uint32_t debugMissingBeforeCollectionCount =
+        lookAheadCache.GetStats().missingInterestedVoxelBricks;
+    std::vector<SparseVoxelClipmapCoord> predictedDebugCoords;
+    const uint32_t predictedDebugCount =
+        lookAheadCache.CollectPredictedVisibleVoxelInterestForDebug(
+            predictedDebugCoords,
+            0.0f,
+            128.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            1.0f,
+            2u,
+            lookAheadPolicy,
+            32u);
+    std::vector<SparseVoxelClipmapCoord> predictedPureDebugCoords;
+    const uint32_t predictedPureDebugCount =
+        lookAheadCache.CollectPredictedVisibleVoxelInterestPureForDebug(
+            predictedPureDebugCoords,
+            0.0f,
+            128.0f,
+            0.0f,
+            0.0f,
+            0.0f,
+            1.0f,
+            2u,
+            lookAheadPolicy,
+            32u);
+    std::vector<SparseVoxelClipmapCoord> debugMissingAfterCollection;
+    lookAheadCache.CollectMissingVoxelInterest(debugMissingAfterCollection);
+    sortVoxelCoords(debugMissingAfterCollection);
+    Check(predictedDebugCount == predictedDebugCoords.size(),
+        "clipmap debug predicted collector reports returned coord count");
+    Check(predictedDebugCount > 0u,
+        "clipmap debug predicted collector returns candidate voxel work");
+    Check(predictedPureDebugCount == predictedPureDebugCoords.size(),
+        "clipmap pure predicted collector reports returned coord count");
+    Check(predictedPureDebugCoords == predictedDebugCoords,
+        "clipmap pure predicted collector matches stateful predicted candidate order");
+    Check(lookAheadCache.GetStats().interestedVoxelBricks == debugInterestedBeforeCollection,
+        "clipmap debug predicted collector preserves current voxel interest size");
+    Check(lookAheadCache.GetStats().missingInterestedVoxelBricks == debugMissingBeforeCollectionCount,
+        "clipmap debug predicted collector preserves current missing voxel interest count");
+    Check(debugMissingAfterCollection == debugMissingBeforeCollection,
+        "clipmap debug predicted collector preserves current missing voxel interest set");
+
+    SparseClipmapConfig highAltPredictionConfig;
+    highAltPredictionConfig.enabled = true;
+    highAltPredictionConfig.heightClipmapEnabled = true;
+    highAltPredictionConfig.voxelClipmapEnabled = true;
+    highAltPredictionConfig.startDistance = 1024.0f;
+    highAltPredictionConfig.endDistance = 6400.0f;
+    highAltPredictionConfig.minCellSize = 12.0f;
+    highAltPredictionConfig.nearExitPadding = 12.0f;
+    highAltPredictionConfig.ringCount = 4u;
+    highAltPredictionConfig.tileRadius = 3u;
+    highAltPredictionConfig.tileSampleSide = 33u;
+    highAltPredictionConfig.maxTiles = 256u;
+    highAltPredictionConfig.voxelBrickRadiusXz = 8u;
+    highAltPredictionConfig.voxelBrickRadiusY = 4u;
+    highAltPredictionConfig.maxVoxelBricks = 12288u;
+    highAltPredictionConfig.voxelInterestCapacityPercent = 75u;
+    highAltPredictionConfig.motionLookaheadMinSpeed = 64.0f;
+    highAltPredictionConfig.motionLookaheadSteps = 3u;
+    highAltPredictionConfig.interestUpdateIntervalFrames = 1u;
+    highAltPredictionConfig.backlogAwarePump = true;
+    highAltPredictionConfig.seed = 12345u;
+    SparseClipmapPolicy highAltPredictionPolicy(highAltPredictionConfig);
+    SparseClipmapTileCache highAltPredictionCache;
+    Check(highAltPredictionCache.Initialize(highAltPredictionPolicy.Config()),
+        "high-alt predicted candidate cache initializes");
+    highAltPredictionCache.UpdateInterest(
+        -461.96f,
+        436.82f,
+        874.31f,
+        300u,
+        highAltPredictionPolicy,
+        0.646f,
+        -0.364f,
+        -0.671f,
+        0.0f,
+        0.0f,
+        0.0f,
+        0.0f);
+    highAltPredictionCache.PumpGeneration(
+        highAltPredictionConfig.maxTiles,
+        highAltPredictionConfig.maxVoxelBricks,
+        300u,
+        highAltPredictionPolicy);
+    std::vector<SparseVoxelClipmapCoord> highAltStatefulPredicted;
+    std::vector<SparseVoxelClipmapCoord> highAltPurePredicted;
+    std::vector<SparseVoxelClipmapCoord> highAltPureResidentTouches;
+    const uint32_t highAltStatefulCount =
+        highAltPredictionCache.CollectPredictedVisibleVoxelInterestForDebug(
+            highAltStatefulPredicted,
+            -315.32f,
+            435.00f,
+            -486.55f,
+            0.586f,
+            -0.430f,
+            0.687f,
+            360u,
+            highAltPredictionPolicy,
+            4096u);
+    const uint32_t highAltPureCount =
+        highAltPredictionCache.CollectPredictedVisibleVoxelInterestPureForDebug(
+            highAltPurePredicted,
+            -315.32f,
+            435.00f,
+            -486.55f,
+            0.586f,
+            -0.430f,
+            0.687f,
+            360u,
+            highAltPredictionPolicy,
+            4096u,
+            &highAltPureResidentTouches);
+    if (highAltPurePredicted != highAltStatefulPredicted) {
+        size_t mismatch = 0;
+        while (mismatch < highAltPurePredicted.size() &&
+               mismatch < highAltStatefulPredicted.size() &&
+               highAltPurePredicted[mismatch] == highAltStatefulPredicted[mismatch]) {
+            ++mismatch;
+        }
+        std::cerr << "  high-alt predicted mismatch stateful="
+                  << highAltStatefulPredicted.size() << " pure="
+                  << highAltPurePredicted.size() << " firstMismatch=" << mismatch << '\n';
+        if (mismatch < highAltStatefulPredicted.size()) {
+            const SparseVoxelClipmapCoord& coord = highAltStatefulPredicted[mismatch];
+            std::cerr << "  stateful[" << mismatch << "]=("
+                      << coord.ring << "," << coord.x << "," << coord.y << "," << coord.z << ")\n";
+        }
+        if (mismatch < highAltPurePredicted.size()) {
+            const SparseVoxelClipmapCoord& coord = highAltPurePredicted[mismatch];
+            std::cerr << "  pure[" << mismatch << "]=("
+                      << coord.ring << "," << coord.x << "," << coord.y << "," << coord.z << ")\n";
+        }
+    }
+    Check(highAltStatefulCount == highAltStatefulPredicted.size(),
+        "high-alt stateful predicted collector reports returned coord count");
+    Check(highAltPureCount == highAltPurePredicted.size(),
+        "high-alt pure predicted collector reports returned coord count");
+    Check(highAltPurePredicted == highAltStatefulPredicted,
+        "high-alt pure predicted collector matches stateful predicted candidate order");
+    Check(!highAltPureResidentTouches.empty(),
+        "high-alt pure predicted collector exposes resident touch candidates");
     lookAheadCache.PumpGeneration(128u, 1u, lookAheadPolicy);
     SparseClipmapGpuSnapshot lookAheadSnapshot;
     Check(lookAheadCache.BuildGpuSnapshot(lookAheadSnapshot),
         "clipmap lookahead snapshot builds");
     bool hasForwardHeightTile = false;
+    bool hasViewFanHeightTile = false;
     for (size_t i = 4; i + 3u < lookAheadSnapshot.metadata.size(); i += 4u) {
         if (lookAheadSnapshot.metadata[i + 3u] == 0u) {
             continue;
         }
+        const int32_t originX = static_cast<int32_t>(lookAheadSnapshot.metadata[i + 0u]);
         const int32_t originZ = static_cast<int32_t>(lookAheadSnapshot.metadata[i + 1u]);
         hasForwardHeightTile = hasForwardHeightTile || originZ > 0;
+        hasViewFanHeightTile = hasViewFanHeightTile || (std::abs(originX) > 0 && originZ > 0);
     }
     Check(hasForwardHeightTile,
         "clipmap lookahead queues height tiles ahead of the camera");
+    Check(hasViewFanHeightTile,
+        "clipmap lookahead queues lateral height fan tiles for visible valley walls");
     bool hasForwardVoxelBrick = false;
+    bool hasViewFanVoxelBrick = false;
     for (size_t i = 4; i + 3u < lookAheadSnapshot.voxelMetadata.size(); i += 4u) {
         if ((lookAheadSnapshot.voxelMetadata[i + 3u] & 0xFFu) == 0u &&
             lookAheadSnapshot.voxelMetadata[i + 0u] == 0u &&
@@ -4778,11 +7775,54 @@ void TestSparseClipmapTileCache() {
             lookAheadSnapshot.voxelMetadata[i + 2u] == 0u) {
             continue;
         }
+        const int32_t originX = static_cast<int32_t>(lookAheadSnapshot.voxelMetadata[i + 0u]);
         const int32_t originZ = static_cast<int32_t>(lookAheadSnapshot.voxelMetadata[i + 2u]);
         hasForwardVoxelBrick = hasForwardVoxelBrick || originZ > 0;
+        hasViewFanVoxelBrick = hasViewFanVoxelBrick || (std::abs(originX) > 0 && originZ > 0);
     }
     Check(hasForwardVoxelBrick,
         "clipmap lookahead queues voxel bricks ahead of the camera");
+    Check(hasViewFanVoxelBrick,
+        "clipmap lookahead queues lateral voxel fan bricks for visible valley walls");
+
+    std::vector<SparseVoxelClipmapCoord> currentMissingBeforePrediction;
+    lookAheadCache.CollectMissingVoxelInterest(currentMissingBeforePrediction);
+    sortVoxelCoords(currentMissingBeforePrediction);
+    const uint32_t currentInterestedBeforePrediction =
+        lookAheadCache.GetStats().interestedVoxelBricks;
+    const uint32_t currentMissingBeforePredictionCount =
+        lookAheadCache.GetStats().missingInterestedVoxelBricks;
+    (void)lookAheadCache.QueuePredictedVisibleVoxelInterest(
+        0.0f,
+        128.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+        1.0f,
+        1.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+        1.0f,
+        0.0f,
+        1.0f,
+        1.0f,
+        2u,
+        lookAheadPolicy,
+        32u,
+        5u,
+        0.0f,
+        4u,
+        1u);
+    std::vector<SparseVoxelClipmapCoord> currentMissingAfterPrediction;
+    lookAheadCache.CollectMissingVoxelInterest(currentMissingAfterPrediction);
+    sortVoxelCoords(currentMissingAfterPrediction);
+    Check(lookAheadCache.GetStats().interestedVoxelBricks == currentInterestedBeforePrediction,
+        "clipmap predicted visible admission preserves current voxel interest size");
+    Check(lookAheadCache.GetStats().missingInterestedVoxelBricks == currentMissingBeforePredictionCount,
+        "clipmap predicted visible admission preserves current missing voxel interest count");
+    Check(currentMissingAfterPrediction == currentMissingBeforePrediction,
+        "clipmap predicted visible admission preserves current missing voxel interest set");
 
     SparseClipmapConfig sidewaysConfig = config;
     sidewaysConfig.maxTiles = 32;
@@ -4862,11 +7902,497 @@ void TestSparseClipmapTileCache() {
     }
 }
 
+bool SnapshotHasVoxelCoord(
+    const SparseClipmapGpuSnapshot& snapshot,
+    const SparseVoxelClipmapCoord& target)
+{
+    for (size_t i = 0; i + 3u < snapshot.voxelLookup.size(); i += 4u) {
+        const uint32_t packed = snapshot.voxelLookup[i + 3u];
+        if (packed == 0u) {
+            continue;
+        }
+        const int32_t ring = static_cast<int32_t>(packed >> 24u);
+        const int32_t x = static_cast<int32_t>(snapshot.voxelLookup[i + 0u]);
+        const int32_t y = static_cast<int32_t>(snapshot.voxelLookup[i + 1u]);
+        const int32_t z = static_cast<int32_t>(snapshot.voxelLookup[i + 2u]);
+        if (ring == target.ring && x == target.x && y == target.y && z == target.z) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint32_t ShaderStyleMidVoxelLookupProbeDistance(
+    const SparseClipmapGpuSnapshot& snapshot,
+    const SparseVoxelClipmapCoord& target)
+{
+    if (snapshot.voxelLookupCapacity == 0u ||
+        (snapshot.voxelLookupCapacity & (snapshot.voxelLookupCapacity - 1u)) != 0u) {
+        return UINT32_MAX;
+    }
+    uint32_t hash = 2166136261u;
+    hash = (hash ^ static_cast<uint32_t>(target.ring)) * 16777619u;
+    hash = (hash ^ static_cast<uint32_t>(target.x)) * 16777619u;
+    hash = (hash ^ static_cast<uint32_t>(target.y)) * 16777619u;
+    hash = (hash ^ static_cast<uint32_t>(target.z)) * 16777619u;
+    uint32_t slot = hash & (snapshot.voxelLookupCapacity - 1u);
+    for (uint32_t probe = 0; probe < snapshot.voxelLookupCapacity; ++probe) {
+        const size_t base = static_cast<size_t>(slot) * 4u;
+        if (snapshot.voxelLookup[base + 3u] == 0u) {
+            return UINT32_MAX;
+        }
+        const int32_t ring = static_cast<int32_t>(snapshot.voxelLookup[base + 3u] >> 24u);
+        const int32_t x = static_cast<int32_t>(snapshot.voxelLookup[base + 0u]);
+        const int32_t y = static_cast<int32_t>(snapshot.voxelLookup[base + 1u]);
+        const int32_t z = static_cast<int32_t>(snapshot.voxelLookup[base + 2u]);
+        if (ring == target.ring && x == target.x && y == target.y && z == target.z) {
+            return probe;
+        }
+        slot = (slot + 1u) & (snapshot.voxelLookupCapacity - 1u);
+    }
+    return UINT32_MAX;
+}
+
+void DumpVoxelNeighborhoodForTest(
+    const SparseClipmapGpuSnapshot& snapshot,
+    const SparseVoxelClipmapCoord& target)
+{
+    std::cerr << "  nearby resident voxel coords for target ring="
+              << target.ring << " coord=("
+              << target.x << "," << target.y << "," << target.z << "):";
+    uint32_t count = 0;
+    for (size_t i = 0; i + 3u < snapshot.voxelLookup.size(); i += 4u) {
+        const uint32_t packed = snapshot.voxelLookup[i + 3u];
+        if (packed == 0u) {
+            continue;
+        }
+        const int32_t ring = static_cast<int32_t>(packed >> 24u);
+        const int32_t x = static_cast<int32_t>(snapshot.voxelLookup[i + 0u]);
+        const int32_t y = static_cast<int32_t>(snapshot.voxelLookup[i + 1u]);
+        const int32_t z = static_cast<int32_t>(snapshot.voxelLookup[i + 2u]);
+        if (ring != target.ring ||
+            std::abs(x - target.x) > 2 ||
+            std::abs(y - target.y) > 2 ||
+            std::abs(z - target.z) > 2) {
+            continue;
+        }
+        std::cerr << " (" << x << "," << y << "," << z << ")";
+        if (++count >= 24u) {
+            break;
+        }
+    }
+    std::cerr << '\n';
+}
+
+struct TestVec3 {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+};
+
+TestVec3 operator+(const TestVec3& lhs, const TestVec3& rhs) {
+    return {lhs.x + rhs.x, lhs.y + rhs.y, lhs.z + rhs.z};
+}
+
+TestVec3 operator*(const TestVec3& lhs, double scale) {
+    return {lhs.x * scale, lhs.y * scale, lhs.z * scale};
+}
+
+double Dot(const TestVec3& lhs, const TestVec3& rhs) {
+    return lhs.x * rhs.x + lhs.y * rhs.y + lhs.z * rhs.z;
+}
+
+double Length(const TestVec3& value) {
+    return std::sqrt(Dot(value, value));
+}
+
+TestVec3 Normalize(const TestVec3& value) {
+    const double len = Length(value);
+    if (len <= 0.000001) {
+        return {0.0, 1.0, 0.0};
+    }
+    return {value.x / len, value.y / len, value.z / len};
+}
+
+double MidTestCellSize(uint32_t ring, const SparseClipmapConfig& config) {
+    return static_cast<double>(config.minCellSize) * static_cast<double>(1u << ring);
+}
+
+bool SampleSnapshotMidVoxel(
+    const SparseClipmapGpuSnapshot& snapshot,
+    const SparseClipmapConfig& config,
+    const TestVec3& worldPos,
+    uint32_t ring,
+    uint32_t& outVoxel)
+{
+    outVoxel = VENPOD::Utils::PackVoxel(VENPOD::Utils::Material::Air, 0, 0, 0);
+    if (snapshot.voxelMetadata.size() < 4u ||
+        snapshot.voxelLookupCapacity == 0u ||
+        ring >= config.ringCount) {
+        return false;
+    }
+    const uint32_t brickCount = snapshot.voxelMetadata[2];
+    const double cellSize = MidTestCellSize(ring, config);
+    const double brickWorldSize = cellSize * static_cast<double>(SPARSE_BRICK_SIZE);
+    const SparseVoxelClipmapCoord coord{
+        static_cast<int32_t>(ring),
+        static_cast<int32_t>(std::floor(worldPos.x / brickWorldSize)),
+        static_cast<int32_t>(std::floor(worldPos.y / brickWorldSize)),
+        static_cast<int32_t>(std::floor(worldPos.z / brickWorldSize))
+    };
+    const uint32_t probeDistance = ShaderStyleMidVoxelLookupProbeDistance(snapshot, coord);
+    if (probeDistance >= 8u) {
+        return false;
+    }
+
+    uint32_t hash = 2166136261u;
+    hash = (hash ^ static_cast<uint32_t>(coord.ring)) * 16777619u;
+    hash = (hash ^ static_cast<uint32_t>(coord.x)) * 16777619u;
+    hash = (hash ^ static_cast<uint32_t>(coord.y)) * 16777619u;
+    hash = (hash ^ static_cast<uint32_t>(coord.z)) * 16777619u;
+    uint32_t slot = hash & (snapshot.voxelLookupCapacity - 1u);
+    uint32_t brickIndex = UINT32_MAX;
+    for (uint32_t probe = 0; probe < 8u; ++probe) {
+        const size_t base = static_cast<size_t>(slot) * 4u;
+        const uint32_t packed = snapshot.voxelLookup[base + 3u];
+        if (packed == 0u) {
+            return false;
+        }
+        const int32_t entryRing = static_cast<int32_t>(packed >> 24u);
+        if (entryRing == coord.ring &&
+            static_cast<int32_t>(snapshot.voxelLookup[base + 0u]) == coord.x &&
+            static_cast<int32_t>(snapshot.voxelLookup[base + 1u]) == coord.y &&
+            static_cast<int32_t>(snapshot.voxelLookup[base + 2u]) == coord.z) {
+            brickIndex = (packed & 0x00FFFFFFu) - 1u;
+            break;
+        }
+        slot = (slot + 1u) & (snapshot.voxelLookupCapacity - 1u);
+    }
+    if (brickIndex == UINT32_MAX || brickIndex >= brickCount) {
+        return false;
+    }
+    const size_t metadataBase = static_cast<size_t>(brickIndex + 1u) * 4u;
+    if (metadataBase + 3u >= snapshot.voxelMetadata.size()) {
+        return false;
+    }
+    const int32_t originX = static_cast<int32_t>(snapshot.voxelMetadata[metadataBase + 0u]);
+    const int32_t originY = static_cast<int32_t>(snapshot.voxelMetadata[metadataBase + 1u]);
+    const int32_t originZ = static_cast<int32_t>(snapshot.voxelMetadata[metadataBase + 2u]);
+    const double storedCellSize = static_cast<double>(snapshot.voxelMetadata[metadataBase + 3u] >> 8u);
+    if (storedCellSize < 1.0) {
+        return false;
+    }
+    const double localX = (worldPos.x - static_cast<double>(originX)) / storedCellSize;
+    const double localY = (worldPos.y - static_cast<double>(originY)) / storedCellSize;
+    const double localZ = (worldPos.z - static_cast<double>(originZ)) / storedCellSize;
+    if (localX < 0.0 || localY < 0.0 || localZ < 0.0 ||
+        localX >= static_cast<double>(SPARSE_BRICK_SIZE) ||
+        localY >= static_cast<double>(SPARSE_BRICK_SIZE) ||
+        localZ >= static_cast<double>(SPARSE_BRICK_SIZE)) {
+        return false;
+    }
+    const uint32_t lx = static_cast<uint32_t>(localX);
+    const uint32_t ly = static_cast<uint32_t>(localY);
+    const uint32_t lz = static_cast<uint32_t>(localZ);
+    const size_t sampleIndex =
+        static_cast<size_t>(brickIndex) * SPARSE_BRICK_VOXEL_COUNT +
+        lx + ly * SPARSE_BRICK_SIZE + lz * SPARSE_BRICK_SIZE * SPARSE_BRICK_SIZE;
+    if (sampleIndex >= snapshot.voxelSamples.size()) {
+        return false;
+    }
+    outVoxel = snapshot.voxelSamples[sampleIndex];
+    return true;
+}
+
+bool SampleSnapshotMidVoxelFallback(
+    const SparseClipmapGpuSnapshot& snapshot,
+    const SparseClipmapConfig& config,
+    const TestVec3& worldPos,
+    uint32_t preferredRing,
+    uint32_t& outVoxel,
+    uint32_t& outRing,
+    double& outCellSize)
+{
+    outVoxel = VENPOD::Utils::PackVoxel(VENPOD::Utils::Material::Air, 0, 0, 0);
+    outRing = std::min(preferredRing, config.ringCount - 1u);
+    outCellSize = MidTestCellSize(outRing, config);
+    if (SampleSnapshotMidVoxel(snapshot, config, worldPos, outRing, outVoxel)) {
+        return true;
+    }
+    for (uint32_t offset = 1u; offset <= outRing; ++offset) {
+        const uint32_t finerRing = outRing - offset;
+        if (SampleSnapshotMidVoxel(snapshot, config, worldPos, finerRing, outVoxel)) {
+            outRing = finerRing;
+            outCellSize = MidTestCellSize(outRing, config);
+            return true;
+        }
+    }
+    for (uint32_t coarserRing = outRing + 1u; coarserRing < config.ringCount; ++coarserRing) {
+        if (SampleSnapshotMidVoxel(snapshot, config, worldPos, coarserRing, outVoxel)) {
+            outRing = coarserRing;
+            outCellSize = MidTestCellSize(outRing, config);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsSnapshotMidVoxelAirOrMissing(
+    const SparseClipmapGpuSnapshot& snapshot,
+    const SparseClipmapConfig& config,
+    const TestVec3& worldPos,
+    uint32_t ring)
+{
+    uint32_t voxel = 0;
+    if (!SampleSnapshotMidVoxel(snapshot, config, worldPos, ring, voxel)) {
+        return true;
+    }
+    return VENPOD::Utils::UnpackMaterial(voxel) == VENPOD::Utils::Material::Air;
+}
+
+bool IsSnapshotMidVoxelExposed(
+    const SparseClipmapGpuSnapshot& snapshot,
+    const SparseClipmapConfig& config,
+    const TestVec3& worldPos,
+    uint32_t ring,
+    double cellSize,
+    TestVec3& normal)
+{
+    normal = {0.0, 0.0, 0.0};
+    const TestVec3 dx{cellSize, 0.0, 0.0};
+    const TestVec3 dy{0.0, cellSize, 0.0};
+    const TestVec3 dz{0.0, 0.0, cellSize};
+    if (IsSnapshotMidVoxelAirOrMissing(snapshot, config, worldPos + dx, ring)) normal.x += 1.0;
+    if (IsSnapshotMidVoxelAirOrMissing(snapshot, config, worldPos + dx * -1.0, ring)) normal.x -= 1.0;
+    if (IsSnapshotMidVoxelAirOrMissing(snapshot, config, worldPos + dy, ring)) normal.y += 1.0;
+    if (IsSnapshotMidVoxelAirOrMissing(snapshot, config, worldPos + dy * -1.0, ring)) normal.y -= 1.0;
+    if (IsSnapshotMidVoxelAirOrMissing(snapshot, config, worldPos + dz, ring)) normal.z += 1.0;
+    if (IsSnapshotMidVoxelAirOrMissing(snapshot, config, worldPos + dz * -1.0, ring)) normal.z -= 1.0;
+    const double normalLength = Length(normal);
+    if (normalLength <= 0.001) {
+        normal = {0.0, 1.0, 0.0};
+        return false;
+    }
+    normal = normal * (1.0 / normalLength);
+    return true;
+}
+
+double NextMidVoxelCellBoundaryTCpu(const TestVec3& rayOrigin, const TestVec3& rayDir, double currentT, double cellSize) {
+    const TestVec3 pos = rayOrigin + rayDir * currentT;
+    const TestVec3 cell{
+        std::floor(pos.x / cellSize),
+        std::floor(pos.y / cellSize),
+        std::floor(pos.z / cellSize)
+    };
+    double nextT = 1.0e20;
+    if (std::abs(rayDir.x) > 0.0001) {
+        const double boundaryX = ((rayDir.x > 0.0) ? (cell.x + 1.0) : cell.x) * cellSize;
+        const double tx = (boundaryX - rayOrigin.x) / rayDir.x;
+        if (tx > currentT + 0.01) {
+            nextT = std::min(nextT, tx);
+        }
+    }
+    if (std::abs(rayDir.y) > 0.0001) {
+        const double boundaryY = ((rayDir.y > 0.0) ? (cell.y + 1.0) : cell.y) * cellSize;
+        const double ty = (boundaryY - rayOrigin.y) / rayDir.y;
+        if (ty > currentT + 0.01) {
+            nextT = std::min(nextT, ty);
+        }
+    }
+    if (std::abs(rayDir.z) > 0.0001) {
+        const double boundaryZ = ((rayDir.z > 0.0) ? (cell.z + 1.0) : cell.z) * cellSize;
+        const double tz = (boundaryZ - rayOrigin.z) / rayDir.z;
+        if (tz > currentT + 0.01) {
+            nextT = std::min(nextT, tz);
+        }
+    }
+    if (nextT >= 1.0e19) {
+        return currentT + std::max(cellSize, 4.0);
+    }
+    return std::max(nextT + 0.02, currentT + 0.05);
+}
+
+bool CpuMidVoxelDdaHits(
+    const SparseClipmapGpuSnapshot& snapshot,
+    const SparseClipmapConfig& config,
+    const TestVec3& rayOrigin,
+    const TestVec3& rayDir,
+    double& hitT,
+    std::string& reason)
+{
+    double t = 1800.0;
+    bool previousWasAir = false;
+    for (int step = 0; step < 176 && t < config.endDistance; ++step) {
+        const double normalized = std::clamp((t - config.startDistance) / (config.endDistance - config.startDistance), 0.0, 0.9999);
+        const uint32_t preferredRing = std::min<uint32_t>(
+            static_cast<uint32_t>(std::floor(normalized * static_cast<double>(config.ringCount))),
+            config.ringCount - 1u);
+        const TestVec3 pos = rayOrigin + rayDir * t;
+        uint32_t voxel = 0;
+        uint32_t actualRing = preferredRing;
+        double actualCellSize = MidTestCellSize(actualRing, config);
+        if (!SampleSnapshotMidVoxelFallback(snapshot, config, pos, preferredRing, voxel, actualRing, actualCellSize)) {
+            previousWasAir = true;
+            t += std::max(MidTestCellSize(preferredRing, config) * 1.55, 12.0);
+            continue;
+        }
+        const double nextT = NextMidVoxelCellBoundaryTCpu(rayOrigin, rayDir, t, actualCellSize);
+        const uint8_t material = VENPOD::Utils::UnpackMaterial(voxel);
+        if (material == VENPOD::Utils::Material::Air) {
+            previousWasAir = true;
+            t = std::min(nextT, t + std::max(actualCellSize, 4.0));
+            continue;
+        }
+        const bool taggedSurface =
+            (VENPOD::Utils::UnpackState(voxel) & VENPOD::Utils::StateFlags::VisualSurface) != 0u;
+        TestVec3 normal;
+        const bool exposedSurface = IsSnapshotMidVoxelExposed(
+            snapshot,
+            config,
+            pos,
+            actualRing,
+            actualCellSize,
+            normal);
+        const bool allowVoxelOnlyInteriorFallback = rayDir.y < 0.12 && t >= 1024.0;
+        if (!exposedSurface && !taggedSurface && !previousWasAir && !allowVoxelOnlyInteriorFallback) {
+            reason = "solid_sample_rejected_not_surface";
+            t = std::min(nextT, t + std::max(actualCellSize, 4.0));
+            continue;
+        }
+        if (!exposedSurface) {
+            normal = Normalize({-rayDir.x, std::max(std::abs(rayDir.y), 0.35), -rayDir.z});
+        }
+        const double surfaceMinNormalY = previousWasAir ? -0.48 : -0.18;
+        if (normal.y < surfaceMinNormalY) {
+            reason = "solid_sample_rejected_normal_y_" + std::to_string(normal.y);
+            t = std::min(nextT, t + std::max(actualCellSize, 4.0));
+            continue;
+        }
+        if (taggedSurface || exposedSurface || previousWasAir || allowVoxelOnlyInteriorFallback) {
+            hitT = t;
+            reason = taggedSurface ? "tagged_surface" : (previousWasAir ? "ray_entry_surface" : "exposed_surface");
+            return true;
+        }
+        t = std::min(nextT, t + std::max(actualCellSize, 4.0));
+    }
+    reason = "budget_or_range_exhausted";
+    return false;
+}
+
+void TestSparseClipmapViewCorridorCoversFrame300Skyline() {
+    SparseClipmapConfig config;
+    config.enabled = true;
+    config.heightClipmapEnabled = true;
+    config.voxelClipmapEnabled = true;
+    config.startDistance = 1024.0f;
+    config.endDistance = 6400.0f;
+    config.minCellSize = 12.0f;
+    config.nearExitPadding = 12.0f;
+    config.ringCount = 4u;
+    config.tileRadius = 3u;
+    config.tileSampleSide = 33u;
+    config.maxTiles = 256u;
+    config.voxelBrickRadiusXz = 8u;
+    config.voxelBrickRadiusY = 4u;
+    config.maxVoxelBricks = 12288u;
+    config.voxelInterestCapacityPercent = 75u;
+    config.motionLookaheadMinSpeed = 64.0f;
+    config.motionLookaheadSteps = 3u;
+    config.interestUpdateIntervalFrames = 1u;
+    config.seed = 12345u;
+
+    SparseClipmapPolicy policy(config);
+    SparseClipmapTileCache cache;
+    Check(cache.Initialize(config), "frame300 clipmap view corridor cache initializes");
+    cache.UpdateInterest(
+        192.5f,
+        43.0f,
+        256.5f,
+        300u,
+        policy,
+        0.0f,
+        -0.04f,
+        0.999f,
+        0.0f,
+        0.0f,
+        0.0f,
+        0.0f);
+    cache.PumpGeneration(0u, config.maxVoxelBricks, 300u, policy);
+
+    SparseClipmapGpuSnapshot snapshot;
+    Check(cache.BuildGpuSnapshot(snapshot, false, true),
+        "frame300 clipmap view corridor voxel snapshot builds");
+
+    const SparseVoxelClipmapCoord targets[] = {
+        {0, -4, 1, 11},
+        {0, -4, 1, 12},
+        {0, -6, 1, 10},
+    };
+    SparseTerrainGenerator terrain(config.seed);
+    for (const SparseVoxelClipmapCoord& target : targets) {
+        const float brickWorldSize = config.minCellSize * static_cast<float>(SPARSE_BRICK_SIZE);
+        const int32_t sampleX = static_cast<int32_t>(std::floor((static_cast<float>(target.x) + 0.5f) * brickWorldSize));
+        const int32_t sampleZ = static_cast<int32_t>(std::floor((static_cast<float>(target.z) + 0.5f) * brickWorldSize));
+        const float terrainY = terrain.HeightAt(sampleX, sampleZ);
+        const int32_t terrainCenterY = static_cast<int32_t>(std::floor(terrainY / brickWorldSize));
+        const std::string message =
+            "frame300 skyline target mid voxel brick is resident in view corridor ring=" +
+            std::to_string(target.ring) +
+            " coord=(" +
+            std::to_string(target.x) + "," +
+            std::to_string(target.y) + "," +
+            std::to_string(target.z) + ") terrainCenterY=" +
+            std::to_string(terrainCenterY) +
+            " height=" +
+            std::to_string(terrainY);
+        const bool hasTarget = SnapshotHasVoxelCoord(snapshot, target);
+        if (!hasTarget) {
+            DumpVoxelNeighborhoodForTest(snapshot, target);
+        }
+        Check(hasTarget, message.c_str());
+        if (hasTarget) {
+            const uint32_t probeDistance = ShaderStyleMidVoxelLookupProbeDistance(snapshot, target);
+            const std::string probeMessage =
+                "frame300 skyline target mid voxel brick is reachable by shader lookup probe ring=" +
+                std::to_string(target.ring) +
+                " coord=(" +
+                std::to_string(target.x) + "," +
+                std::to_string(target.y) + "," +
+                std::to_string(target.z) + ") probe=" +
+                std::to_string(probeDistance);
+            Check(probeDistance < 8u, probeMessage.c_str());
+        }
+    }
+
+    const TestVec3 rayOrigin{192.5, 43.0, 256.5};
+    const TestVec3 rays[] = {
+        Normalize({-0.395, 0.120, 0.911}),
+        Normalize({-0.369, 0.114, 0.922}),
+        Normalize({-0.575, 0.087, 0.814}),
+    };
+    for (const TestVec3& ray : rays) {
+        double hitT = 0.0;
+        std::string reason;
+        const bool hit = CpuMidVoxelDdaHits(snapshot, config, rayOrigin, ray, hitT, reason);
+        if (!hit) {
+            std::cerr << "  frame300 skyline CPU mid DDA miss reason=" << reason << '\n';
+        }
+        Check(hit, "frame300 skyline resident mid voxel DDA hits target ray corridor");
+    }
+}
+
 } // namespace
 
 int main() {
     TestBackendParsing();
+    TestVoxelWorldRaycastReadbackLifecycle();
     TestFarVoxelOctreeResidencyMetadata();
+    TestSparseSurfaceIaStreamSizing();
+    TestSparseSurfaceGpuConfigValidation();
+    TestSparseSurfaceGpuCopyRangeValidation();
+    TestSparseSurfaceGpuAbiLayout();
+    TestSparseVoxelGpuConfigValidation();
+    TestSparseVoxelGpuCopyRangeValidation();
     TestCoordinateConversion();
     TestGpuPageEntryLayout();
     TestPageTable();
@@ -4884,6 +8410,7 @@ int main() {
     TestSparseCollisionSupportRequests();
     TestSparseGpuPhysicsProposalApply();
     TestSparseVoxelWorldLifecycle();
+    TestSparseFixedGridReadiness();
     TestSparseRenderDirtyRegions();
     TestSparseLocalPhysics();
     TestSparseBrushEditSemantics();
@@ -4895,6 +8422,7 @@ int main() {
     TestSparseRuntimeBudgetScheduler();
     TestSparseClipmapPolicy();
     TestSparseClipmapTileCache();
+    TestSparseClipmapViewCorridorCoversFrame300Skyline();
 
     if (failures != 0) {
         std::cerr << failures << " sparse core test failure(s)\n";

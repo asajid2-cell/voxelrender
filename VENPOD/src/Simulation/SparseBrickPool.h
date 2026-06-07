@@ -36,6 +36,7 @@ public:
         uint32_t flags = 0,
         uint32_t occupancyWord0 = 0,
         uint32_t occupancyWord1 = 0);
+    bool MarkGpuPageTablePublished(const BrickCoord& coord, uint32_t pageIndex, uint32_t generation);
     bool QueueEviction(const BrickCoord& coord);
     bool Evict(const BrickCoord& coord);
     bool GetRecord(const BrickCoord& coord, BrickResidentRecord* outRecord = nullptr) const;
@@ -45,10 +46,42 @@ public:
     bool TryGetResidentPage(const BrickCoord& coord, uint32_t* outPageIndex = nullptr) const;
     void Touch(const BrickCoord& coord, uint32_t frameIndex);
     bool MarkResidencyClass(const BrickCoord& coord, SparseResidencyClass residencyClass);
+    bool MarkStreamingLane(const BrickCoord& coord, SparseStreamingLane lane);
     bool TouchResidencyClass(
         const BrickCoord& coord,
         SparseResidencyClass residencyClass,
-        uint32_t frameIndex);
+        uint32_t frameIndex,
+        int32_t queuePriority = 0);
+    bool TouchResidencyClassWithStreamingLane(
+        const BrickCoord& coord,
+        SparseResidencyClass residencyClass,
+        SparseStreamingLane streamingLane,
+        uint32_t frameIndex,
+        int32_t queuePriority = 0);
+    bool TouchStreamingLane(
+        const BrickCoord& coord,
+        SparseStreamingLane lane,
+        uint32_t frameIndex,
+        int32_t queuePriority = 0);
+    bool TouchResidencyClassKnownPage(
+        uint32_t pageIndex,
+        const BrickCoord& coord,
+        SparseResidencyClass residencyClass,
+        uint32_t frameIndex,
+        int32_t queuePriority = 0);
+    bool TouchResidencyClassWithStreamingLaneKnownPage(
+        uint32_t pageIndex,
+        const BrickCoord& coord,
+        SparseResidencyClass residencyClass,
+        SparseStreamingLane streamingLane,
+        uint32_t frameIndex,
+        int32_t queuePriority = 0);
+    bool TouchStreamingLaneKnownPage(
+        uint32_t pageIndex,
+        const BrickCoord& coord,
+        SparseStreamingLane lane,
+        uint32_t frameIndex,
+        int32_t queuePriority = 0);
     bool MarkDirty(const BrickCoord& coord);
     bool MarkHasPersistentEdits(const BrickCoord& coord);
 

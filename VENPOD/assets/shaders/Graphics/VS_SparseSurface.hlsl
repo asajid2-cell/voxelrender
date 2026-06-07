@@ -40,7 +40,9 @@ struct VSOutput {
     float4 position : SV_Position;
     float3 normal : NORMAL0;
     nointerpolation uint material : MATERIAL0;
+    nointerpolation uint faceDirection : TEXCOORD2;
     float distance : TEXCOORD0;
+    float3 worldPos : TEXCOORD1;
     float clipDistance : SV_ClipDistance0;
 };
 
@@ -176,6 +178,9 @@ VSOutput main(uint faceVertex : FACEVERTEX, uint instanceId : SV_InstanceID) {
     const float tanHalfFov = tan(frame.cameraPosition.w * 0.5f);
     const float3 cameraToFace = faceCenter - frame.cameraPosition.xyz;
     const float frontFacing = dot(normal, -normalize(cameraToFace));
+    const float surfaceMaxDistance = frame.nearOwnershipParams.w;
+    const float foregroundDistanceClip =
+        surfaceMaxDistance > 0.0f ? surfaceMaxDistance - length(cameraToFace) : 1.0f;
 
     const float ndcDepth = (viewZ - kNearPlane) / (kFarPlane - kNearPlane);
     output.position = float4(
@@ -184,8 +189,10 @@ VSOutput main(uint faceVertex : FACEVERTEX, uint instanceId : SV_InstanceID) {
         ndcDepth * viewZ,
         viewZ);
     output.normal = normal;
+    output.faceDirection = FaceDirection(face);
     output.material = GetMaterial(FaceVoxel(face));
     output.distance = max(viewZ, 0.0f);
-    output.clipDistance = min(viewZ - kNearPlane, frontFacing + 0.0001f);
+    output.worldPos = world;
+    output.clipDistance = min(min(viewZ - kNearPlane, frontFacing + 0.0001f), foregroundDistanceClip);
     return output;
 }

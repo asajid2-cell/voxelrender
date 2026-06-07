@@ -1,8 +1,11 @@
 #include "SparseSurfaceGpuResources.h"
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cstring>
+#include <cmath>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -12,27 +15,516 @@ namespace VENPOD::Graphics {
 
 namespace {
 
-constexpr uint32_t kMaxUploadRingSlots = 3;
 constexpr uint32_t kCullStatsUintCount = 13;
-constexpr uint32_t kMaxSurfaceRecordsPerCluster = 64;
-constexpr uint32_t kMaxSurfaceClusterExtentVoxels = 4096;
+
+bool IsSparseSurfaceRangeTombstone(const Simulation::SparseSurfaceBrickRange& range) {
+    return (range.flags & Simulation::kSparseSurfaceRangeTombstone) != 0u &&
+        (range.flags & Simulation::kSparseSurfaceRangeValid) == 0u;
+}
+
+Simulation::SparseSurfaceBrickRange MakeSparseSurfaceRangeTombstone(
+    const Simulation::BrickCoord& coord)
+{
+    Simulation::SparseSurfaceBrickRange range = {};
+    range.coord = coord;
+    range.flags = Simulation::kSparseSurfaceRangeTombstone;
+    return range;
+}
 
 uint64_t AlignUp(uint64_t value, uint64_t alignment) {
+    if (alignment == 0) {
+        return value;
+    }
+    const uint64_t addend = alignment - 1u;
+    if (value > std::numeric_limits<uint64_t>::max() - addend) {
+        return std::numeric_limits<uint64_t>::max();
+    }
     return (value + alignment - 1u) & ~(alignment - 1u);
 }
 
-bool IsPowerOfTwo(uint32_t value) {
-    return value != 0u && (value & (value - 1u)) == 0u;
+bool AddUint64(uint64_t a, uint64_t b, uint64_t* out) {
+    if (!out || a > std::numeric_limits<uint64_t>::max() - b) {
+        return false;
+    }
+    *out = a + b;
+    return true;
+}
+
+bool AppendAlignedUploadRange(
+    uint64_t currentEnd,
+    uint64_t bytes,
+    uint64_t alignment,
+    uint64_t* outOffset,
+    uint64_t* outEnd)
+{
+    if (!outOffset || !outEnd) {
+        return false;
+    }
+    if (bytes == 0) {
+        *outOffset = currentEnd;
+        *outEnd = currentEnd;
+        return true;
+    }
+    const uint64_t uploadOffset = AlignUp(currentEnd, alignment);
+    uint64_t endOffset = 0;
+    if (!AddUint64(uploadOffset, bytes, &endOffset)) {
+        return false;
+    }
+    *outOffset = uploadOffset;
+    *outEnd = endOffset;
+    return true;
 }
 
 bool SameBytes(const void* lhs, const void* rhs, size_t byteCount) {
     return byteCount == 0 || std::memcmp(lhs, rhs, byteCount) == 0;
 }
 
+float FiniteOr(float value, float fallback) {
+    return std::isfinite(value) ? value : fallback;
+}
+
+float ClampFinite(float value, float fallback, float minValue, float maxValue) {
+    return std::clamp(FiniteOr(value, fallback), minValue, maxValue);
+}
+
+void SanitizeDirection(
+    float* x,
+    float* y,
+    float* z,
+    float fallbackX,
+    float fallbackY,
+    float fallbackZ)
+{
+    if (!x || !y || !z) {
+        return;
+    }
+    const double dx = static_cast<double>(*x);
+    const double dy = static_cast<double>(*y);
+    const double dz = static_cast<double>(*z);
+    const double lengthSq = dx * dx + dy * dy + dz * dz;
+    if (!std::isfinite(*x) ||
+        !std::isfinite(*y) ||
+        !std::isfinite(*z) ||
+        !std::isfinite(lengthSq) ||
+        lengthSq <= 1.0e-12) {
+        *x = fallbackX;
+        *y = fallbackY;
+        *z = fallbackZ;
+        return;
+    }
+    const float invLength = static_cast<float>(1.0 / std::sqrt(lengthSq));
+    *x *= invLength;
+    *y *= invLength;
+    *z *= invLength;
+}
+
+struct CullVec3 {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
+float Dot(const CullVec3& lhs, const CullVec3& rhs) {
+    return lhs.x * rhs.x + lhs.y * rhs.y + lhs.z * rhs.z;
+}
+
+CullVec3 Sub(const CullVec3& lhs, const CullVec3& rhs) {
+    return {lhs.x - rhs.x, lhs.y - rhs.y, lhs.z - rhs.z};
+}
+
+CullVec3 Add(const CullVec3& lhs, const CullVec3& rhs) {
+    return {lhs.x + rhs.x, lhs.y + rhs.y, lhs.z + rhs.z};
+}
+
+CullVec3 Mul(const CullVec3& value, float scale) {
+    return {value.x * scale, value.y * scale, value.z * scale};
+}
+
+float Length(const CullVec3& value) {
+    return std::sqrt(Dot(value, value));
+}
+
+bool DirectionMaskFacesCameraCpu(uint32_t directionMask, const CullVec3& toCamera) {
+    if (directionMask == 0u) {
+        return true;
+    }
+    constexpr float epsilon = 0.25f;
+    if ((directionMask & (1u << 0u)) != 0u && -toCamera.x >= -epsilon) return true;
+    if ((directionMask & (1u << 1u)) != 0u &&  toCamera.x >= -epsilon) return true;
+    if ((directionMask & (1u << 2u)) != 0u && -toCamera.y >= -epsilon) return true;
+    if ((directionMask & (1u << 3u)) != 0u &&  toCamera.y >= -epsilon) return true;
+    if ((directionMask & (1u << 4u)) != 0u && -toCamera.z >= -epsilon) return true;
+    if ((directionMask & (1u << 5u)) != 0u &&  toCamera.z >= -epsilon) return true;
+    return false;
+}
+
+uint32_t ClassifySparseSurfaceClusterCullCpu(
+    const Simulation::SparseSurfaceClusterRecord& cluster,
+    const CullVec3& camera,
+    const CullVec3& forward,
+    const CullVec3& right,
+    const CullVec3& up,
+    float fovYRadians,
+    float aspectRatio,
+    float maxDistance,
+    float padding)
+{
+    constexpr uint32_t kClusterOutside = 0u;
+    constexpr uint32_t kClusterIntersect = 1u;
+    constexpr uint32_t kClusterInside = 2u;
+    constexpr uint32_t kClusterBackface = 3u;
+    if (cluster.recordCount == 0u) {
+        return kClusterOutside;
+    }
+    const CullVec3 brickMin{
+        static_cast<float>(cluster.minX),
+        static_cast<float>(cluster.minY),
+        static_cast<float>(cluster.minZ)};
+    const CullVec3 brickMax{
+        static_cast<float>(cluster.maxX),
+        static_cast<float>(cluster.maxY),
+        static_cast<float>(cluster.maxZ)};
+    const CullVec3 center = Mul(Add(brickMin, brickMax), 0.5f);
+    const CullVec3 half = Mul(Sub(brickMax, brickMin), 0.5f);
+    const CullVec3 extent{
+        std::max(half.x, 1.0f),
+        std::max(half.y, 1.0f),
+        std::max(half.z, 1.0f)};
+    const float radius = Length(extent);
+    const CullVec3 rel = Sub(center, camera);
+    const float viewZ = Dot(rel, forward);
+    const float distanceLimit = std::max(maxDistance, 1.0f) + padding + radius;
+    if (Dot(rel, rel) > distanceLimit * distanceLimit) {
+        return kClusterOutside;
+    }
+    if (viewZ < -radius || viewZ > distanceLimit) {
+        return kClusterOutside;
+    }
+    const float tanHalfFov = std::tan(fovYRadians * 0.5f);
+    const float safeAspect = std::max(aspectRatio, 0.001f);
+    const float viewX = Dot(rel, right);
+    const float viewY = Dot(rel, up);
+    const float xLimit = std::max(viewZ, 0.0f) * tanHalfFov * safeAspect + padding + radius;
+    const float yLimit = std::max(viewZ, 0.0f) * tanHalfFov + padding + radius;
+    if (std::abs(viewX) > xLimit || std::abs(viewY) > yLimit) {
+        return kClusterOutside;
+    }
+    const uint32_t directionMask = Simulation::SparseSurfaceRecordDirectionMask(cluster.flags);
+    if (!DirectionMaskFacesCameraCpu(directionMask, Sub(camera, center))) {
+        return kClusterBackface;
+    }
+    const float insideMaxDistance = std::max(maxDistance, 1.0f) + padding - radius;
+    const float insideXLimit = std::max(viewZ, 0.0f) * tanHalfFov * safeAspect + padding - radius;
+    const float insideYLimit = std::max(viewZ, 0.0f) * tanHalfFov + padding - radius;
+    if (viewZ >= radius &&
+        viewZ <= insideMaxDistance &&
+        insideXLimit > 0.0f &&
+        insideYLimit > 0.0f &&
+        std::abs(viewX) <= insideXLimit &&
+        std::abs(viewY) <= insideYLimit) {
+        return kClusterInside;
+    }
+    return kClusterIntersect;
+}
+
+uint32_t ClassifySparseSurfaceRecordCullCpu(
+    const Simulation::SparseSurfaceRecord& record,
+    const CullVec3& camera,
+    const CullVec3& forward,
+    const CullVec3& right,
+    const CullVec3& up,
+    float fovYRadians,
+    float aspectRatio,
+    float maxDistance,
+    float padding)
+{
+    constexpr uint32_t kStatAccepted = 0u;
+    constexpr uint32_t kStatRejectInvalid = 1u;
+    constexpr uint32_t kStatRejectDistance = 2u;
+    constexpr uint32_t kStatRejectFrustum = 3u;
+    constexpr uint32_t kStatRejectBackface = 11u;
+    if ((record.flags & Simulation::kSparseSurfaceRangeValid) == 0u || record.faceCount == 0u) {
+        return kStatRejectInvalid;
+    }
+    const CullVec3 brickMin{
+        static_cast<float>(record.minX),
+        static_cast<float>(record.minY),
+        static_cast<float>(record.minZ)};
+    const CullVec3 brickMax{
+        static_cast<float>(record.maxX),
+        static_cast<float>(record.maxY),
+        static_cast<float>(record.maxZ)};
+    const CullVec3 center = Mul(Add(brickMin, brickMax), 0.5f);
+    const CullVec3 half = Mul(Sub(brickMax, brickMin), 0.5f);
+    const CullVec3 extent{
+        std::max(half.x, 0.5f),
+        std::max(half.y, 0.5f),
+        std::max(half.z, 0.5f)};
+    const float radius = std::max(Length(extent), 0.5f);
+    const CullVec3 rel = Sub(center, camera);
+    const float viewZ = Dot(rel, forward);
+    const float distanceLimit = std::max(maxDistance, 1.0f) + padding + radius;
+    if (Dot(rel, rel) > distanceLimit * distanceLimit) {
+        return kStatRejectDistance;
+    }
+    if (viewZ < -radius || viewZ > distanceLimit) {
+        return kStatRejectDistance;
+    }
+    const float tanHalfFov = std::tan(fovYRadians * 0.5f);
+    const float safeAspect = std::max(aspectRatio, 0.001f);
+    const float viewX = Dot(rel, right);
+    const float viewY = Dot(rel, up);
+    const float xLimit = std::max(viewZ, 0.0f) * tanHalfFov * safeAspect + padding + radius;
+    const float yLimit = std::max(viewZ, 0.0f) * tanHalfFov + padding + radius;
+    if (std::abs(viewX) > xLimit || std::abs(viewY) > yLimit) {
+        return kStatRejectFrustum;
+    }
+    const uint32_t directionMask = Simulation::SparseSurfaceRecordDirectionMask(record.flags);
+    if (!DirectionMaskFacesCameraCpu(directionMask, Sub(camera, center))) {
+        return kStatRejectBackface;
+    }
+    return kStatAccepted;
+}
+
+void SetSurfaceRecordBoundsFromBrickCoord(
+    const Simulation::BrickCoord& coord,
+    Simulation::SparseSurfaceRecord& record)
+{
+    int32_t minX = 0;
+    int32_t minY = 0;
+    int32_t minZ = 0;
+    int32_t maxX = 0;
+    int32_t maxY = 0;
+    int32_t maxZ = 0;
+    const bool minOk =
+        Simulation::TryWorldVoxelFromBrickLocal(coord.x, 0, &minX) &&
+        Simulation::TryWorldVoxelFromBrickLocal(coord.y, 0, &minY) &&
+        Simulation::TryWorldVoxelFromBrickLocal(coord.z, 0, &minZ);
+    const bool maxOk =
+        Simulation::TryWorldVoxelFromBrickLocal(coord.x, Simulation::SPARSE_BRICK_SIZE - 1u, &maxX) &&
+        Simulation::TryWorldVoxelFromBrickLocal(coord.y, Simulation::SPARSE_BRICK_SIZE - 1u, &maxY) &&
+        Simulation::TryWorldVoxelFromBrickLocal(coord.z, Simulation::SPARSE_BRICK_SIZE - 1u, &maxZ);
+    if (minOk && maxOk) {
+        record.minX = minX;
+        record.minY = minY;
+        record.minZ = minZ;
+        record.maxX = maxX;
+        record.maxY = maxY;
+        record.maxZ = maxZ;
+        return;
+    }
+    record.minX = record.minY = record.minZ = 0;
+    record.maxX = record.maxY = record.maxZ = 0;
+}
+
 } // namespace
 
 SparseSurfaceGpuResources::~SparseSurfaceGpuResources() {
     Shutdown();
+}
+
+void SparseSurfaceGpuResources::RebuildSurfaceRecordLookup() {
+    m_surfaceRecordIndexByCoord.clear();
+    m_surfaceRecordIndexByCoord.reserve(m_surfaceRecordMirror.size());
+    m_surfaceRecordClusterIndex.assign(m_surfaceRecordMirror.size(), UINT32_MAX);
+
+    for (uint32_t recordIndex = 0;
+         recordIndex < static_cast<uint32_t>(m_surfaceRecordMirror.size());
+         ++recordIndex) {
+        const Simulation::SparseSurfaceRecord& record = m_surfaceRecordMirror[recordIndex];
+        if (record.flags == 0u || record.faceCount == 0u) {
+            continue;
+        }
+        m_surfaceRecordIndexByCoord[record.coord] = recordIndex;
+    }
+
+    for (uint32_t clusterIndex = 0;
+         clusterIndex < static_cast<uint32_t>(m_surfaceClusterMirror.size());
+         ++clusterIndex) {
+        const Simulation::SparseSurfaceClusterRecord& cluster =
+            m_surfaceClusterMirror[clusterIndex];
+        const uint64_t clusterEnd =
+            static_cast<uint64_t>(cluster.firstRecord) +
+            static_cast<uint64_t>(cluster.recordCount);
+        const uint32_t recordEnd = static_cast<uint32_t>(
+            std::min<uint64_t>(clusterEnd, m_surfaceRecordClusterIndex.size()));
+        for (uint32_t recordIndex = cluster.firstRecord; recordIndex < recordEnd; ++recordIndex) {
+            m_surfaceRecordClusterIndex[recordIndex] = clusterIndex;
+        }
+    }
+}
+
+bool SparseSurfaceGpuResources::TryGetBrickDebugInfo(
+    const Simulation::BrickCoord& coord,
+    SparseSurfaceGpuBrickDebugInfo* outInfo) const
+{
+    SparseSurfaceGpuBrickDebugInfo info;
+    info.payloadResident = m_payloadResidentCoords.find(coord) != m_payloadResidentCoords.end();
+
+    const auto payloadIt = m_payloadFaceMirrorByCoord.find(coord);
+    if (payloadIt != m_payloadFaceMirrorByCoord.end()) {
+        info.payloadFaceCount = static_cast<uint32_t>(payloadIt->second.size());
+    }
+
+    const auto recordIt = m_surfaceRecordIndexByCoord.find(coord);
+    if (recordIt != m_surfaceRecordIndexByCoord.end() &&
+        recordIt->second < m_surfaceRecordMirror.size()) {
+        const Simulation::SparseSurfaceRecord& record = m_surfaceRecordMirror[recordIt->second];
+        info.surfaceRecordPresent = record.flags != 0u && record.faceCount > 0u;
+        info.surfaceRecordIndex = recordIt->second;
+        info.surfaceRecordFirstFace = record.firstFace;
+        info.surfaceRecordFaceCount = record.faceCount;
+        info.surfaceRecordFlags = record.flags;
+    }
+
+    const auto slotIt = m_drawSlotByCoord.find(coord);
+    if (slotIt != m_drawSlotByCoord.end()) {
+        info.drawSlotPresent = true;
+        info.drawSlot = slotIt->second;
+    }
+
+    if (!m_rangeMirror.empty()) {
+        const uint32_t mask = static_cast<uint32_t>(m_rangeMirror.size() - 1u);
+        uint32_t slot = Simulation::HashBrickCoord32(coord) & mask;
+        for (uint32_t probe = 0; probe < static_cast<uint32_t>(m_rangeMirror.size()); ++probe) {
+            const Simulation::SparseSurfaceBrickRange& range = m_rangeMirror[slot];
+            if (range.flags == 0u) {
+                break;
+            }
+            if (range.coord == coord) {
+                info.rangePresent = true;
+                info.rangeFirstFace = range.firstFace;
+                info.rangeFaceCount = range.faceCount;
+                info.rangeFlags = range.flags;
+                break;
+            }
+            slot = (slot + 1u) & mask;
+        }
+    }
+
+    const bool present =
+        info.payloadResident ||
+        info.surfaceRecordPresent ||
+        info.drawSlotPresent ||
+        info.rangePresent ||
+        info.payloadFaceCount > 0u;
+    if (outInfo) {
+        *outInfo = info;
+    }
+    return present;
+}
+
+bool SparseSurfaceGpuResources::TryClassifyBrickGpuCull(
+    const Simulation::BrickCoord& coord,
+    float cameraX,
+    float cameraY,
+    float cameraZ,
+    float forwardX,
+    float forwardY,
+    float forwardZ,
+    float rightX,
+    float rightY,
+    float rightZ,
+    float upX,
+    float upY,
+    float upZ,
+    float fovYRadians,
+    float aspectRatio,
+    float maxDistance,
+    float padding,
+    SparseSurfaceGpuCullDebugInfo* outInfo) const
+{
+    SparseSurfaceGpuCullDebugInfo info;
+    const auto recordIt = m_surfaceRecordIndexByCoord.find(coord);
+    if (recordIt == m_surfaceRecordIndexByCoord.end() ||
+        recordIt->second >= m_surfaceRecordMirror.size()) {
+        if (outInfo) {
+            *outInfo = info;
+        }
+        return false;
+    }
+
+    float sanitizedForwardX = forwardX;
+    float sanitizedForwardY = forwardY;
+    float sanitizedForwardZ = forwardZ;
+    float sanitizedRightX = rightX;
+    float sanitizedRightY = rightY;
+    float sanitizedRightZ = rightZ;
+    float sanitizedUpX = upX;
+    float sanitizedUpY = upY;
+    float sanitizedUpZ = upZ;
+    SanitizeDirection(
+        &sanitizedForwardX,
+        &sanitizedForwardY,
+        &sanitizedForwardZ,
+        0.0f,
+        0.0f,
+        1.0f);
+    SanitizeDirection(
+        &sanitizedRightX,
+        &sanitizedRightY,
+        &sanitizedRightZ,
+        1.0f,
+        0.0f,
+        0.0f);
+    SanitizeDirection(
+        &sanitizedUpX,
+        &sanitizedUpY,
+        &sanitizedUpZ,
+        0.0f,
+        1.0f,
+        0.0f);
+
+    const CullVec3 camera{
+        FiniteOr(cameraX, 0.0f),
+        FiniteOr(cameraY, 0.0f),
+        FiniteOr(cameraZ, 0.0f)};
+    const CullVec3 forward{sanitizedForwardX, sanitizedForwardY, sanitizedForwardZ};
+    const CullVec3 right{sanitizedRightX, sanitizedRightY, sanitizedRightZ};
+    const CullVec3 up{sanitizedUpX, sanitizedUpY, sanitizedUpZ};
+    const float safeFov = ClampFinite(fovYRadians, 1.0471976f, 0.05f, 3.0f);
+    const float safeAspect = ClampFinite(aspectRatio, 1.7777778f, 0.1f, 10.0f);
+    const float safeMaxDistance = ClampFinite(maxDistance, 16384.0f, 0.0f, 10000000.0f);
+    const float safePadding = ClampFinite(padding, 0.0f, 0.0f, 4096.0f);
+
+    info.hasRecord = true;
+    info.surfaceRecordIndex = recordIt->second;
+    const Simulation::SparseSurfaceRecord& record = m_surfaceRecordMirror[recordIt->second];
+    const uint32_t clusterIndex =
+        recordIt->second < m_surfaceRecordClusterIndex.size()
+            ? m_surfaceRecordClusterIndex[recordIt->second]
+            : UINT32_MAX;
+    if (clusterIndex != UINT32_MAX && clusterIndex < m_surfaceClusterMirror.size()) {
+        info.hasCluster = true;
+        info.clusterIndex = clusterIndex;
+        info.clusterClass = ClassifySparseSurfaceClusterCullCpu(
+            m_surfaceClusterMirror[clusterIndex],
+            camera,
+            forward,
+            right,
+            up,
+            safeFov,
+            safeAspect,
+            safeMaxDistance,
+            safePadding);
+        info.clusterRejected = info.clusterClass == 0u || info.clusterClass == 3u;
+    }
+    info.recordClass = ClassifySparseSurfaceRecordCullCpu(
+        record,
+        camera,
+        forward,
+        right,
+        up,
+        safeFov,
+        safeAspect,
+        safeMaxDistance,
+        safePadding);
+    info.recordRejected = info.recordClass != 0u;
+
+    if (outInfo) {
+        *outInfo = info;
+    }
+    return true;
 }
 
 Result<void> SparseSurfaceGpuResources::Initialize(
@@ -45,22 +537,8 @@ Result<void> SparseSurfaceGpuResources::Initialize(
     if (!device) {
         return Error("SparseSurfaceGpuResources::Initialize - device is null");
     }
-    if (config.maxFaces == 0 || config.maxBrickRanges == 0 || config.maxDrawCommands == 0) {
-        return Error("SparseSurfaceGpuResources::Initialize - capacities must be > 0");
-    }
-    if (config.uploadRingSlots == 0 || config.uploadRingSlots > kMaxUploadRingSlots) {
-        return Error("SparseSurfaceGpuResources::Initialize - uploadRingSlots must be 1..{}", kMaxUploadRingSlots);
-    }
-    if (config.surfaceRecordsPerCluster == 0 || config.surfaceRecordsPerCluster > kMaxSurfaceRecordsPerCluster) {
-        return Error("SparseSurfaceGpuResources::Initialize - surfaceRecordsPerCluster must be 1..{}", kMaxSurfaceRecordsPerCluster);
-    }
-    if (config.surfaceClusterMaxExtentVoxels > kMaxSurfaceClusterExtentVoxels) {
-        return Error(
-            "SparseSurfaceGpuResources::Initialize - surfaceClusterMaxExtentVoxels must be <= {}",
-            kMaxSurfaceClusterExtentVoxels);
-    }
-    if (config.useFixedRangeTable && !IsPowerOfTwo(config.maxBrickRanges)) {
-        return Error("SparseSurfaceGpuResources::Initialize - fixed range table capacity must be power-of-two");
+    if (!ValidateSparseSurfaceGpuConfigForStats(config)) {
+        return Error("SparseSurfaceGpuResources::Initialize - config is outside sparse surface GPU runtime limits");
     }
 
     Shutdown();
@@ -73,6 +551,7 @@ Result<void> SparseSurfaceGpuResources::Initialize(
     m_stats.stableDrawSlotsEnabled = config.useStableDrawSlots;
     m_stats.compactStableDrawCommandsEnabled =
         config.useStableDrawSlots && config.compactStableDrawCommands;
+    m_stats.incrementalMetadataAddsEnabled = config.incrementalMetadataAdds;
     m_stats.gpuCullEnabled = config.useGpuCull;
     m_stats.maxFaces = config.maxFaces;
     m_stats.maxBrickRanges = config.maxBrickRanges;
@@ -299,6 +778,7 @@ void SparseSurfaceGpuResources::Shutdown() {
         readback.Shutdown();
     }
     m_cullStatsReadbackPending = {};
+    m_cullStatsReadbackQueuedFrames = {};
     for (auto& upload : m_uploadRing) {
         upload.Shutdown();
     }
@@ -315,6 +795,8 @@ void SparseSurfaceGpuResources::Shutdown() {
     m_drawArgsMirror.clear();
     m_surfaceRecordMirror.clear();
     m_surfaceClusterMirror.clear();
+    m_surfaceRecordIndexByCoord.clear();
+    m_surfaceRecordClusterIndex.clear();
     m_drawSlotByCoord.clear();
     m_payloadFaceMirrorByCoord.clear();
     m_drawSlotOccupied.clear();
@@ -330,18 +812,15 @@ Result<void> SparseSurfaceGpuResources::CreateVertexIdStream(ID3D12Device* devic
     if (m_config.maxFaces == 0u) {
         return Error("SparseSurfaceGpuResources::CreateVertexIdStream - maxFaces must be > 0");
     }
-    if (m_config.maxFaces > UINT32_MAX / 6u) {
-        return Error("SparseSurfaceGpuResources::CreateVertexIdStream - maxFaces is too large");
+    SparseSurfaceIaStreamSizing sizing;
+    if (!TryBuildSparseSurfaceIaStreamSizing(m_config.maxFaces, sizing)) {
+        return Error("SparseSurfaceGpuResources::CreateVertexIdStream - maxFaces is too large for indexed IA buffers");
     }
 
-    if (m_config.maxFaces > UINT32_MAX / 4u) {
-        return Error("SparseSurfaceGpuResources::CreateVertexIdStream - maxFaces is too large for vertex stream");
-    }
-
-    const uint32_t vertexCount = m_config.maxFaces * 4u;
-    const uint32_t indexCount = m_config.maxFaces * 6u;
-    const uint64_t vertexByteCount = static_cast<uint64_t>(vertexCount) * sizeof(uint32_t);
-    const uint64_t indexByteCount = static_cast<uint64_t>(indexCount) * sizeof(uint32_t);
+    const uint32_t vertexCount = sizing.vertexCount;
+    const uint32_t indexCount = sizing.indexCount;
+    const uint64_t vertexByteCount = sizing.vertexBytes;
+    const uint64_t indexByteCount = sizing.indexBytes;
     auto result = m_vertexIdStream.Initialize(
         device,
         vertexByteCount,
@@ -520,6 +999,1412 @@ void SparseSurfaceGpuResources::BeginFrame(
     m_stats.uploadOverflowLastFrame = false;
 }
 
+bool SparseSurfaceGpuResources::StageDirtyPayloadSnapshot(
+    const Simulation::SparseSurfaceGpuSnapshot& snapshot,
+    SparseSurfaceUploadTicket* outTicket)
+{
+    if (outTicket) {
+        *outTicket = {};
+    }
+    if (!m_stats.initialized ||
+        !m_config.useRangeAllocator ||
+        m_activeUploadSlot >= m_config.uploadRingSlots ||
+        (snapshot.dirtyBricks.empty() && snapshot.removedBricks.empty()) ||
+        m_rangeMirror.empty() ||
+        m_drawArgsMirror.empty() ||
+        m_surfaceRecordMirror.empty() ||
+        m_surfaceClusterMirror.empty() ||
+        !m_config.useFixedRangeTable ||
+        !m_config.useStableDrawSlots ||
+        !m_config.compactStableDrawCommands ||
+        snapshot.serial == 0u) {
+        return false;
+    }
+
+    UploadBuffer& upload = m_uploadRing[m_activeUploadSlot];
+    uint8_t* mapped = static_cast<uint8_t*>(upload.GetMappedData());
+    if (!mapped) {
+        return false;
+    }
+
+    using DirtyStageClock = std::chrono::steady_clock;
+    const auto dirtyStageStartTime = DirtyStageClock::now();
+    const auto dirtyStageElapsedMs = [](
+        DirtyStageClock::time_point begin,
+        DirtyStageClock::time_point end) -> double {
+        return std::chrono::duration<double, std::milli>(end - begin).count();
+    };
+
+    std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash> dirtyCoords;
+    dirtyCoords.reserve(snapshot.dirtyBricks.size());
+    for (const auto& item : snapshot.dirtyBricks) {
+        if (item.serial <= snapshot.serial) {
+            dirtyCoords.insert(item.coord);
+        }
+    }
+    std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash> removedCoords;
+    removedCoords.reserve(snapshot.removedBricks.size());
+    for (const auto& item : snapshot.removedBricks) {
+        if (item.serial <= snapshot.serial) {
+            removedCoords.insert(item.coord);
+        }
+    }
+    std::unordered_map<
+        Simulation::BrickCoord,
+        const Simulation::SparseSurfaceDrawBatch*,
+        Simulation::BrickCoordHash> dirtyBatches;
+    dirtyBatches.reserve(snapshot.drawBatches.size());
+    for (const Simulation::SparseSurfaceDrawBatch& batch : snapshot.drawBatches) {
+        dirtyBatches.emplace(batch.coord, &batch);
+    }
+    std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash> zeroFaceDirtyCoords;
+    zeroFaceDirtyCoords.reserve(snapshot.dirtyBricks.size());
+    for (const auto& item : snapshot.dirtyBricks) {
+        if (item.serial > snapshot.serial) {
+            continue;
+        }
+        auto batchIt = dirtyBatches.find(item.coord);
+        if (batchIt == dirtyBatches.end() ||
+            !batchIt->second ||
+            batchIt->second->faceCount == 0u ||
+            !batchIt->second->faces) {
+            zeroFaceDirtyCoords.insert(item.coord);
+            removedCoords.insert(item.coord);
+        }
+    }
+    if (dirtyCoords.empty() && removedCoords.empty()) {
+        return false;
+    }
+
+    bool dirtyMetadataResizeRequired = false;
+    for (const auto& item : snapshot.dirtyBricks) {
+        if (item.serial > snapshot.serial ||
+            removedCoords.find(item.coord) != removedCoords.end()) {
+            continue;
+        }
+        auto batchIt = dirtyBatches.find(item.coord);
+        if (batchIt == dirtyBatches.end() || !batchIt->second) {
+            continue;
+        }
+        const Simulation::SparseSurfaceDrawBatch& batch = *batchIt->second;
+        Simulation::SparseSurfaceFaceAllocation previousAllocation;
+        const bool hadAllocation = m_faceRangeAllocator.TryGet(batch.coord, &previousAllocation);
+        if (!hadAllocation || previousAllocation.faceCount != batch.faceCount) {
+            dirtyMetadataResizeRequired = true;
+            break;
+        }
+    }
+    const uint64_t uploadWriteOffsetBeforeStage = m_uploadWriteOffset;
+    const Simulation::SparseSurfaceRangeAllocator allocatorBeforeStage = m_faceRangeAllocator;
+    uint64_t writeOffset = AlignUp(m_uploadWriteOffset, 4u);
+    uint32_t copiedPayloadFaceCount = 0;
+    uint32_t copiedPayloadBrickCount = 0;
+    uint32_t patchedPayloadFaceCount = 0;
+    uint32_t patchedPayloadBrickCount = 0;
+    uint32_t patchedPayloadRegionCount = 0;
+    uint32_t deferredPayloadBrickCount = snapshot.deferredDirtyBricks;
+    const uint32_t initialDeferredPayloadBrickCount = deferredPayloadBrickCount;
+    uint32_t newPayloadBrickCount = 0;
+    uint32_t changedRangeSlots = 0;
+    uint32_t changedDrawCommands = 0;
+    uint32_t changedSurfaceRecords = 0;
+    uint32_t changedSurfaceClusters = 0;
+    uint32_t allocationChangedBrickCount = 0;
+    uint32_t mirrorComparableBrickCount = 0;
+    uint32_t cleanMirrorBrickCount = 0;
+    uint32_t changedRunCount = 0;
+    uint32_t changedRunFaceCount = 0;
+    uint32_t fullPayloadCopyBrickCount = 0;
+    uint32_t fullPayloadCopyFaceCount = 0;
+    uint32_t mirrorUpdateBrickCount = 0;
+    uint32_t mirrorUpdateFaceCount = 0;
+    const bool stableDrawMetadataPatchSafe =
+        m_drawSlotOccupied.size() == m_drawArgsMirror.size();
+    const bool incrementalMetadataAddsEnabled =
+        m_config.incrementalMetadataAdds &&
+        stableDrawMetadataPatchSafe &&
+        m_config.useFixedRangeTable &&
+        m_config.useStableDrawSlots &&
+        m_config.compactStableDrawCommands;
+    uint32_t incrementalDrawArgsSize = static_cast<uint32_t>(m_drawArgsMirror.size());
+    uint32_t incrementalDrawSlotOccupiedSize = static_cast<uint32_t>(m_drawSlotOccupied.size());
+    uint32_t incrementalSurfaceRecordSize = static_cast<uint32_t>(m_surfaceRecordMirror.size());
+    uint32_t incrementalSurfaceClusterSize = static_cast<uint32_t>(m_surfaceClusterMirror.size());
+    bool incrementalDrawSlotStateInitialized = false;
+    std::vector<uint32_t> incrementalFreeDrawSlots;
+
+    auto ensureIncrementalDrawSlotState = [&]() {
+        if (incrementalDrawSlotStateInitialized) {
+            return;
+        }
+        incrementalFreeDrawSlots = m_freeDrawSlots;
+        incrementalDrawSlotStateInitialized = true;
+    };
+
+    bool metadataMirrorsInitialized = false;
+    std::vector<Simulation::SparseSurfaceBrickRange> nextRangeMirror;
+    std::vector<Simulation::SparseSurfaceDrawArgs> nextDrawArgsMirror;
+    std::vector<Simulation::SparseSurfaceRecord> nextSurfaceRecordMirror;
+    std::vector<Simulation::SparseSurfaceClusterRecord> nextSurfaceClusterMirror;
+    std::unordered_map<Simulation::BrickCoord, uint32_t, Simulation::BrickCoordHash> nextDrawSlotByCoord;
+    std::vector<uint8_t> nextDrawSlotOccupied;
+    std::vector<uint32_t> nextFreeDrawSlots;
+
+    SparseSurfaceUploadTicket ticket;
+    ticket.valid = true;
+    ticket.ringSlot = m_activeUploadSlot;
+    ticket.serial = snapshot.serial;
+    ticket.hasUploadWriteOffsetRollback = true;
+    ticket.uploadWriteOffsetBeforeStage = uploadWriteOffsetBeforeStage;
+    ticket.hasRangeAllocatorRollback = true;
+    ticket.rangeAllocatorBeforeStage = allocatorBeforeStage;
+    ticket.incrementalMetadataPatches = false;
+
+    bool allocatorStatsBatchActive = false;
+    auto beginAllocatorStatsBatch = [&]() {
+        if (!allocatorStatsBatchActive) {
+            m_faceRangeAllocator.BeginStatsRefreshBatch();
+            allocatorStatsBatchActive = true;
+        }
+    };
+    auto endAllocatorStatsBatch = [&]() {
+        if (allocatorStatsBatchActive) {
+            m_faceRangeAllocator.EndStatsRefreshBatch();
+            allocatorStatsBatchActive = false;
+        }
+    };
+
+    auto failPayloadOnlyStage = [&]() -> bool {
+        endAllocatorStatsBatch();
+        m_uploadWriteOffset = uploadWriteOffsetBeforeStage;
+        m_faceRangeAllocator = allocatorBeforeStage;
+        return false;
+    };
+
+    auto ensureMetadataMirrors = [&]() {
+        if (metadataMirrorsInitialized) {
+            return;
+        }
+        nextRangeMirror = m_rangeMirror;
+        nextDrawArgsMirror = m_drawArgsMirror;
+        nextSurfaceRecordMirror = m_surfaceRecordMirror;
+        nextSurfaceClusterMirror = m_surfaceClusterMirror;
+        nextDrawSlotByCoord = m_drawSlotByCoord;
+        nextDrawSlotOccupied = m_drawSlotOccupied;
+        nextFreeDrawSlots = m_freeDrawSlots;
+        metadataMirrorsInitialized = true;
+    };
+
+    auto appendBufferCopy = [&](
+        const void* source,
+        uint64_t byteCount,
+        uint64_t destOffset,
+        std::vector<SparseSurfaceBufferCopyRegion>& outRegions) -> bool
+    {
+        if (byteCount == 0u) {
+            return true;
+        }
+        uint64_t uploadOffset = 0;
+        uint64_t endOffset = 0;
+        if (!source ||
+            !AppendAlignedUploadRange(writeOffset, byteCount, 4u, &uploadOffset, &endOffset) ||
+            endOffset > upload.GetSize()) {
+            return false;
+        }
+        std::memcpy(mapped + uploadOffset, source, static_cast<size_t>(byteCount));
+        outRegions.push_back({uploadOffset, destOffset, byteCount});
+        writeOffset = endOffset;
+        return true;
+    };
+
+    auto appendRangePatch = [&](
+        uint32_t index,
+        const Simulation::SparseSurfaceBrickRange& value) -> bool {
+        if (!appendBufferCopy(
+                &value,
+                sizeof(Simulation::SparseSurfaceBrickRange),
+                static_cast<uint64_t>(index) * sizeof(Simulation::SparseSurfaceBrickRange),
+                ticket.rangeCopyRegions)) {
+            return false;
+        }
+        ticket.rangeMirrorPatches.push_back({index, value});
+        return true;
+    };
+
+    auto appendDrawPatch = [&](
+        uint32_t index,
+        const Simulation::SparseSurfaceDrawArgs& value) -> bool {
+        if (!appendBufferCopy(
+                &value,
+                sizeof(Simulation::SparseSurfaceDrawArgs),
+                static_cast<uint64_t>(index) * sizeof(Simulation::SparseSurfaceDrawArgs),
+                ticket.drawArgsCopyRegions)) {
+            return false;
+        }
+        ticket.drawArgsMirrorPatches.push_back({index, value});
+        return true;
+    };
+
+    auto appendRecordPatch = [&](
+        uint32_t index,
+        const Simulation::SparseSurfaceRecord& value) -> bool {
+        if (!appendBufferCopy(
+                &value,
+                sizeof(Simulation::SparseSurfaceRecord),
+                static_cast<uint64_t>(index) * sizeof(Simulation::SparseSurfaceRecord),
+                ticket.surfaceRecordCopyRegions)) {
+            return false;
+        }
+        ticket.surfaceRecordMirrorPatches.push_back({index, value});
+        return true;
+    };
+
+    auto appendClusterPatch = [&](
+        uint32_t index,
+        const Simulation::SparseSurfaceClusterRecord& value) -> bool {
+        if (!appendBufferCopy(
+                &value,
+                sizeof(Simulation::SparseSurfaceClusterRecord),
+                static_cast<uint64_t>(index) * sizeof(Simulation::SparseSurfaceClusterRecord),
+                ticket.surfaceClusterCopyRegions)) {
+            return false;
+        }
+        ticket.surfaceClusterMirrorPatches.push_back({index, value});
+        return true;
+    };
+
+    auto allocateIncrementalDrawSlot = [&](
+        const Simulation::BrickCoord& coord,
+        uint32_t* outSlot) -> bool {
+        if (!outSlot) {
+            return false;
+        }
+        ensureIncrementalDrawSlotState();
+        uint32_t slot = UINT32_MAX;
+        if (!incrementalFreeDrawSlots.empty()) {
+            slot = incrementalFreeDrawSlots.back();
+            incrementalFreeDrawSlots.pop_back();
+            if (slot >= m_config.maxDrawCommands) {
+                return false;
+            }
+        } else {
+            if (incrementalDrawSlotOccupiedSize >= m_config.maxDrawCommands) {
+                return false;
+            }
+            slot = incrementalDrawSlotOccupiedSize++;
+        }
+        incrementalDrawArgsSize = std::max(incrementalDrawArgsSize, slot + 1u);
+        incrementalDrawSlotOccupiedSize = std::max(incrementalDrawSlotOccupiedSize, slot + 1u);
+        ticket.drawSlotAssignments.push_back({coord, slot});
+        ticket.drawArgsMirrorSizeAfterPatch =
+            std::max(ticket.drawArgsMirrorSizeAfterPatch, incrementalDrawArgsSize);
+        ticket.drawSlotOccupiedSizeAfterPatch =
+            std::max(ticket.drawSlotOccupiedSizeAfterPatch, incrementalDrawSlotOccupiedSize);
+        *outSlot = slot;
+        return true;
+    };
+
+    auto findRangeSlotIn = [&](
+        const std::vector<Simulation::SparseSurfaceBrickRange>& rangeMirror,
+        const Simulation::BrickCoord& coord,
+        uint32_t* outSlot) -> bool {
+        if (!outSlot ||
+            rangeMirror.empty() ||
+            (rangeMirror.size() & (rangeMirror.size() - 1u)) != 0u) {
+            return false;
+        }
+        const uint32_t mask = static_cast<uint32_t>(rangeMirror.size() - 1u);
+        uint32_t slot = Simulation::HashBrickCoord32(coord) & mask;
+        uint32_t firstTombstone = UINT32_MAX;
+        for (uint32_t probe = 0; probe < rangeMirror.size(); ++probe) {
+            const Simulation::SparseSurfaceBrickRange& entry = rangeMirror[slot];
+            if (entry.flags == 0u || entry.coord == coord) {
+                *outSlot = entry.flags == 0u && firstTombstone != UINT32_MAX
+                    ? firstTombstone
+                    : slot;
+                return true;
+            }
+            if (firstTombstone == UINT32_MAX && IsSparseSurfaceRangeTombstone(entry)) {
+                firstTombstone = slot;
+            }
+            slot = (slot + 1u) & mask;
+        }
+        if (firstTombstone != UINT32_MAX) {
+            *outSlot = firstTombstone;
+            return true;
+        }
+        return false;
+    };
+    auto findRangeSlot = [&](const Simulation::BrickCoord& coord, uint32_t* outSlot) -> bool {
+        return findRangeSlotIn(nextRangeMirror, coord, outSlot);
+    };
+
+    auto buildDrawArgs = [](const Simulation::SparseSurfaceFaceAllocation& allocation) {
+        Simulation::SparseSurfaceDrawArgs args;
+        args.indexCountPerInstance = allocation.faceCount * 6u;
+        args.instanceCount = 1u;
+        args.startIndexLocation = allocation.firstFace * 6u;
+        args.baseVertexLocation = 0;
+        args.startInstanceLocation = 0u;
+        return args;
+    };
+
+    auto buildRecord = [&](const Simulation::BrickCoord& coord,
+                           const Simulation::SparseSurfaceFaceAllocation& allocation,
+                           uint32_t directionMask) {
+        Simulation::SparseSurfaceRecord record;
+        record.coord = coord;
+        record.firstFace = allocation.firstFace;
+        record.faceCount = allocation.faceCount;
+        record.flags = Simulation::SparseSurfacePackRecordFlags(
+            Simulation::kSparseSurfaceRangeValid,
+            directionMask);
+        record.generation = snapshot.serial;
+        SetSurfaceRecordBoundsFromBrickCoord(coord, record);
+        return record;
+    };
+
+    auto buildSingleRecordCluster = [](uint32_t recordIndex, const Simulation::SparseSurfaceRecord& record) {
+        Simulation::SparseSurfaceClusterRecord cluster;
+        cluster.minX = record.minX;
+        cluster.minY = record.minY;
+        cluster.minZ = record.minZ;
+        cluster.maxX = record.maxX;
+        cluster.maxY = record.maxY;
+        cluster.maxZ = record.maxZ;
+        cluster.firstRecord = recordIndex;
+        cluster.recordCount = 1u;
+        cluster.faceCount = record.faceCount;
+        cluster.flags = record.flags;
+        return cluster;
+    };
+
+    auto canPatchExistingAllocationMetadata = [&](
+        const Simulation::BrickCoord& coord,
+        uint32_t faceCount) -> bool {
+        if (!stableDrawMetadataPatchSafe || faceCount == 0u) {
+            return false;
+        }
+        Simulation::SparseSurfaceFaceAllocation previousAllocation;
+        if (!m_faceRangeAllocator.TryGet(coord, &previousAllocation) ||
+            previousAllocation.faceCount == faceCount) {
+            return false;
+        }
+        uint32_t rangeSlot = 0;
+        if (!findRangeSlotIn(m_rangeMirror, coord, &rangeSlot) ||
+            rangeSlot >= m_rangeMirror.size() ||
+            m_rangeMirror[rangeSlot].flags == 0u ||
+            m_rangeMirror[rangeSlot].coord != coord) {
+            return false;
+        }
+        auto drawSlotIt = m_drawSlotByCoord.find(coord);
+        if (drawSlotIt == m_drawSlotByCoord.end() ||
+            drawSlotIt->second >= m_drawArgsMirror.size()) {
+            return false;
+        }
+        auto recordIt = m_surfaceRecordIndexByCoord.find(coord);
+        if (recordIt == m_surfaceRecordIndexByCoord.end() ||
+            recordIt->second >= m_surfaceRecordMirror.size()) {
+            return false;
+        }
+        const Simulation::SparseSurfaceRecord& record =
+            m_surfaceRecordMirror[recordIt->second];
+        if (record.coord != coord ||
+            record.faceCount == 0u ||
+            record.flags == 0u ||
+            recordIt->second >= m_surfaceRecordClusterIndex.size()) {
+            return false;
+        }
+        const uint32_t clusterIndex = m_surfaceRecordClusterIndex[recordIt->second];
+        return clusterIndex != UINT32_MAX &&
+            clusterIndex < m_surfaceClusterMirror.size();
+    };
+
+    bool dirtyMetadataResizePatchable = true;
+    if (dirtyMetadataResizeRequired) {
+        for (const auto& item : snapshot.dirtyBricks) {
+            if (item.serial > snapshot.serial ||
+                removedCoords.find(item.coord) != removedCoords.end()) {
+                continue;
+            }
+            auto batchIt = dirtyBatches.find(item.coord);
+            if (batchIt == dirtyBatches.end() || !batchIt->second) {
+                dirtyMetadataResizePatchable = false;
+                break;
+            }
+            const Simulation::SparseSurfaceDrawBatch& batch = *batchIt->second;
+            Simulation::SparseSurfaceFaceAllocation previousAllocation;
+            const bool hadAllocation =
+                m_faceRangeAllocator.TryGet(batch.coord, &previousAllocation);
+            if (!hadAllocation) {
+                if (!incrementalMetadataAddsEnabled) {
+                    dirtyMetadataResizePatchable = false;
+                    break;
+                }
+                continue;
+            }
+            if (previousAllocation.faceCount != batch.faceCount &&
+                !canPatchExistingAllocationMetadata(batch.coord, batch.faceCount)) {
+                dirtyMetadataResizePatchable = false;
+                break;
+            }
+        }
+    }
+    const bool useIncrementalMetadataPatches =
+        (!removedCoords.empty() ||
+         (dirtyMetadataResizeRequired && dirtyMetadataResizePatchable)) &&
+        (!dirtyMetadataResizeRequired || dirtyMetadataResizePatchable);
+    ticket.incrementalMetadataPatches = useIncrementalMetadataPatches;
+
+    auto stageFaceCopy = [&](
+        const Simulation::SparseSurfaceFaceAllocation& allocation,
+        const Simulation::SparseSurfaceFace* sourceFaces,
+        uint32_t sourceFirstFace,
+        uint32_t destFirstFace,
+        uint32_t faceCount) -> bool
+    {
+        if (faceCount == 0u) {
+            return true;
+        }
+        const uint64_t faceBytes =
+            static_cast<uint64_t>(faceCount) * sizeof(Simulation::SparseSurfaceFace);
+        uint64_t uploadOffset = 0;
+        uint64_t endOffset = 0;
+        const uint64_t sourceEnd =
+            static_cast<uint64_t>(sourceFirstFace) + static_cast<uint64_t>(faceCount);
+        const uint64_t destEnd =
+            static_cast<uint64_t>(destFirstFace) + static_cast<uint64_t>(faceCount);
+        const uint64_t allocationEnd =
+            static_cast<uint64_t>(allocation.firstFace) + static_cast<uint64_t>(allocation.faceCount);
+        if (!AppendAlignedUploadRange(writeOffset, faceBytes, 4u, &uploadOffset, &endOffset) ||
+            endOffset > upload.GetSize() ||
+            !sourceFaces ||
+            sourceEnd > allocation.faceCount ||
+            destFirstFace < allocation.firstFace ||
+            destEnd > allocationEnd) {
+            return false;
+        }
+        std::memcpy(
+            mapped + uploadOffset,
+            sourceFaces + sourceFirstFace,
+            static_cast<size_t>(faceBytes));
+        ticket.faceCopyRegions.push_back({
+            uploadOffset,
+            destFirstFace,
+            faceCount
+        });
+        writeOffset = endOffset;
+        return true;
+    };
+
+    std::unordered_set<uint32_t> clustersNeedingPatch;
+    std::unordered_map<uint32_t, Simulation::SparseSurfaceRecord> incrementalRecordOverrides;
+    auto getIncrementalRecord = [&](
+        uint32_t recordIndex) -> const Simulation::SparseSurfaceRecord* {
+        auto overrideIt = incrementalRecordOverrides.find(recordIndex);
+        if (overrideIt != incrementalRecordOverrides.end()) {
+            return &overrideIt->second;
+        }
+        if (recordIndex >= m_surfaceRecordMirror.size()) {
+            return nullptr;
+        }
+        return &m_surfaceRecordMirror[recordIndex];
+    };
+    auto appendIncrementalClusterPatch = [&](uint32_t clusterIndex) -> bool {
+        if (clusterIndex >= m_surfaceClusterMirror.size()) {
+            return true;
+        }
+        Simulation::SparseSurfaceClusterRecord cluster = m_surfaceClusterMirror[clusterIndex];
+        uint32_t faceCount = 0;
+        uint32_t flags = 0;
+        bool hasValidRecord = false;
+        int32_t minX = 0;
+        int32_t minY = 0;
+        int32_t minZ = 0;
+        int32_t maxX = 0;
+        int32_t maxY = 0;
+        int32_t maxZ = 0;
+        const uint64_t clusterEnd =
+            static_cast<uint64_t>(cluster.firstRecord) +
+            static_cast<uint64_t>(cluster.recordCount);
+        const uint32_t recordEnd = static_cast<uint32_t>(
+            std::min<uint64_t>(clusterEnd, m_surfaceRecordMirror.size()));
+        for (uint32_t recordIndex = cluster.firstRecord; recordIndex < recordEnd; ++recordIndex) {
+            const Simulation::SparseSurfaceRecord* record = getIncrementalRecord(recordIndex);
+            if (!record || record->faceCount == 0u || record->flags == 0u) {
+                continue;
+            }
+            faceCount += record->faceCount;
+            flags |= record->flags;
+            if (!hasValidRecord) {
+                minX = record->minX;
+                minY = record->minY;
+                minZ = record->minZ;
+                maxX = record->maxX;
+                maxY = record->maxY;
+                maxZ = record->maxZ;
+                hasValidRecord = true;
+            } else {
+                minX = std::min(minX, record->minX);
+                minY = std::min(minY, record->minY);
+                minZ = std::min(minZ, record->minZ);
+                maxX = std::max(maxX, record->maxX);
+                maxY = std::max(maxY, record->maxY);
+                maxZ = std::max(maxZ, record->maxZ);
+            }
+        }
+        cluster.faceCount = faceCount;
+        cluster.flags = hasValidRecord ? flags : 0u;
+        if (hasValidRecord) {
+            cluster.minX = minX;
+            cluster.minY = minY;
+            cluster.minZ = minZ;
+            cluster.maxX = maxX;
+            cluster.maxY = maxY;
+            cluster.maxZ = maxZ;
+        } else {
+            cluster.minX = cluster.minY = cluster.minZ = 0;
+            cluster.maxX = cluster.maxY = cluster.maxZ = 0;
+        }
+        if (!appendClusterPatch(clusterIndex, cluster)) {
+            return false;
+        }
+        ++changedSurfaceClusters;
+        return true;
+    };
+    auto appendFullMirrorClusterPatch = [&](uint32_t clusterIndex) -> bool {
+        if (clusterIndex >= nextSurfaceClusterMirror.size()) {
+            return true;
+        }
+        Simulation::SparseSurfaceClusterRecord& cluster = nextSurfaceClusterMirror[clusterIndex];
+        uint32_t faceCount = 0;
+        uint32_t flags = 0;
+        bool hasValidRecord = false;
+        int32_t minX = 0;
+        int32_t minY = 0;
+        int32_t minZ = 0;
+        int32_t maxX = 0;
+        int32_t maxY = 0;
+        int32_t maxZ = 0;
+        const uint64_t clusterEnd =
+            static_cast<uint64_t>(cluster.firstRecord) +
+            static_cast<uint64_t>(cluster.recordCount);
+        const uint32_t recordEnd = static_cast<uint32_t>(
+            std::min<uint64_t>(clusterEnd, nextSurfaceRecordMirror.size()));
+        for (uint32_t recordIndex = cluster.firstRecord; recordIndex < recordEnd; ++recordIndex) {
+            const Simulation::SparseSurfaceRecord& record = nextSurfaceRecordMirror[recordIndex];
+            if (record.faceCount == 0u || record.flags == 0u) {
+                continue;
+            }
+            faceCount += record.faceCount;
+            flags |= record.flags;
+            if (!hasValidRecord) {
+                minX = record.minX;
+                minY = record.minY;
+                minZ = record.minZ;
+                maxX = record.maxX;
+                maxY = record.maxY;
+                maxZ = record.maxZ;
+                hasValidRecord = true;
+            } else {
+                minX = std::min(minX, record.minX);
+                minY = std::min(minY, record.minY);
+                minZ = std::min(minZ, record.minZ);
+                maxX = std::max(maxX, record.maxX);
+                maxY = std::max(maxY, record.maxY);
+                maxZ = std::max(maxZ, record.maxZ);
+            }
+        }
+        cluster.faceCount = faceCount;
+        cluster.flags = hasValidRecord ? flags : 0u;
+        if (hasValidRecord) {
+            cluster.minX = minX;
+            cluster.minY = minY;
+            cluster.minZ = minZ;
+            cluster.maxX = maxX;
+            cluster.maxY = maxY;
+            cluster.maxZ = maxZ;
+        } else {
+            cluster.minX = cluster.minY = cluster.minZ = 0;
+            cluster.maxX = cluster.maxY = cluster.maxZ = 0;
+        }
+        if (!appendBufferCopy(
+                &cluster,
+                sizeof(Simulation::SparseSurfaceClusterRecord),
+                static_cast<uint64_t>(clusterIndex) * sizeof(Simulation::SparseSurfaceClusterRecord),
+                ticket.surfaceClusterCopyRegions)) {
+            return false;
+        }
+        ++changedSurfaceClusters;
+        return true;
+    };
+
+    const auto dirtyStageAfterSetupTime = DirtyStageClock::now();
+    beginAllocatorStatsBatch();
+    if (!removedCoords.empty() && useIncrementalMetadataPatches) {
+        ticket.removedBricks.reserve(removedCoords.size());
+        incrementalRecordOverrides.reserve(removedCoords.size() + snapshot.dirtyBricks.size());
+        for (const Simulation::BrickCoord& coord : removedCoords) {
+            ticket.removedBricks.push_back(coord);
+            if (zeroFaceDirtyCoords.find(coord) != zeroFaceDirtyCoords.end()) {
+                ticket.uploadedPayloadBricks.push_back(coord);
+            }
+            m_faceRangeAllocator.Free(coord);
+
+            uint32_t rangeSlot = 0;
+            if (findRangeSlotIn(m_rangeMirror, coord, &rangeSlot) &&
+                rangeSlot < m_rangeMirror.size() &&
+                m_rangeMirror[rangeSlot].flags != 0u &&
+                m_rangeMirror[rangeSlot].coord == coord) {
+                const Simulation::SparseSurfaceBrickRange tombstoneRange =
+                    MakeSparseSurfaceRangeTombstone(coord);
+                if (!appendRangePatch(rangeSlot, tombstoneRange)) {
+                    return failPayloadOnlyStage();
+                }
+                ++changedRangeSlots;
+            }
+
+            auto drawSlotIt = m_drawSlotByCoord.find(coord);
+            if (drawSlotIt != m_drawSlotByCoord.end()) {
+                const uint32_t drawSlot = drawSlotIt->second;
+                ticket.drawSlotRetires.push_back({coord, drawSlot});
+                if (stableDrawMetadataPatchSafe && drawSlot < m_drawArgsMirror.size()) {
+                    const Simulation::SparseSurfaceDrawArgs emptyDraw = {};
+                    if (!appendDrawPatch(drawSlot, emptyDraw)) {
+                        return failPayloadOnlyStage();
+                    }
+                    ++changedDrawCommands;
+                }
+            }
+
+            auto recordIt = m_surfaceRecordIndexByCoord.find(coord);
+            if (recordIt != m_surfaceRecordIndexByCoord.end()) {
+                const uint32_t recordIndex = recordIt->second;
+                if (recordIndex >= m_surfaceRecordMirror.size()) {
+                    return failPayloadOnlyStage();
+                }
+                Simulation::SparseSurfaceRecord record = m_surfaceRecordMirror[recordIndex];
+                if (record.coord != coord || record.faceCount == 0u || record.flags == 0u) {
+                    return failPayloadOnlyStage();
+                }
+                record.firstFace = 0u;
+                record.faceCount = 0u;
+                record.flags = 0u;
+                record.generation = snapshot.serial;
+                record.minX = record.minY = record.minZ = 0;
+                record.maxX = record.maxY = record.maxZ = 0;
+                if (!appendRecordPatch(recordIndex, record)) {
+                    return failPayloadOnlyStage();
+                }
+                incrementalRecordOverrides[recordIndex] = record;
+                ++changedSurfaceRecords;
+                if (recordIndex < m_surfaceRecordClusterIndex.size()) {
+                    const uint32_t clusterIndex = m_surfaceRecordClusterIndex[recordIndex];
+                    if (clusterIndex != UINT32_MAX) {
+                        clustersNeedingPatch.insert(clusterIndex);
+                    }
+                }
+            }
+        }
+
+        for (uint32_t clusterIndex : clustersNeedingPatch) {
+            if (!appendIncrementalClusterPatch(clusterIndex)) {
+                return failPayloadOnlyStage();
+            }
+        }
+    } else if (!removedCoords.empty()) {
+        ensureMetadataMirrors();
+        ticket.removedBricks.reserve(removedCoords.size());
+        for (const Simulation::BrickCoord& coord : removedCoords) {
+            ticket.removedBricks.push_back(coord);
+            if (zeroFaceDirtyCoords.find(coord) != zeroFaceDirtyCoords.end()) {
+                ticket.uploadedPayloadBricks.push_back(coord);
+            }
+            m_faceRangeAllocator.Free(coord);
+
+            uint32_t rangeSlot = 0;
+            if (findRangeSlot(coord, &rangeSlot) &&
+                rangeSlot < nextRangeMirror.size() &&
+                nextRangeMirror[rangeSlot].flags != 0u &&
+                nextRangeMirror[rangeSlot].coord == coord) {
+                nextRangeMirror[rangeSlot] = MakeSparseSurfaceRangeTombstone(coord);
+                if (!appendBufferCopy(
+                        &nextRangeMirror[rangeSlot],
+                        sizeof(Simulation::SparseSurfaceBrickRange),
+                        static_cast<uint64_t>(rangeSlot) * sizeof(Simulation::SparseSurfaceBrickRange),
+                        ticket.rangeCopyRegions)) {
+                    return failPayloadOnlyStage();
+                }
+                ++changedRangeSlots;
+            }
+
+            auto drawSlotIt = nextDrawSlotByCoord.find(coord);
+            if (drawSlotIt != nextDrawSlotByCoord.end()) {
+                const uint32_t drawSlot = drawSlotIt->second;
+                nextDrawSlotByCoord.erase(drawSlotIt);
+                if (drawSlot < nextDrawSlotOccupied.size() && nextDrawSlotOccupied[drawSlot] != 0u) {
+                    nextDrawSlotOccupied[drawSlot] = 0u;
+                    nextFreeDrawSlots.push_back(drawSlot);
+                }
+                if (stableDrawMetadataPatchSafe && drawSlot < nextDrawArgsMirror.size()) {
+                    nextDrawArgsMirror[drawSlot] = {};
+                    if (!appendBufferCopy(
+                            &nextDrawArgsMirror[drawSlot],
+                            sizeof(Simulation::SparseSurfaceDrawArgs),
+                            static_cast<uint64_t>(drawSlot) * sizeof(Simulation::SparseSurfaceDrawArgs),
+                            ticket.drawArgsCopyRegions)) {
+                        return failPayloadOnlyStage();
+                    }
+                    ++changedDrawCommands;
+                }
+            }
+
+            auto recordIt = m_surfaceRecordIndexByCoord.find(coord);
+            if (recordIt != m_surfaceRecordIndexByCoord.end()) {
+                const uint32_t recordIndex = recordIt->second;
+                if (recordIndex >= nextSurfaceRecordMirror.size()) {
+                    return failPayloadOnlyStage();
+                }
+                Simulation::SparseSurfaceRecord& record = nextSurfaceRecordMirror[recordIndex];
+                if (record.coord != coord || record.faceCount == 0u || record.flags == 0u) {
+                    return failPayloadOnlyStage();
+                }
+                record.firstFace = 0u;
+                record.faceCount = 0u;
+                record.flags = 0u;
+                record.generation = snapshot.serial;
+                record.minX = record.minY = record.minZ = 0;
+                record.maxX = record.maxY = record.maxZ = 0;
+                if (!appendBufferCopy(
+                        &record,
+                        sizeof(Simulation::SparseSurfaceRecord),
+                        static_cast<uint64_t>(recordIndex) * sizeof(Simulation::SparseSurfaceRecord),
+                        ticket.surfaceRecordCopyRegions)) {
+                    return failPayloadOnlyStage();
+                }
+                ++changedSurfaceRecords;
+                if (recordIndex < m_surfaceRecordClusterIndex.size()) {
+                    const uint32_t clusterIndex = m_surfaceRecordClusterIndex[recordIndex];
+                    if (clusterIndex != UINT32_MAX) {
+                        clustersNeedingPatch.insert(clusterIndex);
+                    }
+                }
+            }
+        }
+
+        for (uint32_t clusterIndex : clustersNeedingPatch) {
+            if (clusterIndex >= nextSurfaceClusterMirror.size()) {
+                continue;
+            }
+            Simulation::SparseSurfaceClusterRecord& cluster = nextSurfaceClusterMirror[clusterIndex];
+            uint32_t faceCount = 0;
+            uint32_t flags = 0;
+            bool hasValidRecord = false;
+            int32_t minX = 0;
+            int32_t minY = 0;
+            int32_t minZ = 0;
+            int32_t maxX = 0;
+            int32_t maxY = 0;
+            int32_t maxZ = 0;
+            const uint64_t clusterEnd =
+                static_cast<uint64_t>(cluster.firstRecord) +
+                static_cast<uint64_t>(cluster.recordCount);
+            const uint32_t recordEnd = static_cast<uint32_t>(
+                std::min<uint64_t>(clusterEnd, nextSurfaceRecordMirror.size()));
+            for (uint32_t recordIndex = cluster.firstRecord; recordIndex < recordEnd; ++recordIndex) {
+                const Simulation::SparseSurfaceRecord& record = nextSurfaceRecordMirror[recordIndex];
+                if (record.faceCount == 0u || record.flags == 0u) {
+                    continue;
+                }
+                faceCount += record.faceCount;
+                flags |= record.flags;
+                if (!hasValidRecord) {
+                    minX = record.minX;
+                    minY = record.minY;
+                    minZ = record.minZ;
+                    maxX = record.maxX;
+                    maxY = record.maxY;
+                    maxZ = record.maxZ;
+                    hasValidRecord = true;
+                } else {
+                    minX = std::min(minX, record.minX);
+                    minY = std::min(minY, record.minY);
+                    minZ = std::min(minZ, record.minZ);
+                    maxX = std::max(maxX, record.maxX);
+                    maxY = std::max(maxY, record.maxY);
+                    maxZ = std::max(maxZ, record.maxZ);
+                }
+            }
+            cluster.faceCount = faceCount;
+            cluster.flags = hasValidRecord ? flags : 0u;
+            if (hasValidRecord) {
+                cluster.minX = minX;
+                cluster.minY = minY;
+                cluster.minZ = minZ;
+                cluster.maxX = maxX;
+                cluster.maxY = maxY;
+                cluster.maxZ = maxZ;
+            } else {
+                cluster.minX = cluster.minY = cluster.minZ = 0;
+                cluster.maxX = cluster.maxY = cluster.maxZ = 0;
+            }
+            if (!appendBufferCopy(
+                    &cluster,
+                    sizeof(Simulation::SparseSurfaceClusterRecord),
+                    static_cast<uint64_t>(clusterIndex) * sizeof(Simulation::SparseSurfaceClusterRecord),
+                    ticket.surfaceClusterCopyRegions)) {
+                return failPayloadOnlyStage();
+            }
+            ++changedSurfaceClusters;
+        }
+    }
+
+    const auto dirtyStageAfterRemovedTime = DirtyStageClock::now();
+    for (const auto& item : snapshot.dirtyBricks) {
+        if (item.serial > snapshot.serial) {
+            continue;
+        }
+        if (removedCoords.find(item.coord) != removedCoords.end()) {
+            continue;
+        }
+        auto batchIt = dirtyBatches.find(item.coord);
+        if (batchIt == dirtyBatches.end() || !batchIt->second) {
+            return failPayloadOnlyStage();
+        }
+        const Simulation::SparseSurfaceDrawBatch& batch = *batchIt->second;
+        if (batch.faceCount == 0u || !batch.faces) {
+            return failPayloadOnlyStage();
+        }
+
+        Simulation::SparseSurfaceFaceAllocation previousAllocation;
+        const bool hadAllocation = m_faceRangeAllocator.TryGet(batch.coord, &previousAllocation);
+        const bool payloadResident = m_payloadResidentCoords.find(batch.coord) != m_payloadResidentCoords.end();
+        const bool allocationChanged = !hadAllocation || previousAllocation.faceCount != batch.faceCount;
+        if (allocationChanged) {
+            ++allocationChangedBrickCount;
+        }
+        if (allocationChanged && !stableDrawMetadataPatchSafe) {
+            ++deferredPayloadBrickCount;
+            continue;
+        }
+
+        auto mirrorIt = m_payloadFaceMirrorByCoord.find(batch.coord);
+        const bool mirrorUsable =
+            mirrorIt != m_payloadFaceMirrorByCoord.end() &&
+            mirrorIt->second.size() == batch.faceCount;
+        const auto runs = Simulation::BuildSparseSurfaceChangedFaceRuns(
+            mirrorUsable ? batch.faces : nullptr,
+            mirrorUsable ? mirrorIt->second.data() : nullptr,
+            batch.faceCount);
+        if (mirrorUsable) {
+            ++mirrorComparableBrickCount;
+        }
+        uint32_t runFaceCount = 0;
+        for (const auto& run : runs) {
+            runFaceCount += run.faceCount;
+        }
+        changedRunCount += static_cast<uint32_t>(runs.size());
+        changedRunFaceCount += runFaceCount;
+        const uint32_t remainingRegionBudget =
+            m_config.maxPayloadCopyRegionsPerFrame == 0u
+                ? UINT_MAX
+                : m_config.maxPayloadCopyRegionsPerFrame -
+                    std::min<uint32_t>(
+                        m_config.maxPayloadCopyRegionsPerFrame,
+                        static_cast<uint32_t>(ticket.faceCopyRegions.size()));
+        const uint32_t remainingFaceBudget =
+            m_config.maxPayloadCopyFacesPerFrame == 0u
+                ? UINT_MAX
+                : m_config.maxPayloadCopyFacesPerFrame - copiedPayloadFaceCount;
+        const bool canPatch =
+            mirrorUsable &&
+            runs.size() <= remainingRegionBudget &&
+            runFaceCount <= remainingFaceBudget;
+        if (hadAllocation && payloadResident && mirrorUsable && runs.empty()) {
+            ticket.uploadedPayloadBricks.push_back(batch.coord);
+            ++cleanMirrorBrickCount;
+            continue;
+        }
+
+        if (allocationChanged) {
+            const bool regionBudgetAvailable =
+                m_config.maxPayloadCopyRegionsPerFrame == 0u ||
+                copiedPayloadBrickCount < m_config.maxPayloadCopyRegionsPerFrame;
+            const bool faceBudgetAvailable =
+                m_config.maxPayloadCopyFacesPerFrame == 0u ||
+                copiedPayloadFaceCount + batch.faceCount <= m_config.maxPayloadCopyFacesPerFrame ||
+                copiedPayloadBrickCount == 0u;
+            if (!regionBudgetAvailable || !faceBudgetAvailable) {
+                ++deferredPayloadBrickCount;
+                continue;
+            }
+        }
+
+        Simulation::SparseSurfaceFaceAllocation allocation = previousAllocation;
+        if (allocationChanged) {
+            if (!m_faceRangeAllocator.AllocateOrResize(batch.coord, batch.faceCount, &allocation)) {
+                return failPayloadOnlyStage();
+            }
+        }
+
+        if (hadAllocation && payloadResident && canPatch) {
+            for (const auto& run : runs) {
+                uint64_t destFirstFace = 0;
+                if (!AddUint64(allocation.firstFace, run.firstFace, &destFirstFace) ||
+                    destFirstFace > std::numeric_limits<uint32_t>::max()) {
+                    return failPayloadOnlyStage();
+                }
+                if (!stageFaceCopy(
+                        allocation,
+                        batch.faces,
+                        run.firstFace,
+                        static_cast<uint32_t>(destFirstFace),
+                        run.faceCount)) {
+                    return failPayloadOnlyStage();
+                }
+            }
+            copiedPayloadFaceCount += runFaceCount;
+            ++copiedPayloadBrickCount;
+            patchedPayloadFaceCount += runFaceCount;
+            ++patchedPayloadBrickCount;
+            patchedPayloadRegionCount += static_cast<uint32_t>(runs.size());
+        } else {
+            const bool regionBudgetAvailable =
+                m_config.maxPayloadCopyRegionsPerFrame == 0u ||
+                copiedPayloadBrickCount < m_config.maxPayloadCopyRegionsPerFrame;
+            const bool faceBudgetAvailable =
+                m_config.maxPayloadCopyFacesPerFrame == 0u ||
+                copiedPayloadFaceCount + batch.faceCount <= m_config.maxPayloadCopyFacesPerFrame ||
+                copiedPayloadBrickCount == 0u;
+            if (!regionBudgetAvailable || !faceBudgetAvailable) {
+                ++deferredPayloadBrickCount;
+                continue;
+            }
+            if (!stageFaceCopy(
+                    allocation,
+                    batch.faces,
+                    0u,
+                    allocation.firstFace,
+                    batch.faceCount)) {
+                return failPayloadOnlyStage();
+            }
+            copiedPayloadFaceCount += batch.faceCount;
+            ++copiedPayloadBrickCount;
+            fullPayloadCopyFaceCount += batch.faceCount;
+            ++fullPayloadCopyBrickCount;
+        }
+
+        if (allocationChanged) {
+            const uint32_t directionMask = Simulation::BuildSparseSurfaceDirectionMask(
+                batch.faces,
+                batch.faceCount);
+            Simulation::SparseSurfaceBrickRange range;
+            range.coord = batch.coord;
+            range.firstFace = allocation.firstFace;
+            range.faceCount = allocation.faceCount;
+            range.flags = Simulation::SparseSurfacePackRecordFlags(
+                Simulation::kSparseSurfaceRangeValid,
+                directionMask);
+
+            Simulation::SparseSurfaceRecord record = buildRecord(batch.coord, allocation, directionMask);
+            const bool useExistingMetadataPatch =
+                ticket.incrementalMetadataPatches &&
+                canPatchExistingAllocationMetadata(batch.coord, batch.faceCount);
+            const bool useIncrementalNewMetadata =
+                ticket.incrementalMetadataPatches &&
+                incrementalMetadataAddsEnabled &&
+                !useExistingMetadataPatch;
+            if (useExistingMetadataPatch) {
+                uint32_t rangeSlot = 0;
+                if (!findRangeSlotIn(m_rangeMirror, batch.coord, &rangeSlot) ||
+                    rangeSlot >= m_rangeMirror.size() ||
+                    m_rangeMirror[rangeSlot].coord != batch.coord ||
+                    !appendRangePatch(rangeSlot, range)) {
+                    return failPayloadOnlyStage();
+                }
+                ++changedRangeSlots;
+
+                auto drawSlotIt = m_drawSlotByCoord.find(batch.coord);
+                if (drawSlotIt == m_drawSlotByCoord.end() ||
+                    drawSlotIt->second >= m_drawArgsMirror.size()) {
+                    return failPayloadOnlyStage();
+                }
+                const uint32_t drawSlot = drawSlotIt->second;
+                if (!appendDrawPatch(drawSlot, buildDrawArgs(allocation))) {
+                    return failPayloadOnlyStage();
+                }
+                ++changedDrawCommands;
+
+                auto recordIt = m_surfaceRecordIndexByCoord.find(batch.coord);
+                if (recordIt == m_surfaceRecordIndexByCoord.end()) {
+                    return failPayloadOnlyStage();
+                }
+                const uint32_t recordIndex = recordIt->second;
+                if (recordIndex >= m_surfaceRecordMirror.size()) {
+                    return failPayloadOnlyStage();
+                }
+                if (!appendRecordPatch(recordIndex, record)) {
+                    return failPayloadOnlyStage();
+                }
+                incrementalRecordOverrides[recordIndex] = record;
+                ++changedSurfaceRecords;
+
+                if (recordIndex >= m_surfaceRecordClusterIndex.size()) {
+                    return failPayloadOnlyStage();
+                }
+                const uint32_t clusterIndex = m_surfaceRecordClusterIndex[recordIndex];
+                if (clusterIndex == UINT32_MAX ||
+                    !appendIncrementalClusterPatch(clusterIndex)) {
+                    return failPayloadOnlyStage();
+                }
+            } else if (useIncrementalNewMetadata) {
+                uint32_t rangeSlot = 0;
+                if (!findRangeSlotIn(m_rangeMirror, batch.coord, &rangeSlot) ||
+                    rangeSlot >= m_rangeMirror.size() ||
+                    !appendRangePatch(rangeSlot, range)) {
+                    return failPayloadOnlyStage();
+                }
+                ++changedRangeSlots;
+
+                uint32_t drawSlot = UINT32_MAX;
+                if (!allocateIncrementalDrawSlot(batch.coord, &drawSlot)) {
+                    return failPayloadOnlyStage();
+                }
+                if (!appendDrawPatch(drawSlot, buildDrawArgs(allocation))) {
+                    return failPayloadOnlyStage();
+                }
+                ++changedDrawCommands;
+
+                if (incrementalSurfaceRecordSize >= m_config.maxDrawCommands ||
+                    incrementalSurfaceClusterSize >= m_config.maxDrawCommands) {
+                    return failPayloadOnlyStage();
+                }
+                const uint32_t recordIndex = incrementalSurfaceRecordSize++;
+                const uint32_t clusterIndex = incrementalSurfaceClusterSize++;
+                if (!appendRecordPatch(recordIndex, record)) {
+                    return failPayloadOnlyStage();
+                }
+                ++changedSurfaceRecords;
+
+                const Simulation::SparseSurfaceClusterRecord cluster =
+                    buildSingleRecordCluster(recordIndex, record);
+                if (!appendClusterPatch(clusterIndex, cluster)) {
+                    return failPayloadOnlyStage();
+                }
+                ++changedSurfaceClusters;
+                ticket.surfaceRecordMirrorSizeAfterPatch =
+                    std::max(ticket.surfaceRecordMirrorSizeAfterPatch, incrementalSurfaceRecordSize);
+                ticket.surfaceClusterMirrorSizeAfterPatch =
+                    std::max(ticket.surfaceClusterMirrorSizeAfterPatch, incrementalSurfaceClusterSize);
+                ++newPayloadBrickCount;
+            } else {
+                ensureMetadataMirrors();
+                uint32_t rangeSlot = 0;
+                if (!findRangeSlot(batch.coord, &rangeSlot)) {
+                    return failPayloadOnlyStage();
+                }
+                nextRangeMirror[rangeSlot] = range;
+                if (!appendBufferCopy(
+                        &nextRangeMirror[rangeSlot],
+                        sizeof(Simulation::SparseSurfaceBrickRange),
+                        static_cast<uint64_t>(rangeSlot) * sizeof(Simulation::SparseSurfaceBrickRange),
+                        ticket.rangeCopyRegions)) {
+                    return failPayloadOnlyStage();
+                }
+                ++changedRangeSlots;
+
+                auto slotIt = nextDrawSlotByCoord.find(batch.coord);
+                uint32_t drawSlot = UINT32_MAX;
+                const bool newDrawSlot = slotIt == nextDrawSlotByCoord.end();
+                if (newDrawSlot) {
+                    if (!nextFreeDrawSlots.empty()) {
+                        drawSlot = nextFreeDrawSlots.back();
+                        nextFreeDrawSlots.pop_back();
+                        if (drawSlot >= nextDrawSlotOccupied.size()) {
+                            return failPayloadOnlyStage();
+                        }
+                        nextDrawSlotByCoord.emplace(batch.coord, drawSlot);
+                        nextDrawSlotOccupied[drawSlot] = 1u;
+                        if (drawSlot >= nextDrawArgsMirror.size()) {
+                            nextDrawArgsMirror.resize(drawSlot + 1u);
+                        }
+                        nextDrawArgsMirror[drawSlot] = buildDrawArgs(allocation);
+                    } else {
+                        if (nextDrawSlotOccupied.size() >= m_config.maxDrawCommands) {
+                            return failPayloadOnlyStage();
+                        }
+                        drawSlot = static_cast<uint32_t>(nextDrawSlotOccupied.size());
+                        nextDrawSlotByCoord.emplace(batch.coord, drawSlot);
+                        nextDrawSlotOccupied.push_back(1u);
+                        nextDrawArgsMirror.push_back(buildDrawArgs(allocation));
+                    }
+                } else {
+                    drawSlot = slotIt->second;
+                    if (drawSlot >= nextDrawArgsMirror.size()) {
+                        return failPayloadOnlyStage();
+                    }
+                    nextDrawArgsMirror[drawSlot] = buildDrawArgs(allocation);
+                }
+                if (!appendBufferCopy(
+                        &nextDrawArgsMirror[drawSlot],
+                        sizeof(Simulation::SparseSurfaceDrawArgs),
+                        static_cast<uint64_t>(drawSlot) * sizeof(Simulation::SparseSurfaceDrawArgs),
+                        ticket.drawArgsCopyRegions)) {
+                    return failPayloadOnlyStage();
+                }
+                ++changedDrawCommands;
+
+                uint32_t recordIndex = UINT32_MAX;
+                auto recordIt = m_surfaceRecordIndexByCoord.find(batch.coord);
+                if (recordIt != m_surfaceRecordIndexByCoord.end()) {
+                    recordIndex = recordIt->second;
+                }
+                const bool newRecord = recordIndex == UINT32_MAX;
+                if (newRecord) {
+                    if (nextSurfaceRecordMirror.size() >= m_config.maxDrawCommands ||
+                        nextSurfaceClusterMirror.size() >= m_config.maxDrawCommands) {
+                        return failPayloadOnlyStage();
+                    }
+                    recordIndex = static_cast<uint32_t>(nextSurfaceRecordMirror.size());
+                    nextSurfaceRecordMirror.push_back(record);
+                } else {
+                    if (recordIndex >= nextSurfaceRecordMirror.size()) {
+                        return failPayloadOnlyStage();
+                    }
+                    nextSurfaceRecordMirror[recordIndex] = record;
+                }
+                if (!appendBufferCopy(
+                        &nextSurfaceRecordMirror[recordIndex],
+                        sizeof(Simulation::SparseSurfaceRecord),
+                        static_cast<uint64_t>(recordIndex) * sizeof(Simulation::SparseSurfaceRecord),
+                        ticket.surfaceRecordCopyRegions)) {
+                    return failPayloadOnlyStage();
+                }
+                ++changedSurfaceRecords;
+
+                if (newRecord) {
+                    const Simulation::SparseSurfaceClusterRecord cluster =
+                        buildSingleRecordCluster(recordIndex, record);
+                    const uint32_t clusterIndex = static_cast<uint32_t>(nextSurfaceClusterMirror.size());
+                    nextSurfaceClusterMirror.push_back(cluster);
+                    if (!appendBufferCopy(
+                            &nextSurfaceClusterMirror[clusterIndex],
+                            sizeof(Simulation::SparseSurfaceClusterRecord),
+                            static_cast<uint64_t>(clusterIndex) * sizeof(Simulation::SparseSurfaceClusterRecord),
+                            ticket.surfaceClusterCopyRegions)) {
+                        return failPayloadOnlyStage();
+                    }
+                    ++changedSurfaceClusters;
+                } else if (recordIndex < m_surfaceRecordClusterIndex.size()) {
+                    const uint32_t clusterIndex = m_surfaceRecordClusterIndex[recordIndex];
+                    if (clusterIndex != UINT32_MAX &&
+                        !appendFullMirrorClusterPatch(clusterIndex)) {
+                        return failPayloadOnlyStage();
+                    }
+                }
+                if (newDrawSlot || newRecord) {
+                    ++newPayloadBrickCount;
+                }
+            }
+        }
+
+        ticket.uploadedPayloadBricks.push_back(batch.coord);
+        SparseSurfacePayloadMirrorUpdate update;
+        update.coord = batch.coord;
+        update.faces.assign(batch.faces, batch.faces + batch.faceCount);
+        ++mirrorUpdateBrickCount;
+        mirrorUpdateFaceCount += batch.faceCount;
+        ticket.payloadMirrorUpdates.push_back(std::move(update));
+    }
+
+    const auto dirtyStageAfterDirtyLoopTime = DirtyStageClock::now();
+    endAllocatorStatsBatch();
+    if (ticket.uploadedPayloadBricks.empty() &&
+        ticket.removedBricks.empty() &&
+        deferredPayloadBrickCount == 0u) {
+        return failPayloadOnlyStage();
+    }
+    if (deferredPayloadBrickCount > initialDeferredPayloadBrickCount &&
+        copiedPayloadBrickCount == 0u &&
+        patchedPayloadBrickCount == 0u) {
+        return failPayloadOnlyStage();
+    }
+
+    m_uploadWriteOffset = writeOffset;
+    ticket.deferredPayloadBricks = deferredPayloadBrickCount;
+
+    const bool metadataChanged =
+        (metadataMirrorsInitialized &&
+            (newPayloadBrickCount != 0u ||
+             !ticket.removedBricks.empty() ||
+             changedRangeSlots != 0u ||
+             changedDrawCommands != 0u ||
+             changedSurfaceRecords != 0u ||
+             changedSurfaceClusters != 0u)) ||
+        (ticket.incrementalMetadataPatches &&
+            (!ticket.rangeMirrorPatches.empty() ||
+             !ticket.drawArgsMirrorPatches.empty() ||
+             !ticket.surfaceRecordMirrorPatches.empty() ||
+             !ticket.surfaceClusterMirrorPatches.empty() ||
+             !ticket.drawSlotRetires.empty()));
+    const uint32_t removedPayloadBrickCount = static_cast<uint32_t>(ticket.removedBricks.size());
+    const uint32_t metadataRangeCount = metadataChanged
+        ? m_stats.uploadedRanges + newPayloadBrickCount -
+            std::min<uint32_t>(removedPayloadBrickCount, m_stats.uploadedRanges + newPayloadBrickCount)
+        : m_stats.uploadedRanges;
+    const uint32_t metadataVisibleBrickCount = metadataChanged
+        ? m_stats.uploadedVisibleBricks + newPayloadBrickCount -
+            std::min<uint32_t>(
+                removedPayloadBrickCount,
+                m_stats.uploadedVisibleBricks + newPayloadBrickCount)
+        : m_stats.uploadedVisibleBricks;
+    const uint32_t metadataCandidateBrickCount = metadataChanged
+        ? m_stats.uploadedCandidateBricks + newPayloadBrickCount -
+            std::min<uint32_t>(
+                removedPayloadBrickCount,
+                m_stats.uploadedCandidateBricks + newPayloadBrickCount)
+        : m_stats.uploadedCandidateBricks;
+    const uint32_t metadataActiveDrawCount = metadataChanged
+        ? m_stats.uploadedActiveDrawCommands + newPayloadBrickCount -
+            std::min<uint32_t>(
+                removedPayloadBrickCount,
+                m_stats.uploadedActiveDrawCommands + newPayloadBrickCount)
+        : m_stats.uploadedActiveDrawCommands;
+    const auto& stagedAllocatorStatsForTicket = m_faceRangeAllocator.GetStats();
+    ticket.payloadOnly = !metadataChanged;
+    ticket.faceCount = stagedAllocatorStatsForTicket.allocatedCapacity;
+    ticket.rangeCount = metadataRangeCount;
+    ticket.rangeTableCapacity = metadataChanged && !ticket.incrementalMetadataPatches
+        ? static_cast<uint32_t>(nextRangeMirror.size())
+        : m_stats.uploadedRangeTableCapacity;
+    ticket.drawCommandCount = metadataChanged && !ticket.incrementalMetadataPatches
+        ? static_cast<uint32_t>(nextDrawArgsMirror.size())
+        : std::max(m_stats.uploadedDrawCommands, ticket.drawArgsMirrorSizeAfterPatch);
+    ticket.activeDrawCommandCount = metadataActiveDrawCount;
+    ticket.candidateBricks = metadataCandidateBrickCount;
+    ticket.visibleBricks = metadataVisibleBrickCount;
+    ticket.culledBricks = metadataChanged ? snapshot.culledBricks : m_stats.uploadedCulledBricks;
+    if (metadataChanged && !ticket.incrementalMetadataPatches) {
+        ticket.rangeMirrorAfterCopy = std::move(nextRangeMirror);
+        ticket.drawArgsMirrorAfterCopy = std::move(nextDrawArgsMirror);
+        ticket.surfaceRecordMirrorAfterCopy = std::move(nextSurfaceRecordMirror);
+        ticket.surfaceClusterMirrorAfterCopy = std::move(nextSurfaceClusterMirror);
+        ticket.drawSlotByCoordAfterCopy = std::move(nextDrawSlotByCoord);
+        ticket.drawSlotOccupiedAfterCopy = std::move(nextDrawSlotOccupied);
+        ticket.freeDrawSlotsAfterCopy = std::move(nextFreeDrawSlots);
+    }
+
+    m_stats.stagedFacesLastFrame = ticket.faceCount;
+    m_stats.stagedRangesLastFrame = ticket.rangeCount;
+    m_stats.stagedRangeTableCapacityLastFrame = ticket.rangeTableCapacity;
+    m_stats.stagedDrawCommandsLastFrame = ticket.drawCommandCount;
+    m_stats.activeDrawCommandsLastFrame = ticket.activeDrawCommandCount;
+    m_stats.stagedSurfaceRecordsLastFrame = metadataChanged
+        ? (ticket.incrementalMetadataPatches
+            ? std::max(m_stats.uploadedSurfaceRecords, ticket.surfaceRecordMirrorSizeAfterPatch)
+            : static_cast<uint32_t>(ticket.surfaceRecordMirrorAfterCopy.size()))
+        : m_stats.uploadedSurfaceRecords;
+    m_stats.stagedSurfaceClustersLastFrame = metadataChanged
+        ? (ticket.incrementalMetadataPatches
+            ? std::max(m_stats.uploadedSurfaceClusters, ticket.surfaceClusterMirrorSizeAfterPatch)
+            : static_cast<uint32_t>(ticket.surfaceClusterMirrorAfterCopy.size()))
+        : m_stats.uploadedSurfaceClusters;
+    m_stats.stagedRangeCopyRegionsLastFrame = static_cast<uint32_t>(ticket.rangeCopyRegions.size());
+    m_stats.stagedDrawCopyRegionsLastFrame = static_cast<uint32_t>(ticket.drawArgsCopyRegions.size());
+    m_stats.stagedSurfaceRecordCopyRegionsLastFrame =
+        static_cast<uint32_t>(ticket.surfaceRecordCopyRegions.size());
+    m_stats.stagedSurfaceClusterCopyRegionsLastFrame =
+        static_cast<uint32_t>(ticket.surfaceClusterCopyRegions.size());
+    m_stats.skippedCleanRangeSlotsLastFrame =
+        m_stats.uploadedRangeTableCapacity > changedRangeSlots
+            ? m_stats.uploadedRangeTableCapacity - changedRangeSlots
+            : 0u;
+    m_stats.skippedCleanDrawCommandsLastFrame =
+        m_stats.uploadedDrawCommands > changedDrawCommands
+            ? m_stats.uploadedDrawCommands - changedDrawCommands
+            : 0u;
+    m_stats.skippedCleanSurfaceRecordsLastFrame =
+        m_stats.uploadedSurfaceRecords > changedSurfaceRecords
+            ? m_stats.uploadedSurfaceRecords - changedSurfaceRecords
+            : 0u;
+    m_stats.skippedCleanSurfaceClustersLastFrame =
+        m_stats.uploadedSurfaceClusters > changedSurfaceClusters
+            ? m_stats.uploadedSurfaceClusters - changedSurfaceClusters
+            : 0u;
+    m_stats.stagedFaceCopyRegionsLastFrame = static_cast<uint32_t>(ticket.faceCopyRegions.size());
+    m_stats.stagedPayloadPatchBricksLastFrame = patchedPayloadBrickCount;
+    m_stats.stagedPayloadPatchFacesLastFrame = patchedPayloadFaceCount;
+    m_stats.stagedPayloadPatchRegionsLastFrame = patchedPayloadRegionCount;
+    m_stats.stagedDirtyPayloadBricksLastFrame = copiedPayloadBrickCount;
+    m_stats.skippedCleanPayloadBricksLastFrame =
+        m_stats.uploadedRanges > copiedPayloadBrickCount
+            ? m_stats.uploadedRanges - copiedPayloadBrickCount
+            : 0u;
+    m_stats.deferredPayloadBricksLastFrame = deferredPayloadBrickCount;
+    m_stats.pendingDirtyBricksLastFrame = static_cast<uint32_t>(snapshot.dirtyBricks.size());
+    m_stats.pendingRemovedBricksLastFrame = static_cast<uint32_t>(snapshot.removedBricks.size());
+    m_stats.stagedBytesLastFrame = writeOffset - AlignUp(uploadWriteOffsetBeforeStage, 4u);
+    const auto& allocatorStats = m_faceRangeAllocator.GetStats();
+    m_stats.allocatedFaceRanges = allocatorStats.allocationCount;
+    m_stats.allocatedFaceCapacity = allocatorStats.allocatedCapacity;
+    m_stats.freeFaceRanges = allocatorStats.freeRangeCount;
+    m_stats.largestFreeFaceRange = allocatorStats.largestFreeRange;
+    m_stats.pendingRetiredFaceRanges = allocatorStats.pendingRetiredRangeCount;
+    m_stats.pendingRetiredFaceCapacity = allocatorStats.pendingRetiredCapacity;
+    m_stats.faceRangeAllocationFailures = allocatorStats.allocationFailures;
+
+    const auto dirtyStageEndTime = DirtyStageClock::now();
+    const double dirtyStageTotalMs = dirtyStageElapsedMs(dirtyStageStartTime, dirtyStageEndTime);
+    if (dirtyStageTotalMs >= 6.0 ||
+        m_stats.stagedBytesLastFrame >= 256u * 1024u ||
+        copiedPayloadFaceCount >= 8192u) {
+        spdlog::info(
+            "PERF_SPARSE_DIRTY_STAGE serial={} dirty={} removed={} zeroFace={} allocChanged={} "
+            "copyBricks={} copyFaces={} fullCopyBricks={} fullCopyFaces={} patchBricks={} "
+            "patchFaces={} patchRegions={} mirrorCmpBricks={} cleanMirrorBricks={} changedRuns={} "
+            "changedRunFaces={} mirrorUpdateBricks={} mirrorUpdateFaces={} newBricks={} deferred={} "
+            "rangeCopies={} drawCopies={} recordCopies={} clusterCopies={} metadataFull={} metadataIncr={} "
+            "stagedMB={:.2f} setupMs={:.2f} removedMs={:.2f} dirtyLoopMs={:.2f} finalMs={:.2f} totalMs={:.2f}",
+            snapshot.serial,
+            static_cast<uint32_t>(snapshot.dirtyBricks.size()),
+            static_cast<uint32_t>(snapshot.removedBricks.size()),
+            static_cast<uint32_t>(zeroFaceDirtyCoords.size()),
+            allocationChangedBrickCount,
+            copiedPayloadBrickCount,
+            copiedPayloadFaceCount,
+            fullPayloadCopyBrickCount,
+            fullPayloadCopyFaceCount,
+            patchedPayloadBrickCount,
+            patchedPayloadFaceCount,
+            patchedPayloadRegionCount,
+            mirrorComparableBrickCount,
+            cleanMirrorBrickCount,
+            changedRunCount,
+            changedRunFaceCount,
+            mirrorUpdateBrickCount,
+            mirrorUpdateFaceCount,
+            newPayloadBrickCount,
+            deferredPayloadBrickCount,
+            static_cast<uint32_t>(ticket.rangeCopyRegions.size()),
+            static_cast<uint32_t>(ticket.drawArgsCopyRegions.size()),
+            static_cast<uint32_t>(ticket.surfaceRecordCopyRegions.size()),
+            static_cast<uint32_t>(ticket.surfaceClusterCopyRegions.size()),
+            metadataMirrorsInitialized ? 1u : 0u,
+            ticket.incrementalMetadataPatches ? 1u : 0u,
+            static_cast<double>(m_stats.stagedBytesLastFrame) / (1024.0 * 1024.0),
+            dirtyStageElapsedMs(dirtyStageStartTime, dirtyStageAfterSetupTime),
+            dirtyStageElapsedMs(dirtyStageAfterSetupTime, dirtyStageAfterRemovedTime),
+            dirtyStageElapsedMs(dirtyStageAfterRemovedTime, dirtyStageAfterDirtyLoopTime),
+            dirtyStageElapsedMs(dirtyStageAfterDirtyLoopTime, dirtyStageEndTime),
+            dirtyStageTotalMs);
+    }
+
+    if (outTicket) {
+        *outTicket = std::move(ticket);
+    }
+    return true;
+}
+
 bool SparseSurfaceGpuResources::StageSnapshot(
     const Simulation::SparseSurfaceGpuSnapshot& snapshot,
     SparseSurfaceUploadTicket* outTicket)
@@ -530,7 +2415,11 @@ bool SparseSurfaceGpuResources::StageSnapshot(
     if (!m_stats.initialized || m_activeUploadSlot >= m_config.uploadRingSlots) {
         return false;
     }
-    if (snapshot.faces.size() > m_config.maxFaces ||
+    const uint64_t snapshotFaceCount =
+        std::max<uint64_t>(
+            static_cast<uint64_t>(snapshot.faces.size()),
+            static_cast<uint64_t>(snapshot.visibleFaceCount));
+    if (snapshotFaceCount > m_config.maxFaces ||
         snapshot.ranges.size() > m_config.maxBrickRanges ||
         snapshot.drawArgs.size() > m_config.maxDrawCommands ||
         snapshot.surfaceRecords.size() > m_config.maxDrawCommands) {
@@ -545,7 +2434,27 @@ bool SparseSurfaceGpuResources::StageSnapshot(
     }
 
     constexpr uint64_t kUploadAlignment = 256u;
+    const uint64_t uploadWriteOffsetBeforeStage = m_uploadWriteOffset;
     if (m_config.useRangeAllocator) {
+        const Simulation::SparseSurfaceRangeAllocator allocatorBeforeStage = m_faceRangeAllocator;
+        auto failRangeAllocatorStage = [&](bool preserveAllocationFailure = false) -> bool {
+            const uint32_t observedAllocationFailures =
+                m_faceRangeAllocator.GetStats().allocationFailures;
+            m_faceRangeAllocator = allocatorBeforeStage;
+            const auto& allocatorStats = m_faceRangeAllocator.GetStats();
+            m_stats.uploadOverflowLastFrame = true;
+            m_stats.allocatedFaceRanges = allocatorStats.allocationCount;
+            m_stats.allocatedFaceCapacity = allocatorStats.allocatedCapacity;
+            m_stats.freeFaceRanges = allocatorStats.freeRangeCount;
+            m_stats.largestFreeFaceRange = allocatorStats.largestFreeRange;
+            m_stats.pendingRetiredFaceRanges = allocatorStats.pendingRetiredRangeCount;
+            m_stats.pendingRetiredFaceCapacity = allocatorStats.pendingRetiredCapacity;
+            m_stats.faceRangeAllocationFailures = preserveAllocationFailure
+                ? std::max(allocatorStats.allocationFailures, observedAllocationFailures)
+                : allocatorStats.allocationFailures;
+            return false;
+        };
+
         std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash> liveCoords;
         liveCoords.reserve(snapshot.brickFaceCounts.size());
         for (const auto& item : snapshot.brickFaceCounts) {
@@ -566,6 +2475,10 @@ bool SparseSurfaceGpuResources::StageSnapshot(
         ticket.candidateBricks = snapshot.candidateBricks;
         ticket.visibleBricks = snapshot.visibleBricks;
         ticket.culledBricks = snapshot.culledBricks;
+        ticket.hasUploadWriteOffsetRollback = true;
+        ticket.uploadWriteOffsetBeforeStage = uploadWriteOffsetBeforeStage;
+        ticket.hasRangeAllocatorRollback = true;
+        ticket.rangeAllocatorBeforeStage = allocatorBeforeStage;
         ticket.removedBricks.reserve(snapshot.removedBricks.size());
         for (const auto& removed : snapshot.removedBricks) {
             if (removed.serial <= snapshot.serial) {
@@ -672,22 +2585,36 @@ bool SparseSurfaceGpuResources::StageSnapshot(
             return true;
         };
 
+        auto batchFaceData = [&](const Simulation::SparseSurfaceDrawBatch& batch) -> const Simulation::SparseSurfaceFace* {
+            if (batch.faceCount == 0u) {
+                return nullptr;
+            }
+            if (batch.faces) {
+                return batch.faces;
+            }
+            const uint64_t batchFaceEnd =
+                static_cast<uint64_t>(batch.firstFace) + static_cast<uint64_t>(batch.faceCount);
+            if (batchFaceEnd <= snapshot.faces.size()) {
+                return snapshot.faces.data() + batch.firstFace;
+            }
+            return nullptr;
+        };
+
         auto queuePayloadMirrorUpdate = [&](
-            const Simulation::SparseSurfaceDrawBatch& batch)
+            const Simulation::SparseSurfaceDrawBatch& batch,
+            const Simulation::SparseSurfaceFace* batchFaces)
         {
             SparseSurfacePayloadMirrorUpdate update;
             update.coord = batch.coord;
-            if (batch.faceCount > 0u &&
-                static_cast<uint64_t>(batch.firstFace + batch.faceCount) <= snapshot.faces.size()) {
-                update.faces.assign(
-                    snapshot.faces.begin() + batch.firstFace,
-                    snapshot.faces.begin() + batch.firstFace + batch.faceCount);
+            if (batch.faceCount > 0u && batchFaces) {
+                update.faces.assign(batchFaces, batchFaces + batch.faceCount);
             }
             ticket.payloadMirrorUpdates.push_back(std::move(update));
         };
 
         auto stageFaceCopy = [&](
             const Simulation::SparseSurfaceFaceAllocation& allocation,
+            const Simulation::SparseSurfaceFace* sourceFaces,
             uint32_t sourceFirstFace,
             uint32_t destFirstFace,
             uint32_t faceCount) -> bool
@@ -697,17 +2624,25 @@ bool SparseSurfaceGpuResources::StageSnapshot(
             }
             const uint64_t faceBytes =
                 static_cast<uint64_t>(faceCount) * sizeof(Simulation::SparseSurfaceFace);
-            const uint64_t uploadOffset = AlignUp(writeOffset, 4u);
-            const uint64_t endOffset = uploadOffset + faceBytes;
-            if (endOffset > upload.GetSize() ||
-                static_cast<uint64_t>(sourceFirstFace + faceCount) > snapshot.faces.size() ||
+            uint64_t uploadOffset = 0;
+            uint64_t endOffset = 0;
+            const uint64_t sourceEnd =
+                static_cast<uint64_t>(sourceFirstFace) + static_cast<uint64_t>(faceCount);
+            const uint64_t destEnd =
+                static_cast<uint64_t>(destFirstFace) + static_cast<uint64_t>(faceCount);
+            const uint64_t allocationEnd =
+                static_cast<uint64_t>(allocation.firstFace) + static_cast<uint64_t>(allocation.faceCount);
+            if (!AppendAlignedUploadRange(writeOffset, faceBytes, 4u, &uploadOffset, &endOffset) ||
+                endOffset > upload.GetSize() ||
+                !sourceFaces ||
+                sourceEnd > allocation.faceCount ||
                 destFirstFace < allocation.firstFace ||
-                destFirstFace + faceCount > allocation.firstFace + allocation.faceCount) {
+                destEnd > allocationEnd) {
                 return false;
             }
             std::memcpy(
                 mapped + uploadOffset,
-                snapshot.faces.data() + sourceFirstFace,
+                sourceFaces + sourceFirstFace,
                 static_cast<size_t>(faceBytes));
             ticket.faceCopyRegions.push_back({
                 uploadOffset,
@@ -719,6 +2654,7 @@ bool SparseSurfaceGpuResources::StageSnapshot(
         };
 
         for (const Simulation::SparseSurfaceDrawBatch& batch : snapshot.drawBatches) {
+            const Simulation::SparseSurfaceFace* sourceFaces = batchFaceData(batch);
             Simulation::SparseSurfaceFaceAllocation previousAllocation;
             const bool hadAllocation =
                 m_faceRangeAllocator.TryGet(batch.coord, &previousAllocation);
@@ -740,12 +2676,14 @@ bool SparseSurfaceGpuResources::StageSnapshot(
             const bool canUploadPayload = !needsPayloadUpload || (regionBudgetAvailable && faceBudgetAvailable);
 
             if (needsPayloadUpload) {
+                if (batch.faceCount > 0u && !sourceFaces) {
+                    return failRangeAllocatorStage();
+                }
                 if (!canUploadPayload) {
                     if (hadAllocation && payloadResident) {
                         visibleAllocations.emplace(batch.coord, previousAllocation);
                         if (!appendDraw(batch.coord, previousAllocation)) {
-                            m_stats.uploadOverflowLastFrame = true;
-                            return false;
+                            return failRangeAllocatorStage();
                         }
                         drawableFaceCount += previousAllocation.faceCount;
                     }
@@ -755,10 +2693,7 @@ bool SparseSurfaceGpuResources::StageSnapshot(
 
                 Simulation::SparseSurfaceFaceAllocation allocation;
                 if (!m_faceRangeAllocator.AllocateOrResize(batch.coord, batch.faceCount, &allocation)) {
-                    m_stats.uploadOverflowLastFrame = true;
-                    const auto& allocatorStats = m_faceRangeAllocator.GetStats();
-                    m_stats.faceRangeAllocationFailures = allocatorStats.allocationFailures;
-                    return false;
+                    return failRangeAllocatorStage(true);
                 }
 
                 bool uploadedPayload = false;
@@ -772,9 +2707,9 @@ bool SparseSurfaceGpuResources::StageSnapshot(
                     const bool mirrorUsable =
                         mirrorIt != m_payloadFaceMirrorByCoord.end() &&
                         mirrorIt->second.size() == batch.faceCount &&
-                        static_cast<uint64_t>(batch.firstFace + batch.faceCount) <= snapshot.faces.size();
+                        sourceFaces != nullptr;
                     const auto runs = Simulation::BuildSparseSurfaceChangedFaceRuns(
-                        mirrorUsable ? snapshot.faces.data() + batch.firstFace : nullptr,
+                        mirrorUsable ? sourceFaces : nullptr,
                         mirrorUsable ? mirrorIt->second.data() : nullptr,
                         batch.faceCount);
                     uint32_t runFaceCount = 0;
@@ -800,15 +2735,18 @@ bool SparseSurfaceGpuResources::StageSnapshot(
                         uploadedPayload = true;
                     } else if (canPatch) {
                         for (const auto& run : runs) {
+                            uint64_t destFirstFace = 0;
+                            if (!AddUint64(allocation.firstFace, run.firstFace, &destFirstFace) ||
+                                destFirstFace > std::numeric_limits<uint32_t>::max()) {
+                                return failRangeAllocatorStage();
+                            }
                             if (!stageFaceCopy(
                                     allocation,
-                                    batch.firstFace + run.firstFace,
-                                    allocation.firstFace + run.firstFace,
+                                    sourceFaces,
+                                    run.firstFace,
+                                    static_cast<uint32_t>(destFirstFace),
                                     run.faceCount)) {
-                                m_stats.uploadOverflowLastFrame = true;
-                                const auto& allocatorStats = m_faceRangeAllocator.GetStats();
-                                m_stats.faceRangeAllocationFailures = allocatorStats.allocationFailures;
-                                return false;
+                                return failRangeAllocatorStage();
                             }
                         }
                         copiedPayloadFaceCount += runFaceCount;
@@ -823,44 +2761,30 @@ bool SparseSurfaceGpuResources::StageSnapshot(
                 if (!uploadedPayload) {
                     if (!stageFaceCopy(
                             allocation,
-                            batch.firstFace,
+                            sourceFaces,
+                            0u,
                             allocation.firstFace,
                             batch.faceCount)) {
-                        m_stats.uploadOverflowLastFrame = true;
-                        const auto& allocatorStats = m_faceRangeAllocator.GetStats();
-                        m_stats.faceRangeAllocationFailures = allocatorStats.allocationFailures;
-                        return false;
+                        return failRangeAllocatorStage();
                     }
                     copiedPayloadFaceCount += batch.faceCount;
                     ++copiedPayloadBrickCount;
                 }
                 ticket.uploadedPayloadBricks.push_back(batch.coord);
-                queuePayloadMirrorUpdate(batch);
+                queuePayloadMirrorUpdate(batch, sourceFaces);
                 visibleAllocations.emplace(batch.coord, allocation);
                 if (!appendDraw(batch.coord, allocation)) {
-                    m_stats.uploadOverflowLastFrame = true;
-                    return false;
+                    return failRangeAllocatorStage();
                 }
                 drawableFaceCount += allocation.faceCount;
             } else {
                 visibleAllocations.emplace(batch.coord, previousAllocation);
                 if (!appendDraw(batch.coord, previousAllocation)) {
-                    m_stats.uploadOverflowLastFrame = true;
-                    return false;
+                    return failRangeAllocatorStage();
                 }
                 drawableFaceCount += previousAllocation.faceCount;
                 ++skippedCleanPayloadBrickCount;
             }
-        }
-
-        struct SnapshotFaceSpan {
-            uint32_t firstFace = 0;
-            uint32_t faceCount = 0;
-        };
-        std::unordered_map<Simulation::BrickCoord, SnapshotFaceSpan, Simulation::BrickCoordHash> snapshotFaceSpans;
-        snapshotFaceSpans.reserve(snapshot.drawBatches.size());
-        for (const Simulation::SparseSurfaceDrawBatch& batch : snapshot.drawBatches) {
-            snapshotFaceSpans.emplace(batch.coord, SnapshotFaceSpan{batch.firstFace, batch.faceCount});
         }
 
         for (size_t i = 0; i < snapshot.ranges.size(); ++i) {
@@ -889,29 +2813,7 @@ bool SparseSurfaceGpuResources::StageSnapshot(
                 record.faceCount = range.faceCount;
                 record.flags = range.flags;
                 record.generation = snapshot.serial;
-                auto spanIt = snapshotFaceSpans.find(range.coord);
-                if (spanIt != snapshotFaceSpans.end() &&
-                    static_cast<uint64_t>(spanIt->second.firstFace + spanIt->second.faceCount) <= snapshot.faces.size()) {
-                    Simulation::ComputeSparseSurfaceFaceBounds(
-                        snapshot.faces.data() + spanIt->second.firstFace,
-                        spanIt->second.faceCount,
-                        &record.minX,
-                        &record.minY,
-                        &record.minZ,
-                        &record.maxX,
-                        &record.maxY,
-                        &record.maxZ);
-                } else {
-                    const int32_t minX = range.coord.x * Simulation::SPARSE_BRICK_SIZE;
-                    const int32_t minY = range.coord.y * Simulation::SPARSE_BRICK_SIZE;
-                    const int32_t minZ = range.coord.z * Simulation::SPARSE_BRICK_SIZE;
-                    record.minX = minX;
-                    record.minY = minY;
-                    record.minZ = minZ;
-                    record.maxX = minX + Simulation::SPARSE_BRICK_SIZE;
-                    record.maxY = minY + Simulation::SPARSE_BRICK_SIZE;
-                    record.maxZ = minZ + Simulation::SPARSE_BRICK_SIZE;
-                }
+                SetSurfaceRecordBoundsFromBrickCoord(range.coord, record);
                 remappedSurfaceRecords.push_back(record);
             }
         }
@@ -942,14 +2844,17 @@ bool SparseSurfaceGpuResources::StageSnapshot(
                 remappedSurfaceRecords,
                 m_config.surfaceRecordsPerCluster,
                 m_config.surfaceClusterMaxExtentVoxels);
+        if (remappedSurfaceRecords.size() > m_config.maxDrawCommands ||
+            remappedSurfaceClusters.size() > m_config.maxDrawCommands ||
+            remappedDrawArgs.size() > m_config.maxDrawCommands) {
+            return failRangeAllocatorStage();
+        }
 
         std::vector<Simulation::SparseSurfaceBrickRange> publishedRanges;
         if (m_config.useFixedRangeTable) {
-            if (snapshot.rangeCount * 2u > m_config.maxBrickRanges) {
-                m_stats.uploadOverflowLastFrame = true;
-                const auto& allocatorStats = m_faceRangeAllocator.GetStats();
-                m_stats.faceRangeAllocationFailures = allocatorStats.allocationFailures;
-                return false;
+            if (static_cast<uint64_t>(snapshot.rangeCount) * 2ull >
+                static_cast<uint64_t>(m_config.maxBrickRanges)) {
+                return failRangeAllocatorStage();
             }
             publishedRanges.resize(m_config.maxBrickRanges);
             const uint32_t mask = m_config.maxBrickRanges - 1u;
@@ -969,8 +2874,7 @@ bool SparseSurfaceGpuResources::StageSnapshot(
                     slot = (slot + 1u) & mask;
                 }
                 if (!inserted) {
-                    m_stats.uploadOverflowLastFrame = true;
-                    return false;
+                    return failRangeAllocatorStage();
                 }
             }
         } else {
@@ -1031,9 +2935,10 @@ bool SparseSurfaceGpuResources::StageSnapshot(
 
                 const uint32_t count = index - start;
                 const uint64_t byteCount = static_cast<uint64_t>(count) * elementSize;
-                const uint64_t uploadOffset = AlignUp(inOutWriteOffset, 4u);
-                const uint64_t endOffset = uploadOffset + byteCount;
-                if (endOffset > upload.GetSize()) {
+                uint64_t uploadOffset = 0;
+                uint64_t endOffset = 0;
+                if (!AppendAlignedUploadRange(inOutWriteOffset, byteCount, 4u, &uploadOffset, &endOffset) ||
+                    endOffset > upload.GetSize()) {
                     return false;
                 }
                 std::memcpy(
@@ -1060,10 +2965,7 @@ bool SparseSurfaceGpuResources::StageSnapshot(
                 metadataWriteOffset,
                 ticket.rangeCopyRegions,
                 skippedCleanRangeSlots)) {
-            m_stats.uploadOverflowLastFrame = true;
-            const auto& allocatorStats = m_faceRangeAllocator.GetStats();
-            m_stats.faceRangeAllocationFailures = allocatorStats.allocationFailures;
-            return false;
+            return failRangeAllocatorStage();
         }
         metadataWriteOffset = AlignUp(metadataWriteOffset, kUploadAlignment);
         if (!stageChangedBlocks(
@@ -1075,10 +2977,7 @@ bool SparseSurfaceGpuResources::StageSnapshot(
                 metadataWriteOffset,
                 ticket.drawArgsCopyRegions,
                 skippedCleanDrawCommands)) {
-            m_stats.uploadOverflowLastFrame = true;
-            const auto& allocatorStats = m_faceRangeAllocator.GetStats();
-                m_stats.faceRangeAllocationFailures = allocatorStats.allocationFailures;
-            return false;
+            return failRangeAllocatorStage();
         }
         metadataWriteOffset = AlignUp(metadataWriteOffset, kUploadAlignment);
         if (!stageChangedBlocks(
@@ -1090,10 +2989,7 @@ bool SparseSurfaceGpuResources::StageSnapshot(
                 metadataWriteOffset,
                 ticket.surfaceRecordCopyRegions,
                 skippedCleanSurfaceRecords)) {
-            m_stats.uploadOverflowLastFrame = true;
-            const auto& allocatorStats = m_faceRangeAllocator.GetStats();
-            m_stats.faceRangeAllocationFailures = allocatorStats.allocationFailures;
-            return false;
+            return failRangeAllocatorStage();
         }
         metadataWriteOffset = AlignUp(metadataWriteOffset, kUploadAlignment);
         if (!stageChangedBlocks(
@@ -1105,10 +3001,7 @@ bool SparseSurfaceGpuResources::StageSnapshot(
                 metadataWriteOffset,
                 ticket.surfaceClusterCopyRegions,
                 skippedCleanSurfaceClusters)) {
-            m_stats.uploadOverflowLastFrame = true;
-            const auto& allocatorStats = m_faceRangeAllocator.GetStats();
-            m_stats.faceRangeAllocationFailures = allocatorStats.allocationFailures;
-            return false;
+            return failRangeAllocatorStage();
         }
         const uint64_t endOffset = metadataWriteOffset;
         const uint64_t rangeBytes = 0;
@@ -1118,10 +3011,7 @@ bool SparseSurfaceGpuResources::StageSnapshot(
         const uint64_t drawArgsOffset = 0;
         const uint64_t surfaceRecordOffset = 0;
         if (endOffset > upload.GetSize()) {
-            m_stats.uploadOverflowLastFrame = true;
-            const auto& allocatorStats = m_faceRangeAllocator.GetStats();
-            m_stats.faceRangeAllocationFailures = allocatorStats.allocationFailures;
-            return false;
+            return failRangeAllocatorStage();
         }
         ticket.rangeMirrorAfterCopy = std::move(publishedRanges);
         ticket.drawArgsMirrorAfterCopy = std::move(remappedDrawArgs);
@@ -1214,13 +3104,22 @@ bool SparseSurfaceGpuResources::StageSnapshot(
             m_config.surfaceClusterMaxExtentVoxels);
     const uint64_t surfaceClusterBytes =
         static_cast<uint64_t>(fallbackSurfaceClusters.size()) * sizeof(Simulation::SparseSurfaceClusterRecord);
-    const uint64_t faceOffset = AlignUp(m_uploadWriteOffset, kUploadAlignment);
-    const uint64_t rangeOffset = AlignUp(faceOffset + faceBytes, kUploadAlignment);
-    const uint64_t drawArgsOffset = AlignUp(rangeOffset + rangeBytes, kUploadAlignment);
-    const uint64_t surfaceRecordOffset = AlignUp(drawArgsOffset + drawArgsBytes, kUploadAlignment);
-    const uint64_t surfaceClusterOffset = AlignUp(surfaceRecordOffset + surfaceRecordBytes, kUploadAlignment);
-    const uint64_t endOffset = surfaceClusterOffset + surfaceClusterBytes;
-    if (endOffset > upload.GetSize()) {
+    uint64_t faceOffset = 0;
+    uint64_t rangeOffset = 0;
+    uint64_t drawArgsOffset = 0;
+    uint64_t surfaceRecordOffset = 0;
+    uint64_t surfaceClusterOffset = 0;
+    uint64_t afterFaces = 0;
+    uint64_t afterRanges = 0;
+    uint64_t afterDrawArgs = 0;
+    uint64_t afterSurfaceRecords = 0;
+    uint64_t endOffset = 0;
+    if (!AppendAlignedUploadRange(m_uploadWriteOffset, faceBytes, kUploadAlignment, &faceOffset, &afterFaces) ||
+        !AppendAlignedUploadRange(afterFaces, rangeBytes, kUploadAlignment, &rangeOffset, &afterRanges) ||
+        !AppendAlignedUploadRange(afterRanges, drawArgsBytes, kUploadAlignment, &drawArgsOffset, &afterDrawArgs) ||
+        !AppendAlignedUploadRange(afterDrawArgs, surfaceRecordBytes, kUploadAlignment, &surfaceRecordOffset, &afterSurfaceRecords) ||
+        !AppendAlignedUploadRange(afterSurfaceRecords, surfaceClusterBytes, kUploadAlignment, &surfaceClusterOffset, &endOffset) ||
+        endOffset > upload.GetSize()) {
         m_stats.uploadOverflowLastFrame = true;
         return false;
     }
@@ -1272,6 +3171,8 @@ bool SparseSurfaceGpuResources::StageSnapshot(
     if (outTicket) {
         outTicket->valid = true;
         outTicket->ringSlot = m_activeUploadSlot;
+        outTicket->hasUploadWriteOffsetRollback = true;
+        outTicket->uploadWriteOffsetBeforeStage = uploadWriteOffsetBeforeStage;
         outTicket->faceUploadOffset = faceOffset;
         outTicket->rangeUploadOffset = rangeOffset;
         outTicket->drawArgsUploadOffset = drawArgsOffset;
@@ -1334,10 +3235,30 @@ bool SparseSurfaceGpuResources::EmitCopy(
     ID3D12GraphicsCommandList* commandList,
     const SparseSurfaceUploadTicket& ticket)
 {
+    auto restoreStagedStateFromTicket = [&]() {
+        if (ticket.hasUploadWriteOffsetRollback &&
+            ticket.ringSlot == m_activeUploadSlot) {
+            m_uploadWriteOffset = ticket.uploadWriteOffsetBeforeStage;
+        }
+        if (ticket.hasRangeAllocatorRollback) {
+            m_faceRangeAllocator = ticket.rangeAllocatorBeforeStage;
+            const auto& allocatorStats = m_faceRangeAllocator.GetStats();
+            m_stats.allocatedFaceRanges = allocatorStats.allocationCount;
+            m_stats.allocatedFaceCapacity = allocatorStats.allocatedCapacity;
+            m_stats.freeFaceRanges = allocatorStats.freeRangeCount;
+            m_stats.largestFreeFaceRange = allocatorStats.largestFreeRange;
+            m_stats.pendingRetiredFaceRanges = allocatorStats.pendingRetiredRangeCount;
+            m_stats.pendingRetiredFaceCapacity = allocatorStats.pendingRetiredCapacity;
+            m_stats.faceRangeAllocationFailures = allocatorStats.allocationFailures;
+        }
+    };
+
     if (!m_stats.initialized || !commandList || !ticket.valid) {
+        restoreStagedStateFromTicket();
         return false;
     }
     if (ticket.ringSlot >= m_config.uploadRingSlots) {
+        restoreStagedStateFromTicket();
         return false;
     }
     ID3D12Resource* upload = m_uploadRing[ticket.ringSlot].GetResource();
@@ -1347,7 +3268,98 @@ bool SparseSurfaceGpuResources::EmitCopy(
         !m_drawArgsBuffer.GetResource() ||
         !m_surfaceRecordBuffer.GetResource() ||
         !m_surfaceClusterBuffer.GetResource()) {
+        restoreStagedStateFromTicket();
         return false;
+    }
+
+    const uint64_t uploadSize = m_uploadRing[ticket.ringSlot].GetSize();
+    const uint64_t faceBufferSize = m_faceBuffer.GetSize();
+    const uint64_t rangeBufferSize = m_rangeBuffer.GetSize();
+    const uint64_t drawArgsBufferSize = m_drawArgsBuffer.GetSize();
+    const uint64_t surfaceRecordBufferSize = m_surfaceRecordBuffer.GetSize();
+    const uint64_t surfaceClusterBufferSize = m_surfaceClusterBuffer.GetSize();
+    auto failInvalidTicket = [&](const char* label) -> bool {
+        spdlog::warn("SparseSurfaceGpuResources::EmitCopy rejected out-of-bounds {}", label);
+        m_stats.uploadOverflowLastFrame = true;
+        restoreStagedStateFromTicket();
+        return false;
+    };
+    if (!IsSparseSurfaceGpuByteRangeInBounds(ticket.faceUploadOffset, ticket.faceBytes, uploadSize) ||
+        !IsSparseSurfaceGpuByteRangeInBounds(0u, ticket.faceBytes, faceBufferSize)) {
+        return failInvalidTicket("face upload range");
+    }
+    if (!IsSparseSurfaceGpuByteRangeInBounds(ticket.rangeUploadOffset, ticket.rangeBytes, uploadSize) ||
+        !IsSparseSurfaceGpuByteRangeInBounds(0u, ticket.rangeBytes, rangeBufferSize)) {
+        return failInvalidTicket("range upload range");
+    }
+    if (!IsSparseSurfaceGpuByteRangeInBounds(ticket.drawArgsUploadOffset, ticket.drawArgsBytes, uploadSize) ||
+        !IsSparseSurfaceGpuByteRangeInBounds(0u, ticket.drawArgsBytes, drawArgsBufferSize)) {
+        return failInvalidTicket("draw upload range");
+    }
+    if (!IsSparseSurfaceGpuByteRangeInBounds(ticket.surfaceRecordUploadOffset, ticket.surfaceRecordBytes, uploadSize) ||
+        !IsSparseSurfaceGpuByteRangeInBounds(0u, ticket.surfaceRecordBytes, surfaceRecordBufferSize)) {
+        return failInvalidTicket("surface record upload range");
+    }
+    for (const SparseSurfaceFaceCopyRegion& region : ticket.faceCopyRegions) {
+        if (!IsSparseSurfaceGpuFaceCopyRegionInBounds(region, uploadSize, faceBufferSize)) {
+            return failInvalidTicket("face copy region");
+        }
+    }
+    auto validateBufferRegions = [&](
+        const std::vector<SparseSurfaceBufferCopyRegion>& regions,
+        uint64_t destSize,
+        const char* label) -> bool {
+        for (const SparseSurfaceBufferCopyRegion& region : regions) {
+            if (!IsSparseSurfaceGpuBufferCopyRegionInBounds(region, uploadSize, destSize)) {
+                return failInvalidTicket(label);
+            }
+        }
+        return true;
+    };
+    if (!validateBufferRegions(ticket.rangeCopyRegions, rangeBufferSize, "range copy region") ||
+        !validateBufferRegions(ticket.drawArgsCopyRegions, drawArgsBufferSize, "draw copy region") ||
+        !validateBufferRegions(ticket.surfaceRecordCopyRegions, surfaceRecordBufferSize, "surface record copy region") ||
+        !validateBufferRegions(ticket.surfaceClusterCopyRegions, surfaceClusterBufferSize, "surface cluster copy region")) {
+        return false;
+    }
+    if (ticket.incrementalMetadataPatches) {
+        const uint32_t drawArgsMirrorPatchSize =
+            std::max(static_cast<uint32_t>(m_drawArgsMirror.size()), ticket.drawArgsMirrorSizeAfterPatch);
+        const uint32_t surfaceRecordMirrorPatchSize =
+            std::max(static_cast<uint32_t>(m_surfaceRecordMirror.size()), ticket.surfaceRecordMirrorSizeAfterPatch);
+        const uint32_t surfaceClusterMirrorPatchSize =
+            std::max(static_cast<uint32_t>(m_surfaceClusterMirror.size()), ticket.surfaceClusterMirrorSizeAfterPatch);
+        for (const SparseSurfaceRangeMirrorPatch& patch : ticket.rangeMirrorPatches) {
+            if (patch.index >= m_rangeMirror.size()) {
+                return failInvalidTicket("range mirror patch");
+            }
+        }
+        for (const SparseSurfaceDrawArgsMirrorPatch& patch : ticket.drawArgsMirrorPatches) {
+            if (patch.index >= drawArgsMirrorPatchSize ||
+                patch.index >= m_config.maxDrawCommands) {
+                return failInvalidTicket("draw mirror patch");
+            }
+        }
+        for (const SparseSurfaceRecordMirrorPatch& patch : ticket.surfaceRecordMirrorPatches) {
+            if (patch.index >= surfaceRecordMirrorPatchSize ||
+                patch.index >= m_config.maxDrawCommands) {
+                return failInvalidTicket("surface record mirror patch");
+            }
+        }
+        for (const SparseSurfaceClusterMirrorPatch& patch : ticket.surfaceClusterMirrorPatches) {
+            if (patch.index >= surfaceClusterMirrorPatchSize ||
+                patch.index >= m_config.maxDrawCommands) {
+                return failInvalidTicket("surface cluster mirror patch");
+            }
+        }
+        for (const SparseSurfaceDrawSlotAssign& assign : ticket.drawSlotAssignments) {
+            const uint32_t occupiedSize =
+                std::max(static_cast<uint32_t>(m_drawSlotOccupied.size()), ticket.drawSlotOccupiedSizeAfterPatch);
+            if (assign.slot >= occupiedSize ||
+                assign.slot >= m_config.maxDrawCommands) {
+                return failInvalidTicket("draw slot assignment");
+            }
+        }
     }
 
     if (m_staticIaUploadPending) {
@@ -1356,7 +3368,14 @@ bool SparseSurfaceGpuResources::EmitCopy(
         ID3D12Resource* vertexBuffer = m_vertexIdStream.GetResource();
         ID3D12Resource* indexBuffer = m_indexStream.GetResource();
         if (!vertexUpload || !indexUpload || !vertexBuffer || !indexBuffer) {
+            restoreStagedStateFromTicket();
             return false;
+        }
+        if (!IsSparseSurfaceGpuByteRangeInBounds(0u, m_stats.iaStreamVertexBytes, m_vertexIdStreamUpload.GetSize()) ||
+            !IsSparseSurfaceGpuByteRangeInBounds(0u, m_stats.iaStreamVertexBytes, m_vertexIdStream.GetSize()) ||
+            !IsSparseSurfaceGpuByteRangeInBounds(0u, m_stats.iaStreamIndexBytes, m_indexStreamUpload.GetSize()) ||
+            !IsSparseSurfaceGpuByteRangeInBounds(0u, m_stats.iaStreamIndexBytes, m_indexStream.GetSize())) {
+            return failInvalidTicket("static IA upload range");
         }
 
         m_vertexIdStream.TransitionTo(commandList, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1524,27 +3543,85 @@ bool SparseSurfaceGpuResources::EmitCopy(
             m_payloadFaceMirrorByCoord[update.coord] = update.faces;
         }
     }
-    m_rangeMirror = ticket.rangeMirrorAfterCopy;
-    m_drawArgsMirror = ticket.drawArgsMirrorAfterCopy;
-    m_surfaceRecordMirror = ticket.surfaceRecordMirrorAfterCopy;
-    m_surfaceClusterMirror = ticket.surfaceClusterMirrorAfterCopy;
-    if (m_config.useStableDrawSlots) {
-        m_drawSlotByCoord = ticket.drawSlotByCoordAfterCopy;
-        m_drawSlotOccupied = ticket.drawSlotOccupiedAfterCopy;
-        m_freeDrawSlots = ticket.freeDrawSlotsAfterCopy;
+    if (!ticket.payloadOnly) {
+        if (ticket.incrementalMetadataPatches) {
+            if (ticket.drawArgsMirrorSizeAfterPatch > m_drawArgsMirror.size()) {
+                m_drawArgsMirror.resize(ticket.drawArgsMirrorSizeAfterPatch);
+            }
+            if (ticket.drawSlotOccupiedSizeAfterPatch > m_drawSlotOccupied.size()) {
+                m_drawSlotOccupied.resize(ticket.drawSlotOccupiedSizeAfterPatch, 0u);
+            }
+            if (ticket.surfaceRecordMirrorSizeAfterPatch > m_surfaceRecordMirror.size()) {
+                m_surfaceRecordMirror.resize(ticket.surfaceRecordMirrorSizeAfterPatch);
+            }
+            if (ticket.surfaceClusterMirrorSizeAfterPatch > m_surfaceClusterMirror.size()) {
+                m_surfaceClusterMirror.resize(ticket.surfaceClusterMirrorSizeAfterPatch);
+            }
+            for (const SparseSurfaceRangeMirrorPatch& patch : ticket.rangeMirrorPatches) {
+                m_rangeMirror[patch.index] = patch.value;
+            }
+            for (const SparseSurfaceDrawArgsMirrorPatch& patch : ticket.drawArgsMirrorPatches) {
+                m_drawArgsMirror[patch.index] = patch.value;
+            }
+            for (const SparseSurfaceRecordMirrorPatch& patch : ticket.surfaceRecordMirrorPatches) {
+                m_surfaceRecordMirror[patch.index] = patch.value;
+            }
+            for (const SparseSurfaceClusterMirrorPatch& patch : ticket.surfaceClusterMirrorPatches) {
+                m_surfaceClusterMirror[patch.index] = patch.value;
+            }
+            if (m_config.useStableDrawSlots) {
+                for (const SparseSurfaceDrawSlotAssign& assign : ticket.drawSlotAssignments) {
+                    m_drawSlotByCoord[assign.coord] = assign.slot;
+                    if (assign.slot < m_drawSlotOccupied.size()) {
+                        m_drawSlotOccupied[assign.slot] = 1u;
+                    }
+                    auto freeIt = std::find(
+                        m_freeDrawSlots.begin(),
+                        m_freeDrawSlots.end(),
+                        assign.slot);
+                    if (freeIt != m_freeDrawSlots.end()) {
+                        m_freeDrawSlots.erase(freeIt);
+                    }
+                }
+                for (const SparseSurfaceDrawSlotRetire& retire : ticket.drawSlotRetires) {
+                    m_drawSlotByCoord.erase(retire.coord);
+                    if (retire.slot < m_drawSlotOccupied.size() &&
+                        m_drawSlotOccupied[retire.slot] != 0u) {
+                        m_drawSlotOccupied[retire.slot] = 0u;
+                        m_freeDrawSlots.push_back(retire.slot);
+                    }
+                }
+            }
+            RebuildSurfaceRecordLookup();
+        } else {
+            m_rangeMirror = ticket.rangeMirrorAfterCopy;
+            m_drawArgsMirror = ticket.drawArgsMirrorAfterCopy;
+            m_surfaceRecordMirror = ticket.surfaceRecordMirrorAfterCopy;
+            m_surfaceClusterMirror = ticket.surfaceClusterMirrorAfterCopy;
+            RebuildSurfaceRecordLookup();
+            if (m_config.useStableDrawSlots) {
+                m_drawSlotByCoord = ticket.drawSlotByCoordAfterCopy;
+                m_drawSlotOccupied = ticket.drawSlotOccupiedAfterCopy;
+                m_freeDrawSlots = ticket.freeDrawSlotsAfterCopy;
+            }
+        }
     }
 
-    m_stats.uploadedFaces = ticket.faceCount;
-    m_stats.uploadedRanges = ticket.rangeCount;
-    m_stats.uploadedRangeTableCapacity = ticket.rangeTableCapacity;
-    m_stats.uploadedDrawCommands = ticket.drawCommandCount;
-    m_stats.uploadedActiveDrawCommands = ticket.activeDrawCommandCount;
-    m_stats.uploadedSurfaceRecords = static_cast<uint32_t>(m_surfaceRecordMirror.size());
-    m_stats.uploadedSurfaceClusters = static_cast<uint32_t>(m_surfaceClusterMirror.size());
+    if (!ticket.payloadOnly) {
+        m_stats.uploadedFaces = ticket.faceCount;
+        m_stats.uploadedRanges = ticket.rangeCount;
+        m_stats.uploadedRangeTableCapacity = ticket.rangeTableCapacity;
+        m_stats.uploadedDrawCommands = ticket.drawCommandCount;
+        m_stats.uploadedActiveDrawCommands = ticket.activeDrawCommandCount;
+        m_stats.uploadedSurfaceRecords = static_cast<uint32_t>(m_surfaceRecordMirror.size());
+        m_stats.uploadedSurfaceClusters = static_cast<uint32_t>(m_surfaceClusterMirror.size());
+    }
     m_stats.uploadedSerial = ticket.serial;
-    m_stats.uploadedCandidateBricks = ticket.candidateBricks;
-    m_stats.uploadedVisibleBricks = ticket.visibleBricks;
-    m_stats.uploadedCulledBricks = ticket.culledBricks;
+    if (!ticket.payloadOnly) {
+        m_stats.uploadedCandidateBricks = ticket.candidateBricks;
+        m_stats.uploadedVisibleBricks = ticket.visibleBricks;
+        m_stats.uploadedCulledBricks = ticket.culledBricks;
+    }
     m_stats.residentPayloadBricks = static_cast<uint32_t>(m_payloadResidentCoords.size());
     m_stats.stableDrawSlotCapacity = static_cast<uint32_t>(m_drawSlotOccupied.size());
     m_stats.stableDrawFreeSlots = static_cast<uint32_t>(m_freeDrawSlots.size());
@@ -1602,26 +3679,57 @@ bool SparseSurfaceGpuResources::DispatchGpuCull(
         float params[4];
         float clusterParams[4];
     } constants = {};
-    constants.cameraPosition[0] = cameraX;
-    constants.cameraPosition[1] = cameraY;
-    constants.cameraPosition[2] = cameraZ;
-    constants.cameraPosition[3] = fovYRadians;
-    constants.cameraForward[0] = forwardX;
-    constants.cameraForward[1] = forwardY;
-    constants.cameraForward[2] = forwardZ;
-    constants.cameraForward[3] = aspectRatio;
-    constants.cameraRight[0] = rightX;
-    constants.cameraRight[1] = rightY;
-    constants.cameraRight[2] = rightZ;
+    float sanitizedForwardX = forwardX;
+    float sanitizedForwardY = forwardY;
+    float sanitizedForwardZ = forwardZ;
+    float sanitizedRightX = rightX;
+    float sanitizedRightY = rightY;
+    float sanitizedRightZ = rightZ;
+    float sanitizedUpX = upX;
+    float sanitizedUpY = upY;
+    float sanitizedUpZ = upZ;
+    SanitizeDirection(
+        &sanitizedForwardX,
+        &sanitizedForwardY,
+        &sanitizedForwardZ,
+        0.0f,
+        0.0f,
+        1.0f);
+    SanitizeDirection(
+        &sanitizedRightX,
+        &sanitizedRightY,
+        &sanitizedRightZ,
+        1.0f,
+        0.0f,
+        0.0f);
+    SanitizeDirection(
+        &sanitizedUpX,
+        &sanitizedUpY,
+        &sanitizedUpZ,
+        0.0f,
+        1.0f,
+        0.0f);
+
+    constants.cameraPosition[0] = FiniteOr(cameraX, 0.0f);
+    constants.cameraPosition[1] = FiniteOr(cameraY, 0.0f);
+    constants.cameraPosition[2] = FiniteOr(cameraZ, 0.0f);
+    constants.cameraPosition[3] = ClampFinite(fovYRadians, 1.0471976f, 0.05f, 3.0f);
+    constants.cameraForward[0] = sanitizedForwardX;
+    constants.cameraForward[1] = sanitizedForwardY;
+    constants.cameraForward[2] = sanitizedForwardZ;
+    constants.cameraForward[3] = ClampFinite(aspectRatio, 1.7777778f, 0.1f, 10.0f);
+    constants.cameraRight[0] = sanitizedRightX;
+    constants.cameraRight[1] = sanitizedRightY;
+    constants.cameraRight[2] = sanitizedRightZ;
     constants.cameraRight[3] = 0.0f;
-    constants.cameraUp[0] = upX;
-    constants.cameraUp[1] = upY;
-    constants.cameraUp[2] = upZ;
+    constants.cameraUp[0] = sanitizedUpX;
+    constants.cameraUp[1] = sanitizedUpY;
+    constants.cameraUp[2] = sanitizedUpZ;
     constants.cameraUp[3] = 0.0f;
     constants.params[0] = static_cast<float>(recordCount);
     constants.params[1] = static_cast<float>(m_config.maxDrawCommands);
-    constants.params[2] = maxDistance;
-    constants.params[3] = padding;
+    constants.params[2] = ClampFinite(maxDistance, 16384.0f, 0.0f, 10000000.0f);
+    constants.params[3] = ClampFinite(padding, 0.0f, 0.0f, 4096.0f);
     constants.clusterParams[0] = static_cast<float>(m_config.surfaceClusterFastAcceptMaxRecords);
     constants.clusterParams[1] = static_cast<float>(m_config.surfaceClusterFastAcceptMaxFaces);
     static_assert(sizeof(CullConstants) <= 256u);
@@ -1721,6 +3829,7 @@ void SparseSurfaceGpuResources::QueueGpuCullStatsReadback(
         sizeof(uint32_t) * kCullStatsUintCount);
     m_drawCountBuffer.TransitionTo(commandList, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
     m_cullStatsReadbackPending[slot] = true;
+    m_cullStatsReadbackQueuedFrames[slot] = frameIndex;
     ++m_stats.gpuCullStatsReadbacksQueued;
     uint32_t pendingReadbacks = 0;
     for (bool pending : m_cullStatsReadbackPending) {
@@ -1736,6 +3845,12 @@ bool SparseSurfaceGpuResources::RetireGpuCullStatsReadback(uint32_t frameIndex)
     }
     const uint32_t slot = frameIndex % static_cast<uint32_t>(m_cullStatsReadback.size());
     if (!m_cullStatsReadbackPending[slot] || !m_cullStatsReadback[slot].GetResource()) {
+        return false;
+    }
+    if (!IsSparseSurfaceCullStatsReadbackRetirable(
+            m_cullStatsReadbackPending[slot],
+            m_cullStatsReadbackQueuedFrames[slot],
+            frameIndex)) {
         return false;
     }
 
@@ -1758,6 +3873,7 @@ bool SparseSurfaceGpuResources::RetireGpuCullStatsReadback(uint32_t frameIndex)
     m_stats.gpuCullStatsValid = true;
     m_cullStatsReadback[slot].Unmap();
     m_cullStatsReadbackPending[slot] = false;
+    m_cullStatsReadbackQueuedFrames[slot] = 0u;
     ++m_stats.gpuCullStatsReadbacksRetired;
     uint32_t pendingReadbacks = 0;
     for (bool pending : m_cullStatsReadbackPending) {

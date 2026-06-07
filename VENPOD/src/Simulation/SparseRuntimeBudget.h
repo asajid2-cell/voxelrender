@@ -81,9 +81,13 @@ struct SparseOwnershipPressureInput {
     uint32_t frameIndex = 0;
     uint32_t readyFrame = 0;
     uint32_t terrainPercent = 0;
+    uint32_t voxelTerrainPercent = 0;
+    uint32_t valleyAtmospherePercent = 0;
     uint32_t missPercent = 0;
     uint32_t unsafeNearMissPercent = 0;
     uint32_t minTerrainPercent = 0;
+    uint32_t minVoxelTerrainPercent = 0;
+    uint32_t maxValleyAtmospherePercent = 0;
     uint32_t maxMissPercent = 0;
     uint32_t maxUnsafeNearMissPercent = 0;
     uint32_t holdFrames = 1;
@@ -96,6 +100,8 @@ struct SparseOwnershipPressure {
     uint32_t level = 0;
     uint32_t updatedCatchupFrames = 0;
     uint32_t terrainDeficitPercent = 0;
+    uint32_t voxelTerrainDeficitPercent = 0;
+    uint32_t valleyAtmosphereExcessPercent = 0;
     uint32_t missExcessPercent = 0;
     uint32_t unsafeNearMissExcessPercent = 0;
 };
@@ -109,6 +115,9 @@ struct SparseMissFeedbackPlanInput {
     uint32_t baseStride = 16;
     uint32_t maxRecords = 256;
     uint32_t unsafeNearMissPercent = 0;
+    uint32_t valleyAtmospherePercent = 0;
+    uint32_t maxValleyAtmospherePercent = 8;
+    bool allowValleyAtmosphereFeedback = true;
     uint32_t ownershipPressureLevel = 0;
     uint32_t pendingRecords = 0;
     uint32_t staleReadbackDrops = 0;
@@ -188,6 +197,7 @@ struct SparseBackgroundRenderBudgetInput {
     float midHeightCoverage = 0.0f;
     float midVoxelCoverage = 0.0f;
     float midVoxelPixelShare = 0.0f;
+    float farSvoPixelShare = 0.0f;
     float farHeightPixelShare = 0.0f;
     float skyPixelShare = 0.0f;
     float backgroundPixelShare = 1.0f;
@@ -199,6 +209,7 @@ struct SparseBackgroundRenderBudgetDecision {
     float farFieldQuality = 1.0f;
     float renderQuality = 1.0f;
     uint32_t qualityTier = 0;
+    bool preserveFarFieldQuality = false;
 };
 
 struct SparseFarUploadBudgetInput {
@@ -214,6 +225,7 @@ struct SparseFarUploadBudgetInput {
     bool cheapFrame = false;
     bool canTrickle = false;
     bool visibleMissPressure = false;
+    bool readinessDeadline = false;
 };
 
 struct SparseFarUploadBudgetDecision {

@@ -83,6 +83,27 @@ generated chunk owns a 1 MB GPU buffer.
 surface extraction, page-table invalidations, and residency metrics. `VoxelWorld`
 owns the legacy dense render buffers.
 
+## Sparse Page Publication
+
+The current sparse upload path uses the direct graphics queue. Brick payload and
+occupancy copies are ordered on that queue before the matching GPU page-table
+entry is published. The CPU brick pool is the authoritative residency owner; the
+GPU page table is a delayed visibility snapshot that shaders may use only after
+the publish queue releases the entry.
+
+`SparsePagePublishQueue` stores the page-table entry index, brick coordinate,
+physical page, generation, residency class, ready frame, and ready fence. It
+withholds publication until both frame and fence readiness are satisfied, drops
+stale pending publishes whose CPU entry no longer matches, and lets newer
+generations replace older pending entries for reused slots. Runtime delay
+knobs exercise this path in regression without introducing a separate copy
+queue.
+
+A future dedicated copy queue would need explicit queue ownership and fence
+plumbing for each payload and page-table publication. Until that work exists,
+R-028 is validated only for the current direct-queue async publication contract,
+not for independent cross-queue uploads.
+
 ## Terrain
 
 The current terrain is designed as a vertical traversal sandbox. The conceptual
@@ -100,6 +121,10 @@ Sparse brush targeting uses world-space sparse raycasts, with GPU sparse
 raycast and brush feedback available as diagnostics and guarded apply paths.
 Brush edits are stored as sparse per-brick overlays and replayed over generated
 terrain when bricks are regenerated or reuploaded.
+GPU brush feedback apply only commits payloads whose header and sentinel records
+both report zero missing residents, with no overflow and no duplicate edit
+coordinates. Missing, truncated, duplicate, or stale feedback falls back to CPU
+sparse authority.
 
 This makes painting useful as a traversal mechanic: bridges, ramps, stairs,
 platforms, and tunnels can survive render-window streaming during the session.
@@ -108,7 +133,8 @@ platforms, and tunnels can survive render-window streaming during the session.
 
 Sparse local physics is dirty/active-region based and default-on in sparse
 runtime mode. GPU physics packet upload/readback can propose moves, but CPU
-validation guards page generation, edit revisions, destination residency, and
+validation guards page generation, exact edit-revision parity, edit-delta
+status consistency, malformed local coordinates, destination residency, and
 same-batch conflicts before accepting a proposal.
 
 Relevant shaders:

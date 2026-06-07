@@ -1,11 +1,14 @@
 #include "FarVoxelOctree.h"
 #include "../Simulation/TerrainConstants.h"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <limits>
 #include <thread>
 #include <spdlog/spdlog.h>
 
@@ -13,19 +16,52 @@ namespace VENPOD::Graphics {
 
 namespace {
 constexpr uint32_t kMaterialSand = 1;
+constexpr uint32_t kMaterialWater = 2;
 constexpr uint32_t kMaterialStone = 3;
 constexpr uint32_t kMaterialDirt = 4;
-constexpr uint32_t kMaterialConcrete = 14;
 constexpr uint32_t kLeafFlag = 1;
 constexpr uint32_t kInteriorLeafFlag = 2;
+constexpr uint32_t kFarVoxelOctreeCacheVersion = 50;
+constexpr uint64_t kMaxFarVoxelOctreeCacheBytes = 512ull * 1024ull * 1024ull;
 
 float Smooth01(float value) {
     value = std::clamp(value, 0.0f, 1.0f);
     return value * value * (3.0f - 2.0f * value);
 }
 
-float Ridged(float value, float power) {
-    return std::pow(std::clamp(1.0f - std::abs(value), 0.0f, 1.0f), power);
+uint32_t FarTerrainHash3D(int32_t x, int32_t y, int32_t z, uint32_t seed) {
+    uint32_t h = seed ^ 2166136261u;
+    h = (h ^ static_cast<uint32_t>(x)) * 16777619u;
+    h = (h ^ static_cast<uint32_t>(y)) * 16777619u;
+    h = (h ^ static_cast<uint32_t>(z)) * 16777619u;
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return h;
+}
+
+float FarTerrainValueNoise2D(float x, float z, uint32_t seed) {
+    const int32_t x0 = static_cast<int32_t>(std::floor(x));
+    const int32_t z0 = static_cast<int32_t>(std::floor(z));
+    const float fx = x - static_cast<float>(x0);
+    const float fz = z - static_cast<float>(z0);
+    const float sx = Smooth01(fx);
+    const float sz = Smooth01(fz);
+
+    auto sample = [seed](int32_t ix, int32_t iz) {
+        return static_cast<float>(FarTerrainHash3D(ix, 0, iz, seed) & 0xFFFFFFu) /
+            static_cast<float>(0xFFFFFFu);
+    };
+
+    const float s00 = sample(x0, z0);
+    const float s10 = sample(x0 + 1, z0);
+    const float s01 = sample(x0, z0 + 1);
+    const float s11 = sample(x0 + 1, z0 + 1);
+    const float a = s00 + (s10 - s00) * sx;
+    const float b = s01 + (s11 - s01) * sx;
+    return (a + (b - a) * sz) * 2.0f - 1.0f;
 }
 
 uint32_t CountBits(uint32_t value) {
@@ -36,6 +72,140 @@ uint32_t CountBits(uint32_t value) {
     }
     return count;
 }
+
+bool AddUint64(uint64_t a, uint64_t b, uint64_t* out) {
+    if (!out || a > std::numeric_limits<uint64_t>::max() - b) {
+        return false;
+    }
+    *out = a + b;
+    return true;
+}
+
+bool MulUint64(uint64_t a, uint64_t b, uint64_t* out) {
+    if (!out || (b != 0 && a > std::numeric_limits<uint64_t>::max() / b)) {
+        return false;
+    }
+    *out = a * b;
+    return true;
+}
+
+bool FitsSizeT(uint64_t value) {
+    return value <= static_cast<uint64_t>(std::numeric_limits<size_t>::max());
+}
+
+bool FitsStreamSize(uint64_t value) {
+    return value <= static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max());
+}
+
+bool IsValidByteRange(uint64_t offset, uint64_t bytes, uint64_t capacity) {
+    uint64_t end = 0;
+    return AddUint64(offset, bytes, &end) && end <= capacity;
+}
+
+bool ComputeFarUploadBytesTotal(
+    size_t nodeCount,
+    size_t nodeSize,
+    size_t pageCount,
+    size_t pageSize,
+    size_t pageIndexCount,
+    size_t pageIndexSize,
+    uint64_t* outTotal)
+{
+    uint64_t nodeBytes = 0;
+    uint64_t pageBytes = 0;
+    uint64_t pageIndexBytes = 0;
+    uint64_t total = 0;
+    if (!MulUint64(static_cast<uint64_t>(nodeCount), static_cast<uint64_t>(nodeSize), &nodeBytes) ||
+        !MulUint64(static_cast<uint64_t>(pageCount), static_cast<uint64_t>(pageSize), &pageBytes) ||
+        !MulUint64(static_cast<uint64_t>(pageIndexCount), static_cast<uint64_t>(pageIndexSize), &pageIndexBytes) ||
+        !AddUint64(nodeBytes, pageBytes, &total) ||
+        !AddUint64(total, pageIndexBytes, &total)) {
+        return false;
+    }
+    *outTotal = total;
+    return true;
+}
+
+bool ElementByteCount(uint64_t count, size_t elementSize, uint64_t* outBytes) {
+    return MulUint64(count, static_cast<uint64_t>(elementSize), outBytes);
+}
+
+bool ReadExact(std::ifstream& stream, void* data, uint64_t bytes) {
+    if (bytes == 0) {
+        return true;
+    }
+    if (!data || !FitsStreamSize(bytes)) {
+        return false;
+    }
+    return static_cast<bool>(
+        stream.read(
+            reinterpret_cast<char*>(data),
+            static_cast<std::streamsize>(bytes)));
+}
+
+bool WriteExact(std::ofstream& stream, const void* data, uint64_t bytes) {
+    if (bytes == 0) {
+        return true;
+    }
+    if (!data || !FitsStreamSize(bytes)) {
+        return false;
+    }
+    return static_cast<bool>(
+        stream.write(
+            reinterpret_cast<const char*>(data),
+            static_cast<std::streamsize>(bytes)));
+}
+
+bool TryGetInputStreamSize(std::ifstream& stream, uint64_t* outSize) {
+    if (!outSize) {
+        return false;
+    }
+    const std::streampos end = stream.tellg();
+    if (end < std::streampos{0}) {
+        return false;
+    }
+    const auto size = static_cast<uint64_t>(static_cast<std::streamoff>(end));
+    if (size > static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+        return false;
+    }
+    *outSize = size;
+    stream.seekg(0, std::ios::beg);
+    return static_cast<bool>(stream);
+}
+
+bool TryFloorDoubleToInt32(double value, int32_t* out) {
+    if (!out || !std::isfinite(value)) {
+        return false;
+    }
+    const double floored = std::floor(value);
+    if (floored < static_cast<double>(std::numeric_limits<int32_t>::min()) ||
+        floored > static_cast<double>(std::numeric_limits<int32_t>::max())) {
+        return false;
+    }
+    *out = static_cast<int32_t>(floored);
+    return true;
+}
+
+struct FarVoxelOctreeCacheHeader {
+    uint32_t magic = 0x56534631u; // "VSF1"
+    uint32_t version = kFarVoxelOctreeCacheVersion;
+    int32_t pageRadius = 0;
+    uint32_t maxDepth = 0;
+    uint32_t seed = 0;
+    float pageSize = 0.0f;
+    float rootMinY = 0.0f;
+    uint64_t nodeCount = 0;
+    uint64_t pageCount = 0;
+    uint64_t pageIndexCount = 0;
+};
+
+std::filesystem::path FarVoxelOctreeCachePath(const FarVoxelOctreeConfig& config, int32_t radius) {
+    return std::filesystem::current_path() /
+        ("venpod_far_svo_cache_r" + std::to_string(radius) +
+         "_d" + std::to_string(config.maxDepth) +
+         "_s" + std::to_string(config.seed) + ".bin");
+}
+
 }
 
 Result<void> FarVoxelOctree::Initialize(
@@ -70,6 +240,58 @@ void FarVoxelOctree::BeginAsyncLoad(const FarVoxelOctreeConfig& config) {
     m_asyncBuild = std::async(std::launch::async, [config]() {
         return FarVoxelOctree::BuildCpuData(config);
     });
+}
+
+bool FarVoxelOctree::HasCompatibleCache(const FarVoxelOctreeConfig& config) {
+    std::string validationError;
+    if (!ValidateFarVoxelOctreeConfigForBuild(config, &validationError)) {
+        return false;
+    }
+    const int32_t radius = std::max(1, config.pageRadius);
+    uint64_t pageCountPerAxis64 = 0;
+    uint64_t pageIndexCount64 = 0;
+    if (!AddUint64(static_cast<uint64_t>(radius), static_cast<uint64_t>(radius), &pageCountPerAxis64) ||
+        !AddUint64(pageCountPerAxis64, 1u, &pageCountPerAxis64) ||
+        !MulUint64(pageCountPerAxis64, pageCountPerAxis64, &pageIndexCount64)) {
+        return false;
+    }
+
+    const auto cachePath = FarVoxelOctreeCachePath(config, radius);
+    std::ifstream in(cachePath, std::ios::binary | std::ios::ate);
+    uint64_t cacheBytes = 0;
+    FarVoxelOctreeCacheHeader header{};
+    if (!TryGetInputStreamSize(in, &cacheBytes) ||
+        cacheBytes < static_cast<uint64_t>(sizeof(header)) ||
+        cacheBytes > kMaxFarVoxelOctreeCacheBytes ||
+        !in.read(reinterpret_cast<char*>(&header), sizeof(header)) ||
+        header.magic != 0x56534631u ||
+        header.version != kFarVoxelOctreeCacheVersion ||
+        header.pageRadius != radius ||
+        header.maxDepth != config.maxDepth ||
+        header.seed != config.seed ||
+        header.pageSize != config.pageSize ||
+        header.rootMinY != config.rootMinY ||
+        header.nodeCount == 0 ||
+        header.pageCount == 0 ||
+        header.pageIndexCount != pageIndexCount64 ||
+        !FitsSizeT(header.nodeCount) ||
+        !FitsSizeT(header.pageCount) ||
+        !FitsSizeT(header.pageIndexCount)) {
+        return false;
+    }
+
+    uint64_t nodeBytes = 0;
+    uint64_t pageBytes = 0;
+    uint64_t pageIndexBytes = 0;
+    uint64_t payloadBytes = 0;
+    uint64_t expectedCacheBytes = 0;
+    return ElementByteCount(header.nodeCount, sizeof(Node), &nodeBytes) &&
+        ElementByteCount(header.pageCount, sizeof(Page), &pageBytes) &&
+        ElementByteCount(header.pageIndexCount, sizeof(uint32_t), &pageIndexBytes) &&
+        AddUint64(nodeBytes, pageBytes, &payloadBytes) &&
+        AddUint64(payloadBytes, pageIndexBytes, &payloadBytes) &&
+        AddUint64(static_cast<uint64_t>(sizeof(header)), payloadBytes, &expectedCacheBytes) &&
+        expectedCacheBytes == cacheBytes;
 }
 
 bool FarVoxelOctree::IsGpuUploadPending() const {
@@ -109,6 +331,18 @@ bool FarVoxelOctree::EmitPendingGpuUploadCopies(ID3D12GraphicsCommandList* comma
         }
         if (!dst || !src || !dst->GetResource() || !src->GetResource() || copy.bytes == 0) {
             continue;
+        }
+        if (!IsValidByteRange(copy.offset, copy.bytes, dst->GetSize()) ||
+            !IsValidByteRange(copy.offset, copy.bytes, src->GetSize())) {
+            spdlog::warn(
+                "Far octree skipped invalid pending GPU upload copy: stage={} offset={} bytes={} dstSize={} srcSize={}",
+                static_cast<uint32_t>(copy.stage),
+                copy.offset,
+                copy.bytes,
+                dst->GetSize(),
+                src->GetSize());
+            m_pendingGpuCopies.clear();
+            return false;
         }
 
         dst->TransitionTo(commandList, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -155,7 +389,8 @@ const char* FarVoxelOctree::GetGpuUploadStageName() const {
 bool FarVoxelOctree::TryFinalizeAsyncUpload(
     ID3D12Device* device,
     DescriptorHeapManager& heapManager,
-    uint64_t maxUploadBytes)
+    uint64_t maxUploadBytes,
+    uint32_t maxCpuWaitMs)
 {
     if (!m_asyncPending || !m_asyncBuild.valid()) {
         if (IsGpuUploadPending()) {
@@ -164,7 +399,10 @@ bool FarVoxelOctree::TryFinalizeAsyncUpload(
         return IsValid();
     }
 
-    if (m_asyncBuild.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+    const auto waitDuration = maxCpuWaitMs > 0u
+        ? std::chrono::milliseconds(maxCpuWaitMs)
+        : std::chrono::milliseconds(0);
+    if (m_asyncBuild.wait_for(waitDuration) != std::future_status::ready) {
         return false;
     }
 
@@ -180,10 +418,19 @@ bool FarVoxelOctree::TryFinalizeAsyncUpload(
     m_nodes = std::move(built.nodes);
     m_pages = std::move(built.pages);
     m_pageIndex = std::move(built.pageIndex);
-    m_stats.gpuUploadBytesTotal =
-        static_cast<uint64_t>(m_nodes.size()) * sizeof(Node) +
-        static_cast<uint64_t>(m_pages.size()) * sizeof(Page) +
-        static_cast<uint64_t>(m_pageIndex.size()) * sizeof(uint32_t);
+    uint64_t uploadBytesTotal = 0;
+    if (!ComputeFarUploadBytesTotal(
+            m_nodes.size(),
+            sizeof(Node),
+            m_pages.size(),
+            sizeof(Page),
+            m_pageIndex.size(),
+            sizeof(uint32_t),
+            &uploadBytesTotal)) {
+        spdlog::warn("Far sparse voxel octree async upload size overflow");
+        return false;
+    }
+    m_stats.gpuUploadBytesTotal = uploadBytesTotal;
     m_stats.gpuUploadBytesUploaded = 0;
     m_stats.gpuUploadStageBytesTotal = 0;
     m_stats.gpuUploadStageBytesUploaded = 0;
@@ -203,34 +450,36 @@ FarVoxelOctree::BuildResult FarVoxelOctree::BuildCpuData(const FarVoxelOctreeCon
     builder.m_config = config;
 
     const int32_t radius = std::max(1, builder.m_config.pageRadius);
-    const int32_t pageCountPerAxis = radius * 2 + 1;
+    if (!ValidateFarVoxelOctreeConfigForBuild(builder.m_config, &result.error)) {
+        return result;
+    }
+    uint64_t pageCountPerAxis64 = 0;
+    uint64_t pageIndexCount64 = 0;
+    if (!AddUint64(static_cast<uint64_t>(radius), static_cast<uint64_t>(radius), &pageCountPerAxis64) ||
+        !AddUint64(pageCountPerAxis64, 1u, &pageCountPerAxis64) ||
+        !MulUint64(pageCountPerAxis64, pageCountPerAxis64, &pageIndexCount64) ||
+        pageCountPerAxis64 > static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) ||
+        pageIndexCount64 > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) ||
+        !FitsSizeT(pageIndexCount64)) {
+        result.error = "FarVoxelOctree page grid is too large";
+        return result;
+    }
+    const int32_t pageCountPerAxis = static_cast<int32_t>(pageCountPerAxis64);
     constexpr uint32_t kMissingPage = 0xFFFFFFFFu;
 
-    struct CacheHeader {
-        uint32_t magic = 0x56534631u; // "VSF1"
-        uint32_t version = 4;
-        int32_t pageRadius = 0;
-        uint32_t maxDepth = 0;
-        uint32_t seed = 0;
-        float pageSize = 0.0f;
-        float rootMinY = 0.0f;
-        uint64_t nodeCount = 0;
-        uint64_t pageCount = 0;
-        uint64_t pageIndexCount = 0;
-    };
-
-    const auto cachePath = std::filesystem::current_path() /
-        ("venpod_far_svo_cache_r" + std::to_string(radius) +
-         "_d" + std::to_string(builder.m_config.maxDepth) +
-         "_s" + std::to_string(builder.m_config.seed) + ".bin");
+    const auto cachePath = FarVoxelOctreeCachePath(builder.m_config, radius);
 
     bool loadedFromCache = false;
     {
-        std::ifstream in(cachePath, std::ios::binary);
-        CacheHeader header{};
-        if (in.read(reinterpret_cast<char*>(&header), sizeof(header)) &&
+        std::ifstream in(cachePath, std::ios::binary | std::ios::ate);
+        uint64_t cacheBytes = 0;
+        FarVoxelOctreeCacheHeader header{};
+        if (TryGetInputStreamSize(in, &cacheBytes) &&
+            cacheBytes >= static_cast<uint64_t>(sizeof(header)) &&
+            cacheBytes <= kMaxFarVoxelOctreeCacheBytes &&
+            in.read(reinterpret_cast<char*>(&header), sizeof(header)) &&
             header.magic == 0x56534631u &&
-            header.version == 4 &&
+            header.version == kFarVoxelOctreeCacheVersion &&
             header.pageRadius == radius &&
             header.maxDepth == builder.m_config.maxDepth &&
             header.seed == builder.m_config.seed &&
@@ -238,33 +487,84 @@ FarVoxelOctree::BuildResult FarVoxelOctree::BuildCpuData(const FarVoxelOctreeCon
             header.rootMinY == builder.m_config.rootMinY &&
             header.nodeCount > 0 &&
             header.pageCount > 0 &&
-            header.pageIndexCount == static_cast<uint64_t>(pageCountPerAxis * pageCountPerAxis)) {
+            header.pageIndexCount == pageIndexCount64 &&
+            FitsSizeT(header.nodeCount) &&
+            FitsSizeT(header.pageCount) &&
+            FitsSizeT(header.pageIndexCount)) {
+            uint64_t nodeBytes = 0;
+            uint64_t pageBytes = 0;
+            uint64_t pageIndexBytes = 0;
+            uint64_t payloadBytes = 0;
+            uint64_t expectedCacheBytes = 0;
+            if (ElementByteCount(header.nodeCount, sizeof(Node), &nodeBytes) &&
+                ElementByteCount(header.pageCount, sizeof(Page), &pageBytes) &&
+                ElementByteCount(header.pageIndexCount, sizeof(uint32_t), &pageIndexBytes) &&
+                AddUint64(nodeBytes, pageBytes, &payloadBytes) &&
+                AddUint64(payloadBytes, pageIndexBytes, &payloadBytes) &&
+                AddUint64(static_cast<uint64_t>(sizeof(header)), payloadBytes, &expectedCacheBytes) &&
+                expectedCacheBytes == cacheBytes &&
+                FitsStreamSize(nodeBytes) &&
+                FitsStreamSize(pageBytes) &&
+                FitsStreamSize(pageIndexBytes)) {
+                builder.m_nodes.resize(static_cast<size_t>(header.nodeCount));
+                builder.m_pages.resize(static_cast<size_t>(header.pageCount));
+                builder.m_pageIndex.resize(static_cast<size_t>(header.pageIndexCount));
 
-            builder.m_nodes.resize(static_cast<size_t>(header.nodeCount));
-            builder.m_pages.resize(static_cast<size_t>(header.pageCount));
-            builder.m_pageIndex.resize(static_cast<size_t>(header.pageIndexCount));
-
-            if (in.read(reinterpret_cast<char*>(builder.m_nodes.data()), static_cast<std::streamsize>(builder.m_nodes.size() * sizeof(Node))) &&
-                in.read(reinterpret_cast<char*>(builder.m_pages.data()), static_cast<std::streamsize>(builder.m_pages.size() * sizeof(Page))) &&
-                in.read(reinterpret_cast<char*>(builder.m_pageIndex.data()), static_cast<std::streamsize>(builder.m_pageIndex.size() * sizeof(uint32_t)))) {
-                loadedFromCache = true;
-            } else {
-                builder.m_nodes.clear();
-                builder.m_pages.clear();
-                builder.m_pageIndex.clear();
+                if (ReadExact(in, builder.m_nodes.data(), nodeBytes) &&
+                    ReadExact(in, builder.m_pages.data(), pageBytes) &&
+                    ReadExact(in, builder.m_pageIndex.data(), pageIndexBytes)) {
+                    loadedFromCache = true;
+                } else {
+                    builder.m_nodes.clear();
+                    builder.m_pages.clear();
+                    builder.m_pageIndex.clear();
+                }
             }
         }
     }
 
     if (!loadedFromCache) {
-        builder.m_nodes.reserve(static_cast<size_t>(pageCountPerAxis * pageCountPerAxis * 64));
-        builder.m_pages.reserve(static_cast<size_t>(pageCountPerAxis * pageCountPerAxis));
-        builder.m_pageIndex.assign(static_cast<size_t>(pageCountPerAxis * pageCountPerAxis), kMissingPage);
+        uint64_t reserveNodeCount = 0;
+        if (!MulUint64(pageIndexCount64, 64u, &reserveNodeCount) ||
+            !FitsSizeT(reserveNodeCount)) {
+            result.error = "FarVoxelOctree node reserve is too large";
+            return result;
+        }
+        builder.m_nodes.reserve(static_cast<size_t>(reserveNodeCount));
+        builder.m_pages.reserve(static_cast<size_t>(pageIndexCount64));
+        builder.m_pageIndex.assign(static_cast<size_t>(pageIndexCount64), kMissingPage);
+
+        struct PendingPageBuild {
+            BuildBounds rootBounds{};
+            Page page{};
+            size_t denseIndex = 0;
+        };
+        struct CompletedPageBuild {
+            Page page{};
+            size_t denseIndex = 0;
+            std::vector<Node> nodes;
+            bool success = false;
+        };
+        std::vector<PendingPageBuild> pendingPages;
+        pendingPages.reserve(static_cast<size_t>(pageIndexCount64));
 
         for (int32_t pz = -radius; pz <= radius; ++pz) {
             for (int32_t px = -radius; px <= radius; ++px) {
-                const float originX = static_cast<float>(px) * builder.m_config.pageSize;
-                const float originZ = static_cast<float>(pz) * builder.m_config.pageSize;
+                const double originXDouble =
+                    static_cast<double>(px) * static_cast<double>(builder.m_config.pageSize);
+                const double originZDouble =
+                    static_cast<double>(pz) * static_cast<double>(builder.m_config.pageSize);
+                int32_t pageOriginX = 0;
+                int32_t pageOriginY = 0;
+                int32_t pageOriginZ = 0;
+                if (!TryFloorDoubleToInt32(originXDouble, &pageOriginX) ||
+                    !TryFloorDoubleToInt32(static_cast<double>(builder.m_config.rootMinY), &pageOriginY) ||
+                    !TryFloorDoubleToInt32(originZDouble, &pageOriginZ)) {
+                    result.error = "FarVoxelOctree page origin exceeded int32 world range";
+                    return result;
+                }
+                const float originX = static_cast<float>(originXDouble);
+                const float originZ = static_cast<float>(originZDouble);
                 const BuildBounds rootBounds{
                     originX,
                     builder.m_config.rootMinY,
@@ -277,20 +577,80 @@ FarVoxelOctree::BuildResult FarVoxelOctree::BuildCpuData(const FarVoxelOctreeCon
                 }
 
                 Page page;
-                page.originX = static_cast<int32_t>(std::floor(originX));
-                page.originY = static_cast<int32_t>(std::floor(builder.m_config.rootMinY));
-                page.originZ = static_cast<int32_t>(std::floor(originZ));
-                page.rootNode = builder.BuildNode(rootBounds, 0);
-                const uint32_t pageIndex = static_cast<uint32_t>(builder.m_pages.size());
+                page.originX = pageOriginX;
+                page.originY = pageOriginY;
+                page.originZ = pageOriginZ;
                 const size_t denseIndex = static_cast<size_t>(pz + radius) *
                                           static_cast<size_t>(pageCountPerAxis) +
                                           static_cast<size_t>(px + radius);
-                builder.m_pageIndex[denseIndex] = pageIndex;
-                builder.m_pages.push_back(page);
+                pendingPages.push_back(PendingPageBuild{rootBounds, page, denseIndex});
             }
         }
 
-        CacheHeader header{};
+        std::vector<CompletedPageBuild> completedPages(pendingPages.size());
+        if (!pendingPages.empty()) {
+            const uint32_t hardwareThreads = std::max(1u, std::thread::hardware_concurrency());
+            const uint32_t workerCount = std::clamp<uint32_t>(
+                hardwareThreads,
+                1u,
+                static_cast<uint32_t>(pendingPages.size()));
+            std::atomic<size_t> nextPage{0};
+            std::vector<std::thread> workers;
+            workers.reserve(workerCount);
+            for (uint32_t worker = 0; worker < workerCount; ++worker) {
+                workers.emplace_back([&]() {
+                    for (;;) {
+                        const size_t pageBuildIndex = nextPage.fetch_add(1, std::memory_order_relaxed);
+                        if (pageBuildIndex >= pendingPages.size()) {
+                            break;
+                        }
+                        const PendingPageBuild& pending = pendingPages[pageBuildIndex];
+                        FarVoxelOctree pageBuilder;
+                        pageBuilder.m_config = builder.m_config;
+                        pageBuilder.m_nodes.reserve(32768u);
+                        const uint32_t rootNode = pageBuilder.BuildNode(pending.rootBounds, 0);
+
+                        CompletedPageBuild completed;
+                        completed.page = pending.page;
+                        completed.page.rootNode = rootNode;
+                        completed.denseIndex = pending.denseIndex;
+                        completed.nodes = std::move(pageBuilder.m_nodes);
+                        completed.success = !completed.nodes.empty();
+                        completedPages[pageBuildIndex] = std::move(completed);
+                    }
+                });
+            }
+            for (std::thread& worker : workers) {
+                worker.join();
+            }
+        }
+
+        for (CompletedPageBuild& completed : completedPages) {
+            if (!completed.success || completed.nodes.empty()) {
+                continue;
+            }
+            if (builder.m_pages.size() >= std::numeric_limits<uint32_t>::max() ||
+                builder.m_nodes.size() >= std::numeric_limits<uint32_t>::max()) {
+                result.error = "FarVoxelOctree generated counts exceed runtime index limits";
+                return result;
+            }
+            const uint32_t nodeBase = static_cast<uint32_t>(builder.m_nodes.size());
+            for (Node& node : completed.nodes) {
+                if ((node.flags & kLeafFlag) == 0u && node.childBase != 0xFFFFFFFFu) {
+                    node.childBase += nodeBase;
+                }
+            }
+            completed.page.rootNode += nodeBase;
+            const uint32_t pageIndex = static_cast<uint32_t>(builder.m_pages.size());
+            builder.m_pageIndex[completed.denseIndex] = pageIndex;
+            builder.m_nodes.insert(
+                builder.m_nodes.end(),
+                std::make_move_iterator(completed.nodes.begin()),
+                std::make_move_iterator(completed.nodes.end()));
+            builder.m_pages.push_back(completed.page);
+        }
+
+        FarVoxelOctreeCacheHeader header{};
         header.pageRadius = radius;
         header.maxDepth = builder.m_config.maxDepth;
         header.seed = builder.m_config.seed;
@@ -301,16 +661,28 @@ FarVoxelOctree::BuildResult FarVoxelOctree::BuildCpuData(const FarVoxelOctreeCon
         header.pageIndexCount = static_cast<uint64_t>(builder.m_pageIndex.size());
 
         std::ofstream out(cachePath, std::ios::binary | std::ios::trunc);
-        if (out.write(reinterpret_cast<const char*>(&header), sizeof(header)) &&
-            out.write(reinterpret_cast<const char*>(builder.m_nodes.data()), static_cast<std::streamsize>(builder.m_nodes.size() * sizeof(Node))) &&
-            out.write(reinterpret_cast<const char*>(builder.m_pages.data()), static_cast<std::streamsize>(builder.m_pages.size() * sizeof(Page))) &&
-            out.write(reinterpret_cast<const char*>(builder.m_pageIndex.data()), static_cast<std::streamsize>(builder.m_pageIndex.size() * sizeof(uint32_t)))) {
+        uint64_t nodeBytes = 0;
+        uint64_t pageBytes = 0;
+        uint64_t pageIndexBytes = 0;
+        if (ElementByteCount(builder.m_nodes.size(), sizeof(Node), &nodeBytes) &&
+            ElementByteCount(builder.m_pages.size(), sizeof(Page), &pageBytes) &&
+            ElementByteCount(builder.m_pageIndex.size(), sizeof(uint32_t), &pageIndexBytes) &&
+            WriteExact(out, &header, sizeof(header)) &&
+            WriteExact(out, builder.m_nodes.data(), nodeBytes) &&
+            WriteExact(out, builder.m_pages.data(), pageBytes) &&
+            WriteExact(out, builder.m_pageIndex.data(), pageIndexBytes)) {
             spdlog::info("Saved far voxel octree cache: {}", cachePath.string());
         }
     }
 
     if (builder.m_nodes.empty() || builder.m_pages.empty()) {
         result.error = "FarVoxelOctree generated no nodes/pages";
+        return result;
+    }
+    if (builder.m_nodes.size() > std::numeric_limits<uint32_t>::max() ||
+        builder.m_pages.size() > std::numeric_limits<uint32_t>::max() ||
+        builder.m_pageIndex.size() > std::numeric_limits<uint32_t>::max()) {
+        result.error = "FarVoxelOctree generated counts exceed runtime stats limits";
         return result;
     }
 
@@ -340,10 +712,18 @@ Result<void> FarVoxelOctree::UploadToGpu(ID3D12Device* device, DescriptorHeapMan
         return Error("FarVoxelOctree::UploadToGpu - CPU data is empty");
     }
 
-    m_stats.gpuUploadBytesTotal =
-        static_cast<uint64_t>(m_nodes.size()) * sizeof(Node) +
-        static_cast<uint64_t>(m_pages.size()) * sizeof(Page) +
-        static_cast<uint64_t>(m_pageIndex.size()) * sizeof(uint32_t);
+    uint64_t uploadBytesTotal = 0;
+    if (!ComputeFarUploadBytesTotal(
+            m_nodes.size(),
+            sizeof(Node),
+            m_pages.size(),
+            sizeof(Page),
+            m_pageIndex.size(),
+            sizeof(uint32_t),
+            &uploadBytesTotal)) {
+        return Error("FarVoxelOctree::UploadToGpu - upload size overflow");
+    }
+    m_stats.gpuUploadBytesTotal = uploadBytesTotal;
     m_stats.gpuUploadBytesUploaded = 0;
     m_stats.gpuUploadStageBytesTotal = 0;
     m_stats.gpuUploadStageBytesUploaded = 0;
@@ -409,9 +789,34 @@ bool FarVoxelOctree::PumpGpuUpload(
         m_stats.gpuUploadStage = static_cast<uint32_t>(m_gpuUploadStage);
         m_stats.gpuUploadStageBytesTotal = totalBytes;
         m_stats.gpuUploadStageBytesUploaded = m_gpuUploadStageOffset;
+        if (!source ||
+            m_gpuUploadStageOffset > totalBytes ||
+            totalBytes > buffer.GetSize() ||
+            totalBytes > uploadBuffer.GetSize()) {
+            spdlog::warn(
+                "Far octree upload stage {} has invalid bounds: offset={} total={} dstSize={} uploadSize={}",
+                name,
+                m_gpuUploadStageOffset,
+                totalBytes,
+                buffer.GetSize(),
+                uploadBuffer.GetSize());
+            m_gpuUploadStage = GpuUploadStage::Idle;
+            return false;
+        }
         const uint64_t remaining = totalBytes - m_gpuUploadStageOffset;
         const uint64_t bytesToCopy = std::min(remaining, budgetRemaining);
         if (bytesToCopy > 0) {
+            if (bytesToCopy > static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
+                !IsValidByteRange(m_gpuUploadStageOffset, bytesToCopy, totalBytes)) {
+                spdlog::warn(
+                    "Far octree upload stage {} rejected invalid copy range: offset={} bytes={} total={}",
+                    name,
+                    m_gpuUploadStageOffset,
+                    bytesToCopy,
+                    totalBytes);
+                m_gpuUploadStage = GpuUploadStage::Idle;
+                return false;
+            }
             const uint8_t* sourceBytes = static_cast<const uint8_t*>(source);
             uint8_t* mappedUpload = static_cast<uint8_t*>(uploadBuffer.GetMappedData());
             if (!mappedUpload) {
@@ -425,7 +830,13 @@ bool FarVoxelOctree::PumpGpuUpload(
                 bytesToCopy
             });
             m_gpuUploadStageOffset += bytesToCopy;
-            m_stats.gpuUploadBytesUploaded += bytesToCopy;
+            uint64_t uploadedBytes = 0;
+            if (!AddUint64(m_stats.gpuUploadBytesUploaded, bytesToCopy, &uploadedBytes)) {
+                spdlog::warn("Far octree upload byte counter overflow in stage {}", name);
+                m_gpuUploadStage = GpuUploadStage::Idle;
+                return false;
+            }
+            m_stats.gpuUploadBytesUploaded = std::min(uploadedBytes, m_stats.gpuUploadBytesTotal);
             m_stats.gpuUploadStageBytesUploaded = m_gpuUploadStageOffset;
             budgetRemaining -= bytesToCopy;
         }
@@ -631,7 +1042,25 @@ bool FarVoxelOctree::CellMayContainTerrain(const BuildBounds& bounds) const {
     const float h2 = TerrainHeight(x0, z1);
     const float h3 = TerrainHeight(x1, z1);
     const float hc = TerrainHeight(xc, zc);
-    const float maxHeight = std::max({h0, h1, h2, h3, hc}) + bounds.size * 0.35f;
+    const float hx0 = TerrainHeight(xc, z0);
+    const float hx1 = TerrainHeight(xc, z1);
+    const float hz0 = TerrainHeight(x0, zc);
+    const float hz1 = TerrainHeight(x1, zc);
+    const float q0 = TerrainHeight(bounds.x + bounds.size * 0.25f, bounds.z + bounds.size * 0.25f);
+    const float q1 = TerrainHeight(bounds.x + bounds.size * 0.75f, bounds.z + bounds.size * 0.25f);
+    const float q2 = TerrainHeight(bounds.x + bounds.size * 0.25f, bounds.z + bounds.size * 0.75f);
+    const float q3 = TerrainHeight(bounds.x + bounds.size * 0.75f, bounds.z + bounds.size * 0.75f);
+    float maxHeight = std::max({h0, h1, h2, h3, hc, hx0, hx1, hz0, hz1, q0, q1, q2, q3});
+    if (bounds.size >= 48.0f) {
+        for (uint32_t iz = 1; iz < 5; ++iz) {
+            for (uint32_t ix = 1; ix < 5; ++ix) {
+                const float sx = bounds.x + bounds.size * (static_cast<float>(ix) / 5.0f);
+                const float sz = bounds.z + bounds.size * (static_cast<float>(iz) / 5.0f);
+                maxHeight = std::max(maxHeight, TerrainHeight(sx, sz));
+            }
+        }
+    }
+    maxHeight += bounds.size * 0.55f;
 
     return bounds.y <= maxHeight && bounds.y + bounds.size >= minTerrainY;
 }
@@ -643,74 +1072,248 @@ bool FarVoxelOctree::CellCanCollapseSolid(const BuildBounds& bounds) const {
     const float z1 = bounds.z + bounds.size;
     const float xc = bounds.x + bounds.size * 0.5f;
     const float zc = bounds.z + bounds.size * 0.5f;
+    const float xq0 = bounds.x + bounds.size * 0.25f;
+    const float xq1 = bounds.x + bounds.size * 0.75f;
+    const float zq0 = bounds.z + bounds.size * 0.25f;
+    const float zq1 = bounds.z + bounds.size * 0.75f;
 
-    const float minHeight = std::min({
+    float minHeight = std::min({
         TerrainHeight(x0, z0),
         TerrainHeight(x1, z0),
         TerrainHeight(x0, z1),
         TerrainHeight(x1, z1),
-        TerrainHeight(xc, zc)
+        TerrainHeight(xc, zc),
+        TerrainHeight(xc, z0),
+        TerrainHeight(xc, z1),
+        TerrainHeight(x0, zc),
+        TerrainHeight(x1, zc),
+        TerrainHeight(xq0, zq0),
+        TerrainHeight(xq1, zq0),
+        TerrainHeight(xq0, zq1),
+        TerrainHeight(xq1, zq1)
     });
+    if (bounds.size >= 48.0f) {
+        for (uint32_t iz = 1; iz < 5; ++iz) {
+            for (uint32_t ix = 1; ix < 5; ++ix) {
+                const float sx = bounds.x + bounds.size * (static_cast<float>(ix) / 5.0f);
+                const float sz = bounds.z + bounds.size * (static_cast<float>(iz) / 5.0f);
+                minHeight = std::min(minHeight, TerrainHeight(sx, sz));
+            }
+        }
+    }
 
     // Collapse only cells safely below every sampled surface point. This keeps
     // detail near cliffs/ravines while avoiding a deep dense tree for solid
     // mountain interiors that are only used as far-field silhouette.
-    return bounds.y + bounds.size < minHeight - bounds.size * 0.20f;
+    return bounds.y + bounds.size < minHeight - bounds.size * 0.45f;
 }
 
 uint32_t FarVoxelOctree::DominantMaterial(float x, float z, float height) const {
-    const float materialNoise =
-        std::sin(x * 0.013f + z * 0.017f + std::sin(x * 0.004f - z * 0.011f)) * 0.5f + 0.5f;
+    const float hx0 = TerrainHeight(x - 4.0f, z);
+    const float hx1 = TerrainHeight(x + 4.0f, z);
+    const float hz0 = TerrainHeight(x, z - 4.0f);
+    const float hz1 = TerrainHeight(x, z + 4.0f);
+    const float localRelief = std::max(
+        std::max(std::abs(hx0 - height), std::abs(hx1 - height)),
+        std::max(std::abs(hz0 - height), std::abs(hz1 - height)));
 
-    if (height < static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y) + 4.0f) {
+    if (height < static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y)) {
+        return kMaterialWater;
+    }
+    if (height < static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y) + 48.0f &&
+        localRelief < 36.0f) {
         return kMaterialSand;
     }
-    if (height > 430.0f) {
+    if (height < static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y) + 72.0f) {
+        return (height < static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y) + 48.0f &&
+                localRelief < 36.0f)
+            ? kMaterialSand
+            : kMaterialDirt;
+    }
+    if (height < static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y) + 128.0f) {
+        return (height < static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y) + 86.0f &&
+                localRelief < 58.0f)
+            ? kMaterialSand
+            : kMaterialDirt;
+    }
+    if (localRelief > 10.0f || height > 160.0f) {
         return kMaterialStone;
-    }
-    if (height > 220.0f) {
-        return materialNoise > 0.45f ? kMaterialStone : kMaterialConcrete;
-    }
-    if (materialNoise > 0.84f) {
-        return kMaterialConcrete;
     }
     return kMaterialDirt;
 }
 
 float FarVoxelOctree::TerrainHeight(float x, float z) const {
-    const float n0 = std::sin(x * 0.00173f + z * 0.00091f + 2.1f);
-    const float n1 = std::sin(x * -0.00077f + z * 0.00148f + 5.7f);
-    const float n2 = std::sin(x * 0.00320f + z * -0.00260f + 1.3f);
-    const float n3 = std::sin(x * -0.00510f + z * 0.00430f + 8.4f);
+    const float broad = FarTerrainValueNoise2D(x * 0.0045f, z * 0.0045f, m_config.seed + 11u);
+    const float ridgeSource = FarTerrainValueNoise2D(
+        x * 0.0100f + 41.0f,
+        z * 0.0100f - 17.0f,
+        m_config.seed + 23u);
+    const float ridge = 1.0f - std::abs(ridgeSource);
+    const float detail = FarTerrainValueNoise2D(
+        x * 0.035f - 13.0f,
+        z * 0.035f + 29.0f,
+        m_config.seed + 37u);
+    const float ridgeHeight = ridge * ridge;
 
-    const float continent = n0 * 0.58f + n1 * 0.42f;
-    const float mountainMask = Smooth01((continent + 0.20f) * 0.95f);
-    const float ridgeA = Ridged(n2, 1.35f);
-    const float ridgeB = Ridged(n3, 1.90f);
-    const float broadValley = Ridged(std::sin(x * 0.00092f + z * 0.00111f + 0.4f), 1.2f);
-    const float spireMask =
-        std::pow(Ridged(std::sin(x * 0.0078f + z * -0.0062f + n1), 2.0f), 3.5f) *
-        (0.25f + mountainMask * 0.85f);
-    const float ravineMask =
-        1.0f - Smooth01((std::abs(std::sin(x * 0.00135f + z * -0.00105f + 2.6f)) - 0.02f) / 0.10f);
+    float height = -64.0f;
+    height += broad * 145.0f;
+    height += ridgeHeight * 150.0f;
+    height += detail * 8.0f;
 
-    const float dx = x - 96.0f;
-    const float dz = z - 96.0f;
-    const float originUplift = (1.0f - Smooth01(std::sqrt(dx * dx + dz * dz) / 420.0f)) * 170.0f;
+    const float originDx = x - 192.0f;
+    const float originDz = z - 224.0f;
+    const float originDistance = std::sqrt(originDx * originDx + originDz * originDz);
+    const float originComfort =
+        1.0f - Smooth01(std::clamp((originDistance - 180.0f) / 520.0f, 0.0f, 1.0f));
+    const float publicRegionHeight =
+        -42.0f +
+        broad * 54.0f +
+        ridgeHeight * 48.0f +
+        detail * 3.0f +
+        (1.0f - Smooth01(originDistance / 360.0f)) * 72.0f;
+    height += (1.0f - Smooth01(originDistance / 420.0f)) * 58.0f;
+    height = height + (publicRegionHeight - height) * (originComfort * 0.94f);
+    const float publicCapInfluence =
+        1.0f - Smooth01(std::clamp((originDistance - 220.0f) / 420.0f, 0.0f, 1.0f));
+    const float publicCap =
+        58.0f + Smooth01(std::clamp(originDistance / 640.0f, 0.0f, 1.0f)) * 114.0f;
+    const float cappedHeight = std::min(height, publicCap);
+    height = height + (cappedHeight - height) * publicCapInfluence;
 
-    float height = -85.0f;
-    height += continent * 210.0f;
-    height += ridgeA * (125.0f + mountainMask * 170.0f);
-    height += ridgeB * mountainMask * 95.0f;
-    height += spireMask * 360.0f;
-    height += originUplift;
-    height -= broadValley * (90.0f - mountainMask * 30.0f);
-    height -= ravineMask * 230.0f;
+    const float submergedBlend =
+        1.0f - Smooth01(std::clamp(
+            (height - static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y + 28)) / 86.0f,
+            0.0f,
+            1.0f));
+    if (submergedBlend > 0.0f) {
+        const float submergedShelfHeight =
+            static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y - 8) +
+            broad * 38.0f +
+            ridgeHeight * 22.0f +
+            detail * 2.0f +
+            (1.0f - Smooth01(originDistance / 520.0f)) * 18.0f;
+        height = height + (submergedShelfHeight - height) * (submergedBlend * 0.55f);
+    }
 
-    const float terraceStep = 10.0f + (22.0f - 10.0f) * mountainMask;
-    const float terraced = std::floor(height / terraceStep) * terraceStep;
-    height = height * (1.0f - (0.26f + mountainMask * 0.20f)) +
-             terraced * (0.26f + mountainMask * 0.20f);
+    const float playableBankBand =
+        1.0f - Smooth01(std::clamp((originDistance - 260.0f) / 980.0f, 0.0f, 1.0f));
+    const float lowlandUpper =
+        1.0f - Smooth01(std::clamp(
+            (height - static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y + 96)) / 120.0f,
+            0.0f,
+            1.0f));
+    const float lowlandFloor =
+        Smooth01(std::clamp(
+            (height - static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y - 40)) / 64.0f,
+            0.0f,
+            1.0f));
+    const float playableBankBlend = playableBankBand * lowlandUpper * lowlandFloor * 0.64f;
+    if (playableBankBlend > 0.0f) {
+        const float playableShelfHeight =
+            static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y + 18) +
+            broad * 28.0f +
+            ridgeHeight * 10.0f +
+            detail * 1.5f +
+            (1.0f - Smooth01(std::clamp(originDistance / 460.0f, 0.0f, 1.0f))) * 42.0f;
+        height = height + (playableShelfHeight - height) * playableBankBlend;
+    }
+    const float publicBasinBand =
+        Smooth01(std::clamp((originDistance - 360.0f) / 240.0f, 0.0f, 1.0f)) *
+        (1.0f - Smooth01(std::clamp((originDistance - 1700.0f) / 760.0f, 0.0f, 1.0f))) *
+        Smooth01(std::clamp(
+            (height - static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y - 38)) / 56.0f,
+            0.0f,
+            1.0f)) *
+        (1.0f - Smooth01(std::clamp(
+            (height - static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y + 180)) / 140.0f,
+            0.0f,
+            1.0f)));
+    const float publicBasinFloor =
+        static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y - 12) +
+        broad * 2.0f +
+        detail * 0.35f;
+    if (publicBasinBand > 0.0f) {
+        const float basinHeight = std::min(height, publicBasinFloor);
+        height = height + (basinHeight - height) * (publicBasinBand * 0.80f);
+    }
+    const float backdropNoise = FarTerrainValueNoise2D(
+        x * 0.0018f + 19.0f,
+        z * 0.0018f - 31.0f,
+        m_config.seed + 211u);
+    const float backdropRidgeSource = FarTerrainValueNoise2D(
+        x * 0.0032f - 71.0f,
+        z * 0.0032f + 43.0f,
+        m_config.seed + 227u);
+    const float backdropRidge = 1.0f - std::abs(backdropRidgeSource);
+    const float backdropBreakup = FarTerrainValueNoise2D(
+        x * 0.0075f + 203.0f,
+        z * 0.0075f - 167.0f,
+        m_config.seed + 271u);
+    const float backdropNotch =
+        Smooth01(std::clamp((backdropBreakup - 0.08f) / 0.58f, 0.0f, 1.0f));
+    const float silhouetteRidge =
+        std::clamp(backdropRidge * backdropRidge * 1.22f + backdropNoise * 0.18f, 0.0f, 1.0f);
+    const float backdropBand =
+        Smooth01(std::clamp((originDistance - 1360.0f) / 700.0f, 0.0f, 1.0f)) *
+        (1.0f - Smooth01(std::clamp((originDistance - 5200.0f) / 1200.0f, 0.0f, 1.0f)));
+    const float northBackdrop = Smooth01(std::clamp((z - 1180.0f) / 900.0f, 0.0f, 1.0f));
+    const float sideBackdrop =
+        Smooth01(std::clamp((std::abs(x - 192.0f) - 820.0f) / 980.0f, 0.0f, 1.0f));
+    const float backdropFacing =
+        std::clamp(northBackdrop + sideBackdrop * 0.58f, 0.0f, 1.0f);
+    const float silhouetteContinuity =
+        std::clamp(silhouetteRidge + backdropBand * backdropFacing * 0.32f, 0.0f, 1.0f);
+    const float backdropInfluence =
+        backdropBand *
+        backdropFacing *
+        Smooth01(silhouetteContinuity) *
+        (0.46f + backdropNotch * 0.54f);
+    const float backdropHeight =
+        248.0f +
+        backdropBand * 160.0f +
+        silhouetteContinuity * 186.0f +
+        backdropNoise * 26.0f;
+    height = height + (std::max(height, backdropHeight) - height) * (backdropInfluence * 0.70f);
+
+    const float westCorridor = Smooth01(std::clamp((192.0f - x - 520.0f) / 820.0f, 0.0f, 1.0f));
+    const float eastCorridor = Smooth01(std::clamp((x - 192.0f - 520.0f) / 820.0f, 0.0f, 1.0f));
+    const float southBlend = Smooth01(std::clamp((360.0f - z) / 1200.0f, 0.0f, 1.0f));
+    const float westNorthBlend = Smooth01(std::clamp((z - 360.0f) / 920.0f, 0.0f, 1.0f));
+    const float routeDistanceBand =
+        Smooth01(std::clamp((originDistance - 780.0f) / 420.0f, 0.0f, 1.0f)) *
+        (1.0f - Smooth01(std::clamp((originDistance - 4300.0f) / 1200.0f, 0.0f, 1.0f)));
+    const float routeCorridor = routeDistanceBand * std::clamp(
+        westCorridor * (0.50f + southBlend * 0.42f + westNorthBlend * 0.30f) +
+        eastCorridor * southBlend,
+        0.0f,
+        1.0f);
+    const float routeRidgeNoiseA = FarTerrainValueNoise2D(
+        x * 0.0024f + 113.0f,
+        z * 0.0024f - 89.0f,
+        m_config.seed + 251u);
+    const float routeRidgeNoiseB = FarTerrainValueNoise2D(
+        x * 0.0068f - 37.0f,
+        z * 0.0068f + 151.0f,
+        m_config.seed + 263u);
+    const float routeBreakup = FarTerrainValueNoise2D(
+        x * 0.0110f - 211.0f,
+        z * 0.0110f + 73.0f,
+        m_config.seed + 281u);
+    const float routeNotch =
+        Smooth01(std::clamp((routeBreakup - 0.02f) / 0.60f, 0.0f, 1.0f));
+    const float routeRidge =
+        std::clamp(
+            0.26f +
+            (1.0f - std::abs(routeRidgeNoiseA)) * 0.58f +
+            routeRidgeNoiseB * 0.16f,
+            0.0f,
+            1.0f);
+    const float routeBackdropHeight =
+        272.0f +
+        routeDistanceBand * 104.0f +
+        routeRidge * 218.0f;
+    height = height + (std::max(height, routeBackdropHeight) - height) *
+        (routeCorridor * routeRidge * routeNotch * 0.68f);
 
     return std::clamp(
         height,

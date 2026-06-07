@@ -5,6 +5,53 @@
 
 namespace VENPOD::Simulation {
 
+namespace {
+
+constexpr float kDefaultCharacterHeight = 6.0f;
+constexpr float kDefaultCharacterRadius = 0.75f;
+constexpr float kDefaultCharacterStepHeight = 2.5f;
+constexpr float kMinCharacterHeight = 0.5f;
+constexpr float kMaxCharacterHeight = 128.0f;
+constexpr float kMinCharacterRadius = 0.05f;
+constexpr float kMaxCharacterRadius = 16.0f;
+constexpr float kMaxCharacterStepHeight = 16.0f;
+constexpr uint32_t kMaxCharacterSweepSteps = 1024;
+
+float ClampFinite(float value, float minValue, float maxValue, float fallback) {
+    return std::clamp(std::isfinite(value) ? value : fallback, minValue, maxValue);
+}
+
+bool TrySanitizeBody(const SparseCharacterBody& in, SparseCharacterBody& out) {
+    if (!std::isfinite(in.eyeX) ||
+        !std::isfinite(in.eyeY) ||
+        !std::isfinite(in.eyeZ)) {
+        return false;
+    }
+
+    out = in;
+    out.height = ClampFinite(in.height, kMinCharacterHeight, kMaxCharacterHeight, kDefaultCharacterHeight);
+    out.radius = ClampFinite(in.radius, kMinCharacterRadius, kMaxCharacterRadius, kDefaultCharacterRadius);
+    out.stepHeight = ClampFinite(in.stepHeight, 0.0f, kMaxCharacterStepHeight, kDefaultCharacterStepHeight);
+    return true;
+}
+
+uint32_t BuildSweepSteps(float distance, uint32_t maxSweepSteps) {
+    if (!std::isfinite(distance) || distance <= 0.0f) {
+        return 1u;
+    }
+    const uint32_t stepLimit = std::clamp(maxSweepSteps, 1u, kMaxCharacterSweepSteps);
+    const double rawSteps = std::ceil(static_cast<double>(distance) / 0.25);
+    if (!std::isfinite(rawSteps) || rawSteps <= 1.0) {
+        return 1u;
+    }
+    if (rawSteps >= static_cast<double>(stepLimit)) {
+        return stepLimit;
+    }
+    return static_cast<uint32_t>(rawSteps);
+}
+
+} // namespace
+
 SparseCollisionAabb MakeSparseCharacterBodyAabb(const SparseCharacterBody& body) {
     const float feetY = body.eyeY - body.height;
     return SparseCollisionAabb{
@@ -34,24 +81,40 @@ SparseCharacterMoveResult ResolveSparseCharacterHorizontalMove(
     const SparseVoxelWorld& world,
     const SparseCharacterMoveRequest& request) {
     SparseCharacterMoveResult result;
-    result.eyeX = request.targetBody.eyeX;
-    result.eyeY = request.targetBody.eyeY;
-    result.eyeZ = request.targetBody.eyeZ;
+    SparseCharacterBody startBody;
+    SparseCharacterBody targetBody;
+    const bool startValid = TrySanitizeBody(request.startBody, startBody);
+    if (!startValid || !TrySanitizeBody(request.targetBody, targetBody)) {
+        if (startValid) {
+            result.eyeX = startBody.eyeX;
+            result.eyeY = startBody.eyeY;
+            result.eyeZ = startBody.eyeZ;
+        }
+        result.blocked = true;
+        result.safeFraction = 0.0f;
+        return result;
+    }
 
-    const float deltaX = request.targetBody.eyeX - request.startBody.eyeX;
-    const float deltaZ = request.targetBody.eyeZ - request.startBody.eyeZ;
-    const float horizontalDistance = std::sqrt(deltaX * deltaX + deltaZ * deltaZ);
+    result.eyeX = targetBody.eyeX;
+    result.eyeY = targetBody.eyeY;
+    result.eyeZ = targetBody.eyeZ;
+
+    const float verticalVelocity = std::isfinite(request.verticalVelocity)
+        ? request.verticalVelocity
+        : 0.0f;
+    const float deltaX = targetBody.eyeX - startBody.eyeX;
+    const float deltaZ = targetBody.eyeZ - startBody.eyeZ;
+    const float horizontalDistance = static_cast<float>(std::sqrt(
+        static_cast<double>(deltaX) * static_cast<double>(deltaX) +
+        static_cast<double>(deltaZ) * static_cast<double>(deltaZ)));
     if (horizontalDistance < 0.0001f) {
         return result;
     }
 
-    const uint32_t sweepSteps = static_cast<uint32_t>(std::clamp(
-        static_cast<int>(std::ceil(horizontalDistance / 0.25f)),
-        1,
-        static_cast<int>(std::max(1u, request.maxSweepSteps))));
+    const uint32_t sweepSteps = BuildSweepSteps(horizontalDistance, request.maxSweepSteps);
 
-    SparseCharacterBody sweepStart = request.startBody;
-    sweepStart.eyeY = request.targetBody.eyeY;
+    SparseCharacterBody sweepStart = startBody;
+    sweepStart.eyeY = targetBody.eyeY;
     const SparseCollisionSweepResult sweep = world.SweepCollisionAabb(
         MakeSparseCharacterBodyAabb(sweepStart),
         deltaX,
@@ -69,9 +132,9 @@ SparseCharacterMoveResult ResolveSparseCharacterHorizontalMove(
 
     result.blocked = true;
 
-    if (request.allowStepUp && request.verticalVelocity <= 0.0f) {
-        SparseCharacterBody elevatedTarget = request.targetBody;
-        elevatedTarget.eyeY += request.targetBody.stepHeight;
+    if (request.allowStepUp && verticalVelocity <= 0.0f) {
+        SparseCharacterBody elevatedTarget = targetBody;
+        elevatedTarget.eyeY += targetBody.stepHeight;
         const SparseCollisionVolumeResult elevatedBody =
             world.TestCollisionAabb(MakeSparseCharacterBodyAabb(elevatedTarget));
         result.sampledVoxels += elevatedBody.sampledVoxels;
@@ -79,12 +142,15 @@ SparseCharacterMoveResult ResolveSparseCharacterHorizontalMove(
         result.liquidVoxels += elevatedBody.liquidVoxels;
 
         if (!elevatedBody.blocked) {
-            const float currentFeetY = request.targetBody.eyeY - request.targetBody.height;
+            const float currentFeetY = targetBody.eyeY - targetBody.height;
             const SparseCollisionAabb stepFootProbe = MakeSparseCharacterFootprintAabb(
                 elevatedTarget,
-                currentFeetY + request.targetBody.stepHeight);
+                currentFeetY + targetBody.stepHeight);
             const SparseCollisionSupportResult stepSupport =
-                world.FindCollisionSupportBelow(stepFootProbe, request.targetBody.stepHeight + 0.75f);
+                world.FindCollisionSupportBelow(
+                    stepFootProbe,
+                    targetBody.stepHeight + 0.75f,
+                    request.liquidsSupport);
             result.sampledVoxels += stepSupport.sampledVoxels;
             result.solidVoxels += stepSupport.solidVoxels;
             result.liquidVoxels += stepSupport.liquidVoxels;
@@ -93,11 +159,11 @@ SparseCharacterMoveResult ResolveSparseCharacterHorizontalMove(
                 const float supportFeetY = static_cast<float>(stepSupport.supportY) + 1.0f;
                 const bool withinStep =
                     supportFeetY >= currentFeetY - 0.1f &&
-                    supportFeetY <= currentFeetY + request.targetBody.stepHeight + 0.35f;
+                    supportFeetY <= currentFeetY + targetBody.stepHeight + 0.35f;
                 if (withinStep) {
-                    result.eyeX = request.targetBody.eyeX;
-                    result.eyeY = supportFeetY + request.targetBody.height;
-                    result.eyeZ = request.targetBody.eyeZ;
+                    result.eyeX = targetBody.eyeX;
+                    result.eyeY = supportFeetY + targetBody.height;
+                    result.eyeZ = targetBody.eyeZ;
                     result.steppedUp = true;
                     return result;
                 }
@@ -105,9 +171,9 @@ SparseCharacterMoveResult ResolveSparseCharacterHorizontalMove(
         }
     }
 
-    SparseCharacterBody xOnly = request.targetBody;
+    SparseCharacterBody xOnly = targetBody;
     xOnly.eyeZ = sweepStart.eyeZ;
-    SparseCharacterBody zOnly = request.targetBody;
+    SparseCharacterBody zOnly = targetBody;
     zOnly.eyeX = sweepStart.eyeX;
     const SparseCollisionVolumeResult xOnlyVolume =
         world.TestCollisionAabb(MakeSparseCharacterBodyAabb(xOnly));
@@ -118,11 +184,11 @@ SparseCharacterMoveResult ResolveSparseCharacterHorizontalMove(
     result.liquidVoxels += xOnlyVolume.liquidVoxels + zOnlyVolume.liquidVoxels;
 
     if (!xOnlyVolume.blocked && zOnlyVolume.blocked) {
-        result.eyeX = request.targetBody.eyeX;
+        result.eyeX = targetBody.eyeX;
         result.eyeZ = sweepStart.eyeZ;
     } else if (xOnlyVolume.blocked && !zOnlyVolume.blocked) {
         result.eyeX = sweepStart.eyeX;
-        result.eyeZ = request.targetBody.eyeZ;
+        result.eyeZ = targetBody.eyeZ;
     } else {
         result.eyeX = sweepStart.eyeX + deltaX * sweep.safeFraction;
         result.eyeZ = sweepStart.eyeZ + deltaZ * sweep.safeFraction;
@@ -134,27 +200,42 @@ SparseCharacterVerticalMoveResult ResolveSparseCharacterVerticalMove(
     const SparseVoxelWorld& world,
     const SparseCharacterVerticalMoveRequest& request) {
     SparseCharacterVerticalMoveResult result;
-    result.eyeY = request.targetBody.eyeY;
-    result.verticalVelocity = request.verticalVelocity;
+    SparseCharacterBody startBody;
+    SparseCharacterBody targetBody;
+    const bool startValid = TrySanitizeBody(request.startBody, startBody);
+    if (!startValid || !TrySanitizeBody(request.targetBody, targetBody)) {
+        if (startValid) {
+            result.eyeY = startBody.eyeY;
+        }
+        result.verticalVelocity = 0.0f;
+        result.blocked = true;
+        result.safeFraction = 0.0f;
+        return result;
+    }
 
-    const float deltaY = request.targetBody.eyeY - request.startBody.eyeY;
+    result.eyeY = targetBody.eyeY;
+    result.verticalVelocity = std::isfinite(request.verticalVelocity)
+        ? request.verticalVelocity
+        : 0.0f;
+
+    const float deltaY = targetBody.eyeY - startBody.eyeY;
     if (std::abs(deltaY) < 0.0001f) {
         return result;
     }
 
     const float travelDistance = std::abs(deltaY);
-    const uint32_t sweepSteps = static_cast<uint32_t>(std::clamp(
-        static_cast<int>(std::ceil(travelDistance / 0.25f)),
-        1,
-        static_cast<int>(std::max(1u, request.maxSweepSteps))));
+    const uint32_t sweepSteps = BuildSweepSteps(travelDistance, request.maxSweepSteps);
 
     if (deltaY < 0.0f) {
-        const float startFeetY = request.startBody.eyeY - request.startBody.height;
-        const float targetFeetY = request.targetBody.eyeY - request.targetBody.height;
+        const float startFeetY = startBody.eyeY - startBody.height;
+        const float targetFeetY = targetBody.eyeY - targetBody.height;
         const SparseCollisionAabb supportProbe =
-            MakeSparseCharacterFootprintAabb(request.startBody, startFeetY + 0.25f);
+            MakeSparseCharacterFootprintAabb(startBody, startFeetY + 0.25f);
         const SparseCollisionSupportResult support =
-            world.FindCollisionSupportBelow(supportProbe, (startFeetY - targetFeetY) + 1.0f);
+            world.FindCollisionSupportBelow(
+                supportProbe,
+                (startFeetY - targetFeetY) + 1.0f,
+                request.liquidsSupport);
         result.sampledVoxels += support.sampledVoxels;
         result.solidVoxels += support.solidVoxels;
         result.liquidVoxels += support.liquidVoxels;
@@ -164,7 +245,7 @@ SparseCharacterVerticalMoveResult ResolveSparseCharacterVerticalMove(
             if (supportFeetY >= targetFeetY - 0.001f && supportFeetY <= startFeetY + 0.25f) {
                 result.blocked = true;
                 result.landed = true;
-                result.eyeY = supportFeetY + request.targetBody.height;
+                result.eyeY = supportFeetY + targetBody.height;
                 result.verticalVelocity = 0.0f;
                 const float denominator = std::max(0.0001f, startFeetY - targetFeetY);
                 result.safeFraction = std::clamp((startFeetY - supportFeetY) / denominator, 0.0f, 1.0f);
@@ -174,7 +255,7 @@ SparseCharacterVerticalMoveResult ResolveSparseCharacterVerticalMove(
     }
 
     const SparseCollisionSweepResult sweep = world.SweepCollisionAabb(
-        MakeSparseCharacterBodyAabb(request.startBody),
+        MakeSparseCharacterBodyAabb(startBody),
         0.0f,
         deltaY,
         0.0f,
@@ -189,7 +270,7 @@ SparseCharacterVerticalMoveResult ResolveSparseCharacterVerticalMove(
 
     result.blocked = true;
     result.hitCeiling = deltaY > 0.0f;
-    result.eyeY = request.startBody.eyeY + deltaY * sweep.safeFraction;
+    result.eyeY = startBody.eyeY + deltaY * sweep.safeFraction;
     result.verticalVelocity = 0.0f;
     return result;
 }
@@ -198,18 +279,26 @@ SparseCharacterGroundResult ResolveSparseCharacterGrounding(
     const SparseVoxelWorld& world,
     const SparseCharacterGroundRequest& request) {
     SparseCharacterGroundResult result;
-    result.eyeY = request.body.eyeY;
-    result.verticalVelocity = request.verticalVelocity;
+    SparseCharacterBody body;
+    if (!TrySanitizeBody(request.body, body)) {
+        result.verticalVelocity = 0.0f;
+        return result;
+    }
 
-    const float feetY = request.body.eyeY - request.body.height;
-    const float snapUp = std::max(0.0f, request.maxSnapUp);
-    const float snapDown = std::max(0.0f, request.maxSnapDown);
+    result.eyeY = body.eyeY;
+    result.verticalVelocity = std::isfinite(request.verticalVelocity)
+        ? request.verticalVelocity
+        : 0.0f;
+
+    const float feetY = body.eyeY - body.height;
+    const float snapUp = ClampFinite(request.maxSnapUp, 0.0f, kMaxCharacterStepHeight, 0.25f);
+    const float snapDown = ClampFinite(request.maxSnapDown, 0.0f, kMaxCharacterHeight, 1.0f);
     if (snapUp <= 0.0f && snapDown <= 0.0f) {
         return result;
     }
 
     const SparseCollisionAabb supportProbe =
-        MakeSparseCharacterFootprintAabb(request.body, feetY + snapUp);
+        MakeSparseCharacterFootprintAabb(body, feetY + snapUp);
     const SparseCollisionSupportResult support =
         world.FindCollisionSupportBelow(supportProbe, snapUp + snapDown, request.liquidsSupport);
     result.sampledVoxels = support.sampledVoxels;
@@ -234,7 +323,7 @@ SparseCharacterGroundResult ResolveSparseCharacterGrounding(
     result.supportZ = support.supportZ;
     result.eyeY = supportFeetY + request.body.height;
     result.verticalVelocity = 0.0f;
-    result.snapped = std::abs(result.eyeY - request.body.eyeY) > 0.001f;
+    result.snapped = std::abs(result.eyeY - body.eyeY) > 0.001f;
     return result;
 }
 

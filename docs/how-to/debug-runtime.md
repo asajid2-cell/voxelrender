@@ -71,9 +71,23 @@ This bypasses the infinite streaming path and copies a fixed 2x2 chunk patch. It
 .\sparse_regression.ps1 -Config Release
 ```
 
-This runs the combined sparse gate: render/backend readiness, flicker stability,
-surface fragments, GPU raycast health, miss feedback, brush feedback/apply,
-sparse edit persistence, GPU physics diagnostics, and engine backbuffer capture.
+This runs the combined review gate: dense legacy fallback launch, sparse
+render/backend readiness, flicker stability, surface fragments, GPU raycast
+health, miss feedback, brush feedback/apply, sparse edit persistence, default
+local sparse physics, GPU physics diagnostics, engine backbuffer capture,
+stress-camera engine capture, and public demo capture validation.
+
+If a smoke frame-count override is too short for post-ready telemetry readback,
+the gate raises it to the minimum safe budget and prints the adjustment.
+
+## Capture Public Review Media
+
+```powershell
+.\public_demo_capture.ps1 -Config Release
+```
+
+This produces a validated contact sheet, image stats, runtime log, and MP4 under
+`build/captures/public_demo/`.
 
 ## Common Symptoms
 
@@ -92,8 +106,10 @@ check render-window recentering in `VoxelWorld`.
 Painting causes a stall:
 
 Check sparse brush feedback, dirty render regions, and local physics wakeup
-regions. Broad full-brick refreshes should be limited to first publication or
-broad edits.
+regions. `brushGpuFbMiss` is the feedback header count and `brushGpuFbHint` is
+the observed missing-resident sentinel count; both must be zero for GPU apply.
+Broad full-brick refreshes should be limited to first publication or broad
+edits.
 
 Far terrain looks wrong but nearby terrain is stable:
 

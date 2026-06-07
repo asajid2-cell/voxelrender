@@ -33,6 +33,17 @@ bool QueueBackbufferCapture(
     const std::filesystem::path& outputPath,
     PendingBackbufferCapture& outCapture);
 
+bool QueueTextureCapture(
+    ID3D12Device* device,
+    ID3D12GraphicsCommandList* commandList,
+    ID3D12Resource* texture,
+    D3D12_RESOURCE_STATES sourceState,
+    D3D12_RESOURCE_STATES restoreState,
+    uint32_t frameNumber,
+    const std::filesystem::path& outputPath,
+    const char* filePrefix,
+    PendingBackbufferCapture& outCapture);
+
 bool WriteBackbufferBmp(const PendingBackbufferCapture& capture);
 
 } // namespace VENPOD::Graphics

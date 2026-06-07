@@ -42,6 +42,7 @@ static const uint SPARSE_BRICK_SIZE = 16u;
 static const uint SPARSE_BRICK_VOXEL_COUNT = 4096u;
 static const uint SPARSE_INVALID_PAGE = 0xFFFFFFFFu;
 static const uint SPARSE_TOMBSTONE_PAGE = 0xFFFFFFFEu;
+static const uint SPARSE_PAGE_TABLE_LOOKUP_PROBES = 256u;
 
 int FloorDiv16(int value) {
     return value >= 0 ? value / 16 : -(((-value) + 15) / 16);
@@ -84,7 +85,7 @@ bool LookupSparseBrick(int3 brickCoord, out SparseBrickPageEntry result) {
     uint mask = pageTableCapacity - 1u;
     uint start = HashSparseBrickCoord(brickCoord) & mask;
     [loop]
-    for (uint probe = 0u; probe < 64u; ++probe) {
+    for (uint probe = 0u; probe < SPARSE_PAGE_TABLE_LOOKUP_PROBES; ++probe) {
         uint slot = (start + probe) & mask;
         SparseBrickPageEntry entry = SparseBrickPageTable[slot];
         if (entry.pageIndex == SPARSE_INVALID_PAGE) {

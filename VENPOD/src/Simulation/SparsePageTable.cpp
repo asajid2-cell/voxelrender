@@ -39,10 +39,6 @@ bool SparsePageTable::InsertOrAssign(
         return false;
     }
 
-    if ((m_count + 1u) * 100u / Capacity() > 70u) {
-        return false;
-    }
-
     bool found = false;
     const uint32_t slot = FindSlot(coord, true, &found);
     if (slot == UINT32_MAX) {
@@ -50,6 +46,9 @@ bool SparsePageTable::InsertOrAssign(
     }
 
     if (!found) {
+        if ((m_count + 1u) * 100u / Capacity() > 70u) {
+            return false;
+        }
         ++m_count;
     }
 

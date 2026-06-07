@@ -22,6 +22,8 @@ using Microsoft::WRL::ComPtr;
 
 namespace VENPOD::Graphics {
 
+struct PendingBackbufferCapture;
+
 // Renderer configuration
 struct RendererConfig {
     uint32_t cbvSrvUavDescriptorCount = 4096;
@@ -29,6 +31,13 @@ struct RendererConfig {
     uint32_t dsvDescriptorCount = 8;
     std::filesystem::path shaderPath;
     bool debugShaders = false;
+    bool backgroundPassEnabled = false;
+    float backgroundPassScale = 1.0f;
+    bool backgroundPassSurfaceRaymarchFill = false;
+    bool backgroundPassClearProbe = false;
+    bool backgroundPassForceColor = false;
+    bool backgroundPassCompositeDebug = false;
+    bool backgroundPassCompositeForceColor = false;
 };
 
 class Renderer {
@@ -56,6 +65,27 @@ public:
     // Render the fullscreen pass
     void RenderFullscreen(ID3D12GraphicsCommandList* cmdList);
 
+    struct BackgroundPassInfo {
+        bool active = false;
+        uint32_t fullWidth = 0;
+        uint32_t fullHeight = 0;
+        uint32_t backgroundWidth = 0;
+        uint32_t backgroundHeight = 0;
+        float scale = 1.0f;
+        bool surfaceRaymarchFill = false;
+        bool clearProbe = false;
+        bool forceColor = false;
+        bool compositeDebug = false;
+        bool compositeForceColor = false;
+    };
+
+    BackgroundPassInfo GetBackgroundPassInfo() const;
+    bool QueueBackgroundPassCapture(
+        ID3D12GraphicsCommandList* cmdList,
+        uint32_t frameNumber,
+        const std::filesystem::path& outputPath,
+        PendingBackbufferCapture& outCapture);
+
     // Camera parameters for rendering
     struct CameraParams {
         float posX, posY, posZ;
@@ -70,14 +100,20 @@ public:
         float renderQuality = 1.0f;
         uint32_t frameIndex = 0;
         bool renderOwnershipStatsEnabled = false;
+        bool backgroundPassSurfaceRaymarchFill = false;
         float midFieldStartDistance = 480.0f;
         float midFieldEndDistance = 4200.0f;
         float midFieldCellSize = 16.0f;
         float midFieldFarHandoffDistance = 2786.4f;
         float midFieldHeightCoverage = 0.0f;
         float midFieldVoxelCoverage = 0.0f;
+        float midFieldVoxelInterestCoverage = 0.0f;
+        float midFieldVoxelWorstRingCoverage = 0.0f;
         uint32_t midFieldResidentHeightTiles = 0;
         uint32_t midFieldResidentVoxelBricks = 0;
+        float surfaceRasterMaxDistance = 0.0f;
+        float exactNearDistance = 0.0f;
+        uint32_t worldSeed = 12345u;
         uint32_t debugMode = 0;
     };
 
@@ -105,6 +141,7 @@ public:
         int32_t pageRadius = 0;
         float pageSize = 0.0f;
         float rootMinY = 0.0f;
+        uint32_t seed = 12345u;
         float uploadCoverageRatio = 0.0f;
         float pageCoverageRatio = 0.0f;
         bool ready = false;
@@ -145,6 +182,8 @@ public:
         bool surfaceRaymarchFill = true;
         bool midClipmapEnabled = false;
         bool surfaceEnabled = false;
+        bool voxelTerrainOnly = false;
+        bool walkingMidVoxelDda = false;
     };
 
     // Render voxels with raymarch shader (binds voxel resources)
@@ -208,9 +247,15 @@ private:
     Result<void> CreateFullscreenPipeline(ID3D12Device* device);
     Result<void> CreateSparseSurfacePipeline(ID3D12Device* device);
     Result<void> CreateOverlayPipeline(ID3D12Device* device);
+    Result<void> CreateBackgroundCompositePipeline(ID3D12Device* device);
     Result<void> CreateSparseSurfaceDrawCommandSignature(ID3D12Device* device);
     Result<void> CreateRTVsForSwapchain();
     Result<void> CreateDepthBuffer();
+    Result<void> CreateBackgroundPassResources();
+    void DestroyBackgroundPassResources();
+    bool UseBackgroundPassSplit() const;
+    void SetMainRenderTarget(ID3D12GraphicsCommandList* cmdList);
+    void SetViewportAndScissor(ID3D12GraphicsCommandList* cmdList, uint32_t width, uint32_t height);
 
     // References to core systems (not owned)
     DX12Device* m_device = nullptr;
@@ -220,17 +265,20 @@ private:
     // Owned resources
     DescriptorHeapManager m_heapManager;
     ShaderCompiler m_shaderCompiler;
+    DescriptorHandle m_imguiReservedSrv;
 
     // Fullscreen rendering pipeline
     DX12GraphicsPipeline m_fullscreenPipeline;
     DX12GraphicsPipeline m_sparseSurfacePipeline;
     DX12GraphicsPipeline m_overlayPipeline;
+    DX12GraphicsPipeline m_backgroundCompositePipeline;
     ComPtr<ID3D12CommandSignature> m_sparseSurfaceDrawSignature;
     CompiledShader m_fullscreenVS;
     CompiledShader m_fullscreenPS;
     CompiledShader m_sparseSurfaceVS;
     CompiledShader m_sparseSurfacePS;
     CompiledShader m_overlayPS;
+    CompiledShader m_backgroundCompositePS;
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_frameConstantUploads;
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_sparseSurfaceConstantUploads;
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_overlayConstantUploads;
@@ -242,6 +290,16 @@ private:
     DescriptorHandle m_rtvHandles[VENPOD::Window::BUFFER_COUNT];
     DescriptorHandle m_dsvHandle;
     ComPtr<ID3D12Resource> m_depthBuffer;
+    DescriptorHandle m_backgroundPassRtv;
+    DescriptorHandle m_backgroundPassDsv;
+    DescriptorHandle m_backgroundPassStagingSrv;
+    DescriptorHandle m_backgroundPassSrv;
+    ComPtr<ID3D12Resource> m_backgroundPassColor;
+    ComPtr<ID3D12Resource> m_backgroundPassDepth;
+    D3D12_RESOURCE_STATES m_backgroundPassColorState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    uint32_t m_backgroundPassWidth = 0;
+    uint32_t m_backgroundPassHeight = 0;
+    bool m_backgroundPassSurfaceRaymarchFillLastFrame = false;
 
     // Configuration
     RendererConfig m_config;

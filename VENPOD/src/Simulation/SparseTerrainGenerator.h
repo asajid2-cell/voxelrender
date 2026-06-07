@@ -41,7 +41,21 @@ public:
         int32_t searchRadius = 448,
         int32_t sampleSpacing = 32) const;
     bool IsDefinitelyEmptyBrick(const BrickCoord& coord, float verticalSafetyMargin = 64.0f) const;
+    bool IsDefinitelyBuriedSolidBrick(const BrickCoord& coord, float verticalSafetyMargin = 24.0f) const;
+    bool MayContainExposedSurfaceBrick(const BrickCoord& coord, float verticalSafetyMargin = 8.0f) const;
+    float SurfaceReliefAt(int32_t worldX, int32_t worldZ, int32_t sampleOffset = 4) const;
+    float SurfaceReliefAtWithCenter(
+        int32_t worldX,
+        int32_t worldZ,
+        float centerHeight,
+        int32_t sampleOffset = 4) const;
     uint32_t SampleGeneratedVoxel(int32_t worldX, int32_t worldY, int32_t worldZ) const;
+    uint32_t SampleGeneratedVoxelWithColumn(
+        int32_t worldX,
+        int32_t worldY,
+        int32_t worldZ,
+        float height,
+        float relief) const;
     uint32_t SampleGeneratedSurfaceVoxel(
         int32_t worldX,
         int32_t worldY,

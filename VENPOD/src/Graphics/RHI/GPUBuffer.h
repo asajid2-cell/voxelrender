@@ -108,6 +108,7 @@ public:
 
 private:
     ComPtr<ID3D12Resource> m_resource;
+    ComPtr<ID3D12Resource> m_pendingInitializationUpload;
     uint64_t m_sizeBytes = 0;
     uint32_t m_stride = 0;
     BufferUsage m_usage = BufferUsage::Default;

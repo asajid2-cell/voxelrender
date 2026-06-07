@@ -5,14 +5,16 @@
 #include "../Utils/Result.h"
 #include <algorithm>
 #include <cstdint>
+#include <cmath>
 #include <future>
+#include <limits>
 #include <string>
 #include <vector>
 
 namespace VENPOD::Graphics {
 
 struct FarVoxelOctreeConfig {
-    int32_t pageRadius = 4;
+    int32_t pageRadius = 12;
     float pageSize = 1024.0f;
     float rootMinY = -384.0f;
     uint32_t maxDepth = 6;
@@ -43,6 +45,50 @@ struct FarVoxelOctreeResidencyMetadata {
     float pageCoverageRatio = 0.0f;
     bool ready = false;
 };
+
+inline bool TryFloorFarVoxelDoubleToInt32(double value) {
+    if (!std::isfinite(value)) {
+        return false;
+    }
+    const double floored = std::floor(value);
+    return floored >= static_cast<double>(std::numeric_limits<int32_t>::min()) &&
+           floored <= static_cast<double>(std::numeric_limits<int32_t>::max());
+}
+
+inline bool ValidateFarVoxelOctreeConfigForBuild(
+    const FarVoxelOctreeConfig& config,
+    std::string* outError = nullptr)
+{
+    auto fail = [outError](const char* message) {
+        if (outError) {
+            *outError = message;
+        }
+        return false;
+    };
+
+    constexpr uint32_t kMaxBuildDepth = 12;
+    if (!std::isfinite(config.pageSize) || config.pageSize <= 0.0f) {
+        return fail("FarVoxelOctree pageSize must be finite and positive");
+    }
+    if (!std::isfinite(config.rootMinY)) {
+        return fail("FarVoxelOctree rootMinY must be finite");
+    }
+    if (config.maxDepth > kMaxBuildDepth) {
+        return fail("FarVoxelOctree maxDepth exceeds runtime limit");
+    }
+    if (!TryFloorFarVoxelDoubleToInt32(static_cast<double>(config.rootMinY))) {
+        return fail("FarVoxelOctree rootMinY is outside int32 world range");
+    }
+
+    const int32_t radius = std::max(1, config.pageRadius);
+    const double pageSize = static_cast<double>(config.pageSize);
+    const double radiusDouble = static_cast<double>(radius);
+    if (!TryFloorFarVoxelDoubleToInt32(-radiusDouble * pageSize) ||
+        !TryFloorFarVoxelDoubleToInt32(radiusDouble * pageSize)) {
+        return fail("FarVoxelOctree page origins exceed int32 world range");
+    }
+    return true;
+}
 
 inline FarVoxelOctreeResidencyMetadata BuildFarVoxelOctreeResidencyMetadata(
     const FarVoxelOctreeStats& stats,
@@ -86,6 +132,7 @@ public:
         DescriptorHeapManager& heapManager,
         const FarVoxelOctreeConfig& config = {});
     void BeginAsyncLoad(const FarVoxelOctreeConfig& config = {});
+    static bool HasCompatibleCache(const FarVoxelOctreeConfig& config);
     bool IsAsyncPending() const { return m_asyncPending; }
     bool IsGpuUploadPending() const;
     bool HasPendingGpuUploadCopies() const;
@@ -94,7 +141,8 @@ public:
     bool TryFinalizeAsyncUpload(
         ID3D12Device* device,
         DescriptorHeapManager& heapManager,
-        uint64_t maxUploadBytes = UINT64_MAX);
+        uint64_t maxUploadBytes = UINT64_MAX,
+        uint32_t maxCpuWaitMs = 0);
 
     void Shutdown();
 

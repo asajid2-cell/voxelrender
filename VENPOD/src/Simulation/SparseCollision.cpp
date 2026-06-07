@@ -4,19 +4,87 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 
 namespace VENPOD::Simulation {
 
 namespace {
 
-constexpr float kAabbMaxExclusiveEpsilon = 0.0001f;
+constexpr uint64_t kMaxCollisionVolumeSamples = 32768;
+constexpr uint64_t kMaxCollisionSupportSamples = 32768;
+constexpr uint32_t kMaxCollisionSweepSteps = 1024;
 
-int32_t InclusiveMinVoxel(float value) {
-    return static_cast<int32_t>(std::floor(value));
+bool IsFiniteAabb(const SparseCollisionAabb& aabb) {
+    return std::isfinite(aabb.minX) &&
+        std::isfinite(aabb.minY) &&
+        std::isfinite(aabb.minZ) &&
+        std::isfinite(aabb.maxX) &&
+        std::isfinite(aabb.maxY) &&
+        std::isfinite(aabb.maxZ);
 }
 
-int32_t InclusiveMaxVoxel(float value) {
-    return static_cast<int32_t>(std::floor(value - kAabbMaxExclusiveEpsilon));
+bool TryFloorToInt32(float value, int32_t& out) {
+    if (!std::isfinite(value)) {
+        return false;
+    }
+    const double floored = std::floor(static_cast<double>(value));
+    if (floored < static_cast<double>(std::numeric_limits<int32_t>::min()) ||
+        floored > static_cast<double>(std::numeric_limits<int32_t>::max())) {
+        return false;
+    }
+    out = static_cast<int32_t>(floored);
+    return true;
+}
+
+bool TryBuildVoxelRange(float minValue, float maxValue, int32_t& minVoxel, int32_t& maxVoxel) {
+    if (!std::isfinite(minValue) || !std::isfinite(maxValue) || maxValue <= minValue) {
+        return false;
+    }
+
+    const float maxExclusive = std::nextafter(maxValue, -std::numeric_limits<float>::infinity());
+    if (!TryFloorToInt32(minValue, minVoxel) || !TryFloorToInt32(maxExclusive, maxVoxel)) {
+        return false;
+    }
+
+    return maxVoxel >= minVoxel;
+}
+
+uint64_t RangeCount(int32_t minVoxel, int32_t maxVoxel) {
+    return static_cast<uint64_t>(
+        static_cast<int64_t>(maxVoxel) - static_cast<int64_t>(minVoxel) + 1);
+}
+
+bool ExceedsSampleLimit(
+    int32_t minX,
+    int32_t maxX,
+    int32_t minY,
+    int32_t maxY,
+    int32_t minZ,
+    int32_t maxZ,
+    uint64_t maxSamples) {
+    const uint64_t countX = RangeCount(minX, maxX);
+    const uint64_t countY = RangeCount(minY, maxY);
+    const uint64_t countZ = RangeCount(minZ, maxZ);
+    return countX > maxSamples ||
+        countY > maxSamples / countX ||
+        countZ > maxSamples / (countX * countY);
+}
+
+SparseCollisionVolumeResult UnknownBlockedVolume(
+    int32_t x = 0,
+    int32_t y = 0,
+    int32_t z = 0) {
+    SparseCollisionVolumeResult result;
+    result.blocked = true;
+    result.hasUnknown = true;
+    result.firstBlockingSample = {CollisionSampleStatus::UnknownBlocked, 0, false};
+    result.firstBlockingX = x;
+    result.firstBlockingY = y;
+    result.firstBlockingZ = z;
+    result.sampledVoxels = 1;
+    result.unknownVoxels = 1;
+    return result;
 }
 
 SparseCollisionAabb TranslateAabb(
@@ -49,22 +117,27 @@ CollisionSample SparseCollisionQuery::Sample(int32_t worldX, int32_t worldY, int
 SparseCollisionVolumeResult SparseCollisionQuery::TestAabb(
     const SparseCollisionAabb& aabb,
     bool liquidsBlock) const {
-    SparseCollisionVolumeResult result;
-
-    if (aabb.maxX <= aabb.minX || aabb.maxY <= aabb.minY || aabb.maxZ <= aabb.minZ) {
-        result.hasUnknown = true;
-        result.unknownVoxels = 1;
-        result.blocked = true;
-        result.firstBlockingSample = {CollisionSampleStatus::UnknownBlocked, 0, false};
-        return result;
+    if (!IsFiniteAabb(aabb)) {
+        return UnknownBlockedVolume();
     }
 
-    const int32_t minX = InclusiveMinVoxel(aabb.minX);
-    const int32_t minY = InclusiveMinVoxel(aabb.minY);
-    const int32_t minZ = InclusiveMinVoxel(aabb.minZ);
-    const int32_t maxX = InclusiveMaxVoxel(aabb.maxX);
-    const int32_t maxY = InclusiveMaxVoxel(aabb.maxY);
-    const int32_t maxZ = InclusiveMaxVoxel(aabb.maxZ);
+    int32_t minX = 0;
+    int32_t minY = 0;
+    int32_t minZ = 0;
+    int32_t maxX = 0;
+    int32_t maxY = 0;
+    int32_t maxZ = 0;
+    if (!TryBuildVoxelRange(aabb.minX, aabb.maxX, minX, maxX) ||
+        !TryBuildVoxelRange(aabb.minY, aabb.maxY, minY, maxY) ||
+        !TryBuildVoxelRange(aabb.minZ, aabb.maxZ, minZ, maxZ) ||
+        ExceedsSampleLimit(minX, maxX, minY, maxY, minZ, maxZ, kMaxCollisionVolumeSamples)) {
+        const int32_t blockingX = minX;
+        const int32_t blockingY = minY;
+        const int32_t blockingZ = minZ;
+        return UnknownBlockedVolume(blockingX, blockingY, blockingZ);
+    }
+
+    SparseCollisionVolumeResult result;
 
     for (int32_t z = minZ; z <= maxZ; ++z) {
         for (int32_t y = minY; y <= maxY; ++y) {
@@ -116,6 +189,17 @@ SparseCollisionSweepResult SparseCollisionQuery::SweepAabb(
     bool liquidsBlock) const {
     SparseCollisionSweepResult result;
 
+    if (!IsFiniteAabb(aabb) ||
+        !std::isfinite(deltaX) ||
+        !std::isfinite(deltaY) ||
+        !std::isfinite(deltaZ)) {
+        result.blocked = true;
+        result.safeFraction = 0.0f;
+        result.hitFraction = 0.0f;
+        result.hitVolume = UnknownBlockedVolume();
+        return result;
+    }
+
     if (std::abs(deltaX) < 0.0001f &&
         std::abs(deltaY) < 0.0001f &&
         std::abs(deltaZ) < 0.0001f) {
@@ -126,7 +210,7 @@ SparseCollisionSweepResult SparseCollisionQuery::SweepAabb(
         return result;
     }
 
-    steps = std::max(1u, steps);
+    steps = std::clamp(steps, 1u, kMaxCollisionSweepSteps);
     float lastSafeFraction = 0.0f;
 
     for (uint32_t step = 1; step <= steps; ++step) {
@@ -157,18 +241,28 @@ SparseCollisionSupportResult SparseCollisionQuery::FindSupportBelow(
     float maxDrop,
     bool liquidsSupport) const {
     SparseCollisionSupportResult result;
-    if (footprintAabb.maxX <= footprintAabb.minX ||
-        footprintAabb.maxZ <= footprintAabb.minZ ||
-        maxDrop < 0.0f) {
+    if (!IsFiniteAabb(footprintAabb) || !std::isfinite(maxDrop) || maxDrop < 0.0f) {
         return result;
     }
 
-    const int32_t minX = InclusiveMinVoxel(footprintAabb.minX);
-    const int32_t minZ = InclusiveMinVoxel(footprintAabb.minZ);
-    const int32_t maxX = InclusiveMaxVoxel(footprintAabb.maxX);
-    const int32_t maxZ = InclusiveMaxVoxel(footprintAabb.maxZ);
-    const int32_t startY = InclusiveMinVoxel(footprintAabb.minY);
-    const int32_t endY = static_cast<int32_t>(std::floor(footprintAabb.minY - maxDrop));
+    int32_t minX = 0;
+    int32_t minY = 0;
+    int32_t minZ = 0;
+    int32_t maxX = 0;
+    int32_t endY = 0;
+    int32_t maxZ = 0;
+    if (!TryBuildVoxelRange(footprintAabb.minX, footprintAabb.maxX, minX, maxX) ||
+        !TryBuildVoxelRange(footprintAabb.minZ, footprintAabb.maxZ, minZ, maxZ) ||
+        !TryFloorToInt32(footprintAabb.minY, minY) ||
+        !TryFloorToInt32(footprintAabb.minY - maxDrop, endY)) {
+        return result;
+    }
+
+    const int32_t startY = minY;
+    if (endY > startY ||
+        ExceedsSampleLimit(minX, maxX, endY, startY, minZ, maxZ, kMaxCollisionSupportSamples)) {
+        return result;
+    }
 
     for (int32_t y = startY; y >= endY; --y) {
         for (int32_t z = minZ; z <= maxZ; ++z) {

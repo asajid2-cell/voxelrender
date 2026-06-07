@@ -1,14 +1,21 @@
 #include "ShaderCompiler.h"
 #include <spdlog/spdlog.h>
+#include <chrono>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <regex>
 #include <sstream>
+#include <system_error>
 #include <unordered_set>
 
 namespace VENPOD::Graphics {
 
 namespace {
+
+constexpr uint64_t kMaxShaderSourceBytes = 64ull * 1024ull * 1024ull;
+constexpr uint64_t kMaxShaderCacheBytes = 128ull * 1024ull * 1024ull;
+constexpr size_t kMaxRaymarchShaderBytecodeBytes = 32ull * 1024ull * 1024ull;
 
 uint64_t AppendHash(uint64_t hash, const void* data, size_t size) {
     const auto* bytes = static_cast<const uint8_t*>(data);
@@ -56,19 +63,53 @@ std::string NarrowAscii(const std::wstring& value) {
     return out;
 }
 
-bool ReadBinaryFile(const std::filesystem::path& path, std::vector<uint8_t>& out) {
+bool FileExistsNoThrow(const std::filesystem::path& path) {
+    std::error_code ec;
+    return std::filesystem::exists(path, ec) && !ec;
+}
+
+bool StreamSizeFits(const std::streampos size, uint64_t maxBytes, size_t* outSize) {
+    const std::streamoff signedSize = size;
+    if (!outSize || signedSize < 0) {
+        return false;
+    }
+    const auto unsignedSize = static_cast<uint64_t>(signedSize);
+    if (unsignedSize > maxBytes ||
+        unsignedSize > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+        return false;
+    }
+    *outSize = static_cast<size_t>(unsignedSize);
+    return true;
+}
+
+bool FitsDxcBlobSize(size_t size) {
+    return size <= static_cast<size_t>(std::numeric_limits<UINT32>::max());
+}
+
+bool IsRaymarchShader(const std::filesystem::path& path) {
+    return path.filename() == "PS_Raymarch.hlsl";
+}
+
+bool ReadBinaryFile(
+    const std::filesystem::path& path,
+    std::vector<uint8_t>& out,
+    uint64_t maxBytes = kMaxShaderCacheBytes)
+{
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         return false;
     }
 
-    const std::streamsize size = file.tellg();
-    if (size < 0) {
+    size_t size = 0;
+    if (!StreamSizeFits(file.tellg(), maxBytes, &size)) {
         return false;
     }
     file.seekg(0, std::ios::beg);
-    out.resize(static_cast<size_t>(size));
-    return out.empty() || static_cast<bool>(file.read(reinterpret_cast<char*>(out.data()), size));
+    out.resize(size);
+    return out.empty() || static_cast<bool>(
+        file.read(
+            reinterpret_cast<char*>(out.data()),
+            static_cast<std::streamsize>(size)));
 }
 
 void WriteBinaryFileBestEffort(const std::filesystem::path& path, const std::vector<uint8_t>& bytes) {
@@ -83,6 +124,46 @@ void WriteBinaryFileBestEffort(const std::filesystem::path& path, const std::vec
         return;
     }
     file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+}
+
+std::filesystem::path ResolveShaderCacheDirectory(
+    const std::filesystem::path& filePath,
+    const std::filesystem::path& compilerIncludePath)
+{
+    auto cacheRootFromShaderRoot = [](std::filesystem::path path) {
+        if (path.filename() == "Graphics" || path.filename() == "Compute") {
+            path = path.parent_path();
+        }
+        if (path.filename() == "shaders") {
+            path = path.parent_path();
+        }
+        if (path.filename() == "assets") {
+            path = path.parent_path();
+        }
+        return path;
+    };
+
+    std::error_code ec;
+    if (!compilerIncludePath.empty()) {
+        std::filesystem::path root = std::filesystem::weakly_canonical(compilerIncludePath, ec);
+        if (ec) {
+            root = compilerIncludePath.lexically_normal();
+        }
+        root = cacheRootFromShaderRoot(root);
+        if (!root.empty()) {
+            return root / ".venpod_shader_cache";
+        }
+    }
+
+    std::filesystem::path root = std::filesystem::weakly_canonical(filePath.parent_path(), ec);
+    if (ec) {
+        root = filePath.parent_path().lexically_normal();
+    }
+    root = cacheRootFromShaderRoot(root);
+    if (root.empty()) {
+        root = std::filesystem::current_path();
+    }
+    return root / ".venpod_shader_cache";
 }
 
 std::filesystem::path ResolveIncludePath(
@@ -102,12 +183,12 @@ std::filesystem::path ResolveIncludePath(
 
     for (const auto& root : searchPaths) {
         const std::filesystem::path candidate = root / includeName;
-        if (std::filesystem::exists(candidate)) {
+        if (FileExistsNoThrow(candidate)) {
             return candidate;
         }
     }
 
-    if (std::filesystem::exists(includeName)) {
+    if (FileExistsNoThrow(includeName)) {
         return includeName;
     }
     return {};
@@ -126,13 +207,14 @@ void HashShaderFileRecursive(
     if (!visited.insert(key).second) {
         return;
     }
+    hash = AppendHash(hash, key);
 
     std::vector<uint8_t> bytes;
-    if (!ReadBinaryFile(path, bytes)) {
+    if (!ReadBinaryFile(path, bytes, kMaxShaderSourceBytes)) {
+        hash = AppendHash(hash, "#unreadable-or-oversized");
         return;
     }
 
-    hash = AppendHash(hash, key);
     hash = AppendHash(hash, bytes.data(), bytes.size());
 
     const std::string source(reinterpret_cast<const char*>(bytes.data()), bytes.size());
@@ -146,6 +228,9 @@ void HashShaderFileRecursive(
             compilerIncludePath);
         if (!resolved.empty()) {
             HashShaderFileRecursive(resolved, includePaths, compilerIncludePath, visited, hash);
+        } else {
+            hash = AppendHash(hash, "#missing-include:");
+            hash = AppendHash(hash, includeName.string());
         }
     }
 }
@@ -213,6 +298,7 @@ HRESULT STDMETHODCALLTYPE DxcIncludeHandler::LoadSource(
     if (!pFilename || !ppIncludeSource) {
         return E_POINTER;
     }
+    *ppIncludeSource = nullptr;
 
     std::filesystem::path filename(pFilename);
 
@@ -222,7 +308,7 @@ HRESULT STDMETHODCALLTYPE DxcIncludeHandler::LoadSource(
     // First, try relative to base path
     if (!m_basePath.empty()) {
         fullPath = m_basePath / filename;
-        if (std::filesystem::exists(fullPath)) {
+        if (FileExistsNoThrow(fullPath)) {
             goto found;
         }
     }
@@ -230,13 +316,13 @@ HRESULT STDMETHODCALLTYPE DxcIncludeHandler::LoadSource(
     // Try each include path
     for (const auto& includePath : m_includePaths) {
         fullPath = includePath / filename;
-        if (std::filesystem::exists(fullPath)) {
+        if (FileExistsNoThrow(fullPath)) {
             goto found;
         }
     }
 
     // Try the filename as-is (absolute path)
-    if (std::filesystem::exists(filename)) {
+    if (FileExistsNoThrow(filename)) {
         fullPath = filename;
         goto found;
     }
@@ -252,7 +338,11 @@ found:
         return E_FAIL;
     }
 
-    size_t size = file.tellg();
+    size_t size = 0;
+    if (!StreamSizeFits(file.tellg(), kMaxShaderSourceBytes, &size) || !FitsDxcBlobSize(size)) {
+        spdlog::error("DxcIncludeHandler: Include file is too large or invalid: {}", fullPath.string());
+        return E_FAIL;
+    }
     file.seekg(0, std::ios::beg);
 
     std::vector<char> contents(size);
@@ -310,7 +400,7 @@ Result<CompiledShader> ShaderCompiler::CompileFromFile(
     const std::filesystem::path& filePath,
     const ShaderCompileOptions& options)
 {
-    if (!std::filesystem::exists(filePath)) {
+    if (!FileExistsNoThrow(filePath)) {
         CompiledShader result;
         result.errors = "File not found: " + filePath.string();
         return Result<CompiledShader>::Ok(std::move(result));
@@ -324,7 +414,12 @@ Result<CompiledShader> ShaderCompiler::CompileFromFile(
         return Result<CompiledShader>::Ok(std::move(result));
     }
 
-    size_t size = file.tellg();
+    size_t size = 0;
+    if (!StreamSizeFits(file.tellg(), kMaxShaderSourceBytes, &size) || !FitsDxcBlobSize(size)) {
+        CompiledShader result;
+        result.errors = "Shader file is too large or invalid: " + filePath.string();
+        return Result<CompiledShader>::Ok(std::move(result));
+    }
     file.seekg(0, std::ios::beg);
 
     std::vector<char> contents(size);
@@ -339,6 +434,13 @@ Result<CompiledShader> ShaderCompiler::CompileFromFile(
 
     // Add the file's parent directory to include paths so relative includes work
     ShaderCompileOptions optionsWithBasePath = options;
+    if (IsRaymarchShader(filePath) && optionsWithBasePath.debugInfo) {
+        // Embedded DXC debug info makes PS_Raymarch bytecode balloon enough to stall
+        // pipeline creation. Runtime diagnostics do not require shader debug symbols.
+        optionsWithBasePath.debugInfo = false;
+        optionsWithBasePath.optimizationLevel3 = true;
+        spdlog::warn("Forcing optimized no-debug compile for {}", filePath.filename().string());
+    }
     optionsWithBasePath.includePaths.push_back(basePath.wstring());
 
     const uint64_t cacheHash = ComputeShaderCacheHash(filePath, optionsWithBasePath, m_includePath);
@@ -347,24 +449,55 @@ Result<CompiledShader> ShaderCompiler::CompileFromFile(
         SanitizeCacheStem(NarrowAscii(options.entryPoint)) + "_" +
         HashToHex(cacheHash);
     const std::filesystem::path cachePath =
-        std::filesystem::current_path() / ".venpod_shader_cache" / (cacheStem + ".cso");
+        ResolveShaderCacheDirectory(filePath, m_includePath) / (cacheStem + ".cso");
 
     CompiledShader cached;
     if (ReadBinaryFile(cachePath, cached.bytecode) && !cached.bytecode.empty()) {
-        cached.success = true;
-        spdlog::debug("Shader cache hit: {} -> {}", filePath.string(), cachePath.string());
-        return Result<CompiledShader>::Ok(std::move(cached));
+        if (IsRaymarchShader(filePath) && cached.bytecode.size() > kMaxRaymarchShaderBytecodeBytes) {
+            spdlog::warn(
+                "Ignoring oversized raymarch shader cache artifact: {} bytes={} max={}",
+                cachePath.string(),
+                cached.bytecode.size(),
+                kMaxRaymarchShaderBytecodeBytes);
+            cached.bytecode.clear();
+        } else {
+            cached.success = true;
+            spdlog::info(
+                "Shader cache hit: {} bytes={}",
+                filePath.filename().string(),
+                cached.bytecode.size());
+            return Result<CompiledShader>::Ok(std::move(cached));
+        }
     }
 
+    const auto compileStart = std::chrono::steady_clock::now();
+    spdlog::info(
+        "Shader cache miss: compiling {} target={} entry={} cache={}",
+        filePath.filename().string(),
+        NarrowAscii(options.target),
+        NarrowAscii(options.entryPoint),
+        cachePath.string());
     auto compiled = CompileInternal(
         contents.data(),
         contents.size(),
         filePath.filename().wstring(),
         optionsWithBasePath
     );
+    const auto compileEnd = std::chrono::steady_clock::now();
+    const double compileSeconds =
+        std::chrono::duration<double>(compileEnd - compileStart).count();
     if (compiled && compiled.value().IsValid()) {
         WriteBinaryFileBestEffort(cachePath, compiled.value().bytecode);
-        spdlog::debug("Shader cache write: {} -> {}", filePath.string(), cachePath.string());
+        spdlog::info(
+            "Shader compile complete: {} seconds={:.2f} bytes={}",
+            filePath.filename().string(),
+            compileSeconds,
+            compiled.value().bytecode.size());
+    } else {
+        spdlog::warn(
+            "Shader compile failed: {} seconds={:.2f}",
+            filePath.filename().string(),
+            compileSeconds);
     }
     return compiled;
 }
@@ -392,6 +525,10 @@ Result<CompiledShader> ShaderCompiler::CompileInternal(
 
     if (!m_compiler || !m_utils) {
         result.errors = "Shader compiler not initialized";
+        return Result<CompiledShader>::Ok(std::move(result));
+    }
+    if (!FitsDxcBlobSize(sourceSize)) {
+        result.errors = "Shader source is too large for DXC";
         return Result<CompiledShader>::Ok(std::move(result));
     }
 

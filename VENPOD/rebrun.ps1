@@ -27,10 +27,16 @@ param(
     [switch]$SparseBrushFeedback,
     [switch]$SparseBrushFeedbackApply,
     [switch]$SparseBrushFeedbackAuthoritative,
+    [switch]$SparseBrushFeedbackStrictResidentOnly,
+    [switch]$SparseBrushFeedbackMovingDiagnostic,
+    [switch]$SparseBrushPaintSmoke,
+    [switch]$SparseBrushPaintMovingSmoke,
+    [switch]$SparseBrushPaintNonresidentSmoke,
     [string]$SparseEditFile = "",
     [switch]$SparsePhysics,
     [switch]$SparseGpuPhysics,
     [switch]$SparseGpuPhysicsApply,
+    [switch]$SparseGpuPhysicsStrict,
     [switch]$SparsePhysicsDiagnosticSeed,
     [switch]$SparsePhysicsDiagnosticFluidSeed,
     [switch]$SparseValidatePool,
@@ -75,6 +81,31 @@ $projectRoot = $PSScriptRoot
 $buildScript = Join-Path $projectRoot "build.ps1"
 $runScript = Join-Path $projectRoot "run.ps1"
 
+function Refresh-RuntimeAssets {
+    $sourceAssets = Join-Path $projectRoot "assets"
+    $targetAssets = Join-Path $projectRoot "build\bin\assets"
+    if (-not (Test-Path $sourceAssets)) {
+        throw "Source assets not found at $sourceAssets"
+    }
+    $binDir = Split-Path $targetAssets -Parent
+    if (-not (Test-Path $binDir)) {
+        throw "Runtime bin directory not found at $binDir. Run build.ps1 first."
+    }
+    if (-not (Test-Path $targetAssets)) {
+        New-Item -ItemType Directory -Path $targetAssets | Out-Null
+    }
+    Copy-Item -Path (Join-Path $sourceAssets "*") -Destination $targetAssets -Recurse -Force
+    $sourceRaymarch = Join-Path $sourceAssets "shaders\Graphics\PS_Raymarch.hlsl"
+    $runtimeRaymarch = Join-Path $targetAssets "shaders\Graphics\PS_Raymarch.hlsl"
+    if ((Test-Path $sourceRaymarch) -and (Test-Path $runtimeRaymarch)) {
+        $sourceHash = (Get-FileHash -Algorithm SHA256 $sourceRaymarch).Hash
+        $runtimeHash = (Get-FileHash -Algorithm SHA256 $runtimeRaymarch).Hash
+        if ($sourceHash -ne $runtimeHash) {
+            throw "Runtime PS_Raymarch.hlsl differs from source after asset refresh."
+        }
+    }
+}
+
 if (-not (Test-Path $buildScript)) {
     throw "build.ps1 not found at $buildScript"
 }
@@ -99,16 +130,41 @@ $savedEnv = @{
     VENPOD_SPARSE_RAYMARCH = $env:VENPOD_SPARSE_RAYMARCH
     VENPOD_SPARSE_ONLY = $env:VENPOD_SPARSE_ONLY
     VENPOD_SPARSE_SURFACE_AUTHORITATIVE = $env:VENPOD_SPARSE_SURFACE_AUTHORITATIVE
+    VENPOD_SPARSE_VOXEL_TERRAIN_ONLY = $env:VENPOD_SPARSE_VOXEL_TERRAIN_ONLY
+    VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_GATE = $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_GATE
+    VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_FRAME = $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_FRAME
+    VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MAX_FRAME = $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MAX_FRAME
+    VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_FAIL_OPEN_AT_MAX_FRAME = $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_FAIL_OPEN_AT_MAX_FRAME
+    VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_READY_BRICKS = $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_READY_BRICKS
+    VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_TERRAIN_CRITICAL_BLOCKS = $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_TERRAIN_CRITICAL_BLOCKS
+    VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_SURFACE_PROOF = $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_SURFACE_PROOF
+    VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_SURFACE_FRAGMENTS = $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_SURFACE_FRAGMENTS
+    VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_FAR_SVO_PROOF = $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_FAR_SVO_PROOF
+    VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MID_VOXEL_PROOF = $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MID_VOXEL_PROOF
+    VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_MID_VOXEL_COVERAGE_PCT = $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_MID_VOXEL_COVERAGE_PCT
+    VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_MID_VOXEL_WORST_RING_PCT = $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_MID_VOXEL_WORST_RING_PCT
+    VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_HIDDEN_EXACT_PROOF = $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_HIDDEN_EXACT_PROOF
+    VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_HIDDEN_EXACT_BLOCKS = $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_HIDDEN_EXACT_BLOCKS
+    VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_HIDDEN_EXACT_CLEAN_FRAMES = $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_HIDDEN_EXACT_CLEAN_FRAMES
+    VENPOD_SPARSE_STARTUP_HIDDEN_EXACT_REPAIR_BLOCKS = $env:VENPOD_SPARSE_STARTUP_HIDDEN_EXACT_REPAIR_BLOCKS
+    VENPOD_SPARSE_HIDDEN_EXACT_MISS_DURING_STARTUP = $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_DURING_STARTUP
     VENPOD_SPARSE_GPU_RAYCAST = $env:VENPOD_SPARSE_GPU_RAYCAST
     VENPOD_SPARSE_MISS_FEEDBACK = $env:VENPOD_SPARSE_MISS_FEEDBACK
     VENPOD_SPARSE_BRUSH_FEEDBACK = $env:VENPOD_SPARSE_BRUSH_FEEDBACK
     VENPOD_SPARSE_BRUSH_FEEDBACK_APPLY = $env:VENPOD_SPARSE_BRUSH_FEEDBACK_APPLY
     VENPOD_SPARSE_BRUSH_FEEDBACK_AUTHORITATIVE = $env:VENPOD_SPARSE_BRUSH_FEEDBACK_AUTHORITATIVE
+    VENPOD_SPARSE_BRUSH_FEEDBACK_STRICT_RESIDENT_ONLY = $env:VENPOD_SPARSE_BRUSH_FEEDBACK_STRICT_RESIDENT_ONLY
+    VENPOD_SPARSE_BRUSH_FEEDBACK_MOVING_DIAGNOSTIC = $env:VENPOD_SPARSE_BRUSH_FEEDBACK_MOVING_DIAGNOSTIC
+    VENPOD_SPARSE_BRUSH_PAINT_SMOKE = $env:VENPOD_SPARSE_BRUSH_PAINT_SMOKE
+    VENPOD_SPARSE_BRUSH_PAINT_MOVING_SMOKE = $env:VENPOD_SPARSE_BRUSH_PAINT_MOVING_SMOKE
+    VENPOD_SPARSE_BRUSH_PAINT_NONRESIDENT_SMOKE = $env:VENPOD_SPARSE_BRUSH_PAINT_NONRESIDENT_SMOKE
     VENPOD_SPARSE_EDIT_FILE = $env:VENPOD_SPARSE_EDIT_FILE
     VENPOD_ENABLE_SPARSE_PHYSICS = $env:VENPOD_ENABLE_SPARSE_PHYSICS
     VENPOD_SPARSE_PHYSICS_GPU = $env:VENPOD_SPARSE_PHYSICS_GPU
     VENPOD_SPARSE_PHYSICS_GPU_APPLY = $env:VENPOD_SPARSE_PHYSICS_GPU_APPLY
+    VENPOD_SPARSE_PHYSICS_GPU_STRICT = $env:VENPOD_SPARSE_PHYSICS_GPU_STRICT
     VENPOD_SPARSE_PHYSICS_DIAGNOSTIC_SEED = $env:VENPOD_SPARSE_PHYSICS_DIAGNOSTIC_SEED
+    VENPOD_SPARSE_PHYSICS_DIAGNOSTIC_MATERIAL_SEED = $env:VENPOD_SPARSE_PHYSICS_DIAGNOSTIC_MATERIAL_SEED
     VENPOD_SPARSE_PHYSICS_DIAGNOSTIC_FLUID_SEED = $env:VENPOD_SPARSE_PHYSICS_DIAGNOSTIC_FLUID_SEED
     VENPOD_SPARSE_VALIDATE_POOL = $env:VENPOD_SPARSE_VALIDATE_POOL
     VENPOD_SPARSE_STRESS_REQUESTS = $env:VENPOD_SPARSE_STRESS_REQUESTS
@@ -153,6 +209,8 @@ function Restore-Env {
         }
     }
 }
+
+$explicitSparsePhysicsDiagnosticSeed = $SparsePhysicsDiagnosticSeed.IsPresent
 
 try {
     if ($SparseSmoke) {
@@ -236,10 +294,28 @@ try {
         if ($SparseOwnershipInterval -lt 0) { $SparseOwnershipInterval = 30 }
         if ($ExitAfterFrames -le 0) { $ExitAfterFrames = 240 }
     }
+    if ($SparseBrushPaintMovingSmoke -or $SparseBrushPaintNonresidentSmoke) {
+        $SparseBrushPaintSmoke = $true
+    }
+    if ($SparseBrushPaintSmoke) {
+        if (-not ($SparsePhysics -or $SparseGpuPhysics -or $SparseGpuPhysicsApply -or $SparseGpuPhysicsStrict)) {
+            $DisablePhysics = $true
+        }
+        $SparseBrushFeedback = $true
+        $SparseValidatePool = $true
+        $RequireSparsePipeReady = $true
+        $RequireSparseOwnershipQuality = $true
+        $RequireSparseOwnershipStability = $true
+        if ($SparseDebugMode -lt 0) { $SparseDebugMode = 50 }
+        if ($SparseOwnershipInterval -lt 0) { $SparseOwnershipInterval = 30 }
+        if ($ExitAfterFrames -le 0) { $ExitAfterFrames = 600 }
+    }
     if ($SparseMissFeedbackSmoke) {
         $DisablePhysics = $true
         $SparseMissFeedback = $true
         $SparseValidatePool = $true
+        $SparseStressRequests = $true
+        $SparseStressCamera = $true
         $RequireSparsePipeReady = $true
         $RequireSparseOwnershipQuality = $true
         $RequireSparseOwnershipStability = $true
@@ -267,16 +343,40 @@ try {
     Remove-Item env:VENPOD_SPARSE_RAYMARCH -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_ONLY -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_SURFACE_AUTHORITATIVE -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_VOXEL_TERRAIN_ONLY -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_GATE -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_FRAME -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MAX_FRAME -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_FAIL_OPEN_AT_MAX_FRAME -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_READY_BRICKS -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_TERRAIN_CRITICAL_BLOCKS -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_SURFACE_PROOF -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_SURFACE_FRAGMENTS -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_FAR_SVO_PROOF -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MID_VOXEL_PROOF -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_MID_VOXEL_COVERAGE_PCT -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_MID_VOXEL_WORST_RING_PCT -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_HIDDEN_EXACT_PROOF -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_HIDDEN_EXACT_BLOCKS -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_HIDDEN_EXACT_CLEAN_FRAMES -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_DURING_STARTUP -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_GPU_RAYCAST -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_MISS_FEEDBACK -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_BRUSH_FEEDBACK -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_BRUSH_FEEDBACK_APPLY -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_BRUSH_FEEDBACK_AUTHORITATIVE -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_BRUSH_FEEDBACK_STRICT_RESIDENT_ONLY -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_BRUSH_FEEDBACK_MOVING_DIAGNOSTIC -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_BRUSH_PAINT_SMOKE -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_BRUSH_PAINT_MOVING_SMOKE -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_BRUSH_PAINT_NONRESIDENT_SMOKE -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_EDIT_FILE -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_ENABLE_SPARSE_PHYSICS -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_PHYSICS_GPU -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_PHYSICS_GPU_APPLY -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_PHYSICS_GPU_STRICT -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_PHYSICS_DIAGNOSTIC_SEED -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_PHYSICS_DIAGNOSTIC_MATERIAL_SEED -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_PHYSICS_DIAGNOSTIC_FLUID_SEED -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_VALIDATE_POOL -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_STRESS_REQUESTS -ErrorAction SilentlyContinue
@@ -316,12 +416,43 @@ try {
     if ($DisableFarSVO) { $env:VENPOD_DISABLE_FAR_SVO = "1" }
     if ($SparseGpuRaycastStrict) { $SparseGpuRaycast = $true }
     $useSparseDefault = -not $DenseLegacy -and -not $HighDensity -and -not $LowMemoryDense
-    $useSparse = $useSparseDefault -or $Sparse -or $SparseOnly -or $SparseDebug -or $SparseSurfaceAuthoritative -or $SparseLegacyFullscreen -or $SparseGpuRaycast -or $SparseMissFeedback -or $SparseBrushFeedback -or $SparseBrushFeedbackApply -or ($SparseEditFile -ne "") -or $SparsePhysics -or $SparseGpuPhysics -or $SparseGpuPhysicsApply -or $SparsePhysicsDiagnosticSeed -or $SparsePhysicsDiagnosticFluidSeed -or $SparseValidatePool -or $SparseStressRequests -or $SparseStressCamera -or $SparseSmoke -or $SparsePhysicsSmoke -or $SparseFlickerSmoke -or $SparseSurfaceSmoke -or $SparseGpuRaycastSmoke -or $SparseMissFeedbackSmoke -or $SparseBrushFeedbackSmoke -or ($SparseDebugMode -ge 0)
+    $useSparse = $useSparseDefault -or $Sparse -or $SparseOnly -or $SparseDebug -or $SparseSurfaceAuthoritative -or $SparseLegacyFullscreen -or $SparseGpuRaycast -or $SparseMissFeedback -or $SparseBrushFeedback -or $SparseBrushFeedbackApply -or $SparseBrushFeedbackMovingDiagnostic -or $SparseBrushPaintSmoke -or $SparseBrushPaintMovingSmoke -or ($SparseEditFile -ne "") -or $SparsePhysics -or $SparseGpuPhysics -or $SparseGpuPhysicsApply -or $SparseGpuPhysicsStrict -or $SparsePhysicsDiagnosticSeed -or $SparsePhysicsDiagnosticFluidSeed -or $SparseValidatePool -or $SparseStressRequests -or $SparseStressCamera -or $SparseSmoke -or $SparsePhysicsSmoke -or $SparseFlickerSmoke -or $SparseSurfaceSmoke -or $SparseGpuRaycastSmoke -or $SparseMissFeedbackSmoke -or $SparseBrushFeedbackSmoke -or ($SparseDebugMode -ge 0)
     if ($useSparse) {
         $env:VENPOD_ENABLE_EXPERIMENTAL_SPARSE = "1"
         $env:VENPOD_RENDER_BACKEND = "sparse"
         $env:VENPOD_SPARSE_RAYMARCH = "1"
         $env:VENPOD_SPARSE_MISS_FEEDBACK = "1"
+        # Public sparse runs should not expose the world until coherent LOD
+        # owners are ready. Startup hidden-exact repair prewarms the first
+        # public view so the renderer does not open on a partial exact/mid/far
+        # mix and then visibly assemble terrain.
+        $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_GATE = "1"
+        $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_FRAME = "24"
+        $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MAX_FRAME = "360"
+        $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_FAIL_OPEN_AT_MAX_FRAME = "0"
+        $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_READY_BRICKS = "512"
+        $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_TERRAIN_CRITICAL_BLOCKS = "1"
+        $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_SURFACE_PROOF = "1"
+        $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_FAR_SVO_PROOF = "1"
+        $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MID_VOXEL_PROOF = "1"
+        $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_MID_VOXEL_COVERAGE_PCT = "95"
+        $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_MID_VOXEL_WORST_RING_PCT = "90"
+        $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_HIDDEN_EXACT_PROOF = "0"
+        $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_HIDDEN_EXACT_BLOCKS = "0"
+        if ([string]::IsNullOrWhiteSpace($savedEnv.VENPOD_SPARSE_HIDDEN_EXACT_MISS_DURING_STARTUP)) {
+            $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_DURING_STARTUP = "1"
+        } else {
+            $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_DURING_STARTUP =
+                $savedEnv.VENPOD_SPARSE_HIDDEN_EXACT_MISS_DURING_STARTUP
+        }
+        if ([string]::IsNullOrWhiteSpace($savedEnv.VENPOD_SPARSE_STARTUP_HIDDEN_EXACT_REPAIR_BLOCKS)) {
+            $env:VENPOD_SPARSE_STARTUP_HIDDEN_EXACT_REPAIR_BLOCKS = "0"
+        } else {
+            $env:VENPOD_SPARSE_STARTUP_HIDDEN_EXACT_REPAIR_BLOCKS =
+                $savedEnv.VENPOD_SPARSE_STARTUP_HIDDEN_EXACT_REPAIR_BLOCKS
+        }
+        $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_WARMUP_FRAME = "240"
+        $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_CLEAN_IDLE_FRAMES = "8"
     }
     if ($SparseOnly -or $useSparseDefault) { $env:VENPOD_SPARSE_ONLY = "1" }
     if (($SparseOnly -or $SparseSurfaceAuthoritative -or $useSparseDefault) -and -not $SparseLegacyFullscreen) {
@@ -340,6 +471,22 @@ try {
         $env:VENPOD_SPARSE_BRUSH_FEEDBACK_APPLY = "1"
         $env:VENPOD_SPARSE_BRUSH_FEEDBACK_AUTHORITATIVE = "1"
     }
+    if ($SparseBrushFeedbackStrictResidentOnly) {
+        $env:VENPOD_SPARSE_BRUSH_FEEDBACK = "1"
+        $env:VENPOD_SPARSE_BRUSH_FEEDBACK_APPLY = "1"
+        $env:VENPOD_SPARSE_BRUSH_FEEDBACK_AUTHORITATIVE = "1"
+        $env:VENPOD_SPARSE_BRUSH_FEEDBACK_STRICT_RESIDENT_ONLY = "1"
+    }
+    if ($SparseBrushFeedbackMovingDiagnostic) { $env:VENPOD_SPARSE_BRUSH_FEEDBACK_MOVING_DIAGNOSTIC = "1" }
+    if ($SparseBrushPaintSmoke) {
+        $env:VENPOD_SPARSE_BRUSH_FEEDBACK = "1"
+        $env:VENPOD_SPARSE_BRUSH_FEEDBACK_APPLY = "1"
+        $env:VENPOD_SPARSE_BRUSH_FEEDBACK_AUTHORITATIVE = "1"
+        $env:VENPOD_SPARSE_BRUSH_FEEDBACK_STRICT_RESIDENT_ONLY = "1"
+        $env:VENPOD_SPARSE_BRUSH_PAINT_SMOKE = "1"
+    }
+    if ($SparseBrushPaintMovingSmoke) { $env:VENPOD_SPARSE_BRUSH_PAINT_MOVING_SMOKE = "1" }
+    if ($SparseBrushPaintNonresidentSmoke) { $env:VENPOD_SPARSE_BRUSH_PAINT_NONRESIDENT_SMOKE = "1" }
     if ($SparseEditFile -ne "") { $env:VENPOD_SPARSE_EDIT_FILE = $SparseEditFile }
     if ($SparseBrushFeedbackSmoke) { $env:VENPOD_SPARSE_BRUSH_FEEDBACK_DIAGNOSTIC_SEED = "1" }
     if ($SparsePhysics) { $env:VENPOD_ENABLE_SPARSE_PHYSICS = "1" }
@@ -352,9 +499,17 @@ try {
         $env:VENPOD_SPARSE_PHYSICS_GPU = "1"
         $env:VENPOD_SPARSE_PHYSICS_GPU_APPLY = "1"
     }
-    if ($SparsePhysicsDiagnosticSeed -or $SparsePhysicsDiagnosticFluidSeed) {
+    if ($SparseGpuPhysicsStrict) {
         $env:VENPOD_ENABLE_SPARSE_PHYSICS = "1"
+        $env:VENPOD_SPARSE_PHYSICS_GPU = "1"
+        $env:VENPOD_SPARSE_PHYSICS_GPU_APPLY = "1"
+        $env:VENPOD_SPARSE_PHYSICS_GPU_STRICT = "1"
+    }
+    if ($SparsePhysicsDiagnosticSeed -or $SparsePhysicsDiagnosticFluidSeed) {
         $env:VENPOD_SPARSE_PHYSICS_DIAGNOSTIC_SEED = "1"
+    }
+    if ($explicitSparsePhysicsDiagnosticSeed -or ($SparsePhysicsDiagnosticSeed -and -not $SparsePhysicsDiagnosticFluidSeed)) {
+        $env:VENPOD_SPARSE_PHYSICS_DIAGNOSTIC_MATERIAL_SEED = "1"
     }
     if ($SparsePhysicsDiagnosticFluidSeed) { $env:VENPOD_SPARSE_PHYSICS_DIAGNOSTIC_FLUID_SEED = "1" }
     if ($SparseValidatePool) { $env:VENPOD_SPARSE_VALIDATE_POOL = "1" }
@@ -448,6 +603,7 @@ try {
         }
         if ($useSparseDefault) {
             Write-Info "Sparse surface-authoritative renderer is the default rebrun target; use -DenseLegacy for the old renderer."
+            Write-Info "Startup contract: hold public render for coherent surface/mid/Far-SVO readiness; hidden exact streams after open."
         }
         if ($SparseEditFile -ne "") {
             Write-Info "Sparse edit persistence file: $SparseEditFile"
@@ -474,6 +630,9 @@ try {
 
     if ($NoBuild) {
         Write-Info "Build step: skipped (-NoBuild)"
+        Write-Step "Refreshing runtime assets for -NoBuild..."
+        Refresh-RuntimeAssets
+        Write-Success "Runtime assets refreshed"
     } else {
         Write-Step "Building latest code..."
         if ($Clean) {
@@ -536,8 +695,12 @@ try {
                     -Path $runtimeLog `
                     -Pattern "missPending=[1-9][0-9]*" `
                     -CaseSensitive:$false
-                if (-not $missFeedbackPipelineLines -or -not $missFeedbackPendingLines) {
-                    Write-Host "[ERROR] Sparse miss feedback smoke did not observe pipeline creation and nonzero pending miss requests." -ForegroundColor Red
+                $missFeedbackCleanOwnershipLines = Select-String `
+                    -Path $runtimeLog `
+                    -Pattern "PERF_RENDER_OWNERSHIP .*miss=0 unsafeNearMiss=0" `
+                    -CaseSensitive:$false
+                if (-not $missFeedbackPipelineLines -or (-not $missFeedbackPendingLines -and -not $missFeedbackCleanOwnershipLines)) {
+                    Write-Host "[ERROR] Sparse miss feedback smoke did not observe pipeline creation with either nonzero pending miss requests or clean zero-miss ownership." -ForegroundColor Red
                     exit 15
                 }
             }
@@ -558,9 +721,14 @@ try {
                     -Path $runtimeLog `
                     -Pattern "SPARSE_BRUSH_FEEDBACK parity observed" `
                     -CaseSensitive:$false
+                $brushFeedbackSuitePattern = if ($env:VENPOD_SPARSE_BRUSH_FEEDBACK_STRICT_RESIDENT_ONLY -eq "1") {
+                    "SPARSE_BRUSH_FEEDBACK diagnostic suite passed cases=6 strictResidentOnly=1"
+                } else {
+                    "SPARSE_BRUSH_FEEDBACK diagnostic suite passed cases=7"
+                }
                 $brushFeedbackSuiteLines = Select-String `
                     -Path $runtimeLog `
-                    -Pattern "SPARSE_BRUSH_FEEDBACK diagnostic suite passed cases=7" `
+                    -Pattern $brushFeedbackSuitePattern `
                     -CaseSensitive:$false
                 if (-not $brushFeedbackDiagnosticLines -or -not $brushFeedbackRetireLines -or -not $brushFeedbackResidentLines -or -not $brushFeedbackParityLines -or -not $brushFeedbackSuiteLines) {
                     Write-Host "[ERROR] Sparse brush feedback smoke did not observe queued diagnostic, retired resident feedback records, zero missing resident pages, and full parity-suite success." -ForegroundColor Red

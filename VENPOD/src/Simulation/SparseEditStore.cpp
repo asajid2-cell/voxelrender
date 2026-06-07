@@ -1,8 +1,10 @@
 #include "SparseEditStore.h"
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <limits>
+#include <string>
 #include <system_error>
 #include <utility>
 
@@ -22,15 +24,60 @@ LocalVoxelCoord UnpackSparseEditLocal(uint32_t packedLocal) {
     };
 }
 
+bool IsSparseEditPersistencePathAllowed(const std::filesystem::path& path) {
+    if (path.empty() || !path.has_filename()) {
+        return false;
+    }
+    std::string extension = path.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return extension == ".vsed";
+}
+
 namespace {
 
 constexpr uint32_t kSparseEditFileMagic = 0x44455356u; // VSED, little-endian
 constexpr uint32_t kSparseEditFileVersion = 1u;
 constexpr uint64_t kSparseEditFileMaxOverlays = 1'000'000ull;
 constexpr uint64_t kSparseEditFileMaxVoxels = 128'000'000ull;
+constexpr uint64_t kSparseEditFileMaxBytes = 1024ull * 1024ull * 1024ull;
+constexpr uint64_t kSparseEditFileHeaderBytes =
+    sizeof(uint32_t) * 4ull + sizeof(uint64_t) * 2ull;
+constexpr uint64_t kSparseEditFileOverlayBytes =
+    sizeof(int32_t) * 3ull + sizeof(uint32_t) * 2ull;
+constexpr uint64_t kSparseEditFileVoxelBytes =
+    sizeof(uint16_t) + sizeof(uint32_t);
 
 uint32_t PackSparseEditLocalIndex(uint16_t localIndex) {
     return PackSparseEditLocal(LocalVoxelFromIndex(localIndex));
+}
+
+uint32_t SaturatingSizeToUint32(size_t value) {
+    if (value > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+        return std::numeric_limits<uint32_t>::max();
+    }
+    return static_cast<uint32_t>(value);
+}
+
+bool BeginOverlayRevisionUpdate(
+    BrickEditOverlay& overlay,
+    std::vector<SparseEditDelta>& pendingGpuDeltas)
+{
+    if (overlay.revision != std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+
+    pendingGpuDeltas.erase(
+        std::remove_if(
+            pendingGpuDeltas.begin(),
+            pendingGpuDeltas.end(),
+            [&overlay](const SparseEditDelta& delta) {
+                return delta.coord == overlay.coord;
+            }),
+        pendingGpuDeltas.end());
+    overlay.revision = 0;
+    return true;
 }
 
 template <typename T>
@@ -48,6 +95,49 @@ bool ReadBinary(std::istream& stream, T* value) {
     return stream.good();
 }
 
+bool AddUint64(uint64_t a, uint64_t b, uint64_t* out) {
+    if (!out || a > std::numeric_limits<uint64_t>::max() - b) {
+        return false;
+    }
+    *out = a + b;
+    return true;
+}
+
+bool MulUint64(uint64_t a, uint64_t b, uint64_t* out) {
+    if (!out || (b != 0 && a > std::numeric_limits<uint64_t>::max() / b)) {
+        return false;
+    }
+    *out = a * b;
+    return true;
+}
+
+bool TryGetInputStreamSize(std::ifstream& stream, uint64_t* outSize) {
+    if (!outSize) {
+        return false;
+    }
+    const std::streampos end = stream.tellg();
+    const std::streamoff signedSize = end;
+    if (signedSize < 0) {
+        return false;
+    }
+    *outSize = static_cast<uint64_t>(signedSize);
+    stream.seekg(0, std::ios::beg);
+    return static_cast<bool>(stream);
+}
+
+bool ComputeSparseEditFileBytes(uint64_t overlayCount, uint64_t voxelCount, uint64_t* outBytes) {
+    uint64_t overlayBytes = 0;
+    uint64_t voxelBytes = 0;
+    uint64_t payloadBytes = 0;
+    if (!MulUint64(overlayCount, kSparseEditFileOverlayBytes, &overlayBytes) ||
+        !MulUint64(voxelCount, kSparseEditFileVoxelBytes, &voxelBytes) ||
+        !AddUint64(overlayBytes, voxelBytes, &payloadBytes) ||
+        !AddUint64(kSparseEditFileHeaderBytes, payloadBytes, outBytes)) {
+        return false;
+    }
+    return true;
+}
+
 }
 
 SparseEditDeltaBatch BuildSparseEditDeltaBatch(
@@ -59,23 +149,49 @@ SparseEditDeltaBatch BuildSparseEditDeltaBatch(
     SparseEditDeltaBatch batch;
     if (deltas.empty() || maxDeltas == 0 || maxRanges == 0) {
         batch.overflow = !deltas.empty();
+        batch.truncated = !deltas.empty();
         return batch;
     }
 
     if (rangeTableCapacity != 0 && (rangeTableCapacity & (rangeTableCapacity - 1u)) != 0) {
         batch.overflow = true;
+        batch.truncated = true;
         return batch;
     }
     batch.rangeTableCapacity = rangeTableCapacity;
 
-    batch.inputDeltaCount = std::min<uint32_t>(
-        static_cast<uint32_t>(deltas.size()),
-        maxDeltas);
-    batch.overflow = batch.inputDeltaCount < deltas.size();
-
     std::vector<SparseEditDelta> sorted(
         deltas.begin(),
-        deltas.begin() + static_cast<std::ptrdiff_t>(batch.inputDeltaCount));
+        deltas.end());
+    const bool coalesceBeforeCap = deltas.size() > maxDeltas;
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+        if (a.coord != b.coord) {
+            return a.coord < b.coord;
+        }
+        if (a.packedLocal != b.packedLocal) {
+            return a.packedLocal < b.packedLocal;
+        }
+        return a.revision > b.revision;
+    });
+
+    if (coalesceBeforeCap) {
+        std::vector<SparseEditDelta> latestUnique;
+        latestUnique.reserve(sorted.size());
+        for (const SparseEditDelta& delta : sorted) {
+            if (!latestUnique.empty() &&
+                latestUnique.back().coord == delta.coord &&
+                latestUnique.back().packedLocal == delta.packedLocal) {
+                continue;
+            }
+            latestUnique.push_back(delta);
+        }
+        sorted.swap(latestUnique);
+    }
+
+    batch.inputDeltaCount = std::min<uint32_t>(SaturatingSizeToUint32(sorted.size()), maxDeltas);
+    batch.truncated = batch.inputDeltaCount < sorted.size();
+    batch.overflow = coalesceBeforeCap || batch.truncated;
+    sorted.resize(batch.inputDeltaCount);
     std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
         if (a.coord != b.coord) {
             return a.coord < b.coord;
@@ -100,6 +216,7 @@ SparseEditDeltaBatch BuildSparseEditDeltaBatch(
 
         if (batch.ranges.size() >= maxRanges) {
             batch.overflow = true;
+            batch.truncated = true;
             break;
         }
 
@@ -133,6 +250,7 @@ SparseEditDeltaBatch BuildSparseEditDeltaBatch(
             }
             if (!inserted) {
                 batch.overflow = true;
+                batch.truncated = true;
                 break;
             }
         }
@@ -151,20 +269,34 @@ void SparseEditStore::SetVoxel(int32_t worldX, int32_t worldY, int32_t worldZ, u
         overlay.coord = brick;
     }
 
+    const bool resetRevisionEpoch = BeginOverlayRevisionUpdate(overlay, m_pendingGpuDeltas);
     const bool inserted = overlay.voxels.find(localIndex) == overlay.voxels.end();
     overlay.voxels[localIndex] = packedVoxel;
-    overlay.revision++;
+    const uint32_t revision = ++overlay.revision;
     overlay.dirtyDisk = true;
     overlay.dirtyGpu = true;
-    m_pendingGpuDeltas.push_back({
-        brick,
-        PackSparseEditLocal(local),
-        packedVoxel,
-        overlay.revision
-    });
+    if (resetRevisionEpoch) {
+        m_pendingGpuDeltas.reserve(m_pendingGpuDeltas.size() + overlay.voxels.size());
+        for (const auto& [overlayLocalIndex, overlayVoxel] : overlay.voxels) {
+            m_pendingGpuDeltas.push_back({
+                brick,
+                PackSparseEditLocalIndex(overlayLocalIndex),
+                overlayVoxel,
+                revision
+            });
+        }
+    } else {
+        m_pendingGpuDeltas.push_back({
+            brick,
+            PackSparseEditLocal(local),
+            packedVoxel,
+            revision
+        });
+    }
     if (inserted) {
         ++m_editedVoxelCount;
     }
+    ++m_revisionSerial;
 }
 
 bool SparseEditStore::TryGetVoxel(
@@ -278,7 +410,7 @@ uint32_t SparseEditStore::GetOverlayRevision(const BrickCoord& coord) const {
 }
 
 bool SparseEditStore::SaveToFile(const std::filesystem::path& path) {
-    if (path.empty()) {
+    if (!IsSparseEditPersistencePathAllowed(path)) {
         return false;
     }
 
@@ -365,8 +497,18 @@ bool SparseEditStore::SaveToFile(const std::filesystem::path& path) {
 }
 
 bool SparseEditStore::LoadFromFile(const std::filesystem::path& path) {
-    std::ifstream stream(path, std::ios::binary);
+    if (!IsSparseEditPersistencePathAllowed(path)) {
+        return false;
+    }
+
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
     if (!stream) {
+        return false;
+    }
+    uint64_t fileBytes = 0;
+    if (!TryGetInputStreamSize(stream, &fileBytes) ||
+        fileBytes < kSparseEditFileHeaderBytes ||
+        fileBytes > kSparseEditFileMaxBytes) {
         return false;
     }
 
@@ -393,6 +535,11 @@ bool SparseEditStore::LoadFromFile(const std::filesystem::path& path) {
         totalVoxelCount > kSparseEditFileMaxVoxels) {
         return false;
     }
+    uint64_t expectedBytes = 0;
+    if (!ComputeSparseEditFileBytes(overlayCount, totalVoxelCount, &expectedBytes) ||
+        expectedBytes != fileBytes) {
+        return false;
+    }
 
     std::unordered_map<BrickCoord, BrickEditOverlay, BrickCoordHash> loaded;
     loaded.reserve(static_cast<size_t>(std::min<uint64_t>(overlayCount, 65536ull)));
@@ -409,7 +556,9 @@ bool SparseEditStore::LoadFromFile(const std::filesystem::path& path) {
             return false;
         }
 
-        if (voxelCount > SPARSE_BRICK_VOXEL_COUNT ||
+        if (voxelCount == 0 ||
+            overlay.revision == 0 ||
+            voxelCount > SPARSE_BRICK_VOXEL_COUNT ||
             readVoxelCount + voxelCount > totalVoxelCount) {
             return false;
         }
@@ -430,9 +579,6 @@ bool SparseEditStore::LoadFromFile(const std::filesystem::path& path) {
         }
         readVoxelCount += voxelCount;
 
-        if (overlay.voxels.empty()) {
-            continue;
-        }
         overlay.dirtyDisk = false;
         overlay.dirtyGpu = false;
         if (!loaded.emplace(overlay.coord, std::move(overlay)).second) {
@@ -461,6 +607,7 @@ bool SparseEditStore::LoadFromFile(const std::filesystem::path& path) {
     m_overlays = std::move(loaded);
     m_pendingGpuDeltas.clear();
     m_editedVoxelCount = editedVoxelCount;
+    ++m_revisionSerial;
     return true;
 }
 

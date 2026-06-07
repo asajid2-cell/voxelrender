@@ -93,7 +93,9 @@ coordinates. When a chunk streams or recenters back into the dense render
 window, its overlay is replayed on top of generated terrain.
 
 This means bridges, ramps, platforms, tunnels, and walls painted during a
-session survive render-window recentering. Disk save/load is still future work.
+session survive render-window recentering. This dense-window checkpoint did not
+include disk save/load; the current sparse path now covers edit save/load with
+`.\rebrun.ps1 -SparseEditFile` and pause-menu controls.
 
 The traversal brush also has a close-range handoff: line-of-sight painting
 continues normally until it gets close to the player, then the brush finishes
@@ -127,10 +129,10 @@ Runtime smoke test:
 - Later Release smoke tests confirmed `PS_Raymarch.hlsl` compiled with the far
   SVO bindings and the far octree initialized with 81 pages and 1,910,633 nodes.
 
-## Remaining Architectural Blockers
+## Historical Dense-Path Blockers
 
-This is real vertical chunk streaming, but not yet a full world-streaming
-architecture:
+At the end of the dense vertical-window pass, this was real vertical chunk
+streaming but not yet a full world-streaming architecture:
 
 - Physics operates on the local render buffer, not on a persistent world-chunk
   simulation layer.
@@ -143,9 +145,16 @@ architecture:
 - Brush edit overlays are runtime-persistent, but disk persistence is not yet
   the default public path.
 
-## Next Refactor
+Current sparse status: the active sparse path no longer uses the dense moving
+render buffer as the world authority. Sparse edits have disk save/load through
+`.\rebrun.ps1 -SparseEditFile` and pause-menu controls, collision samples the
+sparse edit/procedural world, and near/mid/far residency is lane-budgeted. The
+remaining public-review limits are tracked in
+[Sparse completion audit](../reference/sparse-completion-audit.md).
 
-The next terrain/traversal pass should build on the persistent chunk-edit layer:
+## Historical Next Refactor
+
+The next terrain/traversal pass proposed from this historical checkpoint was:
 
 1. Add disk persistence and exact generated-material queries for brush edits.
 2. Add a chunk metadata pass for surface height, biome, cave/ravine masks, and
@@ -193,14 +202,16 @@ back GPU replayed voxels.
 
 ### Current Edit Semantics
 
-Runtime-session persistence is implemented. Disk save/load is not implemented
-yet.
+Runtime-session persistence was implemented in this dense-window checkpoint.
+The current sparse path adds disk save/load through `.\rebrun.ps1 -SparseEditFile`
+and pause-menu controls.
 
-Paint, replace, fill, and erase are stored as voxel overrides. The CPU overlay
-does not yet sample generated terrain before deciding whether a paint operation
-would have affected only air in the shader. In normal traversal use this matches
-the important case, painting platforms or stairs into air. A future pass should
-add generated/material queries for exact CPU/GPU brush parity.
+In this dense-window checkpoint, paint, replace, fill, and erase were stored as
+voxel overrides. The CPU overlay did not sample generated terrain before
+deciding whether a paint operation would have affected only air in the shader.
+In normal traversal use this matched the important case, painting platforms or
+stairs into air. The current sparse path has stronger brush/raycast parity
+tests, GPU feedback smokes, and CPU-authoritative fallback.
 
 ### Physics Safeguard
 
@@ -321,9 +332,9 @@ Opt-in infinite physics smoke:
 - the process remained responsive during the smoke run
 - no `critical`, `error`, `failed`, or `timeout` log lines
 
-### Remaining Weak Spots
+### Historical Remaining Weak Spots
 
-- Visual brush persistence still needs manual validation with real painting,
+- Visual brush persistence still needed manual validation with real painting,
   recentering, and returning to the edited area.
 - CPU persistence still approximates generated air/solid state from the hit
   normal instead of querying exact generated terrain.
@@ -331,6 +342,11 @@ Opt-in infinite physics smoke:
   read back to the overlay.
 - Edited chunks are naturally prioritized when near the player, but there is not
   yet a separate recently-edited physics queue.
+
+Current sparse status: sparse brush/raycast and edit persistence are covered by
+unit tests and sparse regression smokes, with GPU feedback kept as a guarded
+hybrid path. Sparse local physics is default-on and bounded, while GPU proposal
+apply remains an opt-in guarded path.
 
 ## GPU Brush Edit Feedback Pass
 
@@ -402,9 +418,11 @@ Runtime shader/launch smoke:
 - No `error`, `failed`, `critical`, `timeout`, device-removed, or feedback
   overflow/slot-skip log lines appeared during the smoke.
 
-### Remaining Weak Spots
+### Historical Remaining Weak Spots
 
-- Disk save/load for edit overlays is still not implemented.
+- This dense-window checkpoint did not include disk save/load for edit overlays;
+  the current sparse path now provides it through `.\rebrun.ps1 -SparseEditFile`
+  and pause-menu controls.
 - The fallback CPU persistence path remains approximate and is only used if GPU
   feedback cannot allocate a readback slot.
 - Full manual validation should still include painting a bridge, forcing a
@@ -495,7 +513,7 @@ Boundary smoke:
 - log scan found no `error`, `failed`, `critical`, `timeout`,
   `device removed`, `hung`, `discontinuity`, or invariant-violation lines
 
-### Remaining Weak Spots
+### Historical Remaining Weak Spots
 
 - The boundary test is a runtime smoke path, not a headless unit test.
 - Vertical render-window movement is now less aggressive. Later validation found

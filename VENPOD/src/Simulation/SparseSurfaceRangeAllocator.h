@@ -32,6 +32,8 @@ public:
     void Clear();
     void BeginFrame(uint64_t frameIndex);
     void BeginFrame(uint64_t completedRetirementToken, uint64_t currentRetirementToken);
+    void BeginStatsRefreshBatch();
+    void EndStatsRefreshBatch();
 
     bool AllocateOrResize(
         const BrickCoord& coord,
@@ -39,7 +41,6 @@ public:
         SparseSurfaceFaceAllocation* outAllocation);
     void Free(const BrickCoord& coord);
     void ReleaseNotIn(const std::unordered_set<BrickCoord, BrickCoordHash>& liveCoords);
-
     bool TryGet(const BrickCoord& coord, SparseSurfaceFaceAllocation* outAllocation = nullptr) const;
     const SparseSurfaceRangeAllocatorStats& GetStats() const { return m_stats; }
 
@@ -58,6 +59,7 @@ private:
     void RetireRange(uint32_t firstFace, uint32_t count);
     void AddFreeRange(uint32_t firstFace, uint32_t count);
     void RefreshStats();
+    void RecomputeStats();
 
     uint32_t m_maxFaces = 0;
     uint32_t m_retirementDelayFrames = 3;
@@ -67,6 +69,8 @@ private:
     std::vector<FreeRange> m_freeRanges;
     std::vector<RetiredRange> m_retiredRanges;
     SparseSurfaceRangeAllocatorStats m_stats;
+    uint32_t m_statsRefreshBatchDepth = 0;
+    bool m_statsRefreshDirty = false;
 };
 
 } // namespace VENPOD::Simulation

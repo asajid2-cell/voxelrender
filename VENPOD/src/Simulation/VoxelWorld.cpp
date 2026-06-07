@@ -215,7 +215,7 @@ Result<void> VoxelWorld::Initialize(
         m_chunkManager = std::make_unique<InfiniteChunkManager>();
 
         InfiniteChunkConfig chunkConfig;
-        chunkConfig.worldSeed = 12345;  // TODO: Make configurable via VoxelWorldConfig
+        chunkConfig.worldSeed = m_config.worldSeed;
         chunkConfig.chunksPerFrame = 3;  // Match the generation allocator ring without retry churn.
         const uint32_t visibleDenseChunkCount =
             RENDER_BUFFER_CHUNKS_X * RENDER_BUFFER_CHUNKS_Y * RENDER_BUFFER_CHUNKS_Z;
@@ -661,11 +661,11 @@ Result<void> VoxelWorld::CreateMaterialPalette(
     // MAT_WATER (2) - Blue transparent
     setMaterial(2, 0.2f, 0.4f, 0.8f, 0.7f);
 
-    // MAT_STONE (3) - Gray
-    setMaterial(3, 0.5f, 0.5f, 0.5f);
+    // MAT_STONE (3) - weathered warm rock
+    setMaterial(3, 0.50f, 0.50f, 0.40f);
 
-    // MAT_DIRT (4) - Brown
-    setMaterial(4, 0.55f, 0.35f, 0.2f);
+    // MAT_DIRT (4) - muted grass/soil
+    setMaterial(4, 0.42f, 0.55f, 0.28f);
 
     // MAT_WOOD (5) - Wood brown
     setMaterial(5, 0.6f, 0.4f, 0.2f);
@@ -895,7 +895,7 @@ void VoxelWorld::RequestBrushRaycastReadback(ID3D12GraphicsCommandList* cmdList)
         m_brushRaycastCPU.posZ = data[2];
 
         // Unpack normal and validity flag
-        uint32_t packed = *reinterpret_cast<uint32_t*>(&data[3]);
+        uint32_t packed = DecodeVoxelRaycastPackedWord(data[3]);
         m_brushRaycastCPU.normalPacked = packed;
         m_brushRaycastCPU.hasValidPosition = (packed >> 6) & 1;
 
@@ -975,7 +975,7 @@ void VoxelWorld::RequestGroundRaycastReadback(ID3D12GraphicsCommandList* cmdList
         m_groundRaycastCPU.posZ = data[2];
 
         // Unpack normal and validity flag
-        uint32_t packed = *reinterpret_cast<uint32_t*>(&data[3]);
+        uint32_t packed = DecodeVoxelRaycastPackedWord(data[3]);
         m_groundRaycastCPU.normalPacked = packed;
         m_groundRaycastCPU.hasValidPosition = (packed >> 6) & 1;
 
@@ -987,6 +987,7 @@ void VoxelWorld::RequestGroundRaycastReadback(ID3D12GraphicsCommandList* cmdList
 void VoxelWorld::QueueBrushRaycastReadback(ID3D12GraphicsCommandList* cmdList, uint32_t slotIndex) {
     if (!cmdList) return;
     if (!m_config.enableRaycastResultBuffers || !m_brushRaycastResult.GetResource()) return;
+    const uint32_t queuedFrame = slotIndex;
     slotIndex %= RAYCAST_READBACK_SLOTS;
 
     ID3D12Device* device = nullptr;
@@ -1040,14 +1041,19 @@ void VoxelWorld::QueueBrushRaycastReadback(ID3D12GraphicsCommandList* cmdList, u
     }
 
     m_brushRaycastReadbackReady[slotIndex] = true;
+    m_brushRaycastReadbackQueuedFrame[slotIndex] = queuedFrame;
 }
 
 bool VoxelWorld::RetireBrushRaycastReadback(uint32_t slotIndex) {
+    const uint32_t retireFrame = slotIndex;
     slotIndex %= RAYCAST_READBACK_SLOTS;
     if (!m_config.enableRaycastResultBuffers) {
         return false;
     }
     if (!m_brushRaycastReadbackReady[slotIndex] || !m_brushRaycastReadbackSlots[slotIndex]) {
+        return false;
+    }
+    if (!IsVoxelRaycastReadbackRetirable(m_brushRaycastReadbackQueuedFrame[slotIndex], retireFrame)) {
         return false;
     }
 
@@ -1062,18 +1068,21 @@ bool VoxelWorld::RetireBrushRaycastReadback(uint32_t slotIndex) {
     m_brushRaycastCPU.posX = data[0];
     m_brushRaycastCPU.posY = data[1];
     m_brushRaycastCPU.posZ = data[2];
-    uint32_t packed = *reinterpret_cast<uint32_t*>(&data[3]);
+    uint32_t packed = DecodeVoxelRaycastPackedWord(data[3]);
     m_brushRaycastCPU.normalPacked = packed;
     m_brushRaycastCPU.hasValidPosition = (packed >> 6) & 1;
 
     D3D12_RANGE writeRange = {0, 0};
     m_brushRaycastReadbackSlots[slotIndex]->Unmap(0, &writeRange);
+    m_brushRaycastReadbackReady[slotIndex] = false;
+    m_brushRaycastReadbackQueuedFrame[slotIndex] = InvalidVoxelRaycastReadbackFrame();
     return true;
 }
 
 void VoxelWorld::QueueGroundRaycastReadback(ID3D12GraphicsCommandList* cmdList, uint32_t slotIndex) {
     if (!cmdList) return;
     if (!m_config.enableRaycastResultBuffers || !m_groundRaycastResult.GetResource()) return;
+    const uint32_t queuedFrame = slotIndex;
     slotIndex %= RAYCAST_READBACK_SLOTS;
 
     ID3D12Device* device = nullptr;
@@ -1127,14 +1136,19 @@ void VoxelWorld::QueueGroundRaycastReadback(ID3D12GraphicsCommandList* cmdList, 
     }
 
     m_groundRaycastReadbackReady[slotIndex] = true;
+    m_groundRaycastReadbackQueuedFrame[slotIndex] = queuedFrame;
 }
 
 bool VoxelWorld::RetireGroundRaycastReadback(uint32_t slotIndex) {
+    const uint32_t retireFrame = slotIndex;
     slotIndex %= RAYCAST_READBACK_SLOTS;
     if (!m_config.enableRaycastResultBuffers) {
         return false;
     }
     if (!m_groundRaycastReadbackReady[slotIndex] || !m_groundRaycastReadbackSlots[slotIndex]) {
+        return false;
+    }
+    if (!IsVoxelRaycastReadbackRetirable(m_groundRaycastReadbackQueuedFrame[slotIndex], retireFrame)) {
         return false;
     }
 
@@ -1149,12 +1163,14 @@ bool VoxelWorld::RetireGroundRaycastReadback(uint32_t slotIndex) {
     m_groundRaycastCPU.posX = data[0];
     m_groundRaycastCPU.posY = data[1];
     m_groundRaycastCPU.posZ = data[2];
-    uint32_t packed = *reinterpret_cast<uint32_t*>(&data[3]);
+    uint32_t packed = DecodeVoxelRaycastPackedWord(data[3]);
     m_groundRaycastCPU.normalPacked = packed;
     m_groundRaycastCPU.hasValidPosition = (packed >> 6) & 1;
 
     D3D12_RANGE writeRange = {0, 0};
     m_groundRaycastReadbackSlots[slotIndex]->Unmap(0, &writeRange);
+    m_groundRaycastReadbackReady[slotIndex] = false;
+    m_groundRaycastReadbackQueuedFrame[slotIndex] = InvalidVoxelRaycastReadbackFrame();
     return true;
 }
 

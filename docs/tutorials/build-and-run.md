@@ -92,6 +92,10 @@ For the full sparse regression gate:
 .\sparse_regression.ps1 -Config Release
 ```
 
+The gate builds Release, runs `VENPODSparseCore`, verifies the dense legacy
+fallback still launches, then runs the sparse render, edit, feedback, physics,
+capture, stress-capture, and public demo media validation stages.
+
 ## Expected Result
 
 The sandbox opens in a first-person view above generated vertical voxel terrain.

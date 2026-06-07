@@ -92,6 +92,23 @@ Implemented pieces:
   - Sparse per-brick edit overlays.
   - Negative coordinate support.
   - Overlay replay over generated brick payloads.
+  - Persistent edit-file validation rejects malformed overlay records, and
+    saturated per-brick edit revisions reset to a fresh nonzero epoch while
+    replacing stale queued GPU deltas for that brick with a complete overlay
+    delta snapshot under the new epoch.
+  - Sparse brush previews use the same nonzero revision epoch rule without
+    mutating the edit overlay.
+  - Oversized GPU edit-delta batches coalesce duplicate brick/local records to
+    the newest revision before upload caps are applied, and runtime upload
+    tickets distinguish fully represented coalesced input from true truncation.
+    Edit-delta overflow telemetry now follows true truncation rather than
+    duplicate coalescing that was fully represented.
+  - GPU edit-delta staging computes dynamic range-table sizes with wide
+    intermediates and rejects impossible aligned upload offsets instead of
+    allowing overflowed byte ranges to look valid.
+  - Shared aligned-upload admission and staging for sparse brick and mid-clipmap
+    uploads now fail closed on offset overflow before wrapped byte ranges can be
+    accepted or emitted.
 
 - `SparseCollisionQuery`
   - Collision does not require render page residency.
@@ -13479,7 +13496,7 @@ Overlay:
 Sparse brush GPU feedback <off/observe/apply> | q <queued> rb <retired> apply <applied> overflow <overflow>
 
 PERF_SPARSE:
-brushGpuFb=<queued>/<retired>/<applied>/<overflow>
+brushGpuFb=<queued>/<retired>/<applied>/<overflow>/<stale> brushGpuFbMiss=<header-count> brushGpuFbHint=<sentinel-count>
 ```
 
 Observed diagnostic result:
@@ -13499,9 +13516,9 @@ Sparse brush feedback diagnostic prepared case=prepare-negative-resident ... edi
 Sparse brush feedback diagnostic queued case=replace-negative-resident ... expected=<nonzero>
 SPARSE_BRUSH_FEEDBACK parity observed ... case=replace-negative-resident expected=<N> gpu=<N> matched=<N>
 Sparse brush feedback diagnostic queued case=report-missing-nonresident ... expected=0
-SPARSE_BRUSH_FEEDBACK parity observed ... case=report-missing-nonresident expected=0 gpu=0 matched=0 missingResident=<nonzero>
+SPARSE_BRUSH_FEEDBACK parity observed ... case=report-missing-nonresident expected=0 gpu=0 matched=0 missingResident=<nonzero> hints=<nonzero>
 SPARSE_BRUSH_FEEDBACK diagnostic suite passed cases=7
-Sparse brush-feedback apply smoke: passed with brushGpuFb=0/6/6/0 brushGpuFbMiss=0
+Sparse brush-feedback apply smoke: passed with brushGpuFb=0/6/6/0 brushGpuFbMiss=0 brushGpuFbHint=0
 ```
 
 Current correctness contract:
@@ -13517,7 +13534,8 @@ Current correctness contract:
   Any brush voxel whose sparse page lookup is missing, stale, or generation
   mismatched increments the `brushGpuFbMiss` counter instead of disappearing
   silently.
-- Apply mode now treats nonzero `brushGpuFbMiss` as a CPU-fallback condition.
+- Apply mode now treats nonzero `brushGpuFbMiss` or feedback overflow as a
+  CPU-fallback condition.
   Runtime strokes already apply CPU sparse edit deltas immediately, so the
   retired resident-only GPU record list is skipped instead of being treated as
   a complete authoritative result. Logs expose this as `brushGpuFbFallback=1`,
@@ -13727,7 +13745,8 @@ Follow-up implementation note:
   edit records that it actually touched.
 - On feedback retirement:
   - If the GPU record had no missing resident pages and did not overflow, the CPU
-    sparse edit overlay is updated from the GPU feedback records.
+    sparse edit overlay is updated from the GPU feedback records. Truncated
+    feedback is never partially committed.
   - If the feedback reports missing resident pages or overflow, the queued CPU
     stroke is replayed as the safe fallback and missing resident bricks are
     requested.
@@ -15770,8 +15789,9 @@ Observed result:
   architecture, runtime reference, and sparse review checklist.
 - Active public docs no longer contain the stale "visual-only sparse far field"
   or dense-window-first wording that applied to older checkpoints.
-- Public docs now include a verified sparse renderer contact sheet; only a
-  polished demo video remains pending in the media/presentation bucket.
+- Public docs now include a verified sparse renderer contact sheet. Public demo
+  MP4 generation is handled by `VENPOD/public_demo_capture.ps1` and the
+  generated video remains outside git.
 - `VENPODSparseCore` covers edit-store save/load round trips and world-level
   load collision authority. A sparse runtime smoke also passed with
   `VENPOD_SPARSE_EDIT_FILE` enabled.
@@ -15785,3 +15805,4874 @@ Observed result:
   saved edit file is missing, header-only, malformed, internally inconsistent,
   or contains duplicate local voxel entries. A targeted regression subset
   verified a persisted edit file with 8 overlays, 405 voxels, and 2622 bytes.
+- After adding the pause-menu save/load controls, the full Release sparse
+  regression gate passed, including unit tests, render/backend smoke, flicker
+  smoke, seeded-surface edit persistence, GPU raycast, miss feedback, brush
+  feedback, brush-feedback apply/authoritative smokes, GPU physics, and engine
+  backbuffer capture. The seeded-surface persistence verifier reported 8
+  overlays, 405 voxels, and 2622 bytes.
+- Refreshed `docs/media/sparse-engine-contact-sheet.png` from the latest
+  passing engine backbuffer capture. The sampled frames were nonblank terrain
+  captures with roughly 76-81% terrain-like pixels and no sky-only frames.
+- Added a separate default local sparse-physics regression smoke. It runs the
+  diagnostic seed without setting `VENPOD_ENABLE_SPARSE_PHYSICS`, verifies that
+  local sparse physics is enabled by default, requires staged work and CPU moves,
+  and fails if GPU packet/apply counters are nonzero.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\rebrun.ps1 `
+  -Config Release -NoBuild -SparsePhysicsDiagnosticSeed -SparseValidatePool `
+  -RequireSparsePipeReady -RequireSparseOwnershipQuality `
+  -RequireSparseOwnershipStability -ExitAfterFrames 240
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipFlickerSmoke -SkipSurfaceSmoke `
+  -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke -SkipBrushFeedbackSmoke `
+  -SkipBrushFeedbackApplySmoke -SkipBrushFeedbackAuthoritativeSmoke `
+  -SkipEngineCaptureSmoke -RenderExitAfterFrames 240 `
+  -DefaultPhysicsExitAfterFrames 240 -PhysicsExitAfterFrames 240
+```
+
+Observed result:
+
+- Direct default local sparse-physics smoke passed.
+- Targeted regression subset passed and exercised the new default local physics
+  assertion.
+- `PERF_SPARSE_PHYSICS` showed `enabled=1`, `packets=1`, `processed=1`,
+  `moved=1`, `gpuPackets=0`, and `gpuApply=0/0`.
+
+### Public Demo Capture Wrapper
+
+Implemented after the default local sparse-physics gate.
+
+Problem:
+
+- Public docs had a verified contact sheet, but still listed a polished demo
+  video as pending.
+- `engine_capture_smoke.ps1` was useful for regression evidence but not a single
+  public-review media command.
+
+Implemented:
+
+- Added `VENPOD/public_demo_capture.ps1`.
+- The wrapper runs the existing in-engine DX12 backbuffer capture smoke with
+  sequential frame capture, preserving the same visual/runtime validation.
+- Local sparse physics is enabled by default for public demo captures so the
+  media path matches the normal sparse sandbox; `-DisablePhysics` remains
+  available for render-only isolation.
+- If `ffmpeg` is available, it encodes `sparse-public-demo.mp4` from the
+  validated BMP frames and verifies the resulting stream with `ffprobe`, or by
+  decoding it with `ffmpeg` when `ffprobe` is unavailable.
+- Outputs land under `VENPOD/build/captures/public_demo/` by default and remain
+  untracked generated artifacts.
+- Added a how-to page and updated README/docs/review wording so public reviewers
+  can regenerate media without checking large videos into git.
+- Added public demo capture validation to `sparse_regression.ps1`. The gate runs
+  `public_demo_capture.ps1` with a compact physics-enabled capture, encodes MP4
+  when `ffmpeg` is available, and falls back to validated contact-sheet/stats
+  output when it is not.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\public_demo_capture.ps1 `
+  -Config Release -NoBuild -CaptureFrames 16 -PlaybackFps 8 `
+  -OutputDir build\captures\public_demo_validation_physics
+```
+
+Observed result:
+
+- Engine backbuffer capture smoke passed.
+- `sparse-public-demo.mp4`, `contact_sheet.png`, `image_stats.csv`, and
+  `venpod_runtime.log` were produced.
+- Runtime telemetry showed `PERF_BACKEND_PIPE ... phys=1` and
+  `PERF_SPARSE_PHYSICS ... enabled=1`, matching the normal sparse sandbox path.
+- Image stats showed 16 nonblank 1920x1080 frames with about 77% terrain-like
+  sampled pixels.
+
+Regression gate validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipFlickerSmoke -SkipSurfaceSmoke `
+  -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke -SkipBrushFeedbackSmoke `
+  -SkipBrushFeedbackApplySmoke -SkipBrushFeedbackAuthoritativeSmoke `
+  -SkipEngineCaptureSmoke -RenderExitAfterFrames 240 `
+  -DefaultPhysicsExitAfterFrames 240 -PhysicsExitAfterFrames 240 `
+  -PublicDemoCaptureFrames 12 -PublicDemoPlaybackFps 6
+```
+
+Observed result:
+
+- Targeted sparse regression subset passed.
+- The new public demo capture validation stage produced MP4/contact
+  sheet/stats/log artifacts under `VENPOD/build/logs/public_demo_capture/`.
+
+Full gate validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release
+```
+
+Observed result:
+
+- Full Release sparse regression passed, including `VENPODSparseCore`, render
+  smoke, flicker smoke, seeded-surface edit persistence, GPU raycast, miss
+  feedback, brush feedback/apply/authoritative smokes, default local physics,
+  GPU physics, engine backbuffer capture, and public demo capture validation.
+- The latest engine capture contact sheet was refreshed into
+  `docs/media/sparse-engine-contact-sheet.png`.
+- Engine capture image stats showed six nonblank 1920x1080 frames with 81.44%
+  terrain-like sampled pixels.
+- Public demo capture validation produced MP4/contact-sheet/stats/log artifacts
+  under `VENPOD/build/logs/public_demo_capture/`.
+
+### Public Review Manifest
+
+Implemented after the full sparse regression pass.
+
+Problem:
+
+- The sparse review checklist contained gate coverage, but the public handoff
+  still lacked a compact artifact manifest that tied commands, tracked docs,
+  generated logs/media, public claims, and known limits together.
+
+Implemented:
+
+- Added `docs/reference/public-review-manifest.md`.
+- Linked the manifest from the README, docs index, and sparse review checklist.
+- The manifest records:
+  - review commands;
+  - tracked review artifacts;
+  - generated smoke/media artifacts;
+  - public sparse-refactor claims and their evidence;
+  - remaining public review limits.
+
+### Sparse Completion Audit
+
+Implemented after the public review manifest.
+
+Problem:
+
+- The public review docs had gates and a manifest, but not a strict
+  prompt-to-artifact audit that separated covered requirements from known
+  remaining limits.
+
+Implemented:
+
+- Added `docs/reference/sparse-completion-audit.md`.
+- Linked it from the README, docs index, and public review manifest.
+- The audit maps each concrete sparse-refactor review requirement to inspected
+  files, commands, gates, or generated artifacts.
+- The audit explicitly keeps GPU feedback/physics authority and final mid/far
+  LOD polish in the known-limits bucket rather than treating passing tests as a
+  proxy for unfinished future work.
+
+### Public Demo MP4 Stream Verification
+
+Implemented after the public review manifest.
+
+Problem:
+
+- `public_demo_capture.ps1` checked that the MP4 file existed and had bytes, but
+  did not prove the encoded artifact had a valid video stream.
+
+Implemented:
+
+- After MP4 encoding, the script now probes the first video stream with
+  `ffprobe` when available.
+- The probe must report positive width and height.
+- If frame count is available, it must be at least the requested capture frame
+  count.
+- If `ffprobe` is unavailable, the script falls back to an `ffmpeg` decode pass.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\public_demo_capture.ps1 `
+  -Config Release -NoBuild -CaptureFrames 8 -PlaybackFps 4 `
+  -OutputDir build\captures\public_demo_probe_validation
+```
+
+Observed result:
+
+- Engine capture smoke passed.
+- MP4 encode passed.
+- MP4 stream verification reported `1280x720` and 8 frames.
+- A targeted sparse regression subset also passed after this change, exercising
+  the public demo capture validation stage and reporting `Video stream verified:
+  1280x720 frames=8`.
+
+### Stress-Camera Engine Capture Gate
+
+Implemented after MP4 stream verification.
+
+Problem:
+
+- Mid/far continuity and high-flight behavior were covered by telemetry and
+  normal captures, but public review needed a regression artifact from the
+  stress-camera/high-flight path itself.
+
+Implemented:
+
+- Added a stress-camera engine backbuffer capture stage to
+  `sparse_regression.ps1`.
+- The stage writes artifacts under `VENPOD/build/logs/sparse_stress_engine_capture/`.
+- Updated the sparse review checklist, public review manifest, debug docs, and
+  completion audit to point high-flight/far-terrain review at this capture.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\engine_capture_smoke.ps1 `
+  -Config Release -NoBuild -StressCamera -ExitAfterFrames 260 `
+  -CaptureStartFrame 160 -CaptureIntervalFrames 20 -CaptureCount 5 `
+  -OutputDir .\VENPOD\build\logs\sparse_stress_engine_capture_probe
+```
+
+Observed result:
+
+- Stress-camera engine capture smoke passed.
+- Image stats showed five nonblank 1920x1080 frames with 99.79-99.98%
+  terrain-like sampled pixels.
+- Runtime ownership logs showed `miss=0` and `unsafeNearMiss=0` in the sampled
+  high-flight frames.
+- A targeted sparse regression subset passed with the new
+  `sparse_stress_engine_capture` stage enabled, producing artifacts under
+  `VENPOD/build/logs/sparse_stress_engine_capture/`.
+
+Full gate validation after adding the stress stage:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release
+```
+
+Observed result:
+
+- Full Release sparse regression passed with the stress-camera capture stage in
+  the default gate.
+- Coverage included `VENPODSparseCore`, render/backend smoke, flicker smoke,
+  seeded-surface edit persistence, GPU raycast, miss feedback, brush feedback,
+  brush apply/authoritative smokes, default local sparse physics, GPU physics,
+  normal engine backbuffer capture, stress-camera engine backbuffer capture, and
+  public demo capture validation.
+- Normal engine capture stats showed six nonblank 1920x1080 frames with about
+  76.70-81.44% terrain-like sampled pixels.
+- Stress-camera capture stats showed five nonblank 1920x1080 frames with about
+  99.79-99.98% terrain-like sampled pixels.
+- Public demo capture validation verified an MP4 stream at `1280x720` with 16
+  frames.
+
+### Page-Table Load-Limit Update Hardening
+
+Implemented after the stress-camera regression gate.
+
+Problem:
+
+- `SparsePageTable::InsertOrAssign` applied the 70% page-table load cap before
+  it knew whether the operation was a new insert or an update to an existing
+  coordinate.
+- Under high page-table occupancy, this could reject an existing-entry update
+  for a resident brick even though no new slot was needed. That is a lifecycle
+  risk for reuploads, edit republishes, and generation-aware page-table
+  publication because stale entry data could remain harder to refresh exactly
+  when the table is under pressure.
+
+Implemented:
+
+- Moved the load-cap check so it only applies when `FindSlot` reports that a
+  new entry would be inserted.
+- Existing coord/page entries can now be reassigned at the load threshold while
+  new entries past the threshold are still rejected.
+- Added `VENPODSparseCore` coverage that fills a 16-slot page table to the
+  insertion threshold, verifies that the next new insert is rejected, then
+  verifies that an existing entry can still update page, flags, and generation.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed.
+- A compact sparse regression subset also passed after the page-table change:
+  render/backend smoke plus GPU-physics smoke completed with no page-table
+  publish retries or stale publish drops in the key telemetry.
+
+### Sparse Regression Frame-Budget Guard
+
+Implemented after the page-table load-limit hardening.
+
+Problem:
+
+- A manually shortened sparse render smoke with `-RenderExitAfterFrames 180`
+  exited on the same frame as the default pipe/ownership readiness deadline.
+- The runtime had reached readiness, but there was no post-ready ownership
+  readback sample available before shutdown, so the smoke failed with
+  `did not observe a post-ready clean sample`.
+
+Implemented:
+
+- Added frame-budget normalization to `VENPOD/sparse_regression.ps1`.
+- If a caller supplies a frame budget lower than the known safe minimum for a
+  smoke stage, the script raises it and prints the adjustment before launching
+  the runtime.
+- This keeps short manual invocations from producing deterministic false
+  negatives while preserving the normal default budgets.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipFlickerSmoke -SkipSurfaceSmoke `
+  -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke -SkipBrushFeedbackSmoke `
+  -SkipBrushFeedbackApplySmoke -SkipBrushFeedbackAuthoritativeSmoke `
+  -SkipDefaultPhysicsSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture `
+  -RenderExitAfterFrames 180
+```
+
+Observed result:
+
+- The script reported `Render smoke frame budget raised from 180 to 240`.
+- The sparse render/backend smoke passed.
+- The sparse GPU-physics smoke passed.
+- The compact gate ended with `[OK] Sparse regression gate passed.`
+
+### GPU Physics Edit-Revision Parity Guard
+
+Implemented after the sparse regression frame-budget guard.
+
+Problem:
+
+- GPU physics proposal apply rejected edit-delta proposals when the CPU overlay
+  revision had advanced beyond the GPU-reported revision.
+- That covered stale readbacks, but it still allowed an edit-delta proposal whose
+  reported source or destination revision was ahead of the CPU overlay revision.
+  That should not be trusted: an apply-mode proposal that sampled edit deltas
+  should match the CPU overlay revision exactly before it can mutate voxels.
+
+Implemented:
+
+- Tightened `SparseVoxelWorld::ApplyGpuPhysicsProposals` so an
+  `SPARSE_PHYSICS_PACKET_STATUS_EDIT_DELTA_HIT` proposal must carry at least one
+  sampled edit revision, and any nonzero `sourceRevision` or
+  `destinationRevision` must equal the current CPU overlay revision before the
+  proposal can mutate sparse edits.
+- Added `VENPODSparseCore` coverage for mismatched/future source revisions and
+  inconsistent edit-delta status with no sampled edit revision. The proposal is
+  rejected, counted in GPU rejection stats, requeued for fresh CPU physics work,
+  and leaves the source voxel unchanged.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipFlickerSmoke -SkipSurfaceSmoke `
+  -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke -SkipBrushFeedbackSmoke `
+  -SkipBrushFeedbackApplySmoke -SkipBrushFeedbackAuthoritativeSmoke `
+  -SkipDefaultPhysicsSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed.
+- Targeted sparse regression subset passed, including render/backend smoke and
+  GPU-physics proposal/readback smoke.
+
+Full gate validation after page-table and GPU-physics hardening:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release
+```
+
+Observed result:
+
+- Full Release sparse regression passed with the latest page-table
+  load-threshold update guard, sparse regression frame-budget guard, and GPU
+  physics exact edit-revision parity guard included.
+- Coverage included `VENPODSparseCore`, render/backend smoke, flicker smoke,
+  seeded-surface edit persistence, GPU raycast, miss feedback, brush feedback,
+  brush apply/authoritative smokes, default local sparse physics, GPU physics,
+  normal engine backbuffer capture, stress-camera engine backbuffer capture, and
+  public demo capture validation.
+- Seeded edit persistence verifier reported 8 overlays, 405 voxels, and a
+  2622-byte `.vsed` artifact.
+- Normal engine capture stats showed six nonblank 1920x1080 frames with about
+  76.74-81.44% terrain-like sampled pixels.
+- Stress-camera capture stats showed five nonblank 1920x1080 frames with about
+  99.79-99.98% terrain-like sampled pixels.
+- Public demo capture validation verified an MP4 stream at `1280x720` with 16
+  frames; the generated artifact was 139832 bytes.
+- GPU physics telemetry produced proposal/readback results with guarded
+  `gpuApply=1/1` and zero `gpuReject` in the seeded smoke.
+- Refreshed `docs/media/sparse-engine-contact-sheet.png` from the latest
+  passing normal engine capture.
+
+### Sparse Brush Feedback Overflow Apply Guard
+
+Implemented after the page-table and GPU-physics hardening pass.
+
+Problem:
+
+- Brush feedback apply mode already fell back to CPU authority when GPU feedback
+  reported missing resident pages.
+- The GPU apply branch checked only the missing-resident counter. If the brush
+  feedback buffer overflowed without missing resident pages, the truncated
+  resident record list could be applied before the fallback branch handled the
+  overflow condition.
+
+Implemented:
+
+- Added `CanApplySparseBrushFeedbackPayload()` to the sparse edit feedback
+  contract.
+- GPU brush feedback apply now commits records only when the retired payload has
+  zero missing-resident header count, zero observed missing-resident sentinel
+  records, and no overflow.
+- Missing-resident or overflowed payloads both follow the existing CPU fallback
+  path, so truncated GPU feedback cannot partially mutate the sparse edit
+  overlay. Later hardening removed the old two-argument helper so apply call
+  sites must pass both missing-resident signals.
+- Added `VENPODSparseCore` coverage for complete, missing-resident header,
+  missing-resident sentinel, and overflowed brush-feedback payload decisions.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipFlickerSmoke -SkipSurfaceSmoke `
+  -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the new brush-feedback payload completeness
+  checks.
+- Targeted sparse regression passed, including render/backend smoke, brush
+  feedback observe/apply/authoritative smokes, and GPU-physics smoke.
+
+### Public Demo Capture Output Guard
+
+Implemented after the GPU feedback/physics guard hardening.
+
+Problem:
+
+- `VENPOD/public_demo_capture.ps1` removes prior `engine_frame_*.bmp`,
+  `contact_sheet.png`, `image_stats.csv`, `venpod_runtime.log`, and
+  `sparse-public-demo.mp4` files from its output directory before starting a
+  new capture.
+- That cleanup is correct for generated capture folders, but a broad
+  `-OutputDir` such as the repository root or build root could delete unrelated
+  files with those names.
+
+Implemented:
+
+- Added an output-directory safety check before cleanup.
+- The wrapper now rejects the filesystem root, VENPOD project root, build root,
+  and broad build output roots such as `build\captures`, `build\logs`, and
+  `build\bin`.
+- The default `build\captures\public_demo` path and dedicated validation
+  subfolders remain allowed.
+- Path normalization does not require the build directory to already exist, so
+  external output folders remain usable on fresh checkouts.
+- Capture frame/FPS parameters are validated before output cleanup begins. Bad
+  frame counts, negative start frames, invalid playback FPS, or an overflowing
+  computed exit frame fail without deleting previous artifacts.
+- Updated the public demo capture how-to to call out the cleanup behavior and
+  dedicated-output-directory expectation.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\public_demo_capture.ps1 `
+  -NoBuild -OutputDir . -CaptureFrames 1 -SkipVideo
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\public_demo_capture.ps1 `
+  -NoBuild -OutputDir build\logs -CaptureFrames 1 -SkipVideo
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\public_demo_capture.ps1 `
+  -NoBuild -OutputDir build\captures\public_demo_guard_validation `
+  -CaptureFrames 0 -SkipVideo
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\public_demo_capture.ps1 `
+  -Config Release -NoBuild -CaptureFrames 1 -PlaybackFps 1 -SkipVideo `
+  -OutputDir build\captures\public_demo_guard_validation
+```
+
+Observed result:
+
+- The project-root and `build\logs` output paths were rejected before capture or
+  cleanup.
+- Invalid `-CaptureFrames 0` was rejected before cleanup and preserved an
+  existing sentinel artifact in the target folder.
+- The dedicated `build\captures\public_demo_guard_validation` folder passed
+  capture validation and produced contact sheet, image stats, and runtime log
+  artifacts.
+- The output-directory safety check now runs before `New-Item`, so unsafe public
+  demo output paths are rejected before output-folder creation as well. Parser
+  validation passed, unsafe `-OutputDir .` and `-OutputDir build\logs` probes
+  were rejected, and a dedicated one-frame `-SkipVideo` capture under
+  `build\captures\public_demo_precreate_guard_validation` passed.
+- The public demo output guard now also rejects the VENPOD parent/repository
+  root and broad caller-relative build roots. Unsafe `-OutputDir ..` from inside
+  `VENPOD` and an absolute repository-root `-OutputDir` from the repo root were
+  rejected before output-folder creation, while a dedicated one-frame
+  `-SkipVideo` capture under
+  `build\captures\public_demo_parent_guard_validation` passed.
+
+### Dense Legacy Fallback Smoke Gate
+
+Implemented after the public demo capture hardening.
+
+Problem:
+
+- Public docs and the review manifest correctly state that the dense renderer
+  remains available for fallback/regression comparison.
+- The full sparse regression gate did not verify that fallback path, so the
+  claim depended on documentation plus manual launch rather than gate evidence.
+
+Implemented:
+
+- Added a dense legacy fallback smoke stage to `VENPOD/sparse_regression.ps1`.
+- The stage runs `rebrun.ps1 -DenseLegacy -DisablePhysics -ExitAfterFrames 60`,
+  saves `VENPOD/build/logs/dense_legacy_smoke.log`, and fails if runtime logs
+  contain critical/error/device-removed/timeout markers.
+- Added `-SkipDenseLegacySmoke` and `-DenseLegacyExitAfterFrames` controls for
+  targeted sparse-only runs.
+- Updated public review docs and the sparse completion audit so dense fallback
+  availability is covered by the gate, not only by documentation.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\rebrun.ps1 `
+  -Config Release -NoBuild -DenseLegacy -DisablePhysics -ExitAfterFrames 60
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipFlickerSmoke -SkipSurfaceSmoke `
+  -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke -SkipBrushFeedbackSmoke `
+  -SkipBrushFeedbackApplySmoke -SkipBrushFeedbackAuthoritativeSmoke `
+  -SkipDefaultPhysicsSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Dense legacy fallback launched and exited normally in 60 frames.
+- The compact sparse regression subset passed with the new dense fallback stage,
+  sparse render/backend smoke, and GPU-physics smoke enabled.
+
+Full gate validation after dense fallback and public capture hardening:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release
+```
+
+Observed result:
+
+- Full Release sparse regression passed with `VENPODSparseCore`, dense legacy
+  fallback smoke, render/backend smoke, flicker smoke, seeded-surface edit
+  persistence, GPU raycast, miss feedback, brush feedback/apply/authoritative
+  smokes, default local sparse physics, GPU physics, normal engine capture,
+  stress-camera engine capture, and public demo capture validation.
+- Seeded edit persistence verifier reported 8 overlays, 405 voxels, and a
+  2622-byte `.vsed` artifact.
+- Normal engine capture stats showed six nonblank 1920x1080 frames with about
+  76.74-81.44% terrain-like sampled pixels, and the tracked
+  `docs/media/sparse-engine-contact-sheet.png` was refreshed from this run.
+- Stress-camera capture stats showed five nonblank 1920x1080 frames with about
+  99.79-99.98% terrain-like sampled pixels.
+- Public demo capture validation verified an MP4 stream at `1280x720` with 16
+  frames; the generated artifact was 137801 bytes.
+
+### Mid-Range Ownership Boundary Hardening
+
+Implemented after the dense fallback smoke gate.
+
+Problem:
+
+- `SparseClipmapPolicy::OwnsRaySegment` correctly delayed mid-field ownership
+  until the ray passed the padded near exit.
+- If the near-owned volume exited beyond the configured mid clipmap range, a
+  very long ray segment could still overlap the clipmap end and be reported as
+  mid-owned even though the transition start was already outside the mid range.
+- That did not match the near/mid/far ownership contract: a mid clipmap cannot
+  own any segment when the near-field handoff starts after the mid clipmap has
+  ended.
+
+Implemented:
+
+- `OwnsRaySegment` now returns false when the padded transition start is at or
+  beyond the mid clipmap end distance.
+- Ray-aware transition metadata now disables the mid range when the adjusted
+  start reaches the end distance, instead of exposing an inverted start/end
+  range to future scheduling or debug code.
+- Added `VENPODSparseCore` coverage for a ray segment that spans the old false
+  positive case and for exhausted transition metadata.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed through the repo wrapper.
+- `VENPODSparseCore` passed.
+- Targeted sparse regression passed, including render/backend smoke and
+  GPU-physics proposal/readback smoke.
+
+Full gate validation after mid-range ownership boundary hardening:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release
+```
+
+Observed result:
+
+- Full Release sparse regression passed on the current tree.
+- Coverage included `VENPODSparseCore`, dense legacy fallback smoke,
+  render/backend smoke, flicker smoke, seeded-surface edit persistence, GPU
+  raycast, miss feedback, brush feedback/apply/authoritative smokes, default
+  local sparse physics, GPU physics, normal engine backbuffer capture,
+  stress-camera engine backbuffer capture, and public demo capture validation.
+- Seeded edit persistence verifier reported 8 overlays, 405 voxels, and a
+  2622-byte `.vsed` artifact.
+- Normal engine capture stats showed six nonblank 1920x1080 frames with about
+  76.74-81.44% terrain-like sampled pixels.
+- Stress-camera capture stats showed five nonblank 1920x1080 frames with about
+  99.79-99.98% terrain-like sampled pixels.
+- Public demo capture validation verified an MP4 stream at `1280x720` with 16
+  frames; the generated artifact was 95948 bytes.
+
+### GPU Physics Expected-Page Status Guard
+
+Implemented after the mid-range ownership boundary hardening.
+
+Problem:
+
+- GPU physics proposals can carry status bits saying that the shader validated
+  an expected sparse page.
+- The CPU apply path validated `expectedPageIndex`/`expectedPageGeneration` when
+  those fields were populated, but a malformed readback with expected-page
+  status bits and no valid expected-page data could fall through as an ordinary
+  proposal.
+- That weakens the guarded-GPU contract: status metadata that claims validation
+  must not be able to bypass the validation data it depends on.
+
+Implemented:
+
+- `SparseVoxelWorld::ApplyGpuPhysicsProposals()` now rejects any proposal that
+  sets expected-page status bits without a valid expected page index and
+  generation.
+- Rejected malformed proposals are counted, skipped, requeued for fresh CPU
+  physics work, and leave source/destination voxels unchanged.
+- Added `VENPODSparseCore` coverage for the malformed expected-page status case.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed through the repo wrapper.
+- `VENPODSparseCore` passed.
+- Targeted sparse regression passed, including render/backend smoke and
+  GPU-physics proposal/readback smoke.
+
+### Engine Capture Parameter Guard
+
+Implemented after the GPU physics expected-page status guard.
+
+Problem:
+
+- `VENPOD/engine_capture_smoke.ps1` is both a public review utility and a lower
+  layer for `public_demo_capture.ps1`.
+- It accepted invalid direct capture parameters such as zero frame count, zero
+  interval, zero exit frame, or values whose computed final capture frame would
+  overflow an `int`.
+- Those bad inputs could fail later after unrelated setup or output-directory
+  creation, which made public-review failures less clear than the hardened
+  public demo wrapper.
+
+Implemented:
+
+- Added early capture-parameter validation to `engine_capture_smoke.ps1`.
+- The script now rejects invalid frame count, interval, start frame, exit frame,
+  and overflowed capture-window calculations before build, launch, or output
+  directory creation.
+- The existing minimum-exit-frame normalization now uses the checked value from
+  the validation helper.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\engine_capture_smoke.ps1 `
+  -NoBuild -CaptureCount 0 `
+  -OutputDir .\VENPOD\build\captures\invalid_param_probe
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\engine_capture_smoke.ps1 `
+  -NoBuild -CaptureIntervalFrames 0 `
+  -OutputDir .\VENPOD\build\captures\invalid_param_probe
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\engine_capture_smoke.ps1 `
+  -NoBuild -ExitAfterFrames 0 `
+  -OutputDir .\VENPOD\build\captures\invalid_param_probe
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\engine_capture_smoke.ps1 `
+  -NoBuild -CaptureStartFrame 2147483640 -CaptureIntervalFrames 20 `
+  -CaptureCount 2 -OutputDir .\VENPOD\build\captures\invalid_param_probe
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\engine_capture_smoke.ps1 `
+  -Config Release -NoBuild -CaptureStartFrame 120 -CaptureIntervalFrames 1 `
+  -CaptureCount 1 -ExitAfterFrames 128 `
+  -OutputDir .\VENPOD\build\captures\engine_capture_param_validation
+```
+
+Observed result:
+
+- Invalid frame count, interval, exit frame, and overflowing capture-window
+  inputs were rejected before the probe output folder was created.
+- PowerShell parser validation passed for the script.
+- The minimal one-frame valid capture passed and produced contact sheet and
+  image stats artifacts.
+
+Full gate validation after engine capture parameter hardening:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release
+```
+
+Observed result:
+
+- Full Release sparse regression passed on the current tree.
+- Coverage included `VENPODSparseCore`, dense legacy fallback smoke,
+  render/backend smoke, flicker smoke, seeded-surface edit persistence, GPU
+  raycast, miss feedback, brush feedback/apply/authoritative smokes, default
+  local sparse physics, GPU physics, normal engine backbuffer capture,
+  stress-camera engine backbuffer capture, and public demo capture validation.
+- Seeded edit persistence verifier reported 8 overlays, 405 voxels, and a
+  2622-byte `.vsed` artifact.
+- Normal engine capture stats showed six nonblank 1920x1080 frames with about
+  76.76-81.44% terrain-like sampled pixels.
+- Stress-camera capture stats showed five nonblank 1920x1080 frames with about
+  99.79-99.98% terrain-like sampled pixels.
+- Public demo capture validation verified an MP4 stream at `1280x720` with 16
+  frames; the generated artifact was 115606 bytes.
+
+### Sparse Regression Capture Parameter Guard
+
+Implemented after the engine capture parameter guard.
+
+Problem:
+
+- `sparse_regression.ps1` calls both normal/stress engine capture smoke and
+  public demo capture validation.
+- The lower-level scripts rejected invalid capture parameters, but the top-level
+  regression wrapper could still build before discovering bad capture counts,
+  intervals, or public-demo playback settings.
+- Public-review gates should reject impossible media settings before unrelated
+  setup work or generated-artifact cleanup.
+
+Implemented:
+
+- Added early validation helpers to `VENPOD/sparse_regression.ps1`.
+- Normal engine capture and stress engine capture now reject invalid exit frame,
+  start frame, interval, count, and overflowing capture-window calculations
+  before the build step.
+- Public demo capture validation now rejects invalid frame count and playback
+  FPS before the build step.
+- The checks are skipped when the corresponding capture stage is explicitly
+  skipped.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -EngineCaptureCount 0
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -StressEngineCaptureIntervalFrames 0
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -PublicDemoPlaybackFps 0
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Invalid engine capture count, stress capture interval, and public-demo FPS were
+  rejected before the sparse regression banner or build step.
+- PowerShell parser validation passed for `sparse_regression.ps1`.
+- The compact valid Release regression path passed, including sparse
+  render/backend smoke and sparse GPU-physics smoke.
+
+### Sparse Regression Runtime Failure Marker Gate
+
+Implemented after the sparse regression capture parameter guard.
+
+Problem:
+
+- `sparse_regression.ps1` already scanned the dense fallback runtime log for
+  critical/error/device-removed/timeout markers.
+- Most sparse smoke stages saved summarized logs but relied on their specialized
+  telemetry gates alone.
+- A public-review gate should fail if any sparse smoke emits explicit runtime
+  failure markers, even when other telemetry happens to satisfy the smoke.
+
+Implemented:
+
+- Extended `Assert-NoRuntimeFailureMarkersFromLog` to every sparse smoke log
+  saved by `sparse_regression.ps1`.
+- The render/backend, flicker, seeded-surface, GPU raycast, miss feedback, brush
+  feedback, brush apply, brush authoritative, default local physics, and GPU
+  physics stages now fail on critical/error, device-removed, timeout, sparse
+  backend readiness failure, and sparse render ownership quality/stability
+  failure markers.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- PowerShell parser validation passed for `sparse_regression.ps1`.
+- The compact valid Release regression path passed with the stricter sparse
+  render/backend and GPU-physics runtime failure-marker scans enabled.
+
+### Engine Capture Output Cleanup Guard
+
+Implemented after the sparse regression runtime failure marker gate.
+
+Problem:
+
+- `engine_capture_smoke.ps1` accepted a direct `-OutputDir` and only checked that
+  enough `engine_frame_*.bmp` files existed after the run.
+- If an output folder already contained stale frame files, those files could be
+  counted alongside a new run.
+- Adding cleanup requires an output-directory guard first, because direct capture
+  users can pass broad paths such as `.`, `build\logs`, or `build\captures`.
+
+Implemented:
+
+- Added an engine-capture output directory guard before build or cleanup.
+- The script rejects filesystem roots, the VENPOD project root, the VENPOD build
+  root, broad build output roots, the caller's current directory, and broad
+  caller-relative build output roots.
+- Dedicated output subfolders remain valid, including the existing
+  `.\VENPOD\build\captures\...` direct-call style from the repository root.
+- Before launching the engine, the script removes stale `engine_frame_*.bmp`,
+  `contact_sheet.png`, `image_stats.csv`, and `venpod_runtime.log` artifacts
+  from the dedicated output folder only.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\engine_capture_smoke.ps1 `
+  -NoBuild -OutputDir . -CaptureCount 1 -CaptureIntervalFrames 1 `
+  -ExitAfterFrames 128
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\engine_capture_smoke.ps1 `
+  -NoBuild -OutputDir build\logs -CaptureCount 1 -CaptureIntervalFrames 1 `
+  -ExitAfterFrames 128
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\engine_capture_smoke.ps1 `
+  -NoBuild -OutputDir .\VENPOD\build\captures -CaptureCount 1 `
+  -CaptureIntervalFrames 1 -ExitAfterFrames 128
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\engine_capture_smoke.ps1 `
+  -Config Release -NoBuild -CaptureStartFrame 120 -CaptureIntervalFrames 1 `
+  -CaptureCount 1 -ExitAfterFrames 128 `
+  -OutputDir .\VENPOD\build\captures\engine_capture_cleanup_probe
+```
+
+Observed result:
+
+- The broad `.`, `build\logs`, and `.\VENPOD\build\captures` output paths were
+  rejected before build or cleanup.
+- PowerShell parser validation passed for `engine_capture_smoke.ps1`.
+- A dedicated one-frame cleanup probe removed a stale `engine_frame_9999.bmp`
+  and stale summary artifacts before launch, preserved an unrelated `keep.txt`,
+  and passed the engine backbuffer capture smoke.
+- Direct engine capture now also rejects the VENPOD parent/repository root.
+  Unsafe `-OutputDir ..` from inside `VENPOD` and an absolute repository-root
+  `-OutputDir` from the repo root were rejected before cleanup, while a
+  dedicated one-frame capture under
+  `build\captures\engine_capture_parent_guard_validation` passed.
+
+### GPU Physics Local Coordinate Guard
+
+Implemented after the engine capture output cleanup guard.
+
+Problem:
+
+- GPU physics proposals encode source and destination locals as byte fields.
+- The shader should only emit locals in the sparse brick's 16^3 range, but the
+  CPU apply path unpacked the bytes and converted them to world coordinates
+  without first checking `local < 16`.
+- A malformed or stale readback with `local=255` could therefore address a voxel
+  outside the claimed sparse brick before CPU authority validated source and
+  destination contents.
+
+Implemented:
+
+- Added a CPU-side local-coordinate guard in
+  `SparseVoxelWorld::ApplyGpuPhysicsProposals()`.
+- Proposals with source or destination locals outside the 16^3 sparse brick
+  bounds are rejected before world-coordinate conversion or voxel mutation.
+- Requeued malformed proposals fall back to the full claimed source brick rather
+  than queuing an invalid dirty region.
+- Added `VENPODSparseCore` coverage for a malformed proposal that would
+  otherwise mutate an outside-brick edited voxel.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the malformed local-coordinate proposal test.
+- Targeted sparse regression passed, including render/backend smoke and
+  GPU-physics proposal/readback smoke.
+
+### Sparse Edit Zero-Revision Load Guard
+
+Implemented after the GPU physics local-coordinate guard.
+
+Problem:
+
+- Sparse edit files saved by the engine only contain non-empty overlays after at
+  least one edit, so each persisted overlay should have a positive revision.
+- The public seeded-surface verifier already rejects zero overlay revisions.
+- `SparseEditStore::LoadFromFile()` rejected malformed headers, out-of-range
+  locals, duplicate local entries, and trailing bytes, but still accepted a
+  non-empty overlay with revision `0`.
+
+Implemented:
+
+- `SparseEditStore::LoadFromFile()` now rejects empty overlay records and any
+  non-empty overlay whose revision is zero.
+- Failed loads still leave the existing edit store untouched.
+- Added `VENPODSparseCore` coverage for zero-revision and empty-overlay
+  malformed files, plus preservation of previously loaded edits.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the zero-revision and empty-overlay sparse edit
+  load guards.
+
+### Sparse Page Publish Sentinel Guard
+
+Implemented after the sparse edit empty-overlay load guard.
+
+Problem:
+
+- Page-table tombstones use `INVALID_BRICK_PAGE - 1`.
+- Delayed invalidation already treats that value as non-resident, but
+  `SparsePagePublishQueue::IsValidPublish()` only rejected
+  `INVALID_BRICK_PAGE`.
+- A malformed publish/retry could therefore stage a tombstone physical page for
+  publication instead of being ignored at the queue boundary.
+
+Implemented:
+
+- `SparsePagePublishQueue` now rejects both `INVALID_BRICK_PAGE` and
+  `INVALID_BRICK_PAGE - 1` page indices.
+- Older generations for the same physical page can no longer replace a newer
+  pending publish on the same table slot through enqueue or retry; enqueue
+  reports `IgnoredStale`, and retry leaves the newer publish intact.
+- Added unit coverage for invalid page, tombstone page, zero generation, and
+  invalid retry publishes, plus stale same-page replacement and retry rejection.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the page publish sentinel/stale-replacement
+  guard.
+
+### Sparse Collision Query Bounds Guard
+
+Implemented after the page publish sentinel guard.
+
+Problem:
+
+- Sparse collision volume and support queries convert world-space floating
+  bounds into integer voxel ranges.
+- Non-finite values, coordinates outside the `int32_t` voxel domain, or very
+  large AABBs/support drops should never reach the scan loops or rely on
+  implementation-defined float-to-int casts.
+- Collision should fail closed for malformed body volumes while still bounding
+  the amount of CPU work a bad query can request.
+
+Implemented:
+
+- `SparseCollisionQuery::TestAabb()` now validates all bounds before voxel
+  conversion, uses exclusive max bounds with `nextafter`, rejects out-of-range
+  coordinates, and caps volume scans.
+- Rejected AABB queries return a single `UnknownBlocked` sample so callers do
+  not treat malformed collision data as air.
+- `SparseCollisionQuery::SweepAabb()` rejects non-finite deltas before stepping
+  and reports an unknown-blocked hit at fraction zero.
+- `SparseCollisionQuery::FindSupportBelow()` rejects non-finite, out-of-range,
+  and oversized footprint/drop requests before scanning.
+- Added `VENPODSparseCore` coverage for NaN bounds, infinite/out-of-range
+  bounds, oversized AABBs, infinite sweep deltas, and oversized/invalid support
+  queries.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the sparse collision bounds/query guards.
+
+### Sparse Runtime Budget Saturation Guard
+
+Implemented after the sparse collision query bounds guard.
+
+Problem:
+
+- The runtime scheduler deliberately scales work budgets up and down under
+  frame pressure, protected collision/edit pressure, ownership misses, and far
+  upload pressure.
+- Normal budgets are small, but pathological queue counters or future tuning
+  mistakes could push `uint32_t` additions/multiplications through wraparound
+  before later clamps were applied.
+- Wrapped request totals or defer counters are dangerous because they can turn a
+  pressure signal into an apparent small backlog.
+
+Implemented:
+
+- Added local saturating arithmetic helpers for scheduler-only `uint32_t` and
+  `uint64_t` budget math.
+- `ScaleBudget()` now saturates large finite scale products instead of relying
+  on float-to-integer wrap behavior.
+- Request admission totals, protected hard totals, processing catch-up,
+  physics move catch-up, frame upload protected/background totals, and
+  byte-limited defer accounting now use saturating addition/multiplication.
+- Opportunistic far-upload trickle doubling now saturates before clamping to the
+  full budget.
+- Added `VENPODSparseCore` coverage for scaled-budget saturation, request total
+  saturation, byte-limited defer saturation, and far-upload trickle expansion
+  saturation.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the runtime budget saturation guards.
+- Targeted sparse regression passed with render/backend and GPU-physics smokes
+  active after the scheduler changes.
+
+Full gate validation after collision and scheduler hardening:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release
+```
+
+Observed result:
+
+- Full Release sparse regression passed on the current tree.
+- Coverage included `VENPODSparseCore`, dense legacy fallback smoke,
+  render/backend smoke, every-frame flicker smoke, seeded-surface edit
+  persistence, GPU raycast, miss feedback, brush feedback/apply/authoritative
+  smokes, default local sparse physics, GPU physics, normal engine backbuffer
+  capture, stress-camera engine backbuffer capture, and public demo capture
+  validation.
+- Seeded edit persistence verifier reported 8 overlays, 405 voxels, and a
+  2622-byte `.vsed` artifact.
+- Normal engine capture stats showed six nonblank 1920x1080 frames with about
+  76.76-81.44% terrain-like sampled pixels.
+- Stress-camera capture stats showed five nonblank 1920x1080 frames with about
+  99.79-99.98% terrain-like sampled pixels.
+- Public demo capture validation verified an MP4 stream at `1280x720` with 16
+  frames; the generated artifact was 132252 bytes.
+
+### Sparse Coordinate Extreme-Range Guard
+
+Implemented after the runtime budget saturation guard.
+
+Problem:
+
+- Sparse editing, collision, physics, brush feedback, and residency all convert
+  signed world voxel coordinates into `BrickCoord` plus 16^3 local coordinates.
+- The negative-coordinate path in `FloorDiv()` used `-value` to implement floor
+  division. For `INT32_MIN`, that negation can overflow before the result is
+  divided by the sparse brick size.
+- A malformed GPU feedback record or any future far-world query at the signed
+  minimum coordinate should not be able to hit undefined conversion behavior.
+
+Implemented:
+
+- `FloorDiv()` and `FloorMod()` now use 64-bit intermediates while preserving
+  the existing signed floor-division and positive-modulo semantics.
+- Added `VENPODSparseCore` coverage for `INT32_MIN`, `INT32_MIN + 1`, and
+  `INT32_MAX` through `FloorDiv`, `FloorMod`, `BrickCoord::FromWorldVoxel`, and
+  `LocalVoxelFromWorld`.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the extreme sparse-coordinate conversion tests.
+- Targeted sparse regression passed with render/backend and GPU-physics smokes
+  active after the coordinate conversion change.
+
+### Sparse Upload Staging Range Consolidation
+
+Implemented after the coordinate extreme-range guard.
+
+Problem:
+
+- Brick and mid-clipmap uploads had already moved to checked aligned upload
+  ranges, but page-table entry/reset/invalidation staging, physics packet
+  uploads, and edit-delta admission/staging still had local `AlignUp(...) +
+  bytes` arithmetic.
+- Those paths are normally bounded by small buffers, but a public review-ready
+  sparse upload lane should have one fail-closed range builder rather than
+  several subtly different offset calculations.
+
+Implemented:
+
+- `CanReserveUploadRange()` now uses the shared aligned upload append helper.
+- Page-table entry, invalidation, and reset staging now use the same checked
+  helper before writing into the upload ring.
+- Physics packet staging now fails closed through the same helper and preserves
+  both upload-ring and physics-packet overflow telemetry.
+- Edit-delta admission and staging now use the same helper for the delta,
+  range, and range-table spans, matching the brick and mid-clipmap paths.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed.
+- Targeted sparse regression passed with render/backend and GPU-physics smokes
+  active after the upload staging consolidation.
+
+### Sparse Surface Upload Range Guard
+
+Implemented after sparse upload staging range consolidation.
+
+Problem:
+
+- The main sparse brick/page upload path had a shared checked aligned range
+  helper, but the sparse surface uploader still had local offset arithmetic for
+  payload patches, metadata block uploads, and fallback full-snapshot uploads.
+- Surface staging also compared a few face ranges after adding `uint32_t`
+  endpoints, which could wrap before being widened for malformed or future
+  large-range input.
+
+Implemented:
+
+- `SparseSurfaceGpuResources` now uses a local overflow-aware aligned range
+  append helper for:
+  - dirty payload face patch regions,
+  - changed range/draw/record/cluster metadata blocks,
+  - fallback full face/range/draw/record/cluster snapshot uploads.
+- Face source/destination span checks now widen before addition for payload
+  mirror updates, patch staging, mirror usability, and surface record bounds.
+- Surface upload overflow telemetry remains the fail-closed signal when a range
+  cannot be represented in the active upload ring.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke -SkipBrushFeedbackSmoke `
+  -SkipBrushFeedbackApplySmoke -SkipBrushFeedbackAuthoritativeSmoke `
+  -SkipDefaultPhysicsSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed.
+- Targeted sparse regression passed with render/backend, seeded surface
+  smoke/edit persistence, and GPU-physics smokes active after the surface upload
+  range guard.
+
+### Far SVO Upload Range Guard
+
+Implemented after sparse surface upload range guard.
+
+Problem:
+
+- Far SVO upload is a large background continuity layer staged over multiple
+  frames. Normal builds produce bounded buffers, but the upload path assumed
+  internal stage offsets and pending copy ranges were always consistent.
+- A stale, corrupted, or future refactored upload state should not be able to
+  underflow `totalBytes - offset`, overflow upload progress counters, or emit a
+  `CopyBufferRegion` outside either the default buffer or persistent upload
+  buffer.
+
+Implemented:
+
+- Far SVO aggregate upload byte totals are now computed with checked
+  multiplication/addition before asynchronous or synchronous GPU upload begins.
+- Each upload stage validates source presence, stage offset, stage byte total,
+  default buffer capacity, upload buffer capacity, copy range, and upload
+  progress counter update before copying into the staging buffer.
+- Pending GPU upload copy emission validates the copy range against both source
+  and destination buffers before recording the GPU copy command.
+- Invalid internal far upload state now fails closed with a warning instead of
+  issuing an out-of-bounds copy.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed.
+- Targeted sparse regression passed with render/backend and GPU-physics smokes
+  active.
+
+### Far SVO Cache Bounds Guard
+
+Implemented after shared RHI buffer bounds guard.
+
+Problem:
+
+- Far SVO cache binaries are generated local artifacts and are intentionally not
+  tracked, but public review and repeated local runs depend on loading them
+  safely.
+- The cache loader matched header fields, then resized vectors and converted
+  byte counts to `std::streamsize` without checking whether the header counts
+  fit local memory/index/stat/stream limits.
+- A corrupt or oversized cache file should fall back to rebuild or fail with a
+  clear error instead of forcing huge allocations, wrapped page-grid counts, or
+  narrowed stream reads.
+
+Implemented:
+
+- Far SVO page-grid dimensions are computed with checked 64-bit arithmetic
+  before cache load or procedural rebuild begins.
+- Cache header element counts must fit `size_t`, expected page-index count, and
+  checked per-vector byte counts before any resize/read.
+- Cache reads and writes use checked `std::streamsize` conversions.
+- Procedural fallback reserve sizes are checked before allocation.
+- Runtime stats casts for node/page/page-index counts now reject oversized
+  generated data before narrowing to 32-bit telemetry fields.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed.
+- Targeted sparse regression passed with render/backend and GPU-physics smokes
+  active.
+
+- Sparse render/backend smoke observed far SVO readiness with complete
+  `farCov=1.00/1.00` upload/page coverage.
+- Sparse render/backend smoke observed far SVO readiness with complete
+  `farCov=1.00/1.00` upload/page coverage and no upload overflow.
+
+### Backbuffer Capture BMP Bounds Guard
+
+Implemented after far SVO upload range guard.
+
+Problem:
+
+- The in-engine backbuffer capture path is public review evidence: normal and
+  stress capture smokes, contact sheets, image stats, and public demo capture
+  all depend on the BMP files produced by `BackbufferCapture.cpp`.
+- The BMP writer previously computed row size, image size, file size, and
+  readback map range with narrow arithmetic. Normal 1920x1080 captures are safe,
+  but malformed capture dimensions, future larger captures, or an undersized
+  readback buffer should fail before mapping/writing instead of producing a
+  corrupt artifact.
+
+Implemented:
+
+- `WriteBackbufferBmp()` now validates:
+  - source row bytes and row pitch,
+  - readback byte count and `SIZE_T` map range,
+  - readback resource buffer size,
+  - BMP padded row bytes,
+  - BMP image bytes,
+  - BMP total file bytes.
+- `QueueBackbufferCapture()` now rejects unsupported backbuffer dimensions and
+  invalid copy footprints before allocating readback resources.
+- Pixel row copy indexing now widens through `size_t` offsets.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\engine_capture_smoke.ps1 `
+  -Config Release -NoBuild -ExitAfterFrames 150 -CaptureStartFrame 120 `
+  -CaptureIntervalFrames 1 -CaptureCount 1 `
+  -OutputDir .\VENPOD\build\captures\backbuffer_capture_guard_validation_full
+```
+
+Observed result:
+
+- Release build completed.
+- One-frame late engine capture smoke passed.
+- The capture smoke wrote a valid contact sheet and image stats in
+  `VENPOD/build/captures/backbuffer_capture_guard_validation_full/`.
+
+### Shared RHI Buffer Bounds Guard
+
+Implemented after backbuffer capture BMP bounds guard.
+
+Problem:
+
+- Sparse page uploads, surface uploads, far SVO uploads, physics buffers,
+  capture readbacks, and utility render resources all route through the shared
+  `GPUBuffer`/`UploadBuffer` helpers.
+- `GPUBuffer::Upload()` checked `destOffset + sizeBytes` directly, which could
+  wrap before comparing against the buffer size.
+- SRV/UAV element counts and CBV aligned sizes are written into 32-bit D3D12
+  view fields. Oversized or malformed buffers should fail before descriptor
+  creation rather than truncating view metadata.
+
+Implemented:
+
+- Added checked 64-bit add, align, byte-range, and view-field helpers inside
+  `GPUBuffer.cpp`.
+- `GPUBuffer::InitializeWithData()` rejects null initial data.
+- `GPUBuffer::Upload()` now rejects wrapped or out-of-bounds byte ranges before
+  mapping/copying.
+- `CreateSRV()` and `CreateUAV()` reject element counts that do not fit D3D12's
+  32-bit view field.
+- `CreateCBV()` and `ConstantBuffer::InitializeInternal()` reject aligned sizes
+  that do not fit D3D12's 32-bit CBV size field.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed.
+- Targeted sparse regression passed with render/backend and GPU-physics smokes
+  active.
+
+### Sparse Surface IA View Bounds Guard
+
+Implemented after shared RHI buffer bounds guard.
+
+Problem:
+
+- The sparse surface raster path builds a static indexed IA stream from
+  `maxFaces`: four vertex IDs and six indices per face.
+- Existing guards rejected `vertexCount` and `indexCount` overflow, but the
+  resulting byte totals are stored in D3D12 vertex/index buffer views whose
+  `SizeInBytes` fields are 32-bit.
+- An impossible high `maxFaces` capacity should fail during initialization
+  instead of narrowing the byte size written into the buffer-view metadata.
+
+Implemented:
+
+- Added `TryBuildSparseSurfaceIaStreamSizing()` as the shared sizing rule for
+  static surface IA streams.
+- `SparseSurfaceGpuResources::CreateVertexIdStream()` now rejects `maxFaces`
+  values whose vertex stream byte total cannot fit a 32-bit D3D12 vertex buffer
+  view.
+- The same setup rejects `maxFaces` values whose index stream byte total cannot
+  fit a 32-bit D3D12 index buffer view.
+- These guards sit next to the existing vertex/index count checks, so invalid
+  static IA capacities fail before CPU vector sizing or GPU buffer creation.
+- `VENPODSparseCore` now covers the shared sizing rule without requiring a D3D12
+  device: zero faces, one face, max-valid index-view capacity, and one-past the
+  max-valid capacity.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke -SkipBrushFeedbackSmoke `
+  -SkipBrushFeedbackApplySmoke -SkipBrushFeedbackAuthoritativeSmoke `
+  -SkipDefaultPhysicsSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the sparse surface IA stream sizing boundary
+  test.
+- Targeted sparse regression passed with seeded surface smoke/edit persistence
+  active. The render/backend and GPU-physics smokes that remain enabled in that
+  profile also passed.
+
+### Public Review Docs Verifier
+
+Implemented after sparse surface IA view bounds guard.
+
+Problem:
+
+- The public review manifest ties together README claims, docs, scripts, tracked
+  media, generated artifact locations, and known limits.
+- Before this pass, the sparse regression gate validated runtime behavior and
+  capture artifacts, but it did not fail if a handoff doc was deleted, a markdown
+  link broke, the tracked contact sheet disappeared, or generated-artifact ignore
+  patterns drifted.
+- Public-review readiness depends on those handoff files being reproducible and
+  navigable, so docs should be checked before paying the build/runtime cost.
+
+Implemented:
+
+- Added a public-review verifier to `VENPOD/sparse_regression.ps1`.
+- The verifier checks required public-review artifacts:
+  - README, `refactor.md`, review/audit/runtime docs, sandbox/media how-tos,
+    the tracked sparse contact sheet, and public scripts.
+  - Required source handoff artifacts must be tracked or staged in git and must
+    not be ignored.
+  - Public PowerShell entrypoints parse without syntax errors.
+  - The tracked contact sheet must be non-empty and larger than a tiny placeholder.
+  - `.gitignore` must continue excluding generated build/log/edit/cache outputs.
+  - README, `refactor.md`, and docs markdown links are walked; local relative
+    targets must exist and local Markdown anchors must match generated heading
+    slugs.
+- The verifier runs before build by default. `-SkipPublicReviewDocs` is available
+  for narrow script-debug runs.
+- Public review manifest, review checklist, runtime reference, and completion
+  audit now mention the verifier.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Public review docs verifier passed: 16 required artifacts, 5 public scripts,
+  and 14 markdown files.
+- Release build completed.
+- Targeted sparse regression passed with render/backend and GPU-physics smokes
+  active.
+- Follow-up validation added Markdown anchor checking to the same verifier. The
+  compact Release sparse regression passed again with the anchor-aware verifier,
+  render/backend smoke, and GPU-physics smoke active.
+- Follow-up validation added `refactor.md` to the Markdown link/anchor walk.
+  The compact Release sparse regression passed with the verifier reporting 15
+  Markdown files, then render/backend and GPU-physics smokes passed.
+- Follow-up documentation added a sparse regression options section to the
+  runtime reference, including `-SkipPublicReviewDocs` and guidance that public
+  review runs should leave the verifier enabled. The compact Release sparse
+  regression passed after this documentation update.
+- Follow-up validation added the repository `LICENSE` to the required public
+  artifacts checked before build. The compact Release sparse regression passed
+  with 17 required artifacts, 5 public scripts, and 15 Markdown files verified.
+- Follow-up validation made `docs/reference/asset-credits.md` an explicit public
+  handoff artifact. README, docs index, and the public review manifest link it,
+  and the verifier requires it before build. The compact Release sparse
+  regression passed with 18 required artifacts verified.
+- Follow-up validation added `git check-ignore` probes for representative
+  generated review artifacts: sparse logs, public demo captures, sparse edit
+  files, runtime logs, and far SVO cache binaries. The compact Release sparse
+  regression passed with these ignore probes active.
+- Follow-up validation now parses the tracked sparse contact sheet PNG header
+  before build, checking the signature, initial IHDR chunk, and nonzero
+  dimensions. The compact Release sparse regression passed with the contact
+  sheet reported as `960x360`.
+- Follow-up validation expanded the public script parse check to every top-level
+  `VENPOD/*.ps1` helper, including legacy/developer aliases beyond the runtime
+  reference table. A first compact regression exposed that the local
+  PowerShell/.NET host lacks `System.IO.Path.GetRelativePath`; the verifier now
+  uses a local URI-based relative-path helper. The compact Release sparse
+  regression passed with 21 required artifacts and 11 scripts verified.
+- Follow-up documentation added those legacy/developer helpers to the runtime
+  reference as non-preferred helper scripts. This keeps the public review script
+  inventory explicit while preserving `build.ps1`, `rebrun.ps1`,
+  `sparse_regression.ps1`, `engine_capture_smoke.ps1`, and
+  `public_demo_capture.ps1` as the review entrypoints. The compact Release
+  sparse regression passed after the documentation update.
+- Follow-up validation made `docs/index.md` an enforced document map: every
+  Markdown file under `docs/` except the index itself must be linked from it.
+  The compact Release sparse regression passed with the docs map check enabled.
+- Full-gate validation passed with the verifier enabled:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 -Config Release
+```
+
+Observed result:
+
+- Public review docs verifier passed before build, including the tracked contact
+  sheet PNG header check (`960x360`), 21 required artifacts, 11 top-level
+  PowerShell scripts, and 15 Markdown files.
+- Release build, `VENPODSparseCore`, dense legacy fallback smoke, render/backend
+  smoke, every-frame flicker smoke, seeded-surface edit persistence smoke, GPU
+  raycast, miss feedback, brush feedback/apply/authoritative smokes, default
+  local sparse physics, GPU physics, normal/stress engine captures, and public
+  demo MP4 validation all passed.
+
+### GPU Physics Zero-Budget Proposal Requeue
+
+Implemented after the public-review verifier full gate.
+
+Problem:
+
+- `SparseVoxelWorld::ApplyGpuPhysicsProposals()` already requeued proposal
+  sources when the CPU apply budget was exhausted partway through a retired GPU
+  proposal batch.
+- The explicit `maxVoxelMoves == 0` path returned before that requeue helper was
+  available, so a zero-budget frame could drop proposal sources without applying
+  or rejecting them.
+- That is a lifecycle gap for the guarded GPU physics path: backpressure should
+  preserve work for a later CPU-authoritative validation pass.
+
+Implemented:
+
+- Moved the proposal-source requeue helper ahead of the early return path.
+- Empty proposal batches still only reset stats.
+- Zero-budget non-empty proposal batches now requeue proposal-status records,
+  refresh stats, apply no edits, and do not count the work as rejected.
+- The existing mid-batch budget-exhaustion path continues to use the same
+  helper.
+- `VENPODSparseCore` now covers zero-budget GPU proposals: no source/destination
+  mutation, no rejection count, and at least one physics candidate requeued.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the zero-budget GPU proposal requeue test.
+- Targeted sparse regression passed with the public-review verifier,
+  render/backend smoke, and GPU-physics proposal/readback smoke active.
+
+### Sparse Physics Submit Backpressure Requeue
+
+Implemented after GPU physics zero-budget proposal requeue.
+
+Problem:
+
+- `StageLocalPhysicsWork()` pops work packets out of the hot/warm physics queues
+  into `m_physicsStagedPackets`.
+- `ExecuteStagedLocalPhysics()` requeued work after exhausting the move budget
+  inside a staged batch, but the explicit zero-move path returned before
+  requeueing staged packets.
+- In GPU-apply mode, the launcher skips CPU execution and expects packet upload,
+  dispatch, and readback to own the staged batch. If packet staging or emit
+  failed under upload-ring backpressure, the next staging pass could clear the
+  staged vector and lose that physics work.
+
+Implemented:
+
+- `ExecuteStagedLocalPhysics(0, ...)` now requeues all staged packets before
+  returning without mutation.
+- The sparse launcher now tracks whether GPU physics packet work was actually
+  submitted for dispatch in GPU-apply mode.
+- If GPU-apply mode has staged packets but no successful GPU dispatch, the
+  launcher requeues the staged packets and logs the backpressure event.
+- This keeps CPU-authoritative physics work alive across zero budget, upload
+  deferral, and packet emit failure instead of relying on the transient staged
+  vector.
+- `VENPODSparseCore` now covers the local zero-move staged requeue path.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the zero-move staged physics requeue test.
+- Targeted sparse regression passed with the public-review verifier,
+  render/backend smoke, and GPU-physics proposal/readback smoke active.
+
+### Brush Feedback Stale Readback Fallback
+
+Implemented after sparse physics submit backpressure requeue.
+
+Problem:
+
+- Authoritative sparse brush mode previews CPU edits, queues a pending stroke,
+  and waits for the GPU feedback payload to commit or trigger CPU fallback.
+- Missing-resident and overflow payloads already fell back to the queued CPU
+  stroke. A stale readback payload was dropped by the GPU resource layer, but
+  the launcher did not know which queued frame had been dropped.
+- That could leave an authoritative pending stroke in the deque until a later
+  cleanup opportunity instead of replaying it immediately.
+
+Implemented:
+
+- `SparseVoxelGpuStats` now records `brushFeedbackQueuedFrameLastRetire` when a
+  brush feedback readback slot is retired.
+- On a stale brush feedback payload, the GPU resource layer still rejects the
+  payload, but the launcher can identify the dropped queued frame.
+- In authoritative apply mode, a stale brush feedback drop now pops only the
+  matching pending stroke and replays it through `SparseVoxelWorld::ApplyBrushEdit`.
+- The normal complete-payload GPU apply path and missing/overflow CPU fallback
+  path share the same pending-stroke pop/replay helpers.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipDefaultPhysicsSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed.
+- Targeted sparse regression passed with the public-review verifier,
+  render/backend smoke, brush-feedback authoritative smoke, and GPU-physics
+  proposal/readback smoke active.
+
+### Brush Feedback Positive Gate Assertions
+
+Implemented after brush feedback stale readback fallback.
+
+Problem:
+
+- The sparse regression gate saved brush-feedback runtime logs and scanned them
+  for generic failure markers.
+- That did not prove the brush feedback stages actually exercised the important
+  success cases: parity suite completion, GPU edit application, authoritative
+  pending-stroke completion, and CPU fallback on missing-resident payloads.
+
+Implemented:
+
+- Added `Assert-BrushFeedbackDiagnosticsFromLog` to
+  `VENPOD/sparse_regression.ps1`.
+- The observe smoke now requires at least seven parity observations and the
+  diagnostic suite pass marker.
+- The apply smoke additionally requires at least one non-empty GPU apply and a
+  missing-resident CPU fallback.
+- The authoritative smoke additionally requires a GPU apply that completes a
+  pending authoritative stroke, plus the missing-resident CPU fallback path.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipDefaultPhysicsSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Public-review verifier passed before build.
+- Brush-feedback observe smoke reported `parity=7` and `suite=True`.
+- Brush-feedback apply smoke reported `parity=7`, `suite=True`,
+  `gpuApply=True`, and `cpuFallback=True`.
+- Brush-feedback authoritative smoke reported `parity=7`, `suite=True`,
+  `gpuApply=True`, `authoritativeApply=True`, and `cpuFallback=True`.
+- The same targeted regression also passed render/backend and GPU-physics smokes.
+
+### Mid/Far Continuity Positive Gate Assertion
+
+Implemented after brush feedback positive gate assertions.
+
+Problem:
+
+- The render/backend smoke already checked pipe readiness, far SVO readiness,
+  ownership quality, and ownership pressure telemetry.
+- That proved the frame was stable, but it did not make the mid/far continuity
+  evidence explicit. A regression could have stopped exercising the mid clipmap
+  or far ownership path while still passing a broad terrain percentage gate.
+
+Implemented:
+
+- Added `Assert-MidFarContinuityTelemetryFromLog` to
+  `VENPOD/sparse_regression.ps1`.
+- The sparse render/backend smoke now requires:
+  - a `PERF_SPARSE` sample with `midClip=1`, `midCov`, `midTiles`, and
+    `midVoxels` showing nonzero mid-clipmap work or coverage;
+  - a `PERF_RENDER_OWNERSHIP` sample with nonzero mid terrain ownership;
+  - a `PERF_RENDER_OWNERSHIP` sample with nonzero far terrain ownership.
+- The sparse regression log summary now includes `PERF_SPARSE` mid-clipmap
+  samples so continuity failures expose the relevant counters directly.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Public-review verifier passed before build.
+- Sparse render/backend smoke passed the existing pipe, far SVO, surface
+  lookahead, and ownership-pressure checks.
+- The new mid/far continuity assertion reported `maxMidCov=0.92/0.47`,
+  `midTiles=251/225`, `midVoxels=251/843`, `maxOwnedMid=888526`, and
+  `maxOwnedFar=1685100`.
+- The same compact regression also passed the GPU-physics smoke.
+
+### GPU Physics Positive Gate Assertion
+
+Implemented after mid/far continuity positive gate assertion.
+
+Problem:
+
+- The sparse GPU-physics smoke launched the GPU packet/proposal path and scanned
+  logs for generic runtime failures.
+- That did not explicitly prove that the smoke staged GPU physics packets,
+  retired GPU result/proposal payloads, and applied a proposal through the
+  CPU-authoritative validation path.
+
+Implemented:
+
+- Added `Assert-GpuSparsePhysicsFromLog` to `VENPOD/sparse_regression.ps1`.
+- The GPU-physics smoke now requires:
+  - sparse GPU physics enabled in `PERF_SPARSE_PHYSICS`;
+  - at least one staged GPU physics packet;
+  - at least one `PERF_SPARSE_PHYSICS_GPU_RESULT` readback with nonzero results
+    and proposals;
+  - a nonzero `gpuApply=<completed>/<total>` sample;
+  - no sparse physics edit/upload overflow samples in the smoke log.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Public-review verifier passed before build.
+- Sparse render/backend smoke passed, including the mid/far continuity assertion.
+- Sparse GPU-physics smoke reported `gpuPackets=1`, `resultPackets=1`,
+  `proposals=1`, and `gpuApply=1/1`.
+- The compact regression ended with `[OK] Sparse regression gate passed.`
+
+### Sparse Body Collision Positive Gate Assertion
+
+Implemented after GPU physics positive gate assertion.
+
+Problem:
+
+- Sparse collision had strong unit coverage for samples, AABBs, sweeps, support
+  queries, malformed input guards, and collision residency.
+- The default local-physics smoke verified CPU physics movement, but the
+  regression wrapper did not explicitly prove that runtime body movement was
+  sampling sparse collision and retiring support/grounded telemetry.
+
+Implemented:
+
+- Added `Assert-SparseBodyCollisionFromLog` to `VENPOD/sparse_regression.ps1`.
+- The default local sparse-physics smoke now requires:
+  - the sparse collision backend active in `PERF_BACKEND_PIPE`;
+  - nonzero sparse body-collision voxel samples in `bodyColl=...`;
+  - nonzero solid sparse body-collision support;
+  - grounded state plus landing or vertical-block state in retired telemetry.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Public-review verifier passed before build.
+- Sparse render/backend smoke passed, including the mid/far continuity assertion.
+- Default local sparse-physics smoke reported CPU local physics with no GPU
+  packet/apply flags.
+- The new body-collision assertion reported `sampled=39`, `solid=1`,
+  `grounded=True`, and `landingOrVerticalBlock=True`.
+- Sparse GPU-physics smoke also passed the positive packet/readback/apply
+  assertion.
+
+### GPU Raycast Positive Gate Assertion
+
+Implemented after sparse body collision positive gate assertion.
+
+Problem:
+
+- The sparse GPU-raycast smoke asked the engine to require GPU raycast health
+  and scanned logs for failure markers.
+- The regression wrapper did not explicitly parse the health evidence, so a
+  public-review handoff had to infer success from the process exit and absence
+  of a failure line.
+
+Implemented:
+
+- Added `Assert-GpuRaycastHealthFromLog` to `VENPOD/sparse_regression.ps1`.
+- The GPU-raycast smoke now requires:
+  - a `SPARSE_GPU_RAYCAST health observed` marker;
+  - accepted GPU raycast hits greater than or equal to the configured minimum;
+  - reported fallback percentage no higher than the configured maximum;
+  - optional `PERF_SPARSE_GPU_RAYCAST` health telemetry is summarized when
+    present.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipMissFeedbackSmoke -SkipBrushFeedbackSmoke `
+  -SkipBrushFeedbackApplySmoke -SkipBrushFeedbackAuthoritativeSmoke `
+  -SkipDefaultPhysicsSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Public-review verifier passed before build.
+- Sparse render/backend smoke passed, including the mid/far continuity assertion.
+- Sparse GPU-raycast smoke reported `accepted=1`, `fallback=0`, `rejected=0`,
+  `miss=0`, and `maxFallbackPct=0`.
+- Sparse GPU-physics smoke also passed the positive packet/readback/apply
+  assertion.
+
+### Sparse Surface GPU Path Positive Gate Assertion
+
+Implemented after GPU raycast positive gate assertion.
+
+Problem:
+
+- The seeded-surface smoke already required surface fragments in-engine and
+  verified the persisted sparse edit file after launch.
+- The regression wrapper did not explicitly parse the surface GPU telemetry, so
+  it did not directly prove the seeded scenario exercised GPU faces, compact
+  draw commands, GPU culling, and raster fragments.
+
+Implemented:
+
+- Added `Assert-SparseSurfaceGpuPathFromLog` to
+  `VENPOD/sparse_regression.ps1`.
+- The seeded-surface smoke now requires:
+  - a queued sparse surface diagnostic seed;
+  - nonzero GPU faces, draw commands, active draws, surface records, clusters,
+    and resident payload;
+  - GPU cull dispatch with accepted draws;
+  - stable draw slots plus compact draw commands;
+  - nonzero raster faces and `PERF_RENDER_OWNERSHIP` surface fragments;
+  - no sparse surface upload/cull overflow.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke -SkipBrushFeedbackSmoke `
+  -SkipBrushFeedbackApplySmoke -SkipBrushFeedbackAuthoritativeSmoke `
+  -SkipDefaultPhysicsSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Public-review verifier passed before build.
+- Sparse render/backend smoke passed, including the mid/far continuity assertion.
+- Seeded-surface smoke reported `seedVoxels=405`, `gpuFaces=14475`,
+  `activeDraws=57`, `records=57`, `cullAccepted=47`, and
+  `fragments=1213721`.
+- Sparse edit persistence verified `8` overlays, `405` voxels, and `2622`
+  bytes.
+- Sparse GPU-physics smoke also passed the positive packet/readback/apply
+  assertion.
+
+### Miss Feedback Positive Pressure Gate Assertion
+
+Implemented after sparse surface GPU path positive gate assertion.
+
+Problem:
+
+- The miss-feedback smoke checked that pending feedback produced nonzero
+  effective ownership pressure.
+- The wrapper did not report the pending-feedback telemetry or the active
+  sampling plan, so the public-review evidence was weaker than the newer
+  raycast, surface, brush, and physics positive gates.
+
+Implemented:
+
+- Strengthened `Assert-MissFeedbackPressureFromLog` in
+  `VENPOD/sparse_regression.ps1`.
+- The miss-feedback smoke now requires:
+  - nonzero `missPending` telemetry in `PERF_SPARSE`;
+  - nonzero effective ownership pressure while pending miss feedback exists;
+  - positive feedback grid, distance, and stride values from
+    `PERF_SPARSE_OWNERSHIP_PRESSURE`;
+  - diagnostic output for pending, retired, consumed, effective level, feedback
+    plan, and urgent state.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipBrushFeedbackSmoke `
+  -SkipBrushFeedbackApplySmoke -SkipBrushFeedbackAuthoritativeSmoke `
+  -SkipDefaultPhysicsSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Public-review verifier passed before build.
+- Sparse render/backend smoke passed, including the mid/far continuity assertion.
+- Miss-feedback smoke reported `pending=24`, `retired=0`, `consumed=0`,
+  `effectiveLevel=1`, `feedback=5/256/16`, and `urgent=False`.
+- Sparse GPU-physics smoke also passed the positive packet/readback/apply
+  assertion.
+
+### Full Positive-Gate Sparse Regression Pass
+
+Recorded after miss feedback positive pressure gate assertion.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release
+```
+
+Observed result:
+
+- Public-review verifier passed before build, including `21` required
+  artifacts, `11` top-level PowerShell scripts, `15` Markdown files, tracked
+  contact-sheet PNG validation, generated-artifact ignore probes, and docs
+  link/anchor/index-map checks.
+- Release build completed and `VENPODSparseCore` passed.
+- Dense legacy fallback smoke passed.
+- Sparse render/backend smoke passed with far SVO readiness, surface lookahead,
+  ownership-pressure telemetry, and positive mid/far continuity telemetry.
+- Flicker smoke passed.
+- Seeded-surface smoke passed the positive GPU path assertion and verified
+  sparse edit persistence with `8` overlays, `405` voxels, and `2622` bytes.
+- GPU-raycast smoke passed the positive health assertion.
+- Miss-feedback smoke passed the positive pending-feedback pressure and
+  sampling-plan assertion.
+- Brush-feedback observe/apply/authoritative smokes passed the positive parity,
+  GPU apply, authoritative apply, and CPU fallback assertions.
+- Default local sparse-physics smoke passed with positive sparse body-collision
+  sampling/support telemetry.
+- GPU sparse-physics smoke passed with packet staging, result/proposal readback,
+  CPU-authoritative apply, and no physics upload/result overflow.
+- Engine backbuffer capture, stress-camera capture, and public demo capture
+  validation passed; the MP4 stream was verified at `1280x720` with `16`
+  frames.
+- Final gate result: `[OK] Sparse regression gate passed.`
+
+### Sparse Queue Alias Compaction
+
+Implemented after the full positive-gate sparse regression pass.
+
+Problem:
+
+- Generation, upload, and surface extraction each keep a global queue plus
+  class-specific queues for edited/collision/visible/speculative priority
+  service.
+- Retouching a queued brick to a stronger class added an alias to the new class
+  bucket, while stale aliases in the old buckets were only cleaned up if that
+  old bucket was later sorted or popped.
+- The stale aliases did not publish incorrect bricks because pop paths recheck
+  the current pool record, but long sessions and repeated retouches could leave
+  avoidable bucket growth and extra skip work.
+
+Implemented:
+
+- Added shared queue removal helpers that erase all queued aliases for a brick.
+- Generation, upload, and surface class alias insertion now removes any old
+  class-bucket entries for that brick before adding the current class entry.
+- Generation/upload requeue paths also remove existing global and class entries
+  before pushing the new requested position, so requeue-front truly moves a
+  brick rather than leaving duplicates behind.
+- Added small diagnostic class-queue size accessors used by sparse core tests.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed and now checks generation, upload, and surface class
+  upgrades leave one live class-bucket entry after retouch.
+- Compact Release sparse regression passed with the public-review verifier,
+  sparse render/backend mid/far continuity gate, and GPU physics positive gate
+  active.
+- Full Release sparse regression passed after this hardening, including
+  `VENPODSparseCore`, dense legacy fallback, render/backend, flicker,
+  seeded-surface/edit persistence, GPU raycast, miss feedback, brush feedback
+  observe/apply/authoritative, default local physics, GPU physics, engine
+  capture, stress-camera capture, and public demo MP4 validation.
+
+### Dense Fallback Seed Cleanup
+
+Implemented after sparse queue alias compaction.
+
+Problem:
+
+- The dense legacy fallback remains in tree for public comparison and
+  regression safety.
+- Its infinite chunk manager still used a hardcoded procedural seed even though
+  `VoxelWorld` already owns a configuration object.
+
+Implemented:
+
+- Added `worldSeed` to `VoxelWorldConfig`, defaulting to the existing public
+  seed `12345`.
+- Wired dense fallback chunk initialization to `m_config.worldSeed`.
+- Removed the stale source TODO while preserving the default public terrain.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipFlickerSmoke -SkipSurfaceSmoke `
+  -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke -SkipBrushFeedbackSmoke `
+  -SkipBrushFeedbackApplySmoke -SkipBrushFeedbackAuthoritativeSmoke `
+  -SkipDefaultPhysicsSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- Targeted Release sparse regression subset passed with public-review verifier,
+  dense legacy fallback smoke, sparse render/backend mid/far continuity gate,
+  and GPU physics positive gate active.
+
+### Renderer Sparse Ownership Constant Hardening
+
+Implemented after GPU physics result-retire filtering.
+
+Problem:
+
+- The CPU clipmap policy and scheduler had finite-value guards, but the final
+  renderer frame-constant assembly still trusted runtime camera and sparse
+  ownership values before publishing them to HLSL.
+- A bad debug/config value in camera pose/orientation, region origin, mid-field
+  start/end/cell size, mid/far coverage, far quality, far SVO coverage, far root
+  height, or near ownership center/radius could leak NaN/Inf into the raymarch
+  shader's ownership and transition math.
+
+Implemented:
+
+- Added finite-value helpers in `Renderer.cpp` for frame-constant publication.
+- Sanitized camera pose/orientation, FOV/aspect ratio, and region origin before
+  filling primary raymarch constants.
+- Sanitized far quality/coverage/root metadata before filling far-field and
+  background ownership constants.
+- Sanitized mid clipmap transition constants and far handoff distance before
+  enabling the mid/far background chain.
+- Sanitized sparse near ownership center/radius before HLSL uses the ownership
+  sphere to suppress mid/far terrain through near holes.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed.
+- Compact Release sparse regression passed with public-review verification,
+  sparse render/backend smoke, positive mid/far continuity telemetry, and
+  GPU-physics smoke active. GPU physics reported `wellFormedStatus=True` and
+  `malformedRows=0`.
+
+### Sparse Clipmap Non-Finite Policy Hardening
+
+Implemented after dense fallback seed cleanup.
+
+Problem:
+
+- The sparse clipmap policy owns near/mid/far transition distances, background
+  fallback ranges, and voxel clipmap cell sizing.
+- Non-finite inputs from config or runtime distance queries could flow into
+  clamp/floor/cast paths and produce undefined or platform-sensitive ownership
+  decisions.
+
+Implemented:
+
+- Added finite-value sanitization for `SparseClipmapPolicy` configuration
+  values before the existing range clamps run.
+- Sanitized transition and background-start helper inputs so NaN/Inf distances
+  fall back to deterministic policy boundaries.
+- Rejected non-finite ray ownership and missing-near-page background queries.
+- Made `CellSizeForDistance` return the sanitized minimum cell size for
+  disabled policy or non-finite query distance.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed and now covers NaN/Inf sparse clipmap config and
+  query inputs.
+- Compact Release sparse regression passed with public-review verifier, sparse
+  render/backend mid/far continuity gate, and GPU physics positive gate active.
+
+### Sparse Clipmap Interest Non-Finite Hardening
+
+Implemented after sparse clipmap policy non-finite hardening.
+
+Problem:
+
+- The clipmap policy now sanitizes transition/range inputs, but the tile-cache
+  interest builder still accepted raw camera, forward, velocity, and prediction
+  values.
+- NaN/Inf interest inputs could reach prediction, line planning, and
+  floor-to-int coordinate conversion before the requests entered the height
+  tile and voxel clipmap queues.
+
+Implemented:
+
+- Sanitized camera, forward, velocity, and prediction values at the start of
+  height-tile interest planning.
+- Applied the same guard in voxel-brick interest planning so private/internal
+  use cannot bypass the public `UpdateInterest()` sanitization.
+- Clamped invalid prediction time to zero and fell predicted anchors back to
+  the sanitized camera when velocity projection becomes non-finite.
+- Added `VENPODSparseCore` coverage that feeds NaN/Inf interest input and
+  checks generated height and voxel clipmap requests remain near the sanitized
+  origin.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the new non-finite clipmap interest case.
+
+### GPU Physics Expected-Page Status Consistency Guard
+
+Implemented after sparse clipmap interest non-finite hardening.
+
+Problem:
+
+- GPU physics proposals include status bits for expected-page validation:
+  `HAS_EXPECTED_PAGE`, `PAGE_MATCH`, and `PAGE_STALE`.
+- The shader emits `PAGE_MATCH`/`PAGE_STALE` only as refinements of
+  `HAS_EXPECTED_PAGE`, and match/stale are mutually exclusive.
+- The CPU apply path rejected missing expected-page data, stale pages, and
+  absent match bits when `HAS_EXPECTED_PAGE` was present, but a malformed
+  readback could still set `PAGE_MATCH` without `HAS_EXPECTED_PAGE` and valid
+  page fields.
+
+Implemented:
+
+- Split expected-page status validation into explicit `has`, `match`, and
+  `stale` booleans before page-table lookup.
+- Rejected proposals that set `PAGE_MATCH` or `PAGE_STALE` without
+  `HAS_EXPECTED_PAGE`.
+- Rejected proposals that set both `PAGE_MATCH` and `PAGE_STALE`.
+- Rejected proposals with zero work generation before sampling sparse edits or
+  generated terrain. Staged GPU physics work increments from generation one, so
+  zero indicates stale/uninitialized or otherwise malformed readback data.
+- Promoted the CPU-side sparse physics packet status bits into
+  `SparseVoxelWorld.h` so implementation and tests share one ABI contract
+  instead of duplicating raw status numbers.
+- Added `VENPODSparseCore` coverage that verifies both malformed status cases
+  and zero-generation proposals are rejected, counted, requeued, and leave the
+  source voxel unchanged, and that the CPU status constants retain their
+  shader-facing numeric values.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the new malformed expected-page status cases,
+  zero-generation rejection, and shared CPU status-constant checks.
+
+### Sparse Clipmap Extreme Finite Interest Hardening
+
+Implemented after sparse clipmap interest non-finite hardening.
+
+Problem:
+
+- The clipmap interest builder already sanitized NaN/Inf camera, view,
+  velocity, and prediction inputs.
+- Very large finite coordinates could still reach `floor()` and `int32_t`
+  narrowing while deriving height-tile centers, DDA line cells, terrain
+  centerline samples, voxel clipmap centers, and generated tile/brick origins.
+- That is a near/mid/far transition hardening gap for fast-flight or malformed
+  diagnostic input: the correct behavior is bounded clamping, not undefined or
+  platform-specific integer conversion.
+
+Implemented:
+
+- Added shared clamped floor/round helpers for sparse clipmap grid and world
+  coordinate conversion.
+- Height-tile interest, DDA line traversal, shell offsets, generated tile
+  origins, voxel terrain centerline sampling, voxel shell offsets, generated
+  voxel-brick origins, and packed height samples now use clamped conversion or
+  saturating integer addition.
+- Added `VENPODSparseCore` coverage for extreme finite camera/velocity input.
+  The test verifies the clipmap still queues/generates work and that generated
+  height and voxel origins avoid saturated integer endpoints.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the new extreme finite clipmap-interest case.
+
+### GPU Physics Destination-Voxel Parity Guard
+
+Implemented after sparse clipmap extreme finite interest hardening.
+
+Problem:
+
+- The guarded GPU physics proposal apply path verified the source voxel exactly
+  and required the CPU-current destination to be air.
+- It did not require the CPU-current destination voxel to match the
+  GPU-sampled destination voxel carried by the proposal.
+- A stale or malformed proposal that sampled a different destination voxel could
+  therefore still commit if the current destination material was air.
+
+Implemented:
+
+- Tightened `SparseVoxelWorld::ApplyGpuPhysicsProposals()` so the current
+  destination voxel must exactly match `proposal.destinationVoxel` and still be
+  air before the CPU-authoritative apply mutates source/destination edits.
+- Added `VENPODSparseCore` coverage that feeds a mismatched destination readback
+  and verifies the proposal is rejected, counted, requeued, and leaves source
+  and destination voxels unchanged.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the destination-voxel mismatch case.
+
+### Sparse Brush Feedback Duplicate Payload Guard
+
+Implemented after the GPU physics proposal generation guard.
+
+Problem:
+
+- Sparse GPU brush feedback apply already rejected incomplete resident coverage
+  through both header and sentinel missing-resident signals, and rejected
+  overflowed payloads.
+- A malformed complete payload could still contain two edit records for the
+  same world voxel.
+- Applying those records directly would make the final edit depend on readback
+  ordering rather than the CPU-authoritative brush stamp.
+
+Implemented:
+
+- Added `HasDuplicateSparseBrushFeedbackVoxels()` beside the existing sparse
+  brush feedback sentinel/completeness helpers.
+- The helper ignores missing-resident hint records and rejects duplicate edit
+  coordinates.
+- Runtime GPU brush-feedback apply now requires complete payload coverage and
+  unique edit coordinates.
+- Duplicate edit-record payloads route through the existing CPU fallback path
+  in authoritative mode, where the original pending stroke is replayed instead
+  of applying ambiguous GPU records.
+- Fallback logging now records the duplicate-payload reason.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the new sparse brush-feedback duplicate
+  detector coverage.
+
+### Sparse Brush Feedback Missing-Hint Completeness Guard
+
+Implemented after sparse brush feedback duplicate payload guard.
+
+Problem:
+
+- GPU brush-feedback apply already rejected payloads whose readback header
+  reported missing resident pages or overflow.
+- The launcher also scanned retired records for missing-resident sentinel
+  records and used those records to request missing bricks.
+- A malformed payload with sentinel records but a zero missing-resident header
+  count could still be treated as complete for GPU apply after the sentinel
+  records were filtered out of the edit list.
+
+Implemented:
+
+- Extended `CanApplySparseBrushFeedbackPayload()` so apply requires both the
+  readback header missing-resident count and the observed missing-resident hint
+  record count to be zero.
+- Runtime brush-feedback apply now passes the observed hint count into the
+  completeness guard.
+- Header/record disagreement routes through the existing CPU fallback branch in
+  apply/authoritative modes.
+- Added `VENPODSparseCore` coverage for the completeness helper so missing
+  header counts or missing sentinel records both block GPU apply.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the missing-hint completeness cases.
+
+### Sparse Brush Feedback Missing-Hint Diagnostic Parity
+
+Implemented after the sparse brush feedback missing-hint completeness guard.
+
+Problem:
+
+- GPU brush-feedback apply/fallback had been hardened to require agreement
+  between the readback header missing-resident count and observed
+  missing-resident sentinel records.
+- The diagnostic parity decision still evaluated expected missing-resident
+  behavior from the header count alone.
+- A malformed feedback payload with only one of the two signals could therefore
+  fail closed for apply while still looking healthy in the parity diagnostics.
+
+Implemented:
+
+- Tightened sparse brush-feedback parity so missing-resident diagnostic cases
+  require both the header count and sentinel hint count to be nonzero.
+- Non-missing parity cases now fail if either signal is nonzero.
+- Parity success/failure logs include the sentinel count as `hints=...`.
+- `PERF_SPARSE` now logs `brushGpuFbHint` beside `brushGpuFbMiss`, so public
+  review logs expose both halves of the completeness contract.
+- `sparse_regression.ps1` now includes `brushGpuFbHint` in saved key lines and
+  requires CPU fallback assertions to observe nonzero missing-resident header
+  and sentinel counts.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed.
+- Targeted Release sparse regression passed with the public-review verifier,
+  sparse render/backend smoke, brush-feedback apply smoke, brush-feedback
+  authoritative smoke, and GPU-physics smoke active.
+- Brush-feedback diagnostics observed the new two-signal parity logs:
+  resident cases reported `missingResident=0 hints=0`, and the
+  non-resident diagnostic reported `missingResident=28 hints=28` before CPU
+  fallback. The later script assertion also required both fallback signals.
+
+### Sparse Brush Feedback Header Overflow Guard
+
+Implemented after renderer sparse ownership constant hardening.
+
+Problem:
+
+- The sparse brush-feedback ABI stores an explicit overflow flag in header
+  word `z`.
+- CPU retirement only treated `reportedRecordCount > maxBrushFeedbackRecords`
+  as overflow. That catches the current shader's normal overflow pattern, but
+  not a stale, corrupt, or future payload that sets the header overflow bit
+  while reporting an in-range count.
+- Such a payload could be treated as complete if missing-resident counts and
+  duplicate checks were otherwise clean.
+
+Implemented:
+
+- Added `SparseBrushFeedbackPayloadOverflowed()` beside the existing
+  brush-feedback completeness helpers.
+- `SparseVoxelGpuResources::RetireBrushFeedback()` now treats either an
+  over-capacity record count or a nonzero shader header overflow bit as an
+  incomplete payload.
+- `CanApplySparseBrushFeedbackPayload()` still receives a single overflow
+  decision, so the existing GPU apply and authoritative CPU fallback logic use
+  the stricter retire contract automatically.
+- Added `VENPODSparseCore` coverage for exact-capacity payloads,
+  count-over-capacity payloads, and header-flag overflow payloads.
+- `PERF_SPARSE` now reports `brushGpuFb` as
+  `<queued>/<retired>/<applied>/<overflow>/<stale>`.
+- Tightened `Assert-BrushFeedbackDiagnosticsFromLog` so brush-feedback smoke
+  gates fail on any `SPARSE_BRUSH_FEEDBACK parity failed` line, any
+  `PERF_SPARSE` line with a nonzero `brushGpuFb` overflow field, or any
+  nonzero stale feedback readback drop.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with exact-capacity, count-over-capacity, and
+  shader-header overflow brush-feedback helper coverage.
+- Targeted Release sparse regression passed with public-review verification,
+  sparse render/backend smoke, brush-feedback apply smoke, brush-feedback
+  authoritative smoke, and GPU-physics smoke active.
+- Brush-feedback apply/authoritative diagnostics both completed seven parity
+  cases, observed GPU apply, and observed missing-resident CPU fallback with
+  both header and sentinel hint signals. The regression output now reports
+  `overflow=False stale=False` for the clean diagnostic path.
+
+### GPU Physics Proposal Status Guard
+
+Implemented after sparse brush feedback missing-hint diagnostic parity.
+
+Problem:
+
+- The shader initializes every physics packet result with
+  `PACKET_STATUS_CONSUMED` and then adds `PACKET_STATUS_PROPOSAL` only when it
+  emits a candidate move.
+- CPU proposal apply was checking for `PROPOSAL`, but it did not require the
+  consumed bit or reject unknown status bits.
+- A stale, partially initialized, corrupt, or future-layout result could
+  therefore reach deeper validation as long as the proposal bit was set.
+
+Implemented:
+
+- Added a CPU-side well-formed status guard before page, revision, voxel, or
+  batch-conflict validation.
+- GPU proposal payloads now must include `SPARSE_PHYSICS_PACKET_STATUS_CONSUMED`
+  and may only use the known shader-facing status bits.
+- Malformed status payloads are rejected, counted, and requeued for fresh local
+  physics work without mutating sparse edit overlays.
+- GPU physics result retirement now applies the same consumed/known-bit filter
+  before counting valid results or appending proposal payloads for CPU apply.
+  The first-result telemetry is taken from the first well-formed result row,
+  not just row zero.
+- Runtime sparse physics logs expose malformed result-row drops as
+  `gpuMalformed`, and the GPU-physics smoke gate fails if the value is nonzero.
+- Updated `VENPODSparseCore` GPU-physics fixtures to use the consumed proposal
+  status the shader actually writes.
+- Added unit cases for missing-consumed and unknown-bit proposal payloads.
+- Tightened the GPU-physics smoke parser so runtime logs must include at least
+  one well-formed consumed proposal status and must not expose unknown status
+  bits in `firstStatus`.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+```
+
+Observed result:
+
+- Release build completed.
+- `VENPODSparseCore` passed with the missing-consumed and unknown-status
+  proposal rejection cases.
+- Targeted Release sparse regression passed with the public-review verifier,
+  sparse render/backend smoke, and GPU-physics smoke active.
+- GPU-physics smoke observed shader-written result status `87`, which includes
+  consumed, expected-page match, proposal, and edit-delta-hit bits. The later
+  script assertion also required `wellFormedStatus=True`.
+- After resource-layer result filtering, Release build, `VENPODSparseCore`, and
+  the targeted GPU-physics sparse regression subset passed again with
+  `wellFormedStatus=True` and `malformedRows=0`; runtime physics telemetry
+  includes `gpuMalformed=0` for the clean shader path.
+
+### Full Post-Hardening Sparse Regression Pass
+
+Completed after the GPU physics, brush-feedback, clipmap, and public-review
+verifier hardening passes.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 -Config Release
+```
+
+Observed result:
+
+- Public-review verifier passed with `21` required artifacts, `11` public
+  PowerShell scripts, `15` Markdown files, and `24` tracked/staged source
+  artifacts.
+- Release build completed and `VENPODSparseCore` passed.
+- Dense legacy fallback smoke passed.
+- Sparse render/backend smoke passed with pipe readiness, ownership quality,
+  far SVO readiness, surface lookahead telemetry, ownership-pressure telemetry,
+  and positive mid/far continuity telemetry.
+- Flicker smoke, seeded-surface/edit-persistence smoke, GPU-raycast smoke,
+  miss-feedback smoke, brush-feedback observe/apply/authoritative smokes,
+  default local sparse-physics smoke, and GPU-physics smoke passed.
+- Engine backbuffer capture, stress-camera engine capture, and public demo MP4
+  capture validation passed.
+
+### Mid/Far Continuity Smoke Gate Tightening
+
+Problem:
+
+- The render-smoke mid/far continuity assertion only required some nonzero
+  mid ownership and some nonzero far ownership across the whole log.
+- That could miss a regression where the ownership layers never overlap in a
+  meaningful frame, or where a trivial ownership count makes the check pass.
+
+Implemented:
+
+- `Assert-MidFarContinuityTelemetryFromLog` now parses `total` from
+  `PERF_RENDER_OWNERSHIP` and requires at least one simultaneous mid/far
+  ownership sample above a resolution-scaled floor.
+- The floor is `0.5%` of the reported render pixel count, with a minimum of 64
+  pixels, so the gate remains portable across smoke resolutions while rejecting
+  one-pixel or stale telemetry passes.
+- Public review docs now describe the render-smoke requirement as meaningful
+  simultaneous mid/far ownership instead of merely positive ownership.
+
+### Far SVO Readiness Visibility Gate
+
+Problem:
+
+- `Assert-FarSvoReadyFromLog` proved that the far SVO backend was active and
+  that `farCov` reached resident/page coverage.
+- It did not prove the far SVO layer actually owned any pixels; a regression
+  could theoretically keep far height/procedural fallback visible while the SVO
+  path stayed uploaded but visually unused.
+
+Implemented:
+
+- The far-SVO readiness assertion now also parses `PERF_RENDER_OWNERSHIP` and
+  requires at least one visible `farSvo` ownership sample.
+- When render `total` is present, the visibility floor is `0.1%` of the pixel
+  count with a minimum of 64 pixels. Older logs without `total` still require
+  nonzero `farSvo` ownership.
+- Public review docs now call out visible far-SVO ownership as part of the
+  near/mid/far continuity evidence.
+
+### Default Sparse Physics Budget Gate
+
+Problem:
+
+- The default local sparse-physics smoke proved sparse physics was enabled,
+  CPU-local moves happened, and GPU proposal apply stayed off.
+- The public audit also described the path as bounded, but the smoke did not
+  explicitly fail on packet/processed/move budget overruns, overflow flags, or
+  malformed GPU-result counters.
+
+Implemented:
+
+- `Assert-DefaultSparsePhysicsFromLog` now parses `PERF_SPARSE_PHYSICS`
+  packet, processed, moved, and `budget=<bricks>/<moves>` fields.
+- The smoke fails if packet staging or processed bricks exceed the brick
+  budget, if moved voxels exceed the move budget, or if the scheduler catch-up
+  budgets exceed the established `32` brick / `1024` move caps.
+- The smoke also fails on nonzero edit overflow, GPU packet overflow, or
+  malformed GPU-result rows in the default CPU-local path.
+- Public review docs now name the budget and overflow checks as part of the
+  default-on local sparse physics evidence.
+
+### GPU Physics Clean-Smoke Result Guard
+
+Problem:
+
+- The GPU-physics smoke already required packet staging, result/proposal
+  readback, CPU-authoritative apply, well-formed consumed proposal status bits,
+  and zero malformed retire rows.
+- The clean diagnostic smoke did not explicitly fail on proposals reporting
+  missing destination support, CPU-side proposal rejects, or result rows without
+  nonzero generation/checksum metadata.
+
+Implemented:
+
+- `Assert-GpuSparsePhysicsFromLog` now requires GPU result rows to carry
+  nonzero `firstGen` and checksum metadata.
+- The clean GPU-physics smoke fails on any nonzero `missingBelow` result count.
+- The same smoke fails on any nonzero `gpuReject` in `PERF_SPARSE_PHYSICS`,
+  keeping the diagnostic path strict: accepted GPU proposals must survive the
+  CPU-authoritative validator in the public review gate.
+- The success log now reports generation/checksum evidence plus
+  `missingBelow=0` and `rejects=0`.
+
+### GPU Raycast Strict Diagnostic Reject/Miss Gate
+
+Problem:
+
+- The GPU-raycast smoke required a health marker, at least the configured
+  accepted-hit count, and fallback percentage within the configured limit.
+- In strict seeded mode the deterministic target should be accepted by the GPU
+  raycast path without rejected or missed diagnostic rays. A smoke could
+  otherwise pass after accumulating one accepted hit while still reporting
+  reject/miss evidence in the same health window.
+
+Implemented:
+
+- `Assert-GpuRaycastHealthFromLog` now fails if the health marker reports any
+  rejected or missed strict diagnostic raycasts.
+- Public review docs now describe GPU raycast evidence as accepted-hit,
+  no-reject/no-miss, and fallback-bounded.
+
+### Miss-Feedback Stale/Overflow Runtime Gate
+
+Problem:
+
+- Miss-feedback stale readback drops and overflow already fed the runtime
+  scheduler retry policy, and they were visible in the diagnostics overlay.
+- The machine-parsed `PERF_SPARSE` smoke line did not expose those two status
+  counters, so the miss-feedback smoke could not fail a public-review run that
+  recovered from stale or overflowed feedback internally.
+
+Implemented:
+
+- `PERF_SPARSE` now logs `missFbStale=<N>` and `missFbOverflow=<0|1>` beside
+  `missRetired`, `missPending`, and `missConsumed`.
+- `Assert-MissFeedbackPressureFromLog` now requires the new fields and fails on
+  any nonzero stale readback drop or overflow status.
+- The miss-feedback smoke success line reports `stale=0 overflow=0`, and the
+  public-review docs name those zero-status checks as part of the scheduler
+  pressure evidence.
+
+### Sparse Surface Settled-Frame Gate
+
+Problem:
+
+- The seeded-surface smoke already required diagnostic seeding, nonzero GPU
+  faces/draws/records/payload, GPU cull dispatch, accepted draws, compact stable
+  draw mode, raster fragments, and no explicit surface overflow.
+- It did not require a post-ready surface telemetry sample where GPU updates had
+  settled with no staged uploads, deferred work, pending snapshots, allocation
+  failures, or retries.
+
+Implemented:
+
+- `Assert-SparseSurfaceGpuPathFromLog` now requires at least one settled
+  `PERF_SPARSE_SURFACE` sample with accepted GPU cull draws and zero
+  staged/deferred/pending-snapshot/retry/allocation-failure/overflow backlog.
+- The same assertion now fails on any sparse-surface allocation failure, retry,
+  or overflow backlog line.
+- Public review docs now list the settled-frame condition as part of the sparse
+  surface GPU rendering evidence.
+
+### Flicker Smoke Ownership Stability Parser
+
+Problem:
+
+- The every-frame flicker smoke already enabled the engine-side ownership
+  stability gate and failed on `SPARSE_RENDER_OWNERSHIP stability failed`.
+- The regression wrapper did not independently summarize the post-ready
+  ownership samples, terrain/miss deltas, or unsafe near-miss pixels that made
+  the run pass.
+
+Implemented:
+
+- Added `Assert-FlickerOwnershipStabilityFromLog` to parse
+  `PERF_RENDER_OWNERSHIP` after the flicker ready frame.
+- The assertion requires enough post-ready samples, bounds terrain and miss
+  percentage ranges with the flicker smoke thresholds, and fails on any
+  post-ready `miss` or `unsafeNearMiss` pixels.
+- The flicker stage now prints the observed sample count and terrain/miss range
+  in the sparse regression output, making the original page-flashing failure
+  mode visible in the public gate.
+
+### Dense Legacy Fallback Positive Gate
+
+Problem:
+
+- The dense fallback smoke launched the legacy path and scanned for runtime
+  failures, but it did not prove that the requested backend was actually active.
+- A launcher or renderer regression could have silently fallen back to sparse
+  visual paths while the smoke still exited cleanly.
+
+Implemented:
+
+- Added `Assert-DenseLegacyFallbackFromLog` to parse the dense fallback runtime
+  log for the requested and active `dense-legacy` render backend.
+- The gate requires `Sparse raymarch visual path: disabled`.
+- The gate also requires the dense dispatcher contract:
+  `denseSim=1`, `sparseRaycast=0`, `sparseFeedback=0`, and
+  `sparsePhysicsPackets=0`.
+- Public review docs now describe dense fallback evidence as a positive backend
+  and dispatcher assertion, not just a no-failure smoke.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipFlickerSmoke -SkipSurfaceSmoke `
+  -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke -SkipBrushFeedbackSmoke `
+  -SkipBrushFeedbackApplySmoke -SkipBrushFeedbackAuthoritativeSmoke `
+  -SkipDefaultPhysicsSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Public-review verifier passed and the Release build was already current.
+- Dense legacy fallback smoke passed with `requested=True`, `active=True`,
+  `sparseRaymarchDisabled=True`, and `denseDispatcher=True`.
+- Sparse render/backend smoke still passed the far-SVO visibility and mid/far
+  continuity assertions.
+- GPU sparse-physics smoke still passed with nonzero generation/checksum
+  result metadata, `missingBelow=0`, and `rejects=0`.
+
+### Stress-Camera Ownership Capture Gate
+
+Problem:
+
+- The stress-camera engine capture smoke generated backbuffer frames and image
+  statistics for the fast-flight public review path.
+- The regression wrapper did not parse the stress run's ownership telemetry, so
+  a nonblank capture could still hide sparse miss pixels or unsafe near-field
+  holes during the moving-camera path.
+
+Implemented:
+
+- Added `Assert-StressCaptureOwnershipFromLog` to parse
+  `PERF_RENDER_OWNERSHIP` from the stress capture `venpod_runtime.log`.
+- The gate requires enough post-ready samples, a terrain-owned frame floor,
+  zero `miss` pixels, zero `unsafeNearMiss` pixels, positive mid/far terrain
+  ownership, and positive sparse surface fragments.
+- The stress capture stage now also scans its runtime log for the shared
+  critical/error/device-removed/timeout readiness failure markers.
+- Public review docs now describe the stress-camera capture as explicit
+  streaming/ownership evidence, not only media generation.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Public-review verifier passed and the Release build was already current.
+- Sparse render/backend smoke still passed far-SVO visibility and mid/far
+  continuity.
+- GPU sparse-physics smoke still passed with generation/checksum metadata,
+  `missingBelow=0`, and `rejects=0`.
+
+### GPU Physics Proposal Coordinate Overflow Guard
+
+Implemented after the fast-request telemetry gate.
+
+Problem:
+
+- GPU physics proposal apply already rejected malformed local coordinates before
+  mutating sparse edits.
+- The next step converted `BrickCoord + local` back to an `int32_t` world voxel
+  with `brickCoord * 16 + local`.
+- A stale, corrupt, or future malformed GPU result with an extreme brick
+  coordinate could overflow during that conversion before the CPU-authoritative
+  validator sampled source/destination voxels.
+
+Implemented:
+
+- Added a checked `TrySparseWorldVoxelFromLocal()` helper that widens the
+  multiply/add to `int64_t` and rejects coordinates outside `int32_t` world
+  voxel range.
+- `SparseVoxelWorld::ApplyGpuPhysicsProposals()` now rejects and requeues
+  proposals whose source or destination coordinate would overflow world-voxel
+  conversion.
+- `VENPODSparseCore` now covers malformed source and destination overflow
+  coordinates and verifies they are counted, requeued, and applied without
+  mutation.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build compiled `SparseVoxelWorld.cpp` and `test_sparse_core.cpp`.
+- `VENPODSparseCore` passed with the new GPU physics source/destination
+  overflow-coordinate proposal tests.
+- Compact Release sparse regression passed with public-review verifier,
+  render/backend smoke, fast-request telemetry, mid/far continuity telemetry,
+  and GPU-physics smoke active.
+- GPU sparse-physics smoke still reported generation/checksum metadata,
+  `wellFormedStatus=True`, `missingBelow=0`, and `rejects=0`.
+
+### Shared Brick/Local World-Coordinate Guard
+
+Implemented after the GPU physics proposal coordinate overflow guard.
+
+Problem:
+
+- The GPU physics apply path now rejected overflow when converting
+  `BrickCoord + local` to world voxels, but that checked conversion was still
+  private to `SparseVoxelWorld.cpp`.
+- Surface extraction also converted brick coordinates with `coord * 16 + local`.
+  A malformed or future out-of-range generated brick could therefore overflow
+  before building CPU/GPU surface payloads.
+
+Implemented:
+
+- Promoted the checked conversion to
+  `TryWorldVoxelFromBrickLocal()` in `SparseVoxelTypes`.
+- `SparseVoxelWorld::ApplyGpuPhysicsProposals()` now uses the shared helper.
+- `SparseSurfaceExtractor::ExtractRegion()` validates the requested region's
+  min/max world voxels before scanning and returns an empty extraction result
+  for out-of-range brick coordinates.
+- `VENPODSparseCore` now covers checked conversion at `int32_t` world bounds,
+  positive/negative overflow rejection, and surface extraction rejection for an
+  out-of-range brick coordinate.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build compiled the shared sparse voxel types, surface extractor,
+  sparse world, and sparse core tests.
+- `VENPODSparseCore` passed with checked-conversion and surface-extractor
+  overflow-coordinate tests.
+- Compact Release sparse regression passed with public-review verifier,
+  render/backend smoke, fast-request telemetry, mid/far continuity telemetry,
+  and GPU-physics smoke active.
+- GPU sparse-physics smoke still reported `wellFormedStatus=True`,
+  `missingBelow=0`, and `rejects=0`.
+- Stress-camera engine capture passed and the new ownership assertion reported
+  `samples=100`, `minTerrain=89.02%`, `miss=0`, `unsafeNearMiss=0`,
+  positive mid/far terrain ownership, and positive surface fragments.
+
+### Terrain/Surface/Local-Physics Coordinate Conversion Closure
+
+Implemented after the shared brick/local world-coordinate guard.
+
+Problem:
+
+- The shared `TryWorldVoxelFromBrickLocal()` helper protected GPU proposal
+  apply and surface extraction region bounds.
+- Terrain generation, local sparse physics candidate collection, and surface
+  cache visibility/dirty-region math still had direct `BrickCoord * 16`
+  conversion sites. Malformed or future out-of-range brick coordinates could
+  therefore overflow before being rejected or treated as nonresident work.
+
+Implemented:
+
+- `SparseTerrainGenerator::IsDefinitelyEmptyBrick()` now fails closed when
+  checked world-coordinate conversion cannot represent the brick bounds.
+- `SparseTerrainGenerator::GenerateBrick()` pre-fills output bricks with air
+  and returns an empty fail-closed brick if any voxel coordinate cannot be
+  represented as an `int32_t` world voxel.
+- Local sparse physics candidate staging now skips candidates whose brick/local
+  coordinate cannot be converted safely, counting them as skipped physics work
+  instead of mutating sparse edits from overflowed coordinates.
+- `SparseSurfaceCache` visibility and dirty-region filtering now use checked
+  brick-base conversion plus wide local-offset math before accepting face
+  bounds.
+- Searched sparse production paths no longer contain the direct
+  `coord.* * SPARSE_BRICK_SIZE` or `brick.coord.* * SPARSE_BRICK_SIZE`
+  conversion patterns that this pass targeted.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build compiled the terrain generator, surface cache/extractor, sparse
+  world, shared sparse voxel types, and sparse core tests.
+- `VENPODSparseCore` passed with checked-conversion, surface-extractor, and
+  terrain overflow-coordinate coverage.
+- Compact Release sparse regression passed with public-review verifier,
+  render/backend smoke, fast-request telemetry, mid/far continuity telemetry,
+  and GPU-physics smoke active.
+- Render/backend smoke reported visible far SVO ownership (`farSvo=46911`) and
+  fast-request telemetry `samples=2`, `scale=4`,
+  `spec/vis/coll=24/130/130`, `total=208`, `skips=0/0/0`.
+- GPU sparse-physics smoke still reported `wellFormedStatus=True`,
+  `missingBelow=0`, and `rejects=0`.
+
+### Sparse Collision Sweep-Step Hardening
+
+Implemented after the terrain/surface/local-physics coordinate conversion
+closure.
+
+Problem:
+
+- Sparse collision AABB and support queries already rejected non-finite,
+  out-of-range, and oversized sample volumes.
+- `SparseCollisionQuery::SweepAabb()` still trusted the caller-provided step
+  count after clamping only the zero-step case to one step.
+- A malformed or accidental huge step count could therefore turn an otherwise
+  bounded collision query into a long blocking loop, which is not acceptable for
+  the default sparse physics/collision path.
+
+Implemented:
+
+- Added a `1024`-step hard cap for sparse collision sweeps.
+- The existing one-step minimum is preserved for zero-step callers.
+- `VENPODSparseCore` now covers a `UINT32_MAX` sweep-step request and verifies
+  an open path remains open instead of hanging or reporting a false collision.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build compiled `SparseCollision.cpp` and `VENPODSparseCore`.
+- `VENPODSparseCore` passed with the huge sweep-step clamp regression.
+- Compact Release sparse regression passed with public-review verifier,
+  render/backend smoke, fast-request telemetry, mid/far continuity telemetry,
+  and GPU-physics smoke active.
+- Render/backend smoke reported visible far SVO ownership (`farSvo=47555`) and
+  fast-request telemetry `samples=2`, `scale=4`,
+  `spec/vis/coll=24/130/130`, `total=208`, `skips=0/0/0`.
+- GPU sparse-physics smoke still reported `wellFormedStatus=True`,
+  `missingBelow=0`, and `rejects=0`.
+
+### Scenic Spawn Input Hardening
+
+Implemented after the sparse collision sweep-step hardening.
+
+Problem:
+
+- The scenic sparse spawn path is part of startup readiness: it decides whether
+  the player starts on usable sparse-rendered terrain.
+- The normal path was covered, but malformed inputs could still overflow signed
+  search bounds, use a non-finite player height in clearance math, or narrow
+  out-of-range scenic sample coordinates while probing view cones near extreme
+  world origins.
+
+Implemented:
+
+- `SparseTerrainGenerator::FindScenicSpawn()` now clamps search radius, sample
+  spacing, and player height to bounded finite values.
+- Search bounds are derived with widened integer math and clamped to the
+  representable `int32_t` world range.
+- Local relief samples use checked integer addition, and view-cone probes reject
+  non-finite or out-of-range rounded sample coordinates before calling
+  `HeightAt()`.
+- Candidate distance scoring now uses wide floating-point math rather than
+  multiplying signed `int32_t` deltas.
+- `VENPODSparseCore` now covers malformed extreme-origin scenic spawn input and
+  verifies the fallback data remains finite and inside terrain height bounds.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build compiled `SparseTerrainGenerator.cpp` and `VENPODSparseCore`.
+- `VENPODSparseCore` passed with the malformed scenic-spawn input regression.
+- Compact Release sparse regression passed with public-review verifier,
+  render/backend smoke, fast-request telemetry, mid/far continuity telemetry,
+  and GPU-physics smoke active.
+- Render/backend smoke reported visible far SVO ownership (`farSvo=47555`) and
+  fast-request telemetry `samples=2`, `scale=4`,
+  `spec/vis/coll=24/130/130`, `total=208`, `skips=0/0/0`.
+- GPU sparse-physics smoke still reported `wellFormedStatus=True`,
+  `missingBelow=0`, and `rejects=0`.
+
+### CPU Sparse Raycast Input Hardening
+
+Implemented after scenic spawn input hardening.
+
+Problem:
+
+- The CPU sparse raycast is still the correctness fallback for sparse brush
+  targeting and startup ground probing when GPU sparse raycast is disabled or
+  falls back.
+- The DDA path trusted finite/ranged origin, direction, and max-distance input.
+  Extreme values could narrow through `floor()` into `int32_t`, produce an
+  unbounded step count, or overflow voxel stepping at signed world-coordinate
+  boundaries.
+
+Implemented:
+
+- `SparseVoxelWorld::Raycast()` now rejects non-finite origin, direction, and
+  max-distance inputs before traversal.
+- Direction normalization uses widened arithmetic, avoiding float overflow from
+  large-but-finite direction components.
+- Ray distance and DDA step count are capped for bounded CPU work.
+- Initial origin voxel conversion uses checked floor-to-`int32_t` conversion.
+- Per-axis DDA stepping uses checked signed integer addition and fails closed at
+  world-coordinate boundaries instead of wrapping.
+- `VENPODSparseCore` now covers non-finite origin, direction, max-distance, and
+  positive boundary step-overflow cases while preserving generated-terrain,
+  edit-overlay, erase, and negative-coordinate raycast behavior.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build compiled `SparseVoxelWorld.cpp` and `VENPODSparseCore`.
+- `VENPODSparseCore` passed with the CPU sparse raycast malformed-input and
+  boundary tests.
+- Compact Release sparse regression passed with public-review verifier,
+  render/backend smoke, fast-request telemetry, mid/far continuity telemetry,
+  and GPU-physics smoke active.
+- Render/backend smoke reported visible far SVO ownership (`farSvo=47551`) and
+  fast-request telemetry `samples=2`, `scale=4`,
+  `spec/vis/coll=24/130/130`, `total=208`, `skips=0/0/0`.
+- GPU sparse-physics smoke still reported `wellFormedStatus=True`,
+  `missingBelow=0`, and `rejects=0`.
+
+### Sparse Brush Input Hardening
+
+Implemented after CPU sparse raycast input hardening.
+
+Problem:
+
+- Sparse brush preview and commit are the CPU-authoritative edit path and the
+  fallback/replay authority for GPU brush feedback.
+- The evaluator accepted its world position and radius directly, then cast
+  `floor()`/`ceil()` results to `int32_t` and built signed edit-loop bounds.
+- Non-finite inputs, huge radii, or positions near signed world-coordinate
+  boundaries could therefore produce invalid ranges or unbounded CPU work before
+  the edit overlay, dirty-region, physics, and upload queues were touched.
+
+Implemented:
+
+- Added a checked sparse brush volume builder.
+- Brush preview/commit now reject non-finite world position, radius, or
+  strength inputs before scanning voxels.
+- Radius is capped to the same public brush scale used by the controller, and
+  the evaluated voxel volume is bounded.
+- Center and end-coordinate conversion use checked floor/ceil-to-`int32_t`
+  helpers.
+- Range construction uses widened arithmetic and fails closed when the brush
+  would cross signed world-coordinate limits.
+- `VENPODSparseCore` now covers non-finite preview radius, non-finite commit
+  position, and positive world-coordinate boundary rejection while preserving
+  existing preview/commit parity and collision-authoritative edit behavior.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build compiled `SparseVoxelWorld.cpp` and `VENPODSparseCore`.
+- `VENPODSparseCore` passed with the sparse brush malformed-input and
+  boundary-volume tests.
+- Compact Release sparse regression passed with public-review verifier,
+  render/backend smoke, fast-request telemetry, mid/far continuity telemetry,
+  and GPU-physics smoke active.
+- Render/backend smoke reported visible far SVO ownership (`farSvo=47468`) and
+  fast-request telemetry `samples=2`, `scale=4`,
+  `spec/vis/coll=24/130/130`, `total=208`, `skips=0/0/0`.
+- GPU sparse-physics smoke still reported `wellFormedStatus=True`,
+  `missingBelow=0`, and `rejects=0`.
+
+### Collision/Brush Residency Planner Input Hardening
+
+Implemented after sparse brush input hardening.
+
+Problem:
+
+- Sparse collision residency planning reserves pages for body/support motion and
+  active brush intent before edits or physics need those bricks.
+- The planner still derived brick ranges from raw camera, velocity, body, and
+  brush-intent floats. Non-finite motion or brush input could therefore narrow
+  undefined `floor()` values into brick coordinates or produce unbounded intent
+  sampling before request caps were applied.
+
+Implemented:
+
+- Collision residency velocity and prediction inputs are sanitized before
+  deriving lookahead samples.
+- Body radius, height, step height, and support drop are clamped to finite
+  bounded values.
+- Non-finite camera positions fall back to the configured center brick.
+- Body/support world ranges use checked floor-to-`int32_t` conversion before
+  becoming `BrickCoord` ranges.
+- Brush-intent residency only runs when start/end/radius inputs are finite and
+  positive.
+- Brush line DDA rejects non-finite endpoints, checks start conversion, uses
+  widened brick-boundary math, and fails closed on signed brick-coordinate step
+  overflow.
+- Neighbor brush requests use checked brick-coordinate offsets before enqueue.
+- `VENPODSparseCore` now covers malformed collision/brush residency input and
+  verifies bounded requests remain near the configured center and within the
+  request cap.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build compiled `SparseBrickRequestPlanner.cpp` and
+  `VENPODSparseCore`; a transient float-conversion warning was fixed before the
+  final build.
+- `VENPODSparseCore` passed with the malformed collision/brush residency
+  planner test.
+- Compact Release sparse regression passed with public-review verifier,
+  render/backend smoke, fast-request telemetry, mid/far continuity telemetry,
+  and GPU-physics smoke active.
+- Render/backend smoke reported visible far SVO ownership (`farSvo=47549`) and
+  fast-request telemetry `samples=2`, `scale=4`,
+  `spec/vis/coll=24/130/130`, `total=208`, `skips=0/0/0`.
+- GPU sparse-physics smoke still reported `wellFormedStatus=True`,
+  `missingBelow=0`, and `rejects=0`.
+
+### Basic/Stress Request Planner Radius Hardening
+
+Implemented after collision/brush residency planner input hardening.
+
+Problem:
+
+- The basic sparse request planner and stress-volume request planner are public
+  planning entry points used by smoke/stress paths.
+- Both accepted unsigned radius/prefetch/request inputs and narrowed them into
+  signed loop bounds or coordinate offsets. Malformed extreme radii could wrap
+  into negative signed ranges or generate overflowing `BrickCoord` offsets
+  before the final request cap was applied.
+
+Implemented:
+
+- Added shared planner caps for request count, X/Z radius, Y radius, and
+  forward-prefetch length.
+- Basic neighborhood planning clamps radius and prefetch inputs, uses widened
+  priority math, and checks every center/forward-neighbor offset before enqueue.
+- Basic planning preserves the previous collect/sort/resize semantics so
+  center and forward-prefetch priorities remain stable.
+- Stress-volume planning clamps radius and request inputs, bounds candidate
+  reserve size, uses checked center offsets, and saturates priority math.
+- `VENPODSparseCore` now covers extreme unsigned planner radii, extreme
+  forward prefetch, signed-coordinate boundary centers, request-cap behavior,
+  and duplicate-free output for both basic and stress planners.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure -R VENPODSparseCore
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build compiled `SparseBrickRequestPlanner.cpp` and
+  `VENPODSparseCore`.
+- `VENPODSparseCore` initially caught a priority-ordering regression in the
+  basic planner; the implementation was adjusted to preserve collect/sort/resize
+  semantics, and the test then passed.
+- Compact Release sparse regression passed with public-review verifier,
+  render/backend smoke, fast-request telemetry, mid/far continuity telemetry,
+  and GPU-physics smoke active.
+- Render/backend smoke reported visible far SVO ownership (`farSvo=46799`) and
+  fast-request telemetry `samples=2`, `scale=4`,
+  `spec/vis/coll=24/130/130`, `total=208`, `skips=0/0/0`.
+- GPU sparse-physics smoke still reported `wellFormedStatus=True`,
+  `missingBelow=0`, and `rejects=0`.
+
+### Sparse Brush Feedback Dispatch Bounds Hardening
+
+Implemented after basic/stress request planner radius hardening.
+
+Problem:
+
+- CPU sparse brush preview/commit had a checked bounded edit volume, but the
+  GPU sparse brush-feedback dispatch still derived its shader volume from raw
+  `worldPosition*`, `radius`, and `strength` inputs.
+- Non-finite or extreme finite brush inputs could narrow through float-to-int
+  casts, signed subtraction/addition, or dispatch-volume math before reaching
+  the shader.
+- The CPU and GPU brush paths should reject and clamp the same brush volume
+  contract so brush feedback cannot diverge from CPU sparse authority.
+
+Implemented:
+
+- Moved sparse brush voxel-bound construction into shared
+  `TryBuildSparseBrushVoxelBounds` in `SparseVoxelTypes`.
+- The helper rejects non-finite position/radius/strength input, rejects signed
+  world-coordinate overflow boundaries, clamps radius to
+  `SPARSE_MAX_BRUSH_RADIUS`, clamps strength to `[0, 1]`, and caps total brush
+  voxels before any scan or dispatch.
+- CPU sparse brush preview/commit now uses the shared helper.
+- `PhysicsDispatcher::DispatchSparseBrushFeedback` now uses the same checked
+  helper before publishing shader constants, and sends the clamped
+  radius/strength and checked start/volume to the GPU.
+- `VENPODSparseCore` now covers normal checked brush bounds, radius/strength
+  clamping, non-finite position rejection, and positive signed-coordinate
+  overflow rejection.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipDefaultPhysicsSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build passed through the repo build wrapper after the local shell was
+  missing direct MSVC/SDK include environment for raw Ninja.
+- `VENPODSparseCore` passed after correcting the expected inclusive dispatch
+  bounds in the new unit test.
+- Sparse regression passed with public-review verifier, render/backend smoke,
+  brush-feedback parity, brush-feedback apply, brush-feedback authoritative,
+  and GPU-physics smoke active.
+- Brush-feedback parity smoke reported seven diagnostic cases and clean
+  duplicate/stale/overflow status.
+- Brush-feedback apply smoke reported GPU apply plus CPU fallback for
+  missing-resident hints.
+- Brush-feedback authoritative smoke reported `authoritativeApply=True`,
+  `duplicate=False`, `stale=False`, and `overflow=False`.
+
+### Sparse View-Cone Request Planner Input Hardening
+
+Implemented after sparse brush feedback dispatch bounds hardening.
+
+Problem:
+
+- `PlanViewCone` feeds visible residency and ownership recovery planning, but
+  it still accepted raw camera origin, distance, step, FOV/aspect, coverage, and
+  request-count values.
+- Non-finite origins could narrow through `floor()` into undefined brick
+  coordinates, huge request counts could reserve excessive memory, and DDA
+  stepping/coverage dilation added brick offsets without checked overflow.
+
+Implemented:
+
+- View-cone planning now caps max requests, rejects non-finite origin,
+  max-distance, and step-distance input, clamps optional FOV/aspect/distance
+  and step values, and bounds coverage dilation.
+- The planner now converts the origin through checked floor-to-int conversion
+  and skips invalid rays instead of narrowing malformed world coordinates.
+- Coverage dilation uses checked brick offsets and clamped priority arithmetic.
+- Brick DDA stepping now stops if any axis step overflows instead of wrapping
+  the request coordinate.
+- `VENPODSparseCore` covers non-finite origin rejection, malformed optional
+  parameter clamping, capped request counts, duplicate-free output, and
+  positive signed-coordinate overflow boundary rejection.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build passed and `VENPODSparseCore` passed with the new view-cone
+  planner guards.
+- Compact Release sparse regression passed with public-review verifier,
+  render/backend smoke, fast-request telemetry, mid/far continuity telemetry,
+  and GPU-physics smoke active.
+- Render/backend smoke reported visible far SVO ownership (`farSvo=47555`) and
+  fast-request telemetry `samples=2`, `scale=4`,
+  `spec/vis/coll=24/130/130`, `total=208`, `skips=0/0/0`.
+- GPU sparse-physics smoke still reported `wellFormedStatus=True`,
+  `missingBelow=0`, and `rejects=0`.
+
+### Hierarchical/Collision Request Planner Bounds Hardening
+
+Implemented after sparse view-cone request planner input hardening.
+
+Problem:
+
+- `PlanHierarchical` composes collision, near-visible, motion-visible,
+  ownership-recovery, visible, and speculative request planning.
+- Several composed inputs still trusted raw request counts, radii, camera,
+  velocity, prediction, and signed center offsets before lower-level caps could
+  apply.
+- `PlanCollisionResidency` also still had a fallback shell path that used raw
+  shell radii, unchecked center offsets, and potentially overflowing priority
+  distance math.
+
+Implemented:
+
+- Collision residency now caps request counts, prediction bricks, shell radii,
+  and intent samples before reserving or looping.
+- Collision body/brush priorities use widened absolute-distance math and
+  clamped priority output.
+- Collision fallback shells use checked center/neighbor offsets and stop at the
+  capped request limit.
+- Hierarchical planning now caps its own request count, sanitizes camera,
+  velocity, prediction, body height, visible/speculative distance, and step
+  distance before composing sub-planners.
+- Near-visible and motion-visible paths clamp radii/counts, use checked offsets,
+  and clamp priority math.
+- Ownership-recovery, visible, and speculative view-cone calls receive bounded
+  origins, distances, step values, and request caps.
+- `VENPODSparseCore` covers malformed hierarchical camera/motion inputs,
+  malformed request counts, unique output, and signed-boundary centers that
+  must not wrap emitted request coordinates.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build passed and `VENPODSparseCore` passed with the new
+  hierarchical/collision planner guards.
+- Compact Release sparse regression passed with public-review verifier,
+  render/backend smoke, fast-request telemetry, mid/far continuity telemetry,
+  and GPU-physics smoke active.
+- Render/backend smoke reported visible far SVO ownership (`farSvo=47555`) and
+  fast-request telemetry `samples=2`, `scale=4`,
+  `spec/vis/coll=24/130/130`, `total=208`, `skips=0/0/0`.
+- GPU sparse-physics smoke still reported `wellFormedStatus=True`,
+  `missingBelow=0`, and `rejects=0`.
+
+### Sparse GPU Raycast/Miss Dispatch Input Hardening
+
+Implemented after hierarchical/collision request planner bounds hardening.
+
+Problem:
+
+- CPU sparse raycast and request planning had explicit malformed-input guards,
+  but `PhysicsDispatcher::DispatchSparseRaycast` and
+  `DispatchSparseMissFeedback` still published raw camera/ray origins,
+  directions, FOV/aspect, distance, and step fields to shader constants.
+- Non-finite origins or signed-coordinate overflow boundaries could reach HLSL
+  `floor()`/`int` conversion, and non-finite distances could feed CPU-side
+  dispatch step-count math before the shader saw the constants.
+
+Implemented:
+
+- Added dispatcher-local finite vector, checked floor-to-`int32_t`,
+  finite-clamp, and finite-normalization helpers.
+- Sparse GPU raycast dispatch now rejects invalid descriptors/page metadata,
+  non-finite or out-of-range origins, non-positive/non-finite distance, and
+  invalid ray directions before binding or dispatching.
+- Sparse GPU raycast constants now use normalized finite direction and clamped
+  max distance for shader constants and CPU step-count derivation.
+- Sparse miss-feedback dispatch now rejects invalid descriptors/page metadata,
+  non-finite or out-of-range camera origins, and non-positive/non-finite
+  distance before dispatch.
+- Sparse miss-feedback constants now use finite-normalized basis vectors,
+  clamped max distance, clamped step distance, and finite-clamped FOV/aspect.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build passed after compiling `PhysicsDispatcher.cpp`.
+- Runtime sparse regression passed with public-review verifier,
+  render/backend smoke, GPU-raycast smoke, miss-feedback smoke, and
+  GPU-physics smoke active.
+- GPU-raycast smoke reported `accepted=1`, `fallback=0`, `rejected=0`, and
+  `miss=0`.
+- Miss-feedback smoke reported ownership-pressure feedback with
+  `stale=0` and `overflow=0`.
+- Render/backend smoke still reported visible far SVO ownership
+  (`farSvo=47555`) and fast-request telemetry `samples=2`, `scale=4`,
+  `spec/vis/coll=24/130/130`, `total=208`, `skips=0/0/0`.
+- GPU sparse-physics smoke still reported `wellFormedStatus=True`,
+  `missingBelow=0`, and `rejects=0`.
+
+### Sparse GPU Physics Dispatch Metadata Hardening
+
+Implemented after sparse GPU raycast/miss dispatch input hardening.
+
+Problem:
+
+- GPU physics packet upload already caps staged packets and edit deltas, but
+  `PhysicsDispatcher::DispatchSparsePhysicsPackets` still trusted the dispatch
+  ticket metadata.
+- A malformed or stale dispatch ticket could publish impossible packet counts,
+  non-power-of-two page tables, edit range counts beyond shader limits, or an
+  invalid range table before computing dispatch groups.
+- The group-count math used `(packetCount + 63) / 64`, so dispatch must reject
+  impossible packet counts before addition.
+
+Implemented:
+
+- Added dispatcher-side sparse physics packet, edit-delta, and edit-range caps
+  matching the GPU resource/shader contract.
+- Sparse GPU physics dispatch now rejects zero/oversized packet counts,
+  invalid page-table capacity, invalid edit-range table capacity, edit ranges
+  beyond edit deltas, and edit counts beyond shader limits before binding or
+  dispatching.
+- Dispatch group math now only runs after packet count is within the guarded
+  maximum.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build passed after compiling `PhysicsDispatcher.cpp`.
+- Compact Release sparse regression passed with public-review verifier,
+  render/backend smoke, fast-request telemetry, mid/far continuity telemetry,
+  and GPU-physics smoke active.
+- GPU sparse-physics smoke reported `gpuPackets=1`, `gpuApply=1/1`,
+  `wellFormedStatus=True`, `malformedRows=0`, `missingBelow=0`, and
+  `rejects=0`.
+- Render/backend smoke still reported visible far SVO ownership
+  (`farSvo=47555`) and fast-request telemetry `samples=2`, `scale=4`,
+  `spec/vis/coll=24/130/130`, `total=208`, `skips=0/0/0`.
+
+### Sparse Character Controller Input Hardening
+
+Implemented after sparse GPU physics dispatch metadata hardening.
+
+Problem:
+
+- Sparse collision queries were guarded, but the character controller could
+  still build movement sweeps from raw body poses, dimensions, snap distances,
+  velocities, and sweep step counts.
+- Non-finite movement targets could reach distance calculations and sweep-step
+  casts before collision queries had a chance to reject malformed AABBs.
+- Huge `maxSweepSteps` values could propagate farther than needed before the
+  lower-level collision sweep cap.
+
+Implemented:
+
+- Added character-controller body sanitization for finite eye position and
+  bounded height/radius/step-height values.
+- Horizontal and vertical movement now reject malformed start/target poses
+  before any collision scan, fail closed at the start pose when possible, and
+  clamp non-finite velocity to zero.
+- Horizontal and vertical sweep step counts now use bounded finite distance math
+  and an explicit character-controller step cap before calling sparse collision.
+- Grounding now rejects malformed bodies before support scans and clamps
+  snap-up/snap-down distances.
+- `VENPODSparseCore` now covers malformed horizontal movement, vertical
+  movement, and grounding requests, verifying that they fail closed without
+  collision/support scans.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build passed after compiling `SparseCharacterController.cpp` and
+  `VENPODSparseCore`.
+- `VENPODSparseCore` passed with the new malformed movement/grounding cases.
+- Focused Release sparse regression passed with public-review verifier,
+  render/backend smoke, default local-physics smoke, and GPU-physics smoke
+  active.
+- Default local-physics smoke reported active sparse body collision sampling,
+  grounded/landing state, CPU packet processing, and zero GPU packet/apply flags.
+- GPU sparse-physics smoke still reported `wellFormedStatus=True`,
+  `missingBelow=0`, and `rejects=0`.
+
+### Sparse World Boundary Dirty/Physics Hardening
+
+Implemented after sparse character controller input hardening.
+
+Problem:
+
+- Sparse world dirty-region and local-physics paths were mostly driven by
+  normal world-voxel edits, but some public APIs accept raw `BrickCoord` values.
+- Local physics support-residency planning could derive the brick below a work
+  packet with `coord.y - 1`; at `int32_t` minimum that wrapped to a far positive
+  brick and could request unrelated residency.
+- Local falling-voxel execution could derive `worldY - 1` before sampling the
+  destination voxel; at `int32_t` minimum that wrapped the destination instead
+  of failing closed.
+- Local physics batch staging reserved the caller-provided packet count
+  directly, so malformed large staging requests could ask the vector for an
+  excessive reserve before normal work limits applied.
+- Surface dirty-region neighbor propagation used direct adjacent-brick
+  arithmetic for boundary faces.
+
+Implemented:
+
+- Added checked sparse-world brick offset composition and reused the existing
+  checked int32 stepping helper.
+- Surface dirty-region neighbor propagation now skips adjacent dirty-surface
+  requests that would overflow signed brick coordinates.
+- Support wakeups now check `x +/- 1`, `y + 1`, and `z +/- 1` before queuing
+  physics voxels.
+- Local physics batch staging now caps requested work packets to the
+  shader/runtime packet contract before reserving or consuming queued work.
+- Support-brick residency planning and GPU edit-delta snapshot collection now
+  skip below-brick lookups that would overflow signed brick coordinates.
+- Local falling-voxel execution now checks the destination `y - 1` before
+  sampling, mutating edits, or queuing follow-up work.
+- `VENPODSparseCore` now covers oversized local-physics staging requests at the
+  signed minimum brick boundary and falling-voxel edits at `int32_t::min()`.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- First Release link attempt was blocked by an already-running
+  `VENPOD.exe`; after stopping that process, the Release build passed.
+- `VENPODSparseCore` passed with the new signed-boundary local-physics cases.
+- Focused Release sparse regression passed with public-review verifier,
+  render/backend smoke, default local-physics smoke, and GPU-physics smoke
+  active.
+- Render/backend smoke still reported far-SVO readiness, fast-request
+  telemetry `samples=2`, `scale=4`, `spec/vis/coll=24/130/130`,
+  `total=208`, `skips=0/0/0`, and clean ownership with `miss=0` and
+  `unsafeNearMiss=0`.
+- Default local-physics smoke still reported CPU packet processing, sparse
+  body-collision sampling, support requests at zero for the clean seeded
+  scenario, and zero GPU packet/apply flags.
+- GPU sparse-physics smoke still reported well-formed generation/checksum
+  metadata, `missingBelow=0`, and `rejects=0`.
+
+### Sparse Residency Trim Distance Hardening
+
+Implemented after sparse world boundary dirty/physics hardening.
+
+Problem:
+
+- Sparse residency trim and priority-replacement code ranks candidate bricks by
+  distance from a protected center.
+- Those paths used `int32_t` coordinate deltas and squared them in several
+  places, so very large sparse brick separations could overflow before the
+  candidate sort.
+- Queued background trimming also accepts raw requested brick coordinates, so a
+  malformed or extreme request could exercise full signed-range deltas before a
+  brick ever reached terrain generation.
+
+Implemented:
+
+- Added shared 64-bit sparse brick delta helpers, unsigned absolute-distance
+  comparisons, and saturating weighted distance-score math.
+- Upload queue value scoring, resident trimming, background resident trimming,
+  queued background trimming, and lower-priority replacement eviction now use
+  the same saturating distance score.
+- Keep-radius checks now compare 64-bit absolute deltas against the original
+  unsigned radius values instead of narrowing radii to `int32_t`.
+- Unit coverage now includes:
+  - queued trim across `int32_t::min()` to `int32_t::max()` brick coordinates;
+  - resident trim at large separations whose squared distance exceeds `int32_t`;
+  - priority replacement at the same large-distance scale.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build passed after compiling `SparseVoxelWorld.cpp` and
+  `VENPODSparseCore`.
+- `VENPODSparseCore` passed with the new queued-trim, resident-trim, and
+  replacement distance-boundary cases.
+- Focused Release sparse regression passed with public-review verifier,
+  render/backend smoke, default local-physics smoke, and GPU-physics smoke
+  active.
+- Render/backend smoke still reported far-SVO readiness, visible far-SVO
+  ownership, fast-request telemetry `samples=2`, `scale=4`,
+  `spec/vis/coll=24/130/130`, `total=208`, and `skips=0/0/0`.
+- Default local sparse physics and GPU sparse physics both remained clean, with
+  `missingBelow=0`, malformed/reject counters at zero, and no GPU packet/apply
+  flags in the default local path.
+
+### Sparse Surface Boundary Math Hardening
+
+Implemented after sparse residency trim distance hardening.
+
+Problem:
+
+- Sparse surface extraction converts local brick faces into world-space face
+  records and may ask a neighbor sampler for the voxel just outside the brick.
+- At the valid positive world boundary, a positive-face neighbor sample could
+  compute `world + 1` and wrap before reaching the sampler.
+- Surface cache bounds for merged quads used direct `world + width/height`
+  additions, so a boundary face could wrap its record bounds even when the
+  source brick coordinate itself was valid.
+
+Implemented:
+
+- Surface extraction now checks signed world-voxel neighbor steps before
+  calling the neighbor sampler; an overflowing neighbor is treated as missing
+  outside-brick air.
+- Surface cache record bounds now use saturating signed additions for merged
+  face width/height extents.
+- `VENPODSparseCore` now covers a valid max-world boundary brick, verifies the
+  extractor does not call the neighbor sampler with wrapped coordinates, and
+  verifies surface-cache bounds clamp at `int32_t::max()`.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build passed after compiling `SparseSurfaceExtractor.cpp`,
+  `SparseSurfaceCache.cpp`, and `VENPODSparseCore`.
+- `VENPODSparseCore` passed with the new boundary extractor/cache cases.
+- Focused Release sparse regression passed with public-review verifier,
+  render/backend smoke, default local-physics smoke, and GPU-physics smoke
+  active.
+- Render/backend smoke still reported visible far-SVO ownership, fast-request
+  telemetry `samples=2`, `scale=4`, `spec/vis/coll=24/130/130`,
+  `total=208`, `skips=0/0/0`, and clean ownership with `miss=0` and
+  `unsafeNearMiss=0`.
+- Default local sparse physics and GPU sparse physics still reported clean
+  support/result counters with `missingBelow=0` and malformed/reject counters
+  at zero.
+
+### Far SVO Config-Origin Hardening
+
+Implemented after sparse surface boundary math hardening.
+
+Problem:
+
+- The far SVO builder already guarded byte counts, cache reads/writes, and GPU
+  upload ranges, but malformed config values could still reach CPU build math.
+- Non-finite or non-positive `pageSize`, non-finite `rootMinY`, excessive
+  `maxDepth`, or page origins outside signed world range could flow into
+  `floor()` casts or recursive SVO bounds before the build failed.
+- The builder is a private implementation detail, while the sparse core test
+  target intentionally links only header-level far-SVO helpers.
+
+Implemented:
+
+- Added a shared inline `ValidateFarVoxelOctreeConfigForBuild()` helper for the
+  CPU builder and sparse core tests.
+- Far SVO CPU build now rejects invalid page size, root height, excessive tree
+  depth, and page-origin ranges that cannot safely floor to `int32_t`.
+- Page origin publication now uses checked double-to-int32 floor conversion
+  instead of raw `static_cast<int32_t>(std::floor(...))`.
+- `VENPODSparseCore` now covers non-finite page size, out-of-range page
+  origins, and excessive max depth through the same validation helper used by
+  the builder.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build passed after compiling `FarVoxelOctree.cpp`,
+  `VENPODSparseCore`, and the launcher.
+- `VENPODSparseCore` passed with the new far-SVO malformed-config cases.
+- Focused Release sparse regression passed with public-review verifier,
+  render/backend smoke, default local-physics smoke, and GPU-physics smoke
+  active.
+- Render/backend smoke still reported far-SVO readiness, visible far-SVO
+  ownership (`farSvo=47384`), fast-request telemetry `samples=2`,
+  `scale=4`, `spec/vis/coll=24/130/130`, `total=208`, and
+  `skips=0/0/0`.
+- Default local sparse physics and GPU sparse physics remained clean with
+  `missingBelow=0` and malformed/reject counters at zero.
+
+### Sparse Surface Visibility Culling Input Hardening
+
+Implemented after far SVO config-origin hardening.
+
+Problem:
+
+- Sparse surface GPU snapshots use CPU-side visibility culling for stable,
+  compact surface payloads.
+- The culling config is derived from renderer camera, lookahead, basis, FOV,
+  aspect, distance, and padding values. If any of those inputs became
+  non-finite, NaN comparisons could incorrectly cull valid cached surface
+  bricks.
+- A malformed visibility packet should not blank the sparse surface layer; it
+  should fail open and preserve cached terrain until sane culling metadata
+  returns.
+
+Implemented:
+
+- Surface visibility culling now rejects malformed camera, lookahead, basis, or
+  derived projection math by treating the brick as visible.
+- FOV, aspect, max-distance, and padding inputs are clamped to finite ranges
+  before use.
+- Distance and frustum calculations now check intermediate finite results
+  before deciding to cull.
+- `VENPODSparseCore` now covers malformed camera/lookahead visibility input and
+  verifies that cached surface bricks remain visible instead of being culled
+  by NaN comparisons.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release -R VENPODSparseCore --output-on-failure
+
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build passed after compiling `SparseSurfaceCache.cpp` and
+  `VENPODSparseCore`.
+- `VENPODSparseCore` passed with the new malformed visibility-culling case.
+- Focused Release sparse regression passed with public-review verifier,
+  render/backend smoke, default local-physics smoke, and GPU-physics smoke
+  active.
+- Render/backend smoke still reported surface GPU/raster/surface-authoritative
+  backend readiness, visible far-SVO ownership (`farSvo=46776`),
+  fast-request telemetry `samples=2`, `scale=4`,
+  `spec/vis/coll=24/130/130`, `total=208`, and `skips=0/0/0`.
+- Surface telemetry remained clean with accepted GPU cull draws, no overflow,
+  no staged/deferred/retry backlog, and nonzero raster faces.
+
+### Static Engine Capture Ownership Gate
+
+Implemented after the stress-camera ownership capture gate.
+
+Problem:
+
+- The static engine capture smoke generated a contact sheet and image
+  statistics for the default public view.
+- Like the stress-camera path before the previous pass, it did not parse the
+  runtime ownership telemetry. A nonblank capture could therefore pass without
+  proving that the default view had sparse terrain ownership, mid/far ownership,
+  and zero sparse miss/unsafe-near-miss pixels.
+
+Implemented:
+
+- Generalized the capture ownership parser to
+  `Assert-EngineCaptureOwnershipFromLog`.
+- The normal engine capture stage now scans its `venpod_runtime.log` for
+  runtime failure markers and then requires enough post-ready ownership samples,
+  a terrain-owned frame floor, zero `miss` pixels, zero `unsafeNearMiss` pixels,
+  positive mid/far terrain ownership, and positive sparse surface fragments.
+- The stress-camera stage now uses the same shared assertion.
+- Public review docs now describe both engine capture paths as ownership gates,
+  not only media artifacts.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Public-review verifier passed and the Release build was already current.
+- Sparse render/backend smoke still passed far-SVO visibility and mid/far
+  continuity.
+- GPU sparse-physics smoke still passed with generation/checksum metadata,
+  `missingBelow=0`, and `rejects=0`.
+- Static engine capture passed and the new ownership assertion reported
+  `samples=125`, `minTerrain=62.60%`, `miss=0`, `unsafeNearMiss=0`,
+  positive mid/far terrain ownership, and positive surface fragments.
+
+### Public Demo Capture Ownership Gate
+
+Implemented after the static engine capture ownership gate.
+
+Problem:
+
+- The public demo capture path validated contact-sheet/stat artifacts and the
+  encoded MP4 stream.
+- It reused the engine backbuffer capture script, but the sparse regression
+  wrapper did not parse the public-demo runtime log. A demo could therefore
+  produce valid media while hiding sparse ownership holes in the source frames.
+
+Implemented:
+
+- Added `PublicDemoCaptureStartFrame` to `sparse_regression.ps1` and pass it
+  through to `public_demo_capture.ps1`, keeping the ownership parser aligned
+  with the captured frame window.
+- Public demo validation now scans the generated `venpod_runtime.log` for
+  runtime failure markers.
+- Public demo validation now uses `Assert-EngineCaptureOwnershipFromLog` to
+  require enough post-ready samples, terrain ownership, positive mid/far
+  ownership, positive surface fragments, and zero `miss`/`unsafeNearMiss`
+  pixels in the frames used for public media.
+- Public review docs now describe the public demo media gate as both media
+  validation and sparse ownership validation.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke
+```
+
+Observed result:
+
+- Public-review verifier passed and the Release build was already current.
+- Sparse render/backend smoke still passed far-SVO visibility and mid/far
+  continuity.
+- GPU sparse-physics smoke still passed with generation/checksum metadata,
+  `missingBelow=0`, and `rejects=0`.
+- Public demo capture produced a verified `1280x720` MP4 with `16` frames.
+- Public demo ownership assertion reported `samples=24`,
+  `minTerrain=62.60%`, `miss=0`, `unsafeNearMiss=0`, positive mid/far terrain
+  ownership, and positive surface fragments.
+
+### Full Capture-Ownership Sparse Regression Pass
+
+Completed after the static/stress/public-demo capture ownership gates.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 -Config Release
+```
+
+Observed result:
+
+- Public-review verifier passed with `21` required artifacts, `11` public
+  PowerShell scripts, `15` Markdown files, and `24` tracked/staged source
+  artifacts.
+- Release build completed and `VENPODSparseCore` passed.
+- Dense legacy fallback smoke passed with positive dense backend and dispatcher
+  assertions.
+- Sparse render/backend smoke passed with far-SVO visibility and meaningful
+  simultaneous mid/far ownership.
+- Flicker, seeded-surface/edit-persistence, GPU-raycast, miss-feedback,
+  brush-feedback observe/apply/authoritative, default local sparse physics, and
+  GPU sparse-physics smokes passed.
+- Static engine capture ownership assertion reported `samples=125`,
+  `minTerrain=62.24%`, `miss=0`, `unsafeNearMiss=0`, positive mid/far terrain
+  ownership, and positive surface fragments.
+- Stress-camera capture ownership assertion reported `samples=100`,
+  `minTerrain=89.03%`, `miss=0`, `unsafeNearMiss=0`, positive mid/far terrain
+  ownership, and positive surface fragments.
+- Public demo capture produced a verified `1280x720` MP4 with `16` frames and
+  reported `samples=24`, `minTerrain=62.60%`, `miss=0`,
+  `unsafeNearMiss=0`, positive mid/far terrain ownership, and positive surface
+  fragments.
+
+### Brush Feedback Duplicate Clean-Smoke Gate
+
+Implemented after the full capture-ownership sparse regression pass.
+
+Problem:
+
+- Duplicate sparse brush feedback edit records are a guarded malformed-payload
+  case covered by `VENPODSparseCore`.
+- The public audit text implied the brush-feedback runtime smokes exercised that
+  duplicate fallback, while the clean diagnostic logs correctly reported
+  `duplicate=0`.
+- If a clean brush-feedback diagnostic began producing duplicate edit payloads,
+  it should be treated as a regression rather than accepted as a normal CPU
+  fallback case.
+
+Implemented:
+
+- `Assert-BrushFeedbackDiagnosticsFromLog` now parses
+  `SPARSE_BRUSH_FEEDBACK CPU fallback ... duplicate=<N>` lines and fails clean
+  diagnostics if `duplicate` is nonzero.
+- The brush-feedback success summary now reports `duplicate=False`.
+- Public review docs now distinguish unit coverage for duplicate-payload
+  fallback from the runtime smoke requirement that clean diagnostics do not
+  produce duplicate feedback records.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Public-review verifier passed and the Release build was already current.
+- Sparse render/backend smoke still passed far-SVO visibility and mid/far
+  continuity.
+- Brush-feedback apply smoke passed with `duplicate=False`.
+- Brush-feedback authoritative smoke passed with `duplicate=False`.
+- GPU sparse-physics smoke still passed with generation/checksum metadata,
+  `missingBelow=0`, and `rejects=0`.
+
+### GPU Physics Aggregate Missing-Support Gate
+
+Implemented after the brush-feedback duplicate clean-smoke gate.
+
+Problem:
+
+- The GPU-physics smoke already failed when dedicated
+  `PERF_SPARSE_PHYSICS_GPU_RESULT` rows reported `missingBelow > 0`.
+- The aggregate `PERF_SPARSE_PHYSICS` line also exposes `gpuMissingBelow`.
+  If a future logging or retire path surfaced missing-support evidence only
+  through that aggregate counter, the clean smoke should still fail.
+
+Implemented:
+
+- `Assert-GpuSparsePhysicsFromLog` now treats nonzero `gpuMissingBelow` in
+  `PERF_SPARSE_PHYSICS` the same way as nonzero `missingBelow` in GPU result
+  rows.
+- The existing clean-smoke success summary still reports `missingBelow=0`, now
+  backed by both telemetry sources.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipStressEngineCaptureSmoke `
+  -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Public-review verifier passed and the Release build was already current.
+- Sparse render/backend smoke still passed far-SVO visibility and mid/far
+  continuity.
+- GPU sparse-physics smoke passed with generation/checksum metadata,
+  `missingBelow=0`, and `rejects=0`, with the new aggregate
+  `gpuMissingBelow` rejection path active.
+
+### Capture Far-SVO Visibility Gate
+
+Implemented after the GPU physics aggregate missing-support gate.
+
+Problem:
+
+- The capture ownership assertion already required combined far terrain
+  ownership, but `far = farSvo + farHeight` meant a capture could pass while
+  only the far-height background contributed.
+- Public review capture gates need to prove the actual far SVO layer is visible
+  in source frames, not only that the far fallback layer exists.
+
+Implemented:
+
+- `Assert-EngineCaptureOwnershipFromLog` now tracks the maximum `farSvo`
+  ownership from post-ready `PERF_RENDER_OWNERSHIP` samples.
+- Normal engine capture, stress-camera capture, and public demo capture
+  validation now fail if no visible `farSvo` pixels are observed.
+- Public review docs now describe capture ownership gates as requiring visible
+  far-SVO pixels alongside terrain ownership, mid/far ownership, surface
+  fragments, and zero `miss` / `unsafeNearMiss` pixels.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke
+```
+
+Observed result:
+
+- Public-review verifier passed and the Release build was already current.
+- Sparse render/backend smoke still passed far-SVO visibility and mid/far
+  continuity.
+- Static engine capture ownership assertion reported `samples=125`,
+  `minTerrain=62.24%`, `miss=0`, `unsafeNearMiss=0`, `farSvo=39806`, positive
+  mid/far terrain ownership, and positive surface fragments.
+- Stress-camera capture ownership assertion reported `samples=100`,
+  `minTerrain=89.02%`, `miss=0`, `unsafeNearMiss=0`, `farSvo=103411`, positive
+  mid/far terrain ownership, and positive surface fragments.
+- Public demo capture validation produced a probed `1280x720` / 16-frame MP4
+  and reported `samples=24`, `minTerrain=62.60%`, `miss=0`,
+  `unsafeNearMiss=0`, `farSvo=32288`, positive mid/far terrain ownership, and
+  positive surface fragments.
+
+### Fast-Request Telemetry Gate
+
+Implemented after the capture far-SVO visibility gate.
+
+Problem:
+
+- The render/backend smoke and stress-camera capture already enabled fast
+  sparse request planning, but the wrapper inferred that path from the preset
+  and final ownership quality.
+- Public review needs a positive assertion that fast-flight/request scaling was
+  actually active, reserved visible/collision work, and did not silently skip
+  requests under clean stress conditions.
+
+Implemented:
+
+- Added `Assert-FastRequestTelemetryFromLog` to parse
+  `PERF_SPARSE_FAST_REQUEST`.
+- The assertion requires enough telemetry samples, scaled planning
+  (`scale > 1`), nonzero visible/collision/total request budgets, and zero
+  free-page, class-budget, or total-budget request skips.
+- Sparse render/backend smoke and stress-camera capture smoke now call the new
+  assertion.
+- Public review docs now list fast-request telemetry as direct evidence for
+  fast-flight streaming coverage.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipDefaultPhysicsSmoke `
+  -SkipEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Public-review verifier passed and the Release build was already current.
+- Sparse render/backend smoke reported fast-request telemetry `samples=2`,
+  `scale=4`, `spec/vis/coll=24/130/130`, `total=208`, and `skips=0/0/0`.
+- Stress-camera capture ownership remained clean with `samples=100`,
+  `minTerrain=89.04%`, `miss=0`, `unsafeNearMiss=0`, `farSvo=103391`.
+- Stress-camera capture reported fast-request telemetry `samples=3`,
+  `scale=4`, `spec/vis/coll=24/130/130`, `total=208`, and `skips=0/0/0`.
+- GPU sparse-physics smoke still passed with generation/checksum metadata,
+  `missingBelow=0`, and `rejects=0`.
+
+### Sparse GPU Resource Config/Stats Validation
+
+Implemented after sparse surface visibility culling input hardening.
+
+Problem:
+
+- `SparseVoxelGpuResources::Initialize()` guarded the normal defaults, but a
+  malformed caller-provided config could still push public stat helpers or
+  buffer sizing toward oversized counters.
+- Mid clipmap, voxel clipmap, feedback, physics, and edit-delta capacities feed
+  loops and D3D12 resource/view sizing. Extreme values should fail before
+  runtime allocation or public stats computation.
+- Public review hardening should make invalid sparse GPU runtime configs fail
+  closed with a single shared validator instead of depending on each later
+  caller to notice the bad field.
+
+Implemented:
+
+- Added `ValidateSparseVoxelGpuConfigForStats()` and a shared power-of-two
+  helper in `SparseVoxelGpuResources.h`.
+- `SparseVoxelGpuResources::Initialize()` now rejects configs outside the
+  sparse GPU runtime/stat limits before allocating resources.
+- `SparseVoxelGpuResources::ComputeStats()` now returns zero/default stats for
+  invalid configs instead of entering wrapping loops or deriving impossible
+  buffer sizes.
+- The validator now rejects zero or excessive brick pages, invalid page-table
+  and edit-range table capacities, invalid upload ring sizing, wrapping
+  feedback record counts, excessive mid/far clipmap capacities, oversized
+  physics packet limits, and oversized edit-delta/range limits.
+- `VENPODSparseCore` now covers the default valid config plus malformed mid
+  clipmap, voxel clipmap, miss-feedback, physics-packet, and edit-delta limits.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir VENPOD/build -C Release -R VENPODSparseCore --output-on-failure
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build passed.
+- `VENPODSparseCore` passed with the sparse GPU config validation cases.
+- Public-review verifier passed in the compact sparse regression.
+- Sparse render/backend smoke still reported visible far SVO, fast-request
+  telemetry `samples=2`, `scale=4`, `spec/vis/coll=24/130/130`,
+  `total=208`, and `skips=0/0/0`.
+- Mid/far continuity remained positive.
+- Default local sparse physics still reported CPU packet processing and moves
+  with zero GPU packet/apply flags.
+- GPU sparse-physics smoke still reported well-formed generation/checksum
+  metadata, `missingBelow=0`, and `rejects=0`.
+
+### Sparse Surface GPU Config Validation
+
+Implemented after sparse GPU resource config/stat validation.
+
+Problem:
+
+- Sparse surface GPU resources had several initialization checks, but the
+  contract was not exposed as a reusable validation helper for tests and public
+  review.
+- Surface resource capacities drive IA stream sizing, range-table publication,
+  stable draw slots, GPU cull dispatch group counts, cluster metadata, and
+  payload copy budgets.
+- A malformed config should fail before GPU resource allocation, D3D12 view
+  creation, upload staging, or compute dispatch publication.
+
+Implemented:
+
+- Added `ValidateSparseSurfaceGpuConfigForStats()`.
+- `SparseSurfaceGpuResources::Initialize()` now uses that shared validator
+  before allocation.
+- The validator now rejects zero/oversized face capacity, IA stream view
+  overflow, zero range/draw capacity, fixed range tables that are not
+  power-of-two, invalid upload ring sizing, zero or excessive upload slots, GPU
+  cull dispatch group overflow, excessive face/range capacities before resource
+  allocation, fixed range-table capacities that exceed the draw-command-backed
+  visible-record capacity, oversized cluster extents, fast-accept thresholds
+  beyond cluster/face capacity, and bounded payload copy budgets beyond
+  configured capacity while preserving the existing `0` cluster-extent
+  count-only mode.
+- Surface snapshot staging now rechecks remapped draw commands, surface
+  records, and surface clusters against GPU buffer capacity after range
+  allocation and clustering.
+- The fixed range-table load-factor check now uses 64-bit arithmetic.
+- Surface-record fallback bounds now use checked brick/local-to-world
+  conversion instead of direct `coord * 16` arithmetic.
+- `VENPODSparseCore` now covers the default valid surface GPU config and the
+  malformed capacity/allocation/dispatch/cluster/payload cases.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir VENPOD/build -C Release -R VENPODSparseCore --output-on-failure
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build passed after recompiling `SparseSurfaceGpuResources.cpp`,
+  `test_sparse_core.cpp`, and the launcher.
+- `VENPODSparseCore` passed with the sparse surface GPU config validation
+  cases.
+- Public-review verifier passed in the compact sparse regression.
+- Sparse render/backend smoke still reported visible far SVO, fast-request
+  telemetry `samples=2`, `scale=4`, `spec/vis/coll=24/130/130`,
+  `total=208`, `skips=0/0/0`, and positive mid/far continuity.
+- Default local sparse physics still reported CPU packet processing, movement,
+  sparse body-collision authority, and zero GPU packet/apply flags.
+- GPU sparse-physics smoke still reported well-formed generation/checksum
+  metadata, `missingBelow=0`, and `rejects=0`.
+
+### Sparse Surface GPU Cull Dispatch Input Hardening
+
+Implemented after sparse surface GPU config validation.
+
+Problem:
+
+- CPU surface visibility culling already failed open on malformed camera,
+  lookahead, basis, or projection inputs.
+- The GPU cull dispatch still wrote renderer-provided camera position, basis,
+  FOV, aspect, max-distance, and padding values directly into shader constants.
+- A NaN/Inf camera or degenerate basis should not publish malformed constants
+  to the surface cull shader and risk hiding valid sparse surface draws.
+
+Implemented:
+
+- Added finite/clamped GPU cull constant sanitization before dispatch.
+- Camera position falls back to bounded finite values.
+- Forward/right/up basis vectors are checked, normalized, and replaced with
+  canonical axes when non-finite, overflowing, or degenerate.
+- FOV, aspect ratio, max-distance, and padding are clamped to finite runtime
+  ranges before the cull shader sees them.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir VENPOD/build -C Release -R VENPODSparseCore --output-on-failure
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build passed after recompiling `SparseSurfaceGpuResources.cpp`.
+- `VENPODSparseCore` still passed.
+- Public-review verifier passed in the compact sparse regression.
+- Sparse render/backend smoke still reported accepted GPU cull draws, visible
+  far SVO, fast-request telemetry `samples=2`, `scale=4`,
+  `spec/vis/coll=24/130/130`, `total=208`, `skips=0/0/0`, and positive mid/far
+  continuity.
+- Default local sparse physics and GPU sparse physics remained clean.
+
+### Public Review ABI, Readback, and Lifetime Hardening
+
+Implemented after the surface range allocator boundary pass.
+
+Problems found during adversarial review:
+
+- Sparse surface CPU structs had size checks, but not offset-level checks for
+  every shader-visible field.
+- `FrameConstantsCpu` was mirrored by HLSL, but the field offsets were not
+  pinned in C++ and the shared comment for `farFieldGridParams.w` was stale.
+- Legacy dense brush/ground raycast fallback decoded a packed GPU word by
+  type-punning through a `float*`, which is not defined under Release
+  optimization.
+- `GPUBuffer::InitializeWithData` could release its temporary upload resource
+  before the command list consuming the default-heap copy had executed.
+- The fullscreen raymarch root signature still carried a stale unused `b1`
+  32-bit constants parameter.
+- The sparse GPU-raycast smoke exposed a real frame-lifecycle bug: brush/ground
+  raycast readbacks were queued with the swapchain frame index instead of the
+  monotonic producer frame, so delayed readbacks could be mistaken for invalid
+  or same-frame payloads.
+
+Implemented:
+
+- Added `VENPODSparseCore` offset/size/alignment coverage for
+  `SparseSurfaceDrawArgs`, `SparseSurfaceRecord`, and
+  `SparseSurfaceClusterRecord`, and pinned the matching C++/HLSL structs in the
+  public verifier.
+- Added compile-time `FrameConstantsCpu` standard-layout and offset assertions
+  for every shader-visible field, and updated the HLSL ownership-stat comment.
+- Added `DecodeVoxelRaycastPackedWord(float)` using byte copy and routed legacy
+  brush/ground raycast readback decoding through it.
+- Kept the `InitializeWithData` upload resource alive on the owning GPU buffer
+  until reset or shutdown.
+- Removed the stale fullscreen root-signature constants parameter and made the
+  public verifier reject its return.
+- Changed brush/ground raycast queue and retire call sites in the launcher to
+  pass `frameCount`, while keeping the swapchain frame index scoped to the
+  local per-backbuffer metadata arrays.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir .\VENPOD\build -C Release --output-on-failure
+.\VENPOD\rebrun.ps1 -Config Release -NoBuild -SparseGpuRaycastSmoke -ExitAfterFrames 300
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 -Config Release
+```
+
+Observed result:
+
+- Release build passed.
+- Full `ctest` passed.
+- The targeted sparse GPU-raycast smoke reported
+  `SPARSE_GPU_RAYCAST health observed at frame 120: accepted=1 fallback=0
+  rejected=0 miss=0 fallbackPct=0 maxFallbackPct=0 minAccepted=1`.
+- Full sparse regression passed after the monotonic frame-count fix, including
+  the public verifier, dense fallback, flicker, seeded-surface edit
+  persistence, GPU raycast, miss feedback, brush feedback
+  observe/apply/authoritative, default local physics, GPU physics, normal and
+  stress engine captures, and public demo MP4 validation.
+
+Follow-up validation after remapped surface snapshot admission hardening:
+
+- Release build and `VENPODSparseCore` passed with the fixed range-table ratio
+  validation case.
+- Compact sparse regression passed with render/backend, default local physics,
+  and GPU-physics smokes active.
+- Render/backend smoke still reported accepted GPU cull draws, visible far SVO,
+  fast-request telemetry `samples=2`, `scale=4`, `spec/vis/coll=24/130/130`,
+  `total=208`, `skips=0/0/0`, and positive mid/far continuity.
+
+Follow-up validation after sparse surface cluster metadata hardening:
+
+- `BuildSparseSurfaceClusters` now avoids overflow in cluster reserve sizing,
+  narrows record offsets/counts through saturating helpers, accumulates
+  cluster face counts with saturation, and checks cluster extents with 64-bit
+  signed differences instead of `int32_t` subtraction.
+- `SparseSurfaceMortonKey` now builds biased axis bits with 64-bit arithmetic
+  before masking to the 21-bit Morton domain, avoiding signed overflow for
+  extreme brick coordinates during surface-record sorting.
+- `VENPODSparseCore` now covers extreme `int32_t` surface-record bounds so
+  loose records split instead of merging through a wrapped extent, and covers
+  face-count saturation so malformed record totals cannot wrap into a small
+  indirect-draw count. It also covers deterministic sorting for `INT_MIN` and
+  `INT_MAX` brick coordinates.
+- Release build and `VENPODSparseCore` passed.
+- Compact sparse regression passed with the public-review verifier,
+  render/backend smoke, default local sparse physics, and GPU sparse physics
+  active.
+
+Follow-up validation after sparse brick-pool capacity admission hardening:
+
+- `SparseBrickPool::Initialize` now computes the required page-table capacity
+  with 64-bit arithmetic and rejects configurations whose `maxPages * 2`
+  requirement cannot fit in a `uint32_t` page-table capacity.
+- `VENPODSparseCore` now covers zero page capacity and wrapped page-table
+  capacity validation before allocation.
+- Release build and `VENPODSparseCore` passed.
+
+Follow-up validation after sparse edit-delta range-table hardening:
+
+- `BuildSparseEditDeltaBatch` now narrows vector sizes through an explicit
+  saturating helper before applying `uint32_t` GPU caps.
+- Edit-delta range-table insertion failure now marks the batch as both
+  overflowed and truncated, making the unrepresented GPU lookup state explicit
+  to upload scheduling and diagnostics.
+- `VENPODSparseCore` now covers a too-small power-of-two range table that keeps
+  CPU ranges visible but cannot publish every GPU lookup entry.
+- Release build and `VENPODSparseCore` passed.
+
+### Full Sparse Regression After Current Public Review Hardening
+
+Completed after the sparse GPU config, surface GPU config, cull dispatch,
+range allocator, surface cluster metadata, brick-pool capacity admission, and
+edit-delta range-table hardening passes.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 -Config Release
+```
+
+Observed result:
+
+- Public-review verifier passed with `21` required artifacts, `11` public
+  PowerShell scripts, `15` Markdown files, and `24` tracked/staged source
+  artifacts.
+- Release build was current and `VENPODSparseCore` passed.
+- Dense legacy fallback smoke passed with positive dense backend and dispatcher
+  assertions.
+- Sparse render/backend smoke passed with accepted GPU cull draws, visible far
+  SVO (`farSvo=47549`), fast-request telemetry `samples=2`, `scale=4`,
+  `spec/vis/coll=24/130/130`, `total=208`, `skips=0/0/0`, and meaningful
+  simultaneous mid/far ownership.
+- Flicker smoke reported `samples=60`, terrain stability `64.23-64.63%`,
+  `miss=0`, and `unsafeNearMiss=0`.
+- Seeded-surface smoke reported `seedVoxels=405`, `gpuFaces=14475`,
+  `activeDraws=57`, `records=57`, accepted GPU cull draws, and verified sparse
+  edit persistence with `8` overlays, `405` voxels, and `2622` bytes.
+- Brush feedback observe/apply/authoritative, GPU raycast, miss-feedback,
+  default local sparse physics, and GPU sparse-physics smokes passed.
+- Static engine capture ownership reported `samples=125`,
+  `minTerrain=62.24%`, `miss=0`, `unsafeNearMiss=0`, positive mid/far
+  ownership, visible far-SVO pixels (`farSvo=39814`), and positive surface
+  fragments.
+- Stress-camera capture ownership reported `samples=100`,
+  `minTerrain=89.01%`, `miss=0`, `unsafeNearMiss=0`, visible far-SVO pixels
+  (`farSvo=103410`), positive surface fragments, and fast-request telemetry
+  `samples=3`, `scale=4`, `spec/vis/coll=24/130/130`, `total=208`,
+  `skips=0/0/0`.
+- Public demo capture produced a verified `1280x720` / 16-frame MP4 and
+  reported `samples=24`, `minTerrain=62.24%`, `miss=0`,
+  `unsafeNearMiss=0`, visible far-SVO pixels (`farSvo=39813`), and positive
+  surface fragments.
+
+### Sparse Surface Range Allocator Boundary Hardening
+
+Implemented after sparse surface GPU cull dispatch input hardening.
+
+Problem:
+
+- The sparse surface range allocator manages stable face ranges for the
+  surface-authoritative renderer.
+- Normal public configs now bound face capacity, but the allocator is still a
+  shared lifecycle primitive and should not rely on callers to avoid extreme
+  frame tokens or face ranges.
+- Retire-token addition, range coalescing, and stats accumulation used narrow
+  arithmetic that could wrap under malformed/future callers.
+
+Implemented:
+
+- `BeginFrame(frameIndex)` now uses saturating retirement-token addition.
+- Allocation scans now reject free ranges whose requested span would exceed the
+  allocator capacity.
+- Retired/free ranges are clamped to allocator capacity before enqueue or
+  coalescing.
+- Free-range coalescing now computes exclusive ends with 64-bit intermediates
+  and clamps merged spans back to capacity.
+- Allocation generation increments now wrap to a nonzero epoch for both
+  in-place resize and moved-resize paths.
+- Range allocator stats now saturate allocation counts and accumulated
+  capacities instead of wrapping.
+- `VENPODSparseCore` now covers in-place/moved resize generation advancement,
+  saturated retire-token behavior, and `uint32_t` boundary-range coalescing.
+
+Validation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\VENPOD\build.ps1 -Config Release
+ctest --test-dir VENPOD/build -C Release -R VENPODSparseCore --output-on-failure
+powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 `
+  -Config Release -SkipTests -SkipDenseLegacySmoke -SkipFlickerSmoke `
+  -SkipSurfaceSmoke -SkipGpuRaycastSmoke -SkipMissFeedbackSmoke `
+  -SkipBrushFeedbackSmoke -SkipBrushFeedbackApplySmoke `
+  -SkipBrushFeedbackAuthoritativeSmoke -SkipEngineCaptureSmoke `
+  -SkipStressEngineCaptureSmoke -SkipPublicDemoCapture
+```
+
+Observed result:
+
+- Release build passed after recompiling `SparseSurfaceRangeAllocator.cpp`,
+  `SparseSurfaceGpuResources.cpp`, and `test_sparse_core.cpp`.
+- `VENPODSparseCore` passed with the generation-advance, saturated-token, and
+  boundary coalescing cases.
+- Public-review verifier passed in the compact sparse regression.
+- Sparse render/backend smoke still reported accepted GPU cull draws, visible
+  far SVO, fast-request telemetry `samples=2`, `scale=4`,
+  `spec/vis/coll=24/130/130`, `total=208`, `skips=0/0/0`, and positive mid/far
+  continuity.
+- Default local sparse physics and GPU sparse physics remained clean.

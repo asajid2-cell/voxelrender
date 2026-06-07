@@ -1,5 +1,8 @@
 #include "SparseVoxelTypes.h"
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace VENPOD::Simulation {
@@ -8,19 +11,141 @@ int32_t FloorDiv(int32_t value, int32_t divisor) {
     if (divisor <= 0) {
         throw std::invalid_argument("FloorDiv requires a positive divisor");
     }
-    return value >= 0 ? value / divisor : -(((-value) + divisor - 1) / divisor);
+    const int64_t wideValue = static_cast<int64_t>(value);
+    const int64_t wideDivisor = static_cast<int64_t>(divisor);
+    return static_cast<int32_t>(
+        wideValue >= 0
+            ? wideValue / wideDivisor
+            : -(((-wideValue) + wideDivisor - 1) / wideDivisor));
 }
 
 uint32_t FloorMod(int32_t value, uint32_t divisor) {
     if (divisor == 0) {
         throw std::invalid_argument("FloorMod requires a non-zero divisor");
     }
-    const int32_t signedDivisor = static_cast<int32_t>(divisor);
-    int32_t result = value % signedDivisor;
+    const int64_t signedDivisor = static_cast<int64_t>(divisor);
+    int64_t result = static_cast<int64_t>(value) % signedDivisor;
     if (result < 0) {
         result += signedDivisor;
     }
     return static_cast<uint32_t>(result);
+}
+
+bool TryWorldVoxelFromBrickLocal(int32_t brickCoord, uint8_t local, int32_t* outWorldVoxel) {
+    if (!outWorldVoxel) {
+        return false;
+    }
+    const int64_t worldVoxel =
+        static_cast<int64_t>(brickCoord) * static_cast<int64_t>(SPARSE_BRICK_SIZE) +
+        static_cast<int64_t>(local);
+    if (worldVoxel < static_cast<int64_t>(std::numeric_limits<int32_t>::min()) ||
+        worldVoxel > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+        return false;
+    }
+    *outWorldVoxel = static_cast<int32_t>(worldVoxel);
+    return true;
+}
+
+namespace {
+
+bool TryFloorToInt32(float value, int32_t* out) {
+    if (!out || !std::isfinite(value)) {
+        return false;
+    }
+    const double floored = std::floor(static_cast<double>(value));
+    if (floored < static_cast<double>(std::numeric_limits<int32_t>::min()) ||
+        floored > static_cast<double>(std::numeric_limits<int32_t>::max())) {
+        return false;
+    }
+    *out = static_cast<int32_t>(floored);
+    return true;
+}
+
+bool TryCeilToInt32(float value, int32_t* out) {
+    if (!out || !std::isfinite(value)) {
+        return false;
+    }
+    const double ceiled = std::ceil(static_cast<double>(value));
+    if (ceiled < static_cast<double>(std::numeric_limits<int32_t>::min()) ||
+        ceiled > static_cast<double>(std::numeric_limits<int32_t>::max())) {
+        return false;
+    }
+    *out = static_cast<int32_t>(ceiled);
+    return true;
+}
+
+} // namespace
+
+bool TryBuildSparseBrushVoxelBounds(
+    float worldPositionX,
+    float worldPositionY,
+    float worldPositionZ,
+    float radius,
+    float strength,
+    SparseBrushVoxelBounds* outBounds)
+{
+    if (!outBounds ||
+        !std::isfinite(worldPositionX) ||
+        !std::isfinite(worldPositionY) ||
+        !std::isfinite(worldPositionZ) ||
+        !std::isfinite(radius) ||
+        !std::isfinite(strength) ||
+        radius <= 0.0f) {
+        return false;
+    }
+
+    const float boundedRadius = std::min(radius, SPARSE_MAX_BRUSH_RADIUS);
+    const float boundedStrength = std::clamp(strength, 0.0f, 1.0f);
+    const int64_t radiusCeil =
+        static_cast<int64_t>(std::ceil(static_cast<double>(boundedRadius))) + 2;
+
+    int32_t centerX = 0;
+    int32_t centerY = 0;
+    int32_t centerZ = 0;
+    int32_t ceilX = 0;
+    int32_t ceilY = 0;
+    int32_t ceilZ = 0;
+    if (!TryFloorToInt32(worldPositionX, &centerX) ||
+        !TryFloorToInt32(worldPositionY, &centerY) ||
+        !TryFloorToInt32(worldPositionZ, &centerZ) ||
+        !TryCeilToInt32(worldPositionX, &ceilX) ||
+        !TryCeilToInt32(worldPositionY, &ceilY) ||
+        !TryCeilToInt32(worldPositionZ, &ceilZ)) {
+        return false;
+    }
+
+    const int64_t startX = static_cast<int64_t>(centerX) - radiusCeil;
+    const int64_t startY = static_cast<int64_t>(centerY) - radiusCeil;
+    const int64_t startZ = static_cast<int64_t>(centerZ) - radiusCeil;
+    const int64_t endX = static_cast<int64_t>(ceilX) + radiusCeil + 1;
+    const int64_t endY = static_cast<int64_t>(ceilY) + radiusCeil + 1;
+    const int64_t endZ = static_cast<int64_t>(ceilZ) + radiusCeil + 1;
+    const int64_t minInt = static_cast<int64_t>(std::numeric_limits<int32_t>::min());
+    const int64_t maxInt = static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+    if (startX < minInt || startY < minInt || startZ < minInt ||
+        endX > maxInt || endY > maxInt || endZ > maxInt ||
+        endX <= startX || endY <= startY || endZ <= startZ) {
+        return false;
+    }
+
+    const uint64_t countX = static_cast<uint64_t>(endX - startX);
+    const uint64_t countY = static_cast<uint64_t>(endY - startY);
+    const uint64_t countZ = static_cast<uint64_t>(endZ - startZ);
+    if (countX > SPARSE_MAX_BRUSH_VOXELS ||
+        countY > SPARSE_MAX_BRUSH_VOXELS / countX ||
+        countZ > SPARSE_MAX_BRUSH_VOXELS / (countX * countY)) {
+        return false;
+    }
+
+    outBounds->startX = static_cast<int32_t>(startX);
+    outBounds->startY = static_cast<int32_t>(startY);
+    outBounds->startZ = static_cast<int32_t>(startZ);
+    outBounds->endX = static_cast<int32_t>(endX);
+    outBounds->endY = static_cast<int32_t>(endY);
+    outBounds->endZ = static_cast<int32_t>(endZ);
+    outBounds->radius = boundedRadius;
+    outBounds->strength = boundedStrength;
+    return true;
 }
 
 BrickCoord BrickCoord::FromWorldVoxel(int32_t worldX, int32_t worldY, int32_t worldZ) {

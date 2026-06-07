@@ -11,31 +11,153 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 namespace VENPOD::Graphics {
 
+struct SparseSurfaceIaStreamSizing {
+    uint32_t vertexCount = 0;
+    uint32_t indexCount = 0;
+    uint64_t vertexBytes = 0;
+    uint64_t indexBytes = 0;
+};
+
+inline bool TryBuildSparseSurfaceIaStreamSizing(
+    uint32_t maxFaces,
+    SparseSurfaceIaStreamSizing& outSizing)
+{
+    outSizing = {};
+    constexpr uint32_t verticesPerFace = 4u;
+    constexpr uint32_t indicesPerFace = 6u;
+    constexpr uint32_t elementBytes = static_cast<uint32_t>(sizeof(uint32_t));
+    constexpr uint32_t maxViewBytes = std::numeric_limits<uint32_t>::max();
+
+    if (maxFaces == 0u) {
+        return false;
+    }
+    if (maxFaces > std::numeric_limits<uint32_t>::max() / indicesPerFace ||
+        maxFaces > std::numeric_limits<uint32_t>::max() / verticesPerFace) {
+        return false;
+    }
+    if (maxFaces > maxViewBytes / (verticesPerFace * elementBytes) ||
+        maxFaces > maxViewBytes / (indicesPerFace * elementBytes)) {
+        return false;
+    }
+
+    outSizing.vertexCount = maxFaces * verticesPerFace;
+    outSizing.indexCount = maxFaces * indicesPerFace;
+    outSizing.vertexBytes = static_cast<uint64_t>(outSizing.vertexCount) * elementBytes;
+    outSizing.indexBytes = static_cast<uint64_t>(outSizing.indexCount) * elementBytes;
+    return true;
+}
+
 struct SparseSurfaceGpuConfig {
-    uint32_t maxFaces = 1u << 20;
-    uint32_t maxBrickRanges = 16384;
-    uint32_t maxDrawCommands = 16384;
+    // Aggressive variable-dt movement can keep more than 3.3M exact sparse
+    // surface faces visible while small dirty/removal updates fragment the
+    // range allocator. Keep enough contiguous slack for atomic old->new
+    // surface replacement instead of exposing allocation-overflow frames.
+    uint32_t maxFaces = 1u << 23;
+    uint32_t maxBrickRanges = 32768;
+    uint32_t maxDrawCommands = 65535;
     uint32_t uploadRingSlots = 3;
-    uint32_t uploadBytesPerSlot = 8 * 1024 * 1024;
-    uint32_t maxPayloadCopyRegionsPerFrame = 128;
-    uint32_t maxPayloadCopyFacesPerFrame = 256 * 1024;
+    uint32_t uploadBytesPerSlot = 32 * 1024 * 1024;
+    uint32_t maxPayloadCopyRegionsPerFrame = 512;
+    uint32_t maxPayloadCopyFacesPerFrame = 1024 * 1024;
     uint32_t rangeRetirementDelayFrames = 3;
     uint32_t surfaceRecordsPerCluster = 32;
     uint32_t surfaceClusterMaxExtentVoxels = 128;
-    uint32_t surfaceClusterFastAcceptMaxRecords = 8;
-    uint32_t surfaceClusterFastAcceptMaxFaces = 2048;
+    // Cluster fast-accept can expose partial exact-surface groups as detached
+    // foreground bands. Keep GPU culling per-record unless a safer grouped
+    // visibility contract is added.
+    uint32_t surfaceClusterFastAcceptMaxRecords = 0;
+    uint32_t surfaceClusterFastAcceptMaxFaces = 0;
     bool useRangeAllocator = true;
     bool useFixedRangeTable = true;
     bool useStableDrawSlots = true;
     bool compactStableDrawCommands = true;
     bool useGpuCull = true;
+    bool incrementalMetadataAdds = false;
 };
+
+inline bool IsSparseSurfaceGpuPowerOfTwo(uint32_t value) {
+    return value != 0u && (value & (value - 1u)) == 0u;
+}
+
+inline bool ValidateSparseSurfaceGpuConfigForStats(const SparseSurfaceGpuConfig& config) {
+    constexpr uint32_t maxUploadRingSlots = 3u;
+    constexpr uint32_t maxUploadBytesPerSlot = 256u * 1024u * 1024u;
+    constexpr uint32_t maxSurfaceFaces = 1u << 23;
+    constexpr uint32_t maxSurfaceBrickRanges = 1u << 20;
+    constexpr uint32_t maxSurfaceRecordsPerCluster = 64u;
+    constexpr uint32_t maxSurfaceClusterExtentVoxels = 4096u;
+    constexpr uint32_t maxGpuCullDispatchGroups = 65535u;
+
+    SparseSurfaceIaStreamSizing ignoredSizing;
+    if (!TryBuildSparseSurfaceIaStreamSizing(config.maxFaces, ignoredSizing)) {
+        return false;
+    }
+    if (config.maxFaces > maxSurfaceFaces) {
+        return false;
+    }
+    if (config.maxBrickRanges == 0u || config.maxDrawCommands == 0u) {
+        return false;
+    }
+    if (config.maxBrickRanges > maxSurfaceBrickRanges) {
+        return false;
+    }
+    if (config.maxDrawCommands > maxGpuCullDispatchGroups) {
+        return false;
+    }
+    if (config.useFixedRangeTable &&
+        config.maxBrickRanges > config.maxDrawCommands * 2u) {
+        return false;
+    }
+    if (config.uploadRingSlots == 0u || config.uploadRingSlots > maxUploadRingSlots) {
+        return false;
+    }
+    if (config.uploadBytesPerSlot == 0u) {
+        return false;
+    }
+    if (config.uploadBytesPerSlot > maxUploadBytesPerSlot) {
+        return false;
+    }
+    if (config.useFixedRangeTable && !IsSparseSurfaceGpuPowerOfTwo(config.maxBrickRanges)) {
+        return false;
+    }
+    if (config.surfaceRecordsPerCluster == 0u ||
+        config.surfaceRecordsPerCluster > maxSurfaceRecordsPerCluster) {
+        return false;
+    }
+    if (config.surfaceClusterMaxExtentVoxels > maxSurfaceClusterExtentVoxels) {
+        return false;
+    }
+    if (config.surfaceClusterFastAcceptMaxRecords > config.surfaceRecordsPerCluster) {
+        return false;
+    }
+    if (config.surfaceClusterFastAcceptMaxFaces > config.maxFaces) {
+        return false;
+    }
+    if (config.maxPayloadCopyRegionsPerFrame != 0u &&
+        config.maxPayloadCopyRegionsPerFrame > config.maxDrawCommands) {
+        return false;
+    }
+    if (config.maxPayloadCopyFacesPerFrame != 0u &&
+        config.maxPayloadCopyFacesPerFrame > config.maxFaces) {
+        return false;
+    }
+    return true;
+}
+
+inline bool IsSparseSurfaceCullStatsReadbackRetirable(
+    bool pending,
+    uint32_t queuedFrame,
+    uint32_t retireFrame)
+{
+    return pending && queuedFrame != retireFrame;
+}
 
 struct SparseSurfaceGpuStats {
     bool initialized = false;
@@ -65,6 +187,7 @@ struct SparseSurfaceGpuStats {
     bool fixedRangeTableEnabled = false;
     bool stableDrawSlotsEnabled = false;
     bool compactStableDrawCommandsEnabled = false;
+    bool incrementalMetadataAddsEnabled = false;
     bool gpuCullEnabled = false;
     uint32_t iaStreamCapacityFaces = 0;
     uint32_t iaStreamVertexCount = 0;
@@ -136,6 +259,33 @@ struct SparseSurfaceGpuStats {
     bool uploadOverflowLastFrame = false;
 };
 
+struct SparseSurfaceGpuBrickDebugInfo {
+    bool payloadResident = false;
+    bool surfaceRecordPresent = false;
+    bool drawSlotPresent = false;
+    bool rangePresent = false;
+    uint32_t payloadFaceCount = 0;
+    uint32_t surfaceRecordFaceCount = 0;
+    uint32_t surfaceRecordFirstFace = 0;
+    uint32_t surfaceRecordFlags = 0;
+    uint32_t surfaceRecordIndex = 0;
+    uint32_t drawSlot = 0;
+    uint32_t rangeFirstFace = 0;
+    uint32_t rangeFaceCount = 0;
+    uint32_t rangeFlags = 0;
+};
+
+struct SparseSurfaceGpuCullDebugInfo {
+    bool hasRecord = false;
+    bool hasCluster = false;
+    uint32_t surfaceRecordIndex = 0;
+    uint32_t clusterIndex = 0;
+    uint32_t clusterClass = 0;
+    uint32_t recordClass = 0;
+    bool clusterRejected = false;
+    bool recordRejected = false;
+};
+
 struct SparseSurfaceFaceCopyRegion {
     uint64_t uploadOffset = 0;
     uint32_t destFirstFace = 0;
@@ -148,9 +298,72 @@ struct SparseSurfaceBufferCopyRegion {
     uint64_t byteCount = 0;
 };
 
+inline bool IsSparseSurfaceGpuByteRangeInBounds(
+    uint64_t offset,
+    uint64_t byteCount,
+    uint64_t capacityBytes)
+{
+    return offset <= capacityBytes && byteCount <= capacityBytes - offset;
+}
+
+inline bool IsSparseSurfaceGpuFaceCopyRegionInBounds(
+    const SparseSurfaceFaceCopyRegion& region,
+    uint64_t uploadCapacityBytes,
+    uint64_t faceCapacityBytes)
+{
+    const uint64_t faceSize = sizeof(Simulation::SparseSurfaceFace);
+    if (region.faceCount > std::numeric_limits<uint64_t>::max() / faceSize ||
+        region.destFirstFace > std::numeric_limits<uint64_t>::max() / faceSize) {
+        return false;
+    }
+    const uint64_t byteCount = static_cast<uint64_t>(region.faceCount) * faceSize;
+    const uint64_t destOffset = static_cast<uint64_t>(region.destFirstFace) * faceSize;
+    return IsSparseSurfaceGpuByteRangeInBounds(region.uploadOffset, byteCount, uploadCapacityBytes) &&
+        IsSparseSurfaceGpuByteRangeInBounds(destOffset, byteCount, faceCapacityBytes);
+}
+
+inline bool IsSparseSurfaceGpuBufferCopyRegionInBounds(
+    const SparseSurfaceBufferCopyRegion& region,
+    uint64_t uploadCapacityBytes,
+    uint64_t destCapacityBytes)
+{
+    return IsSparseSurfaceGpuByteRangeInBounds(region.uploadOffset, region.byteCount, uploadCapacityBytes) &&
+        IsSparseSurfaceGpuByteRangeInBounds(region.destOffset, region.byteCount, destCapacityBytes);
+}
+
 struct SparseSurfacePayloadMirrorUpdate {
     Simulation::BrickCoord coord;
     std::vector<Simulation::SparseSurfaceFace> faces;
+};
+
+struct SparseSurfaceRangeMirrorPatch {
+    uint32_t index = 0;
+    Simulation::SparseSurfaceBrickRange value;
+};
+
+struct SparseSurfaceDrawArgsMirrorPatch {
+    uint32_t index = 0;
+    Simulation::SparseSurfaceDrawArgs value;
+};
+
+struct SparseSurfaceRecordMirrorPatch {
+    uint32_t index = 0;
+    Simulation::SparseSurfaceRecord value;
+};
+
+struct SparseSurfaceClusterMirrorPatch {
+    uint32_t index = 0;
+    Simulation::SparseSurfaceClusterRecord value;
+};
+
+struct SparseSurfaceDrawSlotRetire {
+    Simulation::BrickCoord coord;
+    uint32_t slot = std::numeric_limits<uint32_t>::max();
+};
+
+struct SparseSurfaceDrawSlotAssign {
+    Simulation::BrickCoord coord;
+    uint32_t slot = std::numeric_limits<uint32_t>::max();
 };
 
 struct SparseSurfaceUploadTicket {
@@ -174,6 +387,10 @@ struct SparseSurfaceUploadTicket {
     uint32_t visibleBricks = 0;
     uint32_t culledBricks = 0;
     uint32_t deferredPayloadBricks = 0;
+    bool payloadOnly = false;
+    bool incrementalMetadataPatches = false;
+    bool hasUploadWriteOffsetRollback = false;
+    uint64_t uploadWriteOffsetBeforeStage = 0;
     std::vector<Simulation::BrickCoord> uploadedPayloadBricks;
     std::vector<Simulation::BrickCoord> removedBricks;
     std::vector<SparseSurfacePayloadMirrorUpdate> payloadMirrorUpdates;
@@ -182,6 +399,16 @@ struct SparseSurfaceUploadTicket {
     std::vector<SparseSurfaceBufferCopyRegion> drawArgsCopyRegions;
     std::vector<SparseSurfaceBufferCopyRegion> surfaceRecordCopyRegions;
     std::vector<SparseSurfaceBufferCopyRegion> surfaceClusterCopyRegions;
+    std::vector<SparseSurfaceRangeMirrorPatch> rangeMirrorPatches;
+    std::vector<SparseSurfaceDrawArgsMirrorPatch> drawArgsMirrorPatches;
+    std::vector<SparseSurfaceRecordMirrorPatch> surfaceRecordMirrorPatches;
+    std::vector<SparseSurfaceClusterMirrorPatch> surfaceClusterMirrorPatches;
+    std::vector<SparseSurfaceDrawSlotRetire> drawSlotRetires;
+    std::vector<SparseSurfaceDrawSlotAssign> drawSlotAssignments;
+    uint32_t drawArgsMirrorSizeAfterPatch = 0;
+    uint32_t drawSlotOccupiedSizeAfterPatch = 0;
+    uint32_t surfaceRecordMirrorSizeAfterPatch = 0;
+    uint32_t surfaceClusterMirrorSizeAfterPatch = 0;
     std::vector<Simulation::SparseSurfaceBrickRange> rangeMirrorAfterCopy;
     std::vector<Simulation::SparseSurfaceDrawArgs> drawArgsMirrorAfterCopy;
     std::vector<Simulation::SparseSurfaceRecord> surfaceRecordMirrorAfterCopy;
@@ -189,6 +416,8 @@ struct SparseSurfaceUploadTicket {
     std::unordered_map<Simulation::BrickCoord, uint32_t, Simulation::BrickCoordHash> drawSlotByCoordAfterCopy;
     std::vector<uint8_t> drawSlotOccupiedAfterCopy;
     std::vector<uint32_t> freeDrawSlotsAfterCopy;
+    bool hasRangeAllocatorRollback = false;
+    Simulation::SparseSurfaceRangeAllocator rangeAllocatorBeforeStage;
 };
 
 class SparseSurfaceGpuResources {
@@ -212,6 +441,9 @@ public:
         uint64_t completedFenceValue = 0,
         uint64_t currentFrameFenceValue = 0);
     bool StageSnapshot(
+        const Simulation::SparseSurfaceGpuSnapshot& snapshot,
+        SparseSurfaceUploadTicket* outTicket = nullptr);
+    bool StageDirtyPayloadSnapshot(
         const Simulation::SparseSurfaceGpuSnapshot& snapshot,
         SparseSurfaceUploadTicket* outTicket = nullptr);
     bool EmitCopy(ID3D12GraphicsCommandList* commandList, const SparseSurfaceUploadTicket& ticket);
@@ -248,9 +480,32 @@ public:
     const D3D12_INDEX_BUFFER_VIEW& IndexBufferView() const { return m_indexBufferView; }
     uint32_t VertexIdCapacityFaces() const { return m_vertexIdCapacityFaces; }
     bool IsGpuCullEnabled() const { return m_config.useGpuCull && m_surfaceCullPipeline.IsValid(); }
+    bool TryGetBrickDebugInfo(
+        const Simulation::BrickCoord& coord,
+        SparseSurfaceGpuBrickDebugInfo* outInfo = nullptr) const;
+    bool TryClassifyBrickGpuCull(
+        const Simulation::BrickCoord& coord,
+        float cameraX,
+        float cameraY,
+        float cameraZ,
+        float forwardX,
+        float forwardY,
+        float forwardZ,
+        float rightX,
+        float rightY,
+        float rightZ,
+        float upX,
+        float upY,
+        float upZ,
+        float fovYRadians,
+        float aspectRatio,
+        float maxDistance,
+        float padding,
+        SparseSurfaceGpuCullDebugInfo* outInfo) const;
 
 private:
     Result<void> CreateVertexIdStream(ID3D12Device* device);
+    void RebuildSurfaceRecordLookup();
 
     SparseSurfaceGpuConfig m_config;
     SparseSurfaceGpuStats m_stats;
@@ -262,6 +517,7 @@ private:
     GPUBuffer m_drawCountBuffer;
     std::array<GPUBuffer, 3> m_cullStatsReadback;
     std::array<bool, 3> m_cullStatsReadbackPending = {};
+    std::array<uint32_t, 3> m_cullStatsReadbackQueuedFrames = {};
     std::array<UploadBuffer, 3> m_uploadRing;
     std::array<UploadBuffer, 3> m_cullConstantUploads;
     GPUBuffer m_vertexIdStream;
@@ -284,6 +540,8 @@ private:
     std::vector<Simulation::SparseSurfaceDrawArgs> m_drawArgsMirror;
     std::vector<Simulation::SparseSurfaceRecord> m_surfaceRecordMirror;
     std::vector<Simulation::SparseSurfaceClusterRecord> m_surfaceClusterMirror;
+    std::unordered_map<Simulation::BrickCoord, uint32_t, Simulation::BrickCoordHash> m_surfaceRecordIndexByCoord;
+    std::vector<uint32_t> m_surfaceRecordClusterIndex;
     std::unordered_map<Simulation::BrickCoord, uint32_t, Simulation::BrickCoordHash> m_drawSlotByCoord;
     std::unordered_map<
         Simulation::BrickCoord,

@@ -34,7 +34,38 @@ if (-not $isAdmin) {
     Write-Info "Note: Not running as Administrator. Some operations may require elevation."
 }
 
-$projectRoot = $PSScriptRoot
+$projectRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
+
+function Assert-ProjectChildPath {
+    param(
+        [string]$Path,
+        [string]$Label
+    )
+
+    $root = [System.IO.Path]::GetFullPath($projectRoot).TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar)
+    $full = [System.IO.Path]::GetFullPath($Path).TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar)
+    $separator = [System.IO.Path]::DirectorySeparatorChar
+    if ($full -eq $root) {
+        throw "Refusing to modify $Label because it resolves to the project root: $full"
+    }
+    if (-not $full.StartsWith($root + $separator, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to modify $Label outside the project root: $full"
+    }
+}
+
+function Remove-ProjectChildPath {
+    param(
+        [string]$Path,
+        [string]$Label
+    )
+
+    Assert-ProjectChildPath -Path $Path -Label $Label
+    Remove-Item -LiteralPath $Path -Recurse -Force
+}
 
 # =============================================================================
 # STEP 1: Check Prerequisites & Tools
@@ -179,23 +210,32 @@ $imguiMain = Join-Path $imguiDir "imgui.h"
 
 if (-not (Test-Path $imguiMain)) {
     Write-Info "Downloading Dear ImGui..."
-    $imguiZip = "$env:TEMP\imgui.zip"
+    $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("venpod-imgui-" + [System.Guid]::NewGuid().ToString("N"))
+    $imguiZip = Join-Path $tempRoot "imgui.zip"
     $imguiVersion = "v1.91.6"
-    Invoke-WebRequest -Uri "https://github.com/ocornut/imgui/archive/refs/tags/$imguiVersion.zip" -OutFile $imguiZip
+    try {
+        New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+        Invoke-WebRequest -Uri "https://github.com/ocornut/imgui/archive/refs/tags/$imguiVersion.zip" -OutFile $imguiZip
 
-    # Extract to temp first
-    $tempExtract = "$env:TEMP\imgui-extract"
-    if (Test-Path $tempExtract) { Remove-Item -Recurse -Force $tempExtract }
-    Expand-Archive $imguiZip -DestinationPath $tempExtract -Force
+        # Extract to temp first
+        $tempExtract = Join-Path $tempRoot "extract"
+        Expand-Archive $imguiZip -DestinationPath $tempExtract -Force
 
-    # Move contents to vendor/imgui
-    $extractedFolder = Get-ChildItem $tempExtract | Select-Object -First 1
-    if (Test-Path $imguiDir) { Remove-Item -Recurse -Force $imguiDir }
-    Move-Item $extractedFolder.FullName $imguiDir
+        # Move contents to vendor/imgui
+        $extractedFolder = Get-ChildItem -LiteralPath $tempExtract -Directory | Select-Object -First 1
+        if (-not $extractedFolder) {
+            throw "Downloaded ImGui archive did not contain an extracted source directory"
+        }
+        Assert-ProjectChildPath -Path $imguiDir -Label "vendor/imgui"
+        if (Test-Path $imguiDir) { Remove-ProjectChildPath -Path $imguiDir -Label "vendor/imgui" }
+        Move-Item -LiteralPath $extractedFolder.FullName -Destination $imguiDir
 
-    Remove-Item $imguiZip -Force
-    Remove-Item -Recurse -Force $tempExtract -ErrorAction SilentlyContinue
-    Write-Success "ImGui downloaded to vendor/imgui"
+        Write-Success "ImGui downloaded to vendor/imgui"
+    } finally {
+        if (Test-Path $tempRoot) {
+            Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 } else {
     Write-Success "ImGui already present"
 }
@@ -213,7 +253,7 @@ Write-Info "Toolchain:  $toolchainFile"
 # Clean build directory if it exists
 if (Test-Path $buildDir) {
     try {
-        Remove-Item -Recurse -Force $buildDir -ErrorAction Stop
+        Remove-ProjectChildPath -Path $buildDir -Label "build directory"
     } catch {
         Write-Info "Build directory is in use; reusing existing folder."
     }

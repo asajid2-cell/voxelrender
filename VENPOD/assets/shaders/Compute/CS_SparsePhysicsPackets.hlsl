@@ -23,6 +23,7 @@ RWStructuredBuffer<uint> gDiagnostics : register(u1);
 
 static const uint SPARSE_INVALID_PAGE = 0xFFFFFFFFu;
 static const uint SPARSE_TOMBSTONE_PAGE = 0xFFFFFFFEu;
+static const uint SPARSE_PAGE_TABLE_LOOKUP_PROBES = 256u;
 static const uint SPARSE_BRICK_SIZE = 16u;
 static const uint SPARSE_BRICK_VOXEL_COUNT = 4096u;
 static const uint PACKET_STATUS_CONSUMED = 1u;
@@ -74,7 +75,7 @@ bool LookupSparseBrick(int3 brickCoord, out BrickPageEntry result) {
     const uint mask = capacity - 1u;
     const uint start = HashSparseBrickCoord(brickCoord) & mask;
     [loop]
-    for (uint probe = 0u; probe < 64u; ++probe) {
+    for (uint probe = 0u; probe < SPARSE_PAGE_TABLE_LOOKUP_PROBES; ++probe) {
         const uint slot = (start + probe) & mask;
         const BrickPageEntry entry = gPageTable[slot];
         if (entry.pageIndex == SPARSE_INVALID_PAGE) {

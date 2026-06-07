@@ -4,8 +4,15 @@
 #include "Utils/BitPacking.h"
 
 #include <algorithm>
+#include <atomic>
+#include <array>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstdlib>
 #include <limits>
+#include <mutex>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -22,11 +29,51 @@ constexpr uint32_t SPARSE_BRUSH_SHAPE_CYLINDER = 2;
 constexpr uint32_t SPARSE_PHYSICS_MATERIAL_SAND = 1u << 0u;
 constexpr uint32_t SPARSE_PHYSICS_MATERIAL_WATER = 1u << 1u;
 constexpr uint32_t SPARSE_PHYSICS_MATERIAL_LAVA = 1u << 2u;
-constexpr uint32_t SPARSE_PHYSICS_PACKET_STATUS_HAS_EXPECTED_PAGE = 2u;
-constexpr uint32_t SPARSE_PHYSICS_PACKET_STATUS_PAGE_MATCH = 4u;
-constexpr uint32_t SPARSE_PHYSICS_PACKET_STATUS_PAGE_STALE = 8u;
-constexpr uint32_t SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL = 16u;
-constexpr uint32_t SPARSE_PHYSICS_PACKET_STATUS_EDIT_DELTA_HIT = 64u;
+constexpr uint32_t SPARSE_PHYSICS_PACKET_STATUS_KNOWN_MASK =
+    SPARSE_PHYSICS_PACKET_STATUS_CONSUMED |
+    SPARSE_PHYSICS_PACKET_STATUS_HAS_EXPECTED_PAGE |
+    SPARSE_PHYSICS_PACKET_STATUS_PAGE_MATCH |
+    SPARSE_PHYSICS_PACKET_STATUS_PAGE_STALE |
+    SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL |
+    SPARSE_PHYSICS_PACKET_STATUS_MISSING_BELOW |
+    SPARSE_PHYSICS_PACKET_STATUS_EDIT_DELTA_HIT;
+constexpr float kMaxSparseRaycastDistance = 8192.0f;
+constexpr uint32_t kMaxSparseRaycastSteps = 32768;
+constexpr uint32_t kMaxSparseLocalPhysicsWorkPackets = 2048;
+constexpr uint32_t kStreamingTicketStageCpuGenerated = 1u << 0u;
+constexpr uint32_t kStreamingTicketStageGpuUploaded = 1u << 1u;
+constexpr uint32_t kStreamingTicketStageSurfaceReady = 1u << 2u;
+constexpr uint32_t kStreamingTicketStagePagePublished = 1u << 3u;
+
+template <typename Candidate, typename Compare>
+void SortBestEvictionCandidates(
+    std::vector<Candidate>& candidates,
+    uint32_t maxCandidates,
+    Compare compare)
+{
+    if (candidates.empty()) {
+        return;
+    }
+
+    static const bool usePartialSort = []() {
+        const char* env = std::getenv("VENPOD_SPARSE_EVICTION_PARTIAL_SORT");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    if (!usePartialSort) {
+        std::sort(candidates.begin(), candidates.end(), compare);
+        return;
+    }
+
+    const size_t limit = std::min<size_t>(
+        static_cast<size_t>(std::max(1u, maxCandidates)),
+        candidates.size());
+    if (limit < candidates.size()) {
+        std::partial_sort(candidates.begin(), candidates.begin() + limit, candidates.end(), compare);
+        candidates.resize(limit);
+    } else {
+        std::sort(candidates.begin(), candidates.end(), compare);
+    }
+}
 
 struct SparseWorldVoxelKey {
     int32_t x = 0;
@@ -48,10 +95,6 @@ struct SparseWorldVoxelKeyHash {
     }
 };
 
-int32_t SparseWorldVoxelFromLocal(int32_t brickCoord, uint8_t local) {
-    return brickCoord * SPARSE_BRICK_SIZE + static_cast<int32_t>(local);
-}
-
 uint8_t HashVoxelVariant(int32_t x, int32_t y, int32_t z, uint32_t seed) {
     uint32_t hash = 2166136261u ^ seed;
     hash = (hash ^ static_cast<uint32_t>(x)) * 16777619u;
@@ -65,6 +108,20 @@ uint8_t HashVoxelVariant(int32_t x, int32_t y, int32_t z, uint32_t seed) {
     return static_cast<uint8_t>(hash & 0xFFu);
 }
 
+bool BrushFeedbackVoxelAlreadyApplied(uint32_t currentVoxel, uint32_t feedbackVoxel) {
+    if (currentVoxel == feedbackVoxel) {
+        return true;
+    }
+
+    // GPU brush feedback can lag one or two edit-delta uploads. During a held
+    // brush, the GPU may keep proposing the same material with a new random
+    // variant even though the CPU authoritative world already contains the
+    // visible result. Treat material-equivalent feedback as a no-op so repeated
+    // stamps do not churn sparse pages, surface extraction, and mid-clipmap
+    // invalidation.
+    return Utils::UnpackMaterial(currentVoxel) == Utils::UnpackMaterial(feedbackVoxel);
+}
+
 uint32_t PackPhysicsRegionPoint(uint8_t x, uint8_t y, uint8_t z) {
     return static_cast<uint32_t>(x) |
            (static_cast<uint32_t>(y) << 8u) |
@@ -76,6 +133,285 @@ LocalVoxelCoord UnpackPhysicsRegionPoint(uint32_t packed) {
         static_cast<uint8_t>(packed & 0xFFu),
         static_cast<uint8_t>((packed >> 8u) & 0xFFu),
         static_cast<uint8_t>((packed >> 16u) & 0xFFu)};
+}
+
+bool IsValidPhysicsLocal(LocalVoxelCoord local) {
+    return local.x < SPARSE_BRICK_SIZE &&
+           local.y < SPARSE_BRICK_SIZE &&
+           local.z < SPARSE_BRICK_SIZE;
+}
+
+bool TryFloorToInt32(float value, int32_t* out) {
+    if (!out || !std::isfinite(value)) {
+        return false;
+    }
+    const double floored = std::floor(static_cast<double>(value));
+    if (floored < static_cast<double>(std::numeric_limits<int32_t>::min()) ||
+        floored > static_cast<double>(std::numeric_limits<int32_t>::max())) {
+        return false;
+    }
+    *out = static_cast<int32_t>(floored);
+    return true;
+}
+
+bool TryStepInt32(int32_t value, int32_t step, int32_t* out) {
+    if (!out) {
+        return false;
+    }
+    const int64_t stepped = static_cast<int64_t>(value) + static_cast<int64_t>(step);
+    if (stepped < static_cast<int64_t>(std::numeric_limits<int32_t>::min()) ||
+        stepped > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+        return false;
+    }
+    *out = static_cast<int32_t>(stepped);
+    return true;
+}
+
+bool TryOffsetBrickCoord(const BrickCoord& coord, int32_t dx, int32_t dy, int32_t dz, BrickCoord* out) {
+    if (!out) {
+        return false;
+    }
+    return TryStepInt32(coord.x, dx, &out->x) &&
+           TryStepInt32(coord.y, dy, &out->y) &&
+           TryStepInt32(coord.z, dz, &out->z);
+}
+
+struct SurfaceWorkerColumnKey {
+    int32_t x = 0;
+    int32_t z = 0;
+
+    bool operator==(const SurfaceWorkerColumnKey& other) const noexcept {
+        return x == other.x && z == other.z;
+    }
+};
+
+struct SurfaceWorkerColumnKeyHash {
+    size_t operator()(const SurfaceWorkerColumnKey& key) const noexcept {
+        uint64_t h = 1469598103934665603ull;
+        h ^= static_cast<uint32_t>(key.x);
+        h *= 1099511628211ull;
+        h ^= static_cast<uint32_t>(key.z);
+        h *= 1099511628211ull;
+        return static_cast<size_t>(h);
+    }
+};
+
+struct SurfaceWorkerColumnCacheEntry {
+    float height = 0.0f;
+    float relief = 0.0f;
+    int32_t reliefSampleOffset = 0;
+    bool reliefValid = false;
+};
+
+using SurfaceWorkerColumnCache =
+    std::unordered_map<SurfaceWorkerColumnKey, SurfaceWorkerColumnCacheEntry, SurfaceWorkerColumnKeyHash>;
+
+SparseSurfaceExtractionResult ExtractSurfaceNoEditWithTerrain(
+    const SparseTerrainGenerator& terrain,
+    const GeneratedSparseBrick& brick,
+    SurfaceWorkerColumnCache& columnCache)
+{
+    const auto cachedHeightAt = [&terrain, &columnCache](int32_t worldX, int32_t worldZ) {
+        const SurfaceWorkerColumnKey key{worldX, worldZ};
+        auto columnIt = columnCache.find(key);
+        if (columnIt != columnCache.end()) {
+            return columnIt->second.height;
+        }
+
+        SurfaceWorkerColumnCacheEntry entry;
+        entry.height = terrain.HeightAt(worldX, worldZ);
+        auto [insertedIt, inserted] = columnCache.emplace(key, entry);
+        (void)inserted;
+        return insertedIt->second.height;
+    };
+    const auto cachedReliefAt = [
+        &columnCache,
+        &cachedHeightAt](int32_t worldX, int32_t worldZ, int32_t sampleOffset) {
+        const int32_t offset = std::max(1, sampleOffset);
+        const SurfaceWorkerColumnKey key{worldX, worldZ};
+        auto columnIt = columnCache.find(key);
+        if (columnIt == columnCache.end()) {
+            SurfaceWorkerColumnCacheEntry entry;
+            entry.height = cachedHeightAt(worldX, worldZ);
+            columnIt = columnCache.emplace(key, entry).first;
+        }
+        if (columnIt->second.reliefValid && columnIt->second.reliefSampleOffset == offset) {
+            return columnIt->second.relief;
+        }
+
+        int32_t xMinus = worldX;
+        int32_t xPlus = worldX;
+        int32_t zMinus = worldZ;
+        int32_t zPlus = worldZ;
+        (void)TryStepInt32(worldX, -offset, &xMinus);
+        (void)TryStepInt32(worldX, offset, &xPlus);
+        (void)TryStepInt32(worldZ, -offset, &zMinus);
+        (void)TryStepInt32(worldZ, offset, &zPlus);
+
+        const float center = columnIt->second.height;
+        float localMin = center;
+        float localMax = center;
+        const float samples[] = {
+            cachedHeightAt(xMinus, worldZ),
+            cachedHeightAt(xPlus, worldZ),
+            cachedHeightAt(worldX, zMinus),
+            cachedHeightAt(worldX, zPlus),
+        };
+        for (float height : samples) {
+            localMin = std::min(localMin, height);
+            localMax = std::max(localMax, height);
+        }
+
+        columnIt->second.relief = localMax - localMin;
+        columnIt->second.reliefSampleOffset = offset;
+        columnIt->second.reliefValid = true;
+        return columnIt->second.relief;
+    };
+
+    constexpr int32_t kSurfaceHaloColumnSize = SPARSE_BRICK_SIZE + 2;
+    int32_t brickWorldMinX = 0;
+    int32_t brickWorldMinZ = 0;
+    bool haloCacheValid =
+        TryWorldVoxelFromBrickLocal(brick.coord.x, 0, &brickWorldMinX) &&
+        TryWorldVoxelFromBrickLocal(brick.coord.z, 0, &brickWorldMinZ);
+    int32_t haloMinX = 0;
+    int32_t haloMinZ = 0;
+    if (haloCacheValid &&
+        (!TryStepInt32(brickWorldMinX, -1, &haloMinX) ||
+         !TryStepInt32(brickWorldMinZ, -1, &haloMinZ))) {
+        haloCacheValid = false;
+    }
+
+    std::array<float, kSurfaceHaloColumnSize * kSurfaceHaloColumnSize> haloHeights = {};
+    std::array<float, kSurfaceHaloColumnSize * kSurfaceHaloColumnSize> haloRelief = {};
+    if (haloCacheValid) {
+        for (int32_t z = 0; z < kSurfaceHaloColumnSize; ++z) {
+            for (int32_t x = 0; x < kSurfaceHaloColumnSize; ++x) {
+                const int32_t worldX = haloMinX + x;
+                const int32_t worldZ = haloMinZ + z;
+                const size_t index = static_cast<size_t>(x + z * kSurfaceHaloColumnSize);
+                haloHeights[index] = cachedHeightAt(worldX, worldZ);
+                haloRelief[index] = cachedReliefAt(worldX, worldZ, 4);
+            }
+        }
+    }
+
+    auto neighborSampler = [
+        &terrain,
+        haloCacheValid,
+        haloMinX,
+        haloMinZ,
+        &haloHeights,
+        &haloRelief](int32_t worldX, int32_t worldY, int32_t worldZ) {
+        if (haloCacheValid &&
+            worldX >= haloMinX &&
+            worldX < haloMinX + kSurfaceHaloColumnSize &&
+            worldZ >= haloMinZ &&
+            worldZ < haloMinZ + kSurfaceHaloColumnSize) {
+            const int32_t localX = worldX - haloMinX;
+            const int32_t localZ = worldZ - haloMinZ;
+            const size_t index = static_cast<size_t>(localX + localZ * kSurfaceHaloColumnSize);
+            return terrain.SampleGeneratedVoxelWithColumn(
+                worldX,
+                worldY,
+                worldZ,
+                haloHeights[index],
+                haloRelief[index]);
+        }
+        return terrain.SampleGeneratedVoxel(worldX, worldY, worldZ);
+    };
+
+    return SparseSurfaceExtractor::Extract(brick, neighborSampler);
+}
+
+int64_t BrickCoordDelta(int32_t coord, int32_t center) {
+    return static_cast<int64_t>(coord) - static_cast<int64_t>(center);
+}
+
+uint64_t AbsInt64ToUint64(int64_t value) {
+    if (value >= 0) {
+        return static_cast<uint64_t>(value);
+    }
+    return static_cast<uint64_t>(-(value + 1)) + 1u;
+}
+
+bool WithinKeepRadius(int64_t dx, int64_t dy, int64_t dz, uint32_t keepRadiusXz, uint32_t keepRadiusY) {
+    return AbsInt64ToUint64(dx) <= static_cast<uint64_t>(keepRadiusXz) &&
+           AbsInt64ToUint64(dy) <= static_cast<uint64_t>(keepRadiusY) &&
+           AbsInt64ToUint64(dz) <= static_cast<uint64_t>(keepRadiusXz);
+}
+
+uint64_t SaturatingWeightedSquare(uint64_t value, uint64_t weight) {
+    constexpr uint64_t kMaxScore = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    if (value == 0 || weight == 0) {
+        return 0;
+    }
+    if (value > kMaxScore / value) {
+        return kMaxScore;
+    }
+    const uint64_t square = value * value;
+    if (square > kMaxScore / weight) {
+        return kMaxScore;
+    }
+    return square * weight;
+}
+
+uint64_t SaturatingAddScore(uint64_t a, uint64_t b) {
+    constexpr uint64_t kMaxScore = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    if (a > kMaxScore - b) {
+        return kMaxScore;
+    }
+    return a + b;
+}
+
+int64_t SparseBrickDistanceScore(int64_t dx, int64_t dy, int64_t dz) {
+    constexpr uint64_t kMaxScore = static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    uint64_t score = SaturatingWeightedSquare(AbsInt64ToUint64(dx), 1u);
+    score = SaturatingAddScore(score, SaturatingWeightedSquare(AbsInt64ToUint64(dz), 1u));
+    score = SaturatingAddScore(score, SaturatingWeightedSquare(AbsInt64ToUint64(dy), 4u));
+    return score >= kMaxScore
+        ? std::numeric_limits<int64_t>::max()
+        : static_cast<int64_t>(score);
+}
+
+int64_t SaturatingAddInt64(int64_t a, int64_t b) {
+    if (b > 0 && a > std::numeric_limits<int64_t>::max() - b) {
+        return std::numeric_limits<int64_t>::max();
+    }
+    if (b < 0 && a < std::numeric_limits<int64_t>::min() - b) {
+        return std::numeric_limits<int64_t>::min();
+    }
+    return a + b;
+}
+
+bool GpuPhysicsEditRevisionsMatch(
+    bool proposalUsedEditDelta,
+    uint32_t proposalSourceRevision,
+    uint32_t proposalDestinationRevision,
+    uint32_t currentSourceRevision,
+    uint32_t currentDestinationRevision)
+{
+    if (!proposalUsedEditDelta) {
+        return true;
+    }
+    if (proposalSourceRevision == 0u && proposalDestinationRevision == 0u) {
+        return false;
+    }
+    if (proposalSourceRevision != 0u && currentSourceRevision != proposalSourceRevision) {
+        return false;
+    }
+    if (proposalDestinationRevision != 0u &&
+        currentDestinationRevision != proposalDestinationRevision) {
+        return false;
+    }
+    return true;
+}
+
+bool GpuPhysicsProposalStatusWellFormed(uint32_t status) {
+    if ((status & SPARSE_PHYSICS_PACKET_STATUS_CONSUMED) == 0u) {
+        return false;
+    }
+    return (status & ~SPARSE_PHYSICS_PACKET_STATUS_KNOWN_MASK) == 0u;
 }
 
 template <typename TRegion>
@@ -130,8 +466,28 @@ uint8_t ResidencyRank(SparseResidencyClass residencyClass) {
     return static_cast<uint8_t>(residencyClass);
 }
 
+uint8_t StreamingLaneRank(SparseStreamingLane lane) {
+    switch (lane) {
+        case SparseStreamingLane::PublicCritical:
+            return 4;
+        case SparseStreamingLane::Visible:
+            return 3;
+        case SparseStreamingLane::Repair:
+            return 2;
+        case SparseStreamingLane::Prefetch:
+            return 1;
+        case SparseStreamingLane::Cache:
+        default:
+            return 0;
+    }
+}
+
 size_t ResidencyClassQueueIndex(SparseResidencyClass residencyClass) {
     return static_cast<size_t>(ResidencyRank(residencyClass));
+}
+
+size_t OwnershipCriticalQueueIndex(bool ownershipCritical) {
+    return ownershipCritical ? 1u : 0u;
 }
 
 void IncrementResidencyClassCounter(
@@ -158,6 +514,34 @@ void IncrementResidencyClassCounter(
     }
 }
 
+void IncrementStreamingLaneCounter(
+    SparseStreamingLane lane,
+    uint32_t& cache,
+    uint32_t& prefetch,
+    uint32_t& repair,
+    uint32_t& visible,
+    uint32_t& publicCritical)
+{
+    switch (lane) {
+        case SparseStreamingLane::PublicCritical:
+            ++publicCritical;
+            break;
+        case SparseStreamingLane::Visible:
+            ++visible;
+            break;
+        case SparseStreamingLane::Repair:
+            ++repair;
+            break;
+        case SparseStreamingLane::Prefetch:
+            ++prefetch;
+            break;
+        case SparseStreamingLane::Cache:
+        default:
+            ++cache;
+            break;
+    }
+}
+
 uint32_t LatestPriorityTouch(const BrickResidentRecord& record) {
     uint32_t latest = record.lastTouchedFrame;
     latest = std::max(latest, record.lastSpeculativeFrame);
@@ -171,31 +555,49 @@ bool HasResidencyFlag(uint32_t flags, BrickResidencyFlags flag) {
     return (flags & static_cast<uint32_t>(flag)) != 0u;
 }
 
-int64_t QueuePriorityScore(const BrickResidentRecord& record, uint32_t currentFrame) {
+int64_t QueuePriorityScore(
+    const BrickResidentRecord& record,
+    uint32_t currentFrame,
+    bool streamingLanePriority)
+{
     const uint32_t latestTouch = LatestPriorityTouch(record);
     const uint32_t age = currentFrame > latestTouch ? currentFrame - latestTouch : 0u;
     const uint32_t freshness = currentFrame == 0
         ? latestTouch
         : (100000u - std::min(age, 100000u));
-    return static_cast<int64_t>(ResidencyRank(record.residencyClass)) * 1000000000ll +
-           static_cast<int64_t>(freshness);
+    const int64_t requestPriority = std::clamp<int64_t>(
+        static_cast<int64_t>(record.queuePriority),
+        -500000ll,
+        500000ll);
+    const int64_t lanePriority = streamingLanePriority
+        ? static_cast<int64_t>(StreamingLaneRank(record.streamingLane)) * 200000000000ll
+        : 0ll;
+    return static_cast<int64_t>(ResidencyRank(record.residencyClass)) * 1000000000000ll +
+           lanePriority +
+           static_cast<int64_t>(freshness) * 1000000ll +
+           requestPriority;
 }
 
 int64_t UploadValueScore(
     const BrickResidentRecord& record,
     const BrickCoord& focus,
-    uint32_t currentFrame)
+    uint32_t currentFrame,
+    bool streamingLanePriority)
 {
-    const int64_t dx = static_cast<int64_t>(record.coord.x) - focus.x;
-    const int64_t dy = static_cast<int64_t>(record.coord.y) - focus.y;
-    const int64_t dz = static_cast<int64_t>(record.coord.z) - focus.z;
-    const int64_t distancePenalty = dx * dx + dz * dz + dy * dy * 4;
+    const int64_t dx = BrickCoordDelta(record.coord.x, focus.x);
+    const int64_t dy = BrickCoordDelta(record.coord.y, focus.y);
+    const int64_t dz = BrickCoordDelta(record.coord.z, focus.z);
+    const int64_t distancePenalty = SparseBrickDistanceScore(dx, dy, dz);
     const uint32_t latestTouch = LatestPriorityTouch(record);
     const uint32_t age = currentFrame > latestTouch ? currentFrame - latestTouch : 0u;
     const uint32_t freshness = currentFrame == 0
         ? latestTouch
         : (100000u - std::min(age, 100000u));
+    const int64_t lanePriority = streamingLanePriority
+        ? static_cast<int64_t>(StreamingLaneRank(record.streamingLane)) * 200000000000ll
+        : 0ll;
     return static_cast<int64_t>(ResidencyRank(record.residencyClass)) * 1000000000000ll +
+           lanePriority +
            static_cast<int64_t>(freshness) * 10000ll -
            distancePenalty;
 }
@@ -203,7 +605,8 @@ int64_t UploadValueScore(
 void SortQueuedBricksByPriority(
     std::deque<BrickCoord>& queue,
     const SparseBrickPool& pool,
-    uint32_t currentFrame)
+    uint32_t currentFrame,
+    bool streamingLanePriority)
 {
     if (queue.size() <= 1) {
         return;
@@ -225,7 +628,7 @@ void SortQueuedBricksByPriority(
         if (!pool.GetRecord(coord, &record)) {
             continue;
         }
-        sorted.push_back({coord, QueuePriorityScore(record, currentFrame)});
+        sorted.push_back({coord, QueuePriorityScore(record, currentFrame, streamingLanePriority)});
     }
 
     std::sort(sorted.begin(), sorted.end(), [](const QueuedBrick& a, const QueuedBrick& b) {
@@ -245,7 +648,8 @@ void SortQueuedBricksByValue(
     std::deque<BrickCoord>& queue,
     const SparseBrickPool& pool,
     const BrickCoord& focus,
-    uint32_t currentFrame)
+    uint32_t currentFrame,
+    bool streamingLanePriority)
 {
     if (queue.size() <= 1) {
         return;
@@ -267,7 +671,7 @@ void SortQueuedBricksByValue(
         if (!pool.GetRecord(coord, &record)) {
             continue;
         }
-        sorted.push_back({coord, UploadValueScore(record, focus, currentFrame)});
+        sorted.push_back({coord, UploadValueScore(record, focus, currentFrame, streamingLanePriority)});
     }
 
     std::sort(sorted.begin(), sorted.end(), [](const QueuedBrick& a, const QueuedBrick& b) {
@@ -276,6 +680,59 @@ void SortQueuedBricksByValue(
         }
         return a.coord < b.coord;
     });
+
+    queue.clear();
+    for (const QueuedBrick& queued : sorted) {
+        queue.push_back(queued.coord);
+    }
+}
+
+void PartialSortQueuedBricksByValue(
+    std::deque<BrickCoord>& queue,
+    const SparseBrickPool& pool,
+    const BrickCoord& focus,
+    uint32_t currentFrame,
+    size_t frontCount,
+    bool streamingLanePriority)
+{
+    if (queue.size() <= 1 || frontCount == 0) {
+        return;
+    }
+
+    struct QueuedBrick {
+        BrickCoord coord;
+        int64_t score = 0;
+    };
+
+    std::vector<QueuedBrick> sorted;
+    sorted.reserve(queue.size());
+    std::unordered_set<BrickCoord, BrickCoordHash> seen;
+    for (const BrickCoord& coord : queue) {
+        if (!seen.insert(coord).second) {
+            continue;
+        }
+        BrickResidentRecord record;
+        if (!pool.GetRecord(coord, &record)) {
+            continue;
+        }
+        sorted.push_back({coord, UploadValueScore(record, focus, currentFrame, streamingLanePriority)});
+    }
+
+    const auto better = [](const QueuedBrick& a, const QueuedBrick& b) {
+        if (a.score != b.score) {
+            return a.score > b.score;
+        }
+        return a.coord < b.coord;
+    };
+
+    const size_t selectedCount = std::min(frontCount, sorted.size());
+    if (selectedCount == sorted.size()) {
+        std::sort(sorted.begin(), sorted.end(), better);
+    } else if (selectedCount > 0) {
+        const auto selectedEnd = sorted.begin() + static_cast<std::ptrdiff_t>(selectedCount);
+        std::nth_element(sorted.begin(), selectedEnd, sorted.end(), better);
+        std::sort(sorted.begin(), selectedEnd, better);
+    }
 
     queue.clear();
     for (const QueuedBrick& queued : sorted) {
@@ -305,6 +762,24 @@ bool PopFrontQueuedBrick(
     return false;
 }
 
+bool RemoveAllQueuedCoord(std::deque<BrickCoord>& queue, const BrickCoord& coord) {
+    const auto oldSize = queue.size();
+    queue.erase(std::remove(queue.begin(), queue.end(), coord), queue.end());
+    return queue.size() != oldSize;
+}
+
+template <size_t N>
+bool RemoveAllClassQueueCoord(
+    std::array<std::deque<BrickCoord>, N>& queues,
+    const BrickCoord& coord)
+{
+    bool removed = false;
+    for (auto& queue : queues) {
+        removed = RemoveAllQueuedCoord(queue, coord) || removed;
+    }
+    return removed;
+}
+
 bool BuildUploadPacketForCoord(
     const BrickCoord& coord,
     SparseBrickPool& pool,
@@ -329,6 +804,7 @@ bool BuildUploadPacketForCoord(
     outPacket->pageIndex = record.pageIndex;
     outPacket->generation = record.generation;
     outPacket->residencyClass = record.residencyClass;
+    outPacket->streamingLane = record.streamingLane;
     outPacket->partialVoxelUpload = false;
     outPacket->voxelStartIndex = 0;
     outPacket->voxelCount = SPARSE_BRICK_VOXEL_COUNT;
@@ -385,20 +861,64 @@ float BrushSdf(
 
 } // namespace
 
+size_t SparseVoxelWorld::TerrainSurfaceColumnKeyHash::operator()(
+    const TerrainSurfaceColumnKey& key) const noexcept
+{
+    uint32_t hash = 2166136261u;
+    hash = (hash ^ static_cast<uint32_t>(key.x)) * 16777619u;
+    hash = (hash ^ static_cast<uint32_t>(key.z)) * 16777619u;
+    hash ^= hash >> 16;
+    hash *= 2246822519u;
+    hash ^= hash >> 13;
+    hash *= 3266489917u;
+    hash ^= hash >> 16;
+    return static_cast<size_t>(hash);
+}
+
+SparseVoxelWorld::~SparseVoxelWorld() {
+    StopPersistentExactGenerationWorkers();
+    StopAsyncExactGenerationWorker();
+}
+
 bool SparseVoxelWorld::Initialize(const SparseVoxelWorldConfig& config) {
+    StopPersistentExactGenerationWorkers();
+    StopAsyncExactGenerationWorker();
     m_config = config;
+    m_config.parallelExactGenerationMaxWorkers =
+        std::clamp<uint32_t>(m_config.parallelExactGenerationMaxWorkers, 1u, 16u);
+    m_config.parallelExactGenerationMinBricks =
+        std::clamp<uint32_t>(m_config.parallelExactGenerationMinBricks, 2u, 256u);
+    m_config.parallelSurfaceExtractionMaxWorkers =
+        std::clamp<uint32_t>(m_config.parallelSurfaceExtractionMaxWorkers, 1u, 16u);
+    m_config.parallelSurfaceExtractionMinBricks =
+        std::clamp<uint32_t>(m_config.parallelSurfaceExtractionMinBricks, 2u, 256u);
+    m_config.parallelSurfaceExtractionMaxBatch =
+        std::clamp<uint32_t>(m_config.parallelSurfaceExtractionMaxBatch, 1u, 256u);
+    m_config.terrainColumnCacheMaxEntries =
+        std::clamp<uint32_t>(m_config.terrainColumnCacheMaxEntries, 4096u, 1048576u);
+    m_config.incrementalPressureTrimScanBudget =
+        std::clamp<uint32_t>(m_config.incrementalPressureTrimScanBudget, 1024u, 262144u);
     m_terrain = SparseTerrainGenerator(config.seed);
     m_edits = SparseEditStore{};
     m_generated.clear();
+    m_deferredGeneratedDownstreamQueue.clear();
+    m_deferredGeneratedDownstreamSet.clear();
     m_pendingSurfaceBricks.clear();
     m_knownEmptyGeneratedBricks.clear();
     m_generationQueue.clear();
     for (auto& classQueue : m_generationClassQueues) {
         classQueue.clear();
     }
+    for (auto& ownershipWorklist : m_generationOwnershipWorklists) {
+        ownershipWorklist.clear();
+    }
+    m_generationOwnershipWorklistEntries.clear();
     m_uploadQueue.clear();
     for (auto& classQueue : m_uploadClassQueues) {
         classQueue.clear();
+    }
+    for (auto& ownershipQueue : m_uploadOwnershipQueues) {
+        ownershipQueue.clear();
     }
     m_invalidationQueue.clear();
     m_surfaceExtractionQueue.clear();
@@ -406,28 +926,97 @@ bool SparseVoxelWorld::Initialize(const SparseVoxelWorldConfig& config) {
     for (auto& classQueue : m_surfaceClassQueues) {
         classQueue.clear();
     }
+    for (auto& ownershipQueue : m_surfaceOwnershipQueues) {
+        ownershipQueue.clear();
+    }
     m_generationQueuePriorityDirty = false;
     m_uploadQueuePriorityDirty = false;
     m_surfaceExtractionQueuePriorityDirty = false;
+    m_deferredGeneratedDownstreamPromotedFrame = 0xFFFFFFFFu;
+    m_uploadClassValueSortValid.fill(false);
+    m_uploadClassValueSortFocus = {};
+    m_uploadClassValueSortFrame = {};
+    m_surfaceClassValueSortValid.fill(false);
+    m_surfaceClassValueSortFocus = {};
     m_queueClassStatsDirty = true;
     m_cachedGenerationQueueSize = 0;
     m_cachedUploadQueueSize = 0;
     m_cachedSurfacePendingSize = 0;
     m_generationQueueClassCounts = {};
     m_uploadQueueClassCounts = {};
+    m_generationQueueLaneCounts = {};
+    m_uploadQueueLaneCounts = {};
     m_surfaceQueueClassCounts = {};
+    m_surfaceQueueLaneCounts = {};
     m_deferredDirtyAfterUpload.clear();
     m_renderDirtyRegions.clear();
     m_surfaceDirtyRegions.clear();
+    m_streamingTickets.clear();
+    m_streamingTicketPendingStageOwnershipCounts = {};
+    m_streamingTicketCompletedLastFrame = 0;
+    m_streamingTicketProtectedSortsLastFrame = 0;
+    m_surfaceTerrainColumnCache.clear();
+    m_surfaceTerrainColumnCache.reserve(std::min<uint32_t>(
+        m_config.terrainColumnCacheMaxEntries,
+        32768u));
+    {
+        std::lock_guard<std::mutex> lock(m_asyncExactGenerationMutex);
+        m_asyncExactGenerationQueue.clear();
+        m_asyncExactGenerationResults.clear();
+        m_asyncExactGenerationPending.clear();
+        m_asyncExactGenerationStop = false;
+    }
+    m_asyncExactGenerationEnqueuedLastFrame = 0;
+    m_asyncExactGenerationCompletedLastFrame = 0;
+    m_asyncExactGenerationAppliedLastFrame = 0;
+    m_asyncExactGenerationDeferredLowPriorityApplyLastFrame = 0;
+    m_asyncExactGenerationDiscardedLastFrame = 0;
+    m_asyncExactGenerationSyncFallbackLastFrame = 0;
+    m_asyncExactGenerationEnqueuedCacheLaneLastFrame = 0;
+    m_asyncExactGenerationEnqueuedPrefetchLaneLastFrame = 0;
+    m_asyncExactGenerationEnqueuedRepairLaneLastFrame = 0;
+    m_asyncExactGenerationEnqueuedVisibleLaneLastFrame = 0;
+    m_asyncExactGenerationEnqueuedPublicCriticalLaneLastFrame = 0;
+    m_asyncExactGenerationAppliedCacheLaneLastFrame = 0;
+    m_asyncExactGenerationAppliedPrefetchLaneLastFrame = 0;
+    m_asyncExactGenerationAppliedRepairLaneLastFrame = 0;
+    m_asyncExactGenerationAppliedVisibleLaneLastFrame = 0;
+    m_asyncExactGenerationAppliedPublicCriticalLaneLastFrame = 0;
+    m_asyncExactGenerationWorkerMsLastFrame = 0.0f;
+    m_asyncExactGenerationApplyMsLastFrame = 0.0f;
+    m_asyncExactGenerationStatsFrame = 0;
+    m_parallelExactGenerationBricksLastFrame = 0;
+    m_parallelExactGenerationWorkersLastFrame = 0;
+    m_parallelExactGenerationWallMsLastFrame = 0.0f;
     m_surfaceCache.Clear();
     m_evictedBricksLastFrame = 0;
     m_emptyRequestsSkippedLastFrame = 0;
     m_surfaceBricksExtractedLastFrame = 0;
     m_surfaceEmptyUploadsSkippedLastFrame = 0;
+    m_surfaceBuriedSolidFastPathBricksLastFrame = 0;
+    m_surfaceClassValueSortCallsLastFrame = 0;
+    m_surfaceClassValueSortCacheHitsLastFrame = 0;
+    m_surfaceStrictTimeBudgetUnsortedPopsLastFrame = 0;
+    m_parallelSurfaceExtractionBricksLastFrame = 0;
+    m_parallelSurfaceExtractionWorkersLastFrame = 0;
+    m_parallelSurfaceExtractionWallMsLastFrame = 0.0f;
+    m_streamingTicketCompletedLastFrame = 0;
+    m_streamingTicketProtectedSortsLastFrame = 0;
+    m_deferredGeneratedDownstreamPromotedLastFrame = 0;
+    m_deferredGeneratedDownstreamStaleLastFrame = 0;
     m_renderDirtyVoxelsQueuedLastFrame = 0;
     m_renderDirtyFullUploadsQueuedLastFrame = 0;
     m_renderDirtyUploadDeferredLastFrame = 0;
     m_renderDirtyNonResidentLastFrame = 0;
+    m_trimScanCallsLastFrame = 0;
+    m_trimRecordsScannedLastFrame = 0;
+    m_trimCandidatesLastFrame = 0;
+    m_replacementScanCallsLastFrame = 0;
+    m_replacementRecordsScannedLastFrame = 0;
+    m_replacementCandidatesLastFrame = 0;
+    m_trimResidentCursor = 0;
+    m_trimBackgroundResidentCursor = 0;
+    m_trimQueuedBackgroundCursor = 0;
 
     if (!m_pool.Initialize(config.maxBrickPages, config.pageTableCapacity)) {
         return false;
@@ -444,6 +1033,31 @@ void SparseVoxelWorld::BeginFrame() {
     m_generatedVisibleBricksLastFrame = 0;
     m_generatedCollisionBricksLastFrame = 0;
     m_generatedEditedBricksLastFrame = 0;
+    m_generatedCacheLaneBricksLastFrame = 0;
+    m_generatedPrefetchLaneBricksLastFrame = 0;
+    m_generatedRepairLaneBricksLastFrame = 0;
+    m_generatedVisibleLaneBricksLastFrame = 0;
+    m_generatedPublicCriticalLaneBricksLastFrame = 0;
+    m_deferredGeneratedDownstreamPromotedLastFrame = 0;
+    m_deferredGeneratedDownstreamStaleLastFrame = 0;
+    m_asyncExactGenerationEnqueuedLastFrame = 0;
+    m_asyncExactGenerationCompletedLastFrame = 0;
+    m_asyncExactGenerationAppliedLastFrame = 0;
+    m_asyncExactGenerationDeferredLowPriorityApplyLastFrame = 0;
+    m_asyncExactGenerationDiscardedLastFrame = 0;
+    m_asyncExactGenerationSyncFallbackLastFrame = 0;
+    m_asyncExactGenerationEnqueuedCacheLaneLastFrame = 0;
+    m_asyncExactGenerationEnqueuedPrefetchLaneLastFrame = 0;
+    m_asyncExactGenerationEnqueuedRepairLaneLastFrame = 0;
+    m_asyncExactGenerationEnqueuedVisibleLaneLastFrame = 0;
+    m_asyncExactGenerationEnqueuedPublicCriticalLaneLastFrame = 0;
+    m_asyncExactGenerationAppliedCacheLaneLastFrame = 0;
+    m_asyncExactGenerationAppliedPrefetchLaneLastFrame = 0;
+    m_asyncExactGenerationAppliedRepairLaneLastFrame = 0;
+    m_asyncExactGenerationAppliedVisibleLaneLastFrame = 0;
+    m_asyncExactGenerationAppliedPublicCriticalLaneLastFrame = 0;
+    m_asyncExactGenerationWorkerMsLastFrame = 0.0f;
+    m_asyncExactGenerationApplyMsLastFrame = 0.0f;
     m_uploadedSpeculativeBricksLastFrame = 0;
     m_uploadedVisibleBricksLastFrame = 0;
     m_uploadedCollisionBricksLastFrame = 0;
@@ -454,10 +1068,33 @@ void SparseVoxelWorld::BeginFrame() {
     m_surfaceCollisionBricksExtractedLastFrame = 0;
     m_surfaceEditedBricksExtractedLastFrame = 0;
     m_surfaceEmptyUploadsSkippedLastFrame = 0;
+    m_surfaceBuriedSolidFastPathBricksLastFrame = 0;
+    m_surfaceClassValueSortCallsLastFrame = 0;
+    m_surfaceClassValueSortCacheHitsLastFrame = 0;
+    m_surfaceStrictTimeBudgetUnsortedPopsLastFrame = 0;
+    m_parallelSurfaceExtractionBricksLastFrame = 0;
+    m_parallelSurfaceExtractionWorkersLastFrame = 0;
+    m_parallelSurfaceExtractionWallMsLastFrame = 0.0f;
+    m_terrainColumnCacheFrameStats = {};
+    m_terrainColumnCacheClearedLastFrame = 0;
+    if (!m_config.persistentTerrainColumnCache) {
+        m_surfaceTerrainColumnCache.clear();
+        m_terrainColumnCacheClearedLastFrame = 1;
+    } else if (m_surfaceTerrainColumnCache.size() >
+        static_cast<size_t>(m_config.terrainColumnCacheMaxEntries)) {
+        m_surfaceTerrainColumnCache.clear();
+        m_terrainColumnCacheClearedLastFrame = 1;
+    }
     m_renderDirtyVoxelsQueuedLastFrame = 0;
     m_renderDirtyFullUploadsQueuedLastFrame = 0;
     m_renderDirtyUploadDeferredLastFrame = 0;
     m_renderDirtyNonResidentLastFrame = 0;
+    m_trimScanCallsLastFrame = 0;
+    m_trimRecordsScannedLastFrame = 0;
+    m_trimCandidatesLastFrame = 0;
+    m_replacementScanCallsLastFrame = 0;
+    m_replacementRecordsScannedLastFrame = 0;
+    m_replacementCandidatesLastFrame = 0;
     m_surfaceCache.BeginFrame();
     RefreshStats();
 }
@@ -480,8 +1117,39 @@ void SparseVoxelWorld::FlushStats() {
     m_statsRefreshDeferred = wasDeferred;
 }
 
+uint32_t SparseVoxelWorld::GenerationClassQueueSize() const {
+    uint32_t total = 0;
+    for (const auto& queue : m_generationClassQueues) {
+        total += static_cast<uint32_t>(queue.size());
+    }
+    return total;
+}
+
+uint32_t SparseVoxelWorld::UploadClassQueueSize() const {
+    uint32_t total = 0;
+    for (const auto& queue : m_uploadClassQueues) {
+        total += static_cast<uint32_t>(queue.size());
+    }
+    return total;
+}
+
+uint32_t SparseVoxelWorld::SurfaceClassQueueSize() const {
+    uint32_t total = 0;
+    for (const auto& queue : m_surfaceClassQueues) {
+        total += static_cast<uint32_t>(queue.size());
+    }
+    return total;
+}
+
 void SparseVoxelWorld::MarkUploadQueueOrderDirty() {
     m_uploadQueuePriorityDirty = true;
+    m_uploadClassValueSortValid.fill(false);
+    MarkQueueAccountingDirty();
+}
+
+void SparseVoxelWorld::MarkSurfaceQueueOrderDirty() {
+    m_surfaceExtractionQueuePriorityDirty = true;
+    m_surfaceClassValueSortValid.fill(false);
     MarkQueueAccountingDirty();
 }
 
@@ -493,6 +1161,9 @@ void SparseVoxelWorld::RebuildQueueClassStats() {
     m_generationQueueClassCounts = {};
     m_uploadQueueClassCounts = {};
     m_surfaceQueueClassCounts = {};
+    m_generationQueueLaneCounts = {};
+    m_uploadQueueLaneCounts = {};
+    m_surfaceQueueLaneCounts = {};
 
     const auto addQueueClass = [this](const BrickCoord& coord, QueueClassCounts& counts) {
         BrickResidentRecord record;
@@ -516,14 +1187,42 @@ void SparseVoxelWorld::RebuildQueueClassStats() {
         }
     };
 
+    const auto addQueueLane = [this](const BrickCoord& coord, QueueLaneCounts& counts) {
+        BrickResidentRecord record;
+        if (!m_pool.GetRecord(coord, &record)) {
+            return;
+        }
+        switch (record.streamingLane) {
+            case SparseStreamingLane::PublicCritical:
+                ++counts.publicCritical;
+                break;
+            case SparseStreamingLane::Visible:
+                ++counts.visible;
+                break;
+            case SparseStreamingLane::Repair:
+                ++counts.repair;
+                break;
+            case SparseStreamingLane::Prefetch:
+                ++counts.prefetch;
+                break;
+            case SparseStreamingLane::Cache:
+            default:
+                ++counts.cache;
+                break;
+        }
+    };
+
     for (const BrickCoord& coord : m_generationQueue) {
         addQueueClass(coord, m_generationQueueClassCounts);
+        addQueueLane(coord, m_generationQueueLaneCounts);
     }
     for (const BrickCoord& coord : m_uploadQueue) {
         addQueueClass(coord, m_uploadQueueClassCounts);
+        addQueueLane(coord, m_uploadQueueLaneCounts);
     }
     for (const auto& pending : m_pendingSurfaceBricks) {
         addQueueClass(pending.first, m_surfaceQueueClassCounts);
+        addQueueLane(pending.first, m_surfaceQueueLaneCounts);
     }
 
     m_cachedGenerationQueueSize = static_cast<uint32_t>(m_generationQueue.size());
@@ -537,36 +1236,79 @@ void SparseVoxelWorld::QueueGenerationCoordBack(const BrickCoord& coord) {
     if (!m_pool.GetRecord(coord, &record)) {
         return;
     }
+    RemoveAllQueuedCoord(m_generationQueue, coord);
+    RemoveAllClassQueueCoord(m_generationClassQueues, coord);
+    if (m_config.streamingTicketGenerationOwnershipQueues) {
+        RemoveFirstGenerationOwnershipQueueCoord(coord);
+    }
     m_generationQueue.push_back(coord);
     m_generationClassQueues[ResidencyClassQueueIndex(record.residencyClass)].push_back(coord);
+    if (m_config.streamingTicketGenerationOwnershipQueues) {
+        QueueGenerationOwnershipAliasIfRequested(coord);
+    }
     m_generationQueuePriorityDirty = true;
     MarkQueueAccountingDirty();
 }
 
 bool SparseVoxelWorld::RemoveFirstGenerationQueueCoord(const BrickCoord& coord) {
-    for (auto it = m_generationQueue.begin(); it != m_generationQueue.end(); ++it) {
-        if (*it == coord) {
-            m_generationQueue.erase(it);
-            m_generationQueuePriorityDirty = true;
-            MarkQueueAccountingDirty();
-            return true;
+    if (RemoveAllQueuedCoord(m_generationQueue, coord)) {
+        if (m_config.streamingTicketGenerationOwnershipQueues) {
+            RemoveFirstGenerationOwnershipQueueCoord(coord);
         }
+        m_generationQueuePriorityDirty = true;
+        MarkQueueAccountingDirty();
+        return true;
     }
     return false;
 }
 
 bool SparseVoxelWorld::RemoveFirstGenerationClassQueueCoord(
     const BrickCoord& coord,
-    SparseResidencyClass residencyClass)
+    SparseResidencyClass)
 {
-    auto& queue = m_generationClassQueues[ResidencyClassQueueIndex(residencyClass)];
-    for (auto it = queue.begin(); it != queue.end(); ++it) {
-        if (*it == coord) {
-            queue.erase(it);
-            return true;
+    return RemoveAllClassQueueCoord(m_generationClassQueues, coord);
+}
+
+bool SparseVoxelWorld::RemoveFirstGenerationOwnershipQueueCoord(const BrickCoord& coord)
+{
+    if (!m_config.streamingTicketGenerationOwnershipQueues) {
+        return false;
+    }
+    auto entryIt = m_generationOwnershipWorklistEntries.find(coord);
+    if (entryIt == m_generationOwnershipWorklistEntries.end()) {
+        return false;
+    }
+
+    const GenerationOwnershipWorklistEntry entry = entryIt->second;
+    const size_t ownershipIndex = StreamingTicketOwnershipIndex(entry.ownership);
+    std::vector<BrickCoord>& worklist = m_generationOwnershipWorklists[ownershipIndex];
+    if (entry.index < worklist.size() && worklist[entry.index] == coord) {
+        const BrickCoord movedCoord = worklist.back();
+        worklist[entry.index] = movedCoord;
+        worklist.pop_back();
+        if (!(movedCoord == coord)) {
+            auto movedIt = m_generationOwnershipWorklistEntries.find(movedCoord);
+            if (movedIt != m_generationOwnershipWorklistEntries.end()) {
+                movedIt->second.index = entry.index;
+            }
+        }
+    } else {
+        auto fallbackIt = std::find(worklist.begin(), worklist.end(), coord);
+        if (fallbackIt != worklist.end()) {
+            const size_t index = static_cast<size_t>(fallbackIt - worklist.begin());
+            const BrickCoord movedCoord = worklist.back();
+            worklist[index] = movedCoord;
+            worklist.pop_back();
+            if (!(movedCoord == coord)) {
+                auto movedIt = m_generationOwnershipWorklistEntries.find(movedCoord);
+                if (movedIt != m_generationOwnershipWorklistEntries.end()) {
+                    movedIt->second.index = index;
+                }
+            }
         }
     }
-    return false;
+    m_generationOwnershipWorklistEntries.erase(entryIt);
+    return true;
 }
 
 void SparseVoxelWorld::QueueGenerationClassAliasIfRequested(const BrickCoord& coord) {
@@ -577,9 +1319,320 @@ void SparseVoxelWorld::QueueGenerationClassAliasIfRequested(const BrickCoord& co
     if (record.state != BrickLifecycleState::Requested) {
         return;
     }
+    RemoveAllClassQueueCoord(m_generationClassQueues, coord);
+    if (m_config.streamingTicketGenerationOwnershipQueues) {
+        RemoveFirstGenerationOwnershipQueueCoord(coord);
+    }
     m_generationClassQueues[ResidencyClassQueueIndex(record.residencyClass)].push_back(coord);
+    if (m_config.streamingTicketGenerationOwnershipQueues) {
+        QueueGenerationOwnershipAliasIfRequested(coord);
+    }
     m_generationQueuePriorityDirty = true;
     MarkQueueAccountingDirty();
+}
+
+void SparseVoxelWorld::QueueGenerationOwnershipAliasIfRequested(const BrickCoord& coord) {
+    BrickResidentRecord record;
+    if (!m_pool.GetRecord(coord, &record)) {
+        return;
+    }
+    if (record.state != BrickLifecycleState::Requested) {
+        return;
+    }
+    if (!m_config.streamingTicketGenerationOwnershipQueues) {
+        return;
+    }
+    RemoveFirstGenerationOwnershipQueueCoord(coord);
+    const StreamingTicketOwnership ownership = ClassifyStreamingTicketOwnership(record);
+    const size_t ownershipIndex = StreamingTicketOwnershipIndex(ownership);
+    std::vector<BrickCoord>& worklist = m_generationOwnershipWorklists[ownershipIndex];
+    m_generationOwnershipWorklistEntries[coord] = {ownership, worklist.size()};
+    worklist.push_back(coord);
+    m_generationQueuePriorityDirty = true;
+    MarkQueueAccountingDirty();
+}
+
+bool SparseVoxelWorld::PopGenerationOwnershipWorklistCandidate(
+    StreamingTicketOwnership ownership,
+    BrickCoord* outCoord,
+    BrickResidentRecord* outRecord)
+{
+    if (!m_config.streamingTicketGenerationOwnershipQueues || !outCoord || !outRecord) {
+        return false;
+    }
+
+    std::vector<BrickCoord>& worklist = m_generationOwnershipWorklists[StreamingTicketOwnershipIndex(ownership)];
+    while (!worklist.empty()) {
+        const BrickCoord coord = worklist.back();
+        BrickResidentRecord record;
+        if (!m_pool.GetRecord(coord, &record) ||
+            record.state != BrickLifecycleState::Requested) {
+            RemoveFirstGenerationOwnershipQueueCoord(coord);
+            continue;
+        }
+        const StreamingTicketOwnership currentOwnership = ClassifyStreamingTicketOwnership(record);
+        if (currentOwnership != ownership) {
+            QueueGenerationOwnershipAliasIfRequested(coord);
+            continue;
+        }
+        *outCoord = coord;
+        *outRecord = record;
+        return true;
+    }
+    return false;
+}
+
+uint32_t SparseVoxelWorld::PumpGenerationOwnershipQuota(
+    StreamingTicketOwnership ownership,
+    uint32_t maxBricks,
+    uint32_t currentFrame,
+    uint32_t* outProcessed)
+{
+    if (outProcessed) {
+        *outProcessed = 0;
+    }
+    if (maxBricks == 0u || !m_config.streamingTicketGenerationOwnershipQueues) {
+        return 0;
+    }
+
+    uint32_t generated = 0;
+    uint32_t processed = 0;
+    BrickCoord coord{};
+    BrickResidentRecord record;
+    while (processed < maxBricks &&
+           PopGenerationOwnershipWorklistCandidate(ownership, &coord, &record)) {
+        RemoveFirstGenerationQueueCoord(coord);
+        RemoveFirstGenerationClassQueueCoord(coord, record.residencyClass);
+        if (TryQueueAsyncExactGeneration(coord, record, currentFrame)) {
+            ++processed;
+            continue;
+        }
+
+        SparseResidencyClass generatedClass = SparseResidencyClass::Speculative;
+        if (GenerateQueuedBrick(coord, &generatedClass)) {
+            IncrementResidencyClassCounter(
+                generatedClass,
+                m_generatedSpeculativeBricksLastFrame,
+                m_generatedVisibleBricksLastFrame,
+                m_generatedCollisionBricksLastFrame,
+                m_generatedEditedBricksLastFrame);
+            ++generated;
+        }
+        ++processed;
+    }
+
+    if (outProcessed) {
+        *outProcessed = processed;
+    }
+    return generated;
+}
+
+uint32_t SparseVoxelWorld::PumpGenerationOwnershipReservations(
+    uint32_t maxBricks,
+    uint32_t currentFrame,
+    uint32_t* outProcessed)
+{
+    if (outProcessed) {
+        *outProcessed = 0;
+    }
+    if (!m_config.streamingTicketGenerationOwnershipReservations ||
+        !m_config.streamingTicketGenerationOwnershipQueues ||
+        m_config.streamingTicketGenerationOwnershipReservationMax == 0u ||
+        maxBricks == 0u) {
+        return 0;
+    }
+
+    const uint32_t reservationMax =
+        std::min(maxBricks, m_config.streamingTicketGenerationOwnershipReservationMax);
+
+    constexpr std::array<StreamingTicketOwnership, 3> kCriticalOwnershipOrder{
+        StreamingTicketOwnership::PublicCritical,
+        StreamingTicketOwnership::UnknownCritical,
+        StreamingTicketOwnership::SampledVisible,
+    };
+
+    uint32_t generated = 0;
+    uint32_t processed = 0;
+    for (StreamingTicketOwnership ownership : kCriticalOwnershipOrder) {
+        uint32_t ownershipProcessed = 0;
+        generated += PumpGenerationOwnershipQuota(
+            ownership,
+            reservationMax - processed,
+            currentFrame,
+            &ownershipProcessed);
+        processed += ownershipProcessed;
+        if (processed >= reservationMax) {
+            break;
+        }
+    }
+
+    if (outProcessed) {
+        *outProcessed = processed;
+    }
+    return generated;
+}
+
+uint32_t SparseVoxelWorld::PumpGenerationOwnershipShares(
+    uint32_t maxBricks,
+    uint32_t currentFrame,
+    uint32_t* outProcessed)
+{
+    if (outProcessed) {
+        *outProcessed = 0;
+    }
+    if (!m_config.streamingTicketGenerationOwnershipShareScheduler ||
+        !m_config.streamingTicketGenerationOwnershipQueues ||
+        maxBricks == 0u) {
+        return 0;
+    }
+
+    auto pump = [this, currentFrame](
+        StreamingTicketOwnership ownership,
+        uint32_t quota,
+        uint32_t remaining,
+        uint32_t& processed) {
+        const uint32_t allowed = std::min(quota, remaining);
+        if (allowed == 0u) {
+            return 0u;
+        }
+        uint32_t ownershipProcessed = 0;
+        const uint32_t generated = PumpGenerationOwnershipQuota(
+            ownership,
+            allowed,
+            currentFrame,
+            &ownershipProcessed);
+        processed += ownershipProcessed;
+        return generated;
+    };
+
+    uint32_t generated = 0;
+    uint32_t processed = 0;
+    const uint32_t publicTarget =
+        m_config.streamingTicketGenerationOwnershipSharePublicMin;
+    const uint32_t visibleTarget =
+        m_config.streamingTicketGenerationOwnershipShareVisibleMax;
+    const uint32_t prefetchTarget =
+        m_config.streamingTicketGenerationOwnershipSharePrefetchMin;
+    const uint32_t targetTotal = publicTarget + visibleTarget + prefetchTarget;
+    if (targetTotal == 0u) {
+        return 0;
+    }
+
+    uint32_t publicQuota = publicTarget;
+    uint32_t visibleQuota = visibleTarget;
+    uint32_t prefetchQuota = prefetchTarget;
+    if (maxBricks < targetTotal) {
+        publicQuota = static_cast<uint32_t>(
+            (static_cast<uint64_t>(maxBricks) * publicTarget +
+             static_cast<uint64_t>(targetTotal - 1u)) /
+            targetTotal);
+        publicQuota = std::min(publicQuota, maxBricks);
+        const uint32_t afterPublic = maxBricks - publicQuota;
+        visibleQuota = static_cast<uint32_t>(
+            (static_cast<uint64_t>(maxBricks) * visibleTarget) /
+            targetTotal);
+        visibleQuota = std::min(visibleQuota, afterPublic);
+        prefetchQuota = maxBricks - publicQuota - visibleQuota;
+    }
+
+    const uint32_t visibleDebtGate =
+        m_config.streamingTicketGenerationOwnershipShareVisibleDebtGate;
+    if (visibleDebtGate > 0u) {
+        const size_t visibleDebtSize =
+            m_generationOwnershipWorklists[StreamingTicketOwnershipIndex(
+                StreamingTicketOwnership::UnknownCritical)].size() +
+            m_generationOwnershipWorklists[StreamingTicketOwnershipIndex(
+                StreamingTicketOwnership::SampledVisible)].size();
+        const uint32_t visibleDebt = static_cast<uint32_t>(
+            std::min<size_t>(
+                visibleDebtSize,
+                static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+        if (visibleDebt > visibleDebtGate) {
+            visibleQuota = std::min(maxBricks - publicQuota, visibleQuota + prefetchQuota);
+            prefetchQuota = 0u;
+        }
+    }
+
+    generated += pump(
+        StreamingTicketOwnership::PublicCritical,
+        publicQuota,
+        maxBricks - processed,
+        processed);
+
+    uint32_t visibleRemaining = std::min(
+        visibleQuota,
+        maxBricks - processed);
+    const StreamingTicketOwnership visibleOrder[] = {
+        StreamingTicketOwnership::UnknownCritical,
+        StreamingTicketOwnership::SampledVisible,
+    };
+    for (StreamingTicketOwnership ownership : visibleOrder) {
+        const uint32_t before = processed;
+        generated += pump(ownership, visibleRemaining, maxBricks - processed, processed);
+        const uint32_t consumed = processed - before;
+        visibleRemaining = consumed >= visibleRemaining ? 0u : visibleRemaining - consumed;
+        if (visibleRemaining == 0u || processed >= maxBricks) {
+            break;
+        }
+    }
+
+    uint32_t lowPriorityRemaining = std::min(
+        prefetchQuota,
+        maxBricks - processed);
+    const StreamingTicketOwnership lowPriorityOrder[] = {
+        StreamingTicketOwnership::HiddenRepair,
+        StreamingTicketOwnership::Prefetch,
+        StreamingTicketOwnership::Cache,
+    };
+    for (StreamingTicketOwnership ownership : lowPriorityOrder) {
+        const uint32_t before = processed;
+        generated += pump(ownership, lowPriorityRemaining, maxBricks - processed, processed);
+        const uint32_t consumed = processed - before;
+        lowPriorityRemaining =
+            consumed >= lowPriorityRemaining ? 0u : lowPriorityRemaining - consumed;
+        if (lowPriorityRemaining == 0u || processed >= maxBricks) {
+            break;
+        }
+    }
+
+    while (processed < maxBricks) {
+        const uint32_t before = processed;
+        generated += pump(
+            StreamingTicketOwnership::HiddenRepair,
+            maxBricks - processed,
+            maxBricks - processed,
+            processed);
+        generated += pump(
+            StreamingTicketOwnership::Prefetch,
+            maxBricks - processed,
+            maxBricks - processed,
+            processed);
+        generated += pump(
+            StreamingTicketOwnership::Cache,
+            maxBricks - processed,
+            maxBricks - processed,
+            processed);
+        generated += pump(
+            StreamingTicketOwnership::PublicCritical,
+            maxBricks - processed,
+            maxBricks - processed,
+            processed);
+        for (StreamingTicketOwnership ownership : visibleOrder) {
+            generated += pump(
+                ownership,
+                maxBricks - processed,
+                maxBricks - processed,
+                processed);
+        }
+        if (processed == before) {
+            break;
+        }
+    }
+
+    if (outProcessed) {
+        *outProcessed = processed;
+    }
+    return generated;
 }
 
 bool SparseVoxelWorld::GenerateQueuedBrick(
@@ -594,26 +1647,872 @@ bool SparseVoxelWorld::GenerateQueuedBrick(
         return false;
     }
 
-    GeneratedSparseBrick brick = m_terrain.GenerateBrick(coord);
+    GeneratedSparseBrick brick = GenerateBrickWithCachedTerrainColumns(coord);
     m_edits.ApplyToGeneratedBrick(brick);
-    m_generated[coord] = brick;
+    return ApplyGeneratedBrickPayload(coord, brick, outResidencyClass);
+}
 
+bool SparseVoxelWorld::ShouldDeferGeneratedDownstream(
+    const BrickResidentRecord& record,
+    const GeneratedSparseBrick& brick) const
+{
+    if (!m_config.streamingTicketLowPriorityDownstreamDeferral) {
+        return false;
+    }
+    if (HasResidencyFlag(brick.flags, BrickResidencyFlags::Empty)) {
+        return false;
+    }
+    return record.streamingLane == SparseStreamingLane::Cache ||
+           record.streamingLane == SparseStreamingLane::Prefetch ||
+           record.streamingLane == SparseStreamingLane::Repair;
+}
+
+bool SparseVoxelWorld::QueueDeferredGeneratedDownstream(const BrickCoord& coord)
+{
+    BrickResidentRecord record;
+    if (!m_pool.GetRecord(coord, &record) ||
+        record.state != BrickLifecycleState::GeneratedCPU ||
+        m_generated.find(coord) == m_generated.end()) {
+        return false;
+    }
+    if (m_deferredGeneratedDownstreamSet.insert(coord).second) {
+        m_deferredGeneratedDownstreamQueue.push_back(coord);
+    }
+    MarkQueueAccountingDirty();
+    return true;
+}
+
+uint32_t SparseVoxelWorld::PromoteDeferredGeneratedDownstream(
+    uint32_t maxBricks,
+    uint32_t currentFrame)
+{
+    if (!m_config.streamingTicketLowPriorityDownstreamDeferral ||
+        maxBricks == 0u ||
+        m_deferredGeneratedDownstreamQueue.empty()) {
+        return 0;
+    }
+
+    uint32_t promoted = 0;
+    const size_t originalCount = m_deferredGeneratedDownstreamQueue.size();
+    size_t scanned = 0;
+    while (promoted < maxBricks &&
+           scanned < originalCount &&
+           !m_deferredGeneratedDownstreamQueue.empty()) {
+        const BrickCoord coord = m_deferredGeneratedDownstreamQueue.front();
+        m_deferredGeneratedDownstreamQueue.pop_front();
+        m_deferredGeneratedDownstreamSet.erase(coord);
+        ++scanned;
+
+        if (PromoteDeferredGeneratedDownstreamCoordInternal(coord, currentFrame)) {
+            ++promoted;
+        }
+    }
+
+    if (promoted > 0u) {
+        MarkQueueAccountingDirty();
+    }
+    return promoted;
+}
+
+uint32_t SparseVoxelWorld::PromoteDeferredGeneratedDownstreamForOwnership(
+    bool ownershipCritical,
+    uint32_t maxBricks,
+    uint32_t currentFrame)
+{
+    if (!m_config.streamingTicketLowPriorityDownstreamDeferral ||
+        maxBricks == 0u ||
+        m_deferredGeneratedDownstreamQueue.empty()) {
+        return 0;
+    }
+
+    uint32_t promoted = 0;
+    const size_t originalCount = m_deferredGeneratedDownstreamQueue.size();
+    size_t scanned = 0;
+    while (promoted < maxBricks &&
+           scanned < originalCount &&
+           !m_deferredGeneratedDownstreamQueue.empty()) {
+        const BrickCoord coord = m_deferredGeneratedDownstreamQueue.front();
+        m_deferredGeneratedDownstreamQueue.pop_front();
+        ++scanned;
+
+        BrickResidentRecord record;
+        auto generatedIt = m_generated.find(coord);
+        if (!m_pool.GetRecord(coord, &record) ||
+            record.state != BrickLifecycleState::GeneratedCPU ||
+            generatedIt == m_generated.end()) {
+            m_deferredGeneratedDownstreamSet.erase(coord);
+            ++m_deferredGeneratedDownstreamStaleLastFrame;
+            continue;
+        }
+
+        if (IsStreamingOwnershipCritical(record) != ownershipCritical) {
+            m_deferredGeneratedDownstreamQueue.push_back(coord);
+            continue;
+        }
+
+        m_deferredGeneratedDownstreamSet.erase(coord);
+        if (PromoteDeferredGeneratedDownstreamCoordInternal(coord, currentFrame)) {
+            ++promoted;
+        }
+    }
+
+    if (promoted > 0u) {
+        MarkQueueAccountingDirty();
+    }
+    return promoted;
+}
+
+bool SparseVoxelWorld::PromoteDeferredGeneratedDownstreamForCoord(
+    const BrickCoord& coord,
+    uint32_t currentFrame)
+{
+    if (!m_config.streamingTicketLowPriorityDownstreamDeferral ||
+        m_deferredGeneratedDownstreamSet.find(coord) == m_deferredGeneratedDownstreamSet.end()) {
+        return false;
+    }
+    m_deferredGeneratedDownstreamSet.erase(coord);
+    RemoveAllQueuedCoord(m_deferredGeneratedDownstreamQueue, coord);
+    const bool promoted = PromoteDeferredGeneratedDownstreamCoordInternal(coord, currentFrame);
+    if (promoted) {
+        MarkQueueAccountingDirty();
+    }
+    return promoted;
+}
+
+bool SparseVoxelWorld::PromoteDeferredGeneratedDownstreamIfCritical(
+    const BrickCoord& coord,
+    uint32_t currentFrame)
+{
+    if (!m_config.streamingTicketLowPriorityDownstreamDeferral ||
+        m_deferredGeneratedDownstreamSet.find(coord) == m_deferredGeneratedDownstreamSet.end()) {
+        return false;
+    }
+
+    BrickResidentRecord record;
+    if (!m_pool.GetRecord(coord, &record) ||
+        record.state != BrickLifecycleState::GeneratedCPU ||
+        !IsStreamingOwnershipCritical(record)) {
+        return false;
+    }
+    return PromoteDeferredGeneratedDownstreamForCoord(coord, currentFrame);
+}
+
+bool SparseVoxelWorld::PromoteDeferredGeneratedDownstreamCoordInternal(
+    const BrickCoord& coord,
+    uint32_t currentFrame)
+{
+    (void)currentFrame;
+    BrickResidentRecord record;
+    auto generatedIt = m_generated.find(coord);
+    if (!m_pool.GetRecord(coord, &record) ||
+        record.state != BrickLifecycleState::GeneratedCPU ||
+        generatedIt == m_generated.end()) {
+        ++m_deferredGeneratedDownstreamStaleLastFrame;
+        return false;
+    }
+    if (!m_pool.QueueUpload(coord)) {
+        ++m_deferredGeneratedDownstreamStaleLastFrame;
+        return false;
+    }
+
+    const GeneratedSparseBrick& brick = generatedIt->second;
+    uint32_t requiredTicketStages =
+        kStreamingTicketStageCpuGenerated |
+        kStreamingTicketStageGpuUploaded |
+        kStreamingTicketStagePagePublished;
+    uint32_t completedTicketStages = kStreamingTicketStageCpuGenerated;
+    if (CanUseBuriedSolidSurfaceFastPath(coord, brick)) {
+        MarkBuriedSolidSurfaceKnownEmpty(coord);
+    } else if (!HasResidencyFlag(brick.flags, BrickResidencyFlags::Empty)) {
+        requiredTicketStages |= kStreamingTicketStageSurfaceReady;
+        m_pendingSurfaceBricks[coord] = brick;
+        QueueSurfaceExtractionCoord(coord);
+    } else {
+        completedTicketStages |= kStreamingTicketStageSurfaceReady;
+    }
+    TouchStreamingTicket(coord, record, requiredTicketStages, completedTicketStages);
+    QueueUploadCoordBack(coord);
+    ++m_deferredGeneratedDownstreamPromotedLastFrame;
+    return true;
+}
+
+bool SparseVoxelWorld::ApplyGeneratedBrickPayload(
+    const BrickCoord& coord,
+    const GeneratedSparseBrick& brick,
+    SparseResidencyClass* outResidencyClass)
+{
+    BrickResidentRecord generationRecord;
+    if (!m_pool.GetRecord(coord, &generationRecord)) {
+        return false;
+    }
+    const SparseStreamingLane generatedLane = generationRecord.streamingLane;
+
+    m_generated[coord] = brick;
     if (!m_pool.MarkGeneratedCPU(coord)) {
         return false;
+    }
+    if (ShouldDeferGeneratedDownstream(generationRecord, brick)) {
+        TouchStreamingTicket(
+            coord,
+            generationRecord,
+            kStreamingTicketStageCpuGenerated,
+            kStreamingTicketStageCpuGenerated);
+        QueueDeferredGeneratedDownstream(coord);
+        if (outResidencyClass) {
+            *outResidencyClass = generationRecord.residencyClass;
+        }
+        IncrementStreamingLaneCounter(
+            generatedLane,
+            m_generatedCacheLaneBricksLastFrame,
+            m_generatedPrefetchLaneBricksLastFrame,
+            m_generatedRepairLaneBricksLastFrame,
+            m_generatedVisibleLaneBricksLastFrame,
+            m_generatedPublicCriticalLaneBricksLastFrame);
+        MarkQueueAccountingDirty();
+        return true;
     }
     if (!m_pool.QueueUpload(coord)) {
         return false;
     }
 
-    if (!HasResidencyFlag(brick.flags, BrickResidencyFlags::Empty)) {
+    uint32_t requiredTicketStages =
+        kStreamingTicketStageCpuGenerated |
+        kStreamingTicketStageGpuUploaded |
+        kStreamingTicketStagePagePublished;
+    uint32_t completedTicketStages = kStreamingTicketStageCpuGenerated;
+    if (CanUseBuriedSolidSurfaceFastPath(coord, brick)) {
+        MarkBuriedSolidSurfaceKnownEmpty(coord);
+    } else if (!HasResidencyFlag(brick.flags, BrickResidencyFlags::Empty)) {
+        requiredTicketStages |= kStreamingTicketStageSurfaceReady;
         m_pendingSurfaceBricks[coord] = brick;
         QueueSurfaceExtractionCoord(coord);
+    } else {
+        completedTicketStages |= kStreamingTicketStageSurfaceReady;
     }
+    TouchStreamingTicket(coord, generationRecord, requiredTicketStages, completedTicketStages);
     QueueUploadCoordBack(coord);
     if (outResidencyClass) {
         *outResidencyClass = generationRecord.residencyClass;
     }
+    IncrementStreamingLaneCounter(
+        generatedLane,
+        m_generatedCacheLaneBricksLastFrame,
+        m_generatedPrefetchLaneBricksLastFrame,
+        m_generatedRepairLaneBricksLastFrame,
+        m_generatedVisibleLaneBricksLastFrame,
+        m_generatedPublicCriticalLaneBricksLastFrame);
+    MarkQueueAccountingDirty();
     return true;
+}
+
+void SparseVoxelWorld::StartAsyncExactGenerationWorkerIfNeeded()
+{
+    if (!m_config.asyncExactGeneration || m_asyncExactGenerationThread.joinable()) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_asyncExactGenerationMutex);
+        m_asyncExactGenerationStop = false;
+    }
+
+    const SparseTerrainGenerator terrain = m_terrain;
+    m_asyncExactGenerationThread = std::thread([this, terrain]() {
+        TerrainSurfaceColumnCache workerColumnCache;
+        workerColumnCache.reserve(8192);
+        for (;;) {
+            AsyncExactGenerationRequest request;
+            {
+                std::unique_lock<std::mutex> lock(m_asyncExactGenerationMutex);
+                m_asyncExactGenerationCv.wait(lock, [this]() {
+                    return m_asyncExactGenerationStop || !m_asyncExactGenerationQueue.empty();
+                });
+                if (m_asyncExactGenerationStop) {
+                    break;
+                }
+                request = m_asyncExactGenerationQueue.front();
+                m_asyncExactGenerationQueue.pop_front();
+            }
+
+            const auto start = std::chrono::steady_clock::now();
+            GeneratedSparseBrick brick =
+                GenerateExactBrickForConfig(terrain, request.coord, workerColumnCache);
+            const auto elapsed = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            if (workerColumnCache.size() > 65536u) {
+                workerColumnCache.clear();
+                workerColumnCache.reserve(8192);
+            }
+
+            AsyncExactGenerationResult result;
+            result.coord = request.coord;
+            result.brick = std::move(brick);
+            result.residencyClass = request.residencyClass;
+            result.streamingLane = request.streamingLane;
+            result.requestFrame = request.requestFrame;
+            result.editRevision = request.editRevision;
+            result.workerMs = elapsed;
+            {
+                std::lock_guard<std::mutex> lock(m_asyncExactGenerationMutex);
+                if (m_asyncExactGenerationStop) {
+                    break;
+                }
+                m_asyncExactGenerationResults.push_back(std::move(result));
+            }
+        }
+    });
+}
+
+void SparseVoxelWorld::StopAsyncExactGenerationWorker()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_asyncExactGenerationMutex);
+        m_asyncExactGenerationStop = true;
+    }
+    m_asyncExactGenerationCv.notify_all();
+    if (m_asyncExactGenerationThread.joinable()) {
+        m_asyncExactGenerationThread.join();
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_asyncExactGenerationMutex);
+        m_asyncExactGenerationQueue.clear();
+        m_asyncExactGenerationResults.clear();
+        m_asyncExactGenerationPending.clear();
+        m_asyncExactGenerationStop = false;
+    }
+}
+
+void SparseVoxelWorld::StartPersistentExactGenerationWorkers(uint32_t workerCount)
+{
+    workerCount = std::clamp<uint32_t>(workerCount, 1u, m_config.parallelExactGenerationMaxWorkers);
+    if (workerCount <= 1u) {
+        StopPersistentExactGenerationWorkers();
+        return;
+    }
+    if (m_persistentExactGenerationThreads.size() == static_cast<size_t>(workerCount)) {
+        return;
+    }
+
+    StopPersistentExactGenerationWorkers();
+    {
+        std::lock_guard<std::mutex> lock(m_persistentExactGenerationMutex);
+        m_persistentExactGenerationStop = false;
+        m_persistentExactGenerationActive = false;
+        m_persistentExactGenerationTerrain = nullptr;
+        m_persistentExactGenerationCoords = nullptr;
+        m_persistentExactGenerationBricks = nullptr;
+        m_persistentExactGenerationNext = 0;
+        m_persistentExactGenerationRemaining = 0;
+    }
+    m_persistentExactGenerationThreads.reserve(workerCount);
+    for (uint32_t index = 0; index < workerCount; ++index) {
+        m_persistentExactGenerationThreads.emplace_back(
+            [this]() { PersistentExactGenerationWorkerLoop(); });
+    }
+}
+
+void SparseVoxelWorld::StopPersistentExactGenerationWorkers()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_persistentExactGenerationMutex);
+        m_persistentExactGenerationStop = true;
+        m_persistentExactGenerationActive = false;
+        m_persistentExactGenerationTerrain = nullptr;
+        m_persistentExactGenerationCoords = nullptr;
+        m_persistentExactGenerationBricks = nullptr;
+        m_persistentExactGenerationNext = 0;
+        m_persistentExactGenerationRemaining = 0;
+    }
+    m_persistentExactGenerationCv.notify_all();
+    m_persistentExactGenerationDoneCv.notify_all();
+    for (std::thread& worker : m_persistentExactGenerationThreads) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+    m_persistentExactGenerationThreads.clear();
+    {
+        std::lock_guard<std::mutex> lock(m_persistentExactGenerationMutex);
+        m_persistentExactGenerationStop = false;
+    }
+}
+
+void SparseVoxelWorld::PersistentExactGenerationWorkerLoop()
+{
+    TerrainSurfaceColumnCache columnCache;
+    columnCache.reserve(8192);
+    for (;;) {
+        size_t jobIndex = 0;
+        const SparseTerrainGenerator* terrain = nullptr;
+        const std::vector<BrickCoord>* coords = nullptr;
+        std::vector<GeneratedSparseBrick>* bricks = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(m_persistentExactGenerationMutex);
+            m_persistentExactGenerationCv.wait(lock, [this]() {
+                return m_persistentExactGenerationStop ||
+                       (m_persistentExactGenerationActive &&
+                        m_persistentExactGenerationNext <
+                            (m_persistentExactGenerationCoords
+                                ? m_persistentExactGenerationCoords->size()
+                                : 0u));
+            });
+            if (m_persistentExactGenerationStop) {
+                break;
+            }
+            terrain = m_persistentExactGenerationTerrain;
+            coords = m_persistentExactGenerationCoords;
+            bricks = m_persistentExactGenerationBricks;
+            if (!terrain || !coords || !bricks ||
+                m_persistentExactGenerationNext >= coords->size()) {
+                continue;
+            }
+            jobIndex = m_persistentExactGenerationNext++;
+        }
+
+        const BrickCoord coord = (*coords)[jobIndex];
+        (*bricks)[jobIndex] = GenerateExactBrickForConfig(*terrain, coord, columnCache);
+        if (columnCache.size() > 65536u) {
+            columnCache.clear();
+            columnCache.reserve(8192);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_persistentExactGenerationMutex);
+            if (m_persistentExactGenerationRemaining > 0u) {
+                --m_persistentExactGenerationRemaining;
+            }
+            if (m_persistentExactGenerationRemaining == 0u) {
+                m_persistentExactGenerationActive = false;
+                m_persistentExactGenerationTerrain = nullptr;
+                m_persistentExactGenerationCoords = nullptr;
+                m_persistentExactGenerationBricks = nullptr;
+                m_persistentExactGenerationDoneCv.notify_one();
+            }
+        }
+        m_persistentExactGenerationCv.notify_one();
+    }
+}
+
+bool SparseVoxelWorld::GenerateExactBricksWithPersistentWorkers(
+    const SparseTerrainGenerator& terrain,
+    const std::vector<BrickCoord>& coords,
+    std::vector<GeneratedSparseBrick>& bricks,
+    uint32_t workerCount)
+{
+    if (!m_config.parallelExactGenerationPersistentWorkers ||
+        coords.empty() ||
+        bricks.size() < coords.size() ||
+        workerCount <= 1u) {
+        return false;
+    }
+
+    StartPersistentExactGenerationWorkers(workerCount);
+    if (m_persistentExactGenerationThreads.empty()) {
+        return false;
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(m_persistentExactGenerationMutex);
+        m_persistentExactGenerationDoneCv.wait(lock, [this]() {
+            return !m_persistentExactGenerationActive;
+        });
+        m_persistentExactGenerationTerrain = &terrain;
+        m_persistentExactGenerationCoords = &coords;
+        m_persistentExactGenerationBricks = &bricks;
+        m_persistentExactGenerationNext = 0;
+        m_persistentExactGenerationRemaining = coords.size();
+        m_persistentExactGenerationActive = true;
+    }
+    m_persistentExactGenerationCv.notify_all();
+
+    {
+        std::unique_lock<std::mutex> lock(m_persistentExactGenerationMutex);
+        m_persistentExactGenerationDoneCv.wait(lock, [this]() {
+            return !m_persistentExactGenerationActive;
+        });
+    }
+    return true;
+}
+
+bool SparseVoxelWorld::TryQueueAsyncExactGeneration(
+    const BrickCoord& coord,
+    const BrickResidentRecord& record,
+    uint32_t currentFrame)
+{
+    const bool lowPriorityStreamingLane =
+        record.streamingLane == SparseStreamingLane::Cache ||
+        record.streamingLane == SparseStreamingLane::Prefetch ||
+        record.streamingLane == SparseStreamingLane::Repair;
+    const bool publicStreamingLane =
+        record.streamingLane == SparseStreamingLane::Visible ||
+        record.streamingLane == SparseStreamingLane::PublicCritical;
+    const bool prefetchLaneAsyncAllowed =
+        m_config.asyncExactGenerationPrefetchLane &&
+        lowPriorityStreamingLane;
+    if (!m_config.asyncExactGeneration ||
+        m_config.asyncExactGenerationQueueMax == 0u ||
+        record.state != BrickLifecycleState::Requested ||
+        record.residencyClass == SparseResidencyClass::Edited ||
+        record.residencyClass == SparseResidencyClass::Collision ||
+        (publicStreamingLane && !m_config.asyncExactGenerationVisible) ||
+        (record.residencyClass == SparseResidencyClass::Visible &&
+         !m_config.asyncExactGenerationVisible &&
+         !prefetchLaneAsyncAllowed) ||
+        m_edits.EditedBrickCount() != 0u) {
+        return false;
+    }
+
+    StartAsyncExactGenerationWorkerIfNeeded();
+
+    {
+        std::lock_guard<std::mutex> lock(m_asyncExactGenerationMutex);
+        if (m_asyncExactGenerationPending.find(coord) != m_asyncExactGenerationPending.end()) {
+            return true;
+        }
+        if (m_config.asyncExactGenerationMaxEnqueuePerFrame > 0u &&
+            m_asyncExactGenerationEnqueuedLastFrame >= m_config.asyncExactGenerationMaxEnqueuePerFrame) {
+            return false;
+        }
+        if (m_asyncExactGenerationPending.size() >= m_config.asyncExactGenerationQueueMax) {
+            return false;
+        }
+    }
+
+    if (!m_pool.MarkGeneratingCPU(coord)) {
+        return false;
+    }
+
+    AsyncExactGenerationRequest request;
+    request.coord = coord;
+    request.residencyClass = record.residencyClass;
+    request.streamingLane = record.streamingLane;
+    request.requestFrame = currentFrame;
+    request.editRevision = m_edits.RevisionSerial();
+    {
+        std::lock_guard<std::mutex> lock(m_asyncExactGenerationMutex);
+        if (!m_asyncExactGenerationPending.insert(coord).second) {
+            return true;
+        }
+        m_asyncExactGenerationQueue.push_back(request);
+    }
+    m_asyncExactGenerationCv.notify_one();
+    ++m_asyncExactGenerationEnqueuedLastFrame;
+    switch (record.streamingLane) {
+        case SparseStreamingLane::PublicCritical:
+            ++m_asyncExactGenerationEnqueuedPublicCriticalLaneLastFrame;
+            break;
+        case SparseStreamingLane::Visible:
+            ++m_asyncExactGenerationEnqueuedVisibleLaneLastFrame;
+            break;
+        case SparseStreamingLane::Repair:
+            ++m_asyncExactGenerationEnqueuedRepairLaneLastFrame;
+            break;
+        case SparseStreamingLane::Prefetch:
+            ++m_asyncExactGenerationEnqueuedPrefetchLaneLastFrame;
+            break;
+        case SparseStreamingLane::Cache:
+        default:
+            ++m_asyncExactGenerationEnqueuedCacheLaneLastFrame;
+            break;
+    }
+    MarkQueueAccountingDirty();
+    return true;
+}
+
+uint32_t SparseVoxelWorld::ApplyAsyncExactGenerationCompletions(uint32_t currentFrame)
+{
+    if (!m_config.asyncExactGeneration) {
+        return 0;
+    }
+
+    m_asyncExactGenerationStatsFrame = currentFrame;
+    const uint32_t maxApply = std::max(1u, m_config.asyncExactGenerationMaxApplyPerFrame);
+    const uint32_t maxLowPriorityApply =
+        m_config.asyncExactGenerationMaxLowPriorityApplyPerFrame;
+    const bool lowPriorityApplyLimited = maxLowPriorityApply > 0u;
+    uint32_t applied = 0;
+    uint32_t lowPriorityApplied = 0;
+    const auto start = std::chrono::steady_clock::now();
+    size_t maxScans = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_asyncExactGenerationMutex);
+        maxScans = m_asyncExactGenerationResults.size();
+    }
+
+    size_t scanned = 0;
+    while (applied < maxApply && scanned < maxScans) {
+        AsyncExactGenerationResult result;
+        {
+            std::lock_guard<std::mutex> lock(m_asyncExactGenerationMutex);
+            if (m_asyncExactGenerationResults.empty()) {
+                break;
+            }
+            result = std::move(m_asyncExactGenerationResults.front());
+            m_asyncExactGenerationResults.pop_front();
+        }
+        ++scanned;
+
+        const bool lowPriorityResult =
+            result.streamingLane == SparseStreamingLane::Cache ||
+            result.streamingLane == SparseStreamingLane::Prefetch ||
+            result.streamingLane == SparseStreamingLane::Repair;
+        if (lowPriorityApplyLimited &&
+            lowPriorityResult &&
+            lowPriorityApplied >= maxLowPriorityApply) {
+            std::lock_guard<std::mutex> lock(m_asyncExactGenerationMutex);
+            m_asyncExactGenerationResults.push_back(std::move(result));
+            ++m_asyncExactGenerationDeferredLowPriorityApplyLastFrame;
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_asyncExactGenerationMutex);
+            m_asyncExactGenerationPending.erase(result.coord);
+        }
+
+        ++m_asyncExactGenerationCompletedLastFrame;
+        m_asyncExactGenerationWorkerMsLastFrame += result.workerMs;
+
+        BrickResidentRecord record;
+        if (!m_pool.GetRecord(result.coord, &record) ||
+            record.state != BrickLifecycleState::GeneratingCPU) {
+            ++m_asyncExactGenerationDiscardedLastFrame;
+            continue;
+        }
+
+        GeneratedSparseBrick brick = result.brick;
+        SparseResidencyClass generatedClass = result.residencyClass;
+        if (m_edits.EditedBrickCount() != 0u ||
+            m_edits.RevisionSerial() != result.editRevision) {
+            brick = GenerateBrickWithCachedTerrainColumns(result.coord);
+            m_edits.ApplyToGeneratedBrick(brick);
+            ++m_asyncExactGenerationSyncFallbackLastFrame;
+        }
+
+        if (ApplyGeneratedBrickPayload(result.coord, brick, &generatedClass)) {
+            IncrementResidencyClassCounter(
+                generatedClass,
+                m_generatedSpeculativeBricksLastFrame,
+                m_generatedVisibleBricksLastFrame,
+                m_generatedCollisionBricksLastFrame,
+                m_generatedEditedBricksLastFrame);
+            switch (result.streamingLane) {
+                case SparseStreamingLane::PublicCritical:
+                    ++m_asyncExactGenerationAppliedPublicCriticalLaneLastFrame;
+                    break;
+                case SparseStreamingLane::Visible:
+                    ++m_asyncExactGenerationAppliedVisibleLaneLastFrame;
+                    break;
+                case SparseStreamingLane::Repair:
+                    ++m_asyncExactGenerationAppliedRepairLaneLastFrame;
+                    break;
+                case SparseStreamingLane::Prefetch:
+                    ++m_asyncExactGenerationAppliedPrefetchLaneLastFrame;
+                    break;
+                case SparseStreamingLane::Cache:
+                default:
+                    ++m_asyncExactGenerationAppliedCacheLaneLastFrame;
+                    break;
+            }
+            ++m_asyncExactGenerationAppliedLastFrame;
+            if (lowPriorityResult) {
+                ++lowPriorityApplied;
+            }
+            ++applied;
+        } else {
+            ++m_asyncExactGenerationDiscardedLastFrame;
+        }
+    }
+
+    m_asyncExactGenerationApplyMsLastFrame += std::chrono::duration<float, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+    if (applied != 0u ||
+        m_asyncExactGenerationCompletedLastFrame != 0u ||
+        m_asyncExactGenerationDeferredLowPriorityApplyLastFrame != 0u) {
+        RefreshStats();
+    }
+    return applied;
+}
+
+GeneratedSparseBrick SparseVoxelWorld::GenerateBrickWithTerrainColumnCache(
+    const SparseTerrainGenerator& terrain,
+    const BrickCoord& coord,
+    TerrainSurfaceColumnCache& columnCache,
+    TerrainColumnCacheFrameStats* columnStats)
+{
+    GeneratedSparseBrick brick;
+    brick.coord = coord;
+    brick.voxels.fill(Utils::PackVoxel(Utils::Material::Air, 0, 0, 0));
+
+    int32_t worldXByLocal[SPARSE_BRICK_SIZE] = {};
+    int32_t worldYByLocal[SPARSE_BRICK_SIZE] = {};
+    int32_t worldZByLocal[SPARSE_BRICK_SIZE] = {};
+    for (uint8_t i = 0; i < SPARSE_BRICK_SIZE; ++i) {
+        if (!TryWorldVoxelFromBrickLocal(coord.x, i, &worldXByLocal[i]) ||
+            !TryWorldVoxelFromBrickLocal(coord.y, i, &worldYByLocal[i]) ||
+            !TryWorldVoxelFromBrickLocal(coord.z, i, &worldZByLocal[i])) {
+            SparseTerrainGenerator::ComputeOccupancyAndFlags(brick);
+            return brick;
+        }
+    }
+
+    std::array<float, SPARSE_BRICK_SIZE * SPARSE_BRICK_SIZE> heightByColumn = {};
+    std::array<float, SPARSE_BRICK_SIZE * SPARSE_BRICK_SIZE> reliefByColumn = {};
+    const int32_t minWorldY = worldYByLocal[0];
+    const int32_t maxWorldY = worldYByLocal[SPARSE_BRICK_SIZE - 1];
+    const auto cachedHeightAt = [
+        &terrain,
+        &columnCache,
+        columnStats](int32_t worldX, int32_t worldZ) {
+        const TerrainSurfaceColumnKey key{worldX, worldZ};
+        auto columnIt = columnCache.find(key);
+        if (columnIt != columnCache.end()) {
+            if (columnStats) {
+                ++columnStats->heightHits;
+            }
+            return columnIt->second.height;
+        }
+
+        if (columnStats) {
+            ++columnStats->heightMisses;
+        }
+        TerrainSurfaceColumnCacheEntry entry;
+        entry.height = terrain.HeightAt(worldX, worldZ);
+        auto [insertedIt, inserted] = columnCache.emplace(key, entry);
+        (void)inserted;
+        return insertedIt->second.height;
+    };
+    const auto cachedReliefAt =
+        [&terrain, &columnCache, &cachedHeightAt, columnStats](
+            int32_t worldX,
+            int32_t worldZ,
+            int32_t sampleOffset)
+    {
+        const int32_t offset = std::max(1, sampleOffset);
+        const TerrainSurfaceColumnKey key{worldX, worldZ};
+        auto columnIt = columnCache.find(key);
+        if (columnIt == columnCache.end()) {
+            if (columnStats) {
+                ++columnStats->heightMisses;
+            }
+            TerrainSurfaceColumnCacheEntry entry;
+            entry.height = terrain.HeightAt(worldX, worldZ);
+            columnIt = columnCache.emplace(key, entry).first;
+        }
+        if (columnIt->second.reliefValid && columnIt->second.reliefSampleOffset == offset) {
+            if (columnStats) {
+                ++columnStats->reliefHits;
+            }
+            return columnIt->second.relief;
+        }
+
+        if (columnStats) {
+            ++columnStats->reliefMisses;
+        }
+        int32_t xMinus = worldX;
+        int32_t xPlus = worldX;
+        int32_t zMinus = worldZ;
+        int32_t zPlus = worldZ;
+        (void)TryStepInt32(worldX, -offset, &xMinus);
+        (void)TryStepInt32(worldX, offset, &xPlus);
+        (void)TryStepInt32(worldZ, -offset, &zMinus);
+        (void)TryStepInt32(worldZ, offset, &zPlus);
+
+        const float center = columnIt->second.height;
+        float localMin = center;
+        float localMax = center;
+        const float samples[] = {
+            cachedHeightAt(xMinus, worldZ),
+            cachedHeightAt(xPlus, worldZ),
+            cachedHeightAt(worldX, zMinus),
+            cachedHeightAt(worldX, zPlus),
+        };
+        for (float height : samples) {
+            localMin = std::min(localMin, height);
+            localMax = std::max(localMax, height);
+        }
+
+        columnIt->second.relief = localMax - localMin;
+        columnIt->second.reliefSampleOffset = offset;
+        columnIt->second.reliefValid = true;
+        return columnIt->second.relief;
+    };
+    for (uint8_t z = 0; z < SPARSE_BRICK_SIZE; ++z) {
+        for (uint8_t x = 0; x < SPARSE_BRICK_SIZE; ++x) {
+            const int32_t worldX = worldXByLocal[x];
+            const int32_t worldZ = worldZByLocal[z];
+            const size_t index = static_cast<size_t>(x) +
+                static_cast<size_t>(z) * SPARSE_BRICK_SIZE;
+            const float height = cachedHeightAt(worldX, worldZ);
+            heightByColumn[index] = height;
+            if (maxWorldY > TERRAIN_MIN_Y + 2 &&
+                static_cast<float>(minWorldY) <= height) {
+                reliefByColumn[index] = cachedReliefAt(worldX, worldZ, 4);
+            }
+        }
+    }
+
+    for (uint8_t z = 0; z < SPARSE_BRICK_SIZE; ++z) {
+        for (uint8_t x = 0; x < SPARSE_BRICK_SIZE; ++x) {
+            const size_t columnIndex = static_cast<size_t>(x) +
+                static_cast<size_t>(z) * SPARSE_BRICK_SIZE;
+            const float height = heightByColumn[columnIndex];
+            int32_t maxNonAirY = TERRAIN_MIN_Y + 2;
+            int32_t solidMaxY = 0;
+            if (TryFloorToInt32(height, &solidMaxY)) {
+                maxNonAirY = std::max(maxNonAirY, solidMaxY);
+            }
+            if (height < static_cast<float>(SEA_LEVEL_Y - 2)) {
+                maxNonAirY = std::max(maxNonAirY, SEA_LEVEL_Y);
+            }
+            if (maxNonAirY < minWorldY) {
+                continue;
+            }
+
+            const int32_t clampedMaxNonAirY = std::min(maxNonAirY, maxWorldY);
+            const int32_t worldX = worldXByLocal[x];
+            const int32_t worldZ = worldZByLocal[z];
+            for (uint8_t y = 0; y < SPARSE_BRICK_SIZE; ++y) {
+                const int32_t worldY = worldYByLocal[y];
+                if (worldY > clampedMaxNonAirY) {
+                    break;
+                }
+                brick.voxels[LocalVoxelIndex({x, y, z})] =
+                    terrain.SampleGeneratedVoxelWithColumn(
+                        worldX,
+                        worldY,
+                        worldZ,
+                        height,
+                        reliefByColumn[columnIndex]);
+            }
+        }
+    }
+
+    SparseTerrainGenerator::ComputeOccupancyAndFlags(brick);
+    return brick;
+}
+
+GeneratedSparseBrick SparseVoxelWorld::GenerateExactBrickForConfig(
+    const SparseTerrainGenerator& terrain,
+    const BrickCoord& coord,
+    TerrainSurfaceColumnCache& columnCache,
+    TerrainColumnCacheFrameStats* columnStats) const
+{
+    if (m_config.directExactGeneration) {
+        return terrain.GenerateBrick(coord);
+    }
+    return GenerateBrickWithTerrainColumnCache(terrain, coord, columnCache, columnStats);
+}
+
+GeneratedSparseBrick SparseVoxelWorld::GenerateBrickWithCachedTerrainColumns(const BrickCoord& coord) {
+    TerrainColumnCacheFrameStats* columnStats = m_config.persistentTerrainColumnCache
+        ? &m_terrainColumnCacheFrameStats
+        : nullptr;
+    return GenerateExactBrickForConfig(
+        m_terrain,
+        coord,
+        m_surfaceTerrainColumnCache,
+        columnStats);
 }
 
 void SparseVoxelWorld::QueueUploadCoordBack(const BrickCoord& coord) {
@@ -621,8 +2520,12 @@ void SparseVoxelWorld::QueueUploadCoordBack(const BrickCoord& coord) {
     if (!m_pool.GetRecord(coord, &record)) {
         return;
     }
+    RemoveAllQueuedCoord(m_uploadQueue, coord);
+    RemoveAllClassQueueCoord(m_uploadClassQueues, coord);
+    RemoveAllClassQueueCoord(m_uploadOwnershipQueues, coord);
     m_uploadQueue.push_back(coord);
     m_uploadClassQueues[ResidencyClassQueueIndex(record.residencyClass)].push_back(coord);
+    m_uploadOwnershipQueues[OwnershipCriticalQueueIndex(IsStreamingOwnershipCritical(record))].push_back(coord);
     MarkUploadQueueOrderDirty();
 }
 
@@ -631,34 +2534,30 @@ void SparseVoxelWorld::QueueUploadCoordFront(const BrickCoord& coord) {
     if (!m_pool.GetRecord(coord, &record)) {
         return;
     }
+    RemoveAllQueuedCoord(m_uploadQueue, coord);
+    RemoveAllClassQueueCoord(m_uploadClassQueues, coord);
+    RemoveAllClassQueueCoord(m_uploadOwnershipQueues, coord);
     m_uploadQueue.push_front(coord);
     m_uploadClassQueues[ResidencyClassQueueIndex(record.residencyClass)].push_front(coord);
+    m_uploadOwnershipQueues[OwnershipCriticalQueueIndex(IsStreamingOwnershipCritical(record))].push_front(coord);
     MarkUploadQueueOrderDirty();
 }
 
 bool SparseVoxelWorld::RemoveFirstUploadQueueCoord(const BrickCoord& coord) {
-    for (auto it = m_uploadQueue.begin(); it != m_uploadQueue.end(); ++it) {
-        if (*it == coord) {
-            m_uploadQueue.erase(it);
-            MarkUploadQueueOrderDirty();
-            return true;
-        }
+    if (RemoveAllQueuedCoord(m_uploadQueue, coord)) {
+        RemoveAllClassQueueCoord(m_uploadOwnershipQueues, coord);
+        MarkUploadQueueOrderDirty();
+        return true;
     }
+    RemoveAllClassQueueCoord(m_uploadOwnershipQueues, coord);
     return false;
 }
 
 bool SparseVoxelWorld::RemoveFirstUploadClassQueueCoord(
     const BrickCoord& coord,
-    SparseResidencyClass residencyClass)
+    SparseResidencyClass)
 {
-    auto& queue = m_uploadClassQueues[ResidencyClassQueueIndex(residencyClass)];
-    for (auto it = queue.begin(); it != queue.end(); ++it) {
-        if (*it == coord) {
-            queue.erase(it);
-            return true;
-        }
-    }
-    return false;
+    return RemoveAllClassQueueCoord(m_uploadClassQueues, coord);
 }
 
 void SparseVoxelWorld::QueueUploadClassAliasIfUploadQueued(const BrickCoord& coord) {
@@ -669,7 +2568,10 @@ void SparseVoxelWorld::QueueUploadClassAliasIfUploadQueued(const BrickCoord& coo
     if (record.state != BrickLifecycleState::UploadQueued) {
         return;
     }
+    RemoveAllClassQueueCoord(m_uploadClassQueues, coord);
+    RemoveAllClassQueueCoord(m_uploadOwnershipQueues, coord);
     m_uploadClassQueues[ResidencyClassQueueIndex(record.residencyClass)].push_back(coord);
+    m_uploadOwnershipQueues[OwnershipCriticalQueueIndex(IsStreamingOwnershipCritical(record))].push_back(coord);
     MarkUploadQueueOrderDirty();
 }
 
@@ -681,36 +2583,31 @@ void SparseVoxelWorld::QueueSurfaceExtractionCoord(const BrickCoord& coord) {
     if (m_surfaceExtractionQueuedSet.insert(coord).second) {
         m_surfaceExtractionQueue.push_back(coord);
         m_surfaceClassQueues[ResidencyClassQueueIndex(record.residencyClass)].push_back(coord);
+        m_surfaceOwnershipQueues[OwnershipCriticalQueueIndex(IsStreamingOwnershipCritical(record))].push_back(coord);
     }
-    m_surfaceExtractionQueuePriorityDirty = true;
-    MarkQueueAccountingDirty();
+    MarkSurfaceQueueOrderDirty();
 }
 
 bool SparseVoxelWorld::RemoveFirstSurfaceQueueCoord(const BrickCoord& coord) {
-    for (auto it = m_surfaceExtractionQueue.begin(); it != m_surfaceExtractionQueue.end(); ++it) {
-        if (*it == coord) {
-            m_surfaceExtractionQueue.erase(it);
-            m_surfaceExtractionQueuedSet.erase(coord);
-            m_surfaceExtractionQueuePriorityDirty = true;
-            MarkQueueAccountingDirty();
-            return true;
-        }
+    if (RemoveAllQueuedCoord(m_surfaceExtractionQueue, coord)) {
+        RemoveAllClassQueueCoord(m_surfaceOwnershipQueues, coord);
+        m_surfaceExtractionQueuedSet.erase(coord);
+        MarkSurfaceQueueOrderDirty();
+        return true;
     }
+    RemoveAllClassQueueCoord(m_surfaceOwnershipQueues, coord);
     return false;
 }
 
 bool SparseVoxelWorld::RemoveFirstSurfaceClassQueueCoord(
     const BrickCoord& coord,
-    SparseResidencyClass residencyClass)
+    SparseResidencyClass)
 {
-    auto& queue = m_surfaceClassQueues[ResidencyClassQueueIndex(residencyClass)];
-    for (auto it = queue.begin(); it != queue.end(); ++it) {
-        if (*it == coord) {
-            queue.erase(it);
-            return true;
-        }
+    if (!RemoveAllClassQueueCoord(m_surfaceClassQueues, coord)) {
+        return false;
     }
-    return false;
+    MarkSurfaceQueueOrderDirty();
+    return true;
 }
 
 void SparseVoxelWorld::QueueSurfaceClassAliasIfPending(const BrickCoord& coord) {
@@ -721,15 +2618,52 @@ void SparseVoxelWorld::QueueSurfaceClassAliasIfPending(const BrickCoord& coord) 
     if (!m_pool.GetRecord(coord, &record)) {
         return;
     }
+    RemoveAllClassQueueCoord(m_surfaceClassQueues, coord);
+    RemoveAllClassQueueCoord(m_surfaceOwnershipQueues, coord);
     m_surfaceClassQueues[ResidencyClassQueueIndex(record.residencyClass)].push_back(coord);
-    m_surfaceExtractionQueuePriorityDirty = true;
+    m_surfaceOwnershipQueues[OwnershipCriticalQueueIndex(IsStreamingOwnershipCritical(record))].push_back(coord);
+    MarkSurfaceQueueOrderDirty();
+}
+
+bool SparseVoxelWorld::PruneSurfaceExtractionQueuesIfNoPending() {
+    if (!m_pendingSurfaceBricks.empty()) {
+        return false;
+    }
+
+    bool hadQueuedWork =
+        !m_surfaceExtractionQueue.empty() ||
+        !m_surfaceExtractionQueuedSet.empty();
+    for (const auto& classQueue : m_surfaceClassQueues) {
+        hadQueuedWork = hadQueuedWork || !classQueue.empty();
+    }
+    for (const auto& ownershipQueue : m_surfaceOwnershipQueues) {
+        hadQueuedWork = hadQueuedWork || !ownershipQueue.empty();
+    }
+    if (!hadQueuedWork) {
+        return false;
+    }
+
+    m_surfaceExtractionQueue.clear();
+    m_surfaceExtractionQueuedSet.clear();
+    for (auto& classQueue : m_surfaceClassQueues) {
+        classQueue.clear();
+    }
+    for (auto& ownershipQueue : m_surfaceOwnershipQueues) {
+        ownershipQueue.clear();
+    }
+    m_surfaceExtractionQueuePriorityDirty = false;
+    m_surfaceClassValueSortValid.fill(false);
     MarkQueueAccountingDirty();
+    return true;
 }
 
 bool SparseVoxelWorld::ExtractSurfaceCoord(const BrickCoord& coord) {
     auto pendingIt = m_pendingSurfaceBricks.find(coord);
     if (pendingIt == m_pendingSurfaceBricks.end()) {
+        RemoveFirstSurfaceQueueCoord(coord);
+        RemoveAllClassQueueCoord(m_surfaceClassQueues, coord);
         m_surfaceExtractionQueuedSet.erase(coord);
+        MarkQueueAccountingDirty();
         return false;
     }
     BrickResidentRecord surfaceRecord;
@@ -743,6 +2677,8 @@ bool SparseVoxelWorld::ExtractSurfaceCoord(const BrickCoord& coord) {
         m_pendingSurfaceBricks.erase(pendingIt);
         m_surfaceDirtyRegions.erase(coord);
         m_surfaceExtractionQueuedSet.erase(coord);
+        RemoveAllClassQueueCoord(m_surfaceClassQueues, coord);
+        RemoveAllClassQueueCoord(m_surfaceOwnershipQueues, coord);
         MarkQueueAccountingDirty();
         return false;
     }
@@ -751,8 +2687,74 @@ bool SparseVoxelWorld::ExtractSurfaceCoord(const BrickCoord& coord) {
     m_pendingSurfaceBricks.erase(pendingIt);
     m_surfaceExtractionQueuedSet.erase(coord);
     MarkQueueAccountingDirty();
-    auto neighborSampler = [this](int32_t worldX, int32_t worldY, int32_t worldZ) {
-        return SampleEditedOrGeneratedVoxel(worldX, worldY, worldZ);
+    constexpr int32_t kSurfaceHaloColumnSize = SPARSE_BRICK_SIZE + 2;
+    int32_t brickWorldMinX = 0;
+    int32_t brickWorldMinZ = 0;
+    bool haloCacheValid =
+        TryWorldVoxelFromBrickLocal(coord.x, 0, &brickWorldMinX) &&
+        TryWorldVoxelFromBrickLocal(coord.z, 0, &brickWorldMinZ);
+    int32_t haloMinX = 0;
+    int32_t haloMinZ = 0;
+    if (haloCacheValid &&
+        (!TryStepInt32(brickWorldMinX, -1, &haloMinX) ||
+         !TryStepInt32(brickWorldMinZ, -1, &haloMinZ))) {
+        haloCacheValid = false;
+    }
+    std::array<float, kSurfaceHaloColumnSize * kSurfaceHaloColumnSize> haloHeights = {};
+    std::array<float, kSurfaceHaloColumnSize * kSurfaceHaloColumnSize> haloRelief = {};
+    if (haloCacheValid) {
+        for (int32_t z = 0; z < kSurfaceHaloColumnSize; ++z) {
+            for (int32_t x = 0; x < kSurfaceHaloColumnSize; ++x) {
+                const int32_t worldX = haloMinX + x;
+                const int32_t worldZ = haloMinZ + z;
+                const size_t index = static_cast<size_t>(x + z * kSurfaceHaloColumnSize);
+                haloHeights[index] = CachedTerrainHeightAt(worldX, worldZ);
+                haloRelief[index] = CachedTerrainReliefAt(worldX, worldZ, 4);
+            }
+        }
+    }
+    bool haloMayContainEdits = false;
+    for (int32_t dz = -1; dz <= 1 && !haloMayContainEdits; ++dz) {
+        for (int32_t dy = -1; dy <= 1 && !haloMayContainEdits; ++dy) {
+            for (int32_t dx = -1; dx <= 1; ++dx) {
+                BrickCoord neighborCoord;
+                if (TryOffsetBrickCoord(coord, dx, dy, dz, &neighborCoord) &&
+                    m_edits.HasOverlay(neighborCoord)) {
+                    haloMayContainEdits = true;
+                    break;
+                }
+            }
+        }
+    }
+    auto neighborSampler = [this,
+                            haloCacheValid,
+                            haloMayContainEdits,
+                            haloMinX,
+                            haloMinZ,
+                            &haloHeights,
+                            &haloRelief](int32_t worldX, int32_t worldY, int32_t worldZ) {
+        if (haloMayContainEdits) {
+            uint32_t editedVoxel = 0;
+            if (m_edits.TryGetVoxel(worldX, worldY, worldZ, &editedVoxel)) {
+                return editedVoxel;
+            }
+        }
+        if (haloCacheValid &&
+            worldX >= haloMinX &&
+            worldX < haloMinX + kSurfaceHaloColumnSize &&
+            worldZ >= haloMinZ &&
+            worldZ < haloMinZ + kSurfaceHaloColumnSize) {
+            const int32_t localX = worldX - haloMinX;
+            const int32_t localZ = worldZ - haloMinZ;
+            const size_t index = static_cast<size_t>(localX + localZ * kSurfaceHaloColumnSize);
+            return m_terrain.SampleGeneratedVoxelWithColumn(
+                worldX,
+                worldY,
+                worldZ,
+                haloHeights[index],
+                haloRelief[index]);
+        }
+        return m_terrain.SampleGeneratedVoxel(worldX, worldY, worldZ);
     };
     auto surfaceDirtyIt = m_surfaceDirtyRegions.find(coord);
     if (surfaceDirtyIt != m_surfaceDirtyRegions.end()) {
@@ -770,11 +2772,470 @@ bool SparseVoxelWorld::ExtractSurfaceCoord(const BrickCoord& coord) {
             m_surfaceCollisionBricksExtractedLastFrame,
             m_surfaceEditedBricksExtractedLastFrame);
     }
+    MarkStreamingTicketStagesCompleted(coord, kStreamingTicketStageSurfaceReady);
     return true;
+}
+
+bool SparseVoxelWorld::CanUseParallelSurfaceExtractionBatch(uint32_t maxBricks) const {
+    return
+        m_config.parallelSurfaceExtraction &&
+        m_edits.EditedBrickCount() == 0u &&
+        m_surfaceDirtyRegions.empty() &&
+        maxBricks >= m_config.parallelSurfaceExtractionMinBricks &&
+        m_pendingSurfaceBricks.size() >= static_cast<size_t>(m_config.parallelSurfaceExtractionMinBricks);
+}
+
+uint32_t SparseVoxelWorld::ExtractSurfaceBatchNoEdit(std::vector<SurfaceExtractionBatchItem>& pending) {
+    if (pending.empty()) {
+        return 0;
+    }
+
+    const SparseTerrainGenerator terrain = m_terrain;
+    std::vector<SparseSurfaceExtractionResult> results(pending.size());
+    const uint32_t workerCount = std::min<uint32_t>(
+        static_cast<uint32_t>(pending.size()),
+        m_config.parallelSurfaceExtractionMaxWorkers);
+    std::vector<SurfaceWorkerColumnCache> workerColumnCaches(workerCount);
+    for (SurfaceWorkerColumnCache& cache : workerColumnCaches) {
+        cache.reserve(8192);
+    }
+
+    const auto parallelStart = std::chrono::steady_clock::now();
+    if (workerCount <= 1u) {
+        for (size_t index = 0; index < pending.size(); ++index) {
+            results[index] = ExtractSurfaceNoEditWithTerrain(terrain, pending[index].brick, workerColumnCaches[0]);
+        }
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(workerCount);
+        const size_t chunkSize =
+            (pending.size() + static_cast<size_t>(workerCount) - 1u) /
+            static_cast<size_t>(workerCount);
+        for (uint32_t workerIndex = 0u; workerIndex < workerCount; ++workerIndex) {
+            const size_t begin = static_cast<size_t>(workerIndex) * chunkSize;
+            const size_t end = std::min(pending.size(), begin + chunkSize);
+            workers.emplace_back([
+                &terrain,
+                &pending,
+                &results,
+                &workerColumnCaches,
+                workerIndex,
+                begin,
+                end]() {
+                for (size_t index = begin; index < end; ++index) {
+                    results[index] = ExtractSurfaceNoEditWithTerrain(
+                        terrain,
+                        pending[index].brick,
+                        workerColumnCaches[workerIndex]);
+                }
+            });
+        }
+        for (std::thread& worker : workers) {
+            worker.join();
+        }
+    }
+
+    const uint32_t batchBricks = static_cast<uint32_t>(
+        std::min<size_t>(pending.size(), static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+    m_parallelSurfaceExtractionBricksLastFrame =
+        std::min<uint32_t>(
+            std::numeric_limits<uint32_t>::max() - m_parallelSurfaceExtractionBricksLastFrame,
+            batchBricks) +
+        m_parallelSurfaceExtractionBricksLastFrame;
+    m_parallelSurfaceExtractionWorkersLastFrame =
+        std::max(m_parallelSurfaceExtractionWorkersLastFrame, workerCount);
+    m_parallelSurfaceExtractionWallMsLastFrame +=
+        std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - parallelStart).count();
+
+    uint32_t extracted = 0;
+    for (size_t index = 0; index < pending.size(); ++index) {
+        BrickResidentRecord record;
+        if (!m_pool.GetRecord(pending[index].coord, &record)) {
+            continue;
+        }
+        if (m_surfaceCache.UpdateBrickWithExtractedFaces(
+                pending[index].brick,
+                std::move(results[index]))) {
+            IncrementResidencyClassCounter(
+                pending[index].residencyClass,
+                m_surfaceSpeculativeBricksExtractedLastFrame,
+                m_surfaceVisibleBricksExtractedLastFrame,
+                m_surfaceCollisionBricksExtractedLastFrame,
+                m_surfaceEditedBricksExtractedLastFrame);
+            MarkStreamingTicketStagesCompleted(pending[index].coord, kStreamingTicketStageSurfaceReady);
+            ++extracted;
+        }
+    }
+
+    return extracted;
+}
+
+SparseVoxelWorld::StreamingTicketOwnership SparseVoxelWorld::ClassifyStreamingTicketOwnership(
+    const BrickResidentRecord& record) const
+{
+    switch (record.streamingLane) {
+        case SparseStreamingLane::PublicCritical:
+            return StreamingTicketOwnership::PublicCritical;
+        case SparseStreamingLane::Visible:
+            return StreamingTicketOwnership::SampledVisible;
+        case SparseStreamingLane::Repair:
+            return StreamingTicketOwnership::HiddenRepair;
+        case SparseStreamingLane::Prefetch:
+            return StreamingTicketOwnership::Prefetch;
+        case SparseStreamingLane::Cache:
+        default:
+            break;
+    }
+
+    if (record.residencyClass == SparseResidencyClass::Visible ||
+        record.residencyClass == SparseResidencyClass::Collision ||
+        record.residencyClass == SparseResidencyClass::Edited) {
+        return StreamingTicketOwnership::UnknownCritical;
+    }
+    return StreamingTicketOwnership::Cache;
+}
+
+bool SparseVoxelWorld::IsStreamingOwnershipCritical(const BrickResidentRecord& record) const
+{
+    switch (ClassifyStreamingTicketOwnership(record)) {
+        case StreamingTicketOwnership::PublicCritical:
+        case StreamingTicketOwnership::UnknownCritical:
+        case StreamingTicketOwnership::SampledVisible:
+            return true;
+        case StreamingTicketOwnership::HiddenRepair:
+        case StreamingTicketOwnership::FallbackValid:
+        case StreamingTicketOwnership::Prefetch:
+        case StreamingTicketOwnership::Cache:
+        default:
+            return false;
+    }
+}
+
+size_t SparseVoxelWorld::StreamingTicketOwnershipIndex(StreamingTicketOwnership ownership)
+{
+    const size_t index = static_cast<size_t>(ownership);
+    return index < kStreamingTicketOwnershipCount ? index : 0u;
+}
+
+size_t SparseVoxelWorld::StreamingTicketStageIndex(uint32_t stageBit)
+{
+    switch (stageBit) {
+        case kStreamingTicketStageCpuGenerated:
+            return 0u;
+        case kStreamingTicketStageGpuUploaded:
+            return 1u;
+        case kStreamingTicketStageSurfaceReady:
+            return 2u;
+        case kStreamingTicketStagePagePublished:
+            return 3u;
+        default:
+            return kStreamingTicketStageCount;
+    }
+}
+
+void SparseVoxelWorld::AddStreamingTicketPendingStageDemand(const StreamingWorkTicket& ticket)
+{
+    if (!m_config.streamingTicketStageDemandAccounting) {
+        return;
+    }
+    const uint32_t pendingStages = ticket.requiredStages & ~ticket.completedStages;
+    const size_t ownershipIndex = StreamingTicketOwnershipIndex(ticket.ownership);
+    const uint32_t stageBits[] = {
+        kStreamingTicketStageCpuGenerated,
+        kStreamingTicketStageGpuUploaded,
+        kStreamingTicketStageSurfaceReady,
+        kStreamingTicketStagePagePublished,
+    };
+    for (uint32_t stageBit : stageBits) {
+        if ((pendingStages & stageBit) == 0u) {
+            continue;
+        }
+        const size_t stageIndex = StreamingTicketStageIndex(stageBit);
+        if (stageIndex < kStreamingTicketStageCount) {
+            ++m_streamingTicketPendingStageOwnershipCounts[stageIndex][ownershipIndex];
+        }
+    }
+}
+
+void SparseVoxelWorld::RemoveStreamingTicketPendingStageDemand(const StreamingWorkTicket& ticket)
+{
+    if (!m_config.streamingTicketStageDemandAccounting) {
+        return;
+    }
+    const uint32_t pendingStages = ticket.requiredStages & ~ticket.completedStages;
+    const size_t ownershipIndex = StreamingTicketOwnershipIndex(ticket.ownership);
+    const uint32_t stageBits[] = {
+        kStreamingTicketStageCpuGenerated,
+        kStreamingTicketStageGpuUploaded,
+        kStreamingTicketStageSurfaceReady,
+        kStreamingTicketStagePagePublished,
+    };
+    for (uint32_t stageBit : stageBits) {
+        if ((pendingStages & stageBit) == 0u) {
+            continue;
+        }
+        const size_t stageIndex = StreamingTicketStageIndex(stageBit);
+        if (stageIndex >= kStreamingTicketStageCount) {
+            continue;
+        }
+        uint32_t& count = m_streamingTicketPendingStageOwnershipCounts[stageIndex][ownershipIndex];
+        if (count > 0u) {
+            --count;
+        }
+    }
+}
+
+void SparseVoxelWorld::TouchStreamingTicket(
+    const BrickCoord& coord,
+    const BrickResidentRecord& record,
+    uint32_t requiredStages,
+    uint32_t completedStages)
+{
+    if (!m_config.streamingTicketScheduler) {
+        return;
+    }
+
+    auto [ticketIt, inserted] = m_streamingTickets.try_emplace(coord);
+    StreamingWorkTicket& ticket = ticketIt->second;
+    if (!inserted) {
+        RemoveStreamingTicketPendingStageDemand(ticket);
+    }
+    if (ticket.requestFrame == 0u) {
+        ticket.requestFrame = record.lastTouchedFrame;
+    }
+    ticket.residencyClass = record.residencyClass;
+    ticket.streamingLane = record.streamingLane;
+    ticket.ownership = ClassifyStreamingTicketOwnership(record);
+    ticket.requiredStages |= requiredStages;
+    ticket.completedStages |= completedStages;
+    ticket.lastTouchedFrame = std::max(ticket.lastTouchedFrame, record.lastTouchedFrame);
+    ticket.lastUpdatedFrame = std::max(ticket.lastUpdatedFrame, record.lastTouchedFrame);
+    ticket.editRevision = m_edits.RevisionSerial();
+
+    if ((ticket.requiredStages & ~ticket.completedStages) == 0u &&
+        ticket.requiredStages != 0u) {
+        m_streamingTickets.erase(ticketIt);
+        ++m_streamingTicketCompletedLastFrame;
+    } else {
+        AddStreamingTicketPendingStageDemand(ticket);
+    }
+}
+
+void SparseVoxelWorld::UpdateStreamingTicketFromRecord(
+    const BrickCoord& coord,
+    const BrickResidentRecord& record)
+{
+    if (!m_config.streamingTicketScheduler) {
+        return;
+    }
+
+    auto ticketIt = m_streamingTickets.find(coord);
+    if (ticketIt == m_streamingTickets.end()) {
+        return;
+    }
+    RemoveStreamingTicketPendingStageDemand(ticketIt->second);
+    ticketIt->second.residencyClass = record.residencyClass;
+    ticketIt->second.streamingLane = record.streamingLane;
+    ticketIt->second.ownership = ClassifyStreamingTicketOwnership(record);
+    ticketIt->second.lastTouchedFrame =
+        std::max(ticketIt->second.lastTouchedFrame, record.lastTouchedFrame);
+    ticketIt->second.lastUpdatedFrame =
+        std::max(ticketIt->second.lastUpdatedFrame, record.lastTouchedFrame);
+    AddStreamingTicketPendingStageDemand(ticketIt->second);
+}
+
+void SparseVoxelWorld::MarkStreamingTicketStagesCompleted(
+    const BrickCoord& coord,
+    uint32_t completedStages)
+{
+    if (!m_config.streamingTicketScheduler || completedStages == 0u) {
+        return;
+    }
+
+    auto ticketIt = m_streamingTickets.find(coord);
+    if (ticketIt == m_streamingTickets.end()) {
+        return;
+    }
+    RemoveStreamingTicketPendingStageDemand(ticketIt->second);
+    ticketIt->second.completedStages |= completedStages;
+    if ((ticketIt->second.requiredStages & ~ticketIt->second.completedStages) == 0u &&
+        ticketIt->second.requiredStages != 0u) {
+        m_streamingTickets.erase(ticketIt);
+        ++m_streamingTicketCompletedLastFrame;
+    } else {
+        AddStreamingTicketPendingStageDemand(ticketIt->second);
+    }
+}
+
+void SparseVoxelWorld::RemoveStreamingTicket(const BrickCoord& coord)
+{
+    if (!m_config.streamingTicketScheduler) {
+        return;
+    }
+    auto ticketIt = m_streamingTickets.find(coord);
+    if (ticketIt == m_streamingTickets.end()) {
+        return;
+    }
+    RemoveStreamingTicketPendingStageDemand(ticketIt->second);
+    m_streamingTickets.erase(ticketIt);
+}
+
+int64_t SparseVoxelWorld::StreamingTicketOwnershipScore(StreamingTicketOwnership ownership) const
+{
+    switch (ownership) {
+        case StreamingTicketOwnership::PublicCritical:
+            return 700000000000000ll;
+        case StreamingTicketOwnership::UnknownCritical:
+            return 650000000000000ll;
+        case StreamingTicketOwnership::SampledVisible:
+            return 600000000000000ll;
+        case StreamingTicketOwnership::HiddenRepair:
+            return 400000000000000ll;
+        case StreamingTicketOwnership::FallbackValid:
+            return 300000000000000ll;
+        case StreamingTicketOwnership::Prefetch:
+            return 200000000000000ll;
+        case StreamingTicketOwnership::Cache:
+        default:
+            return 100000000000000ll;
+    }
+}
+
+int64_t SparseVoxelWorld::StreamingTicketStageScore(
+    const StreamingWorkTicket& ticket,
+    uint32_t stageBit) const
+{
+    if (stageBit == 0u) {
+        return 0ll;
+    }
+    const bool required = (ticket.requiredStages & stageBit) != 0u;
+    const bool completed = (ticket.completedStages & stageBit) != 0u;
+    if (required && !completed) {
+        return 50000000000000ll;
+    }
+    if (required) {
+        return 1000000000000ll;
+    }
+    return 0ll;
+}
+
+void SparseVoxelWorld::SortQueueByStreamingTickets(
+    std::deque<BrickCoord>& queue,
+    uint32_t stageBit,
+    const BrickCoord* focus,
+    uint32_t currentFrame,
+    bool valueSort,
+    size_t frontCount)
+{
+    if (!m_config.streamingTicketProtectedScheduling || queue.size() <= 1) {
+        return;
+    }
+
+    struct QueuedBrick {
+        BrickCoord coord;
+        int64_t ticketScore = 0;
+        int64_t baseScore = 0;
+    };
+
+    std::vector<QueuedBrick> sorted;
+    sorted.reserve(queue.size());
+    std::unordered_set<BrickCoord, BrickCoordHash> seen;
+    bool hasProtectedTicket = false;
+    for (const BrickCoord& coord : queue) {
+        if (!seen.insert(coord).second) {
+            continue;
+        }
+        BrickResidentRecord record;
+        if (!m_pool.GetRecord(coord, &record)) {
+            continue;
+        }
+        int64_t ticketScore = 0ll;
+        auto ticketIt = m_streamingTickets.find(coord);
+        if (ticketIt != m_streamingTickets.end()) {
+            ticketScore =
+                StreamingTicketOwnershipScore(ticketIt->second.ownership) +
+                StreamingTicketStageScore(ticketIt->second, stageBit);
+            switch (ticketIt->second.ownership) {
+                case StreamingTicketOwnership::PublicCritical:
+                case StreamingTicketOwnership::UnknownCritical:
+                case StreamingTicketOwnership::SampledVisible:
+                case StreamingTicketOwnership::HiddenRepair:
+                case StreamingTicketOwnership::FallbackValid:
+                    hasProtectedTicket = true;
+                    break;
+                case StreamingTicketOwnership::Prefetch:
+                case StreamingTicketOwnership::Cache:
+                default:
+                    break;
+            }
+            if (currentFrame >= ticketIt->second.requestFrame) {
+                ticketScore += static_cast<int64_t>(
+                    std::min<uint32_t>(currentFrame - ticketIt->second.requestFrame, 100000u)) *
+                    1000000ll;
+            }
+        }
+        const int64_t baseScore =
+            valueSort && focus
+                ? UploadValueScore(
+                    record,
+                    *focus,
+                    currentFrame,
+                    m_config.streamingLaneQueuePriority)
+                : QueuePriorityScore(
+                    record,
+                    currentFrame,
+                    m_config.streamingLaneQueuePriority);
+        sorted.push_back({coord, ticketScore, baseScore});
+    }
+
+    if (!hasProtectedTicket) {
+        return;
+    }
+
+    const auto better = [](const QueuedBrick& a, const QueuedBrick& b) {
+        if (a.ticketScore != b.ticketScore) {
+            return a.ticketScore > b.ticketScore;
+        }
+        if (a.baseScore != b.baseScore) {
+            return a.baseScore > b.baseScore;
+        }
+        return a.coord < b.coord;
+    };
+
+    const size_t selectedCount = frontCount == 0
+        ? sorted.size()
+        : std::min(frontCount, sorted.size());
+    if (selectedCount == sorted.size()) {
+        std::sort(sorted.begin(), sorted.end(), better);
+    } else if (selectedCount > 0) {
+        std::partial_sort(sorted.begin(), sorted.begin() + selectedCount, sorted.end(), better);
+    }
+
+    queue.clear();
+    for (const QueuedBrick& queued : sorted) {
+        queue.push_back(queued.coord);
+    }
+    ++m_streamingTicketProtectedSortsLastFrame;
 }
 
 bool SparseVoxelWorld::RequestBrick(const BrickCoord& coord) {
     return RequestBrickDetailed(coord) != SparseBrickRequestResult::Rejected;
+}
+
+bool SparseVoxelWorld::TrySkipKnownEmptyRequest(const BrickCoord& coord)
+{
+    if (m_edits.HasOverlay(coord)) {
+        return false;
+    }
+    if (m_knownEmptyGeneratedBricks.find(coord) == m_knownEmptyGeneratedBricks.end() &&
+        !m_terrain.IsDefinitelyEmptyBrick(coord)) {
+        return false;
+    }
+    m_knownEmptyGeneratedBricks.insert(coord);
+    ++m_emptyRequestsSkippedLastFrame;
+    RefreshStats();
+    return true;
 }
 
 SparseBrickRequestResult SparseVoxelWorld::RequestBrickDetailed(
@@ -785,14 +3246,8 @@ SparseBrickRequestResult SparseVoxelWorld::RequestBrickDetailed(
         return SparseBrickRequestResult::AlreadyResident;
     }
 
-    if (allowEmptyFastPath && !m_edits.HasOverlay(coord)) {
-        if (m_knownEmptyGeneratedBricks.find(coord) != m_knownEmptyGeneratedBricks.end() ||
-            m_terrain.IsDefinitelyEmptyBrick(coord)) {
-            m_knownEmptyGeneratedBricks.insert(coord);
-            ++m_emptyRequestsSkippedLastFrame;
-            RefreshStats();
-            return SparseBrickRequestResult::SkippedKnownEmpty;
-        }
+    if (allowEmptyFastPath && TrySkipKnownEmptyRequest(coord)) {
+        return SparseBrickRequestResult::SkippedKnownEmpty;
     }
 
     const uint32_t page = m_pool.AllocatePage(coord);
@@ -801,27 +3256,408 @@ SparseBrickRequestResult SparseVoxelWorld::RequestBrickDetailed(
     }
 
     QueueGenerationCoordBack(coord);
+    BrickResidentRecord record;
+    if (m_pool.GetRecord(coord, &record)) {
+        TouchStreamingTicket(coord, record, kStreamingTicketStageCpuGenerated);
+    }
     RefreshStats();
     return SparseBrickRequestResult::Allocated;
 }
 
 uint32_t SparseVoxelWorld::PumpGeneration(uint32_t maxBricks, uint32_t currentFrame) {
+    ApplyAsyncExactGenerationCompletions(currentFrame);
+    m_parallelExactGenerationBricksLastFrame = 0;
+    m_parallelExactGenerationWorkersLastFrame = 0;
+    m_parallelExactGenerationWallMsLastFrame = 0.0f;
     uint32_t generated = 0;
-    if (m_generationQueuePriorityDirty) {
-        SortQueuedBricksByPriority(m_generationQueue, m_pool, currentFrame);
+    uint32_t processed = 0;
+    uint32_t ownershipProcessed = 0;
+    if (m_config.streamingTicketGenerationOwnershipShareScheduler) {
+        generated += PumpGenerationOwnershipShares(maxBricks, currentFrame, &ownershipProcessed);
+    } else {
+        generated += PumpGenerationOwnershipReservations(maxBricks, currentFrame, &ownershipProcessed);
+    }
+    processed += ownershipProcessed;
+    if (processed < maxBricks && m_generationQueuePriorityDirty) {
+        SortQueuedBricksByPriority(
+            m_generationQueue,
+            m_pool,
+            currentFrame,
+            m_config.streamingLaneQueuePriority);
+        SortQueueByStreamingTickets(
+            m_generationQueue,
+            kStreamingTicketStageCpuGenerated,
+            nullptr,
+            currentFrame,
+            false);
         m_generationQueuePriorityDirty = false;
     }
 
+    const bool parallelGenerationAllowed =
+        m_config.parallelExactGeneration &&
+        maxBricks >= m_config.parallelExactGenerationMinBricks &&
+        m_generationQueue.size() >= static_cast<size_t>(m_config.parallelExactGenerationMinBricks) &&
+        m_edits.EditedBrickCount() == 0u;
+    if (processed < maxBricks && parallelGenerationAllowed) {
+        struct PendingExactGeneration {
+            BrickCoord coord;
+            SparseResidencyClass residencyClass = SparseResidencyClass::Speculative;
+        };
+
+        std::vector<PendingExactGeneration> pending;
+        pending.reserve(maxBricks);
+        BrickCoord coord{};
+        while (processed < maxBricks &&
+               pending.size() < static_cast<size_t>(maxBricks) &&
+               PopFrontQueuedBrick(m_generationQueue, m_pool, &coord)) {
+            BrickResidentRecord generationRecord;
+            if (!m_pool.GetRecord(coord, &generationRecord)) {
+                continue;
+            }
+            RemoveFirstGenerationClassQueueCoord(coord, generationRecord.residencyClass);
+            if (TryQueueAsyncExactGeneration(coord, generationRecord, currentFrame)) {
+                ++processed;
+                continue;
+            }
+            if (!m_pool.MarkGeneratingCPU(coord)) {
+                continue;
+            }
+            pending.push_back({coord, generationRecord.residencyClass});
+            ++processed;
+        }
+
+        if (!pending.empty()) {
+            const SparseTerrainGenerator terrain = m_terrain;
+            std::vector<GeneratedSparseBrick> bricks(pending.size());
+            std::vector<float> elapsedMs(pending.size(), 0.0f);
+            std::vector<BrickCoord> persistentWorkerCoords;
+            const bool useWorkerThreads =
+                pending.size() >= static_cast<size_t>(m_config.parallelExactGenerationMinBricks) &&
+                m_config.parallelExactGenerationMaxWorkers > 1u;
+            const uint32_t workerCount = useWorkerThreads
+                ? std::min<uint32_t>(
+                    static_cast<uint32_t>(pending.size()),
+                    m_config.parallelExactGenerationMaxWorkers)
+                : 1u;
+            std::vector<TerrainSurfaceColumnCache> workerColumnCaches(workerCount);
+            for (TerrainSurfaceColumnCache& cache : workerColumnCaches) {
+                cache.reserve(8192);
+            }
+            const auto parallelStart = std::chrono::steady_clock::now();
+            if (workerCount <= 1u) {
+                for (size_t index = 0; index < pending.size(); ++index) {
+                    const auto generateStart = std::chrono::steady_clock::now();
+                    bricks[index] = GenerateExactBrickForConfig(
+                        terrain,
+                        pending[index].coord,
+                        workerColumnCaches[0]);
+                    elapsedMs[index] = std::chrono::duration<float, std::milli>(
+                        std::chrono::steady_clock::now() - generateStart).count();
+                }
+            } else if (m_config.parallelExactGenerationPersistentWorkers) {
+                persistentWorkerCoords.reserve(pending.size());
+                for (const PendingExactGeneration& item : pending) {
+                    persistentWorkerCoords.push_back(item.coord);
+                }
+                if (!GenerateExactBricksWithPersistentWorkers(
+                        terrain,
+                        persistentWorkerCoords,
+                        bricks,
+                        workerCount)) {
+                    std::vector<std::thread> workers;
+                    workers.reserve(workerCount);
+                    const size_t chunkSize =
+                        (pending.size() + static_cast<size_t>(workerCount) - 1u) /
+                        static_cast<size_t>(workerCount);
+                    for (uint32_t workerIndex = 0u; workerIndex < workerCount; ++workerIndex) {
+                        const size_t begin = static_cast<size_t>(workerIndex) * chunkSize;
+                        const size_t end = std::min(pending.size(), begin + chunkSize);
+                        workers.emplace_back([
+                            this,
+                            &terrain,
+                            &pending,
+                            &bricks,
+                            &elapsedMs,
+                            &workerColumnCaches,
+                            workerIndex,
+                            begin,
+                            end]() {
+                            for (size_t index = begin; index < end; ++index) {
+                                const auto generateStart = std::chrono::steady_clock::now();
+                                bricks[index] = GenerateExactBrickForConfig(
+                                    terrain,
+                                    pending[index].coord,
+                                    workerColumnCaches[workerIndex]);
+                                elapsedMs[index] = std::chrono::duration<float, std::milli>(
+                                    std::chrono::steady_clock::now() - generateStart).count();
+                            }
+                        });
+                    }
+                    for (std::thread& worker : workers) {
+                        worker.join();
+                    }
+                }
+            } else {
+                std::vector<std::thread> workers;
+                workers.reserve(workerCount);
+                const size_t chunkSize =
+                    (pending.size() + static_cast<size_t>(workerCount) - 1u) /
+                    static_cast<size_t>(workerCount);
+                for (uint32_t workerIndex = 0u; workerIndex < workerCount; ++workerIndex) {
+                    const size_t begin = static_cast<size_t>(workerIndex) * chunkSize;
+                    const size_t end = std::min(pending.size(), begin + chunkSize);
+                    workers.emplace_back([
+                        this,
+                        &terrain,
+                        &pending,
+                        &bricks,
+                        &elapsedMs,
+                        &workerColumnCaches,
+                        workerIndex,
+                        begin,
+                        end]() {
+                        for (size_t index = begin; index < end; ++index) {
+                            const auto generateStart = std::chrono::steady_clock::now();
+                            bricks[index] = GenerateExactBrickForConfig(
+                                terrain,
+                                pending[index].coord,
+                                workerColumnCaches[workerIndex]);
+                            elapsedMs[index] = std::chrono::duration<float, std::milli>(
+                                std::chrono::steady_clock::now() - generateStart).count();
+                        }
+                    });
+                }
+                for (std::thread& worker : workers) {
+                    worker.join();
+                }
+            }
+            (void)elapsedMs;
+            m_parallelExactGenerationBricksLastFrame =
+                static_cast<uint32_t>(
+                    std::min<size_t>(pending.size(), static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+            m_parallelExactGenerationWorkersLastFrame = workerCount;
+            m_parallelExactGenerationWallMsLastFrame =
+                std::chrono::duration<float, std::milli>(
+                    std::chrono::steady_clock::now() - parallelStart).count();
+
+            for (size_t index = 0; index < pending.size(); ++index) {
+                SparseResidencyClass generatedClass = pending[index].residencyClass;
+                if (ApplyGeneratedBrickPayload(pending[index].coord, bricks[index], &generatedClass)) {
+                    IncrementResidencyClassCounter(
+                        generatedClass,
+                        m_generatedSpeculativeBricksLastFrame,
+                        m_generatedVisibleBricksLastFrame,
+                        m_generatedCollisionBricksLastFrame,
+                        m_generatedEditedBricksLastFrame);
+                    ++generated;
+                }
+            }
+        }
+    }
+
     BrickCoord coord{};
-    while (generated < maxBricks &&
+    while (processed < maxBricks &&
            PopFrontQueuedBrick(m_generationQueue, m_pool, &coord)) {
 
         BrickResidentRecord generationRecord;
         if (m_pool.GetRecord(coord, &generationRecord)) {
             RemoveFirstGenerationClassQueueCoord(coord, generationRecord.residencyClass);
         }
+        if (TryQueueAsyncExactGeneration(coord, generationRecord, currentFrame)) {
+            ++processed;
+            continue;
+        }
         SparseResidencyClass generatedClass = SparseResidencyClass::Speculative;
         if (GenerateQueuedBrick(coord, &generatedClass)) {
+            IncrementResidencyClassCounter(
+                generatedClass,
+                m_generatedSpeculativeBricksLastFrame,
+                m_generatedVisibleBricksLastFrame,
+                m_generatedCollisionBricksLastFrame,
+                m_generatedEditedBricksLastFrame);
+            ++generated;
+            ++processed;
+        }
+    }
+
+    RefreshStats();
+    return generated;
+}
+
+uint32_t SparseVoxelWorld::PumpGenerationForCoord(const BrickCoord& coord)
+{
+    BrickResidentRecord record;
+    if (!m_pool.GetRecord(coord, &record) ||
+        record.state != BrickLifecycleState::Requested) {
+        return 0;
+    }
+
+    RemoveFirstGenerationQueueCoord(coord);
+    RemoveFirstGenerationClassQueueCoord(coord, record.residencyClass);
+    SparseResidencyClass generatedClass = SparseResidencyClass::Speculative;
+    const bool generated = GenerateQueuedBrick(coord, &generatedClass);
+    if (generated) {
+        IncrementResidencyClassCounter(
+            generatedClass,
+            m_generatedSpeculativeBricksLastFrame,
+            m_generatedVisibleBricksLastFrame,
+            m_generatedCollisionBricksLastFrame,
+            m_generatedEditedBricksLastFrame);
+    }
+    RefreshStats();
+    return generated ? 1u : 0u;
+}
+
+uint32_t SparseVoxelWorld::PumpGenerationForCoordsParallel(
+    const std::vector<BrickCoord>& coords,
+    uint32_t maxBricks,
+    uint32_t maxWorkers,
+    float* outWallMs)
+{
+    if (outWallMs) {
+        *outWallMs = 0.0f;
+    }
+    if (coords.empty() || maxBricks == 0u) {
+        return 0u;
+    }
+
+    struct PendingExactGeneration {
+        BrickCoord coord;
+        SparseResidencyClass residencyClass = SparseResidencyClass::Speculative;
+    };
+
+    std::vector<PendingExactGeneration> pending;
+    pending.reserve(std::min<size_t>(coords.size(), static_cast<size_t>(maxBricks)));
+    for (const BrickCoord& coord : coords) {
+        if (pending.size() >= static_cast<size_t>(maxBricks)) {
+            break;
+        }
+
+        BrickResidentRecord record;
+        if (!m_pool.GetRecord(coord, &record) ||
+            record.state != BrickLifecycleState::Requested) {
+            continue;
+        }
+
+        RemoveFirstGenerationQueueCoord(coord);
+        RemoveFirstGenerationClassQueueCoord(coord, record.residencyClass);
+        if (!m_pool.MarkGeneratingCPU(coord)) {
+            continue;
+        }
+
+        pending.push_back({coord, record.residencyClass});
+    }
+
+    if (pending.empty()) {
+        RefreshStats();
+        return 0u;
+    }
+
+    const SparseTerrainGenerator terrain = m_terrain;
+    std::vector<GeneratedSparseBrick> bricks(pending.size());
+    std::vector<BrickCoord> persistentWorkerCoords;
+    const uint32_t workerLimit = std::max(1u, maxWorkers);
+    const uint32_t workerCount =
+        std::min<uint32_t>(static_cast<uint32_t>(pending.size()), workerLimit);
+    std::vector<TerrainSurfaceColumnCache> workerColumnCaches(workerCount);
+    for (TerrainSurfaceColumnCache& cache : workerColumnCaches) {
+        cache.reserve(8192);
+    }
+
+    const auto parallelStart = std::chrono::steady_clock::now();
+    if (workerCount <= 1u) {
+        for (size_t index = 0; index < pending.size(); ++index) {
+            bricks[index] = GenerateExactBrickForConfig(
+                terrain,
+                pending[index].coord,
+                workerColumnCaches[0]);
+        }
+    } else if (m_config.parallelExactGenerationPersistentWorkers) {
+        persistentWorkerCoords.reserve(pending.size());
+        for (const PendingExactGeneration& item : pending) {
+            persistentWorkerCoords.push_back(item.coord);
+        }
+        if (!GenerateExactBricksWithPersistentWorkers(
+                terrain,
+                persistentWorkerCoords,
+                bricks,
+                workerCount)) {
+            std::vector<std::thread> workers;
+            workers.reserve(workerCount);
+            const size_t chunkSize =
+                (pending.size() + static_cast<size_t>(workerCount) - 1u) /
+                static_cast<size_t>(workerCount);
+            for (uint32_t workerIndex = 0u; workerIndex < workerCount; ++workerIndex) {
+                const size_t begin = static_cast<size_t>(workerIndex) * chunkSize;
+                const size_t end = std::min(pending.size(), begin + chunkSize);
+                if (begin >= end) {
+                    continue;
+                }
+                workers.emplace_back([
+                    this,
+                    &terrain,
+                    &pending,
+                    &bricks,
+                    &workerColumnCaches,
+                    workerIndex,
+                    begin,
+                    end]() {
+                    for (size_t index = begin; index < end; ++index) {
+                        bricks[index] = GenerateExactBrickForConfig(
+                            terrain,
+                            pending[index].coord,
+                            workerColumnCaches[workerIndex]);
+                    }
+                });
+            }
+            for (std::thread& worker : workers) {
+                worker.join();
+            }
+        }
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(workerCount);
+        const size_t chunkSize =
+            (pending.size() + static_cast<size_t>(workerCount) - 1u) /
+            static_cast<size_t>(workerCount);
+        for (uint32_t workerIndex = 0u; workerIndex < workerCount; ++workerIndex) {
+            const size_t begin = static_cast<size_t>(workerIndex) * chunkSize;
+            const size_t end = std::min(pending.size(), begin + chunkSize);
+            if (begin >= end) {
+                continue;
+            }
+            workers.emplace_back([
+                this,
+                &terrain,
+                &pending,
+                &bricks,
+                &workerColumnCaches,
+                workerIndex,
+                begin,
+                end]() {
+                for (size_t index = begin; index < end; ++index) {
+                    bricks[index] = GenerateExactBrickForConfig(
+                        terrain,
+                        pending[index].coord,
+                        workerColumnCaches[workerIndex]);
+                }
+            });
+        }
+        for (std::thread& worker : workers) {
+            worker.join();
+        }
+    }
+    const float wallMs = std::chrono::duration<float, std::milli>(
+        std::chrono::steady_clock::now() - parallelStart).count();
+    if (outWallMs) {
+        *outWallMs = wallMs;
+    }
+
+    uint32_t generated = 0;
+    for (size_t index = 0; index < pending.size(); ++index) {
+        m_edits.ApplyToGeneratedBrick(bricks[index]);
+        SparseResidencyClass generatedClass = pending[index].residencyClass;
+        if (ApplyGeneratedBrickPayload(pending[index].coord, bricks[index], &generatedClass)) {
             IncrementResidencyClassCounter(
                 generatedClass,
                 m_generatedSpeculativeBricksLastFrame,
@@ -841,8 +3677,20 @@ uint32_t SparseVoxelWorld::PumpGenerationAround(
     const BrickCoord& focus,
     uint32_t currentFrame)
 {
+    ApplyAsyncExactGenerationCompletions(currentFrame);
+    m_parallelExactGenerationBricksLastFrame = 0;
+    m_parallelExactGenerationWorkersLastFrame = 0;
+    m_parallelExactGenerationWallMsLastFrame = 0.0f;
     uint32_t generated = 0;
+    uint32_t processed = 0;
     m_generationQueuePriorityDirty = false;
+    uint32_t ownershipProcessed = 0;
+    if (m_config.streamingTicketGenerationOwnershipShareScheduler) {
+        generated += PumpGenerationOwnershipShares(maxBricks, currentFrame, &ownershipProcessed);
+    } else {
+        generated += PumpGenerationOwnershipReservations(maxBricks, currentFrame, &ownershipProcessed);
+    }
+    processed += ownershipProcessed;
 
     BrickCoord coord{};
     const std::array<SparseResidencyClass, 4> classOrder{
@@ -851,45 +3699,251 @@ uint32_t SparseVoxelWorld::PumpGenerationAround(
         SparseResidencyClass::Visible,
         SparseResidencyClass::Speculative
     };
-    for (SparseResidencyClass residencyClass : classOrder) {
-        auto& classQueue = m_generationClassQueues[ResidencyClassQueueIndex(residencyClass)];
-        SortQueuedBricksByValue(classQueue, m_pool, focus, currentFrame);
-        while (generated < maxBricks &&
-               PopFrontQueuedBrick(classQueue, m_pool, &coord)) {
-            BrickResidentRecord record;
-            if (!m_pool.GetRecord(coord, &record)) {
-                continue;
-            }
-            if (record.residencyClass != residencyClass) {
-                continue;
-            }
-            SparseResidencyClass generatedClass = SparseResidencyClass::Speculative;
-            if (GenerateQueuedBrick(coord, &generatedClass)) {
+    const bool parallelGenerationAllowed =
+        m_config.parallelExactGeneration &&
+        maxBricks >= m_config.parallelExactGenerationMinBricks &&
+        m_edits.EditedBrickCount() == 0u;
+    if (processed < maxBricks && parallelGenerationAllowed) {
+        struct PendingExactGeneration {
+            BrickCoord coord;
+            SparseResidencyClass residencyClass = SparseResidencyClass::Speculative;
+        };
+
+        std::vector<PendingExactGeneration> pending;
+        pending.reserve(maxBricks);
+        for (SparseResidencyClass residencyClass : classOrder) {
+            auto& classQueue = m_generationClassQueues[ResidencyClassQueueIndex(residencyClass)];
+            SortQueuedBricksByValue(
+                classQueue,
+                m_pool,
+                focus,
+                currentFrame,
+                m_config.streamingLaneQueuePriority);
+            SortQueueByStreamingTickets(
+                classQueue,
+                kStreamingTicketStageCpuGenerated,
+                &focus,
+                currentFrame,
+                true);
+            while (processed < maxBricks &&
+                   pending.size() < static_cast<size_t>(maxBricks) &&
+                   PopFrontQueuedBrick(classQueue, m_pool, &coord)) {
+                BrickResidentRecord record;
+                if (!m_pool.GetRecord(coord, &record)) {
+                    continue;
+                }
+                if (record.residencyClass != residencyClass) {
+                    continue;
+                }
+                RemoveAllClassQueueCoord(m_generationClassQueues, coord);
                 RemoveFirstGenerationQueueCoord(coord);
-                IncrementResidencyClassCounter(
-                    generatedClass,
-                    m_generatedSpeculativeBricksLastFrame,
-                    m_generatedVisibleBricksLastFrame,
-                    m_generatedCollisionBricksLastFrame,
-                    m_generatedEditedBricksLastFrame);
-                ++generated;
-            } else {
-                RemoveFirstGenerationQueueCoord(coord);
+                if (TryQueueAsyncExactGeneration(coord, record, currentFrame)) {
+                    ++processed;
+                    continue;
+                }
+                if (!m_pool.MarkGeneratingCPU(coord)) {
+                    ++processed;
+                    continue;
+                }
+                pending.push_back({coord, record.residencyClass});
+                ++processed;
+            }
+            if (processed >= maxBricks) {
+                break;
             }
         }
-        if (generated >= maxBricks) {
-            break;
+
+        if (!pending.empty()) {
+            const SparseTerrainGenerator terrain = m_terrain;
+            std::vector<GeneratedSparseBrick> bricks(pending.size());
+            std::vector<BrickCoord> persistentWorkerCoords;
+            const bool useWorkerThreads =
+                pending.size() >= static_cast<size_t>(m_config.parallelExactGenerationMinBricks) &&
+                m_config.parallelExactGenerationMaxWorkers > 1u;
+            const uint32_t workerCount = useWorkerThreads
+                ? std::min<uint32_t>(
+                    static_cast<uint32_t>(pending.size()),
+                    m_config.parallelExactGenerationMaxWorkers)
+                : 1u;
+            std::vector<TerrainSurfaceColumnCache> workerColumnCaches(workerCount);
+            for (TerrainSurfaceColumnCache& cache : workerColumnCaches) {
+                cache.reserve(8192);
+            }
+            const auto parallelStart = std::chrono::steady_clock::now();
+            if (workerCount <= 1u) {
+                for (size_t index = 0; index < pending.size(); ++index) {
+                    bricks[index] = GenerateExactBrickForConfig(
+                        terrain,
+                        pending[index].coord,
+                        workerColumnCaches[0]);
+                }
+            } else if (m_config.parallelExactGenerationPersistentWorkers) {
+                persistentWorkerCoords.reserve(pending.size());
+                for (const PendingExactGeneration& item : pending) {
+                    persistentWorkerCoords.push_back(item.coord);
+                }
+                if (!GenerateExactBricksWithPersistentWorkers(
+                        terrain,
+                        persistentWorkerCoords,
+                        bricks,
+                        workerCount)) {
+                    std::vector<std::thread> workers;
+                    workers.reserve(workerCount);
+                    const size_t chunkSize =
+                        (pending.size() + static_cast<size_t>(workerCount) - 1u) /
+                        static_cast<size_t>(workerCount);
+                    for (uint32_t workerIndex = 0u; workerIndex < workerCount; ++workerIndex) {
+                        const size_t begin = static_cast<size_t>(workerIndex) * chunkSize;
+                        const size_t end = std::min(pending.size(), begin + chunkSize);
+                        workers.emplace_back([
+                            this,
+                            &terrain,
+                            &pending,
+                            &bricks,
+                            &workerColumnCaches,
+                            workerIndex,
+                            begin,
+                            end]() {
+                            for (size_t index = begin; index < end; ++index) {
+                                bricks[index] = GenerateExactBrickForConfig(
+                                    terrain,
+                                    pending[index].coord,
+                                    workerColumnCaches[workerIndex]);
+                            }
+                        });
+                    }
+                    for (std::thread& worker : workers) {
+                        worker.join();
+                    }
+                }
+            } else {
+                std::vector<std::thread> workers;
+                workers.reserve(workerCount);
+                const size_t chunkSize =
+                    (pending.size() + static_cast<size_t>(workerCount) - 1u) /
+                    static_cast<size_t>(workerCount);
+                for (uint32_t workerIndex = 0u; workerIndex < workerCount; ++workerIndex) {
+                    const size_t begin = static_cast<size_t>(workerIndex) * chunkSize;
+                    const size_t end = std::min(pending.size(), begin + chunkSize);
+                    workers.emplace_back([
+                        this,
+                        &terrain,
+                        &pending,
+                        &bricks,
+                        &workerColumnCaches,
+                        workerIndex,
+                        begin,
+                        end]() {
+                        for (size_t index = begin; index < end; ++index) {
+                            bricks[index] = GenerateExactBrickForConfig(
+                                terrain,
+                                pending[index].coord,
+                                workerColumnCaches[workerIndex]);
+                        }
+                    });
+                }
+                for (std::thread& worker : workers) {
+                    worker.join();
+                }
+            }
+            m_parallelExactGenerationBricksLastFrame =
+                static_cast<uint32_t>(
+                    std::min<size_t>(pending.size(), static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+            m_parallelExactGenerationWorkersLastFrame = workerCount;
+            m_parallelExactGenerationWallMsLastFrame =
+                std::chrono::duration<float, std::milli>(
+                    std::chrono::steady_clock::now() - parallelStart).count();
+
+            for (size_t index = 0; index < pending.size(); ++index) {
+                SparseResidencyClass generatedClass = pending[index].residencyClass;
+                if (ApplyGeneratedBrickPayload(pending[index].coord, bricks[index], &generatedClass)) {
+                    IncrementResidencyClassCounter(
+                        generatedClass,
+                        m_generatedSpeculativeBricksLastFrame,
+                        m_generatedVisibleBricksLastFrame,
+                        m_generatedCollisionBricksLastFrame,
+                        m_generatedEditedBricksLastFrame);
+                    ++generated;
+                }
+            }
         }
     }
 
-    if (generated < maxBricks) {
-        SortQueuedBricksByValue(m_generationQueue, m_pool, focus, currentFrame);
-        while (generated < maxBricks &&
+    if (processed < maxBricks) {
+        for (SparseResidencyClass residencyClass : classOrder) {
+            auto& classQueue = m_generationClassQueues[ResidencyClassQueueIndex(residencyClass)];
+            SortQueuedBricksByValue(
+                classQueue,
+                m_pool,
+                focus,
+                currentFrame,
+                m_config.streamingLaneQueuePriority);
+            SortQueueByStreamingTickets(
+                classQueue,
+                kStreamingTicketStageCpuGenerated,
+                &focus,
+                currentFrame,
+                true);
+            while (processed < maxBricks &&
+                   PopFrontQueuedBrick(classQueue, m_pool, &coord)) {
+                BrickResidentRecord record;
+                if (!m_pool.GetRecord(coord, &record)) {
+                    continue;
+                }
+                if (record.residencyClass != residencyClass) {
+                    continue;
+                }
+                RemoveAllClassQueueCoord(m_generationClassQueues, coord);
+                if (TryQueueAsyncExactGeneration(coord, record, currentFrame)) {
+                    RemoveFirstGenerationQueueCoord(coord);
+                    ++processed;
+                    continue;
+                }
+                SparseResidencyClass generatedClass = SparseResidencyClass::Speculative;
+                if (GenerateQueuedBrick(coord, &generatedClass)) {
+                    RemoveFirstGenerationQueueCoord(coord);
+                    IncrementResidencyClassCounter(
+                        generatedClass,
+                        m_generatedSpeculativeBricksLastFrame,
+                        m_generatedVisibleBricksLastFrame,
+                        m_generatedCollisionBricksLastFrame,
+                        m_generatedEditedBricksLastFrame);
+                    ++generated;
+                    ++processed;
+                } else {
+                    RemoveFirstGenerationQueueCoord(coord);
+                    ++processed;
+                }
+            }
+            if (processed >= maxBricks) {
+                break;
+            }
+        }
+    }
+
+    if (processed < maxBricks) {
+        SortQueuedBricksByValue(
+            m_generationQueue,
+            m_pool,
+            focus,
+            currentFrame,
+            m_config.streamingLaneQueuePriority);
+        SortQueueByStreamingTickets(
+            m_generationQueue,
+            kStreamingTicketStageCpuGenerated,
+            &focus,
+            currentFrame,
+            true);
+        while (processed < maxBricks &&
                PopFrontQueuedBrick(m_generationQueue, m_pool, &coord)) {
             BrickResidentRecord record;
             if (m_pool.GetRecord(coord, &record)) {
                 RemoveFirstGenerationClassQueueCoord(coord, record.residencyClass);
             }
+            if (TryQueueAsyncExactGeneration(coord, record, currentFrame)) {
+                ++processed;
+                continue;
+            }
             SparseResidencyClass generatedClass = SparseResidencyClass::Speculative;
             if (GenerateQueuedBrick(coord, &generatedClass)) {
                 IncrementResidencyClassCounter(
@@ -899,6 +3953,9 @@ uint32_t SparseVoxelWorld::PumpGenerationAround(
                     m_generatedCollisionBricksLastFrame,
                     m_generatedEditedBricksLastFrame);
                 ++generated;
+                ++processed;
+            } else {
+                ++processed;
             }
         }
     }
@@ -911,10 +3968,27 @@ bool SparseVoxelWorld::PopNextUpload(SparseBrickUploadPacket* outPacket, uint32_
     if (!outPacket) {
         return false;
     }
+    if (m_config.streamingTicketLowPriorityDownstreamDeferral &&
+        m_deferredGeneratedDownstreamPromotedFrame != currentFrame) {
+        PromoteDeferredGeneratedDownstream(
+            m_config.streamingTicketLowPriorityDownstreamPromoteMax,
+            currentFrame);
+        m_deferredGeneratedDownstreamPromotedFrame = currentFrame;
+    }
 
     while (!m_uploadQueue.empty()) {
         if (m_uploadQueuePriorityDirty) {
-            SortQueuedBricksByPriority(m_uploadQueue, m_pool, currentFrame);
+            SortQueuedBricksByPriority(
+                m_uploadQueue,
+                m_pool,
+                currentFrame,
+                m_config.streamingLaneQueuePriority);
+            SortQueueByStreamingTickets(
+                m_uploadQueue,
+                kStreamingTicketStageGpuUploaded,
+                nullptr,
+                currentFrame,
+                false);
             m_uploadQueuePriorityDirty = false;
         }
         BrickCoord coord{};
@@ -926,6 +4000,7 @@ bool SparseVoxelWorld::PopNextUpload(SparseBrickUploadPacket* outPacket, uint32_
         if (!m_pool.GetRecord(coord, &record)) {
             continue;
         }
+        RemoveAllClassQueueCoord(m_uploadOwnershipQueues, coord);
         RemoveFirstUploadClassQueueCoord(coord, record.residencyClass);
 
         SparseResidencyClass uploadedClass = record.residencyClass;
@@ -956,10 +4031,27 @@ bool SparseVoxelWorld::PopNextUploadForClass(
     if (!outPacket) {
         return false;
     }
+    if (m_config.streamingTicketLowPriorityDownstreamDeferral &&
+        m_deferredGeneratedDownstreamPromotedFrame != currentFrame) {
+        PromoteDeferredGeneratedDownstream(
+            m_config.streamingTicketLowPriorityDownstreamPromoteMax,
+            currentFrame);
+        m_deferredGeneratedDownstreamPromotedFrame = currentFrame;
+    }
 
     auto& classQueue = m_uploadClassQueues[ResidencyClassQueueIndex(residencyClass)];
     if (m_uploadQueuePriorityDirty) {
-        SortQueuedBricksByPriority(classQueue, m_pool, currentFrame);
+        SortQueuedBricksByPriority(
+            classQueue,
+            m_pool,
+            currentFrame,
+            m_config.streamingLaneQueuePriority);
+        SortQueueByStreamingTickets(
+            classQueue,
+            kStreamingTicketStageGpuUploaded,
+            nullptr,
+            currentFrame,
+            false);
     }
 
     BrickCoord coord{};
@@ -971,6 +4063,7 @@ bool SparseVoxelWorld::PopNextUploadForClass(
         if (record.residencyClass != residencyClass) {
             continue;
         }
+        RemoveAllClassQueueCoord(m_uploadClassQueues, coord);
 
         SparseResidencyClass uploadedClass = record.residencyClass;
         if (!BuildUploadPacketForCoord(coord, m_pool, m_generated, outPacket, &uploadedClass)) {
@@ -1003,9 +4096,37 @@ bool SparseVoxelWorld::PopBestUploadForClass(
     if (!outPacket) {
         return false;
     }
+    if (m_config.streamingTicketLowPriorityDownstreamDeferral &&
+        m_deferredGeneratedDownstreamPromotedFrame != currentFrame) {
+        PromoteDeferredGeneratedDownstream(
+            m_config.streamingTicketLowPriorityDownstreamPromoteMax,
+            currentFrame);
+        m_deferredGeneratedDownstreamPromotedFrame = currentFrame;
+    }
 
     auto& classQueue = m_uploadClassQueues[ResidencyClassQueueIndex(residencyClass)];
-    SortQueuedBricksByValue(classQueue, m_pool, focus, currentFrame);
+    const size_t classIndex = ResidencyClassQueueIndex(residencyClass);
+    const bool valueSortValid =
+        m_uploadClassValueSortValid[classIndex] &&
+        m_uploadClassValueSortFrame[classIndex] == currentFrame &&
+        m_uploadClassValueSortFocus[classIndex] == focus;
+    if (!valueSortValid) {
+        SortQueuedBricksByValue(
+            classQueue,
+            m_pool,
+            focus,
+            currentFrame,
+            m_config.streamingLaneQueuePriority);
+        m_uploadClassValueSortValid[classIndex] = true;
+        m_uploadClassValueSortFrame[classIndex] = currentFrame;
+        m_uploadClassValueSortFocus[classIndex] = focus;
+    }
+    SortQueueByStreamingTickets(
+        classQueue,
+        kStreamingTicketStageGpuUploaded,
+        &focus,
+        currentFrame,
+        true);
     BrickCoord coord{};
     while (PopFrontQueuedBrick(classQueue, m_pool, &coord)) {
         BrickResidentRecord record;
@@ -1015,6 +4136,7 @@ bool SparseVoxelWorld::PopBestUploadForClass(
         if (record.residencyClass != residencyClass) {
             continue;
         }
+        RemoveAllClassQueueCoord(m_uploadClassQueues, coord);
 
         SparseResidencyClass uploadedClass = record.residencyClass;
         if (!BuildUploadPacketForCoord(coord, m_pool, m_generated, outPacket, &uploadedClass)) {
@@ -1036,6 +4158,106 @@ bool SparseVoxelWorld::PopBestUploadForClass(
 
     RefreshStats();
     return false;
+}
+
+bool SparseVoxelWorld::PopBestUploadForOwnershipCritical(
+    SparseBrickUploadPacket* outPacket,
+    bool ownershipCritical,
+    const BrickCoord& focus,
+    uint32_t currentFrame)
+{
+    if (!outPacket) {
+        return false;
+    }
+    if (m_config.streamingTicketLowPriorityDownstreamDeferral) {
+        PromoteDeferredGeneratedDownstreamForOwnership(
+            ownershipCritical,
+            m_config.streamingTicketLowPriorityDownstreamPromoteMax,
+            currentFrame);
+    }
+
+    auto& ownershipQueue = m_uploadOwnershipQueues[OwnershipCriticalQueueIndex(ownershipCritical)];
+    SortQueuedBricksByValue(
+        ownershipQueue,
+        m_pool,
+        focus,
+        currentFrame,
+        m_config.streamingLaneQueuePriority);
+
+    BrickCoord bestCoord{};
+    while (PopFrontQueuedBrick(ownershipQueue, m_pool, &bestCoord)) {
+        BrickResidentRecord record;
+        if (!m_pool.GetRecord(bestCoord, &record)) {
+            RemoveFirstUploadQueueCoord(bestCoord);
+            RemoveAllClassQueueCoord(m_uploadClassQueues, bestCoord);
+            continue;
+        }
+        if (IsStreamingOwnershipCritical(record) != ownershipCritical) {
+            continue;
+        }
+        RemoveFirstUploadQueueCoord(bestCoord);
+        RemoveAllClassQueueCoord(m_uploadClassQueues, bestCoord);
+
+        SparseResidencyClass uploadedClass = record.residencyClass;
+        if (!BuildUploadPacketForCoord(bestCoord, m_pool, m_generated, outPacket, &uploadedClass)) {
+            continue;
+        }
+        AnnotateRenderDirtyUploadRange(outPacket);
+
+        IncrementResidencyClassCounter(
+            uploadedClass,
+            m_uploadedSpeculativeBricksLastFrame,
+            m_uploadedVisibleBricksLastFrame,
+            m_uploadedCollisionBricksLastFrame,
+            m_uploadedEditedBricksLastFrame);
+        RefreshStats();
+        return true;
+    }
+
+    RefreshStats();
+    return false;
+}
+
+bool SparseVoxelWorld::PopUploadForCoord(SparseBrickUploadPacket* outPacket, const BrickCoord& coord) {
+    if (!outPacket) {
+        return false;
+    }
+
+    BrickResidentRecord record;
+    if (!m_pool.GetRecord(coord, &record)) {
+        RefreshStats();
+        return false;
+    }
+    if (record.state == BrickLifecycleState::GeneratedCPU &&
+        PromoteDeferredGeneratedDownstreamForCoord(coord, 0u)) {
+        (void)m_pool.GetRecord(coord, &record);
+    }
+    if (record.state != BrickLifecycleState::UploadQueued) {
+        RefreshStats();
+        return false;
+    }
+
+    SparseResidencyClass uploadedClass = record.residencyClass;
+    if (!BuildUploadPacketForCoord(coord, m_pool, m_generated, outPacket, &uploadedClass)) {
+        RemoveFirstUploadQueueCoord(coord);
+        RemoveAllClassQueueCoord(m_uploadClassQueues, coord);
+        RemoveAllClassQueueCoord(m_uploadOwnershipQueues, coord);
+        RefreshStats();
+        return false;
+    }
+    AnnotateRenderDirtyUploadRange(outPacket);
+    RemoveFirstUploadQueueCoord(coord);
+    RemoveAllClassQueueCoord(m_uploadClassQueues, coord);
+    RemoveAllClassQueueCoord(m_uploadOwnershipQueues, coord);
+
+    IncrementResidencyClassCounter(
+        uploadedClass,
+        m_uploadedSpeculativeBricksLastFrame,
+        m_uploadedVisibleBricksLastFrame,
+        m_uploadedCollisionBricksLastFrame,
+        m_uploadedEditedBricksLastFrame);
+    RefreshStats();
+    return true;
 }
 
 bool SparseVoxelWorld::RequeueUploadFront(const SparseBrickUploadPacket& packet) {
@@ -1079,23 +4301,40 @@ bool SparseVoxelWorld::CompleteUpload(const SparseBrickUploadPacket& packet) {
     if (published) {
         const bool emptyBrick = HasResidencyFlag(packet.brick.flags, BrickResidencyFlags::Empty);
         const bool existingSurface = m_surfaceCache.FindFaces(packet.coord) != nullptr;
+        const bool knownSurface = m_surfaceCache.IsSurfaceKnown(packet.coord);
+        const bool buriedSolidFastPath =
+            CanUseBuriedSolidSurfaceFastPath(packet.coord, packet.brick);
+        if (buriedSolidFastPath) {
+            MarkBuriedSolidSurfaceKnownEmpty(packet.coord);
+        }
         const bool needsUploadSurfaceRefresh =
             emptyBrick ||
-            !existingSurface ||
+            (!knownSurface && !buriedSolidFastPath) ||
             m_surfaceDirtyRegions.find(packet.coord) != m_surfaceDirtyRegions.end();
         if ((!emptyBrick || existingSurface) && needsUploadSurfaceRefresh) {
+            BrickResidentRecord refreshedRecord;
+            if (m_pool.GetRecord(packet.coord, &refreshedRecord)) {
+                TouchStreamingTicket(
+                    packet.coord,
+                    refreshedRecord,
+                    kStreamingTicketStageSurfaceReady);
+            }
             m_pendingSurfaceBricks[packet.coord] = packet.brick;
             QueueSurfaceExtractionCoord(packet.coord);
         } else if (!emptyBrick && existingSurface) {
             m_pendingSurfaceBricks.erase(packet.coord);
+            MarkStreamingTicketStagesCompleted(packet.coord, kStreamingTicketStageSurfaceReady);
             MarkQueueAccountingDirty();
         } else {
             m_pendingSurfaceBricks.erase(packet.coord);
             m_surfaceDirtyRegions.erase(packet.coord);
+            MarkStreamingTicketStagesCompleted(packet.coord, kStreamingTicketStageSurfaceReady);
             MarkQueueAccountingDirty();
             ++m_surfaceEmptyUploadsSkippedLastFrame;
         }
+        MarkStreamingTicketStagesCompleted(packet.coord, kStreamingTicketStageGpuUploaded);
         m_generated.erase(packet.coord);
+        m_deferredGeneratedDownstreamSet.erase(packet.coord);
         auto deferredIt = m_deferredDirtyAfterUpload.find(packet.coord);
         if (deferredIt != m_deferredDirtyAfterUpload.end()) {
             m_deferredDirtyAfterUpload.erase(deferredIt);
@@ -1109,10 +4348,80 @@ bool SparseVoxelWorld::CompleteUpload(const SparseBrickUploadPacket& packet) {
     return published;
 }
 
+bool SparseVoxelWorld::MarkGpuPageTablePublished(
+    const BrickCoord& coord,
+    uint32_t pageIndex,
+    uint32_t generation)
+{
+    const bool marked = m_pool.MarkGpuPageTablePublished(coord, pageIndex, generation);
+    if (marked) {
+        MarkStreamingTicketStagesCompleted(coord, kStreamingTicketStagePagePublished);
+        RefreshStats();
+    }
+    return marked;
+}
+
+bool SparseVoxelWorld::CanUseBuriedSolidSurfaceFastPath(
+    const BrickCoord& coord,
+    const GeneratedSparseBrick& brick) const
+{
+    if (!m_config.surfaceBuriedSolidFastPath ||
+        !HasResidencyFlag(brick.flags, BrickResidencyFlags::Solid) ||
+        HasResidencyFlag(brick.flags, BrickResidencyFlags::Empty) ||
+        HasResidencyFlag(brick.flags, BrickResidencyFlags::HasWater)) {
+        return false;
+    }
+
+    for (int32_t dz = -1; dz <= 1; ++dz) {
+        for (int32_t dy = -1; dy <= 1; ++dy) {
+            for (int32_t dx = -1; dx <= 1; ++dx) {
+                BrickCoord neighborCoord;
+                if (TryOffsetBrickCoord(coord, dx, dy, dz, &neighborCoord) &&
+                    m_edits.HasOverlay(neighborCoord)) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    return m_terrain.IsDefinitelyBuriedSolidBrick(coord);
+}
+
+bool SparseVoxelWorld::MarkBuriedSolidSurfaceKnownEmpty(const BrickCoord& coord) {
+    m_pendingSurfaceBricks.erase(coord);
+    m_surfaceDirtyRegions.erase(coord);
+    m_surfaceExtractionQueuedSet.erase(coord);
+    RemoveFirstSurfaceQueueCoord(coord);
+    RemoveAllClassQueueCoord(m_surfaceClassQueues, coord);
+    const bool marked = m_surfaceCache.MarkKnownEmptySurface(coord);
+    if (marked) {
+        ++m_surfaceBuriedSolidFastPathBricksLastFrame;
+        MarkQueueAccountingDirty();
+    }
+    MarkStreamingTicketStagesCompleted(coord, kStreamingTicketStageSurfaceReady);
+    return marked;
+}
+
 uint32_t SparseVoxelWorld::PumpSurfaceExtraction(uint32_t maxBricks, uint32_t currentFrame) {
     uint32_t extracted = 0;
+    if (maxBricks == 0 || m_pendingSurfaceBricks.empty()) {
+        PruneSurfaceExtractionQueuesIfNoPending();
+        m_surfaceBricksExtractedLastFrame = 0;
+        RefreshStats();
+        return 0;
+    }
     if (m_surfaceExtractionQueuePriorityDirty) {
-        SortQueuedBricksByPriority(m_surfaceExtractionQueue, m_pool, currentFrame);
+        SortQueuedBricksByPriority(
+            m_surfaceExtractionQueue,
+            m_pool,
+            currentFrame,
+            m_config.streamingLaneQueuePriority);
+        SortQueueByStreamingTickets(
+            m_surfaceExtractionQueue,
+            kStreamingTicketStageSurfaceReady,
+            nullptr,
+            currentFrame,
+            false);
         m_surfaceExtractionQueuePriorityDirty = false;
     }
     BrickCoord coord{};
@@ -1132,15 +4441,142 @@ uint32_t SparseVoxelWorld::PumpSurfaceExtraction(uint32_t maxBricks, uint32_t cu
     return extracted;
 }
 
+bool SparseVoxelWorld::PumpSurfaceExtractionForCoord(const BrickCoord& coord) {
+    if (m_pendingSurfaceBricks.find(coord) == m_pendingSurfaceBricks.end()) {
+        return false;
+    }
+
+    BrickResidentRecord surfaceRecord;
+    if (m_pool.GetRecord(coord, &surfaceRecord)) {
+        RemoveFirstSurfaceClassQueueCoord(coord, surfaceRecord.residencyClass);
+    }
+    RemoveFirstSurfaceQueueCoord(coord);
+
+    if (!ExtractSurfaceCoord(coord)) {
+        RefreshStats();
+        return false;
+    }
+
+    ++m_surfaceBricksExtractedLastFrame;
+    RefreshStats();
+    return true;
+}
+
+uint32_t SparseVoxelWorld::PumpSurfaceExtractionForCoords(
+    const std::vector<BrickCoord>& coords,
+    uint32_t maxBricks)
+{
+    if (maxBricks == 0 || coords.empty() || m_pendingSurfaceBricks.empty()) {
+        PruneSurfaceExtractionQueuesIfNoPending();
+        RefreshStats();
+        return 0;
+    }
+
+    if (!CanUseParallelSurfaceExtractionBatch(maxBricks)) {
+        uint32_t extracted = 0;
+        for (const BrickCoord& coord : coords) {
+            if (extracted >= maxBricks) {
+                break;
+            }
+            if (PumpSurfaceExtractionForCoord(coord)) {
+                ++extracted;
+            }
+        }
+        return extracted;
+    }
+
+    std::vector<SurfaceExtractionBatchItem> pending;
+    const uint32_t parallelMaxBricks =
+        m_config.parallelSurfaceExtractionTimeBudgeted
+            ? std::min(maxBricks, m_config.parallelSurfaceExtractionMaxBatch)
+            : maxBricks;
+    pending.reserve(std::min<size_t>(coords.size(), static_cast<size_t>(parallelMaxBricks)));
+    for (const BrickCoord& coord : coords) {
+        if (pending.size() >= static_cast<size_t>(parallelMaxBricks)) {
+            break;
+        }
+        if (m_surfaceCache.IsSurfaceKnown(coord)) {
+            continue;
+        }
+        auto pendingIt = m_pendingSurfaceBricks.find(coord);
+        if (pendingIt == m_pendingSurfaceBricks.end()) {
+            continue;
+        }
+        BrickResidentRecord record;
+        if (!m_pool.GetRecord(coord, &record)) {
+            RemoveFirstSurfaceQueueCoord(coord);
+            RemoveAllClassQueueCoord(m_surfaceClassQueues, coord);
+            m_pendingSurfaceBricks.erase(pendingIt);
+            m_surfaceExtractionQueuedSet.erase(coord);
+            continue;
+        }
+        if (record.state != BrickLifecycleState::UploadQueued &&
+            record.state != BrickLifecycleState::UploadingGPU &&
+            record.state != BrickLifecycleState::Resident &&
+            record.state != BrickLifecycleState::DirtyCPU &&
+            record.state != BrickLifecycleState::DirtyGPU) {
+            RemoveFirstSurfaceQueueCoord(coord);
+            RemoveAllClassQueueCoord(m_surfaceClassQueues, coord);
+            m_pendingSurfaceBricks.erase(pendingIt);
+            m_surfaceDirtyRegions.erase(coord);
+            m_surfaceExtractionQueuedSet.erase(coord);
+            continue;
+        }
+
+        RemoveFirstSurfaceQueueCoord(coord);
+        RemoveAllClassQueueCoord(m_surfaceClassQueues, coord);
+        SurfaceExtractionBatchItem work;
+        work.coord = coord;
+        work.residencyClass = record.residencyClass;
+        work.brick = std::move(pendingIt->second);
+        pending.push_back(std::move(work));
+        m_pendingSurfaceBricks.erase(pendingIt);
+        m_surfaceExtractionQueuedSet.erase(coord);
+    }
+
+    if (pending.empty()) {
+        RefreshStats();
+        return 0;
+    }
+
+    MarkQueueAccountingDirty();
+    const uint32_t extracted = ExtractSurfaceBatchNoEdit(pending);
+    m_surfaceBricksExtractedLastFrame += extracted;
+    RefreshStats();
+    return extracted;
+}
+
 uint32_t SparseVoxelWorld::PumpSurfaceExtractionAround(
     uint32_t maxBricks,
     const BrickCoord& focus,
     uint32_t currentFrame)
 {
-    uint32_t extracted = 0;
-    SortQueuedBricksByValue(m_surfaceExtractionQueue, m_pool, focus, currentFrame);
-    m_surfaceExtractionQueuePriorityDirty = false;
+    return PumpSurfaceExtractionAroundTimed(maxBricks, focus, currentFrame, 0.0);
+}
 
+uint32_t SparseVoxelWorld::PumpSurfaceExtractionAroundTimed(
+    uint32_t maxBricks,
+    const BrickCoord& focus,
+    uint32_t currentFrame,
+    double maxMilliseconds)
+{
+    uint32_t extracted = 0;
+    if (maxBricks == 0 || m_pendingSurfaceBricks.empty()) {
+        PruneSurfaceExtractionQueuesIfNoPending();
+        m_surfaceBricksExtractedLastFrame = 0;
+        RefreshStats();
+        return 0;
+    }
+    const bool hasTimeLimit = maxMilliseconds > 0.0;
+    const auto startTime = std::chrono::steady_clock::now();
+    const auto timeLimitReached = [&]() {
+        if (!hasTimeLimit) {
+            return false;
+        }
+        const double elapsedMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - startTime).count();
+        return elapsedMs >= maxMilliseconds;
+    };
     BrickCoord coord{};
     const std::array<SparseResidencyClass, 4> classOrder{
         SparseResidencyClass::Edited,
@@ -1148,11 +4584,137 @@ uint32_t SparseVoxelWorld::PumpSurfaceExtractionAround(
         SparseResidencyClass::Visible,
         SparseResidencyClass::Speculative
     };
+    const bool parallelSurfaceAllowed = CanUseParallelSurfaceExtractionBatch(maxBricks);
+    if (parallelSurfaceAllowed) {
+        std::vector<SurfaceExtractionBatchItem> pending;
+        const uint32_t parallelMaxBricks =
+            (m_config.parallelSurfaceExtractionTimeBudgeted && hasTimeLimit)
+                ? std::min(maxBricks, m_config.parallelSurfaceExtractionMaxBatch)
+                : maxBricks;
+        pending.reserve(parallelMaxBricks);
+        for (SparseResidencyClass residencyClass : classOrder) {
+            auto& classQueue = m_surfaceClassQueues[ResidencyClassQueueIndex(residencyClass)];
+            SortQueuedBricksByValue(
+                classQueue,
+                m_pool,
+                focus,
+                currentFrame,
+                m_config.streamingLaneQueuePriority);
+            SortQueueByStreamingTickets(
+                classQueue,
+                kStreamingTicketStageSurfaceReady,
+                &focus,
+                currentFrame,
+                true);
+            while (pending.size() < static_cast<size_t>(parallelMaxBricks) &&
+                   !timeLimitReached() &&
+                   PopFrontQueuedBrick(classQueue, m_pool, &coord)) {
+                BrickResidentRecord record;
+                if (!m_pool.GetRecord(coord, &record)) {
+                    continue;
+                }
+                if (record.residencyClass != residencyClass) {
+                    continue;
+                }
+                RemoveAllClassQueueCoord(m_surfaceClassQueues, coord);
+                RemoveFirstSurfaceQueueCoord(coord);
+                auto pendingIt = m_pendingSurfaceBricks.find(coord);
+                if (pendingIt == m_pendingSurfaceBricks.end()) {
+                    m_surfaceExtractionQueuedSet.erase(coord);
+                    continue;
+                }
+                if (record.state != BrickLifecycleState::UploadQueued &&
+                    record.state != BrickLifecycleState::UploadingGPU &&
+                    record.state != BrickLifecycleState::Resident &&
+                    record.state != BrickLifecycleState::DirtyCPU &&
+                    record.state != BrickLifecycleState::DirtyGPU) {
+                    m_pendingSurfaceBricks.erase(pendingIt);
+                    m_surfaceDirtyRegions.erase(coord);
+                    m_surfaceExtractionQueuedSet.erase(coord);
+                    continue;
+                }
+
+                SurfaceExtractionBatchItem work;
+                work.coord = coord;
+                work.residencyClass = record.residencyClass;
+                work.brick = std::move(pendingIt->second);
+                pending.push_back(std::move(work));
+                m_pendingSurfaceBricks.erase(pendingIt);
+                m_surfaceExtractionQueuedSet.erase(coord);
+            }
+            if (pending.size() >= static_cast<size_t>(parallelMaxBricks) || timeLimitReached()) {
+                break;
+            }
+        }
+
+        if (!pending.empty()) {
+            MarkQueueAccountingDirty();
+            extracted = ExtractSurfaceBatchNoEdit(pending);
+
+            m_surfaceBricksExtractedLastFrame = extracted;
+            RefreshStats();
+            return extracted;
+        }
+    }
+
     for (SparseResidencyClass residencyClass : classOrder) {
         auto& classQueue = m_surfaceClassQueues[ResidencyClassQueueIndex(residencyClass)];
-        SortQueuedBricksByValue(classQueue, m_pool, focus, currentFrame);
+        const size_t classIndex = ResidencyClassQueueIndex(residencyClass);
+        const bool strictTimeBudgetUnsorted =
+            m_config.surfaceStrictTimeBudget && hasTimeLimit;
+        if (strictTimeBudgetUnsorted) {
+            m_surfaceClassValueSortValid[classIndex] = false;
+        } else if (m_config.surfaceClassPartialValueSort) {
+            const size_t remainingBudget = static_cast<size_t>(maxBricks - extracted);
+            PartialSortQueuedBricksByValue(
+                classQueue,
+                m_pool,
+                focus,
+                currentFrame,
+                std::max<size_t>(1u, remainingBudget),
+                m_config.streamingLaneQueuePriority);
+            SortQueueByStreamingTickets(
+                classQueue,
+                kStreamingTicketStageSurfaceReady,
+                &focus,
+                currentFrame,
+                true,
+                std::max<size_t>(1u, remainingBudget));
+            ++m_surfaceClassValueSortCallsLastFrame;
+            m_surfaceClassValueSortValid[classIndex] = false;
+        } else {
+            const bool valueSortValid =
+                m_config.surfaceClassValueSortCache &&
+                m_surfaceClassValueSortValid[classIndex] &&
+                m_surfaceClassValueSortFocus[classIndex] == focus;
+            if (valueSortValid) {
+                ++m_surfaceClassValueSortCacheHitsLastFrame;
+            } else {
+                SortQueuedBricksByValue(
+                    classQueue,
+                    m_pool,
+                    focus,
+                    currentFrame,
+                    m_config.streamingLaneQueuePriority);
+                ++m_surfaceClassValueSortCallsLastFrame;
+                if (m_config.surfaceClassValueSortCache) {
+                    m_surfaceClassValueSortValid[classIndex] = true;
+                    m_surfaceClassValueSortFocus[classIndex] = focus;
+                }
+            }
+        }
+        SortQueueByStreamingTickets(
+            classQueue,
+            kStreamingTicketStageSurfaceReady,
+            &focus,
+            currentFrame,
+            true);
         while (extracted < maxBricks &&
+               !timeLimitReached() &&
                PopFrontQueuedBrick(classQueue, m_pool, &coord)) {
+            if (strictTimeBudgetUnsorted) {
+                ++m_surfaceStrictTimeBudgetUnsortedPopsLastFrame;
+            }
             BrickResidentRecord record;
             if (!m_pool.GetRecord(coord, &record)) {
                 continue;
@@ -1160,6 +4722,7 @@ uint32_t SparseVoxelWorld::PumpSurfaceExtractionAround(
             if (record.residencyClass != residencyClass) {
                 continue;
             }
+            RemoveAllClassQueueCoord(m_surfaceClassQueues, coord);
             if (ExtractSurfaceCoord(coord)) {
                 RemoveFirstSurfaceQueueCoord(coord);
                 ++extracted;
@@ -1167,12 +4730,287 @@ uint32_t SparseVoxelWorld::PumpSurfaceExtractionAround(
                 RemoveFirstSurfaceQueueCoord(coord);
             }
         }
-        if (extracted >= maxBricks) {
+        if (extracted >= maxBricks || timeLimitReached()) {
             break;
         }
     }
 
     m_surfaceBricksExtractedLastFrame = extracted;
+    RefreshStats();
+    return extracted;
+}
+
+uint32_t SparseVoxelWorld::PumpSurfaceExtractionAroundTimedForClass(
+    uint32_t maxBricks,
+    const BrickCoord& focus,
+    uint32_t currentFrame,
+    double maxMilliseconds,
+    SparseResidencyClass residencyClass)
+{
+    uint32_t extracted = 0;
+    if (maxBricks == 0 || m_pendingSurfaceBricks.empty()) {
+        PruneSurfaceExtractionQueuesIfNoPending();
+        RefreshStats();
+        return 0;
+    }
+
+    const bool hasTimeLimit = maxMilliseconds > 0.0;
+    const auto startTime = std::chrono::steady_clock::now();
+    const auto timeLimitReached = [&]() {
+        if (!hasTimeLimit) {
+            return false;
+        }
+        const double elapsedMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - startTime).count();
+        return elapsedMs >= maxMilliseconds;
+    };
+
+    auto& classQueue = m_surfaceClassQueues[ResidencyClassQueueIndex(residencyClass)];
+    const size_t classIndex = ResidencyClassQueueIndex(residencyClass);
+    const bool strictTimeBudgetUnsorted =
+        m_config.surfaceStrictTimeBudget && hasTimeLimit;
+    if (strictTimeBudgetUnsorted) {
+        m_surfaceClassValueSortValid[classIndex] = false;
+    } else if (m_config.surfaceClassPartialValueSort) {
+        PartialSortQueuedBricksByValue(
+            classQueue,
+            m_pool,
+            focus,
+            currentFrame,
+            std::max<size_t>(1u, maxBricks),
+            m_config.streamingLaneQueuePriority);
+        SortQueueByStreamingTickets(
+            classQueue,
+            kStreamingTicketStageSurfaceReady,
+            &focus,
+            currentFrame,
+            true,
+            std::max<size_t>(1u, maxBricks));
+        ++m_surfaceClassValueSortCallsLastFrame;
+        m_surfaceClassValueSortValid[classIndex] = false;
+    } else {
+        const bool valueSortValid =
+            m_config.surfaceClassValueSortCache &&
+            m_surfaceClassValueSortValid[classIndex] &&
+            m_surfaceClassValueSortFocus[classIndex] == focus;
+        if (valueSortValid) {
+            ++m_surfaceClassValueSortCacheHitsLastFrame;
+        } else {
+            SortQueuedBricksByValue(
+                classQueue,
+                m_pool,
+                focus,
+                currentFrame,
+                m_config.streamingLaneQueuePriority);
+            ++m_surfaceClassValueSortCallsLastFrame;
+            if (m_config.surfaceClassValueSortCache) {
+                m_surfaceClassValueSortValid[classIndex] = true;
+                m_surfaceClassValueSortFocus[classIndex] = focus;
+            }
+        }
+    }
+    SortQueueByStreamingTickets(
+        classQueue,
+        kStreamingTicketStageSurfaceReady,
+        &focus,
+        currentFrame,
+        true);
+
+    BrickCoord coord{};
+    if (CanUseParallelSurfaceExtractionBatch(maxBricks)) {
+        std::vector<SurfaceExtractionBatchItem> pending;
+        const uint32_t parallelMaxBricks =
+            (m_config.parallelSurfaceExtractionTimeBudgeted && hasTimeLimit)
+                ? std::min(maxBricks, m_config.parallelSurfaceExtractionMaxBatch)
+                : maxBricks;
+        pending.reserve(parallelMaxBricks);
+        while (pending.size() < static_cast<size_t>(parallelMaxBricks) &&
+               !timeLimitReached() &&
+               PopFrontQueuedBrick(classQueue, m_pool, &coord)) {
+            if (strictTimeBudgetUnsorted) {
+                ++m_surfaceStrictTimeBudgetUnsortedPopsLastFrame;
+            }
+            BrickResidentRecord record;
+            if (!m_pool.GetRecord(coord, &record)) {
+                RemoveFirstSurfaceQueueCoord(coord);
+                RemoveAllClassQueueCoord(m_surfaceClassQueues, coord);
+                continue;
+            }
+            if (record.residencyClass != residencyClass) {
+                continue;
+            }
+            RemoveAllClassQueueCoord(m_surfaceClassQueues, coord);
+            RemoveFirstSurfaceQueueCoord(coord);
+
+            auto pendingIt = m_pendingSurfaceBricks.find(coord);
+            if (pendingIt == m_pendingSurfaceBricks.end()) {
+                m_surfaceExtractionQueuedSet.erase(coord);
+                continue;
+            }
+            if (record.state != BrickLifecycleState::UploadQueued &&
+                record.state != BrickLifecycleState::UploadingGPU &&
+                record.state != BrickLifecycleState::Resident &&
+                record.state != BrickLifecycleState::DirtyCPU &&
+                record.state != BrickLifecycleState::DirtyGPU) {
+                m_pendingSurfaceBricks.erase(pendingIt);
+                m_surfaceDirtyRegions.erase(coord);
+                m_surfaceExtractionQueuedSet.erase(coord);
+                continue;
+            }
+
+            SurfaceExtractionBatchItem work;
+            work.coord = coord;
+            work.residencyClass = record.residencyClass;
+            work.brick = std::move(pendingIt->second);
+            pending.push_back(std::move(work));
+            m_pendingSurfaceBricks.erase(pendingIt);
+            m_surfaceExtractionQueuedSet.erase(coord);
+        }
+        if (!pending.empty()) {
+            MarkQueueAccountingDirty();
+            extracted = ExtractSurfaceBatchNoEdit(pending);
+            m_surfaceBricksExtractedLastFrame += extracted;
+            RefreshStats();
+            return extracted;
+        }
+    }
+
+    while (extracted < maxBricks &&
+           !timeLimitReached() &&
+           PopFrontQueuedBrick(classQueue, m_pool, &coord)) {
+        if (strictTimeBudgetUnsorted) {
+            ++m_surfaceStrictTimeBudgetUnsortedPopsLastFrame;
+        }
+        BrickResidentRecord record;
+        if (!m_pool.GetRecord(coord, &record)) {
+            continue;
+        }
+        if (record.residencyClass != residencyClass) {
+            continue;
+        }
+        RemoveAllClassQueueCoord(m_surfaceClassQueues, coord);
+        if (ExtractSurfaceCoord(coord)) {
+            RemoveFirstSurfaceQueueCoord(coord);
+            ++extracted;
+        } else {
+            RemoveFirstSurfaceQueueCoord(coord);
+        }
+    }
+
+    m_surfaceBricksExtractedLastFrame += extracted;
+    RefreshStats();
+    return extracted;
+}
+
+uint32_t SparseVoxelWorld::PumpSurfaceExtractionAroundTimedForOwnershipCritical(
+    uint32_t maxBricks,
+    const BrickCoord& focus,
+    uint32_t currentFrame,
+    double maxMilliseconds,
+    bool ownershipCritical)
+{
+    uint32_t extracted = 0;
+    if (maxBricks == 0 || m_pendingSurfaceBricks.empty()) {
+        PruneSurfaceExtractionQueuesIfNoPending();
+        RefreshStats();
+        return 0;
+    }
+
+    const bool hasTimeLimit = maxMilliseconds > 0.0;
+    const auto startTime = std::chrono::steady_clock::now();
+    const auto timeLimitReached = [&]() {
+        if (!hasTimeLimit) {
+            return false;
+        }
+        const double elapsedMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - startTime).count();
+        return elapsedMs >= maxMilliseconds;
+    };
+
+    auto& ownershipQueue = m_surfaceOwnershipQueues[OwnershipCriticalQueueIndex(ownershipCritical)];
+    SortQueuedBricksByValue(
+        ownershipQueue,
+        m_pool,
+        focus,
+        currentFrame,
+        m_config.streamingLaneQueuePriority);
+
+    BrickCoord bestCoord{};
+    if (CanUseParallelSurfaceExtractionBatch(maxBricks)) {
+        std::vector<SurfaceExtractionBatchItem> pending;
+        const uint32_t parallelMaxBricks =
+            (m_config.parallelSurfaceExtractionTimeBudgeted && hasTimeLimit)
+                ? std::min(maxBricks, m_config.parallelSurfaceExtractionMaxBatch)
+                : maxBricks;
+        pending.reserve(parallelMaxBricks);
+        while (pending.size() < static_cast<size_t>(parallelMaxBricks) &&
+               !timeLimitReached() &&
+               PopFrontQueuedBrick(ownershipQueue, m_pool, &bestCoord)) {
+            BrickResidentRecord record;
+            if (!m_pool.GetRecord(bestCoord, &record)) {
+                RemoveFirstSurfaceQueueCoord(bestCoord);
+                RemoveAllClassQueueCoord(m_surfaceClassQueues, bestCoord);
+                continue;
+            }
+            if (IsStreamingOwnershipCritical(record) != ownershipCritical) {
+                continue;
+            }
+            RemoveFirstSurfaceQueueCoord(bestCoord);
+            RemoveAllClassQueueCoord(m_surfaceClassQueues, bestCoord);
+
+            auto pendingIt = m_pendingSurfaceBricks.find(bestCoord);
+            if (pendingIt == m_pendingSurfaceBricks.end()) {
+                m_surfaceExtractionQueuedSet.erase(bestCoord);
+                continue;
+            }
+            if (record.state != BrickLifecycleState::UploadQueued &&
+                record.state != BrickLifecycleState::UploadingGPU &&
+                record.state != BrickLifecycleState::Resident &&
+                record.state != BrickLifecycleState::DirtyCPU &&
+                record.state != BrickLifecycleState::DirtyGPU) {
+                m_pendingSurfaceBricks.erase(pendingIt);
+                m_surfaceDirtyRegions.erase(bestCoord);
+                m_surfaceExtractionQueuedSet.erase(bestCoord);
+                continue;
+            }
+
+            SurfaceExtractionBatchItem work;
+            work.coord = bestCoord;
+            work.residencyClass = record.residencyClass;
+            work.brick = std::move(pendingIt->second);
+            pending.push_back(std::move(work));
+            m_pendingSurfaceBricks.erase(pendingIt);
+            m_surfaceExtractionQueuedSet.erase(bestCoord);
+        }
+        if (!pending.empty()) {
+            MarkQueueAccountingDirty();
+            extracted = ExtractSurfaceBatchNoEdit(pending);
+            m_surfaceBricksExtractedLastFrame += extracted;
+            RefreshStats();
+            return extracted;
+        }
+    }
+
+    while (extracted < maxBricks &&
+           !timeLimitReached() &&
+           PopFrontQueuedBrick(ownershipQueue, m_pool, &bestCoord)) {
+        BrickResidentRecord record;
+        if (!m_pool.GetRecord(bestCoord, &record)) {
+            RemoveFirstSurfaceQueueCoord(bestCoord);
+            RemoveAllClassQueueCoord(m_surfaceClassQueues, bestCoord);
+            continue;
+        }
+        if (IsStreamingOwnershipCritical(record) != ownershipCritical) {
+            continue;
+        }
+        RemoveFirstSurfaceQueueCoord(bestCoord);
+        RemoveAllClassQueueCoord(m_surfaceClassQueues, bestCoord);
+        if (ExtractSurfaceCoord(bestCoord)) {
+            ++extracted;
+        }
+    }
+
+    m_surfaceBricksExtractedLastFrame += extracted;
     RefreshStats();
     return extracted;
 }
@@ -1194,13 +5032,25 @@ uint32_t SparseVoxelWorld::TrimResidentBricks(
         uint32_t pageIndex = INVALID_BRICK_PAGE;
         uint32_t generation = 0;
         uint32_t entryIndex = UINT32_MAX;
-        int32_t score = 0;
+        int64_t score = 0;
     };
 
     std::vector<Candidate> candidates;
-    const int32_t radiusXz = static_cast<int32_t>(keepRadiusXz);
-    const int32_t radiusY = static_cast<int32_t>(keepRadiusY);
-    for (const auto& record : m_pool.Records()) {
+    uint32_t recordsScanned = 0;
+    const auto& records = m_pool.Records();
+    const size_t recordCount = records.size();
+    const bool incrementalScan =
+        m_config.incrementalPressureTrim &&
+        recordCount > static_cast<size_t>(m_config.incrementalPressureTrimScanBudget);
+    const size_t scanCount = incrementalScan
+        ? std::min<size_t>(recordCount, static_cast<size_t>(m_config.incrementalPressureTrimScanBudget))
+        : recordCount;
+    const size_t startIndex = incrementalScan && recordCount > 0
+        ? m_trimResidentCursor % recordCount
+        : 0u;
+    for (size_t scanIndex = 0; scanIndex < scanCount; ++scanIndex) {
+        const auto& record = records[incrementalScan ? (startIndex + scanIndex) % recordCount : scanIndex];
+        ++recordsScanned;
         if (record.pageIndex == INVALID_BRICK_PAGE ||
             record.state != BrickLifecycleState::Resident ||
             record.hasPersistentEdits ||
@@ -1208,12 +5058,10 @@ uint32_t SparseVoxelWorld::TrimResidentBricks(
             continue;
         }
 
-        const int32_t dx = record.coord.x - center.x;
-        const int32_t dy = record.coord.y - center.y;
-        const int32_t dz = record.coord.z - center.z;
-        if (std::abs(dx) <= radiusXz &&
-            std::abs(dy) <= radiusY &&
-            std::abs(dz) <= radiusXz) {
+        const int64_t dx = BrickCoordDelta(record.coord.x, center.x);
+        const int64_t dy = BrickCoordDelta(record.coord.y, center.y);
+        const int64_t dz = BrickCoordDelta(record.coord.z, center.z);
+        if (WithinKeepRadius(dx, dy, dz, keepRadiusXz, keepRadiusY)) {
             continue;
         }
 
@@ -1222,13 +5070,24 @@ uint32_t SparseVoxelWorld::TrimResidentBricks(
             continue;
         }
 
-        const int32_t score =
-            dx * dx + dz * dz + dy * dy * 4 -
-            ResidencyRetentionScore(record.residencyClass);
+        const int64_t score = SaturatingAddInt64(
+            SparseBrickDistanceScore(dx, dy, dz),
+            -static_cast<int64_t>(ResidencyRetentionScore(record.residencyClass)));
         candidates.push_back({record.coord, record.pageIndex, record.generation, entryIndex, score});
     }
+    if (incrementalScan && recordCount > 0) {
+        m_trimResidentCursor = (startIndex + scanCount) % recordCount;
+    } else {
+        m_trimResidentCursor = 0;
+    }
 
-    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+    ++m_trimScanCallsLastFrame;
+    m_trimRecordsScannedLastFrame += recordsScanned;
+    m_trimCandidatesLastFrame += static_cast<uint32_t>(std::min<size_t>(
+        candidates.size(),
+        static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+
+    SortBestEvictionCandidates(candidates, maxEvictions, [](const Candidate& a, const Candidate& b) {
         if (a.score != b.score) {
             return a.score > b.score;
         }
@@ -1243,11 +5102,13 @@ uint32_t SparseVoxelWorld::TrimResidentBricks(
         if (!m_pool.Evict(candidate.coord)) {
             continue;
         }
+        RemoveStreamingTicket(candidate.coord);
         m_pendingSurfaceBricks.erase(candidate.coord);
         m_surfaceExtractionQueuedSet.erase(candidate.coord);
         MarkQueueAccountingDirty();
         m_surfaceCache.RemoveBrick(candidate.coord);
         m_generated.erase(candidate.coord);
+        m_deferredGeneratedDownstreamSet.erase(candidate.coord);
         m_deferredDirtyAfterUpload.erase(candidate.coord);
         m_renderDirtyRegions.erase(candidate.coord);
         m_surfaceDirtyRegions.erase(candidate.coord);
@@ -1287,9 +5148,21 @@ uint32_t SparseVoxelWorld::TrimBackgroundResidentBricks(
     };
 
     std::vector<Candidate> candidates;
-    const int32_t radiusXz = static_cast<int32_t>(keepRadiusXz);
-    const int32_t radiusY = static_cast<int32_t>(keepRadiusY);
-    for (const auto& record : m_pool.Records()) {
+    uint32_t recordsScanned = 0;
+    const auto& records = m_pool.Records();
+    const size_t recordCount = records.size();
+    const bool incrementalScan =
+        m_config.incrementalPressureTrim &&
+        recordCount > static_cast<size_t>(m_config.incrementalPressureTrimScanBudget);
+    const size_t scanCount = incrementalScan
+        ? std::min<size_t>(recordCount, static_cast<size_t>(m_config.incrementalPressureTrimScanBudget))
+        : recordCount;
+    const size_t startIndex = incrementalScan && recordCount > 0
+        ? m_trimBackgroundResidentCursor % recordCount
+        : 0u;
+    for (size_t scanIndex = 0; scanIndex < scanCount; ++scanIndex) {
+        const auto& record = records[incrementalScan ? (startIndex + scanIndex) % recordCount : scanIndex];
+        ++recordsScanned;
         if (record.pageIndex == INVALID_BRICK_PAGE ||
             record.state != BrickLifecycleState::Resident ||
             record.hasPersistentEdits ||
@@ -1299,12 +5172,15 @@ uint32_t SparseVoxelWorld::TrimBackgroundResidentBricks(
             continue;
         }
 
-        const int32_t dx = record.coord.x - center.x;
-        const int32_t dy = record.coord.y - center.y;
-        const int32_t dz = record.coord.z - center.z;
-        if (std::abs(dx) <= radiusXz &&
-            std::abs(dy) <= radiusY &&
-            std::abs(dz) <= radiusXz) {
+        const int64_t dx = BrickCoordDelta(record.coord.x, center.x);
+        const int64_t dy = BrickCoordDelta(record.coord.y, center.y);
+        const int64_t dz = BrickCoordDelta(record.coord.z, center.z);
+        if (WithinKeepRadius(dx, dy, dz, keepRadiusXz, keepRadiusY)) {
+            continue;
+        }
+        if (record.residencyClass == SparseResidencyClass::Visible &&
+            currentFrame != 0u &&
+            record.lastVisibleFrame == currentFrame) {
             continue;
         }
 
@@ -1316,22 +5192,34 @@ uint32_t SparseVoxelWorld::TrimBackgroundResidentBricks(
         const uint32_t latestTouch = LatestPriorityTouch(record);
         const uint32_t age = currentFrame > latestTouch ? currentFrame - latestTouch : 0u;
         const uint32_t cappedAge = std::min(age, 100000u);
-        const int32_t distanceScore = dx * dx + dz * dz + dy * dy * 4;
+        const int64_t distanceScore = SparseBrickDistanceScore(dx, dy, dz);
         const int64_t classBias = record.residencyClass == SparseResidencyClass::Speculative
             ? 1'000'000ll
             : 0ll;
+        const int64_t ageScore = static_cast<int64_t>(cappedAge) * 32ll;
         candidates.push_back({
             record.coord,
             record.pageIndex,
             record.generation,
             entryIndex,
-            classBias +
-                static_cast<int64_t>(distanceScore) +
-                static_cast<int64_t>(cappedAge) * 32
+            SaturatingAddInt64(
+                SaturatingAddInt64(classBias, distanceScore),
+                ageScore)
         });
     }
+    if (incrementalScan && recordCount > 0) {
+        m_trimBackgroundResidentCursor = (startIndex + scanCount) % recordCount;
+    } else {
+        m_trimBackgroundResidentCursor = 0;
+    }
 
-    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+    ++m_trimScanCallsLastFrame;
+    m_trimRecordsScannedLastFrame += recordsScanned;
+    m_trimCandidatesLastFrame += static_cast<uint32_t>(std::min<size_t>(
+        candidates.size(),
+        static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+
+    SortBestEvictionCandidates(candidates, maxEvictions, [](const Candidate& a, const Candidate& b) {
         if (a.score != b.score) {
             return a.score > b.score;
         }
@@ -1346,11 +5234,13 @@ uint32_t SparseVoxelWorld::TrimBackgroundResidentBricks(
         if (!m_pool.Evict(candidate.coord)) {
             continue;
         }
+        RemoveStreamingTicket(candidate.coord);
         m_pendingSurfaceBricks.erase(candidate.coord);
         m_surfaceExtractionQueuedSet.erase(candidate.coord);
         MarkQueueAccountingDirty();
         m_surfaceCache.RemoveBrick(candidate.coord);
         m_generated.erase(candidate.coord);
+        m_deferredGeneratedDownstreamSet.erase(candidate.coord);
         m_deferredDirtyAfterUpload.erase(candidate.coord);
         m_renderDirtyRegions.erase(candidate.coord);
         m_surfaceDirtyRegions.erase(candidate.coord);
@@ -1391,9 +5281,21 @@ uint32_t SparseVoxelWorld::TrimQueuedBackgroundBricks(
     };
 
     std::vector<Candidate> candidates;
-    const int32_t radiusXz = static_cast<int32_t>(keepRadiusXz);
-    const int32_t radiusY = static_cast<int32_t>(keepRadiusY);
-    for (const auto& record : m_pool.Records()) {
+    uint32_t recordsScanned = 0;
+    const auto& records = m_pool.Records();
+    const size_t recordCount = records.size();
+    const bool incrementalScan =
+        m_config.incrementalPressureTrim &&
+        recordCount > static_cast<size_t>(m_config.incrementalPressureTrimScanBudget);
+    const size_t scanCount = incrementalScan
+        ? std::min<size_t>(recordCount, static_cast<size_t>(m_config.incrementalPressureTrimScanBudget))
+        : recordCount;
+    const size_t startIndex = incrementalScan && recordCount > 0
+        ? m_trimQueuedBackgroundCursor % recordCount
+        : 0u;
+    for (size_t scanIndex = 0; scanIndex < scanCount; ++scanIndex) {
+        const auto& record = records[incrementalScan ? (startIndex + scanIndex) % recordCount : scanIndex];
+        ++recordsScanned;
         if (record.pageIndex == INVALID_BRICK_PAGE ||
             record.hasPersistentEdits ||
             record.physicsActive ||
@@ -1410,24 +5312,20 @@ uint32_t SparseVoxelWorld::TrimQueuedBackgroundBricks(
             continue;
         }
 
-        const int32_t dx = record.coord.x - center.x;
-        const int32_t dy = record.coord.y - center.y;
-        const int32_t dz = record.coord.z - center.z;
-        if (std::abs(dx) <= radiusXz &&
-            std::abs(dy) <= radiusY &&
-            std::abs(dz) <= radiusXz) {
+        const int64_t dx = BrickCoordDelta(record.coord.x, center.x);
+        const int64_t dy = BrickCoordDelta(record.coord.y, center.y);
+        const int64_t dz = BrickCoordDelta(record.coord.z, center.z);
+        if (WithinKeepRadius(dx, dy, dz, keepRadiusXz, keepRadiusY)) {
             continue;
         }
 
         const uint32_t latestTouch = LatestPriorityTouch(record);
         const uint32_t age = currentFrame > latestTouch ? currentFrame - latestTouch : 0u;
-        const int64_t distanceScore =
-            static_cast<int64_t>(dx) * dx +
-            static_cast<int64_t>(dz) * dz +
-            static_cast<int64_t>(dy) * dy * 4ll;
+        const int64_t distanceScore = SparseBrickDistanceScore(dx, dy, dz);
         const int64_t classBias = record.residencyClass == SparseResidencyClass::Speculative
             ? 2'000'000ll
             : 500'000ll;
+        const int64_t ageScore = static_cast<int64_t>(std::min(age, 100000u)) * 64ll;
         uint32_t entryIndex = UINT32_MAX;
         m_pool.PageTable().TryGetEntryIndex(record.coord, &entryIndex);
         candidates.push_back({
@@ -1436,11 +5334,24 @@ uint32_t SparseVoxelWorld::TrimQueuedBackgroundBricks(
             record.generation,
             entryIndex,
             record.residencyClass,
-            classBias + distanceScore + static_cast<int64_t>(std::min(age, 100000u)) * 64ll
+            SaturatingAddInt64(
+                SaturatingAddInt64(classBias, distanceScore),
+                ageScore)
         });
     }
+    if (incrementalScan && recordCount > 0) {
+        m_trimQueuedBackgroundCursor = (startIndex + scanCount) % recordCount;
+    } else {
+        m_trimQueuedBackgroundCursor = 0;
+    }
 
-    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+    ++m_trimScanCallsLastFrame;
+    m_trimRecordsScannedLastFrame += recordsScanned;
+    m_trimCandidatesLastFrame += static_cast<uint32_t>(std::min<size_t>(
+        candidates.size(),
+        static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+
+    SortBestEvictionCandidates(candidates, maxEvictions, [](const Candidate& a, const Candidate& b) {
         if (a.score != b.score) {
             return a.score > b.score;
         }
@@ -1456,6 +5367,7 @@ uint32_t SparseVoxelWorld::TrimQueuedBackgroundBricks(
             continue;
         }
 
+        RemoveStreamingTicket(candidate.coord);
         RemoveFirstGenerationQueueCoord(candidate.coord);
         RemoveFirstGenerationClassQueueCoord(candidate.coord, candidate.residencyClass);
         RemoveFirstUploadQueueCoord(candidate.coord);
@@ -1466,6 +5378,7 @@ uint32_t SparseVoxelWorld::TrimQueuedBackgroundBricks(
         m_surfaceExtractionQueuedSet.erase(candidate.coord);
         m_surfaceCache.RemoveBrick(candidate.coord);
         m_generated.erase(candidate.coord);
+        m_deferredGeneratedDownstreamSet.erase(candidate.coord);
         m_deferredDirtyAfterUpload.erase(candidate.coord);
         m_renderDirtyRegions.erase(candidate.coord);
         m_surfaceDirtyRegions.erase(candidate.coord);
@@ -1482,6 +5395,137 @@ uint32_t SparseVoxelWorld::TrimQueuedBackgroundBricks(
     }
 
     m_evictedBricksLastFrame = evicted;
+    RefreshStats();
+    return evicted;
+}
+
+uint32_t SparseVoxelWorld::EvictQueuedLowerPriorityForRequest(
+    const BrickCoord& center,
+    SparseResidencyClass requestClass,
+    uint32_t hardKeepRadiusXz,
+    uint32_t hardKeepRadiusY,
+    uint32_t maxEvictions,
+    uint32_t currentFrame)
+{
+    if (maxEvictions == 0 || requestClass == SparseResidencyClass::Speculative) {
+        RefreshStats();
+        return 0;
+    }
+
+    struct Candidate {
+        BrickCoord coord;
+        uint32_t pageIndex = INVALID_BRICK_PAGE;
+        uint32_t generation = 0;
+        uint32_t entryIndex = UINT32_MAX;
+        SparseResidencyClass residencyClass = SparseResidencyClass::Speculative;
+        int64_t score = 0;
+    };
+
+    std::vector<Candidate> candidates;
+    const uint8_t requestRank = ResidencyRank(requestClass);
+    uint32_t recordsScanned = 0;
+    for (const auto& record : m_pool.Records()) {
+        ++recordsScanned;
+        if (record.pageIndex == INVALID_BRICK_PAGE ||
+            record.hasPersistentEdits ||
+            record.physicsActive ||
+            ResidencyRank(record.residencyClass) > requestRank) {
+            continue;
+        }
+
+        const bool queuedState =
+            record.state == BrickLifecycleState::Requested ||
+            record.state == BrickLifecycleState::GeneratedCPU ||
+            record.state == BrickLifecycleState::UploadQueued;
+        if (!queuedState) {
+            continue;
+        }
+
+        const int64_t dx = BrickCoordDelta(record.coord.x, center.x);
+        const int64_t dy = BrickCoordDelta(record.coord.y, center.y);
+        const int64_t dz = BrickCoordDelta(record.coord.z, center.z);
+        if (WithinKeepRadius(dx, dy, dz, hardKeepRadiusXz, hardKeepRadiusY)) {
+            continue;
+        }
+        if (record.residencyClass == SparseResidencyClass::Visible &&
+            currentFrame != 0u &&
+            record.lastVisibleFrame == currentFrame) {
+            continue;
+        }
+
+        uint32_t entryIndex = UINT32_MAX;
+        m_pool.PageTable().TryGetEntryIndex(record.coord, &entryIndex);
+
+        const int64_t classPenalty = static_cast<int64_t>(ResidencyRank(record.residencyClass)) * 100000ll;
+        const int64_t distanceScore = SparseBrickDistanceScore(dx, dy, dz);
+        const uint32_t latestTouch = LatestPriorityTouch(record);
+        const uint32_t age = currentFrame > latestTouch ? currentFrame - latestTouch : 0u;
+        const uint32_t cappedAge = std::min(age, 100000u);
+        const int64_t ageScore = static_cast<int64_t>(cappedAge) * 64ll;
+        candidates.push_back({
+            record.coord,
+            record.pageIndex,
+            record.generation,
+            entryIndex,
+            record.residencyClass,
+            SaturatingAddInt64(
+                SaturatingAddInt64(distanceScore, ageScore),
+                -classPenalty)
+        });
+    }
+
+    ++m_replacementScanCallsLastFrame;
+    m_replacementRecordsScannedLastFrame += recordsScanned;
+    m_replacementCandidatesLastFrame += static_cast<uint32_t>(std::min<size_t>(
+        candidates.size(),
+        static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+
+    SortBestEvictionCandidates(candidates, maxEvictions, [](const Candidate& a, const Candidate& b) {
+        if (a.score != b.score) {
+            return a.score > b.score;
+        }
+        return a.coord < b.coord;
+    });
+
+    uint32_t evicted = 0;
+    for (const Candidate& candidate : candidates) {
+        if (evicted >= maxEvictions) {
+            break;
+        }
+        if (!m_pool.Evict(candidate.coord)) {
+            continue;
+        }
+
+        RemoveStreamingTicket(candidate.coord);
+        RemoveFirstGenerationQueueCoord(candidate.coord);
+        RemoveFirstGenerationClassQueueCoord(candidate.coord, candidate.residencyClass);
+        RemoveFirstUploadQueueCoord(candidate.coord);
+        RemoveFirstUploadClassQueueCoord(candidate.coord, candidate.residencyClass);
+        RemoveFirstSurfaceQueueCoord(candidate.coord);
+        RemoveFirstSurfaceClassQueueCoord(candidate.coord, candidate.residencyClass);
+        m_pendingSurfaceBricks.erase(candidate.coord);
+        m_surfaceExtractionQueuedSet.erase(candidate.coord);
+        m_surfaceCache.RemoveBrick(candidate.coord);
+        m_generated.erase(candidate.coord);
+        m_deferredGeneratedDownstreamSet.erase(candidate.coord);
+        m_deferredDirtyAfterUpload.erase(candidate.coord);
+        m_renderDirtyRegions.erase(candidate.coord);
+        m_surfaceDirtyRegions.erase(candidate.coord);
+        if (candidate.entryIndex != UINT32_MAX) {
+            m_invalidationQueue.push_back({
+                candidate.coord,
+                candidate.entryIndex,
+                candidate.pageIndex,
+                candidate.generation
+            });
+        }
+        MarkQueueAccountingDirty();
+        ++evicted;
+    }
+
+    if (evicted > 0) {
+        m_evictedBricksLastFrame += evicted;
+    }
     RefreshStats();
     return evicted;
 }
@@ -1508,10 +5552,10 @@ uint32_t SparseVoxelWorld::EvictLowerPriorityForRequest(
     };
 
     std::vector<Candidate> candidates;
-    const int32_t keepXz = static_cast<int32_t>(hardKeepRadiusXz);
-    const int32_t keepY = static_cast<int32_t>(hardKeepRadiusY);
     const uint8_t requestRank = ResidencyRank(requestClass);
+    uint32_t recordsScanned = 0;
     for (const auto& record : m_pool.Records()) {
+        ++recordsScanned;
         if (record.pageIndex == INVALID_BRICK_PAGE ||
             record.state != BrickLifecycleState::Resident ||
             record.hasPersistentEdits ||
@@ -1520,12 +5564,15 @@ uint32_t SparseVoxelWorld::EvictLowerPriorityForRequest(
             continue;
         }
 
-        const int32_t dx = record.coord.x - center.x;
-        const int32_t dy = record.coord.y - center.y;
-        const int32_t dz = record.coord.z - center.z;
-        if (std::abs(dx) <= keepXz &&
-            std::abs(dy) <= keepY &&
-            std::abs(dz) <= keepXz) {
+        const int64_t dx = BrickCoordDelta(record.coord.x, center.x);
+        const int64_t dy = BrickCoordDelta(record.coord.y, center.y);
+        const int64_t dz = BrickCoordDelta(record.coord.z, center.z);
+        if (WithinKeepRadius(dx, dy, dz, hardKeepRadiusXz, hardKeepRadiusY)) {
+            continue;
+        }
+        if (record.residencyClass == SparseResidencyClass::Visible &&
+            currentFrame != 0u &&
+            record.lastVisibleFrame == currentFrame) {
             continue;
         }
 
@@ -1534,23 +5581,30 @@ uint32_t SparseVoxelWorld::EvictLowerPriorityForRequest(
             continue;
         }
 
-        const int32_t classPenalty = static_cast<int32_t>(ResidencyRank(record.residencyClass)) * 100000;
-        const int32_t distanceScore = dx * dx + dz * dz + dy * dy * 4;
+        const int64_t classPenalty = static_cast<int64_t>(ResidencyRank(record.residencyClass)) * 100000ll;
+        const int64_t distanceScore = SparseBrickDistanceScore(dx, dy, dz);
         const uint32_t latestTouch = LatestPriorityTouch(record);
         const uint32_t age = currentFrame > latestTouch ? currentFrame - latestTouch : 0u;
         const uint32_t cappedAge = std::min(age, 100000u);
+        const int64_t ageScore = static_cast<int64_t>(cappedAge) * 64ll;
         candidates.push_back({
             record.coord,
             record.pageIndex,
             record.generation,
             entryIndex,
-            static_cast<int64_t>(distanceScore) +
-                static_cast<int64_t>(cappedAge) * 64 -
-                static_cast<int64_t>(classPenalty)
+            SaturatingAddInt64(
+                SaturatingAddInt64(distanceScore, ageScore),
+                -classPenalty)
         });
     }
 
-    std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+    ++m_replacementScanCallsLastFrame;
+    m_replacementRecordsScannedLastFrame += recordsScanned;
+    m_replacementCandidatesLastFrame += static_cast<uint32_t>(std::min<size_t>(
+        candidates.size(),
+        static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+
+    SortBestEvictionCandidates(candidates, maxEvictions, [](const Candidate& a, const Candidate& b) {
         if (a.score != b.score) {
             return a.score > b.score;
         }
@@ -1565,11 +5619,13 @@ uint32_t SparseVoxelWorld::EvictLowerPriorityForRequest(
         if (!m_pool.Evict(candidate.coord)) {
             continue;
         }
+        RemoveStreamingTicket(candidate.coord);
         m_pendingSurfaceBricks.erase(candidate.coord);
         m_surfaceExtractionQueuedSet.erase(candidate.coord);
         MarkQueueAccountingDirty();
         m_surfaceCache.RemoveBrick(candidate.coord);
         m_generated.erase(candidate.coord);
+        m_deferredGeneratedDownstreamSet.erase(candidate.coord);
         m_deferredDirtyAfterUpload.erase(candidate.coord);
         m_renderDirtyRegions.erase(candidate.coord);
         m_surfaceDirtyRegions.erase(candidate.coord);
@@ -1610,10 +5666,31 @@ bool SparseVoxelWorld::MarkResidencyClass(const BrickCoord& coord, SparseResiden
     }
     m_generationQueuePriorityDirty = true;
     MarkUploadQueueOrderDirty();
-    m_surfaceExtractionQueuePriorityDirty = true;
+    MarkSurfaceQueueOrderDirty();
     QueueGenerationClassAliasIfRequested(coord);
     QueueUploadClassAliasIfUploadQueued(coord);
     QueueSurfaceClassAliasIfPending(coord);
+    BrickResidentRecord record;
+    if (m_pool.GetRecord(coord, &record)) {
+        UpdateStreamingTicketFromRecord(coord, record);
+        PromoteDeferredGeneratedDownstreamIfCritical(coord, 0u);
+    }
+    RefreshStats();
+    return true;
+}
+
+bool SparseVoxelWorld::MarkStreamingLane(const BrickCoord& coord, SparseStreamingLane lane) {
+    if (!m_pool.MarkStreamingLane(coord, lane)) {
+        return false;
+    }
+    m_generationQueuePriorityDirty = true;
+    MarkUploadQueueOrderDirty();
+    MarkSurfaceQueueOrderDirty();
+    BrickResidentRecord record;
+    if (m_pool.GetRecord(coord, &record)) {
+        UpdateStreamingTicketFromRecord(coord, record);
+        PromoteDeferredGeneratedDownstreamIfCritical(coord, 0u);
+    }
     RefreshStats();
     return true;
 }
@@ -1621,19 +5698,191 @@ bool SparseVoxelWorld::MarkResidencyClass(const BrickCoord& coord, SparseResiden
 bool SparseVoxelWorld::TouchResidencyClass(
     const BrickCoord& coord,
     SparseResidencyClass residencyClass,
-    uint32_t frameIndex)
+    uint32_t frameIndex,
+    int32_t queuePriority)
 {
-    if (!m_pool.TouchResidencyClass(coord, residencyClass, frameIndex)) {
+    if (!m_pool.TouchResidencyClass(coord, residencyClass, frameIndex, queuePriority)) {
         return false;
     }
     m_generationQueuePriorityDirty = true;
     MarkUploadQueueOrderDirty();
-    m_surfaceExtractionQueuePriorityDirty = true;
+    MarkSurfaceQueueOrderDirty();
     QueueGenerationClassAliasIfRequested(coord);
     QueueUploadClassAliasIfUploadQueued(coord);
     QueueSurfaceClassAliasIfPending(coord);
+    BrickResidentRecord record;
+    if (m_pool.GetRecord(coord, &record)) {
+        UpdateStreamingTicketFromRecord(coord, record);
+        PromoteDeferredGeneratedDownstreamIfCritical(coord, frameIndex);
+    }
     RefreshStats();
     return true;
+}
+
+bool SparseVoxelWorld::TouchResidencyClassWithStreamingLane(
+    const BrickCoord& coord,
+    SparseResidencyClass residencyClass,
+    SparseStreamingLane streamingLane,
+    uint32_t frameIndex,
+    int32_t queuePriority)
+{
+    const SparseResidencyClass effectiveResidencyClass =
+        m_config.prefetchLaneSpeculativeClass &&
+        residencyClass == SparseResidencyClass::Visible &&
+        streamingLane == SparseStreamingLane::Prefetch
+            ? SparseResidencyClass::Speculative
+            : residencyClass;
+    if (!m_pool.TouchResidencyClassWithStreamingLane(
+            coord,
+            effectiveResidencyClass,
+            streamingLane,
+            frameIndex,
+            queuePriority)) {
+        return false;
+    }
+    m_generationQueuePriorityDirty = true;
+    MarkUploadQueueOrderDirty();
+    MarkSurfaceQueueOrderDirty();
+    QueueGenerationClassAliasIfRequested(coord);
+    QueueUploadClassAliasIfUploadQueued(coord);
+    QueueSurfaceClassAliasIfPending(coord);
+    BrickResidentRecord record;
+    if (m_pool.GetRecord(coord, &record)) {
+        UpdateStreamingTicketFromRecord(coord, record);
+        PromoteDeferredGeneratedDownstreamIfCritical(coord, frameIndex);
+    }
+    RefreshStats();
+    return true;
+}
+
+bool SparseVoxelWorld::TouchStreamingLane(
+    const BrickCoord& coord,
+    SparseStreamingLane lane,
+    uint32_t frameIndex,
+    int32_t queuePriority)
+{
+    if (!m_pool.TouchStreamingLane(coord, lane, frameIndex, queuePriority)) {
+        return false;
+    }
+    m_generationQueuePriorityDirty = true;
+    MarkUploadQueueOrderDirty();
+    MarkSurfaceQueueOrderDirty();
+    BrickResidentRecord record;
+    if (m_pool.GetRecord(coord, &record)) {
+        UpdateStreamingTicketFromRecord(coord, record);
+        PromoteDeferredGeneratedDownstreamIfCritical(coord, frameIndex);
+    }
+    RefreshStats();
+    return true;
+}
+
+bool SparseVoxelWorld::TouchResidencyClassKnownPage(
+    uint32_t pageIndex,
+    const BrickCoord& coord,
+    SparseResidencyClass residencyClass,
+    uint32_t frameIndex,
+    int32_t queuePriority)
+{
+    if (!m_pool.TouchResidencyClassKnownPage(pageIndex, coord, residencyClass, frameIndex, queuePriority)) {
+        return false;
+    }
+    m_generationQueuePriorityDirty = true;
+    MarkUploadQueueOrderDirty();
+    MarkSurfaceQueueOrderDirty();
+    QueueGenerationClassAliasIfRequested(coord);
+    QueueUploadClassAliasIfUploadQueued(coord);
+    QueueSurfaceClassAliasIfPending(coord);
+    BrickResidentRecord record;
+    if (m_pool.GetRecord(coord, &record)) {
+        UpdateStreamingTicketFromRecord(coord, record);
+        PromoteDeferredGeneratedDownstreamIfCritical(coord, frameIndex);
+    }
+    RefreshStats();
+    return true;
+}
+
+bool SparseVoxelWorld::TouchResidencyClassWithStreamingLaneKnownPage(
+    uint32_t pageIndex,
+    const BrickCoord& coord,
+    SparseResidencyClass residencyClass,
+    SparseStreamingLane streamingLane,
+    uint32_t frameIndex,
+    int32_t queuePriority)
+{
+    const SparseResidencyClass effectiveResidencyClass =
+        m_config.prefetchLaneSpeculativeClass &&
+        residencyClass == SparseResidencyClass::Visible &&
+        streamingLane == SparseStreamingLane::Prefetch
+            ? SparseResidencyClass::Speculative
+            : residencyClass;
+    if (!m_pool.TouchResidencyClassWithStreamingLaneKnownPage(
+            pageIndex,
+            coord,
+            effectiveResidencyClass,
+            streamingLane,
+            frameIndex,
+            queuePriority)) {
+        return false;
+    }
+    m_generationQueuePriorityDirty = true;
+    MarkUploadQueueOrderDirty();
+    MarkSurfaceQueueOrderDirty();
+    QueueGenerationClassAliasIfRequested(coord);
+    QueueUploadClassAliasIfUploadQueued(coord);
+    QueueSurfaceClassAliasIfPending(coord);
+    BrickResidentRecord record;
+    if (m_pool.GetRecord(coord, &record)) {
+        UpdateStreamingTicketFromRecord(coord, record);
+        PromoteDeferredGeneratedDownstreamIfCritical(coord, frameIndex);
+    }
+    RefreshStats();
+    return true;
+}
+
+bool SparseVoxelWorld::TouchStreamingLaneKnownPage(
+    uint32_t pageIndex,
+    const BrickCoord& coord,
+    SparseStreamingLane lane,
+    uint32_t frameIndex,
+    int32_t queuePriority)
+{
+    if (!m_pool.TouchStreamingLaneKnownPage(
+            pageIndex,
+            coord,
+            lane,
+            frameIndex,
+            queuePriority)) {
+        return false;
+    }
+    m_generationQueuePriorityDirty = true;
+    MarkUploadQueueOrderDirty();
+    MarkSurfaceQueueOrderDirty();
+    BrickResidentRecord record;
+    if (m_pool.GetRecord(coord, &record)) {
+        UpdateStreamingTicketFromRecord(coord, record);
+        PromoteDeferredGeneratedDownstreamIfCritical(coord, frameIndex);
+    }
+    RefreshStats();
+    return true;
+}
+
+bool SparseVoxelWorld::TouchResidentRetention(
+    const BrickCoord& coord,
+    SparseResidencyClass residencyClass,
+    uint32_t frameIndex,
+    int32_t queuePriority)
+{
+    return m_pool.TouchResidencyClass(coord, residencyClass, frameIndex, queuePriority);
+}
+
+bool SparseVoxelWorld::TouchResidentRetentionKnownPage(
+    uint32_t pageIndex,
+    const BrickCoord& coord,
+    SparseResidencyClass residencyClass,
+    uint32_t frameIndex,
+    int32_t queuePriority)
+{
+    return m_pool.TouchResidencyClassKnownPage(pageIndex, coord, residencyClass, frameIndex, queuePriority);
 }
 
 bool SparseVoxelWorld::QueuePhysicsCandidateNoStats(const BrickCoord& coord) {
@@ -1698,7 +5947,7 @@ void SparseVoxelWorld::QueueSurfaceDirtyRegionNoStats(
             return;
         }
 
-        GeneratedSparseBrick brick = m_terrain.GenerateBrick(dirtyCoord);
+        GeneratedSparseBrick brick = GenerateBrickWithCachedTerrainColumns(dirtyCoord);
         m_edits.ApplyToGeneratedBrick(brick);
         m_pendingSurfaceBricks[dirtyCoord] = std::move(brick);
         QueueSurfaceExtractionCoord(dirtyCoord);
@@ -1717,34 +5966,52 @@ void SparseVoxelWorld::QueueSurfaceDirtyRegionNoStats(
     queueOne(coord, primary, false);
 
     if (region.minX == 0) {
-        queueOne({coord.x - 1, coord.y, coord.z}, SparseSurfaceLocalRegion{
-            SPARSE_BRICK_SIZE - 1, region.minY, region.minZ,
-            SPARSE_BRICK_SIZE - 1, region.maxY, region.maxZ}, true);
+        BrickCoord neighbor;
+        if (TryOffsetBrickCoord(coord, -1, 0, 0, &neighbor)) {
+            queueOne(neighbor, SparseSurfaceLocalRegion{
+                SPARSE_BRICK_SIZE - 1, region.minY, region.minZ,
+                SPARSE_BRICK_SIZE - 1, region.maxY, region.maxZ}, true);
+        }
     }
     if (region.maxX == SPARSE_BRICK_SIZE - 1) {
-        queueOne({coord.x + 1, coord.y, coord.z}, SparseSurfaceLocalRegion{
-            0, region.minY, region.minZ,
-            0, region.maxY, region.maxZ}, true);
+        BrickCoord neighbor;
+        if (TryOffsetBrickCoord(coord, 1, 0, 0, &neighbor)) {
+            queueOne(neighbor, SparseSurfaceLocalRegion{
+                0, region.minY, region.minZ,
+                0, region.maxY, region.maxZ}, true);
+        }
     }
     if (region.minY == 0) {
-        queueOne({coord.x, coord.y - 1, coord.z}, SparseSurfaceLocalRegion{
-            region.minX, SPARSE_BRICK_SIZE - 1, region.minZ,
-            region.maxX, SPARSE_BRICK_SIZE - 1, region.maxZ}, true);
+        BrickCoord neighbor;
+        if (TryOffsetBrickCoord(coord, 0, -1, 0, &neighbor)) {
+            queueOne(neighbor, SparseSurfaceLocalRegion{
+                region.minX, SPARSE_BRICK_SIZE - 1, region.minZ,
+                region.maxX, SPARSE_BRICK_SIZE - 1, region.maxZ}, true);
+        }
     }
     if (region.maxY == SPARSE_BRICK_SIZE - 1) {
-        queueOne({coord.x, coord.y + 1, coord.z}, SparseSurfaceLocalRegion{
-            region.minX, 0, region.minZ,
-            region.maxX, 0, region.maxZ}, true);
+        BrickCoord neighbor;
+        if (TryOffsetBrickCoord(coord, 0, 1, 0, &neighbor)) {
+            queueOne(neighbor, SparseSurfaceLocalRegion{
+                region.minX, 0, region.minZ,
+                region.maxX, 0, region.maxZ}, true);
+        }
     }
     if (region.minZ == 0) {
-        queueOne({coord.x, coord.y, coord.z - 1}, SparseSurfaceLocalRegion{
-            region.minX, region.minY, SPARSE_BRICK_SIZE - 1,
-            region.maxX, region.maxY, SPARSE_BRICK_SIZE - 1}, true);
+        BrickCoord neighbor;
+        if (TryOffsetBrickCoord(coord, 0, 0, -1, &neighbor)) {
+            queueOne(neighbor, SparseSurfaceLocalRegion{
+                region.minX, region.minY, SPARSE_BRICK_SIZE - 1,
+                region.maxX, region.maxY, SPARSE_BRICK_SIZE - 1}, true);
+        }
     }
     if (region.maxZ == SPARSE_BRICK_SIZE - 1) {
-        queueOne({coord.x, coord.y, coord.z + 1}, SparseSurfaceLocalRegion{
-            region.minX, region.minY, 0,
-            region.maxX, region.maxY, 0}, true);
+        BrickCoord neighbor;
+        if (TryOffsetBrickCoord(coord, 0, 0, 1, &neighbor)) {
+            queueOne(neighbor, SparseSurfaceLocalRegion{
+                region.minX, region.minY, 0,
+                region.maxX, region.maxY, 0}, true);
+        }
     }
 }
 
@@ -1782,18 +6049,105 @@ void SparseVoxelWorld::WakePhysicsSupportNeighborhoodNoStats(
     int32_t worldY,
     int32_t worldZ)
 {
+    int32_t supportY = 0;
+    if (!TryStepInt32(worldY, 1, &supportY)) {
+        return;
+    }
     for (int32_t dz = -1; dz <= 1; ++dz) {
         for (int32_t dx = -1; dx <= 1; ++dx) {
+            int32_t supportX = 0;
+            int32_t supportZ = 0;
+            if (!TryStepInt32(worldX, dx, &supportX) ||
+                !TryStepInt32(worldZ, dz, &supportZ)) {
+                continue;
+            }
             // Removing support only wakes the immediately supported column
             // above the edit. Queue exact voxels instead of full bricks so
             // erase/brush strokes do not turn into broad local scans.
             QueuePhysicsVoxelNoStats(
-                worldX + dx,
-                worldY + 1,
-                worldZ + dz,
+                supportX,
+                supportY,
+                supportZ,
                 SparsePhysicsPriority::Hot);
         }
     }
+}
+
+float SparseVoxelWorld::CachedTerrainHeightAt(int32_t worldX, int32_t worldZ) {
+    const bool collectCacheStats = m_config.persistentTerrainColumnCache;
+    const TerrainSurfaceColumnKey key{worldX, worldZ};
+    auto columnIt = m_surfaceTerrainColumnCache.find(key);
+    if (columnIt != m_surfaceTerrainColumnCache.end()) {
+        if (collectCacheStats) {
+            ++m_terrainColumnCacheFrameStats.heightHits;
+        }
+        return columnIt->second.height;
+    }
+
+    if (collectCacheStats) {
+        ++m_terrainColumnCacheFrameStats.heightMisses;
+    }
+    TerrainSurfaceColumnCacheEntry entry;
+    entry.height = m_terrain.HeightAt(worldX, worldZ);
+    auto [insertedIt, inserted] = m_surfaceTerrainColumnCache.emplace(key, entry);
+    (void)inserted;
+    return insertedIt->second.height;
+}
+
+float SparseVoxelWorld::CachedTerrainReliefAt(
+    int32_t worldX,
+    int32_t worldZ,
+    int32_t sampleOffset)
+{
+    const bool collectCacheStats = m_config.persistentTerrainColumnCache;
+    const int32_t offset = std::max(1, sampleOffset);
+    const TerrainSurfaceColumnKey key{worldX, worldZ};
+    auto columnIt = m_surfaceTerrainColumnCache.find(key);
+    if (columnIt == m_surfaceTerrainColumnCache.end()) {
+        if (collectCacheStats) {
+            ++m_terrainColumnCacheFrameStats.heightMisses;
+        }
+        TerrainSurfaceColumnCacheEntry entry;
+        entry.height = m_terrain.HeightAt(worldX, worldZ);
+        columnIt = m_surfaceTerrainColumnCache.emplace(key, entry).first;
+    }
+    if (columnIt->second.reliefValid && columnIt->second.reliefSampleOffset == offset) {
+        if (collectCacheStats) {
+            ++m_terrainColumnCacheFrameStats.reliefHits;
+        }
+        return columnIt->second.relief;
+    }
+
+    if (collectCacheStats) {
+        ++m_terrainColumnCacheFrameStats.reliefMisses;
+    }
+    int32_t xMinus = worldX;
+    int32_t xPlus = worldX;
+    int32_t zMinus = worldZ;
+    int32_t zPlus = worldZ;
+    (void)TryStepInt32(worldX, -offset, &xMinus);
+    (void)TryStepInt32(worldX, offset, &xPlus);
+    (void)TryStepInt32(worldZ, -offset, &zMinus);
+    (void)TryStepInt32(worldZ, offset, &zPlus);
+
+    const float center = columnIt->second.height;
+    float localMin = center;
+    float localMax = center;
+    const float samples[] = {
+        CachedTerrainHeightAt(xMinus, worldZ),
+        CachedTerrainHeightAt(xPlus, worldZ),
+        CachedTerrainHeightAt(worldX, zMinus),
+        CachedTerrainHeightAt(worldX, zPlus),
+    };
+    for (float height : samples) {
+        localMin = std::min(localMin, height);
+        localMax = std::max(localMax, height);
+    }
+
+    columnIt->second.relief = localMax - localMin;
+    columnIt->second.reliefSampleOffset = offset;
+    columnIt->second.reliefValid = true;
+    return columnIt->second.relief;
 }
 
 bool SparseVoxelWorld::PopNextPhysicsWorkPacket(SparsePhysicsWorkPacket* outPacket) {
@@ -1851,14 +6205,15 @@ bool SparseVoxelWorld::PopNextPhysicsWorkPacket(SparsePhysicsWorkPacket* outPack
 
 uint32_t SparseVoxelWorld::BuildPhysicsWorkBatch(uint32_t maxPackets) {
     m_physicsStagedPackets.clear();
-    m_physicsStagedPackets.reserve(maxPackets);
+    const uint32_t cappedMaxPackets = std::min(maxPackets, kMaxSparseLocalPhysicsWorkPackets);
+    m_physicsStagedPackets.reserve(cappedMaxPackets);
     m_physicsHotWorkPacketsLastFrame = 0;
     m_physicsWarmWorkPacketsLastFrame = 0;
     m_physicsDirtyRegionVoxelsLastFrame = 0;
     ++m_physicsWorkGeneration;
 
     SparsePhysicsWorkPacket packet;
-    while (m_physicsStagedPackets.size() < maxPackets && PopNextPhysicsWorkPacket(&packet)) {
+    while (m_physicsStagedPackets.size() < cappedMaxPackets && PopNextPhysicsWorkPacket(&packet)) {
         m_physicsStagedPackets.push_back(packet);
         if (packet.priority != 0u) {
             ++m_physicsHotWorkPacketsLastFrame;
@@ -1937,7 +6292,10 @@ uint32_t SparseVoxelWorld::StageLocalPhysicsWork(uint32_t maxBricks) {
             continue;
         }
 
-        const BrickCoord belowCoord{packet.coord.x, packet.coord.y - 1, packet.coord.z};
+        BrickCoord belowCoord;
+        if (!TryOffsetBrickCoord(packet.coord, 0, -1, 0, &belowCoord)) {
+            continue;
+        }
         const SparseBrickRequestResult requestResult = RequestBrickDetailed(belowCoord, false);
         if (requestResult != SparseBrickRequestResult::Rejected) {
             MarkResidencyClass(belowCoord, SparseResidencyClass::Collision);
@@ -1980,8 +6338,36 @@ std::vector<SparseEditDelta> SparseVoxelWorld::BuildGpuEditDeltaSnapshotForPhysi
     for (const SparsePhysicsWorkPacket& packet : m_physicsStagedPackets) {
         addCoord(packet.coord);
         const LocalVoxelCoord regionMin = UnpackPhysicsRegionPoint(packet.packedRegionMin);
+        const LocalVoxelCoord regionMax = UnpackPhysicsRegionPoint(packet.packedRegionMax);
         if (regionMin.y == 0) {
-            addCoord(BrickCoord{packet.coord.x, packet.coord.y - 1, packet.coord.z});
+            BrickCoord belowCoord;
+            if (TryOffsetBrickCoord(packet.coord, 0, -1, 0, &belowCoord)) {
+                addCoord(belowCoord);
+            }
+        }
+        if (regionMin.x == 0) {
+            BrickCoord lateralCoord;
+            if (TryOffsetBrickCoord(packet.coord, -1, 0, 0, &lateralCoord)) {
+                addCoord(lateralCoord);
+            }
+        }
+        if (regionMax.x >= SPARSE_BRICK_SIZE - 1) {
+            BrickCoord lateralCoord;
+            if (TryOffsetBrickCoord(packet.coord, 1, 0, 0, &lateralCoord)) {
+                addCoord(lateralCoord);
+            }
+        }
+        if (regionMin.z == 0) {
+            BrickCoord lateralCoord;
+            if (TryOffsetBrickCoord(packet.coord, 0, 0, -1, &lateralCoord)) {
+                addCoord(lateralCoord);
+            }
+        }
+        if (regionMax.z >= SPARSE_BRICK_SIZE - 1) {
+            BrickCoord lateralCoord;
+            if (TryOffsetBrickCoord(packet.coord, 0, 0, 1, &lateralCoord)) {
+                addCoord(lateralCoord);
+            }
         }
     }
 
@@ -1998,8 +6384,12 @@ uint32_t SparseVoxelWorld::ExecuteStagedLocalPhysics(
     m_physicsProcessedBricksLastFrame = 0;
     m_physicsMovedVoxelsLastFrame = 0;
     m_physicsSkippedVoxelsLastFrame = 0;
-    if (maxVoxelMoves == 0 || m_physicsStagedPackets.empty()) {
+    if (m_physicsStagedPackets.empty()) {
         RefreshStats();
+        return 0;
+    }
+    if (maxVoxelMoves == 0) {
+        RequeueLastPhysicsWorkPackets();
         return 0;
     }
 
@@ -2059,10 +6449,19 @@ uint32_t SparseVoxelWorld::ExecuteStagedLocalPhysics(
                 ++m_physicsSkippedVoxelsLastFrame;
                 return;
             }
+            int32_t worldX = 0;
+            int32_t worldY = 0;
+            int32_t worldZ = 0;
+            if (!TryWorldVoxelFromBrickLocal(coord.x, local.x, &worldX) ||
+                !TryWorldVoxelFromBrickLocal(coord.y, local.y, &worldY) ||
+                !TryWorldVoxelFromBrickLocal(coord.z, local.z, &worldZ)) {
+                ++m_physicsSkippedVoxelsLastFrame;
+                return;
+            }
             candidates.push_back(Candidate{
-                coord.x * SPARSE_BRICK_SIZE + static_cast<int32_t>(local.x),
-                coord.y * SPARSE_BRICK_SIZE + static_cast<int32_t>(local.y),
-                coord.z * SPARSE_BRICK_SIZE + static_cast<int32_t>(local.z),
+                worldX,
+                worldY,
+                worldZ,
                 packedVoxel});
         });
 
@@ -2084,7 +6483,11 @@ uint32_t SparseVoxelWorld::ExecuteStagedLocalPhysics(
                 continue;
             }
 
-            const int32_t belowY = candidate.y - 1;
+            int32_t belowY = 0;
+            if (!TryStepInt32(candidate.y, -1, &belowY)) {
+                ++m_physicsSkippedVoxelsLastFrame;
+                continue;
+            }
             uint32_t belowVoxel = 0;
             if (!m_edits.TryGetVoxel(candidate.x, belowY, candidate.z, &belowVoxel)) {
                 belowVoxel = m_terrain.SampleGeneratedVoxel(candidate.x, belowY, candidate.z);
@@ -2124,7 +6527,7 @@ uint32_t SparseVoxelWorld::ExecuteStagedLocalPhysics(
     if (!touchedRenderRegions.empty()) {
         m_generationQueuePriorityDirty = true;
         MarkUploadQueueOrderDirty();
-        m_surfaceExtractionQueuePriorityDirty = true;
+        MarkSurfaceQueueOrderDirty();
     }
 
     m_physicsProcessedBricksLastFrame = processed;
@@ -2146,7 +6549,26 @@ uint32_t SparseVoxelWorld::ApplyGpuPhysicsProposals(
     m_physicsGpuProcessedProposalsLastFrame = 0;
     m_physicsGpuAppliedMovesLastFrame = 0;
     m_physicsGpuRejectedProposalsLastFrame = 0;
-    if (maxVoxelMoves == 0 || proposals.empty()) {
+    auto requeueProposalSource = [this](const SparsePhysicsPacketResult& proposal) {
+        const LocalVoxelCoord sourceLocal = UnpackPhysicsRegionPoint(proposal.packedSourceLocal);
+        SparsePhysicsDirtyRegion deferredRegion;
+        if (IsValidPhysicsLocal(sourceLocal)) {
+            deferredRegion.minX = deferredRegion.maxX = sourceLocal.x;
+            deferredRegion.minY = deferredRegion.maxY = sourceLocal.y;
+            deferredRegion.minZ = deferredRegion.maxZ = sourceLocal.z;
+        }
+        QueuePhysicsRegionNoStats(proposal.coord, deferredRegion, SparsePhysicsPriority::Hot);
+    };
+    if (proposals.empty()) {
+        RefreshStats();
+        return 0;
+    }
+    if (maxVoxelMoves == 0) {
+        for (const SparsePhysicsPacketResult& proposal : proposals) {
+            if ((proposal.status & SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL) != 0u) {
+                requeueProposalSource(proposal);
+            }
+        }
         RefreshStats();
         return 0;
     }
@@ -2164,14 +6586,6 @@ uint32_t SparseVoxelWorld::ApplyGpuPhysicsProposals(
             MergeSparseRegion(regionIt->second, pointRegion);
         }
     };
-    auto requeueProposalSource = [this](const SparsePhysicsPacketResult& proposal) {
-        const LocalVoxelCoord sourceLocal = UnpackPhysicsRegionPoint(proposal.packedSourceLocal);
-        SparsePhysicsDirtyRegion deferredRegion;
-        deferredRegion.minX = deferredRegion.maxX = sourceLocal.x;
-        deferredRegion.minY = deferredRegion.maxY = sourceLocal.y;
-        deferredRegion.minZ = deferredRegion.maxZ = sourceLocal.z;
-        QueuePhysicsRegionNoStats(proposal.coord, deferredRegion, SparsePhysicsPriority::Hot);
-    };
     uint32_t moved = 0;
     uint32_t processed = 0;
     std::unordered_set<SparseWorldVoxelKey, SparseWorldVoxelKeyHash> claimedVoxels;
@@ -2186,9 +6600,39 @@ uint32_t SparseVoxelWorld::ApplyGpuPhysicsProposals(
         }
         ++m_physicsGpuProcessedProposalsLastFrame;
 
+        if (!GpuPhysicsProposalStatusWellFormed(proposal.status)) {
+            ++m_physicsSkippedVoxelsLastFrame;
+            ++m_physicsGpuRejectedProposalsLastFrame;
+            requeueProposalSource(proposal);
+            continue;
+        }
+
+        if (proposal.generation == 0u) {
+            ++m_physicsSkippedVoxelsLastFrame;
+            ++m_physicsGpuRejectedProposalsLastFrame;
+            requeueProposalSource(proposal);
+            continue;
+        }
+
         const bool hasExpectedPage =
             proposal.expectedPageIndex != INVALID_BRICK_PAGE &&
             proposal.expectedPageGeneration != 0u;
+        const bool statusHasExpectedPage =
+            (proposal.status & SPARSE_PHYSICS_PACKET_STATUS_HAS_EXPECTED_PAGE) != 0u;
+        const bool statusPageMatch =
+            (proposal.status & SPARSE_PHYSICS_PACKET_STATUS_PAGE_MATCH) != 0u;
+        const bool statusPageStale =
+            (proposal.status & SPARSE_PHYSICS_PACKET_STATUS_PAGE_STALE) != 0u;
+        const bool claimsExpectedPageValidation =
+            statusHasExpectedPage || statusPageMatch || statusPageStale;
+        if ((claimsExpectedPageValidation && !hasExpectedPage) ||
+            ((statusPageMatch || statusPageStale) && !statusHasExpectedPage) ||
+            (statusPageMatch && statusPageStale)) {
+            ++m_physicsSkippedVoxelsLastFrame;
+            ++m_physicsGpuRejectedProposalsLastFrame;
+            requeueProposalSource(proposal);
+            continue;
+        }
         if (hasExpectedPage) {
             uint32_t currentPageIndex = INVALID_BRICK_PAGE;
             if (!m_pool.PageTable().TryLookupExactGeneration(
@@ -2210,15 +6654,29 @@ uint32_t SparseVoxelWorld::ApplyGpuPhysicsProposals(
         const LocalVoxelCoord sourceLocal = UnpackPhysicsRegionPoint(proposal.packedSourceLocal);
         const LocalVoxelCoord destinationLocal =
             UnpackPhysicsRegionPoint(proposal.packedDestinationLocal);
-        const int32_t sourceX = SparseWorldVoxelFromLocal(proposal.coord.x, sourceLocal.x);
-        const int32_t sourceY = SparseWorldVoxelFromLocal(proposal.coord.y, sourceLocal.y);
-        const int32_t sourceZ = SparseWorldVoxelFromLocal(proposal.coord.z, sourceLocal.z);
-        const int32_t destinationX =
-            SparseWorldVoxelFromLocal(proposal.destinationCoord.x, destinationLocal.x);
-        const int32_t destinationY =
-            SparseWorldVoxelFromLocal(proposal.destinationCoord.y, destinationLocal.y);
-        const int32_t destinationZ =
-            SparseWorldVoxelFromLocal(proposal.destinationCoord.z, destinationLocal.z);
+        if (!IsValidPhysicsLocal(sourceLocal) || !IsValidPhysicsLocal(destinationLocal)) {
+            ++m_physicsSkippedVoxelsLastFrame;
+            ++m_physicsGpuRejectedProposalsLastFrame;
+            requeueProposalSource(proposal);
+            continue;
+        }
+        int32_t sourceX = 0;
+        int32_t sourceY = 0;
+        int32_t sourceZ = 0;
+        int32_t destinationX = 0;
+        int32_t destinationY = 0;
+        int32_t destinationZ = 0;
+        if (!TryWorldVoxelFromBrickLocal(proposal.coord.x, sourceLocal.x, &sourceX) ||
+            !TryWorldVoxelFromBrickLocal(proposal.coord.y, sourceLocal.y, &sourceY) ||
+            !TryWorldVoxelFromBrickLocal(proposal.coord.z, sourceLocal.z, &sourceZ) ||
+            !TryWorldVoxelFromBrickLocal(proposal.destinationCoord.x, destinationLocal.x, &destinationX) ||
+            !TryWorldVoxelFromBrickLocal(proposal.destinationCoord.y, destinationLocal.y, &destinationY) ||
+            !TryWorldVoxelFromBrickLocal(proposal.destinationCoord.z, destinationLocal.z, &destinationZ)) {
+            ++m_physicsSkippedVoxelsLastFrame;
+            ++m_physicsGpuRejectedProposalsLastFrame;
+            requeueProposalSource(proposal);
+            continue;
+        }
         const SparseWorldVoxelKey sourceKey{sourceX, sourceY, sourceZ};
         const SparseWorldVoxelKey destinationKey{destinationX, destinationY, destinationZ};
         if (claimedVoxels.find(sourceKey) != claimedVoxels.end() ||
@@ -2234,10 +6692,12 @@ uint32_t SparseVoxelWorld::ApplyGpuPhysicsProposals(
             const uint32_t currentSourceRevision = m_edits.GetOverlayRevision(proposal.coord);
             const uint32_t currentDestinationRevision =
                 m_edits.GetOverlayRevision(proposal.destinationCoord);
-            if ((proposal.sourceRevision != 0u &&
-                 currentSourceRevision > proposal.sourceRevision) ||
-                (proposal.destinationRevision != 0u &&
-                 currentDestinationRevision > proposal.destinationRevision)) {
+            if (!GpuPhysicsEditRevisionsMatch(
+                    proposalUsedEditDelta,
+                    proposal.sourceRevision,
+                    proposal.destinationRevision,
+                    currentSourceRevision,
+                    currentDestinationRevision)) {
                 ++m_physicsSkippedVoxelsLastFrame;
                 ++m_physicsGpuRejectedProposalsLastFrame;
                 requeueProposalSource(proposal);
@@ -2263,7 +6723,8 @@ uint32_t SparseVoxelWorld::ApplyGpuPhysicsProposals(
             currentDestinationVoxel =
                 m_terrain.SampleGeneratedVoxel(destinationX, destinationY, destinationZ);
         }
-        if (Utils::UnpackMaterial(currentDestinationVoxel) != Utils::Material::Air) {
+        if (currentDestinationVoxel != proposal.destinationVoxel ||
+            Utils::UnpackMaterial(currentDestinationVoxel) != Utils::Material::Air) {
             ++m_physicsSkippedVoxelsLastFrame;
             ++m_physicsGpuRejectedProposalsLastFrame;
             requeueProposalSource(proposal);
@@ -2295,7 +6756,7 @@ uint32_t SparseVoxelWorld::ApplyGpuPhysicsProposals(
     if (!touchedRenderRegions.empty()) {
         m_generationQueuePriorityDirty = true;
         MarkUploadQueueOrderDirty();
-        m_surfaceExtractionQueuePriorityDirty = true;
+        MarkSurfaceQueueOrderDirty();
     }
 
     m_physicsProcessedBricksLastFrame = processed;
@@ -2322,6 +6783,84 @@ void SparseVoxelWorld::SetEditedVoxel(int32_t worldX, int32_t worldY, int32_t wo
     renderRegion.minZ = renderRegion.maxZ = local.z;
     QueueRegeneratedUploadForExistingPage(coord, &renderRegion);
     RefreshStats();
+}
+
+uint32_t SparseVoxelWorld::ApplyEditedVoxels(const std::vector<SparseBrushFeedbackRecord>& records) {
+    if (records.empty()) {
+        return 0;
+    }
+
+    std::unordered_map<BrickCoord, SparseRenderDirtyRegion, BrickCoordHash> touchedRenderRegions;
+    std::unordered_map<BrickCoord, SparsePhysicsDirtyRegion, BrickCoordHash> touchedPhysicsRegions;
+    uint32_t evaluated = 0;
+    uint32_t applied = 0;
+    for (const SparseBrushFeedbackRecord& record : records) {
+        if (IsSparseBrushFeedbackMissingResident(record)) {
+            continue;
+        }
+        ++evaluated;
+
+        uint32_t currentVoxel = 0;
+        if (!m_edits.TryGetVoxel(record.worldX, record.worldY, record.worldZ, &currentVoxel)) {
+            currentVoxel = m_terrain.SampleGeneratedVoxel(record.worldX, record.worldY, record.worldZ);
+        }
+        if (BrushFeedbackVoxelAlreadyApplied(currentVoxel, record.voxel)) {
+            continue;
+        }
+
+        m_edits.SetVoxel(record.worldX, record.worldY, record.worldZ, record.voxel);
+        const BrickCoord coord = BrickCoord::FromWorldVoxel(record.worldX, record.worldY, record.worldZ);
+        const LocalVoxelCoord local = LocalVoxelFromWorld(record.worldX, record.worldY, record.worldZ);
+        m_knownEmptyGeneratedBricks.erase(coord);
+
+        SparseRenderDirtyRegion renderRegion;
+        renderRegion.minX = renderRegion.maxX = local.x;
+        renderRegion.minY = renderRegion.maxY = local.y;
+        renderRegion.minZ = renderRegion.maxZ = local.z;
+        auto [renderIt, insertedRender] = touchedRenderRegions.emplace(coord, renderRegion);
+        if (!insertedRender) {
+            MergeSparseRegion(renderIt->second, renderRegion);
+        }
+
+        SparsePhysicsDirtyRegion physicsRegion;
+        physicsRegion.minX = physicsRegion.maxX = local.x;
+        physicsRegion.minY = physicsRegion.maxY = local.y;
+        physicsRegion.minZ = physicsRegion.maxZ = local.z;
+        auto [physicsIt, insertedPhysics] = touchedPhysicsRegions.emplace(coord, physicsRegion);
+        if (!insertedPhysics) {
+            MergeSparseRegion(physicsIt->second, physicsRegion);
+        }
+
+        if (Utils::UnpackMaterial(record.voxel) == Utils::Material::Air) {
+            WakePhysicsSupportNeighborhoodNoStats(record.worldX, record.worldY, record.worldZ);
+        }
+        ++applied;
+    }
+
+    m_stats.brushVoxelsEvaluatedLastStroke = evaluated;
+    m_stats.brushVoxelsEditedLastStroke = applied;
+    if (applied == 0) {
+        RefreshStats();
+        return 0;
+    }
+
+    uint32_t queued = 0;
+    for (const auto& [coord, renderRegion] : touchedRenderRegions) {
+        auto physicsIt = touchedPhysicsRegions.find(coord);
+        if (physicsIt != touchedPhysicsRegions.end()) {
+            QueuePhysicsRegionNoStats(coord, physicsIt->second, SparsePhysicsPriority::Hot);
+        } else {
+            QueuePhysicsCandidateNoStats(coord);
+        }
+        if (QueueRegeneratedUploadForExistingPage(coord, &renderRegion)) {
+            ++queued;
+        }
+    }
+
+    m_stats.brushBricksTouchedLastStroke = static_cast<uint32_t>(touchedRenderRegions.size());
+    m_stats.brushBricksQueuedLastStroke = queued;
+    RefreshStats();
+    return applied;
 }
 
 bool SparseVoxelWorld::SaveEditsToFile(const std::filesystem::path& path) {
@@ -2362,7 +6901,7 @@ bool SparseVoxelWorld::LoadEditsFromFile(const std::filesystem::path& path, bool
 
     m_generationQueuePriorityDirty = true;
     MarkUploadQueueOrderDirty();
-    m_surfaceExtractionQueuePriorityDirty = true;
+    MarkSurfaceQueueOrderDirty();
     RefreshStats();
     return true;
 }
@@ -2463,23 +7002,19 @@ uint32_t SparseVoxelWorld::EvaluateBrushEdit(
         m_stats.brushBricksQueuedLastStroke = 0;
     }
 
-    if (radius <= 0.0f) {
+    SparseBrushVoxelBounds brushBounds;
+    if (!TryBuildSparseBrushVoxelBounds(
+            worldPositionX,
+            worldPositionY,
+            worldPositionZ,
+            radius,
+            strength,
+            &brushBounds)) {
         if (commit) {
             RefreshStats();
         }
         return 0;
     }
-
-    const int32_t radiusCeil = static_cast<int32_t>(std::ceil(radius)) + 2;
-    const int32_t centerX = static_cast<int32_t>(std::floor(worldPositionX));
-    const int32_t centerY = static_cast<int32_t>(std::floor(worldPositionY));
-    const int32_t centerZ = static_cast<int32_t>(std::floor(worldPositionZ));
-    const int32_t startX = centerX - radiusCeil;
-    const int32_t startY = centerY - radiusCeil;
-    const int32_t startZ = centerZ - radiusCeil;
-    const int32_t endX = static_cast<int32_t>(std::ceil(worldPositionX)) + radiusCeil + 1;
-    const int32_t endY = static_cast<int32_t>(std::ceil(worldPositionY)) + radiusCeil + 1;
-    const int32_t endZ = static_cast<int32_t>(std::ceil(worldPositionZ)) + radiusCeil + 1;
 
     std::unordered_set<BrickCoord, BrickCoordHash> touchedBricks;
     std::unordered_map<BrickCoord, SparsePhysicsDirtyRegion, BrickCoordHash> touchedPhysicsRegions;
@@ -2490,9 +7025,9 @@ uint32_t SparseVoxelWorld::EvaluateBrushEdit(
     const float normalY = static_cast<float>(hitNormalY);
     const float normalZ = static_cast<float>(hitNormalZ);
 
-    for (int32_t z = startZ; z < endZ; ++z) {
-        for (int32_t y = startY; y < endY; ++y) {
-            for (int32_t x = startX; x < endX; ++x) {
+    for (int32_t z = brushBounds.startZ; z < brushBounds.endZ; ++z) {
+        for (int32_t y = brushBounds.startY; y < brushBounds.endY; ++y) {
+            for (int32_t x = brushBounds.startX; x < brushBounds.endX; ++x) {
                 ++evaluated;
 
                 const float sdf = BrushSdf(
@@ -2502,16 +7037,16 @@ uint32_t SparseVoxelWorld::EvaluateBrushEdit(
                     worldPositionX,
                     worldPositionY,
                     worldPositionZ,
-                    radius,
+                    brushBounds.radius,
                     shape);
                 if (sdf > 0.5f || y <= TERRAIN_MIN_Y + 5) {
                     continue;
                 }
 
                 const uint8_t variant = HashVoxelVariant(x, y, z, seed);
-                if (strength < 1.0f && sdf > -0.5f) {
+                if (brushBounds.strength < 1.0f && sdf > -0.5f) {
                     const float edgeFactor = std::clamp(1.0f - sdf / 0.5f, 0.0f, 1.0f);
-                    const float probability = edgeFactor * strength;
+                    const float probability = edgeFactor * brushBounds.strength;
                     if ((static_cast<float>(variant) / 255.0f) > probability) {
                         continue;
                     }
@@ -2574,7 +7109,7 @@ uint32_t SparseVoxelWorld::EvaluateBrushEdit(
                     continue;
                 }
 
-                if (newVoxel == currentVoxel) {
+                if (BrushFeedbackVoxelAlreadyApplied(currentVoxel, newVoxel)) {
                     continue;
                 }
 
@@ -2584,13 +7119,16 @@ uint32_t SparseVoxelWorld::EvaluateBrushEdit(
                     m_edits.SetVoxel(x, y, z, newVoxel);
                 }
                 if (outDeltas) {
+                    const uint32_t currentRevision = m_edits.GetOverlayRevision(editCoord);
+                    const uint32_t deltaRevision =
+                        commit || currentRevision != std::numeric_limits<uint32_t>::max()
+                            ? currentRevision + (commit ? 0u : 1u)
+                            : 1u;
                     outDeltas->push_back({
                         editCoord,
                         PackSparseEditLocal(editLocal),
                         newVoxel,
-                        commit
-                            ? m_edits.GetOverlayRevision(editCoord)
-                            : m_edits.GetOverlayRevision(editCoord) + 1u
+                        deltaRevision
                     });
                 }
                 if (commit && Utils::UnpackMaterial(newVoxel) == Utils::Material::Air) {
@@ -2697,55 +7235,75 @@ SparseRaycastHit SparseVoxelWorld::Raycast(
     float maxDistance) const
 {
     SparseRaycastHit hit;
-    if (maxDistance <= 0.0f) {
+    if (!std::isfinite(originX) ||
+        !std::isfinite(originY) ||
+        !std::isfinite(originZ) ||
+        !std::isfinite(dirX) ||
+        !std::isfinite(dirY) ||
+        !std::isfinite(dirZ) ||
+        !std::isfinite(maxDistance) ||
+        maxDistance <= 0.0f) {
         return hit;
     }
 
-    const float dirLength = std::sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ);
-    if (dirLength <= 0.00001f) {
+    const double dirLength = std::sqrt(
+        static_cast<double>(dirX) * static_cast<double>(dirX) +
+        static_cast<double>(dirY) * static_cast<double>(dirY) +
+        static_cast<double>(dirZ) * static_cast<double>(dirZ));
+    if (!std::isfinite(dirLength) || dirLength <= 0.00001) {
         return hit;
     }
-    dirX /= dirLength;
-    dirY /= dirLength;
-    dirZ /= dirLength;
+    dirX = static_cast<float>(static_cast<double>(dirX) / dirLength);
+    dirY = static_cast<float>(static_cast<double>(dirY) / dirLength);
+    dirZ = static_cast<float>(static_cast<double>(dirZ) / dirLength);
+    const float rayMaxDistance = std::min(maxDistance, kMaxSparseRaycastDistance);
 
-    int32_t voxelX = static_cast<int32_t>(std::floor(originX));
-    int32_t voxelY = static_cast<int32_t>(std::floor(originY));
-    int32_t voxelZ = static_cast<int32_t>(std::floor(originZ));
+    int32_t voxelX = 0;
+    int32_t voxelY = 0;
+    int32_t voxelZ = 0;
+    if (!TryFloorToInt32(originX, &voxelX) ||
+        !TryFloorToInt32(originY, &voxelY) ||
+        !TryFloorToInt32(originZ, &voxelZ)) {
+        return hit;
+    }
 
     const int32_t stepX = dirX > 0.0f ? 1 : (dirX < 0.0f ? -1 : 0);
     const int32_t stepY = dirY > 0.0f ? 1 : (dirY < 0.0f ? -1 : 0);
     const int32_t stepZ = dirZ > 0.0f ? 1 : (dirZ < 0.0f ? -1 : 0);
 
-    const float inf = std::numeric_limits<float>::infinity();
-    const float tDeltaX = stepX != 0 ? std::abs(1.0f / dirX) : inf;
-    const float tDeltaY = stepY != 0 ? std::abs(1.0f / dirY) : inf;
-    const float tDeltaZ = stepZ != 0 ? std::abs(1.0f / dirZ) : inf;
+    const double inf = std::numeric_limits<double>::infinity();
+    const double tDeltaX = stepX != 0 ? std::abs(1.0 / static_cast<double>(dirX)) : inf;
+    const double tDeltaY = stepY != 0 ? std::abs(1.0 / static_cast<double>(dirY)) : inf;
+    const double tDeltaZ = stepZ != 0 ? std::abs(1.0 / static_cast<double>(dirZ)) : inf;
 
     auto firstBoundaryT = [](float origin, float dir, int32_t voxel, int32_t step) {
         if (step > 0) {
-            return (static_cast<float>(voxel + 1) - origin) / dir;
+            return (static_cast<double>(voxel) + 1.0 - static_cast<double>(origin)) /
+                static_cast<double>(dir);
         }
         if (step < 0) {
-            return (origin - static_cast<float>(voxel)) / -dir;
+            return (static_cast<double>(origin) - static_cast<double>(voxel)) /
+                -static_cast<double>(dir);
         }
-        return std::numeric_limits<float>::infinity();
+        return std::numeric_limits<double>::infinity();
     };
 
-    float tMaxX = firstBoundaryT(originX, dirX, voxelX, stepX);
-    float tMaxY = firstBoundaryT(originY, dirY, voxelY, stepY);
-    float tMaxZ = firstBoundaryT(originZ, dirZ, voxelZ, stepZ);
-    tMaxX = std::max(tMaxX, 0.0f);
-    tMaxY = std::max(tMaxY, 0.0f);
-    tMaxZ = std::max(tMaxZ, 0.0f);
+    double tMaxX = firstBoundaryT(originX, dirX, voxelX, stepX);
+    double tMaxY = firstBoundaryT(originY, dirY, voxelY, stepY);
+    double tMaxZ = firstBoundaryT(originZ, dirZ, voxelZ, stepZ);
+    tMaxX = std::max(tMaxX, 0.0);
+    tMaxY = std::max(tMaxY, 0.0);
+    tMaxZ = std::max(tMaxZ, 0.0);
 
     SparseCollisionQuery query(m_terrain, &m_edits);
-    float traveled = 0.0f;
+    double traveled = 0.0;
     int32_t normalX = 0;
     int32_t normalY = 0;
     int32_t normalZ = 0;
-    const uint32_t maxSteps = static_cast<uint32_t>(std::ceil(maxDistance * 3.0f)) + 16u;
-    for (uint32_t step = 0; step < maxSteps && traveled <= maxDistance; ++step) {
+    const uint32_t maxSteps = std::min<uint32_t>(
+        kMaxSparseRaycastSteps,
+        static_cast<uint32_t>(std::ceil(static_cast<double>(rayMaxDistance) * 3.0)) + 16u);
+    for (uint32_t step = 0; step < maxSteps && traveled <= static_cast<double>(rayMaxDistance); ++step) {
         const CollisionSample sample = query.Sample(voxelX, voxelY, voxelZ);
         if (sample.status == CollisionSampleStatus::KnownSolid ||
             sample.status == CollisionSampleStatus::KnownLiquid ||
@@ -2757,28 +7315,34 @@ SparseRaycastHit SparseVoxelWorld::Raycast(
             hit.normalX = normalX;
             hit.normalY = normalY;
             hit.normalZ = normalZ;
-            hit.distance = traveled;
+            hit.distance = static_cast<float>(std::min(traveled, static_cast<double>(rayMaxDistance)));
             hit.voxel = sample.voxel;
             hit.fromEdit = sample.fromEdit;
             return hit;
         }
 
         if (tMaxX <= tMaxY && tMaxX <= tMaxZ) {
-            voxelX += stepX;
+            if (!TryStepInt32(voxelX, stepX, &voxelX)) {
+                return hit;
+            }
             traveled = tMaxX;
             tMaxX += tDeltaX;
             normalX = -stepX;
             normalY = 0;
             normalZ = 0;
         } else if (tMaxY <= tMaxZ) {
-            voxelY += stepY;
+            if (!TryStepInt32(voxelY, stepY, &voxelY)) {
+                return hit;
+            }
             traveled = tMaxY;
             tMaxY += tDeltaY;
             normalX = 0;
             normalY = -stepY;
             normalZ = 0;
         } else {
-            voxelZ += stepZ;
+            if (!TryStepInt32(voxelZ, stepZ, &voxelZ)) {
+                return hit;
+            }
             traveled = tMaxZ;
             tMaxZ += tDeltaZ;
             normalX = 0;
@@ -2809,16 +7373,131 @@ void SparseVoxelWorld::RefreshStats() {
     m_stats.generationQueuedVisibleBricks = m_generationQueueClassCounts.visible;
     m_stats.generationQueuedCollisionBricks = m_generationQueueClassCounts.collision;
     m_stats.generationQueuedEditedBricks = m_generationQueueClassCounts.edited;
+    m_stats.generationQueuedCacheLaneBricks = m_generationQueueLaneCounts.cache;
+    m_stats.generationQueuedPrefetchLaneBricks = m_generationQueueLaneCounts.prefetch;
+    m_stats.generationQueuedRepairLaneBricks = m_generationQueueLaneCounts.repair;
+    m_stats.generationQueuedVisibleLaneBricks = m_generationQueueLaneCounts.visible;
+    m_stats.generationQueuedPublicCriticalLaneBricks = m_generationQueueLaneCounts.publicCritical;
+    m_stats.generationPendingOwnershipPublicCritical = 0u;
+    m_stats.generationPendingOwnershipSampledVisible = 0u;
+    m_stats.generationPendingOwnershipHiddenRepair = 0u;
+    m_stats.generationPendingOwnershipCache = 0u;
+    m_stats.generationPendingOwnershipPrefetch = 0u;
+    m_stats.generationPendingOwnershipFallbackValid = 0u;
+    m_stats.generationPendingOwnershipUnknownCritical = 0u;
     m_stats.generatedBricks = static_cast<uint32_t>(m_generated.size());
     m_stats.generatedSpeculativeBricksLastFrame = m_generatedSpeculativeBricksLastFrame;
     m_stats.generatedVisibleBricksLastFrame = m_generatedVisibleBricksLastFrame;
     m_stats.generatedCollisionBricksLastFrame = m_generatedCollisionBricksLastFrame;
     m_stats.generatedEditedBricksLastFrame = m_generatedEditedBricksLastFrame;
+    m_stats.generatedCacheLaneBricksLastFrame = m_generatedCacheLaneBricksLastFrame;
+    m_stats.generatedPrefetchLaneBricksLastFrame = m_generatedPrefetchLaneBricksLastFrame;
+    m_stats.generatedRepairLaneBricksLastFrame = m_generatedRepairLaneBricksLastFrame;
+    m_stats.generatedVisibleLaneBricksLastFrame = m_generatedVisibleLaneBricksLastFrame;
+    m_stats.generatedPublicCriticalLaneBricksLastFrame =
+        m_generatedPublicCriticalLaneBricksLastFrame;
+    m_stats.deferredGeneratedDownstreamPending = static_cast<uint32_t>(std::min<size_t>(
+        m_deferredGeneratedDownstreamSet.size(),
+        static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+    m_stats.deferredGeneratedDownstreamPendingCache = 0u;
+    m_stats.deferredGeneratedDownstreamPendingPrefetch = 0u;
+    m_stats.deferredGeneratedDownstreamPendingRepair = 0u;
+    m_stats.deferredGeneratedDownstreamPendingVisible = 0u;
+    m_stats.deferredGeneratedDownstreamPendingPublicCritical = 0u;
+    for (const BrickCoord& coord : m_deferredGeneratedDownstreamSet) {
+        BrickResidentRecord record;
+        if (!m_pool.GetRecord(coord, &record) ||
+            record.state != BrickLifecycleState::GeneratedCPU ||
+            m_generated.find(coord) == m_generated.end()) {
+            continue;
+        }
+        IncrementStreamingLaneCounter(
+            record.streamingLane,
+            m_stats.deferredGeneratedDownstreamPendingCache,
+            m_stats.deferredGeneratedDownstreamPendingPrefetch,
+            m_stats.deferredGeneratedDownstreamPendingRepair,
+            m_stats.deferredGeneratedDownstreamPendingVisible,
+            m_stats.deferredGeneratedDownstreamPendingPublicCritical);
+    }
+    m_stats.deferredGeneratedDownstreamPromotedLastFrame =
+        m_deferredGeneratedDownstreamPromotedLastFrame;
+    m_stats.deferredGeneratedDownstreamStaleLastFrame =
+        m_deferredGeneratedDownstreamStaleLastFrame;
+    uint32_t asyncQueueDepth = 0;
+    uint32_t asyncResultDepth = 0;
+    uint32_t asyncPending = 0;
+    uint32_t asyncOldestAge = 0;
+    if (m_config.asyncExactGeneration) {
+        std::lock_guard<std::mutex> lock(m_asyncExactGenerationMutex);
+        asyncQueueDepth = static_cast<uint32_t>(std::min<size_t>(
+            m_asyncExactGenerationQueue.size(),
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+        asyncResultDepth = static_cast<uint32_t>(std::min<size_t>(
+            m_asyncExactGenerationResults.size(),
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+        asyncPending = static_cast<uint32_t>(std::min<size_t>(
+            m_asyncExactGenerationPending.size(),
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+        auto updateOldest = [&](uint32_t requestFrame) {
+            if (m_asyncExactGenerationStatsFrame >= requestFrame) {
+                asyncOldestAge = std::max(asyncOldestAge, m_asyncExactGenerationStatsFrame - requestFrame);
+            }
+        };
+        for (const AsyncExactGenerationRequest& request : m_asyncExactGenerationQueue) {
+            updateOldest(request.requestFrame);
+        }
+        for (const AsyncExactGenerationResult& result : m_asyncExactGenerationResults) {
+            updateOldest(result.requestFrame);
+        }
+    }
+    m_stats.asyncExactGenerationEnabled = m_config.asyncExactGeneration ? 1u : 0u;
+    m_stats.asyncExactGenerationQueueDepth = asyncQueueDepth;
+    m_stats.asyncExactGenerationResultDepth = asyncResultDepth;
+    m_stats.asyncExactGenerationPending = asyncPending;
+    m_stats.asyncExactGenerationEnqueuedLastFrame = m_asyncExactGenerationEnqueuedLastFrame;
+    m_stats.asyncExactGenerationCompletedLastFrame = m_asyncExactGenerationCompletedLastFrame;
+    m_stats.asyncExactGenerationAppliedLastFrame = m_asyncExactGenerationAppliedLastFrame;
+    m_stats.asyncExactGenerationDeferredLowPriorityApplyLastFrame =
+        m_asyncExactGenerationDeferredLowPriorityApplyLastFrame;
+    m_stats.asyncExactGenerationDiscardedLastFrame = m_asyncExactGenerationDiscardedLastFrame;
+    m_stats.asyncExactGenerationSyncFallbackLastFrame = m_asyncExactGenerationSyncFallbackLastFrame;
+    m_stats.asyncExactGenerationOldestAge = asyncOldestAge;
+    m_stats.asyncExactGenerationEnqueuedCacheLaneLastFrame =
+        m_asyncExactGenerationEnqueuedCacheLaneLastFrame;
+    m_stats.asyncExactGenerationEnqueuedPrefetchLaneLastFrame =
+        m_asyncExactGenerationEnqueuedPrefetchLaneLastFrame;
+    m_stats.asyncExactGenerationEnqueuedRepairLaneLastFrame =
+        m_asyncExactGenerationEnqueuedRepairLaneLastFrame;
+    m_stats.asyncExactGenerationEnqueuedVisibleLaneLastFrame =
+        m_asyncExactGenerationEnqueuedVisibleLaneLastFrame;
+    m_stats.asyncExactGenerationEnqueuedPublicCriticalLaneLastFrame =
+        m_asyncExactGenerationEnqueuedPublicCriticalLaneLastFrame;
+    m_stats.asyncExactGenerationAppliedCacheLaneLastFrame =
+        m_asyncExactGenerationAppliedCacheLaneLastFrame;
+    m_stats.asyncExactGenerationAppliedPrefetchLaneLastFrame =
+        m_asyncExactGenerationAppliedPrefetchLaneLastFrame;
+    m_stats.asyncExactGenerationAppliedRepairLaneLastFrame =
+        m_asyncExactGenerationAppliedRepairLaneLastFrame;
+    m_stats.asyncExactGenerationAppliedVisibleLaneLastFrame =
+        m_asyncExactGenerationAppliedVisibleLaneLastFrame;
+    m_stats.asyncExactGenerationAppliedPublicCriticalLaneLastFrame =
+        m_asyncExactGenerationAppliedPublicCriticalLaneLastFrame;
+    m_stats.asyncExactGenerationWorkerMsLastFrame = m_asyncExactGenerationWorkerMsLastFrame;
+    m_stats.asyncExactGenerationApplyMsLastFrame = m_asyncExactGenerationApplyMsLastFrame;
+    m_stats.parallelExactGenerationActive = m_parallelExactGenerationBricksLastFrame != 0u ? 1u : 0u;
+    m_stats.parallelExactGenerationBricksLastFrame = m_parallelExactGenerationBricksLastFrame;
+    m_stats.parallelExactGenerationWorkersLastFrame = m_parallelExactGenerationWorkersLastFrame;
+    m_stats.parallelExactGenerationWallMsLastFrame = m_parallelExactGenerationWallMsLastFrame;
     m_stats.uploadQueuedBricks = static_cast<uint32_t>(m_uploadQueue.size());
     m_stats.uploadQueuedSpeculativeBricks = m_uploadQueueClassCounts.speculative;
     m_stats.uploadQueuedVisibleBricks = m_uploadQueueClassCounts.visible;
     m_stats.uploadQueuedCollisionBricks = m_uploadQueueClassCounts.collision;
     m_stats.uploadQueuedEditedBricks = m_uploadQueueClassCounts.edited;
+    m_stats.uploadQueuedCacheLaneBricks = m_uploadQueueLaneCounts.cache;
+    m_stats.uploadQueuedPrefetchLaneBricks = m_uploadQueueLaneCounts.prefetch;
+    m_stats.uploadQueuedRepairLaneBricks = m_uploadQueueLaneCounts.repair;
+    m_stats.uploadQueuedVisibleLaneBricks = m_uploadQueueLaneCounts.visible;
+    m_stats.uploadQueuedPublicCriticalLaneBricks = m_uploadQueueLaneCounts.publicCritical;
     m_stats.uploadedSpeculativeBricksLastFrame = m_uploadedSpeculativeBricksLastFrame;
     m_stats.uploadedVisibleBricksLastFrame = m_uploadedVisibleBricksLastFrame;
     m_stats.uploadedCollisionBricksLastFrame = m_uploadedCollisionBricksLastFrame;
@@ -2864,6 +7543,170 @@ void SparseVoxelWorld::RefreshStats() {
     m_stats.surfaceQueuedVisibleBricks = m_surfaceQueueClassCounts.visible;
     m_stats.surfaceQueuedCollisionBricks = m_surfaceQueueClassCounts.collision;
     m_stats.surfaceQueuedEditedBricks = m_surfaceQueueClassCounts.edited;
+    m_stats.surfaceQueuedCacheLaneBricks = m_surfaceQueueLaneCounts.cache;
+    m_stats.surfaceQueuedPrefetchLaneBricks = m_surfaceQueueLaneCounts.prefetch;
+    m_stats.surfaceQueuedRepairLaneBricks = m_surfaceQueueLaneCounts.repair;
+    m_stats.surfaceQueuedVisibleLaneBricks = m_surfaceQueueLaneCounts.visible;
+    m_stats.surfaceQueuedPublicCriticalLaneBricks = m_surfaceQueueLaneCounts.publicCritical;
+    m_stats.streamingLaneQueuePriorityActive = m_config.streamingLaneQueuePriority ? 1u : 0u;
+    m_stats.streamingTicketSchedulerActive = m_config.streamingTicketScheduler ? 1u : 0u;
+    m_stats.streamingTicketProtectedSchedulingActive =
+        m_config.streamingTicketProtectedScheduling ? 1u : 0u;
+    m_stats.streamingTicketProtectedSortsLastFrame =
+        m_config.streamingTicketProtectedScheduling
+            ? m_streamingTicketProtectedSortsLastFrame
+            : 0u;
+    m_stats.streamingTicketCompletedLastFrame = m_config.streamingTicketScheduler
+        ? m_streamingTicketCompletedLastFrame
+        : 0u;
+    m_stats.streamingTicketActive = 0u;
+    m_stats.streamingTicketOwnershipPublicCritical = 0u;
+    m_stats.streamingTicketOwnershipSampledVisible = 0u;
+    m_stats.streamingTicketOwnershipHiddenRepair = 0u;
+    m_stats.streamingTicketOwnershipCache = 0u;
+    m_stats.streamingTicketOwnershipPrefetch = 0u;
+    m_stats.streamingTicketOwnershipFallbackValid = 0u;
+    m_stats.streamingTicketOwnershipUnknownCritical = 0u;
+    m_stats.streamingTicketPendingCpu = 0u;
+    m_stats.streamingTicketPendingUpload = 0u;
+    m_stats.streamingTicketPendingSurface = 0u;
+    m_stats.streamingTicketPendingPublish = 0u;
+    m_stats.streamingTicketRequiredCpu = 0u;
+    m_stats.streamingTicketRequiredUpload = 0u;
+    m_stats.streamingTicketRequiredSurface = 0u;
+    m_stats.streamingTicketRequiredPublish = 0u;
+    m_stats.streamingTicketOldestAge = 0u;
+    if (m_config.streamingTicketScheduler) {
+        uint32_t statsFrame = 0u;
+        uint32_t oldestRequestFrame = UINT32_MAX;
+        m_stats.streamingTicketActive = static_cast<uint32_t>(std::min<size_t>(
+            m_streamingTickets.size(),
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+        if (m_config.streamingTicketStageDemandAccounting) {
+            const auto pendingOwnershipCount = [&](uint32_t stageBit, StreamingTicketOwnership ownership) {
+                const size_t stageIndex = StreamingTicketStageIndex(stageBit);
+                if (stageIndex >= kStreamingTicketStageCount) {
+                    return 0u;
+                }
+                return m_streamingTicketPendingStageOwnershipCounts[stageIndex]
+                    [StreamingTicketOwnershipIndex(ownership)];
+            };
+            const auto pendingStageTotal = [&](uint32_t stageBit) {
+                const size_t stageIndex = StreamingTicketStageIndex(stageBit);
+                if (stageIndex >= kStreamingTicketStageCount) {
+                    return 0u;
+                }
+                uint32_t total = 0u;
+                for (uint32_t count : m_streamingTicketPendingStageOwnershipCounts[stageIndex]) {
+                    total += count;
+                }
+                return total;
+            };
+            m_stats.generationPendingOwnershipPublicCritical =
+                pendingOwnershipCount(kStreamingTicketStageCpuGenerated, StreamingTicketOwnership::PublicCritical);
+            m_stats.generationPendingOwnershipSampledVisible =
+                pendingOwnershipCount(kStreamingTicketStageCpuGenerated, StreamingTicketOwnership::SampledVisible);
+            m_stats.generationPendingOwnershipHiddenRepair =
+                pendingOwnershipCount(kStreamingTicketStageCpuGenerated, StreamingTicketOwnership::HiddenRepair);
+            m_stats.generationPendingOwnershipCache =
+                pendingOwnershipCount(kStreamingTicketStageCpuGenerated, StreamingTicketOwnership::Cache);
+            m_stats.generationPendingOwnershipPrefetch =
+                pendingOwnershipCount(kStreamingTicketStageCpuGenerated, StreamingTicketOwnership::Prefetch);
+            m_stats.generationPendingOwnershipFallbackValid =
+                pendingOwnershipCount(kStreamingTicketStageCpuGenerated, StreamingTicketOwnership::FallbackValid);
+            m_stats.generationPendingOwnershipUnknownCritical =
+                pendingOwnershipCount(kStreamingTicketStageCpuGenerated, StreamingTicketOwnership::UnknownCritical);
+            m_stats.streamingTicketPendingCpu = pendingStageTotal(kStreamingTicketStageCpuGenerated);
+            m_stats.streamingTicketPendingUpload = pendingStageTotal(kStreamingTicketStageGpuUploaded);
+            m_stats.streamingTicketPendingSurface = pendingStageTotal(kStreamingTicketStageSurfaceReady);
+            m_stats.streamingTicketPendingPublish = pendingStageTotal(kStreamingTicketStagePagePublished);
+        }
+        for (const auto& ticketEntry : m_streamingTickets) {
+            const StreamingWorkTicket& ticket = ticketEntry.second;
+            statsFrame = std::max(statsFrame, ticket.lastUpdatedFrame);
+            oldestRequestFrame = std::min(oldestRequestFrame, ticket.requestFrame);
+            switch (ticket.ownership) {
+                case StreamingTicketOwnership::PublicCritical:
+                    ++m_stats.streamingTicketOwnershipPublicCritical;
+                    break;
+                case StreamingTicketOwnership::SampledVisible:
+                    ++m_stats.streamingTicketOwnershipSampledVisible;
+                    break;
+                case StreamingTicketOwnership::HiddenRepair:
+                    ++m_stats.streamingTicketOwnershipHiddenRepair;
+                    break;
+                case StreamingTicketOwnership::Prefetch:
+                    ++m_stats.streamingTicketOwnershipPrefetch;
+                    break;
+                case StreamingTicketOwnership::FallbackValid:
+                    ++m_stats.streamingTicketOwnershipFallbackValid;
+                    break;
+                case StreamingTicketOwnership::UnknownCritical:
+                    ++m_stats.streamingTicketOwnershipUnknownCritical;
+                    break;
+                case StreamingTicketOwnership::Cache:
+                default:
+                    ++m_stats.streamingTicketOwnershipCache;
+                    break;
+            }
+            const uint32_t pendingStages = ticket.requiredStages & ~ticket.completedStages;
+            if (!m_config.streamingTicketStageDemandAccounting) {
+                if ((pendingStages & kStreamingTicketStageCpuGenerated) != 0u) {
+                    switch (ticket.ownership) {
+                        case StreamingTicketOwnership::PublicCritical:
+                            ++m_stats.generationPendingOwnershipPublicCritical;
+                            break;
+                        case StreamingTicketOwnership::SampledVisible:
+                            ++m_stats.generationPendingOwnershipSampledVisible;
+                            break;
+                        case StreamingTicketOwnership::HiddenRepair:
+                            ++m_stats.generationPendingOwnershipHiddenRepair;
+                            break;
+                        case StreamingTicketOwnership::Prefetch:
+                            ++m_stats.generationPendingOwnershipPrefetch;
+                            break;
+                        case StreamingTicketOwnership::FallbackValid:
+                            ++m_stats.generationPendingOwnershipFallbackValid;
+                            break;
+                        case StreamingTicketOwnership::UnknownCritical:
+                            ++m_stats.generationPendingOwnershipUnknownCritical;
+                            break;
+                        case StreamingTicketOwnership::Cache:
+                        default:
+                            ++m_stats.generationPendingOwnershipCache;
+                            break;
+                    }
+                }
+                if ((pendingStages & kStreamingTicketStageCpuGenerated) != 0u) {
+                    ++m_stats.streamingTicketPendingCpu;
+                }
+                if ((pendingStages & kStreamingTicketStageGpuUploaded) != 0u) {
+                    ++m_stats.streamingTicketPendingUpload;
+                }
+                if ((pendingStages & kStreamingTicketStageSurfaceReady) != 0u) {
+                    ++m_stats.streamingTicketPendingSurface;
+                }
+                if ((pendingStages & kStreamingTicketStagePagePublished) != 0u) {
+                    ++m_stats.streamingTicketPendingPublish;
+                }
+            }
+            if ((ticket.requiredStages & kStreamingTicketStageCpuGenerated) != 0u) {
+                ++m_stats.streamingTicketRequiredCpu;
+            }
+            if ((ticket.requiredStages & kStreamingTicketStageGpuUploaded) != 0u) {
+                ++m_stats.streamingTicketRequiredUpload;
+            }
+            if ((ticket.requiredStages & kStreamingTicketStageSurfaceReady) != 0u) {
+                ++m_stats.streamingTicketRequiredSurface;
+            }
+            if ((ticket.requiredStages & kStreamingTicketStagePagePublished) != 0u) {
+                ++m_stats.streamingTicketRequiredPublish;
+            }
+        }
+        if (oldestRequestFrame != UINT32_MAX && statsFrame >= oldestRequestFrame) {
+            m_stats.streamingTicketOldestAge = statsFrame - oldestRequestFrame;
+        }
+    }
     m_stats.surfaceBricksExtractedLastFrame = m_surfaceBricksExtractedLastFrame;
     m_stats.surfaceSpeculativeBricksExtractedLastFrame = m_surfaceSpeculativeBricksExtractedLastFrame;
     m_stats.surfaceVisibleBricksExtractedLastFrame = m_surfaceVisibleBricksExtractedLastFrame;
@@ -2871,6 +7714,26 @@ void SparseVoxelWorld::RefreshStats() {
     m_stats.surfaceEditedBricksExtractedLastFrame = m_surfaceEditedBricksExtractedLastFrame;
     m_stats.surfaceEmptyUploadsSkippedLastFrame = m_surfaceEmptyUploadsSkippedLastFrame;
     m_stats.surfaceEmptyFastPathBricksLastFrame = m_surfaceCache.GetStats().emptyFastPathBricksLastFrame;
+    m_stats.surfaceBuriedSolidFastPathBricksLastFrame = m_surfaceBuriedSolidFastPathBricksLastFrame;
+    m_stats.surfaceClassValueSortCallsLastFrame = m_surfaceClassValueSortCallsLastFrame;
+    m_stats.surfaceClassValueSortCacheHitsLastFrame = m_surfaceClassValueSortCacheHitsLastFrame;
+    m_stats.surfaceStrictTimeBudgetUnsortedPopsLastFrame =
+        m_surfaceStrictTimeBudgetUnsortedPopsLastFrame;
+    m_stats.parallelSurfaceExtractionActive =
+        m_parallelSurfaceExtractionBricksLastFrame != 0u ? 1u : 0u;
+    m_stats.parallelSurfaceExtractionBricksLastFrame = m_parallelSurfaceExtractionBricksLastFrame;
+    m_stats.parallelSurfaceExtractionWorkersLastFrame = m_parallelSurfaceExtractionWorkersLastFrame;
+    m_stats.parallelSurfaceExtractionWallMsLastFrame = m_parallelSurfaceExtractionWallMsLastFrame;
+    m_stats.terrainColumnCachePersistentActive = m_config.persistentTerrainColumnCache ? 1u : 0u;
+    m_stats.terrainColumnCacheEntries = static_cast<uint32_t>(std::min<size_t>(
+        m_surfaceTerrainColumnCache.size(),
+        static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+    m_stats.terrainColumnCacheMaxEntries = m_config.terrainColumnCacheMaxEntries;
+    m_stats.terrainColumnCacheClearedLastFrame = m_terrainColumnCacheClearedLastFrame;
+    m_stats.terrainColumnCacheHeightHitsLastFrame = m_terrainColumnCacheFrameStats.heightHits;
+    m_stats.terrainColumnCacheHeightMissesLastFrame = m_terrainColumnCacheFrameStats.heightMisses;
+    m_stats.terrainColumnCacheReliefHitsLastFrame = m_terrainColumnCacheFrameStats.reliefHits;
+    m_stats.terrainColumnCacheReliefMissesLastFrame = m_terrainColumnCacheFrameStats.reliefMisses;
     m_stats.surfaceSerial = m_surfaceCache.GetStats().serial;
     m_stats.physicsCandidateBricks = static_cast<uint32_t>(m_physicsQueuedPriorities.size());
     m_stats.physicsHotCandidateBricks = 0;
@@ -2893,6 +7756,12 @@ void SparseVoxelWorld::RefreshStats() {
     m_stats.physicsGpuProcessedProposalsLastFrame = m_physicsGpuProcessedProposalsLastFrame;
     m_stats.physicsGpuAppliedMovesLastFrame = m_physicsGpuAppliedMovesLastFrame;
     m_stats.physicsGpuRejectedProposalsLastFrame = m_physicsGpuRejectedProposalsLastFrame;
+    m_stats.trimScanCallsLastFrame = m_trimScanCallsLastFrame;
+    m_stats.trimRecordsScannedLastFrame = m_trimRecordsScannedLastFrame;
+    m_stats.trimCandidatesLastFrame = m_trimCandidatesLastFrame;
+    m_stats.replacementScanCallsLastFrame = m_replacementScanCallsLastFrame;
+    m_stats.replacementRecordsScannedLastFrame = m_replacementRecordsScannedLastFrame;
+    m_stats.replacementCandidatesLastFrame = m_replacementCandidatesLastFrame;
 
     for (const auto& record : m_pool.Records()) {
         if (record.state != BrickLifecycleState::Resident) {
@@ -2905,6 +7774,7 @@ void SparseVoxelWorld::RefreshStats() {
                 record.generation,
                 nullptr,
                 &residentFlags) &&
+            record.gpuPageTablePublished &&
             (residentFlags & static_cast<uint32_t>(BrickResidencyFlags::Empty)) == 0u) {
             ++m_stats.residentRenderableBricks;
             if (!m_surfaceCache.IsSurfaceKnown(record.coord) &&
@@ -2936,6 +7806,246 @@ uint32_t SparseVoxelWorld::SampleEditedOrGeneratedVoxel(int32_t worldX, int32_t 
         return editedVoxel;
     }
     return m_terrain.SampleGeneratedVoxel(worldX, worldY, worldZ);
+}
+
+const char* ToString(SparseRenderReadinessState state) {
+    switch (state) {
+        case SparseRenderReadinessState::Missing: return "Missing";
+        case SparseRenderReadinessState::Requested: return "Requested";
+        case SparseRenderReadinessState::GeneratingCPU: return "GeneratingCPU";
+        case SparseRenderReadinessState::GeneratedCPU: return "GeneratedCPU";
+        case SparseRenderReadinessState::UploadQueued: return "UploadQueued";
+        case SparseRenderReadinessState::UploadingGPU: return "UploadingGPU";
+        case SparseRenderReadinessState::ResidentEmpty: return "ResidentEmpty";
+        case SparseRenderReadinessState::ResidentMissingSurface: return "ResidentMissingSurface";
+        case SparseRenderReadinessState::ReadyToRender: return "ReadyToRender";
+        case SparseRenderReadinessState::DirtyCPU: return "DirtyCPU";
+        case SparseRenderReadinessState::DirtyGPU: return "DirtyGPU";
+        case SparseRenderReadinessState::EvictQueued: return "EvictQueued";
+        case SparseRenderReadinessState::Evicted: return "Evicted";
+        default: return "Unknown";
+    }
+}
+
+SparseRenderReadinessState SparseVoxelWorld::GetRenderReadinessState(const BrickCoord& coord) const {
+    BrickResidentRecord record;
+    if (!m_pool.GetRecord(coord, &record) || record.pageIndex == INVALID_BRICK_PAGE) {
+        return SparseRenderReadinessState::Missing;
+    }
+
+    switch (record.state) {
+        case BrickLifecycleState::Requested:
+            return SparseRenderReadinessState::Requested;
+        case BrickLifecycleState::GeneratingCPU:
+            return SparseRenderReadinessState::GeneratingCPU;
+        case BrickLifecycleState::GeneratedCPU:
+            return SparseRenderReadinessState::GeneratedCPU;
+        case BrickLifecycleState::UploadQueued:
+            return SparseRenderReadinessState::UploadQueued;
+        case BrickLifecycleState::UploadingGPU:
+            return SparseRenderReadinessState::UploadingGPU;
+        case BrickLifecycleState::DirtyCPU:
+            return SparseRenderReadinessState::DirtyCPU;
+        case BrickLifecycleState::DirtyGPU:
+            return SparseRenderReadinessState::DirtyGPU;
+        case BrickLifecycleState::EvictQueued:
+            return SparseRenderReadinessState::EvictQueued;
+        case BrickLifecycleState::Evicted:
+            return SparseRenderReadinessState::Evicted;
+        case BrickLifecycleState::Resident:
+            break;
+        case BrickLifecycleState::Missing:
+        default:
+            return SparseRenderReadinessState::Missing;
+    }
+
+    uint32_t residentFlags = 0;
+    if (!m_pool.PageTable().TryLookupExactGeneration(
+            record.coord,
+            record.generation,
+            nullptr,
+            &residentFlags)) {
+        return SparseRenderReadinessState::UploadingGPU;
+    }
+    if (!record.gpuPageTablePublished) {
+        return SparseRenderReadinessState::UploadingGPU;
+    }
+    if ((residentFlags & static_cast<uint32_t>(BrickResidencyFlags::Empty)) != 0u) {
+        return SparseRenderReadinessState::ResidentEmpty;
+    }
+    if (!m_surfaceCache.IsSurfaceKnown(record.coord)) {
+        return SparseRenderReadinessState::ResidentMissingSurface;
+    }
+    return SparseRenderReadinessState::ReadyToRender;
+}
+
+SparseRenderReadinessState SparseVoxelWorld::GetRenderReadinessStateKnownPage(
+    uint32_t pageIndex,
+    const BrickCoord& coord) const
+{
+    const auto& records = m_pool.Records();
+    if (pageIndex >= records.size()) {
+        return SparseRenderReadinessState::Missing;
+    }
+
+    const BrickResidentRecord& record = records[pageIndex];
+    if (record.pageIndex != pageIndex ||
+        record.coord != coord ||
+        record.pageIndex == INVALID_BRICK_PAGE) {
+        return SparseRenderReadinessState::Missing;
+    }
+
+    switch (record.state) {
+        case BrickLifecycleState::Requested:
+            return SparseRenderReadinessState::Requested;
+        case BrickLifecycleState::GeneratingCPU:
+            return SparseRenderReadinessState::GeneratingCPU;
+        case BrickLifecycleState::GeneratedCPU:
+            return SparseRenderReadinessState::GeneratedCPU;
+        case BrickLifecycleState::UploadQueued:
+            return SparseRenderReadinessState::UploadQueued;
+        case BrickLifecycleState::UploadingGPU:
+            return SparseRenderReadinessState::UploadingGPU;
+        case BrickLifecycleState::DirtyCPU:
+            return SparseRenderReadinessState::DirtyCPU;
+        case BrickLifecycleState::DirtyGPU:
+            return SparseRenderReadinessState::DirtyGPU;
+        case BrickLifecycleState::EvictQueued:
+            return SparseRenderReadinessState::EvictQueued;
+        case BrickLifecycleState::Evicted:
+            return SparseRenderReadinessState::Evicted;
+        case BrickLifecycleState::Resident:
+            break;
+        case BrickLifecycleState::Missing:
+        default:
+            return SparseRenderReadinessState::Missing;
+    }
+
+    uint32_t residentFlags = 0;
+    if (!m_pool.PageTable().TryLookupExactGeneration(
+            record.coord,
+            record.generation,
+            nullptr,
+            &residentFlags)) {
+        return SparseRenderReadinessState::UploadingGPU;
+    }
+    if (!record.gpuPageTablePublished) {
+        return SparseRenderReadinessState::UploadingGPU;
+    }
+    if ((residentFlags & static_cast<uint32_t>(BrickResidencyFlags::Empty)) != 0u) {
+        return SparseRenderReadinessState::ResidentEmpty;
+    }
+    if (!m_surfaceCache.IsSurfaceKnown(record.coord)) {
+        return SparseRenderReadinessState::ResidentMissingSurface;
+    }
+    return SparseRenderReadinessState::ReadyToRender;
+}
+
+SparseRenderReadinessStats SparseVoxelWorld::BuildRenderReadinessStats() const {
+    SparseRenderReadinessStats stats;
+    for (const auto& record : m_pool.Records()) {
+        if (record.state == BrickLifecycleState::Missing ||
+            record.pageIndex == INVALID_BRICK_PAGE) {
+            continue;
+        }
+        ++stats.totalTracked;
+        SparseRenderReadinessState state = SparseRenderReadinessState::Missing;
+        switch (record.state) {
+            case BrickLifecycleState::Requested:
+                state = SparseRenderReadinessState::Requested;
+                break;
+            case BrickLifecycleState::GeneratingCPU:
+                state = SparseRenderReadinessState::GeneratingCPU;
+                break;
+            case BrickLifecycleState::GeneratedCPU:
+                state = SparseRenderReadinessState::GeneratedCPU;
+                break;
+            case BrickLifecycleState::UploadQueued:
+                state = SparseRenderReadinessState::UploadQueued;
+                break;
+            case BrickLifecycleState::UploadingGPU:
+                state = SparseRenderReadinessState::UploadingGPU;
+                break;
+            case BrickLifecycleState::Resident: {
+                uint32_t residentFlags = 0;
+                if (!m_pool.PageTable().TryLookupExactGeneration(
+                        record.coord,
+                        record.generation,
+                        nullptr,
+                        &residentFlags)) {
+                    state = SparseRenderReadinessState::UploadingGPU;
+                } else if (!record.gpuPageTablePublished) {
+                    state = SparseRenderReadinessState::UploadingGPU;
+                } else if ((residentFlags & static_cast<uint32_t>(BrickResidencyFlags::Empty)) != 0u) {
+                    state = SparseRenderReadinessState::ResidentEmpty;
+                } else if (!m_surfaceCache.IsSurfaceKnown(record.coord)) {
+                    state = SparseRenderReadinessState::ResidentMissingSurface;
+                } else {
+                    state = SparseRenderReadinessState::ReadyToRender;
+                }
+                break;
+            }
+            case BrickLifecycleState::DirtyCPU:
+                state = SparseRenderReadinessState::DirtyCPU;
+                break;
+            case BrickLifecycleState::DirtyGPU:
+                state = SparseRenderReadinessState::DirtyGPU;
+                break;
+            case BrickLifecycleState::EvictQueued:
+                state = SparseRenderReadinessState::EvictQueued;
+                break;
+            case BrickLifecycleState::Evicted:
+                state = SparseRenderReadinessState::Evicted;
+                break;
+            case BrickLifecycleState::Missing:
+            default:
+                state = SparseRenderReadinessState::Missing;
+                break;
+        }
+
+        switch (state) {
+            case SparseRenderReadinessState::Missing:
+                ++stats.missing;
+                break;
+            case SparseRenderReadinessState::Requested:
+                ++stats.requested;
+                break;
+            case SparseRenderReadinessState::GeneratingCPU:
+                ++stats.generatingCPU;
+                break;
+            case SparseRenderReadinessState::GeneratedCPU:
+                ++stats.generatedCPU;
+                break;
+            case SparseRenderReadinessState::UploadQueued:
+                ++stats.uploadQueued;
+                break;
+            case SparseRenderReadinessState::UploadingGPU:
+                ++stats.uploadingGPU;
+                break;
+            case SparseRenderReadinessState::ResidentEmpty:
+                ++stats.residentEmpty;
+                break;
+            case SparseRenderReadinessState::ResidentMissingSurface:
+                ++stats.residentMissingSurface;
+                break;
+            case SparseRenderReadinessState::ReadyToRender:
+                ++stats.readyToRender;
+                break;
+            case SparseRenderReadinessState::DirtyCPU:
+                ++stats.dirtyCPU;
+                break;
+            case SparseRenderReadinessState::DirtyGPU:
+                ++stats.dirtyGPU;
+                break;
+            case SparseRenderReadinessState::EvictQueued:
+                ++stats.evictQueued;
+                break;
+            case SparseRenderReadinessState::Evicted:
+                ++stats.evicted;
+                break;
+        }
+    }
+    return stats;
 }
 
 void SparseVoxelWorld::AnnotateRenderDirtyUploadRange(SparseBrickUploadPacket* packet) const {
@@ -3026,7 +8136,7 @@ bool SparseVoxelWorld::QueueRegeneratedUploadForExistingPage(
         return false;
     }
 
-    GeneratedSparseBrick brick = m_terrain.GenerateBrick(coord);
+    GeneratedSparseBrick brick = GenerateBrickWithCachedTerrainColumns(coord);
     m_edits.ApplyToGeneratedBrick(brick);
     m_generated[coord] = brick;
 

@@ -97,14 +97,19 @@ static const uint MID_VOXEL_CLIPMAP_MAGIC = 0x56435658u;
 static const uint MID_CLIPMAP_MAX_SHADER_TILES = 256u;
 static const uint MID_CLIPMAP_MAX_SHADER_RINGS = 8u;
 static const uint MID_CLIPMAP_LOOKUP_PROBES = 8u;
-static const uint MID_VOXEL_CLIPMAP_MAX_BRICKS = 512u;
-static const uint SPARSE_PAGE_TABLE_LOOKUP_PROBES = 8u;
-static const uint SPARSE_SURFACE_RANGE_LOOKUP_PROBES = 8u;
+static const uint MID_VOXEL_CLIPMAP_MAX_BRICKS = 16384u;
+// The CPU sparse page table probes until it reaches an empty slot. Runtime
+// eviction leaves tombstones behind, so valid ready-to-render bricks can sit
+// past a short probe window even at modest load. Keep the shader probe budget
+// high enough that "CPU ready / GPU missing" does not expose holes or fake
+// background terrain in the editable near field.
+static const uint SPARSE_PAGE_TABLE_LOOKUP_PROBES = 256u;
+static const uint SPARSE_SURFACE_RANGE_LOOKUP_PROBES = 32u;
 
 static const float FAR_TERRAIN_MIN_HEIGHT = -332.0f;
 static const float FAR_TERRAIN_MAX_HEIGHT = 664.0f;
 static const float FAR_SEA_LEVEL = -48.0f;
-static const uint FAR_WORLD_SEED = 12345u;
+static const float FAR_WATER_SURFACE_Y = FAR_SEA_LEVEL + 1.0f;
 static const bool FAR_TERRAIN_HORIZON_ENABLED = true;
 static const float FAR_SVO_ROOT_CELL_SIZE = 512.0f;
 static const float FAR_SVO_MIN_CELL_SIZE = 24.0f;
@@ -118,7 +123,13 @@ struct PSInput {
 struct RayHit {
     float4 color;
     float distance;
+    uint diagnosticFlags;
 };
+
+static const uint RAY_DIAGNOSTIC_MID_PARENT_HELD = 1u;
+static const uint RAY_DIAGNOSTIC_MID_INTERIOR_FALLBACK = 2u;
+static const uint RAY_DIAGNOSTIC_MID_COLUMN = 4u;
+static const uint RAY_DIAGNOSTIC_MID_CLOSURE = 8u;
 
 struct PSOutput {
     float4 color : SV_Target;
@@ -162,7 +173,7 @@ bool LookupSparseSurfaceRange(int3 brickCoord, out SparseSurfaceBrickRange range
         if (candidate.flags == 0u) {
             return false;
         }
-        if (all(candidate.coord == brickCoord)) {
+        if (all(candidate.coord == brickCoord) && ((candidate.flags & 1u) != 0u)) {
             range = candidate;
             return true;
         }
@@ -184,7 +195,7 @@ bool LookupSparseBrick(int3 brickCoord, uint tableCapacity, out SparseBrickPageE
 
     uint mask = tableCapacity - 1u;
     uint start = HashSparseBrickCoord(brickCoord) & mask;
-    [unroll]
+    [loop]
     for (uint probe = 0u; probe < SPARSE_PAGE_TABLE_LOOKUP_PROBES; ++probe) {
         uint slot = (start + probe) & mask;
         SparseBrickPageEntry entry = SparseBrickPageTable[slot];
@@ -438,6 +449,7 @@ RayHit MakeHit(float4 color, float distance) {
     RayHit hit;
     hit.color = color;
     hit.distance = distance;
+    hit.diagnosticFlags = 0u;
     return hit;
 }
 
@@ -492,7 +504,12 @@ float BackgroundMissingSampleSkipScale() {
 
 bool BackgroundDebugLayerMode() {
     return frame.debugMode == 8u || frame.debugMode == 9u ||
-        frame.debugMode == 49u || frame.debugMode == 50u;
+        frame.debugMode == 49u || frame.debugMode == 50u ||
+        frame.debugMode == 58u || frame.debugMode == 59u ||
+        frame.debugMode == 60u || frame.debugMode == 61u ||
+        frame.debugMode == 62u || frame.debugMode == 63u ||
+        frame.debugMode == 65u || frame.debugMode == 66u ||
+        frame.debugMode == 67u;
 }
 
 float3 SkySunDirection() {
@@ -520,9 +537,58 @@ float3 SkyColor(float3 rayDir) {
 
 float3 SkyAmbient(float3 normal) {
     float up = saturate(normal.y * 0.5f + 0.5f);
-    float3 groundBounce = float3(0.20f, 0.16f, 0.12f);
-    float3 skyBounce = float3(0.34f, 0.48f, 0.68f);
+    float3 groundBounce = float3(0.36f, 0.32f, 0.28f);
+    float3 skyBounce = float3(0.50f, 0.56f, 0.62f);
     return lerp(groundBounce, skyBounce, up);
+}
+
+float UnderwaterCaustic(float3 worldPos) {
+    const float t = (float)(frame.frameIndex & 2047u) * 0.018f;
+    const float a = sin(worldPos.x * 0.115f + worldPos.z * 0.071f + t);
+    const float b = sin(worldPos.x * 0.047f - worldPos.z * 0.163f - t * 0.72f);
+    const float c = sin((worldPos.x + worldPos.z + worldPos.y * 0.35f) * 0.091f + t * 1.37f);
+    return saturate(0.50f + a * b * 0.24f + c * 0.14f);
+}
+
+float UnderwaterParticulate(float3 worldPos) {
+    const float t = (float)(frame.frameIndex & 4095u) * 0.009f;
+    const float a = sin(worldPos.x * 0.029f + worldPos.y * 0.061f + t);
+    const float b = sin(worldPos.z * 0.037f - worldPos.y * 0.023f - t * 0.83f);
+    return saturate(0.52f + a * 0.15f + b * 0.13f);
+}
+
+float3 UnderwaterVolumeTint(float3 worldPos, float distanceFromCamera, float baseFog, out float fogStrength) {
+    const float waterColumn = saturate((distanceFromCamera - 72.0f) / 300.0f);
+    const float aboveWaterPenalty = saturate((worldPos.y - FAR_SEA_LEVEL + 8.0f) / 88.0f);
+    const float verticalSilhouette = saturate((worldPos.y - frame.cameraPosition.y - 12.0f) / 120.0f);
+    const float particulate = UnderwaterParticulate(worldPos);
+    fogStrength = saturate(
+        baseFog +
+        waterColumn * 0.22f +
+        aboveWaterPenalty * 0.20f +
+        verticalSilhouette * 0.14f);
+    const float3 deepTint = lerp(
+        float3(0.15f, 0.36f, 0.40f),
+        float3(0.12f, 0.32f, 0.36f) + particulate * float3(0.020f, 0.038f, 0.034f),
+        waterColumn);
+    const float3 surfaceVolumeTint =
+        float3(0.22f, 0.45f, 0.49f) + particulate * float3(0.018f, 0.032f, 0.028f);
+    return lerp(
+        deepTint,
+        surfaceVolumeTint,
+        saturate(aboveWaterPenalty * 0.42f + verticalSilhouette * 0.28f));
+}
+
+float3 DistantLodShadeNormal(float3 normal, float distanceFromCamera, float strength) {
+    const float distanceBlend = saturate((distanceFromCamera - 900.0f) / 6200.0f);
+    return normalize(lerp(normal, float3(0.0f, 1.0f, 0.0f), saturate(strength * (0.35f + distanceBlend * 0.55f))));
+}
+
+float VoxelGridLine(float2 worldUv, float cellSize, float strength) {
+    const float safeCellSize = max(cellSize, 1.0f);
+    const float2 cell = abs(frac(worldUv / safeCellSize) - 0.5f);
+    const float gridLine = 1.0f - smoothstep(0.455f, 0.495f, max(cell.x, cell.y));
+    return saturate(gridLine * strength);
 }
 
 float FarSmooth01(float value) {
@@ -532,6 +598,10 @@ float FarSmooth01(float value) {
 
 float FarRidged(float value, float power) {
     return pow(saturate(1.0f - abs(value)), power);
+}
+
+uint FarWorldSeed() {
+    return asuint(frame.exactNearParams.y);
 }
 
 uint FarHash3D(int x, int y, int z, uint seed) {
@@ -569,34 +639,263 @@ float FarTerrainHeight(float2 xz, out float mountainMask, out float spireMask, o
     // fallback used a separate sine heightfield, which composited a different
     // world behind the sparse/mid layers and produced detached cliffs, holes,
     // and corrupted-looking horizon transitions.
-    float broad = FarValueNoise2D(xz.x * 0.0045f, xz.y * 0.0045f, FAR_WORLD_SEED + 11u);
+    const uint worldSeed = FarWorldSeed();
+    float broad = FarValueNoise2D(xz.x * 0.0045f, xz.y * 0.0045f, worldSeed + 11u);
     float ridgeSource = FarValueNoise2D(
         xz.x * 0.0100f + 41.0f,
         xz.y * 0.0100f - 17.0f,
-        FAR_WORLD_SEED + 23u);
+        worldSeed + 23u);
     float ridge = 1.0f - abs(ridgeSource);
     float detail = FarValueNoise2D(
         xz.x * 0.035f - 13.0f,
         xz.y * 0.035f + 29.0f,
-        FAR_WORLD_SEED + 37u);
+        worldSeed + 37u);
+
+    float ridgeHeight = ridge * ridge;
 
     float height = -64.0f;
-    height += broad * 155.0f;
-    height += ridge * ridge * 180.0f;
-    height += detail * 18.0f;
+    height += broad * 145.0f;
+    height += ridgeHeight * 150.0f;
+    height += detail * 8.0f;
 
-    float2 originDelta = xz - float2(96.0f, 96.0f);
-    height += (1.0f - FarSmooth01(length(originDelta) / 420.0f)) * 120.0f;
+    float2 originDelta = xz - float2(192.0f, 224.0f);
+    float originDistance = length(originDelta);
+    float originComfort = 1.0f - FarSmooth01(saturate((originDistance - 180.0f) / 520.0f));
+    float publicRegionHeight =
+        -42.0f +
+        broad * 54.0f +
+        ridgeHeight * 48.0f +
+        detail * 3.0f +
+        (1.0f - FarSmooth01(originDistance / 360.0f)) * 72.0f;
+    height += (1.0f - FarSmooth01(originDistance / 420.0f)) * 58.0f;
+    height = lerp(height, publicRegionHeight, originComfort * 0.94f);
+    float publicCapInfluence =
+        1.0f - FarSmooth01(saturate((originDistance - 220.0f) / 420.0f));
+    float publicCap =
+        58.0f + FarSmooth01(saturate(originDistance / 640.0f)) * 114.0f;
+    height = lerp(height, min(height, publicCap), publicCapInfluence);
 
-    mountainMask = saturate((ridge * ridge * 180.0f + max(height - 160.0f, 0.0f)) / 300.0f);
+    float submergedBlend =
+        1.0f - FarSmooth01(saturate((height - (FAR_SEA_LEVEL + 28.0f)) / 86.0f));
+    if (submergedBlend > 0.0f) {
+        float submergedShelfHeight =
+            (FAR_SEA_LEVEL - 8.0f) +
+            broad * 38.0f +
+            ridgeHeight * 22.0f +
+            detail * 2.0f +
+            (1.0f - FarSmooth01(originDistance / 520.0f)) * 18.0f;
+        height = lerp(height, submergedShelfHeight, submergedBlend * 0.55f);
+    }
+
+    float playableBankBand =
+        1.0f - FarSmooth01(saturate((originDistance - 260.0f) / 980.0f));
+    float lowlandUpper =
+        1.0f - FarSmooth01(saturate((height - (FAR_SEA_LEVEL + 96.0f)) / 120.0f));
+    float lowlandFloor =
+        FarSmooth01(saturate((height - (FAR_SEA_LEVEL - 40.0f)) / 64.0f));
+    float playableBankBlend = playableBankBand * lowlandUpper * lowlandFloor * 0.64f;
+    float playableShelfHeight =
+        (FAR_SEA_LEVEL + 18.0f) +
+        broad * 28.0f +
+        ridgeHeight * 10.0f +
+        detail * 1.5f +
+        (1.0f - FarSmooth01(saturate(originDistance / 460.0f))) * 42.0f;
+    height = lerp(height, playableShelfHeight, playableBankBlend);
+    float publicBasinBand =
+        FarSmooth01(saturate((originDistance - 360.0f) / 240.0f)) *
+        (1.0f - FarSmooth01(saturate((originDistance - 1700.0f) / 760.0f))) *
+        FarSmooth01(saturate((height - (FAR_SEA_LEVEL - 38.0f)) / 56.0f)) *
+        (1.0f - FarSmooth01(saturate((height - (FAR_SEA_LEVEL + 180.0f)) / 140.0f)));
+    float publicBasinFloor =
+        (FAR_SEA_LEVEL - 12.0f) +
+        broad * 2.0f +
+        detail * 0.35f;
+    height = lerp(height, min(height, publicBasinFloor), publicBasinBand * 0.80f);
+    float backdropNoise = FarValueNoise2D(
+        xz.x * 0.0018f + 19.0f,
+        xz.y * 0.0018f - 31.0f,
+        worldSeed + 211u);
+    float backdropRidgeSource = FarValueNoise2D(
+        xz.x * 0.0032f - 71.0f,
+        xz.y * 0.0032f + 43.0f,
+        worldSeed + 227u);
+    float backdropRidge = 1.0f - abs(backdropRidgeSource);
+    float backdropBreakup = FarValueNoise2D(
+        xz.x * 0.0075f + 203.0f,
+        xz.y * 0.0075f - 167.0f,
+        worldSeed + 271u);
+    float backdropNotch =
+        FarSmooth01(saturate((backdropBreakup - 0.08f) / 0.58f));
+    float silhouetteRidge = saturate(backdropRidge * backdropRidge * 1.22f + backdropNoise * 0.18f);
+    float backdropBand =
+        FarSmooth01(saturate((originDistance - 1360.0f) / 700.0f)) *
+        (1.0f - FarSmooth01(saturate((originDistance - 5200.0f) / 1200.0f)));
+    float northBackdrop = FarSmooth01(saturate((xz.y - 1180.0f) / 900.0f));
+    float sideBackdrop = FarSmooth01(saturate((abs(xz.x - 192.0f) - 820.0f) / 980.0f));
+    float backdropFacing = saturate(northBackdrop + sideBackdrop * 0.58f);
+    float silhouetteContinuity = saturate(silhouetteRidge + backdropBand * backdropFacing * 0.32f);
+    float backdropInfluence =
+        backdropBand *
+        backdropFacing *
+        FarSmooth01(silhouetteContinuity) *
+        (0.46f + backdropNotch * 0.54f);
+    float backdropHeight =
+        248.0f +
+        backdropBand * 160.0f +
+        silhouetteContinuity * 186.0f +
+        backdropNoise * 26.0f;
+    height = lerp(height, max(height, backdropHeight), backdropInfluence * 0.70f);
+
+    float westCorridor = FarSmooth01(saturate((192.0f - xz.x - 520.0f) / 820.0f));
+    float eastCorridor = FarSmooth01(saturate((xz.x - 192.0f - 520.0f) / 820.0f));
+    float southBlend = FarSmooth01(saturate((360.0f - xz.y) / 1200.0f));
+    float westNorthBlend = FarSmooth01(saturate((xz.y - 360.0f) / 920.0f));
+    float routeDistanceBand =
+        FarSmooth01(saturate((originDistance - 780.0f) / 420.0f)) *
+        (1.0f - FarSmooth01(saturate((originDistance - 4300.0f) / 1200.0f)));
+    float routeCorridor = routeDistanceBand * saturate(
+        westCorridor * (0.50f + southBlend * 0.42f + westNorthBlend * 0.30f) +
+        eastCorridor * southBlend);
+    float routeRidgeNoiseA = FarValueNoise2D(
+        xz.x * 0.0024f + 113.0f,
+        xz.y * 0.0024f - 89.0f,
+        worldSeed + 251u);
+    float routeRidgeNoiseB = FarValueNoise2D(
+        xz.x * 0.0068f - 37.0f,
+        xz.y * 0.0068f + 151.0f,
+        worldSeed + 263u);
+    float routeBreakup = FarValueNoise2D(
+        xz.x * 0.0110f - 211.0f,
+        xz.y * 0.0110f + 73.0f,
+        worldSeed + 281u);
+    float routeNotch =
+        FarSmooth01(saturate((routeBreakup - 0.02f) / 0.60f));
+    float routeRidge =
+        saturate(
+            0.26f +
+            (1.0f - abs(routeRidgeNoiseA)) * 0.58f +
+            routeRidgeNoiseB * 0.16f);
+    float routeBackdropHeight =
+        272.0f +
+        routeDistanceBand * 104.0f +
+        routeRidge * 218.0f;
+    height = lerp(height, max(height, routeBackdropHeight), routeCorridor * routeRidge * routeNotch * 0.68f);
+
+    mountainMask = saturate((ridgeHeight * 150.0f + max(height - 160.0f, 0.0f)) / 300.0f);
     spireMask = 0.0f;
     ravineMask = 0.0f;
     return clamp(height, FAR_TERRAIN_MIN_HEIGHT, FAR_TERRAIN_MAX_HEIGHT);
 }
 
+float2 FarTerrainClosureInfluence(float2 xz) {
+    const uint worldSeed = FarWorldSeed();
+    float2 originDelta = xz - float2(192.0f, 224.0f);
+    float originDistance = length(originDelta);
+
+    float backdropNoise = FarValueNoise2D(
+        xz.x * 0.0018f + 19.0f,
+        xz.y * 0.0018f - 31.0f,
+        worldSeed + 211u);
+    float backdropRidgeSource = FarValueNoise2D(
+        xz.x * 0.0032f - 71.0f,
+        xz.y * 0.0032f + 43.0f,
+        worldSeed + 227u);
+    float backdropRidge = 1.0f - abs(backdropRidgeSource);
+    float backdropBreakup = FarValueNoise2D(
+        xz.x * 0.0075f + 203.0f,
+        xz.y * 0.0075f - 167.0f,
+        worldSeed + 271u);
+    float backdropNotch =
+        FarSmooth01(saturate((backdropBreakup - 0.08f) / 0.58f));
+    float silhouetteRidge = saturate(backdropRidge * backdropRidge * 1.22f + backdropNoise * 0.18f);
+    float backdropBand =
+        FarSmooth01(saturate((originDistance - 1360.0f) / 700.0f)) *
+        (1.0f - FarSmooth01(saturate((originDistance - 5200.0f) / 1200.0f)));
+    float northBackdrop = FarSmooth01(saturate((xz.y - 1180.0f) / 900.0f));
+    float sideBackdrop = FarSmooth01(saturate((abs(xz.x - 192.0f) - 820.0f) / 980.0f));
+    float backdropFacing = saturate(northBackdrop + sideBackdrop * 0.58f);
+    float silhouetteContinuity = saturate(silhouetteRidge + backdropBand * backdropFacing * 0.32f);
+    float backdropInfluence =
+        backdropBand *
+        backdropFacing *
+        FarSmooth01(silhouetteContinuity) *
+        (0.46f + backdropNotch * 0.54f) *
+        0.62f;
+
+    float westCorridor = FarSmooth01(saturate((192.0f - xz.x - 520.0f) / 820.0f));
+    float eastCorridor = FarSmooth01(saturate((xz.x - 192.0f - 520.0f) / 820.0f));
+    float southBlend = FarSmooth01(saturate((360.0f - xz.y) / 1200.0f));
+    float westNorthBlend = FarSmooth01(saturate((xz.y - 360.0f) / 920.0f));
+    float routeDistanceBand =
+        FarSmooth01(saturate((originDistance - 780.0f) / 420.0f)) *
+        (1.0f - FarSmooth01(saturate((originDistance - 4300.0f) / 1200.0f)));
+    float routeRidgeNoiseA = FarValueNoise2D(
+        xz.x * 0.0024f + 113.0f,
+        xz.y * 0.0024f - 89.0f,
+        worldSeed + 251u);
+    float routeRidgeNoiseB = FarValueNoise2D(
+        xz.x * 0.0068f - 37.0f,
+        xz.y * 0.0068f + 151.0f,
+        worldSeed + 263u);
+    float routeBreakup = FarValueNoise2D(
+        xz.x * 0.0110f - 211.0f,
+        xz.y * 0.0110f + 73.0f,
+        worldSeed + 281u);
+    float routeNotch =
+        FarSmooth01(saturate((routeBreakup - 0.02f) / 0.60f));
+    float routeRidge =
+        saturate(
+            0.26f +
+            (1.0f - abs(routeRidgeNoiseA)) * 0.58f +
+            routeRidgeNoiseB * 0.16f);
+    float routeCorridor = routeDistanceBand * saturate(
+        westCorridor * (0.50f + southBlend * 0.42f + westNorthBlend * 0.30f) +
+        eastCorridor * southBlend) *
+        routeRidge *
+        routeNotch *
+        0.68f;
+
+    return float2(
+        saturate(backdropInfluence),
+        saturate(routeCorridor + (worldSeed == 0u ? 0.0f : 0.0f)));
+}
+
+float3 DebugClosureColor(float3 worldPos) {
+    const float2 influence = FarTerrainClosureInfluence(worldPos.xz);
+    const float base = 1.0f - saturate(max(influence.x, influence.y));
+    return saturate(
+        float3(0.05f, 0.26f, 0.08f) * base +
+        float3(1.0f, 0.78f, 0.05f) * influence.x +
+        float3(1.0f, 0.05f, 0.05f) * influence.y);
+}
+
+float3 DebugOwnerLayerColor(uint layer) {
+    if (layer == 1u) {
+        return float3(0.05f, 0.95f, 0.25f);
+    }
+    if (layer == 2u) {
+        return float3(1.0f, 0.86f, 0.08f);
+    }
+    if (layer == 3u) {
+        return float3(0.20f, 0.42f, 1.0f);
+    }
+    if (layer == 4u) {
+        return float3(1.0f, 0.45f, 0.08f);
+    }
+    if (layer == 5u) {
+        return float3(0.02f, 0.78f, 1.0f);
+    }
+    return float3(0.10f, 0.12f, 0.14f);
+}
+
 float QuantizeTerrainHeight(float height, float verticalStep) {
     verticalStep = max(verticalStep, 1.0f);
     return floor(height / verticalStep) * verticalStep;
+}
+
+float QuantizeTerrainTopHeight(float height, float verticalStep) {
+    verticalStep = max(verticalStep, 1.0f);
+    return ceil(height / verticalStep) * verticalStep;
 }
 
 float FarFallbackCellSize(float distanceFromCamera) {
@@ -621,19 +920,170 @@ float FarTerrainHeightVoxelized(
     const float cellSize = FarFallbackCellSize(distanceFromCamera);
     const float2 sampleXz = FarFallbackCellCenter(xz, cellSize);
     const float rawHeight = FarTerrainHeight(sampleXz, mountainMask, spireMask, ravineMask);
-    return QuantizeTerrainHeight(rawHeight, max(4.0f, cellSize * 0.75f));
+    return QuantizeTerrainTopHeight(rawHeight, max(4.0f, cellSize * 0.75f));
 }
 
 uint FarTerrainMaterial(float2 xz, float height, float mountainMask, float spireMask, float ravineMask) {
     // Match the generated top-surface material rule used by
     // SparseTerrainGenerator::SampleGeneratedVoxel.
-    if (height < FAR_SEA_LEVEL + 6.0f) {
+    float mm, sm, rm;
+    const float hx0 = FarTerrainHeight(xz - float2(4.0f, 0.0f), mm, sm, rm);
+    const float hx1 = FarTerrainHeight(xz + float2(4.0f, 0.0f), mm, sm, rm);
+    const float hz0 = FarTerrainHeight(xz - float2(0.0f, 4.0f), mm, sm, rm);
+    const float hz1 = FarTerrainHeight(xz + float2(0.0f, 4.0f), mm, sm, rm);
+    const float localRelief =
+        max(max(abs(hx0 - height), abs(hx1 - height)), max(abs(hz0 - height), abs(hz1 - height)));
+
+    if (height < FAR_SEA_LEVEL) {
+        return MAT_WATER;
+    }
+    if (height < FAR_SEA_LEVEL + 48.0f && localRelief < 36.0f) {
         return MAT_SAND;
     }
-    if (height > 260.0f) {
+    if (height < FAR_SEA_LEVEL + 72.0f) {
+        return (height < FAR_SEA_LEVEL + 48.0f && localRelief < 36.0f) ? MAT_SAND : MAT_DIRT;
+    }
+    if (height < FAR_SEA_LEVEL + 128.0f) {
+        return (height < FAR_SEA_LEVEL + 86.0f && localRelief < 58.0f) ? MAT_SAND : MAT_DIRT;
+    }
+    if (localRelief > 10.0f || height > 160.0f) {
         return MAT_STONE;
     }
     return MAT_DIRT;
+}
+
+float3 ApplyWaterlineWetTerrainTint(float3 baseColor, uint material, float worldY, float normalY, float strengthScale) {
+    if (material != MAT_SAND && material != MAT_DIRT && material != MAT_STONE) {
+        return baseColor;
+    }
+
+    const float waterlineFace = 1.0f - saturate((worldY - FAR_SEA_LEVEL + 2.0f) / 14.0f);
+    const float verticalBank = saturate((0.54f - normalY) / 0.62f);
+    const float wetBoundary = waterlineFace * (0.35f + verticalBank * 0.65f);
+    const float3 wetSediment = material == MAT_SAND
+        ? float3(0.40f, 0.43f, 0.34f)
+        : float3(0.34f, 0.39f, 0.34f);
+    return lerp(baseColor, wetSediment, saturate(wetBoundary * strengthScale));
+}
+
+float3 FarTerrainMaterialVariation(
+    float3 baseColor,
+    uint material,
+    float2 xz,
+    float height,
+    float distanceFromCamera)
+{
+    const float cellSize = FarFallbackCellSize(distanceFromCamera);
+    const int cellX = (int)floor(xz.x / max(cellSize, 1.0f));
+    const int cellZ = (int)floor(xz.y / max(cellSize, 1.0f));
+    const int cellY = (int)floor(height / max(cellSize * 0.75f, 4.0f));
+    const uint worldSeed = FarWorldSeed();
+    const float patch =
+        (float)(FarHash3D(cellX, cellY, cellZ, worldSeed + 131u) & 0xFFFFu) / 65535.0f;
+    const float broad =
+        (float)(FarHash3D(cellX >> 2, cellY, cellZ >> 2, worldSeed + 173u) & 0xFFFFu) / 65535.0f;
+    const float distanceBlend = saturate((distanceFromCamera - 700.0f) / 5200.0f);
+    const float farSoftening = saturate((distanceFromCamera - 1200.0f) / 4200.0f);
+    const float materialPatch = lerp(patch, broad, 0.36f + farSoftening * 0.34f);
+
+    float3 varied = baseColor;
+    if (material == MAT_DIRT) {
+        const float3 grass = lerp(float3(0.23f, 0.40f, 0.19f), float3(0.38f, 0.50f, 0.25f), materialPatch);
+        const float3 scrub = lerp(float3(0.42f, 0.35f, 0.21f), float3(0.30f, 0.36f, 0.20f), broad);
+        const float exposedTop = saturate((height - 54.0f) / 150.0f);
+        varied = lerp(grass, scrub, exposedTop * 0.58f + (1.0f - materialPatch) * 0.20f);
+    } else if (material == MAT_STONE) {
+        varied = lerp(float3(0.40f, 0.42f, 0.36f), float3(0.58f, 0.55f, 0.44f), materialPatch * 0.70f + 0.10f);
+        const float lowStoneVegetation =
+            (1.0f - saturate((height - (FAR_SEA_LEVEL + 48.0f)) / 240.0f)) *
+            smoothstep(0.36f, 0.92f, broad);
+        const float weatheredFace = smoothstep(0.48f, 0.88f, broad) * (1.0f - farSoftening * 0.30f);
+        varied = lerp(varied, float3(0.42f, 0.49f, 0.32f), saturate(lowStoneVegetation * 0.28f + weatheredFace * 0.10f));
+    } else if (material == MAT_SAND) {
+        varied = lerp(float3(0.62f, 0.56f, 0.36f), float3(0.76f, 0.67f, 0.42f), materialPatch);
+    }
+
+    if (material == MAT_STONE) {
+        const float lowMountainBlend = saturate((170.0f - height) / 150.0f) * farSoftening;
+        varied = lerp(varied, float3(0.38f, 0.44f, 0.32f), lowMountainBlend * 0.24f);
+    }
+    const float3 aerialTerrain = lerp(float3(0.43f, 0.49f, 0.35f), float3(0.54f, 0.53f, 0.45f), broad);
+    varied = lerp(varied, aerialTerrain, farSoftening * 0.18f);
+    varied = lerp(varied, baseColor, farSoftening * 0.08f);
+    varied = lerp(baseColor, varied, distanceBlend * (material == MAT_STONE ? 0.74f : 0.56f));
+    return ApplyWaterlineWetTerrainTint(varied, material, height, 1.0f, 0.62f);
+}
+
+float3 BackgroundTerrainMaterialVariation(
+    float3 baseColor,
+    uint material,
+    float3 worldPos,
+    float3 normal,
+    float distanceFromCamera,
+    float strength)
+{
+    const float cellScale = lerp(10.0f, 22.0f, saturate((distanceFromCamera - 900.0f) / 3600.0f));
+    const int cellX = (int)floor(worldPos.x / cellScale);
+    const int cellY = (int)floor(worldPos.y / max(cellScale, 1.0f));
+    const int cellZ = (int)floor(worldPos.z / cellScale);
+    const uint worldSeed = FarWorldSeed();
+    const float patch =
+        (float)(FarHash3D(cellX, cellY, cellZ, worldSeed + 311u) & 0xFFFFu) / 65535.0f;
+    const float largePatch =
+        (float)(FarHash3D(cellX >> 2, cellY >> 1, cellZ >> 2, worldSeed + 337u) & 0xFFFFu) / 65535.0f;
+    const float stonePatch = lerp(patch, largePatch, 0.48f);
+    const float slope = saturate((0.72f - normal.y) / 0.64f);
+    const float highExposure = saturate((worldPos.y - 70.0f) / 190.0f);
+    const float distanceBlend = saturate((distanceFromCamera - 520.0f) / 2400.0f);
+
+    float3 varied = baseColor;
+    if (material == MAT_STONE) {
+        const float3 coolStone = float3(0.40f, 0.42f, 0.36f);
+        const float3 warmStone = float3(0.60f, 0.56f, 0.44f);
+        const float3 lichenStone = float3(0.42f, 0.49f, 0.32f);
+        const float lowAltitudeLichen = (1.0f - saturate((worldPos.y - FAR_SEA_LEVEL - 32.0f) / 220.0f));
+        varied = lerp(coolStone, warmStone, stonePatch * 0.72f + 0.12f);
+        const float ledgeLichen = (1.0f - slope) * smoothstep(0.54f, 0.92f, largePatch);
+        varied = lerp(varied, lichenStone, saturate(ledgeLichen * 0.28f + lowAltitudeLichen * 0.20f));
+    } else if (material == MAT_DIRT) {
+        const float3 grassDirt = float3(0.36f, 0.52f, 0.25f);
+        const float3 exposedDirt = float3(0.48f, 0.42f, 0.31f);
+        const float3 dryScrub = float3(0.50f, 0.49f, 0.32f);
+        varied = lerp(grassDirt, exposedDirt, slope * 0.68f + highExposure * 0.22f);
+        varied = lerp(varied, dryScrub, smoothstep(0.62f, 0.94f, largePatch) * 0.22f);
+    } else if (material == MAT_SAND) {
+        const float3 dampSand = float3(0.58f, 0.53f, 0.36f);
+        const float3 drySand = float3(0.78f, 0.70f, 0.44f);
+        varied = lerp(dampSand, drySand, patch * 0.72f + (1.0f - slope) * 0.18f);
+    }
+
+    const float materialStrength = saturate(strength * (material == MAT_STONE ? (0.72f + distanceBlend * 0.12f) : (0.58f + distanceBlend * 0.20f)));
+    return lerp(baseColor, varied, materialStrength);
+}
+
+float3 DebugMaterialColor(uint material) {
+    if (material == MAT_WATER) {
+        return float3(0.05f, 0.38f, 1.0f);
+    }
+    if (material == MAT_SAND) {
+        return float3(1.0f, 0.84f, 0.12f);
+    }
+    if (material == MAT_DIRT) {
+        return float3(0.18f, 0.78f, 0.20f);
+    }
+    if (material == MAT_STONE) {
+        return float3(0.55f, 0.55f, 0.55f);
+    }
+    if (material == MAT_AIR) {
+        return float3(0.03f, 0.04f, 0.06f);
+    }
+    if (material == MAT_BEDROCK) {
+        return float3(0.12f, 0.12f, 0.13f);
+    }
+    if (material == MAT_GLASS) {
+        return float3(0.70f, 0.95f, 1.0f);
+    }
+    return float3(1.0f, 0.10f, 0.90f);
 }
 
 float3 FarTerrainVoxelNormal(float2 xz, float distanceFromCamera) {
@@ -664,7 +1114,10 @@ float3 FarTerrainVoxelNormal(float2 xz, float distanceFromCamera) {
         mountainMaskB,
         spireMaskB,
         ravineMaskB);
-    return normalize(float3(hx0 - hx1, max(cellSize * 2.0f, 6.0f), hz0 - hz1));
+    return normalize(float3(
+        (hx0 - hx1) * 0.58f,
+        max(cellSize * 3.4f, 10.0f),
+        (hz0 - hz1) * 0.58f));
 }
 
 float3 FarTerrainNormal(float2 xz) {
@@ -794,6 +1247,71 @@ bool LookupResidentMidClipmapTileInRing(
     return false;
 }
 
+void AccumulateMidClipmapMaterialWeight(
+    uint candidateMaterial,
+    float candidateWeight,
+    bool allowWater,
+    inout float bestWeight,
+    inout uint bestMaterial)
+{
+    if (candidateWeight <= bestWeight) {
+        return;
+    }
+    if (!allowWater && candidateMaterial == MAT_WATER) {
+        return;
+    }
+    if (candidateMaterial == MAT_AIR) {
+        return;
+    }
+    bestWeight = candidateWeight;
+    bestMaterial = candidateMaterial;
+}
+
+uint ResolveMidClipmapBilinearMaterial(
+    uint s00,
+    uint s10,
+    uint s01,
+    uint s11,
+    float fx,
+    float fz,
+    float height)
+{
+    const uint m00 = MidClipmapUnpackMaterial(s00);
+    const uint m10 = MidClipmapUnpackMaterial(s10);
+    const uint m01 = MidClipmapUnpackMaterial(s01);
+    const uint m11 = MidClipmapUnpackMaterial(s11);
+
+    const float w00 = (1.0f - fx) * (1.0f - fz);
+    const float w10 = fx * (1.0f - fz);
+    const float w01 = (1.0f - fx) * fz;
+    const float w11 = fx * fz;
+
+    // Mid-column fallback is a public LOD, not a water mask. CPU clipmap
+    // samples clamp submerged columns to sea level, so a mixed shoreline cell
+    // commonly contains both water and land corners. The old shader used s00
+    // material for the whole bilinear height sample; one water corner could
+    // therefore turn an interpolated land slope into water until exact sparse
+    // chunks streamed in. Prefer non-water material whenever the interpolated
+    // surface has risen above the sea plane.
+    const bool aboveSeaSurface = height > FAR_SEA_LEVEL + 0.75f;
+    float bestWeight = -1.0f;
+    uint bestMaterial = MAT_AIR;
+    AccumulateMidClipmapMaterialWeight(m00, w00, !aboveSeaSurface, bestWeight, bestMaterial);
+    AccumulateMidClipmapMaterialWeight(m10, w10, !aboveSeaSurface, bestWeight, bestMaterial);
+    AccumulateMidClipmapMaterialWeight(m01, w01, !aboveSeaSurface, bestWeight, bestMaterial);
+    AccumulateMidClipmapMaterialWeight(m11, w11, !aboveSeaSurface, bestWeight, bestMaterial);
+    if (bestMaterial != MAT_AIR) {
+        return bestMaterial;
+    }
+
+    bestWeight = -1.0f;
+    AccumulateMidClipmapMaterialWeight(m00, w00, true, bestWeight, bestMaterial);
+    AccumulateMidClipmapMaterialWeight(m10, w10, true, bestWeight, bestMaterial);
+    AccumulateMidClipmapMaterialWeight(m01, w01, true, bestWeight, bestMaterial);
+    AccumulateMidClipmapMaterialWeight(m11, w11, true, bestWeight, bestMaterial);
+    return bestMaterial;
+}
+
 bool SampleResidentMidClipmap(float2 xz, out float height, out uint material) {
     height = 0.0f;
     material = MAT_AIR;
@@ -844,7 +1362,7 @@ bool SampleResidentMidClipmap(float2 xz, out float height, out uint material) {
     float h0 = lerp(MidClipmapUnpackHeight(s00), MidClipmapUnpackHeight(s10), fx);
     float h1 = lerp(MidClipmapUnpackHeight(s01), MidClipmapUnpackHeight(s11), fx);
     height = lerp(h0, h1, fz);
-    material = MidClipmapUnpackMaterial(s00);
+    material = ResolveMidClipmapBilinearMaterial(s00, s10, s01, s11, fx, fz, height);
     return true;
 }
 
@@ -908,7 +1426,7 @@ bool SampleResidentMidClipmapRing(
     float h0 = lerp(MidClipmapUnpackHeight(s00), MidClipmapUnpackHeight(s10), fx);
     float h1 = lerp(MidClipmapUnpackHeight(s01), MidClipmapUnpackHeight(s11), fx);
     height = lerp(h0, h1, fz);
-    material = MidClipmapUnpackMaterial(s00);
+    material = ResolveMidClipmapBilinearMaterial(s00, s10, s01, s11, fx, fz, height);
     return true;
 }
 
@@ -1043,6 +1561,7 @@ bool SampleResidentMidVoxel(float3 worldPos, uint ring, out uint voxel) {
 bool SampleResidentMidVoxelFallback(
     float3 worldPos,
     uint preferredRing,
+    bool allowCoarserParent,
     out uint voxel,
     out uint actualRing,
     out float actualCellSize)
@@ -1064,24 +1583,11 @@ bool SampleResidentMidVoxelFallback(
         return true;
     }
 
-    // Missing preferred-ring data is a residency gap, not proof that the world
-    // is empty. Try progressively coarser rings first so the hierarchy degrades
-    // to stable context instead of flashing through to far/sky ownership.
-    [loop]
-    for (uint offset = 1u; offset < MID_CLIPMAP_MAX_SHADER_RINGS; ++offset) {
-        const uint coarserRing = clampedPreferred + offset;
-        if (coarserRing >= ringCount) {
-            break;
-        }
-        if (SampleResidentMidVoxel(worldPos, coarserRing, voxel)) {
-            actualRing = coarserRing;
-            actualCellSize = MidClipmapRingCellSize(actualRing);
-            return true;
-        }
-    }
-
-    // Finer rings are less likely in far segments, but using one if it is
-    // resident is still better than treating the segment as missing terrain.
+    // Missing preferred-ring data is not proof that the terrain is air. Finer
+    // resident data is always acceptable. Low-altitude horizon terrain may also
+    // hold a coarser resident parent so children do not punch sky holes while
+    // streaming; callers keep high-altitude views stricter so broad captures do
+    // not regress back into blocky parent slabs.
     [loop]
     for (uint offsetFine = 1u; offsetFine < MID_CLIPMAP_MAX_SHADER_RINGS; ++offsetFine) {
         if (offsetFine > clampedPreferred) {
@@ -1095,32 +1601,68 @@ bool SampleResidentMidVoxelFallback(
         }
     }
 
+    if (allowCoarserParent) {
+        [loop]
+        for (uint offsetCoarse = 1u; offsetCoarse < MID_CLIPMAP_MAX_SHADER_RINGS; ++offsetCoarse) {
+            const uint coarserRing = clampedPreferred + offsetCoarse;
+            if (coarserRing >= ringCount) {
+                break;
+            }
+            if (SampleResidentMidVoxel(worldPos, coarserRing, voxel)) {
+                actualRing = coarserRing;
+                actualCellSize = MidClipmapRingCellSize(actualRing);
+                return true;
+            }
+        }
+    }
+
     return false;
 }
 
-bool IsMidVoxelAirOrMissing(float3 worldPos, uint ring) {
+bool ProceduralMidVoxelCellIsAir(float3 worldPos, float distanceFromCamera) {
+    float mountainMask, spireMask, ravineMask;
+    const float height = FarTerrainHeightVoxelized(
+        worldPos.xz,
+        distanceFromCamera,
+        mountainMask,
+        spireMask,
+        ravineMask);
+    if (worldPos.y <= FAR_TERRAIN_MIN_HEIGHT + 2.0f) {
+        return false;
+    }
+    if (worldPos.y <= height) {
+        return false;
+    }
+    if (worldPos.y <= FAR_SEA_LEVEL && height < FAR_SEA_LEVEL) {
+        return false;
+    }
+    return true;
+}
+
+bool IsMidVoxelAirOrMissing(float3 worldPos, uint ring, float distanceFromCamera) {
     uint neighborVoxel;
     if (!SampleResidentMidVoxel(worldPos, ring, neighborVoxel)) {
-        // A missing neighbor is an unknown residency boundary, not a real
-        // surface. Treat it as occupied so mid bricks do not draw artificial
-        // chunk shells while streaming catches up.
-        return false;
+        // Missing neighbor bricks are a residency boundary, but the generated
+        // terrain function is deterministic. Use it as a one-cell halo for
+        // exposure classification only, so valid mid-voxel surfaces do not get
+        // mislabeled as interior fallback while adjacent bricks stream in.
+        return ProceduralMidVoxelCellIsAir(worldPos, distanceFromCamera);
     }
     return GetMaterial(neighborVoxel) == MAT_AIR;
 }
 
-bool IsResidentMidVoxelExposed(float3 worldPos, uint ring, float cellSize, out float3 normal) {
+bool IsResidentMidVoxelExposed(float3 worldPos, uint ring, float cellSize, float distanceFromCamera, out float3 normal) {
     normal = float3(0.0f, 0.0f, 0.0f);
     const float3 dx = float3(cellSize, 0.0f, 0.0f);
     const float3 dy = float3(0.0f, cellSize, 0.0f);
     const float3 dz = float3(0.0f, 0.0f, cellSize);
 
-    if (IsMidVoxelAirOrMissing(worldPos + dx, ring)) normal += float3(1.0f, 0.0f, 0.0f);
-    if (IsMidVoxelAirOrMissing(worldPos - dx, ring)) normal += float3(-1.0f, 0.0f, 0.0f);
-    if (IsMidVoxelAirOrMissing(worldPos + dy, ring)) normal += float3(0.0f, 1.0f, 0.0f);
-    if (IsMidVoxelAirOrMissing(worldPos - dy, ring)) normal += float3(0.0f, -1.0f, 0.0f);
-    if (IsMidVoxelAirOrMissing(worldPos + dz, ring)) normal += float3(0.0f, 0.0f, 1.0f);
-    if (IsMidVoxelAirOrMissing(worldPos - dz, ring)) normal += float3(0.0f, 0.0f, -1.0f);
+    if (IsMidVoxelAirOrMissing(worldPos + dx, ring, distanceFromCamera)) normal += float3(1.0f, 0.0f, 0.0f);
+    if (IsMidVoxelAirOrMissing(worldPos - dx, ring, distanceFromCamera)) normal += float3(-1.0f, 0.0f, 0.0f);
+    if (IsMidVoxelAirOrMissing(worldPos + dy, ring, distanceFromCamera)) normal += float3(0.0f, 1.0f, 0.0f);
+    if (IsMidVoxelAirOrMissing(worldPos - dy, ring, distanceFromCamera)) normal += float3(0.0f, -1.0f, 0.0f);
+    if (IsMidVoxelAirOrMissing(worldPos + dz, ring, distanceFromCamera)) normal += float3(0.0f, 0.0f, 1.0f);
+    if (IsMidVoxelAirOrMissing(worldPos - dz, ring, distanceFromCamera)) normal += float3(0.0f, 0.0f, -1.0f);
 
     const float normalLength = length(normal);
     if (normalLength <= 0.001f) {
@@ -1168,22 +1710,31 @@ float NextMidVoxelCellBoundaryT(float3 rayOrigin, float3 rayDir, float currentT,
     return max(nextT + 0.02f, currentT + 0.05f);
 }
 
+bool MidClipmapResidentHeightMaterialForDistance(
+    float2 xz,
+    float distanceFromCamera,
+    out float height,
+    out uint material,
+    out float cellSize);
+void ApplyMidVoxelColumnWaterSurface(inout float height, inout uint material);
+
 bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, out RayHit voxelHit) {
     voxelHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
 
     const uint sparseNearFlags = (uint)frame.sparseNearParams.w;
+    const bool voxelTerrainOnlyMode = (sparseNearFlags & 16u) != 0u;
     if ((sparseNearFlags & 4u) == 0u) {
         return false;
     }
     if (frame.midResidencyParams.y < 0.04f || frame.midResidencyParams.w < 1.0f) {
         return false;
     }
-    // Mid-voxel clipmaps are the most expensive background detail layer because
-    // a miss can still require many resident-brick probes. Keep them as a high
-    // quality detail path and let the cheaper height clipmap own continuity
-    // while the runtime scheduler is already downshifting background work.
-    if (((BackgroundRenderQuality() < 0.58f) ||
-         (frame.renderBudgetParams.z < 0.50f && BackgroundRenderQuality() < 0.90f)) &&
+    // Mid-voxel clipmaps are still the only mid-distance layer that preserves
+    // voxel structure. Do not drop them during normal scheduler pressure, or
+    // public captures collapse back into heightfield/far fallback terrain even
+    // while resident voxel bricks are available.
+    if (frame.renderBudgetParams.z < 0.30f &&
+        BackgroundRenderQuality() < 0.45f &&
         !BackgroundDebugLayerMode()) {
         return false;
     }
@@ -1192,10 +1743,52 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
     if (frame.midFieldParams.x < 0.5f || header.x != MID_VOXEL_CLIPMAP_MAGIC || header.z == 0u) {
         return false;
     }
-    // Mid voxel bricks are coarse context. They should extend the horizon, not
-    // become foreground cliffs/ceilings when the player looks up/down around the
-    // exact sparse-surface near field.
-    if (rayDir.y > 0.20f || rayDir.y < -0.68f) {
+    // The resident mid-voxel payload is a coherent low-resolution filled
+    // volume. The DDA can participate in normal views again, but it still
+    // rejects downward-facing interior/underside hits so the first visible hit
+    // is an exposed terrain face, not the bottom of a coarse cell.
+    const bool highAltitudeVoxelView = rayOrigin.y > 384.0f;
+    const bool walkingMidVoxelDda = (sparseNearFlags & 32u) != 0u;
+    const bool midVoxelDdaDiagnosticMode = frame.debugMode == 65u || frame.debugMode == 67u;
+    if (!highAltitudeVoxelView && !walkingMidVoxelDda && !midVoxelDdaDiagnosticMode) {
+        // Low-altitude public views should not expose the raw 3D mid-voxel
+        // shell by default. The height/column mid path and far SVO provide the
+        // coherent public LOD while exact surfaces stream in; this shell DDA is
+        // still available for explicit walk-DDA experiments and debug modes.
+        return false;
+    }
+    const bool walkingTopSurfaceOnly = !highAltitudeVoxelView && !walkingMidVoxelDda;
+    const bool lowAltitudeGrazingSkylineRay =
+        voxelTerrainOnlyMode &&
+        !highAltitudeVoxelView &&
+        rayDir.y > 0.04f &&
+        rayDir.y < 0.22f;
+    const float minAllowedRayY = highAltitudeVoxelView ? -1.01f : (walkingTopSurfaceOnly ? -0.96f : -0.68f);
+    const float maxAllowedRayY = highAltitudeVoxelView ? 0.20f : 0.42f;
+    if (rayDir.y > maxAllowedRayY || rayDir.y < minAllowedRayY) {
+        return false;
+    }
+    const float highAltitudeFarQuality = min(frame.renderBudgetParams.z, frame.farOwnershipParams.w);
+    const bool highAltitudeFarSvoReady =
+        frame.farOwnershipParams.x > 0.5f &&
+        frame.farOwnershipParams.y >= 0.999f &&
+        frame.farOwnershipParams.z > 0.0f &&
+        frame.farFieldParams.x > 0.5f &&
+        frame.farFieldParams.y > 0.0f &&
+        frame.farFieldParams.z > 0.0f &&
+        highAltitudeFarQuality >= 0.35f;
+    const bool highAltitudeMidVoxelReadyForHandoff =
+        frame.exactNearParams.z >= 0.97f &&
+        frame.exactNearParams.w >= 0.94f &&
+        frame.midResidencyParams.w >= 1.0f;
+    if (highAltitudeVoxelView &&
+        highAltitudeFarSvoReady &&
+        !highAltitudeMidVoxelReadyForHandoff &&
+        rayDir.y <= 0.18f) {
+        // Once the far SVO is complete, it is the cleaner high-altitude voxel
+        // authority while mid is still catching up. When the screen-relevant
+        // mid target set is mature, try resident mid voxels first and keep
+        // far-SVO as fallback instead of permanently hiding real voxel terrain.
         return false;
     }
 
@@ -1203,13 +1796,24 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
     const float endDistance = max(frame.midFieldParams.z, startDistance + 1.0f);
     float t = max(startDist, startDistance);
     int budget = frame.renderBudgetParams.z < 0.55f
-        ? ScaleBackgroundStepBudget(56, 44, 32)
+        ? ScaleBackgroundStepBudget(48, 36, 24)
         : (frame.renderBudgetParams.z < 0.85f
             ? ScaleBackgroundStepBudget(88, 68, 48)
             : ScaleBackgroundStepBudget(128, 96, 64));
+    if (lowAltitudeGrazingSkylineRay) {
+        budget = max(budget, ScaleBackgroundStepBudget(176, 132, 104));
+    }
+    RayHit deferredInteriorFallbackHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
+    bool hasDeferredInteriorFallbackHit = false;
+    float deferredInteriorFallbackEnd = 0.0f;
+    bool previousMidVoxelWasAir = false;
 
     [loop]
     for (int i = 0; i < budget && t < endDistance; ++i) {
+        if (hasDeferredInteriorFallbackHit && t >= deferredInteriorFallbackEnd) {
+            voxelHit = deferredInteriorFallbackHit;
+            return true;
+        }
         uint ring = min((uint)floor(saturate((t - startDistance) / max(endDistance - startDistance, 1.0f)) *
             max((float)(header.w >> 24u), 1.0f)), (uint)max((int)(header.w >> 24u) - 1, 0));
         float cellSize = MidClipmapRingCellSize(ring);
@@ -1217,35 +1821,224 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
         uint voxel;
         uint actualRing;
         float actualCellSize;
-        if (SampleResidentMidVoxelFallback(pos, ring, voxel, actualRing, actualCellSize)) {
+        const bool allowCoarserParentFallback =
+            !highAltitudeVoxelView &&
+            rayDir.y > -0.58f &&
+            rayDir.y < 0.18f;
+        if (SampleResidentMidVoxelFallback(pos, ring, allowCoarserParentFallback, voxel, actualRing, actualCellSize)) {
             float nextCellT = NextMidVoxelCellBoundaryT(rayOrigin, rayDir, t, actualCellSize);
             uint material = GetMaterial(voxel);
             if (material != MAT_AIR) {
-                if (!IsResidentMidVoxelTaggedSurface(voxel)) {
+                if (frame.debugMode == 67u) {
+                    const float solidRingShade =
+                        ((float)actualRing + 1.0f) / max((float)(header.w >> 24u), 1.0f);
+                    voxelHit = MakeHit(
+                        float4(1.0f, solidRingShade, saturate(actualCellSize / 48.0f), 1.0f),
+                        t);
+                    return true;
+                }
+                if (highAltitudeVoxelView && actualRing > ring) {
+                    // In high-altitude views the far SVO is the more stable
+                    // distant authority. A coarser mid-voxel parent is useful
+                    // near the player, but here it reads as fake block terrain
+                    // and can hide the cleaner far-SVO result that follows.
+                    previousMidVoxelWasAir = false;
                     t = min(nextCellT, t + max(actualCellSize, 4.0f));
                     continue;
                 }
                 float3 normal;
-                if (!IsResidentMidVoxelExposed(pos, actualRing, actualCellSize, normal)) {
-                    normal = FarTerrainNormal(pos.xz);
+                const bool taggedMidVoxelSurface = IsResidentMidVoxelTaggedSurface(voxel);
+                const bool exposedMidVoxel = IsResidentMidVoxelExposed(pos, actualRing, actualCellSize, t, normal);
+                const bool rayEntryMidVoxelSurface = previousMidVoxelWasAir;
+                const float exactMidFallbackStart = max(frame.exactNearParams.x, 0.0f);
+                const bool allowVoxelOnlyInteriorFallback =
+                    voxelTerrainOnlyMode &&
+                    rayDir.y < 0.12f &&
+                    t >= exactMidFallbackStart;
+                if (!exposedMidVoxel && !taggedMidVoxelSurface && !rayEntryMidVoxelSurface && !allowVoxelOnlyInteriorFallback) {
+                    previousMidVoxelWasAir = false;
+                    t = min(nextCellT, t + max(actualCellSize, 4.0f));
+                    continue;
+                }
+                if (!exposedMidVoxel) {
+                    normal = normalize(float3(-rayDir.x, max(abs(rayDir.y), 0.35f), -rayDir.z));
+                }
+                const bool interiorFallbackHit =
+                    allowVoxelOnlyInteriorFallback && !exposedMidVoxel && !taggedMidVoxelSurface && !rayEntryMidVoxelSurface;
+                const float minNormalY = walkingTopSurfaceOnly ? 0.14f : -0.18f;
+                const float surfaceMinNormalY =
+                    lowAltitudeGrazingSkylineRay && rayEntryMidVoxelSurface ? -0.04f : -0.18f;
+                const bool residentMidVoxelSurface =
+                    taggedMidVoxelSurface || exposedMidVoxel || rayEntryMidVoxelSurface || allowVoxelOnlyInteriorFallback;
+                const bool rejectedMidVoxelNormal = residentMidVoxelSurface
+                    ? normal.y < surfaceMinNormalY
+                    : normal.y < minNormalY;
+                if (rejectedMidVoxelNormal && !BackgroundDebugLayerMode()) {
+                    previousMidVoxelWasAir = false;
+                    t = min(nextCellT, t + max(actualCellSize, 4.0f));
+                    continue;
+                }
+                if (material == MAT_SAND && pos.y <= FAR_SEA_LEVEL + 2.0f) {
+                    material = MAT_WATER;
+                } else if (interiorFallbackHit && material == MAT_SAND) {
+                    material = pos.y <= FAR_SEA_LEVEL + 8.0f ? MAT_WATER : MAT_DIRT;
+                }
+                const bool waterlineInteriorFallback =
+                    interiorFallbackHit &&
+                    pos.y <= FAR_SEA_LEVEL + 8.0f &&
+                    (material == MAT_WATER || material == MAT_SAND);
+                if (waterlineInteriorFallback) {
+                    previousMidVoxelWasAir = false;
+                    t = min(nextCellT, t + max(actualCellSize, 4.0f));
+                    continue;
+                }
+                float hitDistance = t;
+                float3 hitPos = pos;
+                bool recoveredInteriorSurface = false;
+                if (interiorFallbackHit && rayDir.y < -0.001f) {
+                    float proceduralLo = 0.0f;
+                    float proceduralHi = t;
+                    const int proceduralRefineBudget = ScaleBackgroundRefineBudget(2, 1, 1);
+                    [loop]
+                    for (int refine = 0; refine < proceduralRefineBudget; ++refine) {
+                        const float mid = (proceduralLo + proceduralHi) * 0.5f;
+                        const float3 midPos = rayOrigin + rayDir * mid;
+                        float midMountainMask;
+                        float midSpireMask;
+                        float midRavineMask;
+                        const float midHeight = FarTerrainHeightVoxelized(
+                            midPos.xz,
+                            max(mid, startDistance),
+                            midMountainMask,
+                            midSpireMask,
+                            midRavineMask);
+                        const float midSurfaceY =
+                            midHeight < FAR_SEA_LEVEL ? FAR_SEA_LEVEL : midHeight;
+                        if (midPos.y > midSurfaceY) {
+                            proceduralLo = mid;
+                        } else {
+                            proceduralHi = mid;
+                        }
+                    }
+                    const float recoveredT = max(proceduralHi, exactMidFallbackStart);
+                    if (recoveredT <= t + max(actualCellSize, 16.0f) &&
+                        recoveredT >= exactMidFallbackStart) {
+                        hitDistance = recoveredT;
+                        hitPos = rayOrigin + rayDir * hitDistance;
+                        normal = float3(0.0f, 1.0f, 0.0f);
+                        recoveredInteriorSurface = true;
+                    }
                 }
                 float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, (material + 0.5f) / 256.0f, 0);
-                float ndotl = saturate(dot(normal, SkySunDirection()));
-                float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.34f + ndotl * 0.84f);
-                float fogFactor = saturate((t - startDistance) / max(endDistance - startDistance, 1.0f));
-                color = lerp(color, SkyColor(rayDir), fogFactor * 0.62f);
+                if (frame.debugMode == 54u || frame.debugMode == 56u) {
+                    voxelHit = MakeHit(float4(DebugMaterialColor(material), 1.0f), hitDistance);
+                    return true;
+                }
+                if (frame.debugMode == 59u) {
+                    const float ringShade = (float)(actualRing + 1u) / max((float)(header.w >> 24u), 1.0f);
+                    voxelHit = MakeHit(float4(ringShade, 1.0f - ringShade * 0.62f, saturate(actualCellSize / 96.0f), 1.0f), hitDistance);
+                    return true;
+                }
+                if (frame.debugMode == 63u) {
+                    voxelHit = MakeHit(float4(saturate(normal * 0.5f + 0.5f), 1.0f), hitDistance);
+                    return true;
+                }
+                if (frame.debugMode == 65u) {
+                    const bool parentHeld = actualRing > ring;
+                    const bool unresolvedInterior = interiorFallbackHit && !recoveredInteriorSurface;
+                    float3 debugFaceColor = float3(1.0f, 0.48f, 0.05f);
+                    if (normal.y > 0.62f) {
+                        debugFaceColor = float3(0.05f, 0.95f, 0.18f);
+                    } else if (normal.y < -0.35f) {
+                        debugFaceColor = float3(0.95f, 0.05f, 0.95f);
+                    }
+                    if (parentHeld) {
+                        debugFaceColor = float3(0.86f, 0.18f, 1.0f);
+                    }
+                    if (unresolvedInterior) {
+                        debugFaceColor = float3(1.0f, 0.08f, 0.02f);
+                    }
+                    voxelHit = MakeHit(float4(debugFaceColor, 1.0f), hitDistance);
+                    return true;
+                }
+                if (frame.debugMode == 66u) {
+                    const float distanceBand = saturate(hitDistance / 6400.0f);
+                    voxelHit = MakeHit(float4(distanceBand, distanceBand, distanceBand, 1.0f), hitDistance);
+                    return true;
+                }
+                if (frame.debugMode == 62u) {
+                    voxelHit = MakeHit(float4(DebugClosureColor(hitPos), 1.0f), hitDistance);
+                    return true;
+                }
+                const bool ring0MidVoxel =
+                    actualRing == 0u &&
+                    actualCellSize <= 12.5f;
+                baseColor.rgb = BackgroundTerrainMaterialVariation(
+                    baseColor.rgb,
+                    material,
+                    hitPos,
+                    normal,
+                    hitDistance,
+                    ring0MidVoxel ? 0.52f : 0.72f);
+                baseColor.rgb = ApplyWaterlineWetTerrainTint(baseColor.rgb, material, hitPos.y, normal.y, 0.78f);
+                float3 shadeNormal = DistantLodShadeNormal(
+                    normal,
+                    hitDistance,
+                    ring0MidVoxel ? 0.34f : 0.18f);
+                float ndotl = saturate(dot(shadeNormal, SkySunDirection()) * 0.62f + 0.28f);
+                float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.76f + ndotl * 0.34f);
+                const float nearMidContext = 1.0f - saturate((hitDistance - startDistance) / 620.0f);
+                const float3 contextLift = lerp(SkyColor(rayDir), float3(0.48f, 0.52f, 0.48f), 0.35f);
+                color = lerp(color, contextLift, nearMidContext * 0.08f);
+                if (interiorFallbackHit && !recoveredInteriorSurface) {
+                    const float fallbackConfidence = 1.0f - saturate((actualCellSize - 4.0f) / 28.0f);
+                    const float3 continuityTint = material == MAT_WATER
+                        ? float3(0.12f, 0.32f, 0.36f)
+                        : lerp(float3(0.38f, 0.43f, 0.36f), SkyColor(rayDir), 0.22f);
+                    color = lerp(continuityTint, color, fallbackConfidence * 0.55f);
+                }
+                color = max(color, baseColor.rgb * 0.54f + 0.045f);
+                float fogFactor = saturate((hitDistance - startDistance) / max(endDistance - startDistance, 1.0f));
+                if (frame.debugMode == 60u) {
+                    voxelHit = MakeHit(float4(float3(fogFactor, fogFactor, fogFactor), 1.0f), hitDistance);
+                    return true;
+                }
+                color = lerp(color, SkyColor(rayDir), fogFactor * 0.34f);
                 if (frame.debugMode == 9u) {
                     color = lerp(color, float3(1.0f, 0.58f, 0.10f), 0.52f);
                 }
-                voxelHit = MakeHit(float4(color, baseColor.a), t);
+                voxelHit = MakeHit(float4(color, baseColor.a), hitDistance);
+                if (actualRing > ring) {
+                    voxelHit.diagnosticFlags |= RAY_DIAGNOSTIC_MID_PARENT_HELD;
+                }
+                if (interiorFallbackHit && !recoveredInteriorSurface) {
+                    voxelHit.diagnosticFlags |= RAY_DIAGNOSTIC_MID_INTERIOR_FALLBACK;
+                    if (!hasDeferredInteriorFallbackHit) {
+                        deferredInteriorFallbackHit = voxelHit;
+                        hasDeferredInteriorFallbackHit = true;
+                        deferredInteriorFallbackEnd =
+                            t + min(max(actualCellSize * 10.0f, 96.0f), 384.0f);
+                    }
+                    previousMidVoxelWasAir = false;
+                    t = min(nextCellT, t + max(actualCellSize, 4.0f));
+                    continue;
+                }
                 return true;
             }
+            previousMidVoxelWasAir = true;
             t = min(nextCellT, t + max(actualCellSize, 4.0f));
         } else {
+            previousMidVoxelWasAir = lowAltitudeGrazingSkylineRay
+                ? true
+                : ProceduralMidVoxelCellIsAir(pos, t);
             t += max(cellSize * BackgroundMissingSampleSkipScale(), 12.0f);
         }
     }
 
+    if (hasDeferredInteriorFallbackHit) {
+        voxelHit = deferredInteriorFallbackHit;
+        return true;
+    }
     return false;
 }
 
@@ -1296,7 +2089,7 @@ float3 MidClipmapNormal(float2 xz, float distanceFromCamera) {
         MidClipmapResidentHeightMaterialForDistance(xz + float2(offset, 0.0f), distanceFromCamera, hR, mat, unusedCell) &&
         MidClipmapResidentHeightMaterialForDistance(xz - float2(0.0f, offset), distanceFromCamera, hD, mat, unusedCell) &&
         MidClipmapResidentHeightMaterialForDistance(xz + float2(0.0f, offset), distanceFromCamera, hU, mat, unusedCell)) {
-        return normalize(float3(hL - hR, offset * 2.0f, hD - hU));
+        return normalize(float3((hL - hR) * 0.70f, offset * 2.8f, (hD - hU) * 0.70f));
     }
     return float3(0.0f, 1.0f, 0.0f);
 }
@@ -1314,9 +2107,192 @@ float MidClipmapCellSize(float distanceFromCamera) {
     return minCell * 8.0f;
 }
 
+RayHit MakeMidVoxelColumnClipmapHit(float3 rayOrigin, float3 rayDir, float hitT, uint material, float cellSize) {
+    float3 hitPos = rayOrigin + rayDir * hitT;
+    float3 normal = float3(0.0f, 1.0f, 0.0f);
+    float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, (material + 0.5f) / 256.0f, 0);
+    if (frame.debugMode == 54u || frame.debugMode == 56u) {
+        return MakeHit(float4(DebugMaterialColor(material), 1.0f), hitT);
+    }
+    baseColor.rgb = BackgroundTerrainMaterialVariation(
+        baseColor.rgb,
+        material,
+        hitPos,
+        normal,
+        hitT,
+        0.64f);
+    baseColor.rgb = ApplyWaterlineWetTerrainTint(baseColor.rgb, material, hitPos.y, normal.y, 0.62f);
+    float3 shadeNormal = DistantLodShadeNormal(normal, hitT, 0.16f);
+    float ndotl = saturate(dot(shadeNormal, SkySunDirection()) * 0.58f + 0.32f);
+    float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.74f + ndotl * 0.36f);
+    const float grid = VoxelGridLine(hitPos.xz, max(cellSize, 4.0f), 0.045f);
+    color *= lerp(1.0f, 0.94f, grid);
+    const float startDistance = max(frame.midFieldParams.y, 1.0f);
+    const float endDistance = max(frame.midFieldParams.z, startDistance + 1.0f);
+    const float fogFactor = saturate((hitT - startDistance) / max(endDistance - startDistance, 1.0f));
+    color = lerp(color, SkyColor(rayDir), fogFactor * 0.28f);
+    if (frame.debugMode == 9u) {
+        color = lerp(color, float3(1.0f, 0.58f, 0.10f), 0.52f);
+    }
+    RayHit hit = MakeHit(float4(color, baseColor.a), hitT);
+    hit.diagnosticFlags |= RAY_DIAGNOSTIC_MID_COLUMN;
+    return hit;
+}
+
+void ApplyMidVoxelColumnWaterSurface(inout float height, inout uint material) {
+    if (material == MAT_WATER || height < FAR_SEA_LEVEL) {
+        height = FAR_SEA_LEVEL;
+        material = MAT_WATER;
+    }
+}
+
+bool RaymarchMidVoxelColumnClipmap(float3 rayOrigin, float3 rayDir, float startDist, out RayHit columnHit) {
+    columnHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
+
+    if (frame.midFieldParams.x < 0.5f || frame.renderBudgetParams.z < 0.20f) {
+        return false;
+    }
+    if (frame.midResidencyParams.x < 0.04f || frame.midResidencyParams.z < 1.0f) {
+        return false;
+    }
+
+    // This is the safe mid-distance terrain context for walking views: it
+    // draws block-stepped top surfaces instead of the full shell volume.
+    if (rayDir.y > 0.06f) {
+        return false;
+    }
+
+    const float startDistance = max(frame.midFieldParams.y, 1.0f);
+    const float endDistance = max(frame.midFieldParams.z, startDistance + 1.0f);
+    float t = max(startDist, startDistance);
+    if (rayDir.y < -0.001f) {
+        float3 firstPos = rayOrigin + rayDir * t;
+        uint firstMaterial;
+        float firstHeight;
+        float firstCellSize;
+        bool firstResident = MidClipmapResidentHeightMaterialForDistance(
+            firstPos.xz,
+            t,
+            firstHeight,
+            firstMaterial,
+            firstCellSize);
+        firstCellSize = max(firstCellSize, 4.0f);
+        firstHeight = QuantizeTerrainHeight(firstHeight, firstCellSize);
+        ApplyMidVoxelColumnWaterSurface(firstHeight, firstMaterial);
+        if (firstResident && firstPos.y <= firstHeight) {
+            uint originMaterial;
+            float originHeight;
+            float originCellSize;
+            bool originResident = MidClipmapResidentHeightMaterialForDistance(
+                rayOrigin.xz,
+                startDistance,
+                originHeight,
+                originMaterial,
+                originCellSize);
+            originHeight = QuantizeTerrainHeight(originHeight, max(originCellSize, 4.0f));
+            ApplyMidVoxelColumnWaterSurface(originHeight, originMaterial);
+            if (originResident && rayOrigin.y > originHeight + 1.0f) {
+                float lo = 0.0f;
+                float hi = t;
+                uint material = firstMaterial;
+                float cellSize = firstCellSize;
+                const int refineBudget = ScaleBackgroundRefineBudget(5, 4, 3);
+                [loop]
+                for (int refine = 0; refine < refineBudget; ++refine) {
+                    float mid = (lo + hi) * 0.5f;
+                    float3 midPos = rayOrigin + rayDir * mid;
+                    uint midMaterial;
+                    float midHeight;
+                    float midCellSize;
+                    bool midResident = MidClipmapResidentHeightMaterialForDistance(
+                        midPos.xz,
+                        max(mid, startDistance),
+                        midHeight,
+                        midMaterial,
+                        midCellSize);
+                    midCellSize = max(midCellSize, 4.0f);
+                    midHeight = QuantizeTerrainHeight(midHeight, midCellSize);
+                    ApplyMidVoxelColumnWaterSurface(midHeight, midMaterial);
+                    if (!midResident || midPos.y > midHeight) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                        material = midMaterial;
+                        cellSize = midCellSize;
+                    }
+                }
+                columnHit = MakeMidVoxelColumnClipmapHit(rayOrigin, rayDir, max(hi, startDist), material, cellSize);
+                return true;
+            }
+        }
+    }
+    int stepBudget = frame.renderBudgetParams.z < 0.55f
+        ? ScaleBackgroundStepBudget(44, 32, 20)
+        : (frame.renderBudgetParams.z < 0.85f
+            ? ScaleBackgroundStepBudget(76, 58, 40)
+            : ScaleBackgroundStepBudget(104, 78, 54));
+
+    [loop]
+    for (int i = 0; i < stepBudget && t < endDistance; ++i) {
+        float3 pos = rayOrigin + rayDir * t;
+        uint material;
+        float height;
+        float sampleCellSize;
+        if (!MidClipmapResidentHeightMaterialForDistance(pos.xz, t, height, material, sampleCellSize)) {
+            t += max(MidClipmapCellSize(t) * BackgroundMissingSampleSkipScale(), 12.0f);
+            continue;
+        }
+
+        const float cellSize = max(sampleCellSize, 4.0f);
+        height = QuantizeTerrainHeight(height, cellSize);
+        ApplyMidVoxelColumnWaterSurface(height, material);
+        const float2 cell = floor(pos.xz / cellSize);
+        float nextT = endDistance;
+        if (abs(rayDir.x) > 0.0001f) {
+            const float boundaryX = ((rayDir.x > 0.0f) ? (cell.x + 1.0f) : cell.x) * cellSize;
+            const float tx = (boundaryX - rayOrigin.x) / rayDir.x;
+            if (tx > t + 0.01f) {
+                nextT = min(nextT, tx);
+            }
+        }
+        if (abs(rayDir.z) > 0.0001f) {
+            const float boundaryZ = ((rayDir.z > 0.0f) ? (cell.y + 1.0f) : cell.y) * cellSize;
+            const float tz = (boundaryZ - rayOrigin.z) / rayDir.z;
+            if (tz > t + 0.01f) {
+                nextT = min(nextT, tz);
+            }
+        }
+        if (nextT >= endDistance - 0.001f) {
+            nextT = min(endDistance, t + max(cellSize * 2.0f, 16.0f));
+        }
+
+        float hitT = 1e20f;
+        if (rayDir.y < -0.001f) {
+            const float topT = (height - rayOrigin.y) / rayDir.y;
+            if (topT >= t - 0.02f && topT <= nextT + 0.02f) {
+                hitT = max(topT, t);
+            }
+        }
+        if (hitT < 1e19f) {
+            columnHit = MakeMidVoxelColumnClipmapHit(rayOrigin, rayDir, hitT, material, cellSize);
+            return true;
+        }
+
+        t = max(nextT + 0.02f, t + 0.05f);
+    }
+
+    return false;
+}
+
 bool RaymarchMidClipmap(float3 rayOrigin, float3 rayDir, float startDist, out RayHit midHit) {
     midHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
 
+    // Legacy scalar mid-height fallback is not part of the sparse-brick public
+    // render contract. Keeping the full fallback compiled into PS_Raymarch made
+    // small voxel-path edits push the shader over the PSO creation limit, while
+    // the active sparse-only path uses RaymarchMidVoxelClipmap instead.
+    return false;
+#if 0
     if (frame.midFieldParams.x < 0.5f || frame.renderBudgetParams.z < 0.20f) {
         return false;
     }
@@ -1331,7 +2307,11 @@ bool RaymarchMidClipmap(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     // Transition contract: this layer is terrain context after the near sparse
     // window. Do not draw it for steep rays where it would appear as detached
     // ceilings or terrain punching through editable near holes.
-    if (rayDir.y > 0.12f || rayDir.y < -0.20f) {
+    if (rayDir.y > 0.04f) {
+        return false;
+    }
+
+    if (rayDir.y < -0.72f) {
         return false;
     }
 
@@ -1346,10 +2326,82 @@ bool RaymarchMidClipmap(float3 rayOrigin, float3 rayDir, float startDist, out Ra
         previousMaterial,
         previousCellSize);
     previousHeight = QuantizeTerrainHeight(previousHeight, previousCellSize);
+    ApplyMidVoxelColumnWaterSurface(previousHeight, previousMaterial);
     float previousSigned = previousPos.y - previousHeight;
+    if (previousResident && previousSigned <= 0.0f) {
+        uint originMaterial;
+        float originHeight;
+        float originCellSize;
+        bool originResident = MidClipmapResidentHeightMaterialForDistance(
+            rayOrigin.xz,
+            startDistance,
+            originHeight,
+            originMaterial,
+            originCellSize);
+        originHeight = QuantizeTerrainHeight(originHeight, originCellSize);
+        ApplyMidVoxelColumnWaterSurface(originHeight, originMaterial);
+        if (!originResident || rayOrigin.y <= originHeight + 1.0f) {
+            return false;
+        }
+
+        float lo = 0.0f;
+        float hi = t;
+        uint material = previousMaterial;
+        float height = previousHeight;
+        const int refineBudget = ScaleBackgroundRefineBudget(5, 4, 3);
+        [loop]
+        for (int refine = 0; refine < refineBudget; ++refine) {
+            float mid = (lo + hi) * 0.5f;
+            float3 midPos = rayOrigin + rayDir * mid;
+            uint midMaterial;
+            float midHeight;
+            float midCellSize;
+            bool midResident = MidClipmapResidentHeightMaterialForDistance(
+                midPos.xz,
+                max(mid, startDistance),
+                midHeight,
+                midMaterial,
+                midCellSize);
+            midHeight = QuantizeTerrainHeight(midHeight, midCellSize);
+            ApplyMidVoxelColumnWaterSurface(midHeight, midMaterial);
+            if (!midResident || midPos.y > midHeight) {
+                lo = mid;
+            } else {
+                hi = mid;
+                height = midHeight;
+                material = midMaterial;
+            }
+        }
+
+        float hitT = max(hi, startDist);
+        float3 hitPos = rayOrigin + rayDir * hitT;
+        float3 normal = MidClipmapNormal(hitPos.xz, hitT);
+        float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, (material + 0.5f) / 256.0f, 0);
+        baseColor.rgb = BackgroundTerrainMaterialVariation(
+            baseColor.rgb,
+            material,
+            hitPos,
+            normal,
+            hitT,
+            0.64f);
+        baseColor.rgb = ApplyWaterlineWetTerrainTint(baseColor.rgb, material, hitPos.y, normal.y, 0.62f);
+        float3 lightDir = SkySunDirection();
+        float ndotl = saturate(dot(normal, lightDir));
+        float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.72f + ndotl * 0.58f);
+        const float midGrid = VoxelGridLine(hitPos.xz, max(MidClipmapCellSize(hitT), 4.0f), 0.055f);
+        color *= lerp(1.0f, 0.94f, midGrid);
+        float fogFactor = saturate((hitT - startDistance) / max(endDistance - startDistance, 1.0f));
+        color = lerp(color, SkyColor(rayDir), fogFactor * 0.24f);
+        if (frame.debugMode == 8u) {
+            color = lerp(color, float3(0.15f, 0.75f, 1.0f), 0.45f);
+        }
+
+        midHit = MakeHit(float4(color, 1.0f), hitT);
+        return true;
+    }
 
     int stepBudget = frame.renderBudgetParams.z < 0.55f
-        ? ScaleBackgroundStepBudget(28, 22, 16)
+        ? ScaleBackgroundStepBudget(24, 18, 12)
         : (frame.renderBudgetParams.z < 0.85f
             ? ScaleBackgroundStepBudget(44, 34, 24)
             : ScaleBackgroundStepBudget(64, 48, 32));
@@ -1374,6 +2426,7 @@ bool RaymarchMidClipmap(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             material,
             sampleCellSize);
         height = QuantizeTerrainHeight(height, sampleCellSize);
+        ApplyMidVoxelColumnWaterSurface(height, material);
         float signedDistance = pos.y - height;
 
         if (!residentSample) {
@@ -1407,6 +2460,7 @@ bool RaymarchMidClipmap(float3 rayOrigin, float3 rayDir, float startDist, out Ra
                     midMaterial,
                     midCellSize);
                 midHeight = QuantizeTerrainHeight(midHeight, midCellSize);
+                ApplyMidVoxelColumnWaterSurface(midHeight, midMaterial);
                 if (!midResident || midPos.y > midHeight) {
                     lo = mid;
                 } else {
@@ -1420,12 +2474,22 @@ bool RaymarchMidClipmap(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             float3 hitPos = rayOrigin + rayDir * hitT;
             float3 normal = MidClipmapNormal(hitPos.xz, hitT);
             float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, (material + 0.5f) / 256.0f, 0);
+            baseColor.rgb = BackgroundTerrainMaterialVariation(
+                baseColor.rgb,
+                material,
+                hitPos,
+                normal,
+                hitT,
+                0.64f);
+            baseColor.rgb = ApplyWaterlineWetTerrainTint(baseColor.rgb, material, hitPos.y, normal.y, 0.62f);
 
             float3 lightDir = SkySunDirection();
             float ndotl = saturate(dot(normal, lightDir));
-            float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.36f + ndotl * 0.86f);
+            float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.72f + ndotl * 0.58f);
+            const float midGrid = VoxelGridLine(hitPos.xz, max(MidClipmapCellSize(hitT), 4.0f), 0.055f);
+            color *= lerp(1.0f, 0.94f, midGrid);
             float fogFactor = saturate((hitT - startDistance) / max(endDistance - startDistance, 1.0f));
-            color = lerp(color, SkyColor(rayDir), fogFactor * 0.58f);
+            color = lerp(color, SkyColor(rayDir), fogFactor * 0.24f);
 
             // Debug mode 8 highlights mid clipmap ownership in blue-green.
             if (frame.debugMode == 8u) {
@@ -1442,6 +2506,7 @@ bool RaymarchMidClipmap(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     }
 
     return false;
+#endif
 }
 
 uint FarVoxelChildNodeIndex(uint childBase, uint childMask, uint childOrdinal) {
@@ -1458,6 +2523,66 @@ bool FarSvoLeafSurfaceHit(
     out float hitT,
     out float3 hitNormal,
     out uint hitMaterial);
+
+bool FarSvoInteriorLeafSurfaceRecovery(
+    float3 rayOrigin,
+    float3 rayDir,
+    float leafT0,
+    out float hitT,
+    out float3 hitNormal,
+    out uint hitMaterial)
+{
+    hitT = 1e20f;
+    hitNormal = float3(0.0f, 1.0f, 0.0f);
+    hitMaterial = MAT_STONE;
+
+    const float t = max(leafT0, 0.0f);
+    const float3 pos = rayOrigin + rayDir * t;
+    float mountainMask, spireMask, ravineMask;
+    float height = FarTerrainHeight(pos.xz, mountainMask, spireMask, ravineMask);
+    if (pos.y > height) {
+        return false;
+    }
+
+    float originMountainMask, originSpireMask, originRavineMask;
+    const float originHeight = FarTerrainHeight(
+        rayOrigin.xz,
+        originMountainMask,
+        originSpireMask,
+        originRavineMask);
+    if (rayOrigin.y <= originHeight) {
+        return false;
+    }
+
+    float lo = 0.0f;
+    float hi = t;
+    const bool highAltitudeFarLeaf = rayOrigin.y > 384.0f;
+    const int refineBudget = highAltitudeFarLeaf
+        ? ScaleFarFieldRefineBudget(6, 5, 4)
+        : ScaleFarFieldRefineBudget(6, 4, 3);
+    [loop]
+    for (int refine = 0; refine < refineBudget; ++refine) {
+        const float mid = (lo + hi) * 0.5f;
+        const float3 midPos = rayOrigin + rayDir * mid;
+        float mm, sm, rm;
+        const float midHeight = FarTerrainHeight(midPos.xz, mm, sm, rm);
+        if (midPos.y > midHeight) {
+            lo = mid;
+        } else {
+            hi = mid;
+            mountainMask = mm;
+            spireMask = sm;
+            ravineMask = rm;
+            height = midHeight;
+        }
+    }
+
+    hitT = max(hi, 64.0f);
+    const float3 hitPos = rayOrigin + rayDir * hitT;
+    hitNormal = FarTerrainNormal(hitPos.xz);
+    hitMaterial = FarTerrainMaterial(hitPos.xz, height, mountainMask, spireMask, ravineMask);
+    return true;
+}
 
 bool TraverseFarVoxelPage(
     float3 rayOrigin,
@@ -1503,19 +2628,48 @@ bool TraverseFarVoxelPage(
 
         FarVoxelNode node = FarVoxelNodes[nodeIndex];
         if ((node.flags & 1u) != 0u || node.childMask == 0u || node.childBase == 0xFFFFFFFFu) {
-            // Far SVO pages contain coarse solid-interior leaves so traversal can
-            // skip deep terrain volume. Those leaves are not visual surface
-            // geometry; drawing them caused huge rectangular slabs in high-angle
-            // captures. Surface/detail leaves remain renderable.
-            if ((node.flags & 2u) != 0u || node.material == MAT_AIR) {
+            if (node.material == MAT_AIR) {
                 continue;
             }
-            if (nodeSize <= 40.0f) {
+            const bool interiorLeaf = (node.flags & 2u) != 0u;
+            if (interiorLeaf) {
+                // Interior leaves are conservative solid volume, not drawable
+                // AABB geometry. They still prove that this ray has reached
+                // deterministic terrain. Recover the true heightfield crossing
+                // before/current leaf instead of leaving a hole until water or a
+                // later coarse page happens to own the pixel.
+                float candidateT;
+                float3 candidateNormal;
+                uint candidateMaterial;
+                const float recoveryStartT = max(tNear, startDist);
+                if (recoveryStartT <= min(tFar, nearestT) &&
+                    FarSvoInteriorLeafSurfaceRecovery(
+                    rayOrigin,
+                    rayDir,
+                    recoveryStartT,
+                    candidateT,
+                    candidateNormal,
+                    candidateMaterial) &&
+                    candidateT < nearestT) {
+                    nearestT = candidateT;
+                    nearestNormal = candidateNormal;
+                    nearestMaterial = candidateMaterial;
+                    hit = true;
+                }
+            } else if (nodeSize <= 40.0f && max(tNear, startDist) > 6200.0f) {
                 float candidateT = max(tNear, startDist);
                 if (candidateT < nearestT) {
+                    const float3 candidatePos = rayOrigin + rayDir * candidateT;
+                    uint candidateMaterial = node.material;
+                    if (candidateMaterial == MAT_WATER &&
+                        candidatePos.y > FAR_SEA_LEVEL + 1.0f) {
+                        candidateMaterial = candidatePos.y < FAR_SEA_LEVEL + 96.0f
+                            ? MAT_SAND
+                            : MAT_DIRT;
+                    }
                     nearestT = candidateT;
                     nearestNormal = boxNormal;
-                    nearestMaterial = node.material;
+                    nearestMaterial = candidateMaterial;
                     hit = true;
                 }
             } else {
@@ -1542,9 +2696,14 @@ bool TraverseFarVoxelPage(
         }
 
         float childSize = nodeSize * 0.5f;
+        uint childNodes[8];
+        float3 childMins[8];
+        float childNear[8];
+        int childCount = 0;
+
         [unroll]
         for (uint child = 0; child < 8; ++child) {
-            if ((node.childMask & (1u << child)) == 0u || stackCount >= 64) {
+            if ((node.childMask & (1u << child)) == 0u) {
                 continue;
             }
 
@@ -1553,9 +2712,32 @@ bool TraverseFarVoxelPage(
                 (child & 2u) ? childSize : 0.0f,
                 (child & 4u) ? childSize : 0.0f);
 
-            uint childNode = FarVoxelChildNodeIndex(node.childBase, node.childMask, child);
-            nodeStack[stackCount] = childNode;
-            minStack[stackCount] = childMin;
+            float childTNear, childTFar;
+            if (!IntersectBox(rayOrigin, rayDir, childMin, childMin + childSize, childTNear, childTFar) ||
+                childTFar < startDist ||
+                childTNear > nearestT) {
+                continue;
+            }
+
+            int insertAt = childCount;
+            [loop]
+            while (insertAt > 0 && childTNear < childNear[insertAt - 1]) {
+                childNodes[insertAt] = childNodes[insertAt - 1];
+                childMins[insertAt] = childMins[insertAt - 1];
+                childNear[insertAt] = childNear[insertAt - 1];
+                insertAt--;
+            }
+
+            childNodes[insertAt] = FarVoxelChildNodeIndex(node.childBase, node.childMask, child);
+            childMins[insertAt] = childMin;
+            childNear[insertAt] = childTNear;
+            childCount++;
+        }
+
+        [loop]
+        for (int childIndex = childCount - 1; childIndex >= 0 && stackCount < 64; --childIndex) {
+            nodeStack[stackCount] = childNodes[childIndex];
+            minStack[stackCount] = childMins[childIndex];
             sizeStack[stackCount] = childSize;
             stackCount++;
         }
@@ -1588,12 +2770,61 @@ bool FarSvoLeafSurfaceHit(
     float height = FarTerrainHeight(pos.xz, mountainMask, spireMask, ravineMask);
     float previousSigned = pos.y - height;
     float previousT = t;
+    if (previousSigned <= 0.0f) {
+        float originMountainMask, originSpireMask, originRavineMask;
+        const float originHeight = FarTerrainHeight(
+            rayOrigin.xz,
+            originMountainMask,
+            originSpireMask,
+            originRavineMask);
+        if (rayOrigin.y > originHeight) {
+            float lo = 0.0f;
+            float hi = t;
+            const bool highAltitudeFarLeaf = rayOrigin.y > 384.0f;
+            const int refineBudget = highAltitudeFarLeaf
+                ? ScaleFarFieldRefineBudget(6, 5, 4)
+                : ScaleFarFieldRefineBudget(6, 4, 3);
+            [loop]
+            for (int refine = 0; refine < refineBudget; ++refine) {
+                const float mid = (lo + hi) * 0.5f;
+                const float3 midPos = rayOrigin + rayDir * mid;
+                float mm, sm, rm;
+                const float midHeight = FarTerrainHeight(midPos.xz, mm, sm, rm);
+                if (midPos.y > midHeight) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                    mountainMask = mm;
+                    spireMask = sm;
+                    ravineMask = rm;
+                    height = midHeight;
+                }
+            }
+
+            hitT = max(hi, 64.0f);
+            const float3 hitPos = rayOrigin + rayDir * hitT;
+            hitNormal = FarTerrainNormal(hitPos.xz);
+            hitMaterial = FarTerrainMaterial(hitPos.xz, height, mountainMask, spireMask, ravineMask);
+            return true;
+        }
+
+    }
 
     // A raw SVO leaf AABB is only a conservative container. Drawing the AABB
     // entry face creates the giant rectangular sheets seen in captures. Accept a
     // leaf only where the ray actually crosses the far terrain surface.
-    const float stepSize = clamp(nodeSize * 0.55f, 16.0f, 96.0f);
-    const int sampleBudget = ScaleFarFieldStepBudget(8, 6, 5);
+    const bool highAltitudeFarLeaf = rayOrigin.y > 384.0f;
+    const float farLeafQuality = FarFieldRenderQuality();
+    const float leafStepScale = highAltitudeFarLeaf
+        ? (farLeafQuality < 0.62f ? 0.48f : 0.40f)
+        : (farLeafQuality < 0.62f ? 0.85f : 0.55f);
+    const float stepSize = clamp(
+        nodeSize * leafStepScale,
+        16.0f,
+        highAltitudeFarLeaf ? (farLeafQuality < 0.62f ? 84.0f : 72.0f) : (farLeafQuality < 0.62f ? 128.0f : 96.0f));
+    const int sampleBudget = highAltitudeFarLeaf
+        ? ScaleFarFieldStepBudget(18, 14, 10)
+        : ScaleFarFieldStepBudget(8, 5, 3);
     [loop]
     for (int sample = 0; sample < sampleBudget && t < leafT1; ++sample) {
         t = min(t + stepSize, leafT1);
@@ -1604,7 +2835,9 @@ bool FarSvoLeafSurfaceHit(
         if (signedDistance <= 0.0f && previousSigned > 0.0f) {
             float lo = previousT;
             float hi = t;
-            const int refineBudget = ScaleFarFieldRefineBudget(5, 4, 3);
+            const int refineBudget = highAltitudeFarLeaf
+                ? ScaleFarFieldRefineBudget(5, 4, 3)
+                : ScaleFarFieldRefineBudget(5, 4, 2);
             [loop]
             for (int refine = 0; refine < refineBudget; ++refine) {
                 const float mid = (lo + hi) * 0.5f;
@@ -1652,7 +2885,7 @@ bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, ou
     }
 
     const float farQuality = min(frame.renderBudgetParams.z, frame.farOwnershipParams.w);
-    const bool steepDownCoverageRay = rayDir.y < -0.88f && rayDir.y > -0.95f;
+    const bool steepDownCoverageRay = rayDir.y < -0.88f;
     const bool farSvoQualityAllowed = farQuality >= 0.35f ||
         (steepDownCoverageRay && farQuality >= 0.25f);
     if (frame.farFieldParams.x < 0.5f || !farSvoQualityAllowed ||
@@ -1663,7 +2896,14 @@ bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, ou
     // to answer high/downward validation rays; otherwise those rays fall
     // through to the procedural height fallback and produce huge sheet-like
     // terrain bands.
-    if (rayDir.y > 0.18f || rayDir.y < -0.95f) {
+    const bool lowAltitudeFarSvoView = rayOrigin.y <= 384.0f;
+    // High/free-camera views still see upward mountain-silhouette rays near
+    // the top of the frame. Rejecting those rays here creates true no-owner
+    // holes in voxel-only mode because the procedural height fallback is
+    // intentionally disabled. Let the SVO own the same silhouette cone as
+    // walking views; empty rays still return false through traversal.
+    const float upwardFarSvoLimit = 0.42f;
+    if (rayDir.y > upwardFarSvoLimit) {
         return false;
     }
 
@@ -1674,6 +2914,8 @@ bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, ou
     if (pageRadius <= 0 || pageSide <= 0) {
         return false;
     }
+
+    const bool highAltitudeFarSvoView = rayOrigin.y > 384.0f;
 
     // The first SVO integration scanned every page for every far-field pixel.
     // That is correct but far too expensive once the page forest grows. This
@@ -1687,15 +2929,48 @@ bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, ou
 
     float2 rayXZ = rayDir.xz;
     float2 originXZ = rayOrigin.xz;
-    int maxPageSteps = farQuality < 0.55f
-        ? ScaleFarFieldStepBudget(6, 5, 4)
-        : (farQuality < 0.72f
-            ? ScaleFarFieldStepBudget(8, 6, 5)
-            : (farQuality < 0.85f
-                ? ScaleFarFieldStepBudget(10, 8, 6)
-                : (farQuality < 0.95f
-                    ? ScaleFarFieldStepBudget(16, 12, 8)
-                    : ScaleFarFieldStepBudget(24, 18, 12))));
+    const bool lowAltitudeHorizonCoverageRay =
+        !highAltitudeFarSvoView &&
+        rayDir.y > -0.18f &&
+        rayDir.y <= 0.08f;
+    const bool lowAltitudeMountainSilhouetteRay =
+        !highAltitudeFarSvoView &&
+        rayDir.y > 0.08f &&
+        rayDir.y <= upwardFarSvoLimit;
+    int maxPageSteps = 0;
+    if (highAltitudeFarSvoView) {
+        maxPageSteps = farQuality < 0.55f
+            ? ScaleFarFieldStepBudget(28, 22, 16)
+            : (farQuality < 0.72f
+                ? ScaleFarFieldStepBudget(30, 24, 18)
+                : (farQuality < 0.85f
+                    ? ScaleFarFieldStepBudget(32, 26, 20)
+                    : (farQuality < 0.95f
+                        ? ScaleFarFieldStepBudget(34, 28, 22)
+                        : ScaleFarFieldStepBudget(36, 30, 24))));
+    } else {
+        maxPageSteps = farQuality < 0.55f
+            ? (lowAltitudeMountainSilhouetteRay
+                ? ScaleFarFieldStepBudget(28, 22, 16)
+                : (lowAltitudeHorizonCoverageRay
+                    ? ScaleFarFieldStepBudget(20, 16, 12)
+                    : ScaleFarFieldStepBudget(6, 5, 4)))
+            : (farQuality < 0.72f
+                ? (lowAltitudeMountainSilhouetteRay
+                    ? ScaleFarFieldStepBudget(20, 16, 12)
+                    : (lowAltitudeHorizonCoverageRay
+                        ? ScaleFarFieldStepBudget(16, 13, 10)
+                        : ScaleFarFieldStepBudget(8, 6, 5)))
+                : (farQuality < 0.85f
+                    ? (lowAltitudeMountainSilhouetteRay
+                        ? ScaleFarFieldStepBudget(22, 18, 14)
+                        : (lowAltitudeHorizonCoverageRay
+                            ? ScaleFarFieldStepBudget(18, 15, 12)
+                            : ScaleFarFieldStepBudget(10, 8, 6)))
+                    : (farQuality < 0.95f
+                        ? ScaleFarFieldStepBudget(16, 12, 8)
+                        : ScaleFarFieldStepBudget(24, 18, 12))));
+    }
 
     [loop]
     for (int stepIndex = 0; stepIndex < maxPageSteps && t < farMaxDist && t < nearestT; ++stepIndex) {
@@ -1743,23 +3018,82 @@ bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, ou
         }
 
         float nextT = min(nextTx, nextTz);
+        if (nextT >= 1e19f && abs(rayXZ.x) <= 0.0001f && abs(rayXZ.y) <= 0.0001f) {
+            break;
+        }
         if (nextT <= t + 0.5f || nextT >= 1e19f) {
             t += max(64.0f, pageSize * 0.125f);
         } else {
             t = nextT + 0.5f;
         }
     }
-
     if (nearestT >= 1e19f) {
         return false;
     }
 
     float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, (nearestMaterial + 0.5f) / 256.0f, 0);
+    float3 hitPos = rayOrigin + rayDir * nearestT;
+    if (!highAltitudeFarSvoView && nearestT < 2600.0f) {
+        float rawMountainMask, rawSpireMask, rawRavineMask;
+        const float rawHeight = FarTerrainHeight(hitPos.xz, rawMountainMask, rawSpireMask, rawRavineMask);
+        const float surfaceTolerance = max(8.0f, FarFallbackCellSize(nearestT) * 0.75f);
+        if (rawHeight < FAR_SEA_LEVEL ||
+            hitPos.y > rawHeight + surfaceTolerance) {
+            return false;
+        }
+    }
+    if (frame.debugMode == 54u || frame.debugMode == 56u) {
+        farHit = MakeHit(float4(DebugMaterialColor(nearestMaterial), 1.0f), nearestT);
+        return true;
+    }
+    if (frame.debugMode == 59u) {
+        const float cellShade = saturate(FarFallbackCellSize(nearestT) / 160.0f);
+        farHit = MakeHit(float4(0.18f, cellShade, 1.0f - cellShade * 0.55f, 1.0f), nearestT);
+        return true;
+    }
+    if (frame.debugMode == 63u) {
+        farHit = MakeHit(float4(saturate(nearestNormal * 0.5f + 0.5f), 1.0f), nearestT);
+        return true;
+    }
+    if (frame.debugMode == 65u) {
+        float3 debugFaceColor = float3(1.0f, 0.48f, 0.05f);
+        if (nearestNormal.y > 0.62f) {
+            debugFaceColor = float3(0.05f, 0.95f, 0.18f);
+        } else if (nearestNormal.y < -0.35f) {
+            debugFaceColor = float3(0.95f, 0.05f, 0.95f);
+        }
+        farHit = MakeHit(float4(debugFaceColor, 1.0f), nearestT);
+        return true;
+    }
+    if (frame.debugMode == 66u) {
+        const float distanceBand = saturate(nearestT / 6400.0f);
+        farHit = MakeHit(float4(distanceBand, distanceBand, distanceBand, 1.0f), nearestT);
+        return true;
+    }
+    if (frame.debugMode == 62u) {
+        farHit = MakeHit(float4(DebugClosureColor(hitPos), 1.0f), nearestT);
+        return true;
+    }
+    baseColor.rgb = FarTerrainMaterialVariation(baseColor.rgb, nearestMaterial, hitPos.xz, hitPos.y, nearestT);
+    float3 shadeNormal = DistantLodShadeNormal(nearestNormal, nearestT, 0.58f);
     float3 lightDir = SkySunDirection();
-    float ndotl = saturate(dot(nearestNormal, lightDir));
-    float3 color = baseColor.rgb * (SkyAmbient(nearestNormal) * 0.34f + ndotl * 0.82f);
+    float ndotl = saturate(dot(shadeNormal, lightDir) * 0.56f + 0.34f);
+    float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.74f + ndotl * 0.34f);
+    color = max(color, baseColor.rgb * 0.56f + 0.040f);
+    const float farSvoGridFade = saturate((nearestT - 1200.0f) / 6200.0f);
+    const float farSvoGrid = VoxelGridLine(
+        hitPos.xz,
+        FarFallbackCellSize(nearestT),
+        lerp(0.036f, 0.020f, farSvoGridFade));
+    color *= lerp(1.0f, 0.965f, farSvoGrid);
     float fogFactor = saturate((nearestT - 900.0f) / (10400.0f - 900.0f));
-    color = lerp(color, SkyColor(rayDir), fogFactor * 0.72f);
+    const float horizonHaze = saturate((0.20f - abs(rayDir.y)) / 0.20f);
+    if (frame.debugMode == 60u) {
+        const float debugFog = saturate(fogFactor * 0.42f + horizonHaze * 0.14f);
+        farHit = MakeHit(float4(float3(debugFog, debugFog, debugFog), 1.0f), nearestT);
+        return true;
+    }
+    color = lerp(color, SkyColor(rayDir), fogFactor * 0.42f + horizonHaze * 0.14f);
     farHit = MakeHit(float4(color, 1.0f), nearestT);
     return true;
 }
@@ -1827,7 +3161,7 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     // transition distance. Earlier versions rejected steep downward rays here,
     // which made high-altitude stress views pop terrain pixels into miss/sky
     // whenever Far SVO backed off under budget pressure.
-    if (rayDir.y > 0.24f) {
+    if (rayDir.y > 0.04f) {
         return false;
     }
 
@@ -1850,6 +3184,11 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     float previousHeight = FarTerrainHeightVoxelized(previousPos.xz, previousT, mountainMask, spireMask, ravineMask);
     float previousSigned = previousPos.y - previousHeight;
     if (previousSigned <= 0.0f) {
+        // If the caller pushed the far-height fallback behind a near ownership
+        // boundary, an already-inside first sample usually means the ray crossed
+        // the heightfield before that boundary. Resolve that crossing instead
+        // of surfacing a raw miss; otherwise high-altitude and fast-motion views
+        // expose holes even though the procedural terrain is continuous.
         float originMountainMask, originSpireMask, originRavineMask;
         float originHeight = FarTerrainHeightVoxelized(
             rayOrigin.xz,
@@ -1880,28 +3219,41 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
 
             float hitT = max(hi, 64.0f);
             float3 hitPos = rayOrigin + rayDir * hitT;
-            float3 normal = FarTerrainVoxelNormal(hitPos.xz, hitT);
+            float3 normal = DistantLodShadeNormal(FarTerrainVoxelNormal(hitPos.xz, hitT), hitT, 0.52f);
             uint material = FarTerrainMaterial(hitPos.xz, previousHeight, mountainMask, spireMask, ravineMask);
             float u = (material + 0.5f) / 256.0f;
             float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, u, 0);
+            if (frame.debugMode == 54u || frame.debugMode == 56u) {
+                farHit = MakeHit(float4(DebugMaterialColor(material), 1.0f), hitT);
+                return true;
+            }
+            baseColor.rgb = FarTerrainMaterialVariation(baseColor.rgb, material, hitPos.xz, previousHeight, hitT);
             float3 lightDir = normalize(float3(0.5f, 1.0f, 0.3f));
-            float lighting = max(dot(normal, lightDir), 0.18f);
-            float3 color = baseColor.rgb * lighting;
+            float lighting = saturate(dot(normal, lightDir) * 0.58f + 0.34f);
+            float3 color = baseColor.rgb * (0.72f + lighting * 0.24f);
+            const float farGridFade = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
+            const float farGrid = VoxelGridLine(
+                hitPos.xz,
+                FarFallbackCellSize(hitT),
+                lerp(0.044f, 0.018f, farGridFade));
+            color *= lerp(1.0f, 0.965f, farGrid);
             float fogFactor = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
-            color = lerp(color, SkyColor(rayDir), fogFactor * 0.90f + 0.10f);
+            const float horizonHaze = saturate((0.20f - abs(rayDir.y)) / 0.20f);
+            color = lerp(color, SkyColor(rayDir), fogFactor * 0.46f + horizonHaze * 0.14f + 0.04f);
             farHit = MakeHit(float4(color, 1.0f), hitT);
             return true;
         }
+
     }
 
     // This is a continuity fallback behind the page-indexed SVO, not the main
     // far renderer. Keep it cheap enough that sky/horizon pixels cannot become
     // the frame-time bottleneck.
     int farStepBudget = frame.renderBudgetParams.z < 0.6f
-        ? ScaleFarFieldStepBudget(24, 18, 12)
+        ? ScaleFarFieldStepBudget(28, 20, 14)
         : (frame.renderBudgetParams.z < 0.9f
-            ? ScaleFarFieldStepBudget(36, 28, 20)
-            : ScaleFarFieldStepBudget(48, 36, 26));
+            ? ScaleFarFieldStepBudget(48, 36, 26)
+            : ScaleFarFieldStepBudget(64, 48, 34));
     [loop]
     for (int i = 0; i < farStepBudget && t < farMaxDist; ++i) {
         float distanceStep = lerp(96.0f, 360.0f, saturate(t / farMaxDist));
@@ -1912,7 +3264,10 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
         if (previousSigned > 0.0f && rayDir.y < -0.030f) {
             const float verticalStep = previousSigned / max(-rayDir.y, 0.045f);
             const float qualityStepCap = lerp(distanceStep * 1.50f, distanceStep * 3.25f, BackgroundRenderQuality());
-            stepSize = clamp(verticalStep * 0.68f, stepSize, max(stepSize, qualityStepCap));
+            stepSize = clamp(
+                verticalStep * 0.58f,
+                FAR_SVO_MIN_CELL_SIZE,
+                max(stepSize, qualityStepCap));
         }
         t += stepSize;
 
@@ -1943,19 +3298,31 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
 
             float hitT = hi;
             float3 hitPos = rayOrigin + rayDir * hitT;
-            float3 normal = FarTerrainVoxelNormal(hitPos.xz, hitT);
+            float3 normal = DistantLodShadeNormal(FarTerrainVoxelNormal(hitPos.xz, hitT), hitT, 0.52f);
             uint material = FarTerrainMaterial(hitPos.xz, height, mountainMask, spireMask, ravineMask);
             float u = (material + 0.5f) / 256.0f;
             float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, u, 0);
+            if (frame.debugMode == 54u || frame.debugMode == 56u) {
+                farHit = MakeHit(float4(DebugMaterialColor(material), 1.0f), hitT);
+                return true;
+            }
+            baseColor.rgb = FarTerrainMaterialVariation(baseColor.rgb, material, hitPos.xz, height, hitT);
 
             float3 lightDir = normalize(float3(0.5f, 1.0f, 0.3f));
-            float lighting = max(dot(normal, lightDir), 0.18f);
-            float3 color = baseColor.rgb * lighting;
+            float lighting = saturate(dot(normal, lightDir) * 0.58f + 0.34f);
+            float3 color = baseColor.rgb * (0.72f + lighting * 0.24f);
+            const float farGridFade = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
+            const float farGrid = VoxelGridLine(
+                hitPos.xz,
+                FarFallbackCellSize(hitT),
+                lerp(0.044f, 0.018f, farGridFade));
+            color *= lerp(1.0f, 0.965f, farGrid);
 
             // Extra fog hides the fact that this is a heightfield fallback, not
             // the exact editable voxel buffer.
             float fogFactor = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
-            color = lerp(color, SkyColor(rayDir), fogFactor * 0.90f + 0.10f);
+            const float horizonHaze = saturate((0.20f - abs(rayDir.y)) / 0.20f);
+            color = lerp(color, SkyColor(rayDir), fogFactor * 0.46f + horizonHaze * 0.14f + 0.04f);
             farHit = MakeHit(float4(color, 1.0f), hitT);
             return true;
         }
@@ -1986,11 +3353,82 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     return false;
 }
 
+bool RaymarchFarWater(float3 rayOrigin, float3 rayDir, float startDist, out RayHit waterHit) {
+    waterHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
+
+    if (rayOrigin.y < FAR_WATER_SURFACE_Y) {
+        return false;
+    }
+
+    // Basin water is generated deterministically below sea level. Keep it as
+    // an occluder for downward background rays too, or mid/far terrain can
+    // expose dry shoreline material that disappears when exact water pages
+    // arrive.
+    if (rayDir.y >= -0.015f || rayDir.y < -0.92f) {
+        return false;
+    }
+
+    const float waterT = (FAR_WATER_SURFACE_Y - rayOrigin.y) / rayDir.y;
+    if (waterT < max(startDist, 32.0f) || waterT > 10400.0f) {
+        return false;
+    }
+
+    const float3 hitPos = rayOrigin + rayDir * waterT;
+    float mountainMask, spireMask, ravineMask;
+    const float terrainHeight = FarTerrainHeight(hitPos.xz, mountainMask, spireMask, ravineMask);
+    if (terrainHeight >= FAR_SEA_LEVEL) {
+        return false;
+    }
+
+    const float shimmer = 0.5f + 0.5f * sin(hitPos.x * 0.035f + hitPos.z * 0.041f);
+    float3 waterColor = lerp(float3(0.19f, 0.34f, 0.42f), float3(0.34f, 0.50f, 0.56f), shimmer * 0.16f);
+    const float fog = saturate((waterT - 650.0f) / 3800.0f);
+    waterColor = lerp(waterColor, SkyColor(rayDir), fog * 0.38f);
+    waterHit = MakeHit(float4(waterColor, 1.0f), waterT);
+    return true;
+}
+
+float LowerLodWaterlineTolerance(float backgroundDistance) {
+    const float baseTolerance = max(24.0f, min(96.0f, backgroundDistance * 0.015f));
+    // Coarse mid/far voxel surfaces can put a waterline side face noticeably
+    // in front of the analytic sea-plane crossing. Treat deterministic water
+    // as the foreground owner across that representation error, but keep the
+    // tolerance bounded so real foreground terrain still occludes water.
+    const float coarseTolerance = max(128.0f, min(384.0f, backgroundDistance * 0.12f));
+    return max(baseTolerance, coarseTolerance);
+}
+
 static const uint BACKGROUND_LAYER_NONE = 0u;
 static const uint BACKGROUND_LAYER_MID_VOXEL = 1u;
 static const uint BACKGROUND_LAYER_MID_HEIGHT = 2u;
 static const uint BACKGROUND_LAYER_FAR_SVO = 3u;
 static const uint BACKGROUND_LAYER_FAR_HEIGHT = 4u;
+static const uint BACKGROUND_LAYER_FAR_WATER = 5u;
+
+float3 DebugOwnerMaterialColor(float3 materialColor, uint layer) {
+    float3 ownerTint = float3(0.95f, 0.95f, 0.95f);
+    float ownerWeight = 0.18f;
+    if (layer == BACKGROUND_LAYER_MID_VOXEL) {
+        ownerTint = float3(0.05f, 0.95f, 0.25f);
+        ownerWeight = 0.34f;
+    } else if (layer == BACKGROUND_LAYER_MID_HEIGHT) {
+        ownerTint = float3(1.0f, 0.86f, 0.08f);
+        ownerWeight = 0.42f;
+    } else if (layer == BACKGROUND_LAYER_FAR_SVO) {
+        ownerTint = float3(0.20f, 0.42f, 1.0f);
+        ownerWeight = 0.36f;
+    } else if (layer == BACKGROUND_LAYER_FAR_HEIGHT) {
+        ownerTint = float3(1.0f, 0.45f, 0.08f);
+        ownerWeight = 0.46f;
+    } else if (layer == BACKGROUND_LAYER_FAR_WATER) {
+        ownerTint = float3(0.04f, 0.28f, 0.95f);
+        ownerWeight = 0.24f;
+    } else {
+        ownerTint = float3(1.0f, 0.08f, 0.72f);
+        ownerWeight = 0.46f;
+    }
+    return saturate(materialColor * (1.0f - ownerWeight) + ownerTint * ownerWeight);
+}
 
 static const uint RENDER_OWNER_TOTAL = 0u;
 static const uint RENDER_OWNER_NEAR = 1u;
@@ -2003,6 +3441,321 @@ static const uint RENDER_OWNER_MISS = 7u;
 static const uint RENDER_OWNER_FRAME = 8u;
 static const uint RENDER_OWNER_SURFACE = 9u;
 static const uint RENDER_OWNER_UNSAFE_NEAR_MISS = 10u;
+static const uint RENDER_OWNER_FAR_WATER = 11u;
+static const uint RENDER_OWNER_WATER_CONTEXT = 12u;
+static const uint RENDER_OWNER_VALLEY_ATMOSPHERE = 13u;
+static const uint RENDER_OWNER_LOD_PARENT_HELD = 14u;
+static const uint RENDER_OWNER_UNSAFE_SAMPLE_COUNT = 15u;
+static const uint RENDER_OWNER_UNSAFE_SAMPLE_BRICK_X = 16u;
+static const uint RENDER_OWNER_UNSAFE_SAMPLE_BRICK_Y = 17u;
+static const uint RENDER_OWNER_UNSAFE_SAMPLE_BRICK_Z = 18u;
+static const uint RENDER_OWNER_UNSAFE_SAMPLE_DIST = 19u;
+static const uint RENDER_OWNER_MID_INTERIOR_FALLBACK = 20u;
+static const uint RENDER_OWNER_FAR_SURFACE = 21u;
+static const uint RENDER_OWNER_FAR_HEIGHT_CONTINUITY = 22u;
+static const uint RENDER_OWNER_FAR_HEIGHT_MID_MISSING = 23u;
+static const uint RENDER_OWNER_FAR_HEIGHT_MID_AIR = 24u;
+static const uint RENDER_OWNER_FAR_HEIGHT_MID_SOLID = 25u;
+static const uint RENDER_OWNER_FAR_HEIGHT_FAR_PAGE_PRESENT = 26u;
+static const uint RENDER_OWNER_FAR_HEIGHT_FAR_PAGE_MISSING = 27u;
+static const uint RENDER_OWNER_FAR_HEIGHT_FAR_PAGE_OUT_OF_GRID = 28u;
+static const uint RENDER_OWNER_FAR_HEIGHT_MID_SAMPLE_COUNT = 29u;
+static const uint RENDER_OWNER_UNSAFE_SAMPLE_LIST_BASE = 40u;
+static const uint RENDER_OWNER_UNSAFE_SAMPLE_LIST_CAPACITY = 256u;
+static const uint RENDER_OWNER_FAR_HEIGHT_MID_SAMPLE_LIST_BASE =
+    RENDER_OWNER_UNSAFE_SAMPLE_LIST_BASE + RENDER_OWNER_UNSAFE_SAMPLE_LIST_CAPACITY * 4u;
+static const uint RENDER_OWNER_FAR_HEIGHT_MID_SAMPLE_LIST_CAPACITY = 256u;
+
+float ExactNearDistance() {
+    return max(frame.exactNearParams.x, 0.0f);
+}
+
+bool CameraUnderwaterForShading() {
+    return frame.cameraPosition.y < FAR_WATER_SURFACE_Y - 0.5f;
+}
+
+float PublicExactSurfaceDistance() {
+    const float rasterMax = max(frame.surfaceRasterParams.x, 0.0f);
+    if (rasterMax > 0.0f) {
+        return max(rasterMax, ExactNearDistance());
+    }
+    return ExactNearDistance();
+}
+
+bool SparseExactResidentAirOrWaterAt(float3 worldPos) {
+    if (frame.sparseNearParams.x <= 0.5f) {
+        return false;
+    }
+
+    const uint maxPages = (uint)frame.sparseNearParams.y;
+    const uint tableCapacity = (uint)frame.sparseNearParams.z;
+    const int3 worldVoxel = int3(floor(worldPos));
+    const int3 brickCoord = int3(
+        FloorDiv16(worldVoxel.x),
+        FloorDiv16(worldVoxel.y),
+        FloorDiv16(worldVoxel.z));
+
+    SparseBrickPageEntry entry;
+    if (!LookupSparseBrick(brickCoord, tableCapacity, entry)) {
+        return false;
+    }
+    if (entry.pageIndex >= maxPages ||
+        SparseBrickPageGenerations[entry.pageIndex] != entry.generation) {
+        return false;
+    }
+
+    const uint2 pageOccupancy = SparseBrickOccupancy[entry.pageIndex];
+    if ((pageOccupancy.x | pageOccupancy.y) == 0u) {
+        return true;
+    }
+
+    const uint3 localVoxel = uint3(
+        (uint)FloorModInt(worldVoxel.x, 16),
+        (uint)FloorModInt(worldVoxel.y, 16),
+        (uint)FloorModInt(worldVoxel.z, 16));
+    const uint3 subCoord = localVoxel >> 2u;
+    const uint subIndex = subCoord.x + subCoord.y * 4u + subCoord.z * 16u;
+    const uint occupancyWord = subIndex < 32u ? pageOccupancy.x : pageOccupancy.y;
+    const uint occupancyBit = subIndex < 32u ? subIndex : subIndex - 32u;
+    if (((occupancyWord >> occupancyBit) & 1u) == 0u) {
+        return true;
+    }
+
+    const uint localIndex = SparseLocalIndex(localVoxel);
+    const uint voxel = SparseBrickVoxelPool[entry.pageIndex * SPARSE_BRICK_VOXEL_COUNT + localIndex];
+    const uint material = GetMaterial(voxel);
+    return material == MAT_AIR || material == MAT_WATER;
+}
+
+bool BackgroundHitAllowedByExactNear(float3 rayOrigin, float3 rayDir, RayHit hit, uint layer) {
+    if (layer == BACKGROUND_LAYER_NONE) {
+        return true;
+    }
+    const uint sparseNearFlags = (uint)frame.sparseNearParams.w;
+    const bool sparseSurfaceRaymarchFill = (sparseNearFlags & 8u) != 0u;
+    if (sparseSurfaceRaymarchFill &&
+        (layer == BACKGROUND_LAYER_MID_VOXEL ||
+         layer == BACKGROUND_LAYER_FAR_SVO ||
+         layer == BACKGROUND_LAYER_FAR_WATER)) {
+        const bool lowerLodTerrain =
+            layer == BACKGROUND_LAYER_MID_VOXEL ||
+            layer == BACKGROUND_LAYER_FAR_SVO;
+        const float exactDistance = ExactNearDistance();
+        const float surfaceOwnershipDistance = max(frame.nearOwnershipParams.w, exactDistance);
+        if (lowerLodTerrain &&
+            surfaceOwnershipDistance > 0.0f &&
+            hit.distance <= surfaceOwnershipDistance + 64.0f) {
+            const float3 hitPos = rayOrigin + rayDir * hit.distance;
+            if (SparseExactResidentAirOrWaterAt(hitPos)) {
+                return false;
+            }
+        }
+        // The fullscreen raymarch runs after the raster sparse surface pass.
+        // If execution reaches this function for a pixel, the exact surface did
+        // not already own that pixel. Let legitimate resident lower LOD carry
+        // the public frame while exact sparse terrain streams in, instead of
+        // rejecting it solely because it lies inside the exact ownership radius.
+        return true;
+    }
+    const float exactDistance = ExactNearDistance();
+    const float surfaceOwnershipDistance = max(frame.nearOwnershipParams.w, exactDistance);
+    if (surfaceOwnershipDistance <= 0.0f) {
+        return true;
+    }
+    return hit.distance >= surfaceOwnershipDistance;
+}
+
+bool TryResolveWaterOccluderForBackgroundHit(
+    float3 rayOrigin,
+    float3 rayDir,
+    float startDist,
+    RayHit backgroundHit,
+    bool hasPrecomputedWaterOccluder,
+    RayHit precomputedWaterOccluder,
+    out RayHit waterHit)
+{
+    waterHit = precomputedWaterOccluder;
+    bool hasWater = hasPrecomputedWaterOccluder;
+
+    if (!hasWater) {
+        if (rayOrigin.y < FAR_WATER_SURFACE_Y ||
+            rayDir.y >= -0.015f ||
+            rayDir.y < -0.92f) {
+            return false;
+        }
+        const float waterT = (FAR_WATER_SURFACE_Y - rayOrigin.y) / rayDir.y;
+        // Background terrain can be deliberately started after the exact
+        // surface band. Water is a screen-space occluder for that fallback, so
+        // it must be probed from the ray, not from the delayed terrain handoff.
+        if (waterT < 32.0f || waterT > 10400.0f) {
+            return false;
+        }
+
+        const float3 terrainPos = rayOrigin + rayDir * backgroundHit.distance;
+        if (terrainPos.y > FAR_WATER_SURFACE_Y + 96.0f) {
+            return false;
+        }
+
+        // If the first resident mid/far hit is just behind the sea plane, it is
+        // submerged terrain. Let deterministic water own that pixel even when
+        // the exact water brick has not streamed yet. This does not create water
+        // over missing dry land because it only applies after a real terrain hit
+        // at or below sea level.
+        const float waterLeadTolerance = LowerLodWaterlineTolerance(backgroundHit.distance);
+        if (waterT > backgroundHit.distance + waterLeadTolerance) {
+            return false;
+        }
+
+        const float3 hitPos = rayOrigin + rayDir * waterT;
+        const float shimmer = 0.5f + 0.5f * sin(hitPos.x * 0.035f + hitPos.z * 0.041f);
+        float3 waterColor = lerp(float3(0.19f, 0.34f, 0.42f), float3(0.34f, 0.50f, 0.56f), shimmer * 0.16f);
+        const float fog = saturate((waterT - 650.0f) / 3800.0f);
+        waterColor = lerp(waterColor, SkyColor(rayDir), fog * 0.38f);
+        waterHit = MakeHit(float4(waterColor, 1.0f), waterT);
+        hasWater = true;
+    }
+
+    const float3 backgroundPos = rayOrigin + rayDir * backgroundHit.distance;
+    if (backgroundPos.y > FAR_WATER_SURFACE_Y + 96.0f) {
+        return false;
+    }
+
+    const float waterLeadTolerance = LowerLodWaterlineTolerance(backgroundHit.distance);
+    if (!hasWater ||
+        waterHit.distance > backgroundHit.distance + waterLeadTolerance ||
+        !BackgroundHitAllowedByExactNear(rayOrigin, rayDir, waterHit, BACKGROUND_LAYER_FAR_WATER)) {
+        return false;
+    }
+    return true;
+}
+
+bool TryResolveDeterministicWaterBeforeBackground(
+    float3 rayOrigin,
+    float3 rayDir,
+    RayHit backgroundHit,
+    uint layer,
+    out RayHit waterHit)
+{
+    waterHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
+
+    if (layer == BACKGROUND_LAYER_NONE || layer == BACKGROUND_LAYER_FAR_WATER) {
+        return false;
+    }
+    if (rayOrigin.y < FAR_WATER_SURFACE_Y ||
+        rayDir.y >= -0.015f ||
+        rayDir.y < -0.92f) {
+        return false;
+    }
+
+    const float waterT = (FAR_WATER_SURFACE_Y - rayOrigin.y) / rayDir.y;
+    if (waterT < 32.0f || waterT > 10400.0f) {
+        return false;
+    }
+
+    const float3 hitPos = rayOrigin + rayDir * waterT;
+    float mountainMask, spireMask, ravineMask;
+    const float terrainHeight = FarTerrainHeight(hitPos.xz, mountainMask, spireMask, ravineMask);
+    if (terrainHeight >= FAR_SEA_LEVEL) {
+        return false;
+    }
+
+    const float3 backgroundPos = rayOrigin + rayDir * backgroundHit.distance;
+    if (backgroundPos.y > FAR_WATER_SURFACE_Y + 96.0f) {
+        return false;
+    }
+
+    // Coarse mid/far cells can report a vertical terrain face slightly in
+    // front of the analytic sea-plane crossing even when procedural truth at
+    // that plane is water. Exact sparse surfaces are resolved before this
+    // fallback, so inside the public exact/surface band deterministic water may
+    // own shoreline side faces, but it must not replace a clearly closer
+    // terrain hit. Otherwise missing exact terrain appears as broad water until
+    // the exact page streams in.
+    const bool foregroundWaterlineFallback =
+        (layer == BACKGROUND_LAYER_FAR_SVO ||
+         layer == BACKGROUND_LAYER_MID_VOXEL ||
+         layer == BACKGROUND_LAYER_MID_HEIGHT ||
+         layer == BACKGROUND_LAYER_FAR_HEIGHT) &&
+        waterT <= max(PublicExactSurfaceDistance() + 512.0f, 2048.0f);
+    const float waterLeadTolerance = foregroundWaterlineFallback
+        ? max(LowerLodWaterlineTolerance(backgroundHit.distance), 192.0f)
+        : LowerLodWaterlineTolerance(backgroundHit.distance);
+    if (waterT > backgroundHit.distance + waterLeadTolerance) {
+        return false;
+    }
+
+    const float shimmer = 0.5f + 0.5f * sin(hitPos.x * 0.035f + hitPos.z * 0.041f);
+    float3 waterColor = lerp(float3(0.19f, 0.34f, 0.42f), float3(0.34f, 0.50f, 0.56f), shimmer * 0.16f);
+    const float fog = saturate((waterT - 650.0f) / 3800.0f);
+    waterColor = lerp(waterColor, SkyColor(rayDir), fog * 0.38f);
+    waterHit = MakeHit(float4(waterColor, 1.0f), waterT);
+    return true;
+}
+
+RayHit DebugWaterlineResolverReasonHit(
+    float3 rayOrigin,
+    float3 rayDir,
+    RayHit backgroundHit,
+    uint layer)
+{
+    float3 color = float3(0.08f, 0.08f, 0.10f);
+
+    if (layer == BACKGROUND_LAYER_NONE) {
+        color = float3(0.10f, 0.10f, 0.10f);
+        return MakeHit(float4(color, 1.0f), backgroundHit.distance);
+    }
+    if (layer == BACKGROUND_LAYER_FAR_WATER) {
+        color = float3(0.00f, 0.85f, 1.00f);
+        return MakeHit(float4(color, 1.0f), backgroundHit.distance);
+    }
+    if (rayOrigin.y < FAR_WATER_SURFACE_Y ||
+        rayDir.y >= -0.015f ||
+        rayDir.y < -0.92f) {
+        // Red: this ray is not eligible for deterministic water.
+        color = float3(1.0f, 0.05f, 0.04f);
+        return MakeHit(float4(color, 1.0f), backgroundHit.distance);
+    }
+
+    const float waterT = (FAR_WATER_SURFACE_Y - rayOrigin.y) / rayDir.y;
+    if (waterT < 32.0f || waterT > 10400.0f) {
+        // Orange: water plane crossing is outside the public ray range.
+        color = float3(1.0f, 0.45f, 0.02f);
+        return MakeHit(float4(color, 1.0f), backgroundHit.distance);
+    }
+
+    const float3 hitPos = rayOrigin + rayDir * waterT;
+    float mountainMask, spireMask, ravineMask;
+    const float terrainHeight = FarTerrainHeight(hitPos.xz, mountainMask, spireMask, ravineMask);
+    if (terrainHeight >= FAR_SEA_LEVEL) {
+        // Yellow: shader terrain truth says this XZ is dry terrain, not water.
+        color = float3(1.0f, 0.92f, 0.02f);
+        return MakeHit(float4(color, 1.0f), backgroundHit.distance);
+    }
+
+    const bool foregroundWaterlineFallback =
+        (layer == BACKGROUND_LAYER_FAR_SVO ||
+         layer == BACKGROUND_LAYER_MID_VOXEL ||
+         layer == BACKGROUND_LAYER_MID_HEIGHT ||
+         layer == BACKGROUND_LAYER_FAR_HEIGHT) &&
+        waterT <= max(PublicExactSurfaceDistance() + 512.0f, 2048.0f);
+    if (!foregroundWaterlineFallback) {
+        const float waterLeadTolerance = LowerLodWaterlineTolerance(backgroundHit.distance);
+        if (waterT > backgroundHit.distance + waterLeadTolerance) {
+            // Purple: water is too far behind this lower-LOD terrain hit.
+            color = float3(0.70f, 0.10f, 1.0f);
+            return MakeHit(float4(color, 1.0f), backgroundHit.distance);
+        }
+        // Green: deterministic water would be accepted through tolerance.
+        color = float3(0.05f, 1.0f, 0.20f);
+        return MakeHit(float4(color, 1.0f), backgroundHit.distance);
+    }
+
+    // Cyan: deterministic water would be accepted by the foreground waterline
+    // fallback. If the normal owner for this pixel is still lower LOD, a later
+    // path is bypassing or overwriting this resolver.
+    color = float3(0.00f, 0.95f, 1.0f);
+    return MakeHit(float4(color, 1.0f), backgroundHit.distance);
+}
 
 bool RenderOwnershipEnabled() {
     return frame.farFieldGridParams.w > 0.5f;
@@ -2013,10 +3766,482 @@ void RecordRenderOwnership(uint owner) {
         return;
     }
     InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_TOTAL], 1u);
-    if (owner <= RENDER_OWNER_MISS || owner == RENDER_OWNER_SURFACE || owner == RENDER_OWNER_UNSAFE_NEAR_MISS) {
+    if (owner <= RENDER_OWNER_MISS ||
+        owner == RENDER_OWNER_SURFACE ||
+        owner == RENDER_OWNER_UNSAFE_NEAR_MISS ||
+        owner == RENDER_OWNER_FAR_WATER ||
+        owner == RENDER_OWNER_WATER_CONTEXT ||
+        owner == RENDER_OWNER_VALLEY_ATMOSPHERE) {
         InterlockedAdd(RenderOwnershipStats[owner], 1u);
     }
     RenderOwnershipStats[RENDER_OWNER_FRAME] = frame.frameIndex;
+}
+
+void RecordRenderLodParentHeld() {
+    if (!RenderOwnershipEnabled()) {
+        return;
+    }
+    InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_LOD_PARENT_HELD], 1u);
+    RenderOwnershipStats[RENDER_OWNER_FRAME] = frame.frameIndex;
+}
+
+void RecordRenderMidInteriorFallback() {
+    if (!RenderOwnershipEnabled()) {
+        return;
+    }
+    InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_MID_INTERIOR_FALLBACK], 1u);
+    RenderOwnershipStats[RENDER_OWNER_FRAME] = frame.frameIndex;
+}
+
+void RecordRenderWaterContext() {
+    if (!RenderOwnershipEnabled()) {
+        return;
+    }
+    InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_WATER_CONTEXT], 1u);
+}
+
+void RecordFarHeightMidCoverageSample(float3 worldPos, uint preferredRing) {
+    if (!RenderOwnershipEnabled()) {
+        return;
+    }
+    uint4 header = MidVoxelClipmapMetadata[0];
+    const uint ringCount = min(header.w >> 24u, MID_CLIPMAP_MAX_SHADER_RINGS);
+    if (header.x != MID_VOXEL_CLIPMAP_MAGIC || ringCount == 0u) {
+        return;
+    }
+
+    const uint ring = min(preferredRing, ringCount - 1u);
+    const float cellSize = MidClipmapRingCellSize(ring);
+    const float brickWorldSize = max(cellSize * (float)SPARSE_BRICK_SIZE, 1.0f);
+    const int3 brickCoord = int3(floor(worldPos / brickWorldSize));
+
+    uint writeIndex = 0u;
+    InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_HEIGHT_MID_SAMPLE_COUNT], 1u, writeIndex);
+    uint h = (uint)brickCoord.x * 73856093u;
+    h ^= (uint)brickCoord.y * 19349663u;
+    h ^= (uint)brickCoord.z * 83492791u;
+    h ^= ring * 2654435761u;
+    h ^= (uint)frame.frameIndex * 2246822519u;
+    const uint sampleSlot = h % RENDER_OWNER_FAR_HEIGHT_MID_SAMPLE_LIST_CAPACITY;
+    const uint base = RENDER_OWNER_FAR_HEIGHT_MID_SAMPLE_LIST_BASE + sampleSlot * 4u;
+    RenderOwnershipStats[base + 0u] = ring;
+    RenderOwnershipStats[base + 1u] = (uint)brickCoord.x;
+    RenderOwnershipStats[base + 2u] = (uint)brickCoord.y;
+    RenderOwnershipStats[base + 3u] = (uint)brickCoord.z;
+}
+
+void RecordFarHeightContinuityReason(float3 rayOrigin, float3 rayDir, float diagnosticTerrainT) {
+    if (!RenderOwnershipEnabled()) {
+        return;
+    }
+    InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_HEIGHT_CONTINUITY], 1u);
+
+    uint4 midHeader = MidVoxelClipmapMetadata[0];
+    const uint ringCount = min(midHeader.w >> 24u, MID_CLIPMAP_MAX_SHADER_RINGS);
+    bool sampledMid = false;
+    uint sampledVoxel = PackVoxel(MAT_AIR, 0, 0, 0);
+    if (frame.midFieldParams.x >= 0.5f &&
+        midHeader.x == MID_VOXEL_CLIPMAP_MAGIC &&
+        midHeader.z != 0u &&
+        ringCount != 0u &&
+        diagnosticTerrainT < 1e19f) {
+        const float midStart = max(frame.midFieldParams.y, 1.0f);
+        const float midEnd = max(frame.midFieldParams.z, midStart + 1.0f);
+        if (diagnosticTerrainT <= midEnd) {
+            const float ringDistance = max(diagnosticTerrainT, midStart);
+            const uint preferredRing = min(
+                (uint)floor(saturate((ringDistance - midStart) / max(midEnd - midStart, 1.0f)) *
+                    (float)ringCount),
+                ringCount - 1u);
+            const float3 diagnosticPos = rayOrigin + rayDir * diagnosticTerrainT;
+            RecordFarHeightMidCoverageSample(diagnosticPos, preferredRing);
+            uint actualRing;
+            float actualCellSize;
+            sampledMid = SampleResidentMidVoxelFallback(
+                diagnosticPos,
+                preferredRing,
+                true,
+                sampledVoxel,
+                actualRing,
+                actualCellSize);
+        }
+    }
+    if (!sampledMid) {
+        InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_HEIGHT_MID_MISSING], 1u);
+    } else if (GetMaterial(sampledVoxel) == MAT_AIR) {
+        InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_HEIGHT_MID_AIR], 1u);
+    } else {
+        InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_HEIGHT_MID_SOLID], 1u);
+    }
+
+    bool farPagePresent = false;
+    bool farPageInGrid = false;
+    if (frame.farOwnershipParams.x > 0.5f &&
+        frame.farOwnershipParams.y >= 0.999f &&
+        frame.farOwnershipParams.z > 0.0f &&
+        frame.farFieldParams.x > 0.5f &&
+        frame.farFieldParams.y > 0.0f &&
+        frame.farFieldParams.z > 0.0f &&
+        diagnosticTerrainT < 1e19f) {
+        const uint pageCount = (uint)frame.farFieldParams.y;
+        const int pageRadius = (int)frame.farFieldGridParams.x;
+        const int pageSide = (int)frame.farFieldGridParams.y;
+        const float pageSize = max(frame.farFieldParams.w, 1.0f);
+        const float3 diagnosticPos = rayOrigin + rayDir * diagnosticTerrainT;
+        const int px = (int)floor(diagnosticPos.x / pageSize);
+        const int pz = (int)floor(diagnosticPos.z / pageSize);
+        if (pageCount > 0u &&
+            pageRadius > 0 &&
+            pageSide > 0 &&
+            px >= -pageRadius &&
+            px <= pageRadius &&
+            pz >= -pageRadius &&
+            pz <= pageRadius) {
+            farPageInGrid = true;
+            const uint denseIndex = (uint)((pz + pageRadius) * pageSide + (px + pageRadius));
+            const uint pageIndex = FarVoxelPageIndex[denseIndex];
+            farPagePresent = pageIndex != 0xFFFFFFFFu && pageIndex < pageCount;
+        }
+    }
+    if (!farPageInGrid) {
+        InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_HEIGHT_FAR_PAGE_OUT_OF_GRID], 1u);
+    }
+    InterlockedAdd(
+        RenderOwnershipStats[farPagePresent
+            ? RENDER_OWNER_FAR_HEIGHT_FAR_PAGE_PRESENT
+            : RENDER_OWNER_FAR_HEIGHT_FAR_PAGE_MISSING],
+        1u);
+}
+
+void RecordUnsafeSparseMissSample(int3 brickCoord, float distanceFromCamera) {
+    if (!RenderOwnershipEnabled()) {
+        return;
+    }
+    uint writeIndex = 0u;
+    InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_UNSAFE_SAMPLE_COUNT], 1u, writeIndex);
+    if (writeIndex == 0u) {
+        RenderOwnershipStats[RENDER_OWNER_UNSAFE_SAMPLE_BRICK_X] = (uint)brickCoord.x;
+        RenderOwnershipStats[RENDER_OWNER_UNSAFE_SAMPLE_BRICK_Y] = (uint)brickCoord.y;
+        RenderOwnershipStats[RENDER_OWNER_UNSAFE_SAMPLE_BRICK_Z] = (uint)brickCoord.z;
+        RenderOwnershipStats[RENDER_OWNER_UNSAFE_SAMPLE_DIST] = (uint)min(max(distanceFromCamera, 0.0f), 1000000.0f);
+    }
+    // A full-screen fallback can report hundreds of thousands of pixels in a
+    // few dominant screen regions. First-N samples only teach the CPU about one
+    // cluster and leave the rest of the visible wrong-owner terrain untouched.
+    // Hash by brick so the fixed-size readback carries spatially diverse
+    // render-critical exact misses.
+    uint h = (uint)brickCoord.x * 73856093u;
+    h ^= (uint)brickCoord.y * 19349663u;
+    h ^= (uint)brickCoord.z * 83492791u;
+    h ^= (uint)frame.frameIndex * 2654435761u;
+    const uint sampleSlot = h % RENDER_OWNER_UNSAFE_SAMPLE_LIST_CAPACITY;
+    const uint base = RENDER_OWNER_UNSAFE_SAMPLE_LIST_BASE + sampleSlot * 4u;
+    RenderOwnershipStats[base + 0u] = (uint)brickCoord.x;
+    RenderOwnershipStats[base + 1u] = (uint)brickCoord.y;
+    RenderOwnershipStats[base + 2u] = (uint)brickCoord.z;
+    RenderOwnershipStats[base + 3u] = (uint)min(max(distanceFromCamera, 0.0f), 1000000.0f);
+}
+
+uint SparseSurfaceFaceDirection(SparseSurfaceFace face) {
+    return (face.payload >> 29u) & 0x7u;
+}
+
+uint SparseSurfaceFaceVoxel(SparseSurfaceFace face) {
+    return face.payload & 0x0007FFFFu;
+}
+
+uint SparseSurfaceFaceWidth(SparseSurfaceFace face) {
+    return ((face.payload >> 24u) & 0x1Fu) + 1u;
+}
+
+uint SparseSurfaceFaceHeight(SparseSurfaceFace face) {
+    return ((face.payload >> 19u) & 0x1Fu) + 1u;
+}
+
+float3 SparseSurfaceFaceNormalFromDirection(uint direction) {
+    if (direction == 0u) return float3(-1.0f, 0.0f, 0.0f);
+    if (direction == 1u) return float3(1.0f, 0.0f, 0.0f);
+    if (direction == 2u) return float3(0.0f, -1.0f, 0.0f);
+    if (direction == 3u) return float3(0.0f, 1.0f, 0.0f);
+    if (direction == 4u) return float3(0.0f, 0.0f, -1.0f);
+    return float3(0.0f, 0.0f, 1.0f);
+}
+
+bool IntersectSparseSurfaceFaceForRay(
+    SparseSurfaceFace face,
+    float3 rayOrigin,
+    float3 rayDir,
+    float maxT,
+    out float hitT,
+    out float3 hitNormal,
+    out uint hitMaterial)
+{
+    hitT = 0.0f;
+    hitNormal = float3(0.0f, 1.0f, 0.0f);
+    hitMaterial = MAT_AIR;
+
+    const uint direction = SparseSurfaceFaceDirection(face);
+    const float3 normal = SparseSurfaceFaceNormalFromDirection(direction);
+    const float denom = dot(normal, rayDir);
+    if (denom >= -0.0001f) {
+        return false;
+    }
+
+    const float x0 = (float)face.voxelX;
+    const float y0 = (float)face.voxelY;
+    const float z0 = (float)face.voxelZ;
+    const float width = (float)SparseSurfaceFaceWidth(face);
+    const float height = (float)SparseSurfaceFaceHeight(face);
+    const float x1 = x0 + (direction == 2u || direction == 3u || direction == 4u || direction == 5u ? width : 1.0f);
+    const float y1 = y0 + (direction == 0u || direction == 1u || direction == 4u || direction == 5u ? height : 1.0f);
+    const float z1 =
+        z0 + (direction == 0u || direction == 1u ? width :
+              direction == 2u || direction == 3u ? height :
+              1.0f);
+
+    float plane = x0;
+    float originAxis = rayOrigin.x;
+    float dirAxis = rayDir.x;
+    if (direction == 1u) {
+        plane = x1;
+    } else if (direction == 2u) {
+        plane = y0;
+        originAxis = rayOrigin.y;
+        dirAxis = rayDir.y;
+    } else if (direction == 3u) {
+        plane = y1;
+        originAxis = rayOrigin.y;
+        dirAxis = rayDir.y;
+    } else if (direction == 4u) {
+        plane = z0;
+        originAxis = rayOrigin.z;
+        dirAxis = rayDir.z;
+    } else if (direction == 5u) {
+        plane = z1;
+        originAxis = rayOrigin.z;
+        dirAxis = rayDir.z;
+    }
+
+    if (abs(dirAxis) < 0.000001f) {
+        return false;
+    }
+    const float t = (plane - originAxis) / dirAxis;
+    if (t <= 0.05f || t >= maxT) {
+        return false;
+    }
+
+    const float3 p = rayOrigin + rayDir * t;
+    const float pad = 0.02f;
+    bool inside = false;
+    if (direction == 0u || direction == 1u) {
+        inside = p.y >= y0 - pad && p.y <= y1 + pad &&
+                 p.z >= z0 - pad && p.z <= z1 + pad;
+    } else if (direction == 2u || direction == 3u) {
+        inside = p.x >= x0 - pad && p.x <= x1 + pad &&
+                 p.z >= z0 - pad && p.z <= z1 + pad;
+    } else {
+        inside = p.x >= x0 - pad && p.x <= x1 + pad &&
+                 p.y >= y0 - pad && p.y <= y1 + pad;
+    }
+    if (!inside) {
+        return false;
+    }
+
+    hitT = t;
+    hitNormal = normal;
+    hitMaterial = GetMaterial(SparseSurfaceFaceVoxel(face));
+    return hitMaterial != MAT_AIR;
+}
+
+bool ProbeSparseSurfaceRangeForRay(
+    SparseSurfaceBrickRange range,
+    float3 rayOrigin,
+    float3 rayDir,
+    inout float nearestT,
+    inout float3 nearestNormal,
+    inout uint nearestMaterial)
+{
+    bool found = false;
+    const uint faceCount = min(range.faceCount, 384u);
+    [loop]
+    for (uint i = 0u; i < faceCount; ++i) {
+        SparseSurfaceFace face = SparseSurfaceFaces[range.firstFace + i];
+        float hitT;
+        float3 hitNormal;
+        uint hitMaterial;
+        if (IntersectSparseSurfaceFaceForRay(face, rayOrigin, rayDir, nearestT, hitT, hitNormal, hitMaterial)) {
+            nearestT = hitT;
+            nearestNormal = hitNormal;
+            nearestMaterial = hitMaterial;
+            found = true;
+        }
+    }
+    return found;
+}
+
+RayHit MakeSparseSurfaceRayHit(float3 rayOrigin, float3 rayDir, float hitT, float3 normal, uint material) {
+    const float3 hitPos = rayOrigin + rayDir * hitT;
+    if (frame.debugMode == 54u) {
+        return MakeHit(float4(DebugMaterialColor(material), 1.0f), hitT);
+    }
+    if (frame.debugMode == 55u) {
+        const float exactNearDistance = max(ExactNearDistance(), 0.0f);
+        const float protectedSurfaceDistance = max(exactNearDistance + 768.0f, 1536.0f);
+        if (exactNearDistance > 0.0f && hitT > protectedSurfaceDistance) {
+            return MakeHit(float4(1.0f, 0.05f, 0.90f, 1.0f), hitT);
+        }
+        if (exactNearDistance > 0.0f && hitT > exactNearDistance) {
+            return MakeHit(float4(1.0f, 0.46f, 0.05f, 1.0f), hitT);
+        }
+        return MakeHit(float4(1.0f, 0.95f, 0.05f, 1.0f), hitT);
+    }
+    if (frame.debugMode == 56u) {
+        const float3 materialColor = DebugMaterialColor(material);
+        return MakeHit(float4(saturate(materialColor * 0.86f + float3(0.95f, 0.95f, 0.95f) * 0.14f), 1.0f), hitT);
+    }
+    if (frame.debugMode == 63u) {
+        return MakeHit(float4(saturate(normalize(normal) * 0.5f + 0.5f), 1.0f), hitT);
+    }
+
+    float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, (material + 0.5f) / 256.0f, 0);
+    float3 varied = BackgroundTerrainMaterialVariation(baseColor.rgb, material, hitPos, normal, hitT, 0.72f);
+    const float3 lightDir = normalize(frame.sunDirection.xyz);
+    const float diffuse = saturate(dot(normal, lightDir)) * 0.58f + 0.42f;
+    float3 color = varied * diffuse + SkyAmbient(normal) * 0.18f;
+    if (frame.cameraPosition.y <= 384.0f) {
+        const float fog = saturate((hitT - 1200.0f) / 4200.0f) * 0.10f;
+        color = lerp(color, SkyColor(float3(0.0f, -0.06f, 0.998f)), fog);
+    }
+    return MakeHit(float4(saturate(color), 1.0f), hitT);
+}
+
+bool ResolveExactSparseSurfaceBeforeBackground(
+    float3 rayOrigin,
+    float3 rayDir,
+    RayHit backgroundHit,
+    uint layer,
+    out RayHit exactHit)
+{
+    exactHit = backgroundHit;
+    if (layer != BACKGROUND_LAYER_MID_VOXEL &&
+        layer != BACKGROUND_LAYER_FAR_SVO &&
+        layer != BACKGROUND_LAYER_FAR_WATER) {
+        return false;
+    }
+
+    const uint sparseNearFlags = (uint)frame.sparseNearParams.w;
+    const bool sparseNearActive = frame.sparseNearParams.x > 0.5f;
+    const bool sparseSurfaceAuthoritative = (sparseNearFlags & 2u) != 0u;
+    if (!sparseNearActive || !sparseSurfaceAuthoritative) {
+        return false;
+    }
+
+    const float publicExactDistance = PublicExactSurfaceDistance();
+    if (publicExactDistance <= 0.0f ||
+        backgroundHit.distance <= 32.0f ||
+        backgroundHit.distance > publicExactDistance + 64.0f) {
+        return false;
+    }
+
+    float nearestT = min(backgroundHit.distance - 0.05f, publicExactDistance + 64.0f);
+    if (nearestT <= 32.0f) {
+        return false;
+    }
+
+    float3 nearestNormal = float3(0.0f, 1.0f, 0.0f);
+    uint nearestMaterial = MAT_AIR;
+    bool found = false;
+    int3 lastBrick = int3(2147483647, 2147483647, 2147483647);
+
+    [loop]
+    for (uint i = 0u; i < 6u; ++i) {
+        const float probeT = max(0.05f, backgroundHit.distance - (float)i * 12.0f);
+        if (probeT > publicExactDistance + 64.0f) {
+            continue;
+        }
+        const float3 probePos = rayOrigin + rayDir * probeT;
+        const int3 brickCoord = int3(
+            FloorDiv16((int)floor(probePos.x)),
+            FloorDiv16((int)floor(probePos.y)),
+            FloorDiv16((int)floor(probePos.z)));
+        if (all(brickCoord == lastBrick)) {
+            continue;
+        }
+        lastBrick = brickCoord;
+
+        SparseSurfaceBrickRange surfaceRange;
+        if (LookupSparseSurfaceRange(brickCoord, surfaceRange) && surfaceRange.faceCount > 0u) {
+            found = ProbeSparseSurfaceRangeForRay(
+                surfaceRange,
+                rayOrigin,
+                rayDir,
+                nearestT,
+                nearestNormal,
+                nearestMaterial) || found;
+        }
+    }
+
+    if (!found || nearestMaterial == MAT_AIR) {
+        return false;
+    }
+    if (layer == BACKGROUND_LAYER_FAR_WATER && nearestMaterial == MAT_WATER) {
+        return false;
+    }
+
+    exactHit = MakeSparseSurfaceRayHit(rayOrigin, rayDir, nearestT, nearestNormal, nearestMaterial);
+    return true;
+}
+
+void RecordHiddenExactFallbackSampleForBackgroundHit(
+    float3 rayOrigin,
+    float3 rayDir,
+    RayHit hit,
+    uint layer)
+{
+    if (!RenderOwnershipEnabled()) {
+        return;
+    }
+    if (layer != BACKGROUND_LAYER_MID_VOXEL &&
+        layer != BACKGROUND_LAYER_FAR_SVO &&
+        layer != BACKGROUND_LAYER_FAR_HEIGHT &&
+        layer != BACKGROUND_LAYER_FAR_WATER) {
+        return;
+    }
+    const uint sparseNearFlags = (uint)frame.sparseNearParams.w;
+    const bool sparseNearActive = frame.sparseNearParams.x > 0.5f;
+    const bool sparseSurfaceAuthoritative = (sparseNearFlags & 2u) != 0u;
+    if (!sparseNearActive || !sparseSurfaceAuthoritative) {
+        return;
+    }
+
+    const float surfaceOwnershipDistance = max(frame.nearOwnershipParams.w, ExactNearDistance());
+    if (surfaceOwnershipDistance <= 0.0f ||
+        hit.distance < 32.0f ||
+        hit.distance > surfaceOwnershipDistance) {
+        return;
+    }
+
+    // Broad hidden-exact discovery is handled by the CPU foreground probe. The
+    // pixel shader feedback is deliberately limited to very close fallback
+    // hits; doing deterministic terrain scans here makes the fullscreen shader
+    // too expensive and can stall startup.
+    const float shaderFallbackFeedbackMaxDistance =
+        min(surfaceOwnershipDistance, ExactNearDistance() + 160.0f);
+    if (hit.distance > shaderFallbackFeedbackMaxDistance) {
+        return;
+    }
+
+    const float3 hitPos = rayOrigin + rayDir * hit.distance;
+    const int3 brickCoord = int3(
+        FloorDiv16((int)floor(hitPos.x)),
+        FloorDiv16((int)floor(hitPos.y)),
+        FloorDiv16((int)floor(hitPos.z)));
+    SparseSurfaceBrickRange surfaceRange;
+    if (LookupSparseSurfaceRange(brickCoord, surfaceRange) && surfaceRange.faceCount > 0u) {
+        return;
+    }
+
+    RecordUnsafeSparseMissSample(brickCoord, hit.distance);
 }
 
 float NearBackgroundStartDistance() {
@@ -2030,14 +4255,24 @@ float NearBackgroundStartDistance() {
     return 160.0f;
 }
 
+float LowAltitudeProtectedBackgroundStartDistance() {
+    const float exactDistance = ExactNearDistance();
+    const float ownershipRadius = max(frame.nearOwnershipParams.w, exactDistance);
+    // Low walking views need a real no-fake-terrain band around shorelines, but
+    // the sparse raster ownership radius can be several kilometers. Using that
+    // full radius as the fullscreen background start makes ordinary mid/far
+    // voxel continuity depend on every raster surface chunk being resident.
+    const float protectedBand = max(exactDistance + 768.0f, 1536.0f);
+    return max(exactDistance, min(ownershipRadius, protectedBand));
+}
+
 float SurfaceAuthoritativeBackgroundStartDistance() {
     // The raster sparse-surface pass owns the editable foreground. In this mode
-    // the fullscreen pass is only sky/horizon context, so it must not synthesize
-    // near terrain through temporary surface-cache holes.
-    if (frame.midFieldParams.x > 0.5f) {
-        return max(frame.midFieldParams.y, 896.0f);
-    }
-    return 896.0f;
+    // the fullscreen pass fills continuity behind the explicit ownership
+    // sphere/near box. Keeping this base distance modest prevents the default
+    // sparse-surface cull radius from creating a large sky gap whenever the
+    // raster surface cache has not fully covered mid-distance valley walls.
+    return NearBackgroundStartDistance();
 }
 
 bool IntersectSphere(float3 rayOrigin, float3 rayDir, float3 center, float radius, out float tNear, out float tFar) {
@@ -2077,20 +4312,15 @@ float SurfaceAuthoritativeBackgroundStartForRay(
         // drawing through resident-surface holes or late uploads.
         startDistance = max(startDistance, max(nearExit, 0.0f) + 8.0f);
     }
-    float sphereEntry;
-    float sphereExit;
-    if (IntersectSphere(
-            rayOrigin,
-            rayDir,
-            frame.nearOwnershipParams.xyz,
-            frame.nearOwnershipParams.w,
-            sphereEntry,
-            sphereExit)) {
-        // The raster sparse surface layer is culled by a stable world-space
-        // near radius, not by the legacy dense render AABB. This explicit
-        // ownership sphere prevents mid/far fallback from drawing through
-        // camera-centered near holes while sparse pages are still streaming.
-        startDistance = max(startDistance, max(sphereExit, 0.0f) + 8.0f);
+    // The sparse surface cull sphere is intentionally larger than the exact
+    // editable foreground. Using its far exit as the background start hides
+    // resident mid-voxel cliffs between the exact-near radius and the cull
+    // radius, which shows up as valley-atmosphere cutouts. Keep the hard
+    // no-fake-terrain boundary at ExactNearDistance(); background hits are
+    // still rejected by BackgroundHitAllowedByExactNear before they can own.
+    startDistance = max(startDistance, ExactNearDistance() + 8.0f);
+    if (frame.cameraPosition.y <= FAR_SEA_LEVEL + 220.0f) {
+        startDistance = max(startDistance, LowAltitudeProtectedBackgroundStartDistance() + 8.0f);
     }
     return startDistance;
 }
@@ -2112,6 +4342,9 @@ float SparseMissingPageBackgroundStartForRay(
         // legitimate horizon continuity for too long during fast camera motion.
         startDistance = max(startDistance, max(nearExit, 0.0f) + 8.0f);
     }
+    if (frame.cameraPosition.y <= FAR_SEA_LEVEL + 220.0f) {
+        startDistance = max(startDistance, LowAltitudeProtectedBackgroundStartDistance() + 8.0f);
+    }
     return startDistance;
 }
 
@@ -2129,6 +4362,15 @@ float FarLayerStartAfterBackground(float backgroundStartDistance) {
     return max(backgroundStartDistance, min(endDistance, handoffDistance));
 }
 
+bool VoxelTerrainOnly() {
+    const uint sparseNearFlags = (uint)frame.sparseNearParams.w;
+    return (sparseNearFlags & 16u) != 0u;
+}
+
+bool DiagnosticFarTerrainWouldHit(float3 rayOrigin, float3 rayDir, float startDist, out float hitT);
+float TerrainDiagnosticStartDistance();
+bool TryBuildResidentMidVoxelClosureHit(float3 rayOrigin, float3 rayDir, float terrainT, out RayHit closureHit);
+
 bool RaymarchBackgroundField(
     float3 rayOrigin,
     float3 rayDir,
@@ -2141,37 +4383,277 @@ bool RaymarchBackgroundField(
     backgroundHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
     backgroundLayer = BACKGROUND_LAYER_NONE;
 
-    if (RaymarchMidVoxelClipmap(rayOrigin, rayDir, startDist, backgroundHit)) {
+    const bool voxelTerrainOnly = VoxelTerrainOnly();
+    RayHit waterOccluderHit;
+    // Water is not a fake height proxy: SparseTerrainGenerator fills all
+    // below-sea basin columns with water. Keep the sea-level occluder active
+    // so deterministic water hides submerged mid/far terrain instead of
+    // exposing dry sand that disappears when editable sparse pages arrive.
+    const bool hasWaterOccluder = RaymarchFarWater(rayOrigin, rayDir, 32.0f, waterOccluderHit);
+    const bool highAltitudeBackgroundView = rayOrigin.y > 384.0f;
+    const bool lowAltitudeVoxelTerrainView = voxelTerrainOnly && !highAltitudeBackgroundView;
+    const float farSvoCandidateQuality = min(frame.renderBudgetParams.z, frame.farOwnershipParams.w);
+    const bool farSvoCandidateView =
+        voxelTerrainOnly &&
+        includeSparseFarField &&
+        !highAltitudeBackgroundView &&
+        rayOrigin.y > FAR_SEA_LEVEL + 24.0f &&
+        rayDir.y > -0.24f &&
+        rayDir.y < 0.16f &&
+        farSvoCandidateQuality >= 0.35f &&
+        frame.farOwnershipParams.x > 0.5f &&
+        frame.farOwnershipParams.y >= 0.999f &&
+        frame.farOwnershipParams.z > 0.0f &&
+        frame.farFieldParams.x > 0.5f &&
+        frame.farFieldParams.y > 0.0f &&
+        frame.farFieldParams.z > 0.0f;
+    RayHit elevatedFarSvoCandidateHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
+    bool hasElevatedFarSvoCandidateHit = false;
+    if (farSvoCandidateView &&
+        RaymarchSparseFarField(
+            rayOrigin,
+            rayDir,
+            max(startDist, frame.midFieldParams.y),
+            elevatedFarSvoCandidateHit) &&
+        BackgroundHitAllowedByExactNear(rayOrigin, rayDir, elevatedFarSvoCandidateHit, BACKGROUND_LAYER_FAR_SVO)) {
+        hasElevatedFarSvoCandidateHit = true;
+    }
+    const bool preferCheapMidVoxelColumn =
+        frame.renderBudgetParams.z < 0.55f || BackgroundRenderQuality() < 0.62f;
+    const bool preferForegroundMidColumn =
+        lowAltitudeVoxelTerrainView &&
+        rayDir.y <= 0.06f;
+    const bool allowMidVoxelColumnProxy = !voxelTerrainOnly || preferForegroundMidColumn;
+    RayHit deferredMidInteriorHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
+    bool hasDeferredMidInteriorHit = false;
+    if (allowMidVoxelColumnProxy &&
+        (preferCheapMidVoxelColumn || preferForegroundMidColumn) &&
+        RaymarchMidVoxelColumnClipmap(rayOrigin, rayDir, startDist, backgroundHit)) {
+        RayHit resolvedWaterHit;
+        if (TryResolveWaterOccluderForBackgroundHit(
+                rayOrigin, rayDir, startDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit)) {
+            backgroundHit = resolvedWaterHit;
+            backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
+            return true;
+        }
+        backgroundLayer = BACKGROUND_LAYER_MID_VOXEL;
+        if (BackgroundHitAllowedByExactNear(rayOrigin, rayDir, backgroundHit, backgroundLayer)) {
+            return true;
+        }
+        backgroundLayer = BACKGROUND_LAYER_NONE;
+    }
+    const bool skipFullMidVoxelDda =
+        allowMidVoxelColumnProxy &&
+        preferCheapMidVoxelColumn &&
+        rayOrigin.y > 384.0f &&
+        frame.renderBudgetParams.z < 0.55f;
+    const float lowAltitudeVoxelContinuityStart =
+        max(TerrainDiagnosticStartDistance(), max(frame.midFieldParams.y, 256.0f));
+    const float midVoxelStartDist = lowAltitudeVoxelTerrainView
+        ? max(startDist, lowAltitudeVoxelContinuityStart)
+        : startDist;
+    if (!skipFullMidVoxelDda &&
+        RaymarchMidVoxelClipmap(rayOrigin, rayDir, midVoxelStartDist, backgroundHit)) {
+        const bool midInteriorFallback =
+            (backgroundHit.diagnosticFlags & RAY_DIAGNOSTIC_MID_INTERIOR_FALLBACK) != 0u;
+        RayHit resolvedWaterHit;
+        if (TryResolveWaterOccluderForBackgroundHit(
+                rayOrigin, rayDir, startDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit)) {
+            backgroundHit = resolvedWaterHit;
+            backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
+            return true;
+        }
+        backgroundLayer = BACKGROUND_LAYER_MID_VOXEL;
+        if (BackgroundHitAllowedByExactNear(rayOrigin, rayDir, backgroundHit, backgroundLayer)) {
+            if (midInteriorFallback) {
+                deferredMidInteriorHit = backgroundHit;
+                hasDeferredMidInteriorHit = true;
+            } else {
+                if (hasElevatedFarSvoCandidateHit) {
+                    // Resident mid voxels are the intended mid-distance
+                    // mountain owner. The old handoff allowed the far SVO to
+                    // replace a resident mid hit even when the far hit was
+                    // hundreds of units behind it, which produced mixed
+                    // coarse/sky-looking skyline ownership while all hard miss
+                    // counters still passed. Treat far SVO as a true fallback
+                    // or a clearly nearer occluder only.
+                    const float frontBias = max(24.0f, min(backgroundHit.distance * 0.025f, 160.0f));
+                    if (elevatedFarSvoCandidateHit.distance + frontBias <= backgroundHit.distance) {
+                        RayHit resolvedWaterHit;
+                        if (TryResolveWaterOccluderForBackgroundHit(
+                                rayOrigin, rayDir, startDist, elevatedFarSvoCandidateHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit)) {
+                            backgroundHit = resolvedWaterHit;
+                            backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
+                            return true;
+                        }
+                        backgroundHit = elevatedFarSvoCandidateHit;
+                        backgroundLayer = BACKGROUND_LAYER_FAR_SVO;
+                        return true;
+                    }
+                }
+                return true;
+            }
+        }
+        backgroundLayer = BACKGROUND_LAYER_NONE;
+    }
+    if (allowMidVoxelColumnProxy &&
+        !preferCheapMidVoxelColumn &&
+        RaymarchMidVoxelColumnClipmap(rayOrigin, rayDir, startDist, backgroundHit)) {
+        RayHit resolvedWaterHit;
+        if (TryResolveWaterOccluderForBackgroundHit(
+                rayOrigin, rayDir, startDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit)) {
+            backgroundHit = resolvedWaterHit;
+            backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
+            return true;
+        }
+        backgroundLayer = BACKGROUND_LAYER_MID_VOXEL;
+        if (BackgroundHitAllowedByExactNear(rayOrigin, rayDir, backgroundHit, backgroundLayer)) {
+            return true;
+        }
+        backgroundLayer = BACKGROUND_LAYER_NONE;
+    }
+    const float farStartDist = lowAltitudeVoxelTerrainView
+        // Mid voxels are tried first. If they fail, Far SVO must begin before
+        // the common low-altitude skyline crossing range (~2.0-2.2k) so it can
+        // catch the entry surface instead of starting inside/behind it.
+        ? max(lowAltitudeVoxelContinuityStart, 1800.0f)
+        : (voxelTerrainOnly
+            ? max(startDist, max(frame.midFieldParams.y, 256.0f))
+            : FarLayerStartAfterBackground(startDist));
+    if (lowAltitudeVoxelTerrainView &&
+        includeSparseFarField &&
+        rayDir.y > -0.22f &&
+        rayDir.y < 0.20f) {
+        float diagnosticTerrainT = 1e20f;
+        if (DiagnosticFarTerrainWouldHit(rayOrigin, rayDir, lowAltitudeVoxelContinuityStart, diagnosticTerrainT)) {
+            RayHit closureHit;
+            if (TryBuildResidentMidVoxelClosureHit(rayOrigin, rayDir, diagnosticTerrainT, closureHit) &&
+                closureHit.distance < farStartDist + 2200.0f &&
+                BackgroundHitAllowedByExactNear(rayOrigin, rayDir, closureHit, BACKGROUND_LAYER_MID_VOXEL)) {
+                backgroundHit = closureHit;
+                backgroundLayer = BACKGROUND_LAYER_MID_VOXEL;
+                return true;
+            }
+        }
+    }
+    const bool highAltitudeDownwardView = highAltitudeBackgroundView && rayDir.y < -0.35f;
+    if (highAltitudeBackgroundView &&
+        includeSparseFarField &&
+        RaymarchSparseFarField(
+            rayOrigin,
+            rayDir,
+            highAltitudeDownwardView ? max(startDist, 32.0f) : max(startDist, frame.midFieldParams.y),
+            backgroundHit)) {
+        RayHit resolvedWaterHit;
+        if (TryResolveWaterOccluderForBackgroundHit(
+                rayOrigin, rayDir, startDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit)) {
+            backgroundHit = resolvedWaterHit;
+            backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
+            return true;
+        }
+        backgroundLayer = BACKGROUND_LAYER_FAR_SVO;
+        if (BackgroundHitAllowedByExactNear(rayOrigin, rayDir, backgroundHit, backgroundLayer)) {
+            return true;
+        }
+        backgroundLayer = BACKGROUND_LAYER_NONE;
+    }
+    if (!voxelTerrainOnly) {
+        if (RaymarchMidClipmap(rayOrigin, rayDir, startDist, backgroundHit)) {
+            backgroundLayer = BACKGROUND_LAYER_MID_HEIGHT;
+            if (BackgroundHitAllowedByExactNear(rayOrigin, rayDir, backgroundHit, backgroundLayer)) {
+                return true;
+            }
+            backgroundLayer = BACKGROUND_LAYER_NONE;
+        }
+    }
+    if (includeSparseFarField && RaymarchSparseFarField(rayOrigin, rayDir, farStartDist, backgroundHit)) {
+        RayHit resolvedWaterHit;
+        if (TryResolveWaterOccluderForBackgroundHit(
+                rayOrigin, rayDir, farStartDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit)) {
+            backgroundHit = resolvedWaterHit;
+            backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
+            return true;
+        }
+        backgroundLayer = BACKGROUND_LAYER_FAR_SVO;
+        if (BackgroundHitAllowedByExactNear(rayOrigin, rayDir, backgroundHit, backgroundLayer)) {
+            return true;
+        }
+        backgroundLayer = BACKGROUND_LAYER_NONE;
+    }
+    if (hasWaterOccluder) {
+        backgroundHit = waterOccluderHit;
+        backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
+        if (BackgroundHitAllowedByExactNear(rayOrigin, rayDir, backgroundHit, backgroundLayer)) {
+            if (hasElevatedFarSvoCandidateHit &&
+                backgroundHit.distance > max(frame.midFieldParams.y + 512.0f, 1536.0f)) {
+                const float frontBias = max(48.0f, min(backgroundHit.distance * 0.035f, 220.0f));
+                if (elevatedFarSvoCandidateHit.distance <= backgroundHit.distance + frontBias) {
+                    backgroundHit = elevatedFarSvoCandidateHit;
+                    backgroundLayer = BACKGROUND_LAYER_FAR_SVO;
+                }
+            }
+            return true;
+        }
+        backgroundLayer = BACKGROUND_LAYER_NONE;
+    }
+    if (voxelTerrainOnly &&
+        hasDeferredMidInteriorHit &&
+        RaymarchMidVoxelColumnClipmap(rayOrigin, rayDir, startDist, backgroundHit)) {
+        RayHit resolvedWaterHit;
+        if (TryResolveWaterOccluderForBackgroundHit(
+                rayOrigin, rayDir, startDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit)) {
+            backgroundHit = resolvedWaterHit;
+            backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
+            return true;
+        }
+        backgroundLayer = BACKGROUND_LAYER_MID_VOXEL;
+        if (BackgroundHitAllowedByExactNear(rayOrigin, rayDir, backgroundHit, backgroundLayer)) {
+            return true;
+        }
+        backgroundLayer = BACKGROUND_LAYER_NONE;
+    }
+    if (hasDeferredMidInteriorHit) {
+        backgroundHit = deferredMidInteriorHit;
         backgroundLayer = BACKGROUND_LAYER_MID_VOXEL;
         return true;
     }
-    if (RaymarchMidClipmap(rayOrigin, rayDir, startDist, backgroundHit)) {
-        backgroundLayer = BACKGROUND_LAYER_MID_HEIGHT;
-        return true;
-    }
-    const float farStartDist = FarLayerStartAfterBackground(startDist);
-    if (includeSparseFarField && RaymarchSparseFarField(rayOrigin, rayDir, farStartDist, backgroundHit)) {
-        backgroundLayer = BACKGROUND_LAYER_FAR_SVO;
-        return true;
-    }
-
     const bool heightAngleOk = allowWideHeightAngles
-        ? (rayDir.y < 0.24f)
-        : (rayDir.y > -0.28f && rayDir.y < 0.10f);
-    // Respect the ownership start chosen by the caller. Surface-authoritative
-    // mode deliberately pushes background layers behind the near sparse volume;
-    // pulling the far heightfield back toward the camera makes coarse terrain
-    // draw through near-surface holes as warped foreground sheets.
-    const float heightStart = farStartDist;
+        ? (rayDir.y < 0.04f)
+        : (rayDir.y > -0.28f && rayDir.y < 0.04f);
+    // Mid/far sparse ownership starts are conservative visibility boundaries,
+    // not proof that there is no terrain before them. Walking-height rays can
+    // cross a real valley wall before the near sphere/box exit; if the fallback
+    // starts after that crossing, the public view becomes a ring of sky. Probe
+    // from the mid transition for low-altitude continuity while keeping the
+    // high-altitude stress path behind the caller-selected boundary.
+    const float midStartDist = frame.midFieldParams.x > 0.5f ? frame.midFieldParams.y : 160.0f;
+    const float heightContinuityStart = highAltitudeBackgroundView
+        ? max(startDist, min(farStartDist, midStartDist))
+        : max(64.0f, min(max(startDist, 160.0f), midStartDist));
+    const float heightStart = highAltitudeDownwardView
+        ? max(startDist, 32.0f)
+        : heightContinuityStart;
+    if (voxelTerrainOnly) {
+        return false;
+    }
     if (heightAngleOk && RaymarchFarTerrain(rayOrigin, rayDir, heightStart, backgroundHit)) {
         backgroundLayer = BACKGROUND_LAYER_FAR_HEIGHT;
-        return true;
+        if (BackgroundHitAllowedByExactNear(rayOrigin, rayDir, backgroundHit, backgroundLayer)) {
+            return true;
+        }
+        backgroundLayer = BACKGROUND_LAYER_NONE;
     }
 
     return false;
 }
 
 RayHit DebugBackgroundLayerHit(RayHit hit, uint layer) {
+    if ((hit.diagnosticFlags & RAY_DIAGNOSTIC_MID_PARENT_HELD) != 0u) {
+        RecordRenderLodParentHeld();
+    }
+    if ((hit.diagnosticFlags & RAY_DIAGNOSTIC_MID_INTERIOR_FALLBACK) != 0u) {
+        RecordRenderMidInteriorFallback();
+    }
     if (layer == BACKGROUND_LAYER_MID_VOXEL) {
         RecordRenderOwnership(RENDER_OWNER_MID_VOXEL);
     } else if (layer == BACKGROUND_LAYER_MID_HEIGHT) {
@@ -2180,8 +4662,105 @@ RayHit DebugBackgroundLayerHit(RayHit hit, uint layer) {
         RecordRenderOwnership(RENDER_OWNER_FAR_SVO);
     } else if (layer == BACKGROUND_LAYER_FAR_HEIGHT) {
         RecordRenderOwnership(RENDER_OWNER_FAR_HEIGHT);
+    } else if (layer == BACKGROUND_LAYER_FAR_WATER) {
+        RecordRenderOwnership(RENDER_OWNER_FAR_WATER);
     } else {
         RecordRenderOwnership(RENDER_OWNER_MISS);
+    }
+    if (frame.debugMode == 58u) {
+        hit.color.rgb = DebugOwnerLayerColor(layer);
+        return hit;
+    }
+    if (frame.debugMode == 61u) {
+        hit.color.rgb = layer == BACKGROUND_LAYER_FAR_WATER
+            ? float3(0.02f, 0.88f, 1.0f)
+            : float3(0.92f, 0.22f, 0.05f);
+        return hit;
+    }
+    if (frame.debugMode == 55u) {
+        if (layer == BACKGROUND_LAYER_MID_VOXEL) {
+            if ((hit.diagnosticFlags & RAY_DIAGNOSTIC_MID_INTERIOR_FALLBACK) != 0u) {
+                hit.color.rgb = float3(1.0f, 0.08f, 0.02f);
+            } else if ((hit.diagnosticFlags & RAY_DIAGNOSTIC_MID_PARENT_HELD) != 0u) {
+                hit.color.rgb = float3(0.86f, 0.18f, 1.0f);
+            } else {
+                hit.color.rgb = float3(0.05f, 0.95f, 0.25f);
+            }
+        } else if (layer == BACKGROUND_LAYER_FAR_SVO) {
+            hit.color.rgb = float3(0.20f, 0.42f, 1.0f);
+        } else if (layer == BACKGROUND_LAYER_FAR_WATER) {
+            hit.color.rgb = float3(0.04f, 0.28f, 0.95f);
+        } else if (layer == BACKGROUND_LAYER_MID_HEIGHT || layer == BACKGROUND_LAYER_FAR_HEIGHT) {
+            hit.color.rgb = float3(1.0f, 0.86f, 0.08f);
+        } else {
+            hit.color.rgb = float3(0.12f, 0.14f, 0.16f);
+        }
+        return hit;
+    }
+    if (frame.debugMode == 68u) {
+        if (layer == BACKGROUND_LAYER_MID_VOXEL) {
+            if ((hit.diagnosticFlags & RAY_DIAGNOSTIC_MID_CLOSURE) != 0u) {
+                hit.color.rgb = float3(1.0f, 0.82f, 0.02f);
+            } else if ((hit.diagnosticFlags & RAY_DIAGNOSTIC_MID_COLUMN) != 0u) {
+                hit.color.rgb = float3(0.02f, 0.90f, 1.0f);
+            } else if ((hit.diagnosticFlags & RAY_DIAGNOSTIC_MID_INTERIOR_FALLBACK) != 0u) {
+                hit.color.rgb = float3(1.0f, 0.08f, 0.02f);
+            } else if ((hit.diagnosticFlags & RAY_DIAGNOSTIC_MID_PARENT_HELD) != 0u) {
+                hit.color.rgb = float3(0.86f, 0.18f, 1.0f);
+            } else {
+                hit.color.rgb = float3(0.05f, 0.95f, 0.25f);
+            }
+        } else if (layer == BACKGROUND_LAYER_FAR_SVO) {
+            hit.color.rgb = float3(0.20f, 0.42f, 1.0f);
+        } else if (layer == BACKGROUND_LAYER_FAR_WATER) {
+            hit.color.rgb = float3(0.04f, 0.28f, 0.95f);
+        } else if (layer == BACKGROUND_LAYER_MID_HEIGHT || layer == BACKGROUND_LAYER_FAR_HEIGHT) {
+            hit.color.rgb = float3(1.0f, 0.86f, 0.08f);
+        } else {
+            hit.color.rgb = float3(0.12f, 0.14f, 0.16f);
+        }
+        return hit;
+    }
+    if (frame.debugMode == 56u) {
+        if ((hit.diagnosticFlags & RAY_DIAGNOSTIC_MID_INTERIOR_FALLBACK) != 0u) {
+            hit.color.rgb = lerp(DebugOwnerMaterialColor(hit.color.rgb, layer), float3(1.0f, 0.08f, 0.02f), 0.45f);
+        } else if ((hit.diagnosticFlags & RAY_DIAGNOSTIC_MID_PARENT_HELD) != 0u) {
+            hit.color.rgb = lerp(DebugOwnerMaterialColor(hit.color.rgb, layer), float3(0.86f, 0.18f, 1.0f), 0.45f);
+        } else {
+            hit.color.rgb = DebugOwnerMaterialColor(hit.color.rgb, layer);
+        }
+        return hit;
+    }
+    if (CameraUnderwaterForShading() &&
+        frame.debugMode != 49u &&
+        frame.debugMode != 50u) {
+        const float underwaterFog = saturate((hit.distance - 6.0f) / 92.0f);
+        const float waterColumn = saturate((hit.distance - 72.0f) / 300.0f);
+        const float farLayerBoost =
+            (layer == BACKGROUND_LAYER_FAR_HEIGHT || layer == BACKGROUND_LAYER_MID_HEIGHT) ? 0.13f : 0.02f;
+        const float fogStrength = saturate(0.30f + underwaterFog * 0.30f + waterColumn * 0.22f + farLayerBoost);
+        const float3 waterTint = lerp(float3(0.15f, 0.36f, 0.40f), float3(0.12f, 0.32f, 0.36f), waterColumn);
+        hit.color.rgb = lerp(hit.color.rgb, waterTint, fogStrength);
+    }
+    if (frame.debugMode != 49u &&
+        frame.debugMode != 50u &&
+        frame.cameraPosition.y <= 384.0f) {
+        const bool atmosphericBackground =
+            layer == BACKGROUND_LAYER_MID_VOXEL ||
+            layer == BACKGROUND_LAYER_MID_HEIGHT ||
+            layer == BACKGROUND_LAYER_FAR_SVO ||
+            layer == BACKGROUND_LAYER_FAR_HEIGHT;
+        if (atmosphericBackground) {
+            const float ownershipRadius = max(frame.nearOwnershipParams.w, ExactNearDistance());
+            const float nearContext = 1.0f - saturate((hit.distance - ownershipRadius) / 2200.0f);
+            const float farContext = saturate((hit.distance - frame.midFieldParams.y) /
+                max(frame.midFieldParams.z - frame.midFieldParams.y, 1.0f));
+            const float layerWeight =
+                (layer == BACKGROUND_LAYER_FAR_SVO || layer == BACKGROUND_LAYER_FAR_HEIGHT) ? 0.24f : 0.18f;
+            const float atmosphere = saturate(nearContext * layerWeight + farContext * 0.10f);
+            const float3 contextSky = SkyColor(float3(0.0f, -0.06f, 0.998f));
+            hit.color.rgb = lerp(hit.color.rgb, contextSky, atmosphere);
+        }
     }
     if (frame.debugMode != 49u && frame.debugMode != 50u) {
         return hit;
@@ -2196,6 +4775,8 @@ RayHit DebugBackgroundLayerHit(RayHit hit, uint layer) {
         tint = float3(0.85f, 0.24f, 1.0f);
     } else if (layer == BACKGROUND_LAYER_FAR_HEIGHT) {
         tint = float3(0.45f, 1.0f, 0.30f);
+    } else if (layer == BACKGROUND_LAYER_FAR_WATER) {
+        tint = float3(0.05f, 0.32f, 1.0f);
     }
     if (frame.debugMode == 50u) {
         hit.color.rgb = tint;
@@ -2205,12 +4786,607 @@ RayHit DebugBackgroundLayerHit(RayHit hit, uint layer) {
     return hit;
 }
 
-RayHit DebugBackgroundMissHit(float3 rayDir) {
-    const bool expectedSky = rayDir.y > -0.12f;
-    RecordRenderOwnership(expectedSky ? RENDER_OWNER_SKY : RENDER_OWNER_MISS);
-    if (frame.debugMode == 50u) {
-        if (expectedSky) {
+RayHit DebugBackgroundLayerHitWithExactFeedback(
+    float3 rayOrigin,
+    float3 rayDir,
+    RayHit hit,
+    uint layer)
+{
+    if (frame.debugMode == 70u) {
+        return DebugWaterlineResolverReasonHit(rayOrigin, rayDir, hit, layer);
+    }
+    RayHit exactHit;
+    if (ResolveExactSparseSurfaceBeforeBackground(rayOrigin, rayDir, hit, layer, exactHit)) {
+        RecordRenderOwnership(RENDER_OWNER_SURFACE);
+        return exactHit;
+    }
+    RayHit deterministicWaterHit;
+    if (TryResolveDeterministicWaterBeforeBackground(
+            rayOrigin,
+            rayDir,
+            hit,
+            layer,
+            deterministicWaterHit)) {
+        RecordRenderOwnership(RENDER_OWNER_FAR_WATER);
+        return DebugBackgroundLayerHit(deterministicWaterHit, BACKGROUND_LAYER_FAR_WATER);
+    }
+    RecordHiddenExactFallbackSampleForBackgroundHit(rayOrigin, rayDir, hit, layer);
+    return DebugBackgroundLayerHit(hit, layer);
+}
+
+bool DiagnosticFarTerrainWouldHit(float3 rayOrigin, float3 rayDir, float startDist, out float hitT) {
+    hitT = 1e20f;
+    if (!VoxelTerrainOnly()) {
+        return false;
+    }
+    if (rayDir.y > 0.42f || rayDir.y < -0.92f) {
+        return false;
+    }
+
+    const float farMaxDist = 10400.0f;
+    float t = max(startDist, 160.0f);
+    float mountainMask, spireMask, ravineMask;
+    float3 previousPos = rayOrigin + rayDir * t;
+    float previousHeight = FarTerrainHeight(previousPos.xz, mountainMask, spireMask, ravineMask);
+    float previousSigned = previousPos.y - previousHeight;
+    float previousT = t;
+
+    if (previousSigned <= 0.0f) {
+        float originMountainMask, originSpireMask, originRavineMask;
+        const float originHeight = FarTerrainHeight(
+            rayOrigin.xz,
+            originMountainMask,
+            originSpireMask,
+            originRavineMask);
+        if (rayOrigin.y > originHeight) {
+            hitT = t;
+            return true;
+        }
+    }
+
+    [loop]
+    for (int i = 0; i < 112 && t < farMaxDist; ++i) {
+        const bool nearSkylineProbe =
+            rayOrigin.y <= 384.0f &&
+            rayDir.y > -0.06f &&
+            rayDir.y < 0.24f &&
+            t < 3600.0f;
+        const float distanceStep = nearSkylineProbe
+            ? 36.0f
+            : lerp(56.0f, 220.0f, saturate(t / farMaxDist));
+        float stepSize = distanceStep;
+        if (previousSigned > 0.0f && rayDir.y < -0.015f) {
+            const float verticalStep = previousSigned / max(-rayDir.y, 0.030f);
+            stepSize = clamp(verticalStep * 0.50f, nearSkylineProbe ? 12.0f : 24.0f, distanceStep);
+        }
+        t += stepSize;
+
+        float3 pos = rayOrigin + rayDir * t;
+        const float height = FarTerrainHeight(pos.xz, mountainMask, spireMask, ravineMask);
+        const float signedDistance = pos.y - height;
+        if (signedDistance <= 0.0f && previousSigned > 0.0f) {
+            hitT = t;
+            return true;
+        }
+        previousSigned = signedDistance;
+        previousT = t;
+    }
+    return false;
+}
+
+bool BuildDeterministicFarTerrainContinuityHit(
+    float3 rayOrigin,
+    float3 rayDir,
+    float diagnosticTerrainT,
+    out RayHit continuityHit)
+{
+    continuityHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
+    if (!VoxelTerrainOnly() || diagnosticTerrainT >= 1e19f) {
+        return false;
+    }
+
+    const float hitT = max(diagnosticTerrainT, 32.0f);
+    if (hitT > 13312.0f) {
+        return false;
+    }
+
+    const float3 hitPos = rayOrigin + rayDir * hitT;
+    float mountainMask;
+    float spireMask;
+    float ravineMask;
+    const float height = FarTerrainHeight(hitPos.xz, mountainMask, spireMask, ravineMask);
+
+    const uint material = FarTerrainMaterial(hitPos.xz, height, mountainMask, spireMask, ravineMask);
+    if (material == MAT_AIR) {
+        return false;
+    }
+
+    if (frame.debugMode == 54u || frame.debugMode == 56u) {
+        continuityHit = MakeHit(float4(DebugMaterialColor(material), 1.0f), hitT);
+        return true;
+    }
+    if (frame.debugMode == 59u) {
+        const float cellShade = saturate(FarFallbackCellSize(hitT) / 160.0f);
+        continuityHit = MakeHit(float4(0.34f, cellShade, 1.0f - cellShade * 0.55f, 1.0f), hitT);
+        return true;
+    }
+    if (frame.debugMode == 62u) {
+        continuityHit = MakeHit(float4(DebugClosureColor(hitPos), 1.0f), hitT);
+        return true;
+    }
+
+    float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, (material + 0.5f) / 256.0f, 0);
+    baseColor.rgb = FarTerrainMaterialVariation(baseColor.rgb, material, hitPos.xz, hitPos.y, hitT);
+    const float3 normal = DistantLodShadeNormal(FarTerrainNormal(hitPos.xz), hitT, 0.46f);
+    const float ndotl = saturate(dot(normal, SkySunDirection()) * 0.56f + 0.34f);
+    float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.74f + ndotl * 0.34f);
+    color = max(color, baseColor.rgb * 0.56f + 0.040f);
+    const float gridFade = saturate((hitT - 1200.0f) / 6200.0f);
+    const float grid = VoxelGridLine(hitPos.xz, FarFallbackCellSize(hitT), lerp(0.030f, 0.016f, gridFade));
+    color *= lerp(1.0f, 0.970f, grid);
+    const float fogFactor = saturate((hitT - 900.0f) / (10400.0f - 900.0f));
+    const float horizonHaze = saturate((0.20f - abs(rayDir.y)) / 0.20f);
+    if (frame.debugMode == 60u) {
+        const float debugFog = saturate(fogFactor * 0.42f + horizonHaze * 0.14f);
+        continuityHit = MakeHit(float4(float3(debugFog, debugFog, debugFog), 1.0f), hitT);
+        return true;
+    }
+    color = lerp(color, SkyColor(rayDir), fogFactor * 0.42f + horizonHaze * 0.14f);
+    continuityHit = MakeHit(float4(color, 1.0f), hitT);
+    return true;
+}
+
+bool DiagnosticFarTerrainSampledRangeHit(
+    float3 rayOrigin,
+    float3 rayDir,
+    float startDist,
+    float endDist,
+    out float hitT)
+{
+    hitT = 1e20f;
+    if (!VoxelTerrainOnly()) {
+        return false;
+    }
+    if (rayDir.y > 0.42f || rayDir.y < -0.92f) {
+        return false;
+    }
+
+    const float rangeStart = max(startDist, 160.0f);
+    const float rangeEnd = min(max(endDist, rangeStart + 1.0f), 10400.0f);
+    if (rangeEnd <= rangeStart + 1.0f) {
+        return false;
+    }
+
+    [unroll]
+    for (int i = 0; i < 6; ++i) {
+        const float u = ((float)i + 1.0f) / 7.0f;
+        const float t = lerp(rangeStart, rangeEnd, u);
+        const float3 pos = rayOrigin + rayDir * t;
+        float mountainMask, spireMask, ravineMask;
+        const float height = FarTerrainHeight(pos.xz, mountainMask, spireMask, ravineMask);
+        if (pos.y <= height - 0.5f) {
+            hitT = t;
+            return true;
+        }
+    }
+    return false;
+}
+
+static const uint TERRAIN_SKY_REASON_LEGITIMATE_SKY = 0u;
+static const uint TERRAIN_SKY_REASON_BEFORE_ALLOWED_START = 1u;
+static const uint TERRAIN_SKY_REASON_MID_BRICK_MISSING = 2u;
+static const uint TERRAIN_SKY_REASON_MID_SAMPLED_AIR = 3u;
+static const uint TERRAIN_SKY_REASON_MID_REJECTED = 4u;
+static const uint TERRAIN_SKY_REASON_FAR_SVO_UNAVAILABLE_OR_REJECTED = 5u;
+
+float TerrainDiagnosticStartDistance() {
+    const float midStart = frame.midFieldParams.x > 0.5f
+        ? max(frame.midFieldParams.y, 1.0f)
+        : 160.0f;
+    return max(160.0f, min(midStart, ExactNearDistance() + 8.0f));
+}
+
+bool TryBuildResidentMidVoxelClosureHit(
+    float3 rayOrigin,
+    float3 rayDir,
+    float terrainT,
+    out RayHit closureHit)
+{
+    closureHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
+    if (terrainT >= 1e19f || frame.midFieldParams.x < 0.5f) {
+        return false;
+    }
+
+    uint4 header = MidVoxelClipmapMetadata[0];
+    const uint ringCount = min(header.w >> 24u, MID_CLIPMAP_MAX_SHADER_RINGS);
+    if (header.x != MID_VOXEL_CLIPMAP_MAGIC || header.z == 0u || ringCount == 0u) {
+        return false;
+    }
+
+    const float startDistance = max(frame.midFieldParams.y, 1.0f);
+    const float endDistance = max(frame.midFieldParams.z, startDistance + 1.0f);
+    const bool highAltitudePreMidClosure =
+        rayOrigin.y > 384.0f &&
+        rayDir.y > -0.92f &&
+        rayDir.y <= 0.42f;
+    // In broad/free-camera views the exact sparse surface is a detail layer,
+    // not the only valid foreground owner. If exact misses a downward ray
+    // before midStart, resident ring0 mid voxels should still be allowed to
+    // carry the public pixel. Rejecting these pre-mid crossings forces the
+    // analytic far-height continuity fallback even when voxel data is resident.
+    const float minClosureDistance = highAltitudePreMidClosure
+        ? 32.0f
+        : startDistance;
+    if (terrainT < minClosureDistance || terrainT > endDistance) {
+        return false;
+    }
+    const bool allowCoarserParentFallback =
+        highAltitudePreMidClosure ||
+        (rayOrigin.y <= 384.0f &&
+         rayDir.y > -0.58f &&
+         rayDir.y < 0.18f);
+
+    uint voxel = PackVoxel(MAT_AIR, 0, 0, 0);
+    uint actualRing = 0u;
+    float actualCellSize = MidClipmapRingCellSize(0u);
+    uint material = MAT_AIR;
+    uint closurePreferredRing = 0u;
+    float closureT = terrainT;
+    float3 hitPos = rayOrigin + rayDir * closureT;
+    float ringDistance = max(closureT, startDistance);
+    const uint probeCount = highAltitudePreMidClosure ? 4u : 1u;
+    bool foundResidentSolid = false;
+
+    [loop]
+    for (uint probeIndex = 0u; probeIndex < 4u; ++probeIndex) {
+        if (probeIndex >= probeCount) {
+            break;
+        }
+        const float probeT = min(terrainT + (float)probeIndex * 12.0f, endDistance);
+        const float probeRingDistance = max(probeT, startDistance);
+        const uint preferredRing = min(
+            (uint)floor(saturate((probeRingDistance - startDistance) / max(endDistance - startDistance, 1.0f)) *
+                (float)ringCount),
+            ringCount - 1u);
+        const float3 probePos = rayOrigin + rayDir * probeT;
+        uint probeVoxel;
+        uint probeActualRing;
+        float probeActualCellSize;
+        if (!SampleResidentMidVoxelFallback(
+                probePos,
+                preferredRing,
+                allowCoarserParentFallback,
+                probeVoxel,
+                probeActualRing,
+                probeActualCellSize)) {
+            continue;
+        }
+        const uint probeMaterial = GetMaterial(probeVoxel);
+        if (probeMaterial == MAT_AIR) {
+            continue;
+        }
+        voxel = probeVoxel;
+        actualRing = probeActualRing;
+        actualCellSize = probeActualCellSize;
+        material = probeMaterial;
+        closurePreferredRing = preferredRing;
+        closureT = probeT;
+        hitPos = probePos;
+        ringDistance = probeRingDistance;
+        foundResidentSolid = true;
+        break;
+    }
+
+    if (!foundResidentSolid) {
+        return false;
+    }
+
+    float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, (material + 0.5f) / 256.0f, 0);
+    baseColor.rgb = ApplyWaterlineWetTerrainTint(baseColor.rgb, material, hitPos.y, 1.0f, 0.58f);
+
+    const float3 shadeNormal = float3(0.0f, 1.0f, 0.0f);
+    const float ndotl = saturate(dot(shadeNormal, SkySunDirection()) * 0.52f + 0.34f);
+    float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.78f + ndotl * 0.30f);
+    color = max(color, baseColor.rgb * 0.54f + 0.045f);
+    const float fogFactor = saturate((ringDistance - startDistance) / max(endDistance - startDistance, 1.0f));
+    color = lerp(color, SkyColor(rayDir), fogFactor * 0.50f);
+
+    closureHit = MakeHit(float4(color, baseColor.a), closureT);
+    closureHit.diagnosticFlags |= RAY_DIAGNOSTIC_MID_CLOSURE;
+    if (actualRing > closurePreferredRing) {
+        closureHit.diagnosticFlags |= RAY_DIAGNOSTIC_MID_PARENT_HELD;
+    }
+    return true;
+}
+
+uint DiagnoseTerrainSkyReason(
+    float3 rayOrigin,
+    float3 rayDir,
+    float backgroundAllowedStart,
+    out float diagnosticTerrainT)
+{
+    diagnosticTerrainT = 1e20f;
+    const float terrainDiagnosticStart = TerrainDiagnosticStartDistance();
+    const bool hasBeforeAllowedTerrain =
+        backgroundAllowedStart > terrainDiagnosticStart + 8.0f &&
+        DiagnosticFarTerrainSampledRangeHit(
+            rayOrigin,
+            rayDir,
+            terrainDiagnosticStart,
+            backgroundAllowedStart,
+            diagnosticTerrainT);
+    if (hasBeforeAllowedTerrain) {
+        return TERRAIN_SKY_REASON_BEFORE_ALLOWED_START;
+    }
+    if (!DiagnosticFarTerrainSampledRangeHit(
+            rayOrigin,
+            rayDir,
+            backgroundAllowedStart,
+            backgroundAllowedStart + 3200.0f,
+            diagnosticTerrainT)) {
+        return TERRAIN_SKY_REASON_LEGITIMATE_SKY;
+    }
+
+    if (frame.midFieldParams.x < 0.5f) {
+        return TERRAIN_SKY_REASON_FAR_SVO_UNAVAILABLE_OR_REJECTED;
+    }
+
+    uint4 header = MidVoxelClipmapMetadata[0];
+    const uint ringCount = min(header.w >> 24u, MID_CLIPMAP_MAX_SHADER_RINGS);
+    if (header.x != MID_VOXEL_CLIPMAP_MAGIC || header.z == 0u || ringCount == 0u) {
+        return TERRAIN_SKY_REASON_FAR_SVO_UNAVAILABLE_OR_REJECTED;
+    }
+
+    const float midStart = max(frame.midFieldParams.y, 1.0f);
+    const float midEnd = max(frame.midFieldParams.z, midStart + 1.0f);
+    if (diagnosticTerrainT < midStart || diagnosticTerrainT > midEnd) {
+        return TERRAIN_SKY_REASON_FAR_SVO_UNAVAILABLE_OR_REJECTED;
+    }
+
+    const uint preferredRing = min(
+        (uint)floor(saturate((diagnosticTerrainT - midStart) / max(midEnd - midStart, 1.0f)) *
+            (float)ringCount),
+        ringCount - 1u);
+    const float3 diagnosticPos = rayOrigin + rayDir * diagnosticTerrainT;
+    uint diagnosticVoxel;
+    uint actualRing;
+    float actualCellSize;
+    const bool allowCoarserParentFallback =
+        rayOrigin.y <= 384.0f &&
+        rayDir.y > -0.58f &&
+        rayDir.y < 0.18f;
+    if (!SampleResidentMidVoxelFallback(
+            diagnosticPos,
+            preferredRing,
+            allowCoarserParentFallback,
+            diagnosticVoxel,
+            actualRing,
+            actualCellSize)) {
+        return TERRAIN_SKY_REASON_MID_BRICK_MISSING;
+    }
+    if (actualRing > preferredRing) {
+        return TERRAIN_SKY_REASON_MID_REJECTED;
+    }
+    if (GetMaterial(diagnosticVoxel) == MAT_AIR) {
+        return TERRAIN_SKY_REASON_MID_SAMPLED_AIR;
+    }
+
+    RayHit diagnosticHit = MakeHit(float4(1.0f, 1.0f, 1.0f, 1.0f), diagnosticTerrainT);
+    if (!BackgroundHitAllowedByExactNear(rayOrigin, rayDir, diagnosticHit, BACKGROUND_LAYER_MID_VOXEL)) {
+        return TERRAIN_SKY_REASON_MID_REJECTED;
+    }
+
+    return TERRAIN_SKY_REASON_FAR_SVO_UNAVAILABLE_OR_REJECTED;
+}
+
+float3 TerrainSkyReasonColor(uint reason) {
+    if (reason == TERRAIN_SKY_REASON_BEFORE_ALLOWED_START) {
+        return float3(1.0f, 0.05f, 0.02f);
+    }
+    if (reason == TERRAIN_SKY_REASON_MID_BRICK_MISSING) {
+        return float3(1.0f, 0.58f, 0.04f);
+    }
+    if (reason == TERRAIN_SKY_REASON_MID_SAMPLED_AIR) {
+        return float3(0.02f, 0.86f, 1.0f);
+    }
+    if (reason == TERRAIN_SKY_REASON_MID_REJECTED) {
+        return float3(1.0f, 0.02f, 0.78f);
+    }
+    if (reason == TERRAIN_SKY_REASON_FAR_SVO_UNAVAILABLE_OR_REJECTED) {
+        return float3(0.48f, 0.16f, 1.0f);
+    }
+    return float3(0.18f, 0.42f, 0.95f);
+}
+
+RayHit DebugBackgroundMissHit(
+    float3 rayOrigin,
+    float3 rayDir,
+    float startDist,
+    bool nearSparseHole,
+    bool runTerrainSkyReasonDebug)
+{
+    if (frame.cameraPosition.y < FAR_WATER_SURFACE_Y - 1.0f && rayDir.y > 0.015f) {
+        RecordRenderOwnership(RENDER_OWNER_SKY);
+        if (frame.debugMode == 50u) {
             return MakeHit(float4(0.18f, 0.42f, 0.95f, 1.0f), 1e20f);
+        }
+        const float surfaceBlend = saturate((rayDir.y - 0.015f) / 0.42f);
+        float3 skyThroughWater = SkyColor(rayDir);
+        const float3 shallowWaterTint = float3(0.10f, 0.28f, 0.33f);
+        const float3 surfaceHaze = float3(0.19f, 0.41f, 0.46f);
+        const float3 waterVolume = lerp(shallowWaterTint, surfaceHaze, surfaceBlend * 0.42f);
+        skyThroughWater = lerp(skyThroughWater, waterVolume, 0.76f + surfaceBlend * 0.16f);
+        skyThroughWater = min(skyThroughWater, float3(0.30f, 0.53f, 0.58f));
+        return MakeHit(float4(skyThroughWater, 1.0f), 1e20f);
+    }
+
+    const bool voxelTerrainOnly = VoxelTerrainOnly();
+    const bool highAltitudeHorizonSky =
+        frame.cameraPosition.y > 384.0f && rayDir.y > -0.16f;
+    const bool lowAltitudeVoxelMountainSilhouetteRay =
+        voxelTerrainOnly && frame.cameraPosition.y <= 384.0f;
+    const bool expectedSky =
+        (lowAltitudeVoxelMountainSilhouetteRay ? (rayDir.y > 0.36f) : (rayDir.y > -0.01f)) ||
+        highAltitudeHorizonSky;
+    if (frame.debugMode == 57u && runTerrainSkyReasonDebug) {
+        float reasonTerrainT = 1e20f;
+        const uint reason = DiagnoseTerrainSkyReason(rayOrigin, rayDir, startDist, reasonTerrainT);
+        RecordRenderOwnership(reason == TERRAIN_SKY_REASON_LEGITIMATE_SKY
+            ? RENDER_OWNER_SKY
+            : RENDER_OWNER_MISS);
+        if (reason != TERRAIN_SKY_REASON_LEGITIMATE_SKY) {
+            const float3 diagnosticPos = rayOrigin + rayDir * reasonTerrainT;
+            const int3 diagnosticBrick = int3(
+                FloorDiv16((int)floor(diagnosticPos.x)),
+                FloorDiv16((int)floor(diagnosticPos.y)),
+                FloorDiv16((int)floor(diagnosticPos.z)));
+            RecordUnsafeSparseMissSample(diagnosticBrick, reasonTerrainT);
+        }
+        return MakeHit(float4(TerrainSkyReasonColor(reason), 1.0f), reasonTerrainT);
+    }
+    float diagnosticTerrainT = 1e20f;
+    const bool hiddenVoxelTerrainMiss =
+        DiagnosticFarTerrainWouldHit(rayOrigin, rayDir, startDist, diagnosticTerrainT);
+    const bool underwaterVolume =
+        CameraUnderwaterForShading() &&
+        !expectedSky;
+    const bool hiddenNearVoxelTerrainMiss =
+        hiddenVoxelTerrainMiss &&
+        nearSparseHole &&
+        diagnosticTerrainT <= max(ExactNearDistance(), 224.0f) + 160.0f &&
+        !underwaterVolume;
+    const bool cleanExactSparseAir =
+        hiddenVoxelTerrainMiss &&
+        !nearSparseHole &&
+        diagnosticTerrainT <= max(ExactNearDistance(), 224.0f) + 160.0f &&
+        !underwaterVolume;
+    const bool backgroundHiddenTerrainMiss =
+        hiddenVoxelTerrainMiss &&
+        !cleanExactSparseAir;
+    const bool terrainFacingSparseMiss =
+        (nearSparseHole || hiddenNearVoxelTerrainMiss) &&
+        !underwaterVolume &&
+        rayDir.y > -0.88f;
+    const bool valleyAtmosphere =
+        !voxelTerrainOnly &&
+        !underwaterVolume &&
+        !terrainFacingSparseMiss &&
+        !expectedSky &&
+        rayDir.y > -0.88f;
+    const bool voxelOnlyAir =
+        voxelTerrainOnly &&
+        !underwaterVolume &&
+        !terrainFacingSparseMiss;
+    if (backgroundHiddenTerrainMiss && frame.debugMode != 50u) {
+        RayHit closureHit;
+        if (TryBuildResidentMidVoxelClosureHit(rayOrigin, rayDir, diagnosticTerrainT, closureHit)) {
+            RecordRenderOwnership(RENDER_OWNER_MID_VOXEL);
+            if ((closureHit.diagnosticFlags & RAY_DIAGNOSTIC_MID_PARENT_HELD) != 0u) {
+                RecordRenderLodParentHeld();
+            }
+            return closureHit;
+        }
+        RayHit continuityHit;
+        if (BuildDeterministicFarTerrainContinuityHit(rayOrigin, rayDir, diagnosticTerrainT, continuityHit)) {
+            RecordFarHeightContinuityReason(rayOrigin, rayDir, diagnosticTerrainT);
+            RecordHiddenExactFallbackSampleForBackgroundHit(
+                rayOrigin,
+                rayDir,
+                continuityHit,
+                BACKGROUND_LAYER_FAR_HEIGHT);
+            return DebugBackgroundLayerHit(continuityHit, BACKGROUND_LAYER_FAR_HEIGHT);
+        }
+    }
+    RecordRenderOwnership(terrainFacingSparseMiss
+        ? RENDER_OWNER_UNSAFE_NEAR_MISS
+        : (backgroundHiddenTerrainMiss
+            ? RENDER_OWNER_MISS
+            : ((expectedSky || voxelOnlyAir)
+                ? RENDER_OWNER_SKY
+                : (underwaterVolume
+                    ? RENDER_OWNER_WATER_CONTEXT
+                    : (valleyAtmosphere ? RENDER_OWNER_VALLEY_ATMOSPHERE : RENDER_OWNER_MISS)))));
+    if (frame.debugMode == 58u) {
+        if (terrainFacingSparseMiss || backgroundHiddenTerrainMiss) {
+            return MakeHit(float4(1.0f, 0.05f, 0.02f, 1.0f), 1e20f);
+        }
+        if (underwaterVolume) {
+            return MakeHit(float4(0.02f, 0.78f, 1.0f, 1.0f), 1e20f);
+        }
+        if (valleyAtmosphere) {
+            return MakeHit(float4(0.58f, 0.70f, 0.72f, 1.0f), 1e20f);
+        }
+        return MakeHit(float4(0.02f, 0.05f, 0.18f, 1.0f), 1e20f);
+    }
+    if (frame.debugMode == 61u) {
+        return MakeHit(float4(0.04f, 0.05f, 0.08f, 1.0f), 1e20f);
+    }
+    if (hiddenNearVoxelTerrainMiss || (frame.debugMode == 50u && backgroundHiddenTerrainMiss)) {
+        const float3 diagnosticPos = rayOrigin + rayDir * diagnosticTerrainT;
+        const int3 diagnosticBrick = int3(
+            FloorDiv16((int)floor(diagnosticPos.x)),
+            FloorDiv16((int)floor(diagnosticPos.y)),
+            FloorDiv16((int)floor(diagnosticPos.z)));
+        RecordUnsafeSparseMissSample(diagnosticBrick, diagnosticTerrainT);
+    }
+    if (frame.debugMode == 50u) {
+        if (hiddenNearVoxelTerrainMiss) {
+            return MakeHit(float4(1.0f, 0.02f, 0.75f, 1.0f), diagnosticTerrainT);
+        }
+        if (backgroundHiddenTerrainMiss) {
+            const float midStart = max(frame.midFieldParams.y, 1.0f);
+            const float midEnd = max(frame.midFieldParams.z, midStart + 1.0f);
+            uint4 midVoxelHeader = MidVoxelClipmapMetadata[0];
+            const uint midVoxelRingCount = max(midVoxelHeader.w >> 24u, 1u);
+            const uint diagnosticRing = min(
+                (uint)floor(saturate((diagnosticTerrainT - midStart) / max(midEnd - midStart, 1.0f)) *
+                    (float)midVoxelRingCount),
+                midVoxelRingCount - 1u);
+            uint diagnosticVoxel;
+            uint diagnosticActualRing;
+            float diagnosticCellSize;
+            if (SampleResidentMidVoxelFallback(
+                    rayOrigin + rayDir * diagnosticTerrainT,
+                    diagnosticRing,
+                    false,
+                    diagnosticVoxel,
+                    diagnosticActualRing,
+                    diagnosticCellSize)) {
+                const uint diagnosticMaterial = GetMaterial(diagnosticVoxel);
+                if (diagnosticMaterial != MAT_AIR) {
+                    float3 diagnosticNormal;
+                    const bool diagnosticTaggedSurface =
+                        IsResidentMidVoxelTaggedSurface(diagnosticVoxel);
+                    const bool diagnosticExposedSurface =
+                        IsResidentMidVoxelExposed(
+                            rayOrigin + rayDir * diagnosticTerrainT,
+                            diagnosticActualRing,
+                            diagnosticCellSize,
+                            diagnosticTerrainT,
+                            diagnosticNormal);
+                    if (diagnosticTaggedSurface) {
+                        return MakeHit(float4(0.05f, 1.0f, 0.10f, 1.0f), diagnosticTerrainT);
+                    }
+                    if (diagnosticExposedSurface) {
+                        return MakeHit(float4(0.00f, 1.0f, 1.0f, 1.0f), diagnosticTerrainT);
+                    }
+                    return MakeHit(float4(1.0f, 0.46f, 0.0f, 1.0f), diagnosticTerrainT);
+                }
+                return MakeHit(float4(0.35f, 0.0f, 1.0f, 1.0f), diagnosticTerrainT);
+            }
+            return MakeHit(float4(1.0f, 0.05f, 0.02f, 1.0f), diagnosticTerrainT);
+        }
+        if (expectedSky || voxelOnlyAir) {
+            return MakeHit(float4(0.18f, 0.42f, 0.95f, 1.0f), 1e20f);
+        }
+        if (terrainFacingSparseMiss) {
+            return MakeHit(float4(1.0f, 0.02f, 0.75f, 1.0f), 1e20f);
+        }
+        if (underwaterVolume) {
+            return MakeHit(float4(0.05f, 0.32f, 1.0f, 1.0f), 1e20f);
+        }
+        if (valleyAtmosphere) {
+            return MakeHit(float4(0.58f, 0.70f, 0.72f, 1.0f), 1e20f);
         }
         // Pure red means the background ownership chain found no resident
         // mid/far layer for this pixel. This is intentionally harsh: it makes
@@ -2219,7 +5395,51 @@ RayHit DebugBackgroundMissHit(float3 rayDir) {
         // with missing terrain ownership.
         return MakeHit(float4(1.0f, 0.05f, 0.02f, 1.0f), 1e20f);
     }
-    return MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
+    float3 color = SkyColor(rayDir);
+    if (terrainFacingSparseMiss) {
+        const float terrainGapFog = saturate((0.08f - rayDir.y) / 0.54f);
+        color = lerp(float3(0.30f, 0.24f, 0.16f), float3(0.50f, 0.40f, 0.26f), terrainGapFog);
+    }
+    if (underwaterVolume) {
+        const float depth = saturate((FAR_SEA_LEVEL - frame.cameraPosition.y) / 96.0f);
+        const float volumeFog = saturate((0.12f - rayDir.y) / 0.72f);
+        const float3 deepWater = float3(0.08f, 0.25f, 0.31f);
+        const float3 litWater = float3(0.18f, 0.40f, 0.45f);
+        color = lerp(color, lerp(litWater, deepWater, depth), 0.56f + volumeFog * 0.26f);
+    }
+    if (valleyAtmosphere) {
+        const float valleyFog = saturate((0.04f - rayDir.y) / 0.42f);
+        const float3 airColor = lerp(SkyColor(rayDir), float3(0.56f, 0.66f, 0.70f), 0.26f);
+        color = lerp(color, airColor, 0.12f + valleyFog * 0.16f);
+    }
+    return MakeHit(float4(color, 1.0f), 1e20f);
+}
+
+bool SurfaceAuthoritativeNearTerrainMiss(float3 rayOrigin, float3 rayDir, float backgroundStart) {
+    if (rayOrigin.y > 384.0f || rayDir.y >= -0.005f || rayDir.y <= -0.88f) {
+        return false;
+    }
+
+    const float exactHoleDistance = max(ExactNearDistance(), 224.0f);
+    const float foregroundLimit = min(
+        max(exactHoleDistance + 96.0f, 384.0f),
+        min(max(backgroundStart + 64.0f, 384.0f), 1024.0f));
+    [loop]
+    for (float terrainT = 8.0f; terrainT <= foregroundLimit; terrainT += 16.0f) {
+        const float3 terrainProbe = rayOrigin + rayDir * terrainT;
+        float mountainMask;
+        float spireMask;
+        float ravineMask;
+        const float terrainHeight = FarTerrainHeight(
+            terrainProbe.xz,
+            mountainMask,
+            spireMask,
+            ravineMask);
+        if (terrainProbe.y <= terrainHeight - 1.0f) {
+            return terrainT < exactHoleDistance + 160.0f;
+        }
+    }
+    return false;
 }
 
 RayHit DebugUnsafeNearMissHit(float3 rayDir) {
@@ -2234,7 +5454,7 @@ RayHit DebugUnsafeNearMissHit(float3 rayDir) {
 }
 
 // DDA Raymarcher
-RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
+RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug) {
     // Must cover the diagonal of the moving render window. Keep this generous:
     // shortening it can make startup look like a black/empty screen while chunks
     // are visible but beyond the ray budget.
@@ -2270,9 +5490,20 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
             true,
             backgroundHit,
             backgroundLayer)) {
-            return DebugBackgroundLayerHit(backgroundHit, backgroundLayer);
+            return DebugBackgroundLayerHitWithExactFeedback(rayOrigin, rayDir, backgroundHit, backgroundLayer);
         }
-        return DebugBackgroundMissHit(rayDir);
+        // A miss behind the surface-authoritative foreground is only an
+        // unsafe near hole when the ray actually crosses expected foreground
+        // terrain. Otherwise this path is ordinary sky/valley ownership and
+        // should not look like a sparse residency failure.
+        const bool nearSurfaceTerrainMiss =
+            SurfaceAuthoritativeNearTerrainMiss(rayOrigin, rayDir, backgroundStart);
+        return DebugBackgroundMissHit(
+            rayOrigin,
+            rayDir,
+            backgroundStart,
+            nearSurfaceTerrainMiss,
+            runTerrainSkyReasonDebug);
     }
 
     // Find ray entry point into grid
@@ -2284,9 +5515,9 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
         RayHit farHit;
         uint farLayer;
         if (RaymarchBackgroundField(rayOrigin, rayDir, 32.0f, true, true, farHit, farLayer)) {
-            return DebugBackgroundLayerHit(farHit, farLayer);
+            return DebugBackgroundLayerHitWithExactFeedback(rayOrigin, rayDir, farHit, farLayer);
         }
-        return DebugBackgroundMissHit(rayDir);
+        return DebugBackgroundMissHit(rayOrigin, rayDir, 32.0f, false, runTerrainSkyReasonDebug);
     }
     if (frame.debugMode == 43u) {
         float shade = saturate((tMax - max(tMin, 0.0f)) / 1024.0f);
@@ -2335,6 +5566,14 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
     sparseCache.hasEntry = 0u;
     bool sawSparseMissing = false;
     float firstSparseMissingDist = 1e20f;
+    int3 firstSparseMissingBrickCoord = int3(0, 0, 0);
+    bool firstSparseMissingTerrainAdjacent = false;
+    bool sawLocalWater = false;
+    RayHit nearWaterPlaneHit;
+    const bool aboveWaterView = rayOrigin.y >= FAR_WATER_SURFACE_Y - 0.5f;
+    const bool hasNearWaterPlane =
+        aboveWaterView &&
+        RaymarchFarWater(rayOrigin, rayDir, 32.0f, nearWaterPlaneHit);
 
     if (frame.debugMode == 44u) {
         bool voxelFromSparse = false;
@@ -2374,6 +5613,24 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
         uint material = GetMaterial(voxel);
 
         if (sparseSkipAcceleration && sparseMissing) {
+            if (!sawSparseMissing) {
+                float3 firstMissingPos = startPos + rayDir * dist;
+                firstSparseMissingBrickCoord = int3(
+                    FloorDiv16(voxelPos.x),
+                    FloorDiv16(voxelPos.y),
+                    FloorDiv16(voxelPos.z));
+                float mountainMask;
+                float spireMask;
+                float ravineMask;
+                const float firstMissingTerrainHeight = FarTerrainHeight(
+                    firstMissingPos.xz,
+                    mountainMask,
+                    spireMask,
+                    ravineMask);
+                firstSparseMissingTerrainAdjacent =
+                    firstMissingPos.y <= firstMissingTerrainHeight + 24.0f &&
+                    firstMissingPos.y >= firstMissingTerrainHeight - 48.0f;
+            }
             sawSparseMissing = true;
             firstSparseMissingDist = min(firstSparseMissingDist, dist);
             float3 currentPos = startPos + rayDir * dist;
@@ -2385,36 +5642,108 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
             continue;
         }
 
+        const bool skipLocalWater =
+            material == MAT_WATER &&
+            (aboveWaterView || rayOrigin.y < FAR_SEA_LEVEL + 8.0f);
+        sawLocalWater = sawLocalWater || skipLocalWater;
+
         // Hit non-air voxel?
-        if (material != MAT_AIR) {
+        if (material != MAT_AIR && !skipLocalWater) {
+            const float hitWorldDistance = entryDist + dist;
+            if (hasNearWaterPlane &&
+                nearWaterPlaneHit.distance <= hitWorldDistance + 0.25f) {
+                // The water plane can be closer than the next voxel-DDA hit
+                // while a raster/extracted exact surface face still exists
+                // before the plane. Route this through the same exact-surface
+                // resolver used by background layers so shoreline terrain is
+                // not hidden by water just because the voxel DDA steps past it.
+                return DebugBackgroundLayerHitWithExactFeedback(
+                    rayOrigin,
+                    rayDir,
+                    nearWaterPlaneHit,
+                    BACKGROUND_LAYER_FAR_WATER);
+            }
             // Sample material color from palette
             float u = (material + 0.5f) / 256.0f;
             float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, u, 0);
+            if (frame.debugMode == 54u || frame.debugMode == 56u) {
+                RecordRenderOwnership(RENDER_OWNER_NEAR);
+                return MakeHit(float4(DebugMaterialColor(material), 1.0f), entryDist + dist);
+            }
+            const float3 hitPos = startPos + rayDir * dist;
+            if (frame.debugMode == 58u) {
+                RecordRenderOwnership(RENDER_OWNER_NEAR);
+                return MakeHit(float4(1.0f, 0.95f, 0.05f, 1.0f), entryDist + dist);
+            }
+            if (frame.debugMode == 59u) {
+                RecordRenderOwnership(RENDER_OWNER_NEAR);
+                const float nearBand = 1.0f - saturate((entryDist + dist) / max(ExactNearDistance(), 1.0f));
+                return MakeHit(float4(1.0f, nearBand, 0.0f, 1.0f), entryDist + dist);
+            }
+            if (frame.debugMode == 61u) {
+                RecordRenderOwnership(RENDER_OWNER_NEAR);
+                const float3 waterDebug = material == MAT_WATER
+                    ? float3(0.02f, 0.88f, 1.0f)
+                    : float3(0.12f, 0.08f, 0.05f);
+                return MakeHit(float4(waterDebug, 1.0f), entryDist + dist);
+            }
+            if (frame.debugMode == 62u) {
+                RecordRenderOwnership(RENDER_OWNER_NEAR);
+                return MakeHit(float4(DebugClosureColor(hitPos), 1.0f), entryDist + dist);
+            }
+            baseColor.rgb = ApplyWaterlineWetTerrainTint(baseColor.rgb, material, hitPos.y, normal.y, 0.78f);
 
             // Simple skybox/IBL-style lighting: direct sun plus directional
             // sky/ground ambient so shaded cliffs still read in the vertical world.
             float3 lightDir = SkySunDirection();
-            float ndotl = saturate(dot(normal, lightDir));
-            float3 ambient = SkyAmbient(normal) * 0.35f;
+            float ndotl = saturate(dot(normal, lightDir) * 0.85f + 0.15f);
+            float3 ambient = SkyAmbient(normal) * 0.68f;
 
             // Add slight variant-based color variation
             uint variant = GetVariant(voxel);
             float variantNoise = (variant / 255.0f) * 0.1f - 0.05f;  // +/- 5%
 
-            float3 finalColor = baseColor.rgb * (ambient + ndotl * 0.86f) * (1.0f + variantNoise);
+            float3 finalColor = baseColor.rgb * (ambient + ndotl * 0.48f) * (1.0f + variantNoise);
+            if (CameraUnderwaterForShading()) {
+                const float underwaterFog = saturate((dist - 6.0f) / 88.0f);
+                float fogStrength;
+                const float3 waterTint = UnderwaterVolumeTint(
+                    hitPos,
+                    dist,
+                    0.38f + underwaterFog * 0.38f,
+                    fogStrength);
+                finalColor = lerp(finalColor, waterTint, fogStrength);
+                const float nearWaterLight = 1.0f - saturate((dist - 10.0f) / 180.0f);
+                const float upwardFace = saturate(normal.y * 0.55f + 0.45f);
+                finalColor += float3(0.030f, 0.070f, 0.060f) *
+                    UnderwaterCaustic(hitPos) * nearWaterLight * upwardFace;
+            }
+            if (frame.debugMode == 50u) {
+                finalColor = float3(1.0f, 0.95f, 0.05f);
+            }
             if (frame.debugMode == 7u) {
                 float3 sparseTint = voxelFromSparse ? float3(0.35f, 1.0f, 0.42f) : float3(1.0f, 0.38f, 0.28f);
                 finalColor = lerp(finalColor, sparseTint, 0.55f);
             }
 
-            // Depth fog
-            float fogFactor = saturate(dist / maxDist);
-            float3 fogColor = SkyColor(rayDir);
-            finalColor = lerp(finalColor, fogColor, fogFactor * 0.5f);
+            if (frame.debugMode != 50u) {
+                // Depth fog
+                float fogFactor = saturate(dist / maxDist);
+                if (frame.debugMode == 60u) {
+                    RecordRenderOwnership(RENDER_OWNER_NEAR);
+                    const float debugFog = fogFactor * 0.5f;
+                    return MakeHit(float4(float3(debugFog, debugFog, debugFog), 1.0f), entryDist + dist);
+                }
+                float3 fogColor = SkyColor(rayDir);
+                finalColor = lerp(finalColor, fogColor, fogFactor * 0.5f);
+            }
 
             // Use material's alpha from palette (enables transparency for water, glass, etc.)
+            if (sawLocalWater || material == MAT_WATER) {
+                RecordRenderWaterContext();
+            }
             RecordRenderOwnership(RENDER_OWNER_NEAR);
-            return MakeHit(float4(finalColor, baseColor.a), entryDist + dist);
+            return MakeHit(float4(finalColor, frame.debugMode == 50u ? 1.0f : baseColor.a), hitWorldDistance);
         }
 
         if (sparseSkipAcceleration && voxelFromSparse && sparseSampleState >= SPARSE_SAMPLE_EMPTY_SUBBRICK) {
@@ -2471,13 +5800,38 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
     if (sparseOnlyMode && sawSparseMissing) {
         RayHit backgroundHit;
         uint backgroundLayer;
+        const bool highAltitudeBackgroundView = rayOrigin.y > 384.0f;
+        if (highAltitudeBackgroundView &&
+            RaymarchBackgroundField(
+                rayOrigin,
+                rayDir,
+                32.0f,
+                true,
+                true,
+                backgroundHit,
+                backgroundLayer)) {
+            return DebugBackgroundLayerHitWithExactFeedback(rayOrigin, rayDir, backgroundHit, backgroundLayer);
+        }
         // Missing sparse pages inside the editable/collision volume are not
         // proof that far terrain owns that ray segment. Keep the background
         // renderer behind the same transition band as the surface path so stale
         // or late near pages cannot be filled by detached coarse terrain.
-        const float holeFillStart = max(
-            entryDist + firstSparseMissingDist + 24.0f,
-            SparseMissingPageBackgroundStartForRay(rayOrigin, rayDir, gridMin, gridMax));
+        const float firstHoleStart = entryDist + firstSparseMissingDist + 24.0f;
+        const float protectedHoleFillStart =
+            SparseMissingPageBackgroundStartForRay(rayOrigin, rayDir, gridMin, gridMax);
+        const bool lowSurfaceAuthorityView =
+            sparseSurfaceAuthoritative && frame.cameraPosition.y <= FAR_SEA_LEVEL + 220.0f;
+        // This branch only runs for pixels where the raster exact surface did
+        // not already own the pixel and the exact sparse DDA found a missing
+        // page. Treat that as a streaming hole, not proof that the protected
+        // near band must remain empty. Starting the lower-LOD field at the
+        // first missing page lets mid/far terrain carry the public render until
+        // exact pages promote, instead of showing sky-colored cutouts in the
+        // first visible frames.
+        const float holeFillStart = sparseSurfaceRaymarchFill
+            ? firstHoleStart
+            : max(firstHoleStart, protectedHoleFillStart);
+        const float firstSparseMissingWorldDist = entryDist + firstSparseMissingDist;
         if (RaymarchBackgroundField(
             rayOrigin,
             rayDir,
@@ -2486,8 +5840,66 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
             true,
             backgroundHit,
             backgroundLayer)) {
-            return DebugBackgroundLayerHit(backgroundHit, backgroundLayer);
+            const float surfaceOwnershipDistance = max(frame.nearOwnershipParams.w, ExactNearDistance());
+            const bool lowerLodTerrainBeforeExactSurfaceLimit =
+                backgroundLayer == BACKGROUND_LAYER_MID_VOXEL ||
+                backgroundLayer == BACKGROUND_LAYER_FAR_SVO;
+            if (lowSurfaceAuthorityView &&
+                lowerLodTerrainBeforeExactSurfaceLimit &&
+                firstSparseMissingTerrainAdjacent &&
+                firstSparseMissingWorldDist <= surfaceOwnershipDistance &&
+                backgroundHit.distance > firstSparseMissingWorldDist + 8.0f &&
+                backgroundHit.distance <= surfaceOwnershipDistance + 512.0f) {
+                RecordUnsafeSparseMissSample(firstSparseMissingBrickCoord, firstSparseMissingWorldDist);
+            }
+            return DebugBackgroundLayerHitWithExactFeedback(rayOrigin, rayDir, backgroundHit, backgroundLayer);
         }
+        if (rayDir.y > -0.88f || highAltitudeBackgroundView) {
+            float expectedTerrainT = 1e20f;
+            if (rayDir.y < -0.005f) {
+                const float exactHoleDistance = max(ExactNearDistance(), 224.0f);
+                const float terrainProbeLimit = min(max(exactHoleDistance, 384.0f), 1024.0f);
+                [loop]
+                for (float terrainT = 8.0f; terrainT <= terrainProbeLimit; terrainT += 16.0f) {
+                    const float3 terrainProbe = rayOrigin + rayDir * terrainT;
+                    float mountainMask;
+                    float spireMask;
+                    float ravineMask;
+                    const float terrainHeight = FarTerrainHeight(
+                        terrainProbe.xz,
+                        mountainMask,
+                        spireMask,
+                        ravineMask);
+                    if (terrainProbe.y <= terrainHeight - 1.0f) {
+                        expectedTerrainT = terrainT;
+                        break;
+                    }
+                }
+            }
+            const float exactHoleDistance = max(ExactNearDistance(), 224.0f);
+            const bool nearSparseHole =
+                // "Unsafe near" is reserved for editable/collision foreground
+                // holes. In high-altitude far-LOD views, the exact sparse
+                // window is only a helper layer; missed downward samples should
+                // fall through to sky/valley/background ownership instead of
+                // tripping the near-terrain hole gate.
+                !highAltitudeBackgroundView &&
+                firstSparseMissingTerrainAdjacent &&
+                firstSparseMissingWorldDist < exactHoleDistance + 96.0f &&
+                expectedTerrainT < exactHoleDistance + 160.0f &&
+                firstSparseMissingWorldDist <= expectedTerrainT + 32.0f &&
+                expectedTerrainT <= firstSparseMissingWorldDist + 64.0f;
+            if (nearSparseHole) {
+                RecordUnsafeSparseMissSample(firstSparseMissingBrickCoord, firstSparseMissingWorldDist);
+            }
+            return DebugBackgroundMissHit(
+                rayOrigin,
+                rayDir,
+                entryDist + firstSparseMissingDist,
+                nearSparseHole,
+                runTerrainSkyReasonDebug);
+        }
+        RecordUnsafeSparseMissSample(firstSparseMissingBrickCoord, entryDist + firstSparseMissingDist);
         return DebugUnsafeNearMissHit(rayDir);
     }
 
@@ -2498,13 +5910,43 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
     if (entryDist + dist >= tMax - 1.0f) {
         RayHit farHit;
         uint farLayer;
-        float farStart = max(tMax + 8.0f, entryDist + dist);
-        if (RaymarchBackgroundField(rayOrigin, rayDir, farStart, true, false, farHit, farLayer)) {
-            return DebugBackgroundLayerHit(farHit, farLayer);
+        float farStart = sparseSurfaceAuthoritative
+            ? max(ExactNearDistance() + 8.0f, NearBackgroundStartDistance())
+            : max(tMax + 8.0f, entryDist + dist);
+        if (sparseSurfaceAuthoritative && frame.cameraPosition.y <= FAR_SEA_LEVEL + 220.0f) {
+            farStart = max(farStart, LowAltitudeProtectedBackgroundStartDistance() + 8.0f);
+        }
+        if (RaymarchBackgroundField(rayOrigin, rayDir, farStart, true, true, farHit, farLayer)) {
+            return DebugBackgroundLayerHitWithExactFeedback(rayOrigin, rayDir, farHit, farLayer);
         }
     }
 
-    return DebugBackgroundMissHit(rayDir);
+    if (sparseNearActive) {
+        // Sparse near-field traversal can be intentionally budget-limited by
+        // the scheduler. If that budget expires while the ray is still inside
+        // the editable cache, the old path returned a raw miss/sky pixel and
+        // produced the visible circular moat around the camera. Hand the ray to
+        // the ownership background from the point where near traversal stopped.
+        RayHit budgetHit;
+        uint budgetLayer;
+        const float budgetStart = sparseSurfaceAuthoritative
+            ? (frame.cameraPosition.y <= FAR_SEA_LEVEL + 220.0f
+                ? max(NearBackgroundStartDistance(), LowAltitudeProtectedBackgroundStartDistance() + 8.0f)
+                : max(NearBackgroundStartDistance(), ExactNearDistance() + 8.0f))
+            : max(
+                NearBackgroundStartDistance(),
+                entryDist + min(dist, maxMarchDist) + 8.0f);
+        if (RaymarchBackgroundField(rayOrigin, rayDir, budgetStart, true, true, budgetHit, budgetLayer)) {
+            return DebugBackgroundLayerHitWithExactFeedback(rayOrigin, rayDir, budgetHit, budgetLayer);
+        }
+    }
+
+    return DebugBackgroundMissHit(
+        rayOrigin,
+        rayDir,
+        max(NearBackgroundStartDistance(), entryDist + min(dist, maxMarchDist) + 8.0f),
+        false,
+        runTerrainSkyReasonDebug);
 }
 
 bool IntersectAvatarBox(float3 localOrigin, float3 localDir, float3 boxMin, float3 boxMax, out float tNear, out float3 normal) {
@@ -2603,7 +6045,7 @@ float4 RenderBrushPreview(float3 rayOrigin, float3 rayDir, float3 brushCenter, f
     // sphere projects as a giant fisheye dome and hides the sparse surface pass.
     float3 toBrush = brushCenter - rayOrigin;
     float distToCenter = length(toBrush);
-    if (brushRadius <= 0.0f || distToCenter < max(brushRadius * 3.75f, 12.0f)) {
+    if (brushRadius <= 0.0f || distToCenter < max(brushRadius * 6.0f, 16.0f)) {
         return float4(0, 0, 0, 0);
     }
 
@@ -2615,7 +6057,7 @@ float4 RenderBrushPreview(float3 rayOrigin, float3 rayDir, float3 brushCenter, f
     }
 
     const float angularRadius = asin(saturate(brushRadius / max(distToCenter, 0.001f)));
-    if (angularRadius > 0.34f) {
+    if (angularRadius > 0.16f) {
         return float4(0, 0, 0, 0);
     }
 
@@ -2642,21 +6084,18 @@ float4 RenderBrushPreview(float3 rayOrigin, float3 rayDir, float3 brushCenter, f
 
     // For sphere shape, use distance-based alpha
     if (brushShape == 0) {  // Sphere
-        float dist = length(hitPoint - brushCenter);
-        float normalizedDist = dist / brushRadius;
-
-        // Create wireframe effect - more opaque at edges
-        float edgeFactor = abs(normalizedDist - 0.95f) < 0.05f ? 0.6f : 0.15f;
-
-        // Fresnel-like effect for better visibility
         float3 normal = normalize(hitPoint - brushCenter);
         float fresnel = pow(1.0f - abs(dot(normal, rayDir)), 2.0f);
-        float alpha = lerp(edgeFactor, 0.4f, fresnel);
+        float rim = smoothstep(0.42f, 0.88f, fresnel);
+        if (rim <= 0.02f) {
+            return float4(0, 0, 0, 0);
+        }
+        float alpha = rim * 0.24f;
 
         return float4(baseColor, alpha);
     }
     else {  // Cube or cylinder - simple semi-transparent rendering
-        return float4(baseColor, 0.25f);
+        return float4(baseColor, 0.10f);
     }
 }
 
@@ -2697,15 +6136,23 @@ PSOutput main(PSInput input) {
         return output;
     }
 
+    const uint2 pixelCoord = uint2(input.position.xy);
+    const bool runTerrainSkyReasonDebug =
+        frame.debugMode == 57u &&
+        ((pixelCoord.x & 7u) == 0u) &&
+        ((pixelCoord.y & 7u) == 0u);
+
     // Render voxel world
-    RayHit worldHit = Raymarch(cameraPos, rayDir);
+    RayHit worldHit = Raymarch(cameraPos, rayDir, runTerrainSkyReasonDebug);
     float4 voxelColor = worldHit.color;
     float depthDistance = worldHit.distance;
 
     float avatarT;
     float4 avatarColor;
     if (RenderBlockCharacter(cameraPos, rayDir, avatarT, avatarColor) && avatarT < worldHit.distance) {
-        voxelColor = avatarColor;
+        voxelColor = frame.debugMode == 53u
+            ? float4(0.20f, 1.0f, 0.80f, 1.0f)
+            : avatarColor;
         depthDistance = avatarT;
     }
 
@@ -2725,7 +6172,11 @@ PSOutput main(PSInput input) {
 
         // Alpha blend preview over voxel color
         if (brushPreview.a > 0.0f) {
-            voxelColor.rgb = lerp(voxelColor.rgb, brushPreview.rgb, brushPreview.a);
+            if (frame.debugMode == 53u) {
+                voxelColor = float4(1.0f, 0.20f, 0.80f, 1.0f);
+            } else {
+                voxelColor.rgb = lerp(voxelColor.rgb, brushPreview.rgb, brushPreview.a);
+            }
         }
     }
 

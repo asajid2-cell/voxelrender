@@ -10,6 +10,13 @@ namespace VENPOD::Simulation {
 
 namespace {
 
+constexpr uint32_t kMaxPlannerRequests = 4096;
+constexpr uint32_t kMaxPlannerRadiusXz = 64;
+constexpr uint32_t kMaxPlannerRadiusY = 32;
+constexpr uint32_t kMaxForwardPrefetchBricks = 256;
+constexpr float kMaxViewConeDistance = 8192.0f;
+constexpr float kMaxViewConeStepDistance = 512.0f;
+
 struct Vec3 {
     float x = 0.0f;
     float y = 0.0f;
@@ -17,7 +24,10 @@ struct Vec3 {
 };
 
 float Length(Vec3 v) {
-    return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    return static_cast<float>(std::sqrt(
+        static_cast<double>(v.x) * static_cast<double>(v.x) +
+        static_cast<double>(v.y) * static_cast<double>(v.y) +
+        static_cast<double>(v.z) * static_cast<double>(v.z)));
 }
 
 Vec3 NormalizeOr(Vec3 v, Vec3 fallback) {
@@ -26,6 +36,61 @@ Vec3 NormalizeOr(Vec3 v, Vec3 fallback) {
         return fallback;
     }
     return {v.x / length, v.y / length, v.z / length};
+}
+
+float FiniteOr(float value, float fallback) {
+    return std::isfinite(value) ? value : fallback;
+}
+
+float ClampFinite(float value, float minValue, float maxValue, float fallback) {
+    return std::clamp(FiniteOr(value, fallback), minValue, maxValue);
+}
+
+float BrickCenterWorldFallback(int32_t brickCoord) {
+    return static_cast<float>(
+        static_cast<double>(brickCoord) * static_cast<double>(SPARSE_BRICK_SIZE) +
+        static_cast<double>(SPARSE_BRICK_SIZE) * 0.5);
+}
+
+bool TryFloorToInt32(float value, int32_t& out) {
+    if (!std::isfinite(value)) {
+        return false;
+    }
+    const double floored = std::floor(static_cast<double>(value));
+    if (floored < static_cast<double>(std::numeric_limits<int32_t>::min()) ||
+        floored > static_cast<double>(std::numeric_limits<int32_t>::max())) {
+        return false;
+    }
+    out = static_cast<int32_t>(floored);
+    return true;
+}
+
+bool TryStepBrickCoord(int32_t value, int32_t step, int32_t& out) {
+    const int64_t stepped = static_cast<int64_t>(value) + static_cast<int64_t>(step);
+    if (stepped < static_cast<int64_t>(std::numeric_limits<int32_t>::min()) ||
+        stepped > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+        return false;
+    }
+    out = static_cast<int32_t>(stepped);
+    return true;
+}
+
+bool TryOffsetBrickCoord(const BrickCoord& center, int32_t dx, int32_t dy, int32_t dz, BrickCoord& out) {
+    return TryStepBrickCoord(center.x, dx, out.x) &&
+        TryStepBrickCoord(center.y, dy, out.y) &&
+        TryStepBrickCoord(center.z, dz, out.z);
+}
+
+int32_t ClampPriority(int64_t value) {
+    return static_cast<int32_t>(std::clamp<int64_t>(
+        value,
+        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
+}
+
+int64_t AbsDiffInt64(int32_t a, int32_t b) {
+    const int64_t diff = static_cast<int64_t>(a) - static_cast<int64_t>(b);
+    return diff < 0 ? -diff : diff;
 }
 
 Vec3 Add(Vec3 a, Vec3 b) {
@@ -49,31 +114,43 @@ BrickRayDdaAxis BuildBrickRayDdaAxis(float origin, float direction, int32_t bric
     }
 
     axis.step = direction > 0.0f ? 1 : -1;
-    const float brickSize = static_cast<float>(SPARSE_BRICK_SIZE);
-    const float boundary = axis.step > 0
-        ? static_cast<float>(brickCoord + 1) * brickSize
-        : static_cast<float>(brickCoord) * brickSize;
-    axis.nextT = (boundary - origin) / direction;
+    const double brickSize = static_cast<double>(SPARSE_BRICK_SIZE);
+    const double boundary = axis.step > 0
+        ? (static_cast<double>(brickCoord) + 1.0) * brickSize
+        : static_cast<double>(brickCoord) * brickSize;
+    axis.nextT = static_cast<float>(
+        (boundary - static_cast<double>(origin)) / static_cast<double>(direction));
     if (!std::isfinite(axis.nextT) || axis.nextT < 0.0f) {
         axis.nextT = 0.0f;
     }
-    axis.deltaT = brickSize / std::abs(direction);
+    axis.deltaT = static_cast<float>(brickSize / std::abs(static_cast<double>(direction)));
     return axis;
 }
 
 std::vector<BrickCoord> BuildBrickLineDda(Vec3 start, Vec3 end, uint32_t maxCenters) {
     std::vector<BrickCoord> centers;
-    if (maxCenters == 0) {
+    if (maxCenters == 0 ||
+        !std::isfinite(start.x) ||
+        !std::isfinite(start.y) ||
+        !std::isfinite(start.z) ||
+        !std::isfinite(end.x) ||
+        !std::isfinite(end.y) ||
+        !std::isfinite(end.z)) {
         return centers;
     }
 
     const Vec3 delta{end.x - start.x, end.y - start.y, end.z - start.z};
     const float length = Length(delta);
     const Vec3 dir = NormalizeOr(delta, {0.0f, 0.0f, 1.0f});
-    BrickCoord coord = BrickCoord::FromWorldVoxel(
-        static_cast<int32_t>(std::floor(start.x)),
-        static_cast<int32_t>(std::floor(start.y)),
-        static_cast<int32_t>(std::floor(start.z)));
+    int32_t startVoxelX = 0;
+    int32_t startVoxelY = 0;
+    int32_t startVoxelZ = 0;
+    if (!TryFloorToInt32(start.x, startVoxelX) ||
+        !TryFloorToInt32(start.y, startVoxelY) ||
+        !TryFloorToInt32(start.z, startVoxelZ)) {
+        return centers;
+    }
+    BrickCoord coord = BrickCoord::FromWorldVoxel(startVoxelX, startVoxelY, startVoxelZ);
     centers.push_back(coord);
     if (!std::isfinite(length) || length <= 0.0001f || maxCenters == 1) {
         return centers;
@@ -97,15 +174,21 @@ std::vector<BrickCoord> BuildBrickLineDda(Vec3 start, Vec3 end, uint32_t maxCent
 
         const float tieEpsilon = 0.0005f;
         if (axisX.nextT <= nextDistance + tieEpsilon) {
-            coord.x += axisX.step;
+            if (!TryStepBrickCoord(coord.x, axisX.step, coord.x)) {
+                break;
+            }
             axisX.nextT += axisX.deltaT;
         }
         if (axisY.nextT <= nextDistance + tieEpsilon) {
-            coord.y += axisY.step;
+            if (!TryStepBrickCoord(coord.y, axisY.step, coord.y)) {
+                break;
+            }
             axisY.nextT += axisY.deltaT;
         }
         if (axisZ.nextT <= nextDistance + tieEpsilon) {
-            coord.z += axisZ.step;
+            if (!TryStepBrickCoord(coord.z, axisZ.step, coord.z)) {
+                break;
+            }
             axisZ.nextT += axisZ.deltaT;
         }
         distance = std::max(nextDistance + 0.0001f, distance + 0.0001f);
@@ -114,6 +197,36 @@ std::vector<BrickCoord> BuildBrickLineDda(Vec3 start, Vec3 end, uint32_t maxCent
         }
     }
     return centers;
+}
+
+bool TryWorldRangeToBrickRange(
+    float minXWorld,
+    float minYWorld,
+    float minZWorld,
+    float maxXWorld,
+    float maxYWorld,
+    float maxZWorld,
+    BrickCoord& minBrick,
+    BrickCoord& maxBrick)
+{
+    int32_t minX = 0;
+    int32_t minY = 0;
+    int32_t minZ = 0;
+    int32_t maxX = 0;
+    int32_t maxY = 0;
+    int32_t maxZ = 0;
+    if (!TryFloorToInt32(minXWorld, minX) ||
+        !TryFloorToInt32(minYWorld, minY) ||
+        !TryFloorToInt32(minZWorld, minZ) ||
+        !TryFloorToInt32(maxXWorld, maxX) ||
+        !TryFloorToInt32(maxYWorld, maxY) ||
+        !TryFloorToInt32(maxZWorld, maxZ)) {
+        return false;
+    }
+
+    minBrick = BrickCoord::FromWorldVoxel(minX, minY, minZ);
+    maxBrick = BrickCoord::FromWorldVoxel(maxX, maxY, maxZ);
+    return maxBrick.x >= minBrick.x && maxBrick.y >= minBrick.y && maxBrick.z >= minBrick.z;
 }
 
 int32_t ResidencyPriorityBase(SparseResidencyClass residencyClass) {
@@ -150,7 +263,8 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::Plan(
     int32_t forwardZ) const
 {
     std::vector<SparseBrickRequest> requests;
-    requests.reserve(m_config.maxRequests);
+    const uint32_t requestLimit = std::min(m_config.maxRequests, kMaxPlannerRequests);
+    requests.reserve(requestLimit);
     std::unordered_set<BrickCoord, BrickCoordHash> seen;
 
     const auto addRequest = [&](BrickCoord coord, int32_t priority) {
@@ -166,16 +280,25 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::Plan(
         }
     };
 
-    const int32_t rx = static_cast<int32_t>(m_config.radiusXz);
-    const int32_t ry = static_cast<int32_t>(m_config.radiusY);
+    const int32_t rx = static_cast<int32_t>(std::min(m_config.radiusXz, kMaxPlannerRadiusXz));
+    const int32_t ry = static_cast<int32_t>(std::min(m_config.radiusY, kMaxPlannerRadiusY));
 
     for (int32_t y = -ry; y <= ry; ++y) {
         for (int32_t z = -rx; z <= rx; ++z) {
             for (int32_t x = -rx; x <= rx; ++x) {
-                const int32_t distanceScore = x * x + z * z + y * y * 2;
-                const int32_t forwardScore = x * forwardX + y * forwardY + z * forwardZ;
-                const int32_t priority = distanceScore * 16 - forwardScore * 3;
-                addRequest({center.x + x, center.y + y, center.z + z}, priority);
+                const int64_t distanceScore =
+                    static_cast<int64_t>(x) * x +
+                    static_cast<int64_t>(z) * z +
+                    static_cast<int64_t>(y) * y * 2;
+                const int64_t forwardScore =
+                    static_cast<int64_t>(x) * forwardX +
+                    static_cast<int64_t>(y) * forwardY +
+                    static_cast<int64_t>(z) * forwardZ;
+                const int32_t priority = ClampPriority(distanceScore * 16 - forwardScore * 3);
+                BrickCoord requestCoord;
+                if (TryOffsetBrickCoord(center, x, y, z, requestCoord)) {
+                    addRequest(requestCoord, priority);
+                }
             }
         }
     }
@@ -185,17 +308,34 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::Plan(
         (forwardY != 0 ? 1 : 0) +
         (forwardZ != 0 ? 1 : 0);
     if (directionLength > 0) {
-        for (uint32_t step = 1; step <= m_config.forwardPrefetchBricks; ++step) {
-            const BrickCoord ahead{
-                center.x + forwardX * static_cast<int32_t>(step + m_config.radiusXz),
-                center.y + forwardY * static_cast<int32_t>(step),
-                center.z + forwardZ * static_cast<int32_t>(step + m_config.radiusXz)
-            };
+        const uint32_t forwardPrefetch =
+            std::min(m_config.forwardPrefetchBricks, kMaxForwardPrefetchBricks);
+        for (uint32_t step = 1; step <= forwardPrefetch; ++step) {
+            const int32_t forwardShellOffset =
+                static_cast<int32_t>(step + static_cast<uint32_t>(rx));
+            BrickCoord ahead;
+            if (!TryOffsetBrickCoord(
+                    center,
+                    forwardX * forwardShellOffset,
+                    forwardY * static_cast<int32_t>(step),
+                    forwardZ * forwardShellOffset,
+                    ahead)) {
+                continue;
+            }
             const int32_t basePriority = 4 + static_cast<int32_t>(step) * 12;
             for (int32_t y = -ry; y <= ry; ++y) {
                 for (int32_t z = -1; z <= 1; ++z) {
                     for (int32_t x = -1; x <= 1; ++x) {
-                        addRequest({ahead.x + x, ahead.y + y, ahead.z + z}, basePriority + x * x + y * y + z * z);
+                        BrickCoord requestCoord;
+                        if (TryOffsetBrickCoord(ahead, x, y, z, requestCoord)) {
+                            addRequest(
+                                requestCoord,
+                                ClampPriority(
+                                    static_cast<int64_t>(basePriority) +
+                                    static_cast<int64_t>(x) * x +
+                                    static_cast<int64_t>(y) * y +
+                                    static_cast<int64_t>(z) * z));
+                        }
                     }
                 }
             }
@@ -209,8 +349,8 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::Plan(
         return a.coord < b.coord;
     });
 
-    if (requests.size() > m_config.maxRequests) {
-        requests.resize(m_config.maxRequests);
+    if (requests.size() > requestLimit) {
+        requests.resize(requestLimit);
     }
     return requests;
 }
@@ -219,25 +359,33 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanViewCone(
     const SparseViewConeConfig& view) const
 {
     std::vector<SparseBrickRequest> requests;
-    requests.reserve(view.maxRequests);
+    const uint32_t requestLimit = std::min(view.maxRequests, kMaxPlannerRequests);
+    requests.reserve(requestLimit);
     if (view.maxRequests == 0 ||
+        !std::isfinite(view.originX) ||
+        !std::isfinite(view.originY) ||
+        !std::isfinite(view.originZ) ||
+        !std::isfinite(view.maxDistance) ||
         view.maxDistance <= 0.0f ||
+        !std::isfinite(view.stepDistance) ||
         view.stepDistance <= 0.0f ||
         view.rayGrid == 0) {
         return requests;
     }
 
-    std::unordered_set<BrickCoord, BrickCoordHash> seen;
+    std::unordered_map<BrickCoord, size_t, BrickCoordHash> indexByCoord;
+    indexByCoord.reserve(requestLimit);
     const auto addRequest = [&](BrickCoord coord, int32_t priority) {
-        if (seen.insert(coord).second) {
-            requests.push_back({coord, priority});
+        auto found = indexByCoord.find(coord);
+        if (found == indexByCoord.end()) {
+            indexByCoord.emplace(coord, requests.size());
+            requests.push_back({coord, priority, SparseResidencyClass::Speculative, false, SparseBrickRequestSource::ViewCone});
             return;
         }
-        for (SparseBrickRequest& request : requests) {
-            if (request.coord == coord && priority < request.priority) {
-                request.priority = priority;
-                return;
-            }
+
+        SparseBrickRequest& request = requests[found->second];
+        if (priority < request.priority) {
+            request.priority = priority;
         }
     };
 
@@ -252,14 +400,16 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanViewCone(
         {view.upX, view.upY, view.upZ},
         {0.0f, 1.0f, 0.0f});
 
-    const float fov = std::clamp(view.verticalFovRadians, 0.1f, 2.8f);
-    const float aspect = std::clamp(view.aspectRatio, 0.25f, 4.0f);
+    const float fov = ClampFinite(view.verticalFovRadians, 0.1f, 2.8f, 1.04719755f);
+    const float aspect = ClampFinite(view.aspectRatio, 0.25f, 4.0f, 1.7777778f);
+    const float maxDistance = ClampFinite(view.maxDistance, 0.0f, kMaxViewConeDistance, 192.0f);
+    const float stepDistance = ClampFinite(view.stepDistance, 1.0f, kMaxViewConeStepDistance, 16.0f);
     const float tanHalfFov = std::tan(fov * 0.5f);
     const uint32_t rayGrid = std::clamp<uint32_t>(view.rayGrid, 1u, 7u);
     const float center = static_cast<float>(rayGrid - 1u) * 0.5f;
     const float invCenter = center > 0.0f ? 1.0f / center : 0.0f;
     const uint32_t centerIndex = rayGrid / 2u;
-    const float priorityStepDistance = std::max(view.stepDistance, 1.0f);
+    const float priorityStepDistance = stepDistance;
     const int32_t coverageRadiusXz = static_cast<int32_t>(
         std::min<uint32_t>(view.coverageRadiusXz, 2u));
     const int32_t coverageRadiusY = static_cast<int32_t>(
@@ -289,9 +439,14 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanViewCone(
                             (dx * dx + dz * dz) * 8 +
                             dy * dy * 14 +
                             shellDistance * 3;
-                    addRequest(
-                        {centerCoord.x + dx, centerCoord.y + dy, centerCoord.z + dz},
-                        priority + shellPenalty);
+                    BrickCoord coverageCoord;
+                    if (TryOffsetBrickCoord(centerCoord, dx, dy, dz, coverageCoord)) {
+                        addRequest(
+                            coverageCoord,
+                            ClampPriority(
+                                static_cast<int64_t>(priority) +
+                                static_cast<int64_t>(shellPenalty)));
+                    }
                 }
             }
         }
@@ -309,10 +464,18 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanViewCone(
 
             const int32_t lateralPenalty =
                 static_cast<int32_t>((std::abs(ndcX) + std::abs(ndcY)) * 12.0f);
+            int32_t originVoxelX = 0;
+            int32_t originVoxelY = 0;
+            int32_t originVoxelZ = 0;
+            if (!TryFloorToInt32(origin.x, originVoxelX) ||
+                !TryFloorToInt32(origin.y, originVoxelY) ||
+                !TryFloorToInt32(origin.z, originVoxelZ)) {
+                continue;
+            }
             BrickCoord coord = BrickCoord::FromWorldVoxel(
-                static_cast<int32_t>(std::floor(origin.x)),
-                static_cast<int32_t>(std::floor(origin.y)),
-                static_cast<int32_t>(std::floor(origin.z)));
+                originVoxelX,
+                originVoxelY,
+                originVoxelZ);
             BrickRayDdaAxis axisX = BuildBrickRayDdaAxis(origin.x, dir.x, coord.x);
             BrickRayDdaAxis axisY = BuildBrickRayDdaAxis(origin.y, dir.y, coord.y);
             BrickRayDdaAxis axisZ = BuildBrickRayDdaAxis(origin.z, dir.z, coord.z);
@@ -324,10 +487,10 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanViewCone(
             float distance = 0.0f;
             uint32_t ddaStepIndex = 0;
             const uint32_t maxDdaSteps = std::clamp<uint32_t>(
-                static_cast<uint32_t>(std::ceil(view.maxDistance / static_cast<float>(SPARSE_BRICK_SIZE))) * 4u + 8u,
+                static_cast<uint32_t>(std::ceil(maxDistance / static_cast<float>(SPARSE_BRICK_SIZE))) * 4u + 8u,
                 1u,
                 1024u);
-            while (distance <= view.maxDistance && ddaStepIndex < maxDdaSteps) {
+            while (distance <= maxDistance && ddaStepIndex < maxDdaSteps) {
                 addCoverage(
                     coord,
                     distance,
@@ -336,21 +499,27 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanViewCone(
                     ddaStepIndex);
 
                 const float nextDistance = std::min(axisX.nextT, std::min(axisY.nextT, axisZ.nextT));
-                if (!std::isfinite(nextDistance) || nextDistance > view.maxDistance) {
+                if (!std::isfinite(nextDistance) || nextDistance > maxDistance) {
                     break;
                 }
 
                 const float tieEpsilon = 0.0005f;
                 if (axisX.nextT <= nextDistance + tieEpsilon) {
-                    coord.x += axisX.step;
+                    if (!TryStepBrickCoord(coord.x, axisX.step, coord.x)) {
+                        break;
+                    }
                     axisX.nextT += axisX.deltaT;
                 }
                 if (axisY.nextT <= nextDistance + tieEpsilon) {
-                    coord.y += axisY.step;
+                    if (!TryStepBrickCoord(coord.y, axisY.step, coord.y)) {
+                        break;
+                    }
                     axisY.nextT += axisY.deltaT;
                 }
                 if (axisZ.nextT <= nextDistance + tieEpsilon) {
-                    coord.z += axisZ.step;
+                    if (!TryStepBrickCoord(coord.z, axisZ.step, coord.z)) {
+                        break;
+                    }
                     axisZ.nextT += axisZ.deltaT;
                 }
                 distance = std::max(nextDistance + 0.0001f, distance + 0.0001f);
@@ -366,8 +535,8 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanViewCone(
         return a.coord < b.coord;
     });
 
-    if (requests.size() > view.maxRequests) {
-        requests.resize(view.maxRequests);
+    if (requests.size() > requestLimit) {
+        requests.resize(requestLimit);
     }
     return requests;
 }
@@ -376,10 +545,11 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanCollisionResidenc
     const SparseCollisionResidencyConfig& config) const
 {
     std::vector<SparseBrickRequest> requests;
-    requests.reserve(config.maxRequests);
     if (config.maxRequests == 0) {
         return requests;
     }
+    const uint32_t requestLimit = std::min(config.maxRequests, kMaxPlannerRequests);
+    requests.reserve(requestLimit);
 
     std::unordered_map<BrickCoord, size_t, BrickCoordHash> indexByCoord;
     const auto addRequest = [&](
@@ -393,7 +563,8 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanCollisionResidenc
                 coord,
                 priority,
                 SparseResidencyClass::Collision,
-                urgent
+                urgent,
+                SparseBrickRequestSource::Collision
             });
             return true;
         }
@@ -406,38 +577,54 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanCollisionResidenc
         return false;
     };
 
-    const Vec3 velocity{config.velocityX, config.velocityY, config.velocityZ};
+    const Vec3 velocity{
+        FiniteOr(config.velocityX, 0.0f),
+        FiniteOr(config.velocityY, 0.0f),
+        FiniteOr(config.velocityZ, 0.0f)
+    };
     const float velocityLength = Length(velocity);
     const Vec3 velocityDir = NormalizeOr(velocity, {0.0f, 0.0f, 0.0f});
-    const uint32_t predictionBricks = velocityLength > 0.01f ? config.predictionBricks : 0u;
-    const int32_t shellRadiusXz = static_cast<int32_t>(config.shellRadiusXz);
-    const int32_t shellRadiusY = static_cast<int32_t>(config.shellRadiusY);
+    const uint32_t predictionBricks =
+        velocityLength > 0.01f ? std::min(config.predictionBricks, kMaxForwardPrefetchBricks) : 0u;
+    const int32_t shellRadiusXz =
+        static_cast<int32_t>(std::min(config.shellRadiusXz, kMaxPlannerRadiusXz));
+    const int32_t shellRadiusY =
+        static_cast<int32_t>(std::min(config.shellRadiusY, kMaxPlannerRadiusY));
     uint32_t added = 0;
 
     const bool hasBrushIntent =
         config.brushIntentValid &&
         config.maxBrushRequests > 0 &&
-        config.maxRequests > 0;
+        config.maxRequests > 0 &&
+        std::isfinite(config.brushStartX) &&
+        std::isfinite(config.brushStartY) &&
+        std::isfinite(config.brushStartZ) &&
+        std::isfinite(config.brushEndX) &&
+        std::isfinite(config.brushEndY) &&
+        std::isfinite(config.brushEndZ) &&
+        std::isfinite(config.brushRadius) &&
+        config.brushRadius > 0.0f;
     const uint32_t brushReserve = hasBrushIntent
         ? std::min(
-            config.maxRequests,
+            requestLimit,
             std::min(config.maxBrushRequests, config.reservedBrushRequests))
         : 0u;
-    const uint32_t bodyLimit = brushReserve < config.maxRequests
-        ? config.maxRequests - brushReserve
-        : std::min(config.maxRequests, 1u);
+    const uint32_t bodyLimit = brushReserve < requestLimit
+        ? requestLimit - brushReserve
+        : std::min(requestLimit, 1u);
 
-    const float bodyRadius = std::max(0.1f, config.bodyRadius);
-    const float bodyHeight = std::max(1.0f, config.bodyHeight);
-    const float stepHeight = std::max(0.0f, config.stepHeight);
-    const float supportDrop = std::max(0.0f, config.supportDrop);
-    const float predictedDistance = velocityLength * std::max(0.0f, config.predictionSeconds);
+    const float bodyRadius = ClampFinite(config.bodyRadius, 0.1f, 16.0f, 0.75f);
+    const float bodyHeight = ClampFinite(config.bodyHeight, 1.0f, 128.0f, 6.0f);
+    const float stepHeight = ClampFinite(config.stepHeight, 0.0f, 64.0f, 2.5f);
+    const float supportDrop = ClampFinite(config.supportDrop, 0.0f, 128.0f, 4.0f);
+    const float predictionSeconds = ClampFinite(config.predictionSeconds, 0.0f, 8.0f, 0.25f);
+    const float predictedDistance = std::isfinite(velocityLength) ? velocityLength * predictionSeconds : 0.0f;
     const uint32_t distanceSamples = static_cast<uint32_t>(
         std::ceil(predictedDistance / (static_cast<float>(SPARSE_BRICK_SIZE) * 0.5f))) + 1u;
     const uint32_t bodySamples = std::clamp<uint32_t>(
         std::max(predictionBricks + 1u, distanceSamples),
         1u,
-        std::max(1u, config.maxIntentSamples));
+        std::max(1u, std::min(config.maxIntentSamples, kMaxForwardPrefetchBricks)));
 
     for (uint32_t sampleIndex = 0;
          sampleIndex < bodySamples && added < bodyLimit;
@@ -445,11 +632,11 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanCollisionResidenc
         const float fraction = bodySamples > 1u
             ? static_cast<float>(sampleIndex) / static_cast<float>(bodySamples - 1u)
             : 0.0f;
-        const float predictedSeconds = std::max(0.0f, config.predictionSeconds) * fraction;
+        const float predictedSeconds = predictionSeconds * fraction;
         const Vec3 eye{
-            config.cameraX + config.velocityX * predictedSeconds,
-            config.cameraY + config.velocityY * predictedSeconds,
-            config.cameraZ + config.velocityZ * predictedSeconds
+            FiniteOr(config.cameraX, BrickCenterWorldFallback(config.center.x)) + velocity.x * predictedSeconds,
+            FiniteOr(config.cameraY, BrickCenterWorldFallback(config.center.y)) + velocity.y * predictedSeconds,
+            FiniteOr(config.cameraZ, BrickCenterWorldFallback(config.center.z)) + velocity.z * predictedSeconds
         };
         const float minXWorld = eye.x - bodyRadius;
         const float maxXWorld = eye.x + bodyRadius;
@@ -459,22 +646,22 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanCollisionResidenc
         const float minYWorld = feetY - supportDrop;
         const float maxYWorld = eye.y - 0.35f + stepHeight;
 
-        const BrickCoord minBrick = BrickCoord::FromWorldVoxel(
-            static_cast<int32_t>(std::floor(minXWorld)),
-            static_cast<int32_t>(std::floor(minYWorld)),
-            static_cast<int32_t>(std::floor(minZWorld)));
-        const BrickCoord maxBrick = BrickCoord::FromWorldVoxel(
-            static_cast<int32_t>(std::floor(maxXWorld)),
-            static_cast<int32_t>(std::floor(maxYWorld)),
-            static_cast<int32_t>(std::floor(maxZWorld)));
+        BrickCoord minBrick;
+        BrickCoord maxBrick;
+        if (!TryWorldRangeToBrickRange(
+                minXWorld, minYWorld, minZWorld,
+                maxXWorld, maxYWorld, maxZWorld,
+                minBrick, maxBrick)) {
+            continue;
+        }
         for (int32_t z = minBrick.z; z <= maxBrick.z && added < bodyLimit; ++z) {
             for (int32_t y = minBrick.y; y <= maxBrick.y && added < bodyLimit; ++y) {
                 for (int32_t x = minBrick.x; x <= maxBrick.x && added < bodyLimit; ++x) {
-                    const int32_t priority =
-                        static_cast<int32_t>(sampleIndex) * 48 +
-                        std::abs(x - config.center.x) * 3 +
-                        std::abs(y - config.center.y) * 5 +
-                        std::abs(z - config.center.z) * 3;
+                    const int32_t priority = ClampPriority(
+                        static_cast<int64_t>(sampleIndex) * 48 +
+                        AbsDiffInt64(x, config.center.x) * 3 +
+                        AbsDiffInt64(y, config.center.y) * 5 +
+                        AbsDiffInt64(z, config.center.z) * 3);
                     if (addRequest({x, y, z}, priority, true)) {
                         ++added;
                     }
@@ -483,7 +670,7 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanCollisionResidenc
         }
     }
 
-    if (hasBrushIntent && added < config.maxRequests) {
+    if (hasBrushIntent && added < requestLimit) {
         const Vec3 brushStart{config.brushStartX, config.brushStartY, config.brushStartZ};
         const Vec3 brushEnd{config.brushEndX, config.brushEndY, config.brushEndZ};
         const Vec3 brushDelta{
@@ -508,14 +695,14 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanCollisionResidenc
         for (uint32_t sampleIndex = 0;
              sampleIndex < brushCenters.size() &&
              brushAdded < config.maxBrushRequests &&
-             added < config.maxRequests;
+             added < requestLimit;
              ++sampleIndex) {
             const BrickCoord centerBrick = brushCenters[sampleIndex];
-            const int32_t priority =
-                static_cast<int32_t>(sampleIndex) * 24 +
-                std::abs(centerBrick.x - config.center.x) * 2 +
-                std::abs(centerBrick.y - config.center.y) * 3 +
-                std::abs(centerBrick.z - config.center.z) * 2;
+            const int32_t priority = ClampPriority(
+                static_cast<int64_t>(sampleIndex) * 24 +
+                AbsDiffInt64(centerBrick.x, config.center.x) * 2 +
+                AbsDiffInt64(centerBrick.y, config.center.y) * 3 +
+                AbsDiffInt64(centerBrick.z, config.center.z) * 2);
             if (addRequest(centerBrick, priority, true)) {
                 ++brushAdded;
                 ++added;
@@ -524,33 +711,32 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanCollisionResidenc
         for (uint32_t sampleIndex = 0;
              sampleIndex < brushCenters.size() &&
              brushAdded < config.maxBrushRequests &&
-             added < config.maxRequests;
+             added < requestLimit;
              ++sampleIndex) {
             const BrickCoord centerBrick = brushCenters[sampleIndex];
             for (int32_t z = -brushRadiusBricks;
-                 z <= brushRadiusBricks && brushAdded < config.maxBrushRequests && added < config.maxRequests;
+                 z <= brushRadiusBricks && brushAdded < config.maxBrushRequests && added < requestLimit;
                  ++z) {
                 for (int32_t y = -brushRadiusBricks;
-                     y <= brushRadiusBricks && brushAdded < config.maxBrushRequests && added < config.maxRequests;
+                     y <= brushRadiusBricks && brushAdded < config.maxBrushRequests && added < requestLimit;
                      ++y) {
                     for (int32_t x = -brushRadiusBricks;
-                         x <= brushRadiusBricks && brushAdded < config.maxBrushRequests && added < config.maxRequests;
+                         x <= brushRadiusBricks && brushAdded < config.maxBrushRequests && added < requestLimit;
                          ++x) {
                         if (x == 0 && y == 0 && z == 0) {
                             continue;
                         }
-                        const int32_t priority =
+                        const int32_t priority = ClampPriority(
                             8 +
-                            static_cast<int32_t>(sampleIndex) * 24 +
-                            (x * x + z * z) * 3 +
-                            y * y * 4 +
-                            std::abs(centerBrick.x - config.center.x) * 2 +
-                            std::abs(centerBrick.y - config.center.y) * 3 +
-                            std::abs(centerBrick.z - config.center.z) * 2;
-                        if (addRequest(
-                                {centerBrick.x + x, centerBrick.y + y, centerBrick.z + z},
-                                priority,
-                                true)) {
+                            static_cast<int64_t>(sampleIndex) * 24 +
+                            static_cast<int64_t>(x * x + z * z) * 3 +
+                            static_cast<int64_t>(y * y) * 4 +
+                            AbsDiffInt64(centerBrick.x, config.center.x) * 2 +
+                            AbsDiffInt64(centerBrick.y, config.center.y) * 3 +
+                            AbsDiffInt64(centerBrick.z, config.center.z) * 2);
+                        BrickCoord requestCoord;
+                        if (TryOffsetBrickCoord(centerBrick, x, y, z, requestCoord) &&
+                            addRequest(requestCoord, priority, true)) {
                             ++brushAdded;
                             ++added;
                         }
@@ -560,19 +746,25 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanCollisionResidenc
         }
     }
 
-    for (uint32_t step = 0; step <= predictionBricks && added < config.maxRequests; ++step) {
-        const BrickCoord shellCenter{
-            config.center.x + static_cast<int32_t>(std::round(velocityDir.x * static_cast<float>(step))),
-            config.center.y + static_cast<int32_t>(std::round(velocityDir.y * static_cast<float>(step))),
-            config.center.z + static_cast<int32_t>(std::round(velocityDir.z * static_cast<float>(step)))
-        };
-        for (int32_t dz = -shellRadiusXz; dz <= shellRadiusXz && added < config.maxRequests; ++dz) {
-            for (int32_t dy = -shellRadiusY; dy <= shellRadiusY && added < config.maxRequests; ++dy) {
-                for (int32_t dx = -shellRadiusXz; dx <= shellRadiusXz && added < config.maxRequests; ++dx) {
+    for (uint32_t step = 0; step <= predictionBricks && added < requestLimit; ++step) {
+        BrickCoord shellCenter;
+        if (!TryOffsetBrickCoord(
+                config.center,
+                static_cast<int32_t>(std::round(velocityDir.x * static_cast<float>(step))),
+                static_cast<int32_t>(std::round(velocityDir.y * static_cast<float>(step))),
+                static_cast<int32_t>(std::round(velocityDir.z * static_cast<float>(step))),
+                shellCenter)) {
+            continue;
+        }
+        for (int32_t dz = -shellRadiusXz; dz <= shellRadiusXz && added < requestLimit; ++dz) {
+            for (int32_t dy = -shellRadiusY; dy <= shellRadiusY && added < requestLimit; ++dy) {
+                for (int32_t dx = -shellRadiusXz; dx <= shellRadiusXz && added < requestLimit; ++dx) {
                     const int32_t distanceScore = dx * dx + dz * dz + dy * dy * 2;
-                    if (addRequest(
-                            {shellCenter.x + dx, shellCenter.y + dy, shellCenter.z + dz},
-                            static_cast<int32_t>(step) * 64 + distanceScore,
+                    BrickCoord requestCoord;
+                    if (TryOffsetBrickCoord(shellCenter, dx, dy, dz, requestCoord) &&
+                        addRequest(
+                            requestCoord,
+                            ClampPriority(static_cast<int64_t>(step) * 64 + distanceScore),
                             true)) {
                         ++added;
                     }
@@ -587,8 +779,8 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanCollisionResidenc
         }
         return a.coord < b.coord;
     });
-    if (requests.size() > config.maxRequests) {
-        requests.resize(config.maxRequests);
+    if (requests.size() > requestLimit) {
+        requests.resize(requestLimit);
     }
     return requests;
 }
@@ -597,22 +789,42 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanHierarchical(
     const SparseHierarchicalRequestConfig& config) const
 {
     std::vector<SparseBrickRequest> requests;
-    requests.reserve(config.maxRequests);
     if (config.maxRequests == 0) {
         return requests;
     }
+    const uint32_t requestLimit = std::min(config.maxRequests, kMaxPlannerRequests);
+    requests.reserve(requestLimit);
+
+    const float cameraX = FiniteOr(config.cameraX, BrickCenterWorldFallback(config.center.x));
+    const float cameraY = FiniteOr(config.cameraY, BrickCenterWorldFallback(config.center.y));
+    const float cameraZ = FiniteOr(config.cameraZ, BrickCenterWorldFallback(config.center.z));
+    const float velocityX = FiniteOr(config.velocityX, 0.0f);
+    const float velocityY = FiniteOr(config.velocityY, 0.0f);
+    const float velocityZ = FiniteOr(config.velocityZ, 0.0f);
+    const float predictionSeconds = ClampFinite(config.predictionSeconds, 0.0f, 8.0f, 0.25f);
+    const float collisionBodyHeight = ClampFinite(config.collisionBodyHeight, 1.0f, 128.0f, 6.0f);
+    const float visibleDistance = ClampFinite(config.visibleDistance, 0.0f, kMaxViewConeDistance, 256.0f);
+    const float speculativeDistance = ClampFinite(
+        config.speculativeDistance,
+        visibleDistance,
+        kMaxViewConeDistance,
+        std::max(visibleDistance, 768.0f));
+    const float stepDistance = ClampFinite(config.stepDistance, 1.0f, kMaxViewConeStepDistance, 16.0f);
 
     std::unordered_map<BrickCoord, size_t, BrickCoordHash> indexByCoord;
     const auto addRequest = [&](
         BrickCoord coord,
         int32_t priority,
         SparseResidencyClass residencyClass,
-        bool urgent) -> bool {
-        priority += ResidencyPriorityBase(residencyClass);
+        bool urgent,
+        SparseBrickRequestSource source) -> bool {
+        priority = ClampPriority(
+            static_cast<int64_t>(priority) +
+            static_cast<int64_t>(ResidencyPriorityBase(residencyClass)));
         auto found = indexByCoord.find(coord);
         if (found == indexByCoord.end()) {
             indexByCoord.emplace(coord, requests.size());
-            requests.push_back({coord, priority, residencyClass, urgent});
+            requests.push_back({coord, priority, residencyClass, urgent, source});
             return true;
         }
 
@@ -620,23 +832,25 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanHierarchical(
         if (ResidencyRankValue(residencyClass) > ResidencyRankValue(existing.residencyClass)) {
             existing.residencyClass = residencyClass;
             existing.urgent = urgent || existing.urgent;
+            existing.source = source;
         }
         if (priority < existing.priority) {
             existing.priority = priority;
+            existing.source = source;
         }
         return false;
     };
 
     SparseCollisionResidencyConfig collision{};
     collision.center = config.center;
-    collision.cameraX = config.cameraX;
-    collision.cameraY = config.cameraY;
-    collision.cameraZ = config.cameraZ;
-    collision.velocityX = config.velocityX;
-    collision.velocityY = config.velocityY;
-    collision.velocityZ = config.velocityZ;
-    collision.predictionSeconds = config.predictionSeconds;
-    collision.bodyHeight = config.collisionBodyHeight;
+    collision.cameraX = cameraX;
+    collision.cameraY = cameraY;
+    collision.cameraZ = cameraZ;
+    collision.velocityX = velocityX;
+    collision.velocityY = velocityY;
+    collision.velocityZ = velocityZ;
+    collision.predictionSeconds = predictionSeconds;
+    collision.bodyHeight = collisionBodyHeight;
     collision.bodyRadius = config.collisionBodyRadius;
     collision.stepHeight = config.collisionStepHeight;
     collision.supportDrop = config.collisionSupportDrop;
@@ -654,17 +868,20 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanHierarchical(
     collision.maxIntentSamples = config.collisionMaxIntentSamples;
     collision.maxBrushRequests = config.maxBrushCollisionRequests;
     collision.reservedBrushRequests = config.reservedBrushCollisionRequests;
-    collision.maxRequests = config.maxCollisionRequests;
+    collision.maxRequests = std::min(config.maxCollisionRequests, requestLimit);
     for (const SparseBrickRequest& request : PlanCollisionResidency(collision)) {
         addRequest(
             request.coord,
             request.priority,
             SparseResidencyClass::Collision,
-            request.urgent);
+            request.urgent,
+            SparseBrickRequestSource::Collision);
     }
 
-    const int32_t nearVisibleRadiusXz = static_cast<int32_t>(config.nearVisibleRadiusXz);
-    const int32_t nearVisibleRadiusY = static_cast<int32_t>(config.nearVisibleRadiusY);
+    const int32_t nearVisibleRadiusXz =
+        static_cast<int32_t>(std::min(config.nearVisibleRadiusXz, kMaxPlannerRadiusXz));
+    const int32_t nearVisibleRadiusY =
+        static_cast<int32_t>(std::min(config.nearVisibleRadiusY, kMaxPlannerRadiusY));
     struct NearVisibleCandidate {
         BrickCoord coord;
         int32_t priority = 0;
@@ -685,14 +902,14 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanHierarchical(
                  ++dx) {
                 const int32_t planarDistance = dx * dx + dz * dz;
                 const int32_t verticalDistance = dy * dy;
-                const int32_t priority =
-                    planarDistance * 6 +
-                    verticalDistance * 11 +
-                    std::abs(dx) + std::abs(dz);
-                nearVisibleCandidates.push_back({
-                    {config.center.x + dx, config.center.y + dy, config.center.z + dz},
-                    priority
-                });
+                const int32_t priority = ClampPriority(
+                    static_cast<int64_t>(planarDistance) * 6 +
+                    static_cast<int64_t>(verticalDistance) * 11 +
+                    std::abs(dx) + std::abs(dz));
+                BrickCoord coord;
+                if (TryOffsetBrickCoord(config.center, dx, dy, dz, coord)) {
+                    nearVisibleCandidates.push_back({coord, priority});
+                }
             }
         }
     }
@@ -707,88 +924,96 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanHierarchical(
         });
     uint32_t nearVisibleAdded = 0;
     for (const NearVisibleCandidate& candidate : nearVisibleCandidates) {
-        if (nearVisibleAdded >= config.maxNearVisibleRequests) {
+        if (nearVisibleAdded >= std::min(config.maxNearVisibleRequests, requestLimit)) {
             break;
         }
         if (addRequest(
                 candidate.coord,
                 candidate.priority,
                 SparseResidencyClass::Visible,
-                true)) {
+                true,
+                SparseBrickRequestSource::NearVisible)) {
             ++nearVisibleAdded;
         }
     }
 
-    const Vec3 velocity{config.velocityX, config.velocityY, config.velocityZ};
+    const Vec3 velocity{velocityX, velocityY, velocityZ};
     const float velocityLength = Length(velocity);
+    const uint32_t maxMotionVisibleRequests =
+        std::min(config.maxMotionVisibleRequests, requestLimit);
     if (config.maxMotionVisibleRequests > 0 &&
-        velocityLength >= std::max(0.0f, config.motionVisibleMinSpeed) &&
-        config.predictionSeconds > 0.0f) {
+        velocityLength >= ClampFinite(config.motionVisibleMinSpeed, 0.0f, 4096.0f, 64.0f) &&
+        predictionSeconds > 0.0f) {
         const Vec3 velocityDir = NormalizeOr(velocity, {0.0f, 0.0f, 0.0f});
-        const float predictedDistance = velocityLength * std::max(0.0f, config.predictionSeconds);
+        const float predictedDistance = std::min(velocityLength * predictionSeconds, kMaxViewConeDistance);
         const uint32_t centerSamples = std::clamp<uint32_t>(
             static_cast<uint32_t>(
                 std::ceil(predictedDistance / (static_cast<float>(SPARSE_BRICK_SIZE) * 0.75f))) + 1u,
             1u,
-            std::max(1u, config.maxMotionVisibleRequests));
-        const int32_t radiusXz = static_cast<int32_t>(config.motionVisibleRadiusXz);
-        const int32_t radiusY = static_cast<int32_t>(config.motionVisibleRadiusY);
+            std::max(1u, maxMotionVisibleRequests));
+        const int32_t radiusXz =
+            static_cast<int32_t>(std::min(config.motionVisibleRadiusXz, kMaxPlannerRadiusXz));
+        const int32_t radiusY =
+            static_cast<int32_t>(std::min(config.motionVisibleRadiusY, kMaxPlannerRadiusY));
         uint32_t motionVisibleAdded = 0;
         std::vector<BrickCoord> motionCenters;
-        motionCenters.reserve(std::max<uint32_t>(centerSamples, config.maxMotionVisibleRequests));
+        motionCenters.reserve(std::max<uint32_t>(centerSamples, maxMotionVisibleRequests));
         const Vec3 motionStart{
-            config.cameraX,
-            config.cameraY - config.collisionBodyHeight,
-            config.cameraZ
+            cameraX,
+            cameraY - collisionBodyHeight,
+            cameraZ
         };
         const Vec3 motionEnd{
-            config.cameraX + velocityDir.x * predictedDistance,
-            config.cameraY - config.collisionBodyHeight + velocityDir.y * predictedDistance,
-            config.cameraZ + velocityDir.z * predictedDistance
+            FiniteOr(cameraX + velocityDir.x * predictedDistance, cameraX),
+            FiniteOr(cameraY - collisionBodyHeight + velocityDir.y * predictedDistance, cameraY - collisionBodyHeight),
+            FiniteOr(cameraZ + velocityDir.z * predictedDistance, cameraZ)
         };
         motionCenters = BuildBrickLineDda(
             motionStart,
             motionEnd,
-            std::max<uint32_t>(centerSamples, config.maxMotionVisibleRequests));
+            std::max<uint32_t>(centerSamples, maxMotionVisibleRequests));
         for (uint32_t sampleIndex = 0; sampleIndex < motionCenters.size(); ++sampleIndex) {
             const BrickCoord sampleCenter = motionCenters[sampleIndex];
-            const int32_t priority =
-                -50'000 +
-                static_cast<int32_t>(sampleIndex) * 2;
-            if (motionVisibleAdded < config.maxMotionVisibleRequests &&
+            const int32_t priority = ClampPriority(
+                -50'000 + static_cast<int64_t>(sampleIndex) * 2);
+            if (motionVisibleAdded < maxMotionVisibleRequests &&
                 addRequest(
                     sampleCenter,
                     priority,
                     SparseResidencyClass::Visible,
-                    true)) {
+                    true,
+                    SparseBrickRequestSource::MotionVisible)) {
                 ++motionVisibleAdded;
             }
         }
 
         for (uint32_t sampleIndex = 0;
              sampleIndex < motionCenters.size() &&
-             motionVisibleAdded < config.maxMotionVisibleRequests;
+             motionVisibleAdded < maxMotionVisibleRequests;
              ++sampleIndex) {
             const BrickCoord sampleCenter = motionCenters[sampleIndex];
             for (int32_t dz = -radiusXz;
-                 dz <= radiusXz && motionVisibleAdded < config.maxMotionVisibleRequests;
+                 dz <= radiusXz && motionVisibleAdded < maxMotionVisibleRequests;
                  ++dz) {
                 for (int32_t dy = -radiusY;
-                     dy <= radiusY && motionVisibleAdded < config.maxMotionVisibleRequests;
+                     dy <= radiusY && motionVisibleAdded < maxMotionVisibleRequests;
                      ++dy) {
                     for (int32_t dx = -radiusXz;
-                         dx <= radiusXz && motionVisibleAdded < config.maxMotionVisibleRequests;
+                         dx <= radiusXz && motionVisibleAdded < maxMotionVisibleRequests;
                          ++dx) {
-                        const int32_t priority =
+                        const int32_t priority = ClampPriority(
                             -40'000 +
-                            static_cast<int32_t>(sampleIndex) * 4 +
-                            (dx * dx + dz * dz) * 4 +
-                            dy * dy * 9;
-                        if (addRequest(
-                                {sampleCenter.x + dx, sampleCenter.y + dy, sampleCenter.z + dz},
+                            static_cast<int64_t>(sampleIndex) * 4 +
+                            static_cast<int64_t>(dx * dx + dz * dz) * 4 +
+                            static_cast<int64_t>(dy * dy) * 9);
+                        BrickCoord requestCoord;
+                        if (TryOffsetBrickCoord(sampleCenter, dx, dy, dz, requestCoord) &&
+                            addRequest(
+                                requestCoord,
                                 priority,
                                 SparseResidencyClass::Visible,
-                                true)) {
+                                true,
+                                SparseBrickRequestSource::MotionVisible)) {
                             ++motionVisibleAdded;
                         }
                     }
@@ -800,9 +1025,9 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanHierarchical(
     const uint32_t ownershipPressureLevel = std::min<uint32_t>(3u, config.ownershipPressureLevel);
     if (ownershipPressureLevel > 0 && config.maxOwnershipRecoveryRequests > 0) {
         SparseViewConeConfig recoveryView;
-        recoveryView.originX = config.cameraX;
-        recoveryView.originY = config.cameraY;
-        recoveryView.originZ = config.cameraZ;
+        recoveryView.originX = cameraX;
+        recoveryView.originY = cameraY;
+        recoveryView.originZ = cameraZ;
         recoveryView.forwardX = config.forwardX;
         recoveryView.forwardY = config.forwardY;
         recoveryView.forwardZ = config.forwardZ;
@@ -815,34 +1040,35 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanHierarchical(
         recoveryView.verticalFovRadians = config.verticalFovRadians;
         recoveryView.aspectRatio = config.aspectRatio;
         recoveryView.maxDistance = std::max(
-            config.visibleDistance,
-            config.visibleDistance + static_cast<float>(ownershipPressureLevel) * config.stepDistance * 3.0f);
+            visibleDistance,
+            visibleDistance + static_cast<float>(ownershipPressureLevel) * stepDistance * 3.0f);
         recoveryView.stepDistance = std::max(
             static_cast<float>(SPARSE_BRICK_SIZE) * 0.5f,
-            config.stepDistance * 0.5f);
+            stepDistance * 0.5f);
         recoveryView.rayGrid = std::max<uint32_t>(
             config.visibleRayGrid,
             std::min<uint32_t>(7u, config.visibleRayGrid + ownershipPressureLevel * 2u));
         recoveryView.coverageRadiusXz = ownershipPressureLevel >= 2 ? 1u : 0u;
         recoveryView.coverageRadiusY = ownershipPressureLevel >= 3 ? 1u : 0u;
-        recoveryView.maxRequests = config.maxOwnershipRecoveryRequests;
+        recoveryView.maxRequests = std::min(config.maxOwnershipRecoveryRequests, requestLimit);
         for (const SparseBrickRequest& request : PlanViewCone(recoveryView)) {
-            const int32_t priority =
+            const int32_t priority = ClampPriority(
                 -200'000 +
                 request.priority -
-                static_cast<int32_t>(ownershipPressureLevel) * 10'000;
+                static_cast<int64_t>(ownershipPressureLevel) * 10'000);
             addRequest(
                 request.coord,
                 priority,
                 SparseResidencyClass::Visible,
-                true);
+                true,
+                SparseBrickRequestSource::OwnershipRecovery);
         }
     }
 
     SparseViewConeConfig visibleView;
-    visibleView.originX = config.cameraX;
-    visibleView.originY = config.cameraY;
-    visibleView.originZ = config.cameraZ;
+    visibleView.originX = cameraX;
+    visibleView.originY = cameraY;
+    visibleView.originZ = cameraZ;
     visibleView.forwardX = config.forwardX;
     visibleView.forwardY = config.forwardY;
     visibleView.forwardZ = config.forwardZ;
@@ -854,28 +1080,37 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanHierarchical(
     visibleView.upZ = config.upZ;
     visibleView.verticalFovRadians = config.verticalFovRadians;
     visibleView.aspectRatio = config.aspectRatio;
-    visibleView.maxDistance = config.visibleDistance;
-    visibleView.stepDistance = config.stepDistance;
+    visibleView.maxDistance = visibleDistance;
+    visibleView.stepDistance = stepDistance;
     visibleView.rayGrid = config.visibleRayGrid;
     visibleView.coverageRadiusXz = 1u;
     visibleView.coverageRadiusY = 1u;
-    visibleView.maxRequests = config.maxVisibleRequests;
+    visibleView.maxRequests = std::min(config.maxVisibleRequests, requestLimit);
     for (const SparseBrickRequest& request : PlanViewCone(visibleView)) {
-        addRequest(request.coord, request.priority, SparseResidencyClass::Visible, true);
+        addRequest(
+            request.coord,
+            request.priority,
+            SparseResidencyClass::Visible,
+            true,
+            SparseBrickRequestSource::ViewCone);
     }
 
     SparseViewConeConfig speculativeView = visibleView;
-    const float predictionSeconds = std::max(0.0f, config.predictionSeconds);
-    speculativeView.originX = config.cameraX + config.velocityX * predictionSeconds;
-    speculativeView.originY = config.cameraY + config.velocityY * predictionSeconds;
-    speculativeView.originZ = config.cameraZ + config.velocityZ * predictionSeconds;
-    speculativeView.maxDistance = std::max(config.speculativeDistance, config.visibleDistance);
+    speculativeView.originX = FiniteOr(cameraX + velocityX * predictionSeconds, cameraX);
+    speculativeView.originY = FiniteOr(cameraY + velocityY * predictionSeconds, cameraY);
+    speculativeView.originZ = FiniteOr(cameraZ + velocityZ * predictionSeconds, cameraZ);
+    speculativeView.maxDistance = std::max(speculativeDistance, visibleDistance);
     speculativeView.rayGrid = config.speculativeRayGrid;
     speculativeView.coverageRadiusXz = 0u;
     speculativeView.coverageRadiusY = 0u;
-    speculativeView.maxRequests = config.maxSpeculativeRequests;
+    speculativeView.maxRequests = std::min(config.maxSpeculativeRequests, requestLimit);
     for (const SparseBrickRequest& request : PlanViewCone(speculativeView)) {
-        addRequest(request.coord, request.priority, SparseResidencyClass::Speculative, false);
+        addRequest(
+            request.coord,
+            request.priority,
+            SparseResidencyClass::Speculative,
+            false,
+            SparseBrickRequestSource::SpeculativeView);
     }
 
     std::sort(requests.begin(), requests.end(), [](const SparseBrickRequest& a, const SparseBrickRequest& b) {
@@ -888,8 +1123,8 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanHierarchical(
         return a.coord < b.coord;
     });
 
-    if (requests.size() > config.maxRequests) {
-        requests.resize(config.maxRequests);
+    if (requests.size() > requestLimit) {
+        requests.resize(requestLimit);
     }
     return requests;
 }
@@ -901,17 +1136,19 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanStressVolume(
     if (config.maxRequests == 0) {
         return requests;
     }
+    const uint32_t requestLimit = std::min(config.maxRequests, kMaxPlannerRequests);
 
     struct Candidate {
         BrickCoord coord;
         int32_t priority = 0;
         SparseResidencyClass residencyClass = SparseResidencyClass::Speculative;
         bool urgent = false;
+        SparseBrickRequestSource source = SparseBrickRequestSource::Stress;
     };
 
     std::vector<Candidate> candidates;
-    const int32_t radiusXz = static_cast<int32_t>(config.radiusXz);
-    const int32_t radiusY = static_cast<int32_t>(config.radiusY);
+    const int32_t radiusXz = static_cast<int32_t>(std::min(config.radiusXz, kMaxPlannerRadiusXz));
+    const int32_t radiusY = static_cast<int32_t>(std::min(config.radiusY, kMaxPlannerRadiusY));
     const size_t candidateReserve =
         static_cast<size_t>(radiusXz * 2 + 1) *
         static_cast<size_t>(radiusXz * 2 + 1) *
@@ -935,16 +1172,20 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanStressVolume(
                 const SparseResidencyClass residencyClass = collisionCore
                     ? SparseResidencyClass::Collision
                     : (visibleBand ? SparseResidencyClass::Visible : SparseResidencyClass::Speculative);
-                const int32_t shellScore =
-                    planarDistance * 8 +
-                    verticalDistance * 13 +
-                    std::abs(dx) + std::abs(dz);
-                candidates.push_back({
-                    {config.center.x + dx, config.center.y + dy, config.center.z + dz},
-                    ResidencyPriorityBase(residencyClass) + shellScore,
-                    residencyClass,
-                    residencyClass != SparseResidencyClass::Speculative
-                });
+                const int32_t shellScore = ClampPriority(
+                    static_cast<int64_t>(planarDistance) * 8 +
+                    static_cast<int64_t>(verticalDistance) * 13 +
+                    std::abs(dx) + std::abs(dz));
+                BrickCoord candidateCoord;
+                if (TryOffsetBrickCoord(config.center, dx, dy, dz, candidateCoord)) {
+                    candidates.push_back({
+                        candidateCoord,
+                        ClampPriority(static_cast<int64_t>(ResidencyPriorityBase(residencyClass)) + shellScore),
+                        residencyClass,
+                        residencyClass != SparseResidencyClass::Speculative,
+                        SparseBrickRequestSource::Stress
+                    });
+                }
             }
         }
     }
@@ -956,7 +1197,7 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanStressVolume(
         return a.coord < b.coord;
     });
 
-    const size_t takeCount = std::min<size_t>(config.maxRequests, candidates.size());
+    const size_t takeCount = std::min<size_t>(requestLimit, candidates.size());
     requests.reserve(takeCount);
     if (takeCount == 0) {
         return requests;
@@ -973,7 +1214,8 @@ std::vector<SparseBrickRequest> SparseBrickRequestPlanner::PlanStressVolume(
             candidate.coord,
             candidate.priority,
             candidate.residencyClass,
-            candidate.urgent
+            candidate.urgent,
+            candidate.source
         });
     }
 

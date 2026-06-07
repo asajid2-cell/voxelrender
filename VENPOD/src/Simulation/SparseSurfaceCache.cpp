@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <utility>
 
 namespace VENPOD::Simulation {
@@ -24,6 +25,77 @@ uint32_t NextPowerOfTwo(uint32_t value) {
     return value + 1u;
 }
 
+bool TryBrickBaseWorld(const BrickCoord& coord, int32_t* outBaseX, int32_t* outBaseY, int32_t* outBaseZ) {
+    int32_t baseX = 0;
+    int32_t baseY = 0;
+    int32_t baseZ = 0;
+    if (!TryWorldVoxelFromBrickLocal(coord.x, 0, &baseX) ||
+        !TryWorldVoxelFromBrickLocal(coord.y, 0, &baseY) ||
+        !TryWorldVoxelFromBrickLocal(coord.z, 0, &baseZ)) {
+        return false;
+    }
+    if (outBaseX) *outBaseX = baseX;
+    if (outBaseY) *outBaseY = baseY;
+    if (outBaseZ) *outBaseZ = baseZ;
+    return true;
+}
+
+int32_t SaturatingAddInt32(int32_t value, int32_t delta) {
+    const int64_t sum = static_cast<int64_t>(value) + static_cast<int64_t>(delta);
+    if (sum < static_cast<int64_t>(std::numeric_limits<int32_t>::min())) {
+        return std::numeric_limits<int32_t>::min();
+    }
+    if (sum > static_cast<int64_t>(std::numeric_limits<int32_t>::max())) {
+        return std::numeric_limits<int32_t>::max();
+    }
+    return static_cast<int32_t>(sum);
+}
+
+uint32_t SaturatingAddUint32(uint32_t lhs, uint32_t rhs) {
+    const uint64_t sum = static_cast<uint64_t>(lhs) + static_cast<uint64_t>(rhs);
+    if (sum > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+        return std::numeric_limits<uint32_t>::max();
+    }
+    return static_cast<uint32_t>(sum);
+}
+
+uint32_t SaturatingSizeToUint32(size_t value) {
+    if (value > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+        return std::numeric_limits<uint32_t>::max();
+    }
+    return static_cast<uint32_t>(value);
+}
+
+size_t SparseSurfaceClusterReserveCount(size_t recordCount, uint32_t recordsPerCluster) {
+    const size_t stride = static_cast<size_t>(std::max(1u, recordsPerCluster));
+    return (recordCount / stride) + ((recordCount % stride) != 0u ? 1u : 0u);
+}
+
+bool SparseSurfaceExtentExceedsLimit(int32_t minValue, int32_t maxValue, uint32_t maxExtent) {
+    if (maxExtent == 0u || maxValue <= minValue) {
+        return false;
+    }
+    const uint64_t extent =
+        static_cast<uint64_t>(static_cast<int64_t>(maxValue) - static_cast<int64_t>(minValue));
+    return extent > static_cast<uint64_t>(maxExtent);
+}
+
+uint32_t SparseSurfaceMortonAxisBits(int32_t value) {
+    constexpr uint32_t kBitsPerAxis = 21u;
+    constexpr uint64_t kAxisMask = (uint64_t{1} << kBitsPerAxis) - 1u;
+    constexpr int64_t kSignedBias = int64_t{1} << (kBitsPerAxis - 1u);
+    const int64_t biased = static_cast<int64_t>(value) + kSignedBias;
+    return static_cast<uint32_t>(static_cast<uint64_t>(biased) & kAxisMask);
+}
+
+bool IsFinite3(float x, float y, float z) {
+    return std::isfinite(x) && std::isfinite(y) && std::isfinite(z);
+}
+
+float FiniteOr(float value, float fallback) {
+    return std::isfinite(value) ? value : fallback;
+}
+
 bool BrickPassesVisibility(
     const BrickCoord& coord,
     const SparseSurfaceVisibilityConfig& visibility,
@@ -40,17 +112,37 @@ bool BrickPassesVisibility(
     constexpr float kBrickHalf = kBrickSize * 0.5f;
     constexpr float kBrickRadius = 13.856406f; // sqrt(3) * 8
 
-    const float centerX = static_cast<float>(coord.x * SPARSE_BRICK_SIZE) + kBrickHalf;
-    const float centerY = static_cast<float>(coord.y * SPARSE_BRICK_SIZE) + kBrickHalf;
-    const float centerZ = static_cast<float>(coord.z * SPARSE_BRICK_SIZE) + kBrickHalf;
+    int32_t baseX = 0;
+    int32_t baseY = 0;
+    int32_t baseZ = 0;
+    if (!TryBrickBaseWorld(coord, &baseX, &baseY, &baseZ)) {
+        return false;
+    }
+    const float centerX = static_cast<float>(baseX) + kBrickHalf;
+    const float centerY = static_cast<float>(baseY) + kBrickHalf;
+    const float centerZ = static_cast<float>(baseZ) + kBrickHalf;
+    if (!IsFinite3(visibility.cameraX, visibility.cameraY, visibility.cameraZ)) {
+        return true;
+    }
     const float dx = centerX - visibility.cameraX;
     const float dy = centerY - visibility.cameraY;
     const float dz = centerZ - visibility.cameraZ;
     const float distanceSq = dx * dx + dy * dy + dz * dz;
-    const float maxDistance = std::max(kBrickSize, visibility.maxDistance + visibility.padding + kBrickRadius);
+    if (!std::isfinite(distanceSq)) {
+        return true;
+    }
+    const float padding = std::clamp(FiniteOr(visibility.padding, 0.0f), 0.0f, 8192.0f);
+    const float maxDistanceInput = std::clamp(FiniteOr(visibility.maxDistance, 2500.0f), kBrickSize, 1000000.0f);
+    const float maxDistance = std::max(kBrickSize, maxDistanceInput + padding + kBrickRadius);
     const bool insideCurrentSphere = distanceSq <= maxDistance * maxDistance;
     bool insideLookaheadSphere = false;
     if (!insideCurrentSphere && visibility.useMotionLookahead) {
+        if (!IsFinite3(
+                visibility.lookaheadCameraX,
+                visibility.lookaheadCameraY,
+                visibility.lookaheadCameraZ)) {
+            return true;
+        }
         const float lookaheadDx = centerX - visibility.lookaheadCameraX;
         const float lookaheadDy = centerY - visibility.lookaheadCameraY;
         const float lookaheadDz = centerZ - visibility.lookaheadCameraZ;
@@ -58,6 +150,9 @@ bool BrickPassesVisibility(
             lookaheadDx * lookaheadDx +
             lookaheadDy * lookaheadDy +
             lookaheadDz * lookaheadDz;
+        if (!std::isfinite(lookaheadDistanceSq)) {
+            return true;
+        }
         insideLookaheadSphere = lookaheadDistanceSq <= maxDistance * maxDistance;
     }
     if (!insideCurrentSphere && !insideLookaheadSphere) {
@@ -72,17 +167,27 @@ bool BrickPassesVisibility(
     if (!visibility.useFrustum) {
         return true;
     }
+    if (!IsFinite3(visibility.forwardX, visibility.forwardY, visibility.forwardZ) ||
+        !IsFinite3(visibility.rightX, visibility.rightY, visibility.rightZ) ||
+        !IsFinite3(visibility.upX, visibility.upY, visibility.upZ)) {
+        return true;
+    }
 
     const float z =
         dx * visibility.forwardX +
         dy * visibility.forwardY +
         dz * visibility.forwardZ;
-    if (z < -(visibility.padding + kBrickRadius)) {
+    if (!std::isfinite(z)) {
+        return true;
+    }
+    if (z < -(padding + kBrickRadius)) {
         return false;
     }
 
-    const float tanHalfY = std::tan(std::max(0.1f, visibility.fovYRadians) * 0.5f);
-    const float tanHalfX = tanHalfY * std::max(0.1f, visibility.aspectRatio);
+    const float fovY = std::clamp(FiniteOr(visibility.fovYRadians, 1.04719755f), 0.1f, 3.0f);
+    const float aspect = std::clamp(FiniteOr(visibility.aspectRatio, 1.7777778f), 0.1f, 8.0f);
+    const float tanHalfY = std::tan(fovY * 0.5f);
+    const float tanHalfX = tanHalfY * aspect;
     const float x =
         dx * visibility.rightX +
         dy * visibility.rightY +
@@ -91,10 +196,34 @@ bool BrickPassesVisibility(
         dx * visibility.upX +
         dy * visibility.upY +
         dz * visibility.upZ;
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(tanHalfX) || !std::isfinite(tanHalfY)) {
+        return true;
+    }
     const float zForFrustum = std::max(0.0f, z);
-    const float xLimit = zForFrustum * tanHalfX + visibility.padding + kBrickRadius;
-    const float yLimit = zForFrustum * tanHalfY + visibility.padding + kBrickRadius;
+    const float xLimit = zForFrustum * tanHalfX + padding + kBrickRadius;
+    const float yLimit = zForFrustum * tanHalfY + padding + kBrickRadius;
+    if (!std::isfinite(xLimit) || !std::isfinite(yLimit)) {
+        return true;
+    }
     return std::abs(x) <= xLimit && std::abs(y) <= yLimit;
+}
+
+bool HasHorizontalNeighborCoverage(
+    const BrickCoord& coord,
+    const std::unordered_set<BrickCoord, BrickCoordHash>& knownBricks)
+{
+    const BrickCoord neighbors[] = {
+        {SaturatingAddInt32(coord.x, -1), coord.y, coord.z},
+        {SaturatingAddInt32(coord.x, 1), coord.y, coord.z},
+        {coord.x, coord.y, SaturatingAddInt32(coord.z, -1)},
+        {coord.x, coord.y, SaturatingAddInt32(coord.z, 1)},
+    };
+    for (const BrickCoord& neighbor : neighbors) {
+        if (neighbor == coord || knownBricks.find(neighbor) == knownBricks.end()) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool BrickCoordLess(const BrickCoord& lhs, const BrickCoord& rhs) {
@@ -113,11 +242,21 @@ bool HasResidencyFlag(uint32_t flags, BrickResidencyFlags flag) {
 
 } // namespace
 
-uint32_t BuildSparseSurfaceDirectionMask(const std::vector<SparseSurfaceFace>& faces) {
+uint32_t BuildSparseSurfaceDirectionMask(const SparseSurfaceFace* faces, uint32_t faceCount) {
     uint32_t mask = 0;
-    for (const SparseSurfaceFace& face : faces) {
-        mask |= SparseSurfaceDirectionBit(SparseSurfacePayloadDirection(face.payload));
+    if (!faces) {
+        return 0u;
     }
+    for (uint32_t index = 0; index < faceCount; ++index) {
+        mask |= SparseSurfaceDirectionBit(SparseSurfacePayloadDirection(faces[index].payload));
+    }
+    return mask & kSparseSurfaceDirectionMaskBits;
+}
+
+uint32_t BuildSparseSurfaceDirectionMask(const std::vector<SparseSurfaceFace>& faces) {
+    const uint32_t faceCount = SaturatingSizeToUint32(faces.size());
+    const SparseSurfaceFace* faceData = faces.empty() ? nullptr : faces.data();
+    const uint32_t mask = BuildSparseSurfaceDirectionMask(faceData, faceCount);
     return mask & kSparseSurfaceDirectionMaskBits;
 }
 
@@ -150,25 +289,25 @@ void ComputeSparseSurfaceFaceBounds(
         int32_t faceMinX = face.worldX;
         int32_t faceMinY = face.worldY;
         int32_t faceMinZ = face.worldZ;
-        int32_t faceMaxX = face.worldX + 1;
-        int32_t faceMaxY = face.worldY + 1;
-        int32_t faceMaxZ = face.worldZ + 1;
+        int32_t faceMaxX = SaturatingAddInt32(face.worldX, 1);
+        int32_t faceMaxY = SaturatingAddInt32(face.worldY, 1);
+        int32_t faceMaxZ = SaturatingAddInt32(face.worldZ, 1);
         switch (static_cast<SparseFaceDirection>(SparseSurfacePayloadDirection(face.payload))) {
         case SparseFaceDirection::NegX:
         case SparseFaceDirection::PosX:
-            faceMaxY = face.worldY + height;
-            faceMaxZ = face.worldZ + width;
+            faceMaxY = SaturatingAddInt32(face.worldY, height);
+            faceMaxZ = SaturatingAddInt32(face.worldZ, width);
             break;
         case SparseFaceDirection::NegY:
         case SparseFaceDirection::PosY:
-            faceMaxX = face.worldX + width;
-            faceMaxZ = face.worldZ + height;
+            faceMaxX = SaturatingAddInt32(face.worldX, width);
+            faceMaxZ = SaturatingAddInt32(face.worldZ, height);
             break;
         case SparseFaceDirection::NegZ:
         case SparseFaceDirection::PosZ:
         default:
-            faceMaxX = face.worldX + width;
-            faceMaxY = face.worldY + height;
+            faceMaxX = SaturatingAddInt32(face.worldX, width);
+            faceMaxY = SaturatingAddInt32(face.worldY, height);
             break;
         }
         minX = std::min(minX, faceMinX);
@@ -189,11 +328,9 @@ void ComputeSparseSurfaceFaceBounds(
 
 uint64_t SparseSurfaceMortonKey(const BrickCoord& coord) {
     constexpr uint32_t kBitsPerAxis = 21u;
-    constexpr uint32_t kAxisMask = (1u << kBitsPerAxis) - 1u;
-    constexpr int32_t kSignedBias = 1 << (kBitsPerAxis - 1u);
-    const uint32_t x = static_cast<uint32_t>(coord.x + kSignedBias) & kAxisMask;
-    const uint32_t y = static_cast<uint32_t>(coord.y + kSignedBias) & kAxisMask;
-    const uint32_t z = static_cast<uint32_t>(coord.z + kSignedBias) & kAxisMask;
+    const uint32_t x = SparseSurfaceMortonAxisBits(coord.x);
+    const uint32_t y = SparseSurfaceMortonAxisBits(coord.y);
+    const uint32_t z = SparseSurfaceMortonAxisBits(coord.z);
 
     uint64_t key = 0;
     for (uint32_t bit = 0; bit < kBitsPerAxis; ++bit) {
@@ -222,12 +359,15 @@ std::vector<SparseSurfaceClusterRecord> BuildSparseSurfaceClusters(
 {
     recordsPerCluster = std::max(1u, recordsPerCluster);
     std::vector<SparseSurfaceClusterRecord> clusters;
-    clusters.reserve((records.size() + recordsPerCluster - 1u) / recordsPerCluster);
+    const size_t reserveCount = SparseSurfaceClusterReserveCount(records.size(), recordsPerCluster);
+    if (reserveCount <= clusters.max_size()) {
+        clusters.reserve(reserveCount);
+    }
 
     auto flushCluster = [&](size_t first, size_t count) {
         SparseSurfaceClusterRecord cluster;
-        cluster.firstRecord = static_cast<uint32_t>(first);
-        cluster.recordCount = static_cast<uint32_t>(count);
+        cluster.firstRecord = SaturatingSizeToUint32(first);
+        cluster.recordCount = SaturatingSizeToUint32(count);
         cluster.minX = INT_MAX;
         cluster.minY = INT_MAX;
         cluster.minZ = INT_MAX;
@@ -238,7 +378,7 @@ std::vector<SparseSurfaceClusterRecord> BuildSparseSurfaceClusters(
         uint32_t directionMask = 0;
         for (size_t i = 0; i < count; ++i) {
             const SparseSurfaceRecord& record = records[first + i];
-            cluster.faceCount += record.faceCount;
+            cluster.faceCount = SaturatingAddUint32(cluster.faceCount, record.faceCount);
             directionMask |= SparseSurfaceRecordDirectionMask(record.flags);
             cluster.minX = std::min(cluster.minX, record.minX);
             cluster.minY = std::min(cluster.minY, record.minY);
@@ -272,9 +412,9 @@ std::vector<SparseSurfaceClusterRecord> BuildSparseSurfaceClusters(
             const bool exceedsExtent =
                 maxClusterExtentVoxels > 0u &&
                 count > 0u &&
-                (static_cast<uint32_t>(std::max(0, nextMaxX - nextMinX)) > maxClusterExtentVoxels ||
-                 static_cast<uint32_t>(std::max(0, nextMaxY - nextMinY)) > maxClusterExtentVoxels ||
-                 static_cast<uint32_t>(std::max(0, nextMaxZ - nextMinZ)) > maxClusterExtentVoxels);
+                (SparseSurfaceExtentExceedsLimit(nextMinX, nextMaxX, maxClusterExtentVoxels) ||
+                 SparseSurfaceExtentExceedsLimit(nextMinY, nextMaxY, maxClusterExtentVoxels) ||
+                 SparseSurfaceExtentExceedsLimit(nextMinZ, nextMaxZ, maxClusterExtentVoxels));
             if (count >= recordsPerCluster || exceedsExtent) {
                 break;
             }
@@ -363,12 +503,26 @@ SparseSurfaceLocalRegion ExpandedSurfaceRegion(const SparseSurfaceLocalRegion& r
 }
 
 bool FaceInsideRegion(const SparseSurfaceFace& face, const BrickCoord& coord, const SparseSurfaceLocalRegion& region) {
-    const int32_t baseX = coord.x * SPARSE_BRICK_SIZE;
-    const int32_t baseY = coord.y * SPARSE_BRICK_SIZE;
-    const int32_t baseZ = coord.z * SPARSE_BRICK_SIZE;
-    int32_t minX = face.worldX - baseX;
-    int32_t minY = face.worldY - baseY;
-    int32_t minZ = face.worldZ - baseZ;
+    int32_t baseX = 0;
+    int32_t baseY = 0;
+    int32_t baseZ = 0;
+    if (!TryBrickBaseWorld(coord, &baseX, &baseY, &baseZ)) {
+        return false;
+    }
+    const int64_t minX64 = static_cast<int64_t>(face.worldX) - static_cast<int64_t>(baseX);
+    const int64_t minY64 = static_cast<int64_t>(face.worldY) - static_cast<int64_t>(baseY);
+    const int64_t minZ64 = static_cast<int64_t>(face.worldZ) - static_cast<int64_t>(baseZ);
+    if (minX64 < std::numeric_limits<int32_t>::min() ||
+        minX64 > std::numeric_limits<int32_t>::max() ||
+        minY64 < std::numeric_limits<int32_t>::min() ||
+        minY64 > std::numeric_limits<int32_t>::max() ||
+        minZ64 < std::numeric_limits<int32_t>::min() ||
+        minZ64 > std::numeric_limits<int32_t>::max()) {
+        return false;
+    }
+    int32_t minX = static_cast<int32_t>(minX64);
+    int32_t minY = static_cast<int32_t>(minY64);
+    int32_t minZ = static_cast<int32_t>(minZ64);
     int32_t maxX = minX;
     int32_t maxY = minY;
     int32_t maxZ = minZ;
@@ -418,6 +572,19 @@ bool SparseSurfaceCache::UpdateBrick(
     const GeneratedSparseBrick& brick,
     const SparseNeighborSampler& neighborSampler)
 {
+    if (HasResidencyFlag(brick.flags, BrickResidencyFlags::Empty)) {
+        SparseSurfaceExtractionResult emptyExtraction;
+        return UpdateBrickWithExtractedFaces(brick, std::move(emptyExtraction));
+    }
+
+    auto extracted = SparseSurfaceExtractor::Extract(brick, neighborSampler);
+    return UpdateBrickWithExtractedFaces(brick, std::move(extracted));
+}
+
+bool SparseSurfaceCache::UpdateBrickWithExtractedFaces(
+    const GeneratedSparseBrick& brick,
+    SparseSurfaceExtractionResult&& extracted)
+{
     auto existing = m_facesByBrick.find(brick.coord);
     m_knownBricks.insert(brick.coord);
     if (HasResidencyFlag(brick.flags, BrickResidencyFlags::Empty)) {
@@ -447,8 +614,6 @@ bool SparseSurfaceCache::UpdateBrick(
         RefreshPendingGpuStats();
         return true;
     }
-
-    auto extracted = SparseSurfaceExtractor::Extract(brick, neighborSampler);
     const uint32_t newFaceCount = static_cast<uint32_t>(extracted.faces.size());
 
     if (newFaceCount == 0u) {
@@ -583,6 +748,35 @@ bool SparseSurfaceCache::UpdateBrickRegion(
     return true;
 }
 
+bool SparseSurfaceCache::MarkKnownEmptySurface(const BrickCoord& coord) {
+    m_knownBricks.insert(coord);
+    auto existing = m_facesByBrick.find(coord);
+    if (existing == m_facesByBrick.end()) {
+        m_unitFacesByBrick.erase(coord);
+        m_dirtyBrickSerials.erase(coord);
+        m_removedBrickSerials.erase(coord);
+        RefreshKnownStats();
+        RefreshPendingGpuStats();
+        return true;
+    }
+
+    m_stats.totalFaces -= static_cast<uint32_t>(existing->second.size());
+    auto unitIt = m_unitFacesByBrick.find(coord);
+    if (unitIt != m_unitFacesByBrick.end()) {
+        m_stats.totalUnitFaces -= unitIt->second;
+        m_unitFacesByBrick.erase(unitIt);
+    }
+    m_facesByBrick.erase(existing);
+    m_stats.cachedBricks = static_cast<uint32_t>(m_facesByBrick.size());
+    ++m_stats.bricksRemovedLastFrame;
+    ++m_stats.serial;
+    m_dirtyBrickSerials.erase(coord);
+    m_removedBrickSerials[coord] = m_stats.serial;
+    RefreshKnownStats();
+    RefreshPendingGpuStats();
+    return true;
+}
+
 bool SparseSurfaceCache::RemoveBrick(const BrickCoord& coord) {
     auto existing = m_facesByBrick.find(coord);
     if (existing == m_facesByBrick.end()) {
@@ -655,7 +849,9 @@ bool SparseSurfaceCache::BuildContiguousFaceList(std::vector<SparseSurfaceFace>&
 
 bool SparseSurfaceCache::BuildGpuSnapshot(
     SparseSurfaceGpuSnapshot& outSnapshot,
-    const SparseSurfaceVisibilityConfig* visibility) const
+    const SparseSurfaceVisibilityConfig* visibility,
+    bool includeSurfaceRecords,
+    bool includeFacePayloads) const
 {
     outSnapshot.faces.clear();
     outSnapshot.ranges.clear();
@@ -665,8 +861,10 @@ bool SparseSurfaceCache::BuildGpuSnapshot(
     outSnapshot.brickFaceCounts.clear();
     outSnapshot.dirtyBricks.clear();
     outSnapshot.removedBricks.clear();
+    outSnapshot.deferredDirtyBricks = 0;
     outSnapshot.candidateBricks = static_cast<uint32_t>(m_facesByBrick.size());
     outSnapshot.visibleBricks = 0;
+    outSnapshot.visibleFaceCount = 0;
     outSnapshot.culledBricks = 0;
     outSnapshot.lookaheadVisibleBricks = 0;
     outSnapshot.drawCommandCount = 0;
@@ -684,6 +882,12 @@ bool SparseSurfaceCache::BuildGpuSnapshot(
         if (visibility && visibility->enabled) {
             bool usedLookahead = false;
             isVisible = BrickPassesVisibility(item.first, *visibility, &usedLookahead);
+            if (isVisible && visibility->requireHorizontalNeighborCoverage) {
+                isVisible = HasHorizontalNeighborCoverage(item.first, m_knownBricks);
+                if (!isVisible) {
+                    usedLookahead = false;
+                }
+            }
             if (isVisible) {
                 ++outSnapshot.visibleBricks;
                 outSnapshot.lookaheadVisibleBricks += usedLookahead ? 1u : 0u;
@@ -699,12 +903,17 @@ bool SparseSurfaceCache::BuildGpuSnapshot(
     }
 
     outSnapshot.rangeCount = outSnapshot.visibleBricks;
+    outSnapshot.visibleFaceCount = visibleFaceCapacity;
     outSnapshot.rangeTableCapacity = NextPowerOfTwo(std::max(1u, outSnapshot.rangeCount * 2u));
     outSnapshot.ranges.resize(outSnapshot.rangeTableCapacity);
-    outSnapshot.faces.reserve(visibleFaceCapacity);
+    if (includeFacePayloads) {
+        outSnapshot.faces.reserve(visibleFaceCapacity);
+    }
     outSnapshot.drawArgs.reserve(outSnapshot.visibleBricks);
     outSnapshot.drawBatches.reserve(outSnapshot.visibleBricks);
-    outSnapshot.surfaceRecords.reserve(outSnapshot.visibleBricks);
+    if (includeSurfaceRecords) {
+        outSnapshot.surfaceRecords.reserve(outSnapshot.visibleBricks);
+    }
     outSnapshot.brickFaceCounts.reserve(outSnapshot.candidateBricks);
     outSnapshot.dirtyBricks.reserve(m_dirtyBrickSerials.size());
     outSnapshot.removedBricks.reserve(m_removedBrickSerials.size());
@@ -742,6 +951,7 @@ bool SparseSurfaceCache::BuildGpuSnapshot(
             return BrickCoordLess(lhs.coord, rhs.coord);
         });
 
+    uint32_t nextLogicalFirstFace = 0;
     for (const SnapshotCandidate& candidate : candidates) {
         if (!candidate.faces) {
             continue;
@@ -759,30 +969,36 @@ bool SparseSurfaceCache::BuildGpuSnapshot(
         const uint32_t faceCount = static_cast<uint32_t>(faces.size());
         SparseSurfaceBrickRange range;
         range.coord = coord;
-        range.firstFace = static_cast<uint32_t>(outSnapshot.faces.size());
+        range.firstFace = includeFacePayloads
+            ? static_cast<uint32_t>(outSnapshot.faces.size())
+            : nextLogicalFirstFace;
         range.faceCount = faceCount;
         const uint32_t directionMask = BuildSparseSurfaceDirectionMask(faces);
         range.flags = SparseSurfacePackRecordFlags(kSparseSurfaceRangeValid, directionMask);
-        outSnapshot.faces.insert(outSnapshot.faces.end(), faces.begin(), faces.end());
+        if (includeFacePayloads) {
+            outSnapshot.faces.insert(outSnapshot.faces.end(), faces.begin(), faces.end());
+        }
 
-        SparseSurfaceRecord record;
-        record.coord = coord;
-        record.firstFace = range.firstFace;
-        record.faceCount = faceCount;
-        record.flags = faceCount > 0u
-            ? SparseSurfacePackRecordFlags(kSparseSurfaceRangeValid, directionMask)
-            : 0u;
-        record.generation = m_stats.serial;
-        ComputeSparseSurfaceFaceBounds(
-            faces.data(),
-            faceCount,
-            &record.minX,
-            &record.minY,
-            &record.minZ,
-            &record.maxX,
-            &record.maxY,
-            &record.maxZ);
-        outSnapshot.surfaceRecords.push_back(record);
+        if (includeSurfaceRecords) {
+            SparseSurfaceRecord record;
+            record.coord = coord;
+            record.firstFace = range.firstFace;
+            record.faceCount = faceCount;
+            record.flags = faceCount > 0u
+                ? SparseSurfacePackRecordFlags(kSparseSurfaceRangeValid, directionMask)
+                : 0u;
+            record.generation = m_stats.serial;
+            ComputeSparseSurfaceFaceBounds(
+                faces.data(),
+                faceCount,
+                &record.minX,
+                &record.minY,
+                &record.minZ,
+                &record.maxX,
+                &record.maxY,
+                &record.maxZ);
+            outSnapshot.surfaceRecords.push_back(record);
+        }
 
         if (faceCount > 0u) {
             SparseSurfaceDrawArgs args;
@@ -795,10 +1011,12 @@ bool SparseSurfaceCache::BuildGpuSnapshot(
 
             SparseSurfaceDrawBatch batch;
             batch.coord = coord;
+            batch.faces = faces.data();
             batch.firstFace = range.firstFace;
             batch.faceCount = faceCount;
             outSnapshot.drawBatches.push_back(batch);
         }
+        nextLogicalFirstFace += faceCount;
 
         const uint32_t mask = outSnapshot.rangeTableCapacity - 1u;
         uint32_t slot = HashBrickCoord32(coord) & mask;
@@ -819,11 +1037,94 @@ bool SparseSurfaceCache::BuildGpuSnapshot(
 
     outSnapshot.drawCommandCount = static_cast<uint32_t>(outSnapshot.drawArgs.size());
     outSnapshot.serial = m_stats.serial;
-    return outSnapshot.faces.size() == visibleFaceCapacity &&
+    return (!includeFacePayloads || outSnapshot.faces.size() == visibleFaceCapacity) &&
+        outSnapshot.visibleFaceCount == visibleFaceCapacity &&
         outSnapshot.rangeCount == outSnapshot.visibleBricks &&
         outSnapshot.drawArgs.size() == outSnapshot.drawBatches.size() &&
-        outSnapshot.surfaceRecords.size() == outSnapshot.visibleBricks &&
+        (!includeSurfaceRecords || outSnapshot.surfaceRecords.size() == outSnapshot.visibleBricks) &&
         outSnapshot.brickFaceCounts.size() == outSnapshot.candidateBricks;
+}
+
+bool SparseSurfaceCache::BuildDirtyPayloadGpuSnapshot(
+    SparseSurfaceGpuSnapshot& outSnapshot,
+    uint32_t maxDirtyBricks) const
+{
+    outSnapshot.faces.clear();
+    outSnapshot.ranges.clear();
+    outSnapshot.drawArgs.clear();
+    outSnapshot.drawBatches.clear();
+    outSnapshot.surfaceRecords.clear();
+    outSnapshot.brickFaceCounts.clear();
+    outSnapshot.dirtyBricks.clear();
+    outSnapshot.removedBricks.clear();
+    outSnapshot.deferredDirtyBricks = 0;
+    outSnapshot.rangeCount = 0;
+    outSnapshot.rangeTableCapacity = 0;
+    outSnapshot.drawCommandCount = 0;
+    outSnapshot.serial = m_stats.serial;
+    outSnapshot.candidateBricks = static_cast<uint32_t>(m_facesByBrick.size());
+    outSnapshot.visibleBricks = 0;
+    outSnapshot.visibleFaceCount = 0;
+    outSnapshot.culledBricks = 0;
+    outSnapshot.lookaheadVisibleBricks = 0;
+
+    if (m_dirtyBrickSerials.empty() && m_removedBrickSerials.empty()) {
+        return false;
+    }
+
+    std::vector<BrickCoord> dirtyCoords;
+    dirtyCoords.reserve(m_dirtyBrickSerials.size());
+    for (const auto& item : m_dirtyBrickSerials) {
+        dirtyCoords.push_back(item.first);
+    }
+    std::sort(dirtyCoords.begin(), dirtyCoords.end(), BrickCoordLess);
+    if (maxDirtyBricks > 0u && dirtyCoords.size() > maxDirtyBricks) {
+        outSnapshot.deferredDirtyBricks =
+            static_cast<uint32_t>(dirtyCoords.size() - maxDirtyBricks);
+        dirtyCoords.resize(maxDirtyBricks);
+    }
+
+    outSnapshot.dirtyBricks.reserve(dirtyCoords.size());
+    outSnapshot.drawBatches.reserve(dirtyCoords.size());
+    for (const BrickCoord& coord : dirtyCoords) {
+        auto dirtyIt = m_dirtyBrickSerials.find(coord);
+        if (dirtyIt == m_dirtyBrickSerials.end()) {
+            continue;
+        }
+        auto facesIt = m_facesByBrick.find(coord);
+        if (facesIt == m_facesByBrick.end()) {
+            outSnapshot.dirtyBricks.push_back({coord, dirtyIt->second});
+            continue;
+        }
+        const auto& faces = facesIt->second;
+        outSnapshot.dirtyBricks.push_back({coord, dirtyIt->second});
+        outSnapshot.visibleBricks += 1u;
+        outSnapshot.visibleFaceCount += static_cast<uint32_t>(faces.size());
+        if (!faces.empty()) {
+            SparseSurfaceDrawBatch batch;
+            batch.coord = coord;
+            batch.faces = faces.data();
+            batch.firstFace = 0u;
+            batch.faceCount = static_cast<uint32_t>(faces.size());
+            outSnapshot.drawBatches.push_back(batch);
+        }
+    }
+    std::vector<BrickCoord> removedCoords;
+    removedCoords.reserve(m_removedBrickSerials.size());
+    for (const auto& item : m_removedBrickSerials) {
+        removedCoords.push_back(item.first);
+    }
+    std::sort(removedCoords.begin(), removedCoords.end(), BrickCoordLess);
+    outSnapshot.removedBricks.reserve(removedCoords.size());
+    for (const BrickCoord& coord : removedCoords) {
+        auto removedIt = m_removedBrickSerials.find(coord);
+        if (removedIt != m_removedBrickSerials.end()) {
+            outSnapshot.removedBricks.push_back({coord, removedIt->second});
+        }
+    }
+    outSnapshot.drawCommandCount = static_cast<uint32_t>(outSnapshot.drawBatches.size());
+    outSnapshot.rangeCount = outSnapshot.visibleBricks;
+    return !outSnapshot.dirtyBricks.empty() || !outSnapshot.removedBricks.empty();
 }
 
 void SparseSurfaceCache::MarkGpuUploadComplete(
@@ -866,7 +1167,7 @@ bool SparseSurfaceCache::TryLookupRangeInSnapshot(
         if (entry.flags == 0u) {
             return false;
         }
-        if (entry.coord == coord) {
+        if (entry.coord == coord && (entry.flags & kSparseSurfaceRangeValid) != 0u) {
             if (outRange) {
                 *outRange = entry;
             }
