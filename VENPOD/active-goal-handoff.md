@@ -44,6 +44,17 @@ The engine is now STABLE (no freezes, no holes) at ~20 FPS in the worst region,
 - Stage 2 (generation as pure background producer) reduces the ~10 ms gen.
 Validate every stage with `walk_bench.ps1` incl. the dense region + stall check.
 
+Stage 2 attempt via EXISTING parallel flags (on top of V2) — REJECTED: enabling
+ParallelMidVoxelPump + ParallelSurfaceExtraction + Async/ParallelExactGeneration
+reintroduced gapPrev stalls (550-810 ms spikes) with no median gain (45 vs 49 ms,
+within noise); generation barely left the critical path. The existing worker
+integration is contended (main thread blocks on it) — it is part of the debt. Stage 2
+needs a CLEAN async-producer rewrite (workers produce into a ready queue; main thread
+applies within a bounded budget; never blocks on a worker), not the old flags. The
+uninstrumented gapPrev stall source (worker join/lock/core-contention) must be found
+first. Best validated state right now: **Stage 1 (V2) alone** — stable, no freezes,
+no holes, ~20 FPS worst region / ~30 FPS easy.
+
 ## Measurement Foundation Reset - 2026-06-07 (READ FIRST)
 
 A review of the whole campaign found the dominant reason progress stalled is the
