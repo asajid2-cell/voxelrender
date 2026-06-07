@@ -66,6 +66,41 @@ accept/reject decision, use the new deterministic bench. Key findings:
    snapshot/restore). That pure refactor + golden-equivalence test is the real
    Phase 2 fix.
 
+### Deterministic-bench experiments (2026-06-07) — two directions RULED OUT
+
+First trustworthy walking baseline (`walk_bench.ps1`, fixed dt, vsync off, 5x308
+frames): raw median ~34-42 ms (~24-29 FPS), noise band +/-7.6 ms (20%), p99 ~60-87 ms.
+Steady frame is spread with NO single dominator: request ~10 (pressureTrim ~3.5,
+hierarchy/terrainCritical ~1.5, statsFlush ~1.3, missFb ~0.7, hiddenExact ~1),
+clip ~12 (interest ~6 + synchronous pump ~6), generation ~7, surfExtract ~3.5.
+`fullRebuild=1` and often `centerDelta=0/0/0` (full interest rebuild even when the
+camera did not cross a brick boundary).
+
+1. **Parallel/async stack RULED OUT as a median lever.** Enabling
+   ParallelMidVoxelPump + ParallelSurfaceExtraction + ParallelExactGeneration +
+   IncrementalPressureTrim(2048) moved `clip` down (~12) but raised
+   postWait/surfExtract (~10/4.4); **median got slightly WORSE (~41-47 vs ~34-42)**,
+   only tighter p99. Threading a stage does not shorten the serial per-frame chain;
+   the main thread still blocks on each stage's output within the frame.
+
+2. **Pressure-trim free-page guard RULED OUT (catastrophic).** Hypothesis: trim is
+   wasteful (scans 131072 pool records, evicts only 8, runs every frame on
+   missFeedbackPressure while 35k pages are free; cost ~3.5 ms is independent of
+   scan budget). Reality: gating it **doubled the whole frame** (median 67-84 ms,
+   clip 31, gen 17, postWait 17). The trim is **load-bearing** — it keeps the
+   resident working set small enough that every downstream stage stays cheap. This
+   confirms the campaign's "pressure-trim gating is a rejected family" even on the
+   clean bench.
+
+**Conclusion: the engine is a tightly-coupled steady-state system.** Local
+stage-level changes either shift cost (parallelism) or break the equilibrium that
+keeps other stages cheap (trim gating). Two clean rejections on a trustworthy bench.
+The remaining real levers are: (A) reduce fundamental per-frame WORK VOLUME so the
+whole coupled pipeline shrinks together (interest/resident set size, ring radius,
+LOD density) — trades draw distance/detail; or (B) amortize the per-frame full
+rebuild across frames with bounded staleness (centerDelta=0 reuse) without breaking
+reservation/coverage. Do NOT keep trying isolated stage tweaks.
+
 ### Measurement Protocol (use for ALL walk perf work)
 
 - North-star scenario: **walking** (gameplay), not high-alt (worst case).
