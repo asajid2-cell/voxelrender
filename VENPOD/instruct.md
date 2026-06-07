@@ -210,14 +210,18 @@ Do not stop because:
 
 ## Architectural Direction
 
-ACTIVE PLAN (2026-06-07): see `frontier-streaming-design.md`. Local/flag
-optimization is proven exhausted (4 bench rejections). The committed direction is a
-quantized, incrementally-maintained working set: re-derive the set only on a
-discrete recenter (frontier delta) instead of every frame from continuous camera
-state, plus a persistent generation/mesh cache. Roll out flag-gated and
-bench-validated; Step 1 (gate per-frame request/interest/view-cone rebuild to
-recenter frames only) is the make-or-break thesis test. The older ownership-ticket
-notes below remain valid background but the frontier plan is the concrete next work.
+ACTIVE PLAN (2026-06-07): see `generation-overhaul-v2.md`. After 8 bench
+experiments proved NO local change reaches 60 FPS or stable 30 (the coupled
+coverage/generation equilibrium breaks under any perturbation, worst case 36 s
+freezes), the decision is a full generation/streaming overhaul. Target:
+background-streamed, best-available-LOD renderer — the frame renders whatever LOD is
+resident and NEVER blocks on generation; generation is a pure background producer
+(prefetch-ahead, persistent cache); residency is maintained by discrete-cell
+frontier deltas. Master flag `VENPOD_STREAMING_V2`, staged + bench-validated, old
+path deleted at cutover. Stage 1 (best-available-LOD render decouple) is the
+keystone. The earlier `frontier-streaming-design.md` (incremental gating) is
+SUPERSEDED — gating alone was proven insufficient. Ownership-ticket notes below
+remain valid background.
 
 
 
