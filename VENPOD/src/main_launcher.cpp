@@ -1263,6 +1263,14 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv(
             "VENPOD_SPARSE_STREAMING_TICKET_LOW_PRIORITY_DOWNSTREAM_PROMOTE_MAX",
             sparseWorldConfig.streamingTicketLowPriorityDownstreamPromoteMax);
+    // Generation overhaul V2 (see generation-overhaul-v2.md). Stage 1 keystone:
+    // accept best-available LOD instead of forcing synchronous generation to restore
+    // coverage. Disables the coverage-emergency catchup escalation + pump-budget
+    // disable so generation stays bounded and the existing LOD fallback chain
+    // (mid -> far-SVO -> far-height -> water -> sky) renders coarser terrain rather
+    // than freezing the frame.
+    const bool enableSparseStreamingV2 =
+        ReadUIntEnv("VENPOD_STREAMING_V2", 0u) != 0u;
     const bool enableSparseRequestExplicitSourceLanes =
         sparseBackendRequested &&
         ReadUIntEnv("VENPOD_SPARSE_REQUEST_EXPLICIT_SOURCE_LANES", 0u) != 0u;
@@ -12038,9 +12046,10 @@ int RunSandbox(int argc, char* argv[]) {
                      sparseOwnershipFarSvoPixelShareLastRetire * 100.0f >=
                          static_cast<float>(sparseMidVoxelCleanBacklogFarSvoPct));
                 const bool sparseMidClipmapProtectedCatchup =
-                    (sparseGenerationCatchupActive &&
-                     sparseMidClipmapVisibleCatchup) ||
-                    sparseMidClipmapCoverageCatchup;
+                    !enableSparseStreamingV2 &&
+                    ((sparseGenerationCatchupActive &&
+                      sparseMidClipmapVisibleCatchup) ||
+                     sparseMidClipmapCoverageCatchup);
                 const uint32_t sparseMidClipmapBudgetBase =
                     sparseMidClipmapProtectedCatchup
                         ? std::max(sparseMidClipmapTileBudget, sparseMidClipmapCatchupTileBudget)
@@ -12200,7 +12209,7 @@ int RunSandbox(int argc, char* argv[]) {
                         !sparseMidClipmapVisualOwnershipFailure &&
                         (!sparseMidClipmapCoverageEmergency ||
                          sparseMidClipmapVisibleCriticalCoverageReadyV2);
-                    if (!sparseMidClipmapPumpBudgetCoverageReady) {
+                    if (!enableSparseStreamingV2 && !sparseMidClipmapPumpBudgetCoverageReady) {
                         Simulation::SparseClipmapConfig sparseClipmapPumpConfig =
                             sparseClipmapPumpPolicy.Config();
                         sparseClipmapPumpConfig.pumpBudgetMs = 0.0f;
