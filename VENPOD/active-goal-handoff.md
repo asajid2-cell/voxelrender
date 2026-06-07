@@ -115,6 +115,20 @@ camera did not cross a brick boundary).
    condition to the reuse gate. Expected gain may be sub-noise (~interest 6ms on
    centerDelta=0 frames only) unless a stable set also reduces gen/pump churn.
 
+5. **Center-gated interest reuse (the frontier thesis itself) IMPLEMENTED + RULED
+   OUT.** Added `voxelInterestRecenterGate` (reuse while camera stays in the same
+   finest-ring brick cell), built, benched, reverted. Regressed: median ~56 ms (vs
+   ~38), request 18.6, gen 13, clip hitches to 121 ms at recenter. Mechanism:
+   stable-center frames were perfect (interest 1 ms, missingVoxel 0), but each
+   recenter dumped the accumulated frontier delta (~1479 bricks) -> pump 118 ms.
+   **The per-frame full rebuild IS the generation load-balancer** — it feeds
+   generation smoothly (~46 bricks/frame); skipping it batches work into recenter
+   bursts. Forward-walking cost is mostly irreducible (must generate+mesh terrain
+   you walk into). See `frontier-streaming-design.md` "RESULT: Step 1c failed". The
+   revised real lever is PREFETCH-AHEAD generation (workers generate the frontier
+   before arrival, off the critical path), not gating the rebuild. Do not retry
+   interest reuse.
+
 **Conclusion: the engine is a tightly-coupled steady-state system, and the full
 per-frame rebuild over a view-sized set IS the stable operating point.** Every
 perturbation tested (parallelize, bigger set, smaller set, stale reuse) breaks the

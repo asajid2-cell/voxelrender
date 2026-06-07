@@ -1,7 +1,54 @@
 # VENPOD Frontier / Persistent Streaming — Design & Incremental Plan
 
-Status: DESIGN (scoped 2026-06-07). Read `instruct.md` and the "Measurement
-Foundation Reset" + experiments section of `active-goal-handoff.md` first.
+Status: DESIGN, with a CRITICAL UPDATE 2026-06-07 — the core thesis (gate the
+per-frame rebuild on recenter) was IMPLEMENTED, BENCHED, and FAILED. See
+"## RESULT: Step 1c failed and why" below before doing anything else. Read
+`instruct.md` and the experiments section of `active-goal-handoff.md` first.
+
+## RESULT: Step 1c failed and why (2026-06-07)
+
+Implemented center-gated voxel-interest reuse (`voxelInterestRecenterGate`, reuse
+while the camera stays in the same finest-ring brick cell — the "correct" gate,
+not the camera-blind age reuse). Built clean, benched on the deterministic walk,
+then REVERTED. Result: regressed (median ~56 ms vs ~38 baseline; request 18.6, gen
+13; clip hitches to 121 ms at recenter frames).
+
+Mechanism (from per-frame logs): on stable-center frames the gate worked perfectly
+(interest 1 ms, pump 0.4 ms, missingVoxel 0, clip 2.5 ms). But at each recenter,
+missingVoxel jumped to ~1479 and the pump exploded to ~118 ms. The reuse holds the
+set stable across ~13 frames, the camera drifts, then the recenter dumps the whole
+accumulated frontier delta at once -> pump can't absorb it -> 121 ms hitch.
+
+KEY INSIGHT (revises the whole thesis): **the per-frame full rebuild is the
+engine's generation load-balancer.** It is NOT redundant waste — by re-deriving the
+frontier every frame it feeds generation smoothly at ~46 bricks/frame. Skipping it
+(in ANY form: age reuse, center-gated reuse) batches the same work into recenter
+bursts that blow the pump budget. This is why all 5 experiments failed: every one
+either shifts cost or breaks the smooth per-frame generation feed.
+
+Corollary: the true cost of forward walking is mostly IRREDUCIBLE per-frame
+frontier work — generating+meshing+uploading the ~46 NEW bricks the camera walks
+into each frame (gen 7 + pump 6 + surface 3.5) plus interest scoring (6) + request
+planning (10). You cannot skip generating terrain you are about to walk into.
+
+REVISED real levers (none are a same-day flag fix):
+- (A) Prefetch-ahead generation: run worker threads AHEAD of the camera along its
+  known velocity so the frontier is generated BEFORE it is needed and is resident on
+  arrival -> frontier gen leaves the critical path. Different from the rejected
+  parallel test (which parallelized SAME-frame work). This is the genuine fix for
+  forward motion but has a graveyard of prior attempts (predicted-visible admission,
+  async exact prefetch lane) — must be done carefully on the trustworthy bench.
+- (B) Cheaper per-brick gen/mesh (profile per-brick hotspots; micro-opts may stack).
+- (C) Cheaper interest SCORING without skipping the rebuild (reduce the ~50k
+  candidate attempts / ~30k duplicates at the source, like the retained camera-band
+  skip) — keeps the smooth feed, only trims the compute. Likely sub-noise alone.
+
+The original Step 1/2/3 below (gate rebuild on recenter) is SUPERSEDED by this
+result. Do not retry interest reuse in any form.
+
+---
+
+(Original design retained below for context.)
 
 ## Why this exists
 
