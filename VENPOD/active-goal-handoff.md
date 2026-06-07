@@ -16,6 +16,34 @@ Tool goal currently active:
 Drive VENPOD toward stable 60 FPS by identifying and patching structural engine bottlenecks at their source: preserve public-frame correctness and visual coverage, measure the dominant cost stage before each change, implement core dataflow/architecture fixes rather than tuning knobs, and reject changes that merely shift debt or trade FPS for instability.
 ```
 
+## OVERHAUL V2 — Stage 1 LANDED (2026-06-07, READ FIRST)
+
+The generation overhaul (`generation-overhaul-v2.md`) is underway and Stage 1 (the
+keystone) is validated + committed (`VENPOD_STREAMING_V2`, default off).
+
+Stage 1 = best-available-LOD render decouple: disables the coverage-emergency
+force-generation policy (no catchup budget escalation, no pump-budget disable), so
+the frame renders best-available LOD via the existing fallback chain instead of
+freezing to force exact coverage.
+
+Result on the worst case (dense region, walk frames 600-1000):
+- max frame: `198-36518 ms` (multi-second freezes) -> `84-112 ms`. Catastrophic
+  stalls + 280 ms pump spikes ELIMINATED.
+- median `62-111 -> 49-63 ms`; p99 `151-304 -> 76-94 ms`.
+- `missScreenPct=0`, `unsafeNearMissScreenPct=0` -> NO on-screen holes/sky-leaks.
+  Residency coverage `94->70` = coarser LOD where exact hasn't streamed in (the
+  intended transient-coarseness-for-stability tradeoff).
+
+The engine is now STABLE (no freezes, no holes) at ~20 FPS in the worst region,
+~30 FPS in easy regions. Remaining per-frame cost (now bounded, no spikes): request
+~15, clip/interest ~14, generation ~10, postWait/surfExtract ~11. Next stages:
+- Stage 4 (frontier residency / stop per-frame interest re-derivation) is now likely
+  UNBLOCKED — the center-gated interest reuse that failed as experiment 5 only failed
+  because the force-gen turned recenter bursts into 121 ms freezes; with Stage 1 a
+  recenter burst just streams in coarser over a few frames. Re-test on top of V2.
+- Stage 2 (generation as pure background producer) reduces the ~10 ms gen.
+Validate every stage with `walk_bench.ps1` incl. the dense region + stall check.
+
 ## Measurement Foundation Reset - 2026-06-07 (READ FIRST)
 
 A review of the whole campaign found the dominant reason progress stalled is the
