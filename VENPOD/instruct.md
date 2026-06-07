@@ -210,6 +210,17 @@ Do not stop because:
 
 ## Architectural Direction
 
+ACTIVE PLAN (2026-06-07): see `frontier-streaming-design.md`. Local/flag
+optimization is proven exhausted (4 bench rejections). The committed direction is a
+quantized, incrementally-maintained working set: re-derive the set only on a
+discrete recenter (frontier delta) instead of every frame from continuous camera
+state, plus a persistent generation/mesh cache. Roll out flag-gated and
+bench-validated; Step 1 (gate per-frame request/interest/view-cone rebuild to
+recenter frames only) is the make-or-break thesis test. The older ownership-ticket
+notes below remain valid background but the frontier plan is the concrete next work.
+
+
+
 Implement a single concept that survives through the whole terrain lifecycle: an ownership ticket.
 
 Each request/page/brick should eventually carry:
