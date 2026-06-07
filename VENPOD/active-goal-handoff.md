@@ -100,7 +100,28 @@ camera did not cross a brick boundary).
    it breaks coverage. (Note: `MID_VOXEL_RADIUS_XZ` does NOT change the cap, which
    is pool*pct, so radius alone is not a work-volume knob.)
 
-**Conclusion: the engine is a tightly-coupled steady-state system.** Local
+4. **Existing age-based interest reuse RULED OUT (stale->thrash), but it is the
+   WRONG reuse.** `VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE` age 1
+   fired (interest ~6ms->~1ms) but `missingVoxel` exploded ~130->5184 (~40x) with
+   req/gen ~doubling. Root cause: the reuse gate (`staticVoxelInterestSignatureMatches`,
+   SparseClipmap.cpp ~L4022) deliberately ZEROES camera/forward/velocity before
+   comparing, so it reuses on AGE alone, ignoring that the camera walked forward ->
+   stale set -> coverage holes -> repair thrash. (NOTE: prior "pump=246" in clip
+   detail is a COUNT, not ms; clipMs stayed 7-20ms. The disqualifier is the
+   missingVoxel/coverage explosion, not pump time.)
+   IMPLICATION: a reuse gated on `centerDelta==0` (brick cell unchanged => set is
+   genuinely identical, not merely "recent") would not go stale. That is the one
+   principled local fix not yet tried -- a code change adding a centerDelta==0
+   condition to the reuse gate. Expected gain may be sub-noise (~interest 6ms on
+   centerDelta=0 frames only) unless a stable set also reduces gen/pump churn.
+
+**Conclusion: the engine is a tightly-coupled steady-state system, and the full
+per-frame rebuild over a view-sized set IS the stable operating point.** Every
+perturbation tested (parallelize, bigger set, smaller set, stale reuse) breaks the
+coverage/generation equilibrium and explodes a stage. The ~38ms cost buys that
+stability. Local/flag optimization is exhausted; real 60 FPS needs a different
+streaming architecture (generate+mesh terrain ONCE on cell entry and persist it,
+rather than re-deriving the working set every frame). Local
 stage-level changes either shift cost (parallelism) or break the coverage
 equilibrium in BOTH directions (no-trim balloons, smaller-set thrashes). Three
 clean rejections on a trustworthy bench. Work-volume reduction is ruled out because
