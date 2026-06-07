@@ -25,7 +25,7 @@
 
 .EXAMPLE
     .\walk_bench.ps1 -Runs 5
-    .\walk_bench.ps1 -Runs 5 -SmokeArgs @('-StackPreset','none')
+    .\walk_bench.ps1 -Runs 5 -SmokeArgs @{ ParallelMidVoxelPump=$true; ParallelSurfaceExtraction=$true }
     .\walk_bench.ps1 -ParseOnly -OutRoot build\captures\walk_bench_xxxx
 #>
 param(
@@ -39,8 +39,10 @@ param(
     [string]$OutRoot = "",
     [switch]$NoBuild,
     [switch]$ParseOnly,
-    # Extra args passed straight through to perf_noncapture_smoke.ps1 (e.g. stack flags).
-    [string[]]$SmokeArgs = @()
+    # Extra params splatted straight through to perf_noncapture_smoke.ps1 (e.g. stack
+    # flags). MUST be a hashtable so it binds by name, e.g.
+    #   -SmokeArgs @{ ParallelMidVoxelPump=$true; ParallelMidVoxelPumpMaxWorkers=4 }
+    [hashtable]$SmokeArgs = @{}
 )
 
 $ErrorActionPreference = "Stop"
@@ -190,7 +192,7 @@ if (-not $ParseOnly) {
             FrameEndLogInterval = 1
             OutputDir          = $runDir
         }
-        # Hashtable splat binds named params; $SmokeArgs array splat appends extras.
+        # Both hashtables splat by name (keys must not overlap).
         & (Join-Path $root "perf_noncapture_smoke.ps1") @smoke @SmokeArgs
     }
 }
