@@ -119,6 +119,39 @@ coverageVisibleCritical, missingVoxel) does not regress. Commit or revert each s
 - **Step 4 (Pillar B persistent gen/mesh cache):** restore evicted bricks from cache
   instead of regenerating; targets residual gen churn and back-and-forth motion.
 
+### Step 0 result (2026-06-07) + Step 1 implementation anchors
+
+Step 0 CONFIRMED: on the deterministic walk, ~95% of frames have a stable center
+(`centerDelta=0/0/0`; 74 zero vs 4 nonzero sampled, frames >=300). So the
+re-derivation is redundant on ~19/20 frames. Prize confirmed.
+
+Step 1 implementation anchors (main_launcher.cpp):
+- `sparseRequestFullRebuildThisFrame` is initialized to `1u` EVERY frame when
+  `enableSparseHierarchicalRequests` (line ~6444) -> the hierarchical path (active
+  on walk; nonzero hierarchyMs/terrainCriticalMs) forces full rebuild every frame.
+  This is THE thing Step 1 must change: set it to 1 only on recenter
+  (`sparseCenter != lastSparseRequestCenter`) when the frontier-gate flag is on, in
+  BOTH the hierarchical (`if`) and non-hierarchical (`else`) branches.
+- Non-hierarchical branch already gates the visible `Plan()` on recenter (line
+  ~10347) but runs the collision-shell loop (~10376, cheap touches) and the
+  continuous view-cone raycast prefetch (~10387-10437) every frame.
+- Hierarchical branch (~10240-10344) runs terrain-surface-prefetch raycasts on
+  continuous cameraPos (gated by budget; was 0ms in the baseline so not the current
+  cost) plus the terrain-critical/hierarchy planning (the ~1.3-1.8ms hierarchyMs).
+- The mid-clipmap interest rebuild (`UpdateInterest`/`UpdateVoxelInterest`, called
+  ~10938) is SEPARATE and runs every frame (~6ms interest). Its recenter gate must
+  check the MID clipmap center, and must update the set correctly on recenter (NOT
+  the camera-blind age reuse that thrashed).
+- `lastSparseResidencyCameraWorld` / `sparseCenter` give the recenter signal.
+
+Recommended Step 1 sequencing (each its own flag + bench + commit/revert):
+  1a. Gate the continuous prefetch raycasts (view-cone + terrain-surface) to
+      recenter-only (safe: speculative work). Smallest, safest first cut.
+  1b. Gate the hierarchical full-rebuild (line 6444 init) to recenter-only.
+  1c. Gate the mid-clipmap interest rebuild to recenter-only (correct set update on
+      recenter, not stale reuse).
+Validate coverage HARD at each (missingVoxel must not explode like age-reuse did).
+
 Step 1 is the thesis test. If median drops materially with coverage held, the
 architecture is validated and Steps 2-4 refine it. If coverage cannot be held even
 with Step 2's forward ring, the working-set definition itself must change before
