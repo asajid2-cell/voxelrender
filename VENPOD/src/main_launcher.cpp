@@ -2445,6 +2445,8 @@ int RunSandbox(int argc, char* argv[]) {
         ReadFloatEnv(
             "VENPOD_SPARSE_MID_CLIPMAP_PUMP_BUDGET_MS",
             sparseClipmapConfig.backlogAwarePump ? 4.0f : 0.0f);
+    sparseClipmapConfig.voxelPumpHardBudgetMs =
+        ReadFloatEnv("VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS", 0.0f);
     sparseClipmapConfig.drainReuseDiagnostics =
         ReadUIntEnv("VENPOD_SPARSE_MID_CLIPMAP_DRAIN_REUSE_DIAGNOSTICS", 0u) != 0u;
     sparseClipmapConfig.fallbackValidityClassifier =

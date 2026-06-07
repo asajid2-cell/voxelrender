@@ -2017,6 +2017,10 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
     }
     m_effectivePumpBudgetMsLastFrame =
         policy.Config().backlogAwarePump ? policy.Config().pumpBudgetMs : 0.0f;
+    // Phase 1 hard pump time budget: always enforced, cannot be bypassed by the
+    // coverage-emergency path that zeroes pumpBudgetMs.
+    const float voxelPumpHardBudgetMs = policy.Config().voxelPumpHardBudgetMs;
+    const bool voxelPumpHardBudgetActive = voxelPumpHardBudgetMs > 0.0f;
     if (!policy.IsEnabled() || (maxHeightTiles == 0 && maxVoxelBricks == 0)) {
         RefreshStats();
         m_stats.pumpHeightMsLastFrame = 0.0f;
@@ -2289,6 +2293,14 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
         ++m_dirtySerial;
         ++m_voxelDirtySerial;
         MarkVoxelSlotDirty(slot);
+        if (voxelPumpHardBudgetActive && !m_voxelGenerationQueue.empty()) {
+            const float elapsedMs =
+                ElapsedMs(voxelPumpStart, std::chrono::steady_clock::now());
+            if (elapsedMs >= voxelPumpHardBudgetMs) {
+                m_pumpBudgetHitLastFrame = 1;
+                break;
+            }
+        }
         if (voxelPumpBudgetActive &&
             generatedVoxel < maxVoxelBricks &&
             !m_voxelGenerationQueue.empty()) {

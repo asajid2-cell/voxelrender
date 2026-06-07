@@ -40,6 +40,13 @@ struct SparseClipmapConfig {
     bool footprintInterestSignature = false;
     bool backlogAwarePump = false;
     float pumpBudgetMs = 0.0f;
+    // Phase 1 (stable 30): hard, unbypassable per-pump TIME budget (ms). Unlike
+    // pumpBudgetMs (which the coverage-emergency path sets to 0 to catch up ->
+    // 200ms+ freezes in dense terrain), this is ALWAYS enforced regardless of
+    // coverage. A time budget (not a count cap) is required because per-brick cost
+    // varies ~20x (cheap flat terrain vs dense geometry). Trades brief lower-LOD lag
+    // in dense regions for stable frame time. 0 = disabled.
+    float voxelPumpHardBudgetMs = 0.0f;
     bool drainReuseDiagnostics = false;
     bool fallbackValidityClassifier = false;
     bool fallbackContractDiagnostics = false;

@@ -11,6 +11,7 @@ param(
     [switch]$KillExisting,
     [int]$FixedFrame = 380,
     [int]$WalkFrame = 600,
+    [int]$WalkSpeed = 38,
     [int]$HighAltFrame = 400,
     [string]$BackgroundPassScale = "0.375",
     [switch]$BackgroundPassSurfaceFill,
@@ -67,6 +68,7 @@ param(
     [switch]$MidClipmapFootprintInterestSignature,
     [switch]$MidClipmapVoxelInterestSignatureReuse,
     [int]$MidClipmapVoxelInterestSignatureReuseMaxAge = 1,
+    [double]$MidClipmapPumpHardBudgetMs = 0,
     [int]$StartupPublicRenderMaxFrame = -1,
     [switch]$StartupPublicRenderMidVoxelVisibleProof,
     [switch]$StartupPublicRenderMidVoxelMovingWindowProof,
@@ -335,6 +337,7 @@ $managedEnv = @(
     "VENPOD_SPARSE_MID_CLIPMAP_INTEREST_DETAIL",
     "VENPOD_SPARSE_MID_CLIPMAP_FOOTPRINT_INTEREST_SIGNATURE",
     "VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE",
+    "VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS",
     "VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE_MAX_AGE",
     "VENPOD_SPARSE_MID_CLIPMAP_MOVING_WINDOW_PRIORITY",
     "VENPOD_SPARSE_MID_CLIPMAP_MOVING_WINDOW_ASYNC_RESERVATION",
@@ -758,6 +761,11 @@ function Set-CommonCandidateEnv {
     } else {
         Clear-EnvValue "VENPOD_SPARSE_MID_CLIPMAP_FOOTPRINT_INTEREST_SIGNATURE"
     }
+    if ($MidClipmapPumpHardBudgetMs -gt 0) {
+        Set-EnvValue "VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS" ([string]$MidClipmapPumpHardBudgetMs)
+    } else {
+        Clear-EnvValue "VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS"
+    }
     if ($MidClipmapVoxelInterestSignatureReuse) {
         Set-EnvValue "VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE" "1"
         Set-EnvValue "VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE_MAX_AGE" ([string][Math]::Max(0, $MidClipmapVoxelInterestSignatureReuseMaxAge))
@@ -1060,7 +1068,7 @@ function Clear-ScenarioEnv {
 
 function Set-WalkScenarioEnv {
     Set-EnvValue "VENPOD_SPARSE_WALK_TEST" "1"
-    Set-EnvValue "VENPOD_SPARSE_WALK_TEST_SPEED" "38"
+    Set-EnvValue "VENPOD_SPARSE_WALK_TEST_SPEED" ([string]$WalkSpeed)
     Set-EnvValue "VENPOD_SPARSE_WALK_TEST_YAW_DEG" "10"
     Set-EnvValue "VENPOD_SPARSE_WALK_TEST_PITCH_DEG" "-4"
     if ($WalkFixedDtMs -gt 0) {
@@ -2218,6 +2226,7 @@ function Write-RunManifest {
         MidClipmapFootprintInterestSignature = [bool]$MidClipmapFootprintInterestSignature
         MidClipmapVoxelInterestSignatureReuse = [bool]$MidClipmapVoxelInterestSignatureReuse
         MidClipmapVoxelInterestSignatureReuseMaxAge = $MidClipmapVoxelInterestSignatureReuseMaxAge
+        MidClipmapPumpHardBudgetMs = $MidClipmapPumpHardBudgetMs
         MidClipmapVisibleCriticalPrepump = [bool]$MidClipmapVisibleCriticalPrepump
         MidClipmapVisiblePriorityPump = [bool]$MidClipmapVisiblePriorityPump
         MidClipmapCacheOnlyDefer = [bool]$MidClipmapCacheOnlyDefer
