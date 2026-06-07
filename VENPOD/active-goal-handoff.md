@@ -129,6 +129,34 @@ camera did not cross a brick boundary).
    before arrival, off the critical path), not gating the rebuild. Do not retry
    interest reuse.
 
+6. **Stable-30 via hard pump budget IMPLEMENTED + RULED OUT (catastrophic).**
+   Phase 1 target was the p99 tail. Found the spikes are the mid-voxel PUMP hitting
+   180-280 ms in dense terrain regions (per-brick cost ~2.2 ms, ~20x normal),
+   because the coverage-first policy zeroes `pumpBudgetMs` to catch up. Spikes are
+   terrain-location dependent, NOT walk-speed dependent (tested speed 10 vs 38 -
+   same spikes, just shifted frames). Implemented `voxelPumpHardBudgetMs` (a hard,
+   always-enforced per-pump time budget, code retained default-off as a building
+   block). At 8 ms it bounded the pump (clip 25->17, gen/surface/postWait collapsed)
+   BUT request exploded to 50 ms and produced multi-second `gapPrev` freezes
+   (5 s, 8 s, **36 s**): bounding generation lets the missing-brick backlog grow
+   unbounded -> request re-scans it every frame AND the coverage-emergency
+   eventually force-generates the whole backlog at once. Bounding cannot work alone;
+   it must be paired with admission control (which separately thrashes coverage).
+
+**FINAL VERDICT (8 experiments, trustworthy bench): neither 60 FPS nor stable 30 is
+reachable by any local/bounding change.** Parallelize, trim-gate, shrink-set,
+interest-reuse (age + center-gated), pump-budget - every one breaks the coupled
+coverage/generation equilibrium and shifts or amplifies the cost (worst case 36 s
+freezes). The unbounded full per-frame work IS the only stable operating point
+(~26 FPS avg with terrain-dependent spikes). The ONLY remaining path is an
+architectural rewrite that decouples generation from the per-frame coverage
+requirement: **prefetch-ahead generation** - worker threads generate terrain INTO A
+PERSISTENT CACHE ahead of the camera along its path, so the per-frame thread renders
+already-resident terrain and does little/no generation. This removes both the pump
+spikes AND the backlog explosion (generation is never on the critical path). It is a
+multi-week build with a graveyard of partial prior attempts; it is NOT a same-day
+fix. See `frontier-streaming-design.md` lever (A).
+
 **Conclusion: the engine is a tightly-coupled steady-state system, and the full
 per-frame rebuild over a view-sized set IS the stable operating point.** Every
 perturbation tested (parallelize, bigger set, smaller set, stale reuse) breaks the
