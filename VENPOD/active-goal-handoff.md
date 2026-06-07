@@ -92,14 +92,29 @@ camera did not cross a brick boundary).
    confirms the campaign's "pressure-trim gating is a rejected family" even on the
    clean bench.
 
+3. **Smaller interest set (work-volume reduction) RULED OUT (thrash).** Cutting
+   `VENPOD_SPARSE_MID_VOXEL_INTEREST_PCT` 75->40 (cap 9216->4915) **doubled the
+   frame** (median 70-84 ms) and exploded request (25 ms) + generation (18 ms) +
+   gapPrev hitches (150-240 ms). Fewer resident bricks -> more misses -> on-demand
+   request/gen thrash. The 9216/75% set is sized to just cover the view; shrinking
+   it breaks coverage. (Note: `MID_VOXEL_RADIUS_XZ` does NOT change the cap, which
+   is pool*pct, so radius alone is not a work-volume knob.)
+
 **Conclusion: the engine is a tightly-coupled steady-state system.** Local
-stage-level changes either shift cost (parallelism) or break the equilibrium that
-keeps other stages cheap (trim gating). Two clean rejections on a trustworthy bench.
-The remaining real levers are: (A) reduce fundamental per-frame WORK VOLUME so the
-whole coupled pipeline shrinks together (interest/resident set size, ring radius,
-LOD density) — trades draw distance/detail; or (B) amortize the per-frame full
-rebuild across frames with bounded staleness (centerDelta=0 reuse) without breaking
-reservation/coverage. Do NOT keep trying isolated stage tweaks.
+stage-level changes either shift cost (parallelism) or break the coverage
+equilibrium in BOTH directions (no-trim balloons, smaller-set thrashes). Three
+clean rejections on a trustworthy bench. Work-volume reduction is ruled out because
+the set is sized to just cover the view. **The one remaining non-destructive lever:
+amortize the per-frame FULL rebuild across frames.** `fullRebuild=1` runs every
+frame even when `centerDelta=0/0/0` (camera did not cross a brick boundary), so the
+emitted interest set is ~identical to last frame yet fully recomputed (~candidate
+gen + sort + request scan). Keep the SAME set (no thrash); skip the redundant
+recompute when center+view are unchanged. NOTE: prior signature/ring-plan reuse
+attempts failed, but on the broken benchmark and at high-alt (continuous motion,
+centerDelta rarely 0). Walking with fixed dt has frequent centerDelta=0, so reuse
+has real opportunity here. Next step: find why the existing
+`VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE` does not fire on walking
+and make it fire safely (reuse emitted set, still run apply/queue/reservation).
 
 ### Measurement Protocol (use for ALL walk perf work)
 
