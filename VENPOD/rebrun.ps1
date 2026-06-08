@@ -699,7 +699,7 @@ try {
         # Mid-voxel interest radius is the dominant per-frame CPU driver (clip/req/upload
         # scale ~quadratically with it; default 8 -> ~9200 bricks). Shrink it for fps; the
         # far LOD + background pass fill beyond the mid-detail radius. quality keeps 8.
-        $midVoxRadius = if ($quality) { "8" } elseif ($PerfMode -eq "60fps") { "6" } else { "7" }
+        $midVoxRadius = if ($quality) { "8" } elseif ($PerfMode -eq "60fps") { "4" } else { "6" }
         $env:VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ = $midVoxRadius
         # Mid interest set is rebuilt EVERY frame (interestInterval=1) -- a big chunk of
         # 'clip'. Amortize it across frames (camera moves smoothly, the set barely changes
