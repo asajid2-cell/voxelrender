@@ -4,6 +4,34 @@ Generated: 2026-06-05
 
 This is the compact survival file for the active VENPOD campaign. If chat compacts, first read `instruct.md` for the long-run operating contract, then resume from this file before reading the larger `handoff.md`, `debug-handoff.md`, `root.md`, or `debug.md`.
 
+## VISUAL OVERHAUL + SELF-VERIFY landed (2026-06-07, READ FIRST)
+
+Self-verification loop established: `capvis.ps1` runs the scripted walk in a mode, captures
+BMP frames (VENPOD_CAPTURE_DIR), converts to half-res PNG -> Read the PNG to SEE the render.
+USE THIS to verify visuals/perf yourself; do not rely on stationary headless (it lied) or
+round-trip the user.
+
+Visual fixes landed (shader-only, apply to ALL modes, verified via capture):
+- Terrain de-banding: the voxel staircase shaded as harsh contour bands. Fix = bias lighting
+  normal toward macro-up (normalize(n + up*1.35)) in PS_SparseSurface + both raymarch near
+  paths -> slopes read as smooth hills. Cut the voxel grid-line overlay (was 0.46 -> ~0.02,
+  it was the moiré). Far LOD brightened (was dark grey).
+- Reflective water: PS_SparseSurface MAT_WATER + 3 raymarch FarWater paths (ShadeWaterSurface)
+  were flat teal. Now fresnel sky reflection + sun glint + depth darkening -> reads as water.
+
+Current verified state (60fps mode, render scale 0.65, scripted walk):
+- STEADY ~30-36 fps (frame ms median 28, p90 34, max 40) -- NO big hitches (async producers
+  removed the 100-160ms spikes). GPU has headroom (render scale 0.65 == 0.5 fps, CPU-bound).
+- Frame ~26ms = clip 7-11 (mid-clipmap, SYNC) + req 5-6 + gpu ray 10-11 + surface upload
+  (untracked) 8-10. To reach steady 60: async-ify mid-clipmap gen (clip) AND cut surface
+  upload (BuildGpuSnapshot/stage). Each ~8ms; need several.
+- quality mode = best visual (full coverage, no bandaids) but ~16fps; good for visual checks.
+
+REMAINING for the full goal (steady 60 + full correctness): (1) mid-clipmap async (clip),
+(2) surface upload optimization (untracked), (3) minor: terrain color variation, a tall-spire
+feature reads slightly detached, occasional checkerboard at an LOD gap. Smooth NORMALS proper
+(mesher height-gradient) would beat the up-bias approximation but needs a vertex-format change.
+
 ## ASYNC PRODUCER REWRITE landed — 7→30 fps (2026-06-07, READ FIRST)
 
 Real play now ~30 fps, dips to ~20 on turns (was 7-10). What got us here, in order:
