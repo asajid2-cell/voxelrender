@@ -4,7 +4,23 @@ Generated: 2026-06-05
 
 This is the compact survival file for the active VENPOD campaign. If chat compacts, first read `instruct.md` for the long-run operating contract, then resume from this file before reading the larger `handoff.md`, `debug-handoff.md`, `root.md`, or `debug.md`.
 
-## PERF: 7 -> ~57 fps steady (touches 60) + VISUAL OVERHAUL (2026-06-08, READ FIRST)
+## PERF: 7 -> ~58-61 fps (crosses 60) + VISUAL OVERHAUL (2026-06-08, READ FIRST — latest)
+
+Latest: ~58 fps avg, runs 54-61, regularly hitting 60-67 (no-capture walk speed 26 = sprint
+stress, vsync off); a capture-enabled run averaged 60.6. 8.3x from broken 7fps. Final gains:
+mid voxel radius 4 (shrank interest-rebuild spike) THEN render scale 0.5 (the radius cut
+shifted the bound to GPU, so lowering raymarch res finally helped -> +2-3fps). render scale
+softens only the RAYMARCHED far; near terrain is rasterized full-res (capture-verified good).
+
+Remaining wobble below a HARD every-frame-60 lock: (a) async-apply TIMING VARIANCE (worker
+completion is non-deterministic -> some runs dip, e.g. avg 54/min 41), (b) the periodic
+surface-upload STAGING spike. A hard lock needs incremental snapshot staging + reducing the
+async variance (e.g. deterministic apply pacing). At realistic (non-sprint) speeds it sits
+at/above 60. Config (rebrun 60fps): radius 4 + render scale 0.5 + bg pass 0.3 + async
+producers + signature reuse + pump budget 2 + surface apply 32 + upload interval 3 + stats
+single-flush.
+
+## PERF: 7 -> ~57 fps steady (touches 60) (2026-06-08, superseded above)
 
 Latest: steady ~57 fps (55-60 band, no-capture walk speed 26 = sprint stress, vsync off),
 good visuals. Final tuning gain: mid voxel radius 6->4 (60fps mode) shrank the periodic
