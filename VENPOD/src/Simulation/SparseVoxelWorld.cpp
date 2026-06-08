@@ -4516,7 +4516,7 @@ uint32_t SparseVoxelWorld::PumpSurfaceExtraction(uint32_t maxBricks, uint32_t cu
         if (m_pool.GetRecord(coord, &surfaceRecord)) {
             RemoveFirstSurfaceClassQueueCoord(coord, surfaceRecord.residencyClass);
         }
-        if (ExtractSurfaceCoord(coord)) {
+        if (ExtractOrQueueSurfaceCoord(coord)) {
             ++extracted;
         }
     }
@@ -4626,6 +4626,19 @@ uint32_t SparseVoxelWorld::ApplyAsyncSurfaceExtractionCompletions() {
         RefreshStats();
     }
     return applied;
+}
+
+// Route a coord to the async surface mesher when eligible (non-edited terrain), else
+// extract inline. Used by ALL the per-frame surface pump loops so meshing leaves the
+// main thread regardless of which pump drives it.
+bool SparseVoxelWorld::ExtractOrQueueSurfaceCoord(const BrickCoord& coord) {
+    if (m_config.asyncSurfaceExtraction &&
+        m_edits.EditedBrickCount() == 0u &&
+        m_surfaceDirtyRegions.find(coord) == m_surfaceDirtyRegions.end() &&
+        TryQueueAsyncSurfaceExtraction(coord)) {
+        return true;
+    }
+    return ExtractSurfaceCoord(coord);
 }
 
 bool SparseVoxelWorld::PumpSurfaceExtractionForCoord(const BrickCoord& coord) {
@@ -4922,7 +4935,7 @@ uint32_t SparseVoxelWorld::PumpSurfaceExtractionAroundTimed(
                 continue;
             }
             RemoveAllClassQueueCoord(m_surfaceClassQueues, coord);
-            if (ExtractSurfaceCoord(coord)) {
+            if (ExtractOrQueueSurfaceCoord(coord)) {
                 RemoveFirstSurfaceQueueCoord(coord);
                 ++extracted;
             } else {
@@ -5088,7 +5101,7 @@ uint32_t SparseVoxelWorld::PumpSurfaceExtractionAroundTimedForClass(
             continue;
         }
         RemoveAllClassQueueCoord(m_surfaceClassQueues, coord);
-        if (ExtractSurfaceCoord(coord)) {
+        if (ExtractOrQueueSurfaceCoord(coord)) {
             RemoveFirstSurfaceQueueCoord(coord);
             ++extracted;
         } else {

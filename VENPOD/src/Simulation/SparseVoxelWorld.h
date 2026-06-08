@@ -873,6 +873,7 @@ private:
     bool CanUseBuriedSolidSurfaceFastPath(const BrickCoord& coord, const GeneratedSparseBrick& brick) const;
     bool MarkBuriedSolidSurfaceKnownEmpty(const BrickCoord& coord);
     bool ExtractSurfaceCoord(const BrickCoord& coord);
+    bool ExtractOrQueueSurfaceCoord(const BrickCoord& coord);
     struct SurfaceExtractionBatchItem {
         BrickCoord coord;
         SparseResidencyClass residencyClass = SparseResidencyClass::Speculative;
