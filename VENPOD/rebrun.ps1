@@ -224,6 +224,9 @@ $savedEnv = @{
     VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS = $env:VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS
     VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION = $env:VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION
     VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS = $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS
+    VENPOD_SPARSE_EXACT_ASYNC_GENERATION = $env:VENPOD_SPARSE_EXACT_ASYNC_GENERATION
+    VENPOD_SPARSE_EXACT_ASYNC_VISIBLE = $env:VENPOD_SPARSE_EXACT_ASYNC_VISIBLE
+    VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE = $env:VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE
 }
 
 function Restore-Env {
@@ -616,7 +619,10 @@ try {
         "VENPOD_SPARSE_SURFACE_PARALLEL_TIME_BUDGETED",
         "VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS",
         "VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION",
-        "VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS")) {
+        "VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS",
+        "VENPOD_SPARSE_EXACT_ASYNC_GENERATION",
+        "VENPOD_SPARSE_EXACT_ASYNC_VISIBLE",
+        "VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE")) {
         Remove-Item "env:$pvName" -ErrorAction SilentlyContinue
     }
     if ($PerfMode -ne "none") {
@@ -642,6 +648,13 @@ try {
         # lands. The synchronous surface budgets above still bound any inline fallback.
         $env:VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION = "1"
         $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS = "3"
+        # Async EXACT generation too: move brick generation (gen ~6-10ms while moving)
+        # off the main thread. VISIBLE+PREFETCH lanes must be async or moving-play bricks
+        # (visible lane) bail to synchronous. Generated bricks apply a frame later, then
+        # feed the async surface mesher -> two-stage off-thread pipeline.
+        $env:VENPOD_SPARSE_EXACT_ASYNC_GENERATION = "1"
+        $env:VENPOD_SPARSE_EXACT_ASYNC_VISIBLE = "1"
+        $env:VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE = "1"
         # Low-res far/background raymarch (the GPU win); near terrain stays full-res.
         $env:VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE = "1"
         $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE = $bgScale
