@@ -639,7 +639,7 @@ try {
         # quality mode = VISUAL CORRECTNESS first: fill coverage, full-res near+far,
         # no GPU bandaids (fps is secondary). Other modes trade coverage/sharpness for fps.
         $bgScale = if ($PerfMode -eq "60fps") { "0.3" } else { "0.5" }  # far raymarch res
-        $pumpBudget = if ($quality) { "24" } elseif ($PerfMode -eq "60fps") { "4" } else { "10" }
+        $pumpBudget = if ($quality) { "24" } elseif ($PerfMode -eq "60fps") { "2" } else { "8" }
         $surfBudget = if ($quality) { "24" } elseif ($PerfMode -eq "60fps") { "4" } else { "8" }
         $useBgPass = -not $quality   # quality renders the far field full-res (no blocky distance)
         $env:VENPOD_STREAMING_V2 = "1"
