@@ -212,6 +212,13 @@ $savedEnv = @{
     VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS = $env:VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS
     VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH = $env:VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH
     VENPOD_RAYMARCH_RENDER_SCALE = $env:VENPOD_RAYMARCH_RENDER_SCALE
+    VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET = $env:VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET
+    VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS = $env:VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS
+    VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $env:VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS
+    VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $env:VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS
+    VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE = $env:VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE
+    VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE = $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE
+    VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL = $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL
 }
 
 function Restore-Env {
@@ -580,46 +587,49 @@ try {
     if ($BoundaryTest) { $env:VENPOD_ENABLE_TEST_MODES = "1" }
     if ($ExitAfterFrames -gt 0) { $env:VENPOD_EXIT_AFTER_FRAMES = "$ExitAfterFrames" }
 
-    # Generation Overhaul V2 performance modes. Applied AFTER the sparse env setup so
-    # they override the startup render gate (the bounded pump cannot reach the default
-    # 95% mid-voxel coverage gate, so open at the achievable coverage with fail-open).
-    Remove-Item env:VENPOD_STREAMING_V2 -ErrorAction SilentlyContinue
-    Remove-Item env:VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS -ErrorAction SilentlyContinue
-    Remove-Item env:VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH -ErrorAction SilentlyContinue
-    Remove-Item env:VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET -ErrorAction SilentlyContinue
-    Remove-Item env:VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS -ErrorAction SilentlyContinue
-    Remove-Item env:VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS -ErrorAction SilentlyContinue
-    Remove-Item env:VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS -ErrorAction SilentlyContinue
-    Remove-Item env:VENPOD_RAYMARCH_RENDER_SCALE -ErrorAction SilentlyContinue
+    # --- Generation Overhaul V2 performance modes (architecture-aligned) ---
+    # The framerate is GPU-RAYMARCH bound: the fullscreen raymarch fills every pixel
+    # the cheap rasterized surfaces don't cover (mostly the far horizon). The real GPU
+    # lever is the LOW-RES BACKGROUND PASS (render the far/horizon raymarch at reduced
+    # resolution and composite; the near stays full-res sharp). V2 keeps it stable
+    # (best-available render, no force-gen freezes). We do NOT bound generation here --
+    # bounding lowers surface coverage which pushes MORE pixels onto the raymarch.
+    # Applied after the sparse env setup so it overrides the startup render gate.
+    foreach ($pvName in @(
+        "VENPOD_STREAMING_V2",
+        "VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS",
+        "VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH",
+        "VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET",
+        "VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS",
+        "VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS",
+        "VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS",
+        "VENPOD_RAYMARCH_RENDER_SCALE",
+        "VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE",
+        "VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE",
+        "VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL")) {
+        Remove-Item "env:$pvName" -ErrorAction SilentlyContinue
+    }
     if ($PerfMode -ne "none") {
-        $pumpBudget = if ($PerfMode -eq "60fps") { "4" } else { "12" }  # 30fps/detail -> 12
-        $surfBudget = if ($PerfMode -eq "60fps") { "4" } else { "10" }  # 30fps/detail -> 10
+        $bgScale = if ($PerfMode -eq "60fps") { "0.3" } else { "0.5" }  # far raymarch res
         $env:VENPOD_STREAMING_V2 = "1"
-        $env:VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS = $pumpBudget
-        $env:VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH = "0"
-        # Bound surface extraction (meshing) too -- the post-open pre-publish budget
-        # defaults to 40ms. Under V2 best-available, unmeshed bricks just render coarser.
-        $env:VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET = "1"
-        $env:VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS = $surfBudget
-        $env:VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $surfBudget
-        $env:VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $surfBudget
+        $env:VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH = "0"   # speculative; not needed under best-available
+        # Low-res far/background raymarch (the GPU win); near terrain stays full-res.
+        $env:VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE = "1"
+        $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE = $bgScale
+        $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL = "1"
+        # Foreground raymarch (uncovered near/mid terrain) is the other half of the GPU
+        # cost; render scale lowers it. -RenderScale overrides the per-mode default.
+        $rayScale = if ($RenderScale -gt 0) { "$RenderScale" } elseif ($PerfMode -eq "60fps") { "0.5" } else { "0.75" }
+        $env:VENPOD_RAYMARCH_RENDER_SCALE = $rayScale
         if ($useSparse) {
-            # V2 renders best-available LOD, so holding the public render for high
-            # coverage proofs is counterproductive (the bounded pump fills coverage
-            # slowly). Open the world promptly at best-available and let it refine:
-            # drop the mid-voxel/surface coverage proofs, keep far-SVO background +
-            # shader safety, and fail-open quickly.
+            # Open the world promptly at best-available LOD (V2); don't hold for proofs.
             $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MID_VOXEL_PROOF = "0"
             $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_SURFACE_PROOF = "0"
             $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_READY_BRICKS = "128"
             $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MAX_FRAME = "120"
             $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_FAIL_OPEN_AT_MAX_FRAME = "1"
         }
-        # GPU raymarch is the framerate bottleneck, so render scale is the dominant
-        # FPS dial (trades sharpness for fps). Default per mode; -RenderScale overrides.
-        $rayScale = if ($RenderScale -gt 0) { "$RenderScale" } elseif ($PerfMode -eq "60fps") { "0.5" } else { "0.8" }
-        $env:VENPOD_RAYMARCH_RENDER_SCALE = $rayScale
-        Write-Info "Perf mode: $PerfMode (V2 best-available render, mid-pump ${pumpBudget}ms, surface ${surfBudget}ms, prefetch off, raymarch render scale $rayScale)"
+        Write-Info "Perf mode: $PerfMode (V2 best-available + low-res far background pass $bgScale + foreground render scale $rayScale)"
     }
 
     Write-Host "VENPOD - Rebuild + Run" -ForegroundColor Magenta
