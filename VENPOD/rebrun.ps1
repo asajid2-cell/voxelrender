@@ -219,6 +219,9 @@ $savedEnv = @{
     VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE = $env:VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE
     VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE = $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE
     VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL = $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL
+    VENPOD_SPARSE_SURFACE_PARALLEL_EXTRACTION = $env:VENPOD_SPARSE_SURFACE_PARALLEL_EXTRACTION
+    VENPOD_SPARSE_SURFACE_PARALLEL_TIME_BUDGETED = $env:VENPOD_SPARSE_SURFACE_PARALLEL_TIME_BUDGETED
+    VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS = $env:VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS
 }
 
 function Restore-Env {
@@ -606,7 +609,10 @@ try {
         "VENPOD_RAYMARCH_RENDER_SCALE",
         "VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE",
         "VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE",
-        "VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL")) {
+        "VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL",
+        "VENPOD_SPARSE_SURFACE_PARALLEL_EXTRACTION",
+        "VENPOD_SPARSE_SURFACE_PARALLEL_TIME_BUDGETED",
+        "VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS")) {
         Remove-Item "env:$pvName" -ErrorAction SilentlyContinue
     }
     if ($PerfMode -ne "none") {
@@ -625,6 +631,10 @@ try {
         $env:VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS = $surfBudget
         $env:VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $surfBudget
         $env:VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $surfBudget
+        # NOTE: parallel surface extraction was tried here and reverted -- the existing
+        # parallel worker infra is contended (surfExtract didn't drop, fps fell, gapPrev
+        # stalls). Surface meshing (~20ms median while moving) remains the dominant
+        # moving-play cost; the real fix is a clean async producer, not the old workers.
         # Low-res far/background raymarch (the GPU win); near terrain stays full-res.
         $env:VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE = "1"
         $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE = $bgScale
