@@ -4,7 +4,30 @@ Generated: 2026-06-05
 
 This is the compact survival file for the active VENPOD campaign. If chat compacts, first read `instruct.md` for the long-run operating contract, then resume from this file before reading the larger `handoff.md`, `debug-handoff.md`, `root.md`, or `debug.md`.
 
-## CORRECTNESS BUG: distant terrain renders MUTED/low (pop-in) — diagnosis (2026-06-08, READ FIRST)
+## SHADER-COMPILE WALL blocks the LOD fix (2026-06-08, READ FIRST — latest)
+
+Trying to fix the distant-muting bug, hit a hard wall: PS_Raymarch.hlsl takes ~340s (5-6 min)
+to compile from scratch (DXC, O3). It's only ever fast because it's CACHED; ANY edit triggers
+a full recompile that looks like a hang (it's not infinite - completes ~340s). Findings:
+- O0 (VENPOD_SHADER_FAST_COMPILE attempt) did NOT speed it (still 337s) AND O0's 14.9MB
+  bytecode broke pipeline creation. Reverted. Dead end.
+- Making the far-field refine-loop bounds runtime-derived (no-unroll, ScaleFarFieldStepBudget)
+  did NOT speed it either -> the slowness is PERVASIVE across the whole mega-shader (near-exact
+  + mid-clipmap DDA + far-SVO + far-heightfield + ~60 debug modes all in one ps_6_0), not just
+  the far loops. Reverted.
+- The far-height fix (heightfield FarTerrainHeightVoxelized: sample true XZ vs cell-center snap)
+  compiled + ran but made NO visible difference -> the heightfield fallback is NOT the active
+  distant renderer (the SVO is, and it already samples true FarTerrainHeight). Reverted.
+
+=> The real prerequisite to fixing the LOD efficiently is SPLITTING PS_Raymarch.hlsl by render
+   path into separate smaller shaders/passes (near / mid / far / debug). That cuts compile time
+   (each compiles fast) AND isolates the far-LOD code for fast iteration. Substantial careful
+   refactor (shared helpers, cbuffer, compositing) but it's the unlock. Alternative: add real
+   runtime far-LOD cbuffer params + free-camera so the far path can be tuned/diagnosed live
+   without recompiling. Both are focused multi-step efforts. Diagnostic tools ready:
+   tmp/heightdump.cpp (terrain profiler), capvis.ps1 -DebugMode N.
+
+## CORRECTNESS BUG: distant terrain renders MUTED/low (pop-in) — diagnosis (2026-06-08)
 
 SYMPTOM (user, verified): standing still at full coverage (h/v 1.00/1.00), distant terrain
 renders low/flat; walking forward, the real mountains "pop up" only when close. Real LOD bug.
