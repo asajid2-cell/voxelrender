@@ -4,7 +4,31 @@ Generated: 2026-06-05
 
 This is the compact survival file for the active VENPOD campaign. If chat compacts, first read `instruct.md` for the long-run operating contract, then resume from this file before reading the larger `handoff.md`, `debug-handoff.md`, `root.md`, or `debug.md`.
 
-## SHADER-COMPILE WALL blocks the LOD fix (2026-06-08, READ FIRST — latest)
+## PROVEN: PS_Raymarch is at the GPU complexity LIMIT — must shrink before LOD fix (2026-06-08, READ FIRST — latest)
+
+NEW conclusive finding + corrected LOD diagnosis:
+- The distant-muting is the MID-CLIPMAP 3D voxel DDA (RaymarchMidVoxelClipmap, PS_Raymarch
+  ~1721), NOT the far SVO. The DDA IS enabled for normal low-alt views (walkingMidVoxelDda
+  default on, VENPOD_SPARSE_MID_VOXEL_WALK_DDA=1). Debug modes are RUNTIME (no recompile) -
+  use them: capvis.ps1 -DebugMode N. Mode 59=ring tint, 67=force DDA, 70 was a height-viz I
+  tried to add (see below).
+- BEST HYPOTHESIS for the muting: the DDA march STEP BUDGET (~1798, 48-128 steps) exhausts
+  around ~2500u (small near-ring cell steps ~12u), so distant mountains (1400-4200u) and the
+  up-angled rays toward their peaks are never reached -> fall back to low/flat. Fix = larger /
+  runtime-derived march budget so it reaches distant tall terrain.
+- *** BLOCKER (proven): PS_Raymarch.hlsl is at the GPU shader-complexity limit. Enlarging the
+  march loop AND/OR adding debug mode 70 produced bytecode (7.4MB) that FAILS pipeline-state
+  creation (0x-7FF8FFF2) -> renderer won't init. O0 (14.9MB) failed the same way. The tiny
+  raw-xz far-height edit (no growth) compiled+ran fine. => the shader REJECTS any growth. ***
+- Compile is ~340-440s regardless (O0 + runtime-loop both failed to speed it).
+
+=> HARD PREREQUISITE before ANY LOD shader fix: SHRINK PS_Raymarch. Options: (a) strip/gate
+the ~60 debugMode branches behind #ifdef (big size win, keep a debug build variant), and/or
+(b) split by render path (near/mid/far) into separate PSOs/passes. Only then can the march-
+budget LOD fix be added without blowing the pipeline. This is the focused next effort.
+All experiments reverted; engine on clean cached baseline (fast, valid).
+
+## SHADER-COMPILE WALL (2026-06-08, superseded by the limit finding above)
 
 Trying to fix the distant-muting bug, hit a hard wall: PS_Raymarch.hlsl takes ~340s (5-6 min)
 to compile from scratch (DXC, O3). It's only ever fast because it's CACHED; ANY edit triggers
