@@ -878,11 +878,13 @@ size_t SparseVoxelWorld::TerrainSurfaceColumnKeyHash::operator()(
 SparseVoxelWorld::~SparseVoxelWorld() {
     StopPersistentExactGenerationWorkers();
     StopAsyncExactGenerationWorker();
+    StopAsyncSurfaceExtractionWorker();
 }
 
 bool SparseVoxelWorld::Initialize(const SparseVoxelWorldConfig& config) {
     StopPersistentExactGenerationWorkers();
     StopAsyncExactGenerationWorker();
+    StopAsyncSurfaceExtractionWorker();
     m_config = config;
     m_config.parallelExactGenerationMaxWorkers =
         std::clamp<uint32_t>(m_config.parallelExactGenerationMaxWorkers, 1u, 16u);
@@ -1979,6 +1981,87 @@ void SparseVoxelWorld::StopAsyncExactGenerationWorker()
         m_asyncExactGenerationResults.clear();
         m_asyncExactGenerationPending.clear();
         m_asyncExactGenerationStop = false;
+    }
+}
+
+void SparseVoxelWorld::StartAsyncSurfaceExtractionWorkerIfNeeded()
+{
+    if (!m_config.asyncSurfaceExtraction || !m_asyncSurfaceExtractionThreads.empty()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_asyncSurfaceExtractionMutex);
+        m_asyncSurfaceExtractionStop = false;
+    }
+    const uint32_t workerCount = std::max(1u, m_config.asyncSurfaceExtractionMaxWorkers);
+    const SparseTerrainGenerator terrain = m_terrain;
+    m_asyncSurfaceExtractionThreads.reserve(workerCount);
+    for (uint32_t workerIndex = 0u; workerIndex < workerCount; ++workerIndex) {
+        m_asyncSurfaceExtractionThreads.emplace_back([this, terrain]() {
+            SurfaceWorkerColumnCache workerColumnCache;
+            workerColumnCache.reserve(8192);
+            for (;;) {
+                AsyncSurfaceExtractionRequest request;
+                {
+                    std::unique_lock<std::mutex> lock(m_asyncSurfaceExtractionMutex);
+                    m_asyncSurfaceExtractionCv.wait(lock, [this]() {
+                        return m_asyncSurfaceExtractionStop ||
+                               !m_asyncSurfaceExtractionQueue.empty();
+                    });
+                    if (m_asyncSurfaceExtractionStop) {
+                        break;
+                    }
+                    request = std::move(m_asyncSurfaceExtractionQueue.front());
+                    m_asyncSurfaceExtractionQueue.pop_front();
+                }
+
+                const auto start = std::chrono::steady_clock::now();
+                SparseSurfaceExtractionResult faces =
+                    ExtractSurfaceNoEditWithTerrain(terrain, request.brick, workerColumnCache);
+                const float elapsed = std::chrono::duration<float, std::milli>(
+                    std::chrono::steady_clock::now() - start).count();
+                if (workerColumnCache.size() > 65536u) {
+                    workerColumnCache.clear();
+                    workerColumnCache.reserve(8192);
+                }
+
+                AsyncSurfaceExtractionResult result;
+                result.coord = request.coord;
+                result.residencyClass = request.residencyClass;
+                result.brick = std::move(request.brick);
+                result.faces = std::move(faces);
+                result.workerMs = elapsed;
+                {
+                    std::lock_guard<std::mutex> lock(m_asyncSurfaceExtractionMutex);
+                    if (m_asyncSurfaceExtractionStop) {
+                        break;
+                    }
+                    m_asyncSurfaceExtractionResults.push_back(std::move(result));
+                }
+            }
+        });
+    }
+}
+
+void SparseVoxelWorld::StopAsyncSurfaceExtractionWorker()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_asyncSurfaceExtractionMutex);
+        m_asyncSurfaceExtractionStop = true;
+    }
+    m_asyncSurfaceExtractionCv.notify_all();
+    for (std::thread& worker : m_asyncSurfaceExtractionThreads) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+    m_asyncSurfaceExtractionThreads.clear();
+    {
+        std::lock_guard<std::mutex> lock(m_asyncSurfaceExtractionMutex);
+        m_asyncSurfaceExtractionQueue.clear();
+        m_asyncSurfaceExtractionResults.clear();
+        m_asyncSurfaceExtractionPending.clear();
+        m_asyncSurfaceExtractionStop = false;
     }
 }
 
@@ -3266,6 +3349,7 @@ SparseBrickRequestResult SparseVoxelWorld::RequestBrickDetailed(
 
 uint32_t SparseVoxelWorld::PumpGeneration(uint32_t maxBricks, uint32_t currentFrame) {
     ApplyAsyncExactGenerationCompletions(currentFrame);
+    ApplyAsyncSurfaceExtractionCompletions();
     m_parallelExactGenerationBricksLastFrame = 0;
     m_parallelExactGenerationWorkersLastFrame = 0;
     m_parallelExactGenerationWallMsLastFrame = 0.0f;
@@ -3678,6 +3762,7 @@ uint32_t SparseVoxelWorld::PumpGenerationAround(
     uint32_t currentFrame)
 {
     ApplyAsyncExactGenerationCompletions(currentFrame);
+    ApplyAsyncSurfaceExtractionCompletions();
     m_parallelExactGenerationBricksLastFrame = 0;
     m_parallelExactGenerationWorkersLastFrame = 0;
     m_parallelExactGenerationWallMsLastFrame = 0.0f;
@@ -4441,6 +4526,108 @@ uint32_t SparseVoxelWorld::PumpSurfaceExtraction(uint32_t maxBricks, uint32_t cu
     return extracted;
 }
 
+static bool IsSurfaceExtractableState(BrickLifecycleState state) {
+    return state == BrickLifecycleState::UploadQueued ||
+           state == BrickLifecycleState::UploadingGPU ||
+           state == BrickLifecycleState::Resident ||
+           state == BrickLifecycleState::DirtyCPU ||
+           state == BrickLifecycleState::DirtyGPU;
+}
+
+bool SparseVoxelWorld::TryQueueAsyncSurfaceExtraction(const BrickCoord& coord) {
+    // Only the no-edit meshing path is safe to run off-thread (the worker uses the
+    // terrain generator directly, with no edit overlay sampling). Callers gate on
+    // EditedBrickCount()==0 and no dirty region for the coord before reaching here.
+    auto pendingIt = m_pendingSurfaceBricks.find(coord);
+    if (pendingIt == m_pendingSurfaceBricks.end()) {
+        return false;
+    }
+    BrickResidentRecord record;
+    if (!m_pool.GetRecord(coord, &record) || !IsSurfaceExtractableState(record.state)) {
+        return false;  // let the caller's inline path clean up the stale pending brick
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_asyncSurfaceExtractionMutex);
+        if (m_asyncSurfaceExtractionPending.find(coord) !=
+            m_asyncSurfaceExtractionPending.end()) {
+            // Already in flight: drop this duplicate pending brick (no-edit terrain is
+            // deterministic per coord, so the in-flight mesh is equivalent).
+            m_pendingSurfaceBricks.erase(pendingIt);
+            m_surfaceExtractionQueuedSet.erase(coord);
+            MarkQueueAccountingDirty();
+            return true;
+        }
+        if (m_asyncSurfaceExtractionPending.size() >=
+            static_cast<size_t>(m_config.asyncSurfaceExtractionQueueMax)) {
+            return false;  // backpressure: fall back to inline extraction this frame
+        }
+    }
+
+    StartAsyncSurfaceExtractionWorkerIfNeeded();
+
+    AsyncSurfaceExtractionRequest request;
+    request.coord = coord;
+    request.residencyClass = record.residencyClass;
+    request.brick = std::move(pendingIt->second);
+    m_pendingSurfaceBricks.erase(pendingIt);
+    m_surfaceExtractionQueuedSet.erase(coord);
+    {
+        std::lock_guard<std::mutex> lock(m_asyncSurfaceExtractionMutex);
+        m_asyncSurfaceExtractionPending.insert(coord);
+        m_asyncSurfaceExtractionQueue.push_back(std::move(request));
+    }
+    m_asyncSurfaceExtractionCv.notify_one();
+    ++m_asyncSurfaceExtractionEnqueuedLastFrame;
+    MarkQueueAccountingDirty();
+    return true;
+}
+
+uint32_t SparseVoxelWorld::ApplyAsyncSurfaceExtractionCompletions() {
+    if (!m_config.asyncSurfaceExtraction) {
+        return 0;
+    }
+    const uint32_t maxApply = std::max(1u, m_config.asyncSurfaceExtractionMaxApplyPerFrame);
+    uint32_t applied = 0;
+    while (applied < maxApply) {
+        AsyncSurfaceExtractionResult result;
+        {
+            std::lock_guard<std::mutex> lock(m_asyncSurfaceExtractionMutex);
+            if (m_asyncSurfaceExtractionResults.empty()) {
+                break;
+            }
+            result = std::move(m_asyncSurfaceExtractionResults.front());
+            m_asyncSurfaceExtractionResults.pop_front();
+            m_asyncSurfaceExtractionPending.erase(result.coord);
+        }
+        m_asyncSurfaceExtractionWorkerMsLastFrame += result.workerMs;
+
+        BrickResidentRecord record;
+        if (!m_pool.GetRecord(result.coord, &record) ||
+            !IsSurfaceExtractableState(record.state)) {
+            ++m_asyncSurfaceExtractionDiscardedLastFrame;
+            continue;  // brick evicted/changed while meshing; drop the stale mesh
+        }
+        if (m_surfaceCache.UpdateBrickWithExtractedFaces(
+                result.brick,
+                std::move(result.faces))) {
+            IncrementResidencyClassCounter(
+                result.residencyClass,
+                m_surfaceSpeculativeBricksExtractedLastFrame,
+                m_surfaceVisibleBricksExtractedLastFrame,
+                m_surfaceCollisionBricksExtractedLastFrame,
+                m_surfaceEditedBricksExtractedLastFrame);
+            MarkStreamingTicketStagesCompleted(result.coord, kStreamingTicketStageSurfaceReady);
+            ++m_surfaceBricksExtractedLastFrame;
+            ++m_asyncSurfaceExtractionAppliedLastFrame;
+            ++applied;
+        }
+    }
+    if (applied > 0) {
+        RefreshStats();
+    }
+    return applied;
+}
+
 bool SparseVoxelWorld::PumpSurfaceExtractionForCoord(const BrickCoord& coord) {
     if (m_pendingSurfaceBricks.find(coord) == m_pendingSurfaceBricks.end()) {
         return false;
@@ -4451,6 +4638,16 @@ bool SparseVoxelWorld::PumpSurfaceExtractionForCoord(const BrickCoord& coord) {
         RemoveFirstSurfaceClassQueueCoord(coord, surfaceRecord.residencyClass);
     }
     RemoveFirstSurfaceQueueCoord(coord);
+
+    // Fire-and-forget async meshing for non-edited terrain: enqueue and apply later
+    // off the critical path. Falls back to inline extraction if not eligible/queue full.
+    if (m_config.asyncSurfaceExtraction &&
+        m_edits.EditedBrickCount() == 0u &&
+        m_surfaceDirtyRegions.find(coord) == m_surfaceDirtyRegions.end() &&
+        TryQueueAsyncSurfaceExtraction(coord)) {
+        RefreshStats();
+        return true;
+    }
 
     if (!ExtractSurfaceCoord(coord)) {
         RefreshStats();
@@ -4472,7 +4669,9 @@ uint32_t SparseVoxelWorld::PumpSurfaceExtractionForCoords(
         return 0;
     }
 
-    if (!CanUseParallelSurfaceExtractionBatch(maxBricks)) {
+    // Async surface extraction supersedes the fork-join batch: route every coord
+    // through PumpSurfaceExtractionForCoord, which enqueues to the worker pool.
+    if (m_config.asyncSurfaceExtraction || !CanUseParallelSurfaceExtractionBatch(maxBricks)) {
         uint32_t extracted = 0;
         for (const BrickCoord& coord : coords) {
             if (extracted >= maxBricks) {

@@ -1208,6 +1208,21 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv(
             "VENPOD_SPARSE_SURFACE_PARALLEL_MAX_BATCH",
             sparseWorldConfig.parallelSurfaceExtractionMaxBatch);
+    sparseWorldConfig.asyncSurfaceExtraction =
+        sparseBackendRequested &&
+        ReadUIntEnv("VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION", 0u) != 0u;
+    sparseWorldConfig.asyncSurfaceExtractionMaxWorkers =
+        ReadUIntEnv(
+            "VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS",
+            sparseWorldConfig.asyncSurfaceExtractionMaxWorkers);
+    sparseWorldConfig.asyncSurfaceExtractionQueueMax =
+        ReadUIntEnv(
+            "VENPOD_SPARSE_SURFACE_ASYNC_QUEUE_MAX",
+            sparseWorldConfig.asyncSurfaceExtractionQueueMax);
+    sparseWorldConfig.asyncSurfaceExtractionMaxApplyPerFrame =
+        ReadUIntEnv(
+            "VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME",
+            sparseWorldConfig.asyncSurfaceExtractionMaxApplyPerFrame);
     sparseWorldConfig.persistentTerrainColumnCache =
         sparseBackendRequested &&
         ReadUIntEnv("VENPOD_SPARSE_TERRAIN_COLUMN_CACHE_PERSISTENT", 0u) != 0u;

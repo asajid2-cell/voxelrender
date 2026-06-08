@@ -222,6 +222,8 @@ $savedEnv = @{
     VENPOD_SPARSE_SURFACE_PARALLEL_EXTRACTION = $env:VENPOD_SPARSE_SURFACE_PARALLEL_EXTRACTION
     VENPOD_SPARSE_SURFACE_PARALLEL_TIME_BUDGETED = $env:VENPOD_SPARSE_SURFACE_PARALLEL_TIME_BUDGETED
     VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS = $env:VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS
+    VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION = $env:VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION
+    VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS = $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS
 }
 
 function Restore-Env {
@@ -612,7 +614,9 @@ try {
         "VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL",
         "VENPOD_SPARSE_SURFACE_PARALLEL_EXTRACTION",
         "VENPOD_SPARSE_SURFACE_PARALLEL_TIME_BUDGETED",
-        "VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS")) {
+        "VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS",
+        "VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION",
+        "VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS")) {
         Remove-Item "env:$pvName" -ErrorAction SilentlyContinue
     }
     if ($PerfMode -ne "none") {
@@ -631,10 +635,13 @@ try {
         $env:VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS = $surfBudget
         $env:VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $surfBudget
         $env:VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $surfBudget
-        # NOTE: parallel surface extraction was tried here and reverted -- the existing
-        # parallel worker infra is contended (surfExtract didn't drop, fps fell, gapPrev
-        # stalls). Surface meshing (~20ms median while moving) remains the dominant
-        # moving-play cost; the real fix is a clean async producer, not the old workers.
+        # Fire-and-forget ASYNC surface meshing: surface extraction (~20ms median while
+        # moving) runs on a worker pool OFF the main thread, results applied within a
+        # per-frame budget. This is the clean async producer (the old fork-join parallel
+        # path was contended). Best-available render shows coarser terrain until a mesh
+        # lands. The synchronous surface budgets above still bound any inline fallback.
+        $env:VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION = "1"
+        $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS = "3"
         # Low-res far/background raymarch (the GPU win); near terrain stays full-res.
         $env:VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE = "1"
         $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE = $bgScale

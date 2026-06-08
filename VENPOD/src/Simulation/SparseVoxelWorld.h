@@ -47,6 +47,15 @@ struct SparseVoxelWorldConfig {
     uint32_t parallelSurfaceExtractionMaxWorkers = 4;
     uint32_t parallelSurfaceExtractionMinBricks = 4;
     uint32_t parallelSurfaceExtractionMaxBatch = 32;
+    // Fire-and-forget async surface extraction (meshing) on persistent worker threads.
+    // Unlike parallelSurfaceExtraction (fork-join: main thread blocks each frame), this
+    // enqueues coords to a worker pool and applies finished meshes off the critical path,
+    // so the frame never waits on meshing. Best-available render shows coarser terrain
+    // until a coord's mesh lands.
+    bool asyncSurfaceExtraction = false;
+    uint32_t asyncSurfaceExtractionMaxWorkers = 2;
+    uint32_t asyncSurfaceExtractionQueueMax = 4096;
+    uint32_t asyncSurfaceExtractionMaxApplyPerFrame = 256;
     bool persistentTerrainColumnCache = false;
     uint32_t terrainColumnCacheMaxEntries = 131072;
     bool streamingLaneQueuePriority = false;
@@ -740,6 +749,20 @@ private:
         float workerMs = 0.0f;
     };
 
+    struct AsyncSurfaceExtractionRequest {
+        BrickCoord coord;
+        SparseResidencyClass residencyClass = SparseResidencyClass::Speculative;
+        GeneratedSparseBrick brick;
+    };
+
+    struct AsyncSurfaceExtractionResult {
+        BrickCoord coord;
+        SparseResidencyClass residencyClass = SparseResidencyClass::Speculative;
+        GeneratedSparseBrick brick;
+        SparseSurfaceExtractionResult faces;
+        float workerMs = 0.0f;
+    };
+
     void RefreshStats();
     void MarkQueueAccountingDirty();
     void RebuildQueueClassStats();
@@ -809,6 +832,10 @@ private:
     uint32_t ApplyAsyncExactGenerationCompletions(uint32_t currentFrame);
     void StartAsyncExactGenerationWorkerIfNeeded();
     void StopAsyncExactGenerationWorker();
+    bool TryQueueAsyncSurfaceExtraction(const BrickCoord& coord);
+    uint32_t ApplyAsyncSurfaceExtractionCompletions();
+    void StartAsyncSurfaceExtractionWorkerIfNeeded();
+    void StopAsyncSurfaceExtractionWorker();
     bool QueuePhysicsCandidateNoStats(const BrickCoord& coord);
     bool QueuePhysicsRegionNoStats(
         const BrickCoord& coord,
@@ -1045,6 +1072,18 @@ private:
     std::unordered_set<BrickCoord, BrickCoordHash> m_asyncExactGenerationPending;
     bool m_asyncExactGenerationStop = false;
     uint32_t m_asyncExactGenerationStatsFrame = 0;
+    // Fire-and-forget async surface extraction (meshing) worker pool.
+    std::vector<std::thread> m_asyncSurfaceExtractionThreads;
+    std::mutex m_asyncSurfaceExtractionMutex;
+    std::condition_variable m_asyncSurfaceExtractionCv;
+    std::deque<AsyncSurfaceExtractionRequest> m_asyncSurfaceExtractionQueue;
+    std::deque<AsyncSurfaceExtractionResult> m_asyncSurfaceExtractionResults;
+    std::unordered_set<BrickCoord, BrickCoordHash> m_asyncSurfaceExtractionPending;
+    bool m_asyncSurfaceExtractionStop = false;
+    uint32_t m_asyncSurfaceExtractionEnqueuedLastFrame = 0;
+    uint32_t m_asyncSurfaceExtractionAppliedLastFrame = 0;
+    uint32_t m_asyncSurfaceExtractionDiscardedLastFrame = 0;
+    float m_asyncSurfaceExtractionWorkerMsLastFrame = 0.0f;
     std::vector<std::thread> m_persistentExactGenerationThreads;
     std::mutex m_persistentExactGenerationMutex;
     std::condition_variable m_persistentExactGenerationCv;
