@@ -343,9 +343,14 @@ float4 main(PSInput input) : SV_Target {
 
     const float3 lightDir = normalize(float3(0.45f, 0.82f, 0.34f));
     const float diffuse = saturate(dot(n, lightDir));
-    const float ambient = 0.72f;
-    float3 color = baseColor * (ambient + diffuse * 0.38f);
-    color = max(color, baseColor * 0.58f + 0.035f);
+    // Higher-contrast lighting for terrain depth/definition (was ambient-dominated and
+    // washed out). Warm directional sun + cooler sky fill, with a slope-based ambient
+    // occlusion (downward/horizontal faces receive less sky light).
+    const float3 sunColor = float3(1.06f, 0.99f, 0.86f);
+    const float3 skyFill = float3(0.43f, 0.48f, 0.56f);
+    const float skyAccess = saturate(n.y * 0.5f + 0.5f);
+    float3 color = baseColor * (skyFill * (0.32f + 0.42f * skyAccess) + sunColor * diffuse * 0.80f);
+    color = max(color, baseColor * 0.28f);
     const float voxelTone = HashVoxelCell(floor(input.worldPos + n * 0.01f)) - 0.5f;
     const float terrainToneStrength = input.material == MAT_STONE
         ? (sideFace ? 0.026f : 0.055f)
@@ -372,7 +377,7 @@ float4 main(PSInput input) : SV_Target {
         ? lerp(0.48f, 0.18f, saturate((input.distance - 220.0f) / 620.0f))
         : 1.0f;
     const float dryGridStrength =
-        (sideFace ? 0.12f : 0.46f) *
+        (sideFace ? 0.05f : 0.14f) *
         stoneGridScale *
         sideSandGridScale *
         shorelineGridSuppression *
