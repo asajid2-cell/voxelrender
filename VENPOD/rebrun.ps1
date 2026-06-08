@@ -74,7 +74,11 @@ param(
     #   30fps -> ~30 FPS, stable, no holes; terrain DETAILED (high coverage)
     # Both use best-available-LOD render (no freezes/holes). "none" = legacy path.
     [ValidateSet("none", "60fps", "30fps", "detail")]
-    [string]$PerfMode = "none"
+    [string]$PerfMode = "none",
+    # Raymarch render scale (the dominant FPS lever, since the frame is GPU-raymarch
+    # bound). <1.0 renders the voxel raymarch at lower res then upscales: lower =
+    # faster but softer. 0 = use the perf-mode default. e.g. -RenderScale 0.4
+    [double]$RenderScale = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -207,6 +211,7 @@ $savedEnv = @{
     VENPOD_STREAMING_V2 = $env:VENPOD_STREAMING_V2
     VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS = $env:VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS
     VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH = $env:VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH
+    VENPOD_RAYMARCH_RENDER_SCALE = $env:VENPOD_RAYMARCH_RENDER_SCALE
 }
 
 function Restore-Env {
@@ -585,6 +590,7 @@ try {
     Remove-Item env:VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_RAYMARCH_RENDER_SCALE -ErrorAction SilentlyContinue
     if ($PerfMode -ne "none") {
         $pumpBudget = if ($PerfMode -eq "60fps") { "4" } else { "12" }  # 30fps/detail -> 12
         $surfBudget = if ($PerfMode -eq "60fps") { "4" } else { "10" }  # 30fps/detail -> 10
@@ -609,7 +615,11 @@ try {
             $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MAX_FRAME = "120"
             $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_FAIL_OPEN_AT_MAX_FRAME = "1"
         }
-        Write-Info "Perf mode: $PerfMode (V2 best-available render, mid-pump budget ${pumpBudget}ms, surface-prefetch off)"
+        # GPU raymarch is the framerate bottleneck, so render scale is the dominant
+        # FPS dial (trades sharpness for fps). Default per mode; -RenderScale overrides.
+        $rayScale = if ($RenderScale -gt 0) { "$RenderScale" } elseif ($PerfMode -eq "60fps") { "0.5" } else { "0.8" }
+        $env:VENPOD_RAYMARCH_RENDER_SCALE = $rayScale
+        Write-Info "Perf mode: $PerfMode (V2 best-available render, mid-pump ${pumpBudget}ms, surface ${surfBudget}ms, prefetch off, raymarch render scale $rayScale)"
     }
 
     Write-Host "VENPOD - Rebuild + Run" -ForegroundColor Magenta
