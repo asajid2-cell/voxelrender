@@ -2123,9 +2123,9 @@ RayHit MakeMidVoxelColumnClipmapHit(float3 rayOrigin, float3 rayDir, float hitT,
         0.64f);
     baseColor.rgb = ApplyWaterlineWetTerrainTint(baseColor.rgb, material, hitPos.y, normal.y, 0.62f);
     float3 shadeNormal = DistantLodShadeNormal(normal, hitT, 0.16f);
-    float ndotl = saturate(dot(shadeNormal, SkySunDirection()) * 0.58f + 0.32f);
-    float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.74f + ndotl * 0.36f);
-    const float grid = VoxelGridLine(hitPos.xz, max(cellSize, 4.0f), 0.045f);
+    float ndotl = saturate(dot(shadeNormal, SkySunDirection()) * 0.58f + 0.40f);
+    float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.92f + ndotl * 0.46f);
+    const float grid = VoxelGridLine(hitPos.xz, max(cellSize, 4.0f), 0.020f);
     color *= lerp(1.0f, 0.94f, grid);
     const float startDistance = max(frame.midFieldParams.y, 1.0f);
     const float endDistance = max(frame.midFieldParams.z, startDistance + 1.0f);
@@ -2386,10 +2386,13 @@ bool RaymarchMidClipmap(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             0.64f);
         baseColor.rgb = ApplyWaterlineWetTerrainTint(baseColor.rgb, material, hitPos.y, normal.y, 0.62f);
         float3 lightDir = SkySunDirection();
-        float ndotl = saturate(dot(normal, lightDir));
-        float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.72f + ndotl * 0.58f);
-        const float midGrid = VoxelGridLine(hitPos.xz, max(MidClipmapCellSize(hitT), 4.0f), 0.055f);
-        color *= lerp(1.0f, 0.94f, midGrid);
+        // Smooth-shade the voxel staircase (bias lighting normal toward macro-up so step
+        // risers don't read as contour bands); keep some true-normal slope definition.
+        float3 litNormal = normalize(normal + float3(0.0f, 1.0f, 0.0f) * 1.35f);
+        float ndotl = saturate(dot(litNormal, lightDir));
+        float3 color = baseColor.rgb * (SkyAmbient(litNormal) * 0.82f + ndotl * 0.60f);
+        const float midGrid = VoxelGridLine(hitPos.xz, max(MidClipmapCellSize(hitT), 4.0f), 0.020f);
+        color *= lerp(1.0f, 0.985f, midGrid);
         float fogFactor = saturate((hitT - startDistance) / max(endDistance - startDistance, 1.0f));
         color = lerp(color, SkyColor(rayDir), fogFactor * 0.24f);
         if (frame.debugMode == 8u) {
@@ -2484,10 +2487,11 @@ bool RaymarchMidClipmap(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             baseColor.rgb = ApplyWaterlineWetTerrainTint(baseColor.rgb, material, hitPos.y, normal.y, 0.62f);
 
             float3 lightDir = SkySunDirection();
-            float ndotl = saturate(dot(normal, lightDir));
-            float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.72f + ndotl * 0.58f);
-            const float midGrid = VoxelGridLine(hitPos.xz, max(MidClipmapCellSize(hitT), 4.0f), 0.055f);
-            color *= lerp(1.0f, 0.94f, midGrid);
+            float3 litNormal = normalize(normal + float3(0.0f, 1.0f, 0.0f) * 1.35f);
+            float ndotl = saturate(dot(litNormal, lightDir));
+            float3 color = baseColor.rgb * (SkyAmbient(litNormal) * 0.82f + ndotl * 0.60f);
+            const float midGrid = VoxelGridLine(hitPos.xz, max(MidClipmapCellSize(hitT), 4.0f), 0.020f);
+            color *= lerp(1.0f, 0.985f, midGrid);
             float fogFactor = saturate((hitT - startDistance) / max(endDistance - startDistance, 1.0f));
             color = lerp(color, SkyColor(rayDir), fogFactor * 0.24f);
 
