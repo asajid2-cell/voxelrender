@@ -622,6 +622,7 @@ try {
         "VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS",
         "VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME",
         "VENPOD_SPARSE_SURFACE_UPLOAD_MIN_INTERVAL_FRAMES",
+        "VENPOD_SPARSE_STATS_SINGLE_FLUSH",
         "VENPOD_SPARSE_EXACT_ASYNC_GENERATION",
         "VENPOD_SPARSE_EXACT_ASYNC_VISIBLE",
         "VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE",
@@ -672,6 +673,9 @@ try {
         # Verified: interval 2 -> fps 46->54, steady (max 27ms). quality uploads every frame.
         $surfUploadInterval = if ($quality) { "1" } elseif ($PerfMode -eq "60fps") { "3" } else { "2" }
         $env:VENPOD_SPARSE_SURFACE_UPLOAD_MIN_INTERVAL_FRAMES = $surfUploadInterval
+        # Skip the per-frame stats FlushStats (~2.25ms pure telemetry overhead). Single-flush
+        # mode keeps the metrics overlay slightly staler but is invisible to gameplay.
+        if (-not $quality) { $env:VENPOD_SPARSE_STATS_SINGLE_FLUSH = "1" }
         # Async EXACT generation too: move brick generation (gen ~6-10ms while moving)
         # off the main thread. VISIBLE+PREFETCH lanes must be async or moving-play bricks
         # (visible lane) bail to synchronous. Generated bricks apply a frame later, then
