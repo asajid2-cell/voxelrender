@@ -723,7 +723,7 @@ try {
         }
         # Foreground raymarch (uncovered near/mid terrain) is the other half of the GPU
         # cost; render scale lowers it. -RenderScale overrides the per-mode default.
-        $rayScale = if ($RenderScale -gt 0) { "$RenderScale" } elseif ($quality) { "1.0" } elseif ($PerfMode -eq "60fps") { "0.65" } else { "0.85" }
+        $rayScale = if ($RenderScale -gt 0) { "$RenderScale" } elseif ($quality) { "1.0" } elseif ($PerfMode -eq "60fps") { "0.5" } else { "0.85" }
         $env:VENPOD_RAYMARCH_RENDER_SCALE = $rayScale
         if ($useSparse) {
             # Open the world promptly at best-available LOD (V2); don't hold for proofs.
