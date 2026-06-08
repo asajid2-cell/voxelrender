@@ -4,7 +4,28 @@ Generated: 2026-06-05
 
 This is the compact survival file for the active VENPOD campaign. If chat compacts, first read `instruct.md` for the long-run operating contract, then resume from this file before reading the larger `handoff.md`, `debug-handoff.md`, `root.md`, or `debug.md`.
 
-## PERF: 7 -> ~52 fps steady + VISUAL OVERHAUL (2026-06-08, READ FIRST — latest)
+## PERF: 7 -> ~55 fps steady + VISUAL OVERHAUL (2026-06-08, READ FIRST — latest)
+
+Final: steady ~55 fps (52-59 band, no-capture walk speed 26, vsync off), good visuals
+(capture-verified), no hitches. 7.9x from broken 7-10fps. Tuned config (rebrun 60fps mode):
+V2 + async surface(+Around routing)/exact/mid producers + interest signature reuse +
+mid-pump hard budget 2ms + surface apply 32 + surface UPLOAD every 3 frames +
+STATS single-flush (skip per-frame FlushStats ~2ms) + render scale 0.65 + bg pass 0.3.
+
+CONFIRMED CPU-BOUND (wait=0; render scale 0.5 == 0.65 fps, so GPU ~11ms fully overlaps).
+Levers that did NOT help further (tested + reverted): render scale lower, 6 surface
+workers (added dip), interest-reuse max-age 90 (catch-up bursts -> variance), interval 4.
+
+LAST ~5 fps to locked 60 (the 52-59 band touches 59): CPU coordination floor =
+req ~4ms (exact request planner, runs every frame even at full coverage) + clip ~4.5ms
+(+ periodic ~9ms interest-rebuild spike) + periodic surface upload stage/emit (~4ms every
+3rd frame). Needs: (1) request-planner footprint EARLY-OUT (skip scan when footprint
+unchanged + coverage full), (2) incremental/DEFERRED surface upload (spread stage/emit
+across frames, no periodic spike), (3) async-apply timing is non-deterministic ->
+inherent ~52-59 band. These are deeper renderer/planner rework (the documented final
+project); env tuning + the tractable code cuts are exhausted at ~55fps.
+
+## PERF: 7 -> ~52 fps steady (2026-06-08, superseded above)
 
 Final: steady ~52 fps (50-56, no-capture walk, vsync off), good visuals (capture-verified),
 no hitches. 7.4x from the original broken 7-10fps. THE breakthrough beyond ~44: the
