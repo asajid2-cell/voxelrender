@@ -611,8 +611,20 @@ try {
     }
     if ($PerfMode -ne "none") {
         $bgScale = if ($PerfMode -eq "60fps") { "0.3" } else { "0.5" }  # far raymarch res
+        $pumpBudget = if ($PerfMode -eq "60fps") { "4" } else { "10" }  # cap mid clip/pump CPU
+        $surfBudget = if ($PerfMode -eq "60fps") { "4" } else { "8" }   # cap surface meshing CPU
         $env:VENPOD_STREAMING_V2 = "1"
         $env:VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH = "0"   # speculative; not needed under best-available
+        # CPU caps: when MOVING, the mid-clipmap pump + surface meshing explode
+        # (real play: clip hit ~99ms unbounded). Bound them; V2 best-available renders
+        # the not-yet-generated terrain coarser instead of stalling. The old downside
+        # (less coverage -> more raymarch) no longer matters: the background pass +
+        # render scale handle the GPU regardless of coverage.
+        $env:VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS = $pumpBudget
+        $env:VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET = "1"
+        $env:VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS = $surfBudget
+        $env:VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $surfBudget
+        $env:VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $surfBudget
         # Low-res far/background raymarch (the GPU win); near terrain stays full-res.
         $env:VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE = "1"
         $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE = $bgScale
