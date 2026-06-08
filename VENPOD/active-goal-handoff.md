@@ -35,11 +35,24 @@ Three V2 dials together hit ~60 FPS, STABLE, in the dense/worst walk region
 Result (dense region, deterministic walk): median ~16-20 ms (~50-63 FPS), p99 ~26 ms,
 max ~33 ms, noise tiny. From "26 FPS avg with 36-second freezes" at session start.
 
-TRADEOFF / open item: at pump budget 4 ms, mid-voxel coverage ~40-48% (terrain shown
-coarser) with missScreenPct=0 (no holes). Need to raise the pump budget to the
-coverage/fps sweet spot (max detail still holding ~60), then VISUAL-check (the bound +
-prefetch-off make terrain coarser; confirm acceptable, no pop-in/sky-leak under
-motion). Then bake the chosen values as V2 defaults and cut over.
+TRADEOFF / open item: pump budget is now a perf/detail DIAL (V2 + prefetch off,
+dense region, all stable + missScreenPct=0):
+  - pump  4 ms -> ~50-63 FPS, coverage ~45% (coarse)
+  - pump  8 ms -> ~31-40 FPS, coverage ~45-60%
+  - pump 12 ms -> ~33 FPS,    coverage ~78-86% (detailed)
+Detail costs main-thread generation time, so 60 + full detail simultaneously requires
+moving generation OFF-thread (async producer). Attempt to use the existing async
+producer FAILED: `asyncEnqueued=0` despite `asyncEligibleVoxel=96-186` -- the async
+enqueue path bails in its guards/wiring (suspect the queue-max env default and/or the
+per-coord guards in TryQueueAsyncVoxelGeneration, SparseClipmap.cpp ~883-895; the
+single async worker is also likely insufficient). FINAL STEP for detail-at-60: fix the
+async enqueue wiring + make the async producer multi-worker, so the bounded main pump
+stays ~4 ms (60 FPS) while N workers fill coverage off the critical path. Then
+visual-check + bake defaults + cut over.
+
+To RUN at 60 now: `VENPOD_STREAMING_V2=1`,
+`VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS=4` (or 8-12 for the detail/fps balance),
+`VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH=0`. (backlogAwarePump on by default.)
 
 NOTE on measurement: validated via deterministic CPU sub-timers (clipMs/genMs/request)
 + stable median, which are immune to the GPU/present noise seen earlier. The earlier
