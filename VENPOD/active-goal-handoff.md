@@ -16,6 +16,36 @@ Tool goal currently active:
 Drive VENPOD toward stable 60 FPS by identifying and patching structural engine bottlenecks at their source: preserve public-frame correctness and visual coverage, measure the dominant cost stage before each change, implement core dataflow/architecture fixes rather than tuning knobs, and reject changes that merely shift debt or trade FPS for instability.
 ```
 
+## ARCHITECTURE TRUTH: raymarch fills what surfaces don't cover (2026-06-07, READ FIRST)
+
+Render path (main_launcher.cpp ~19626): (1) rasterize sparse SURFACE meshes -> write
+depth/stencil (~0.7 ms, cheap); (2) fullscreen RAYMARCH (PS_Raymarch) runs ONLY for
+pixels NOT covered by those surfaces. So GPU ray = 67 ms means most of the screen is
+NOT covered by cheap rasterized surfaces and falls to the expensive raymarch (far
+horizon + ungenerated near).
+
+COUNTERINTUITIVE CONSEQUENCE: bounding the pump (the "60fps mode") REDUCES surface
+coverage -> MORE pixels raymarched -> GPU gets WORSE. The perf modes optimized the
+wrong axis for a GPU-bound renderer. The render-scale lever helps the raymarch but
+the user reports the counter barely moved -> the dominant cost is the raymarch of
+uncovered (far/horizon) pixels, and lower coverage feeds it more.
+
+REAL fps levers (GPU renderer, the genuine "make it run" work):
+- Maximize cheap rasterized SURFACE coverage (rasterize more terrain, incl. mid as
+  meshes) so the expensive raymarch shrinks to a thin far sliver. (CPU has headroom:
+  prep ~20 ms.) This is the opposite of bounding generation.
+- Optimize the FAR/background raymarch that fills the horizon: empty-space skipping
+  (big steps through air), shorter far distance (VENPOD_RAYMARCH_MAX_DISTANCE_SCALE),
+  lower-res far/background pass (VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE), fewer max
+  steps (VENPOD_RAYMARCH_MAX_STEPS_SCALE). Shader: PS_Raymarch.hlsl (6185 lines).
+- Profile WHICH raymarch sub-pass dominates (exact-near DDA vs far-SVO vs far-height
+  vs background field) by adding per-sub-pass GPU timestamps; optimize the top one.
+
+This is a substantial GPU-renderer effort (the next major project, like the CPU
+streaming overhaul). Do NOT keep tuning CPU/pump dials for fps -- the ceiling is the
+raymarch. The CPU V2 work stands (stability: no freezes/holes), but real fps needs
+the raymarch/coverage architecture above.
+
 ## CRITICAL RE-DIAGNOSIS: real-play fps is GPU-RAYMARCH-bound (2026-06-07, READ FIRST)
 
 Real interactive play (rebrun, 1080p, ground-level view) runs ~10 FPS. Root cause is
