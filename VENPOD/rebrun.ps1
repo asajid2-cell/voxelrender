@@ -633,7 +633,8 @@ try {
         "VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ",
         "VENPOD_SPARSE_MID_INTEREST_INTERVAL",
         "VENPOD_SPARSE_MID_CLIPMAP_FOOTPRINT_INTEREST_SIGNATURE",
-        "VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE")) {
+        "VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE",
+        "VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE_MAX_AGE")) {
         Remove-Item "env:$pvName" -ErrorAction SilentlyContinue
     }
     if ($PerfMode -ne "none") {
@@ -704,6 +705,8 @@ try {
         if (-not $quality) {
             $env:VENPOD_SPARSE_MID_CLIPMAP_FOOTPRINT_INTEREST_SIGNATURE = "1"
             $env:VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE = "1"
+            # (Extending REUSE_MAX_AGE was tried + reverted: longer reuse caused bigger
+            # catch-up bursts -> MORE fps variance. Default age is steadier.)
         }
         # Low-res far/background raymarch (the GPU win); near terrain stays full-res.
         # quality mode disables it for a sharp full-res horizon.
