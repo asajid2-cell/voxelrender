@@ -16,6 +16,41 @@ Tool goal currently active:
 Drive VENPOD toward stable 60 FPS by identifying and patching structural engine bottlenecks at their source: preserve public-frame correctness and visual coverage, measure the dominant cost stage before each change, implement core dataflow/architecture fixes rather than tuning knobs, and reject changes that merely shift debt or trade FPS for instability.
 ```
 
+## OVERHAUL V2 — session 2 findings (2026-06-07 late, READ FIRST)
+
+Continued the overhaul toward 60. Net: Stage 1 (V2) holds as the real win; further
+gains are blocked by an intermittent stall that is likely environmental, and the
+measurement environment degraded over a long session (dozens of app launches).
+
+Landed this session (committed):
+- `flush_on(info)` -> buffered info logging (warn/err still flush; flush on exit).
+  flush_on(info) was a per-line synchronous disk fsync = a per-frame ~1KB disk flush
+  under per-frame PERF logging. Real overhead + measurement artifact. Fixed.
+
+Tested + rejected toward 60 (on top of V2):
+- Existing parallel/async worker flags (ParallelMidVoxelPump/SurfaceExtraction/
+  ExactGeneration): no median gain; the old worker integration is contended. A clean
+  async producer rewrite is still required (Stage 2), not the old flags.
+- Reduced interest set (work-volume dial) under V2: request/gen thrash, worse. The
+  request path re-requests the missing set; needs frontier residency (Stage 4) first.
+
+Key diagnostic — the recurring multi-second stalls:
+- They are NOT logging (persist with buffered logging) and NOT parallel-specific.
+- They are NON-DETERMINISTIC: identical fixed-dt config/camera, run 3 = clean 46 ms
+  median, run 4 = 5 s freeze. The metric `gapPrev = rawMs - body` is cross-frame
+  skewed (rawMs(N) is frame N-1's wall time); the real stall is a BODY spike, located
+  at `postRender` (render-submit -> present region), e.g. frame 623 postRender
+  `1505 ms`. Post-render/present-side, intermittent.
+- Most likely ENVIRONMENTAL (GPU/driver/memory state after dozens of DX12 launches in
+  one long session), not deterministic engine CPU work. FIRST step next session:
+  reboot / fresh GPU state, re-run the V2 bench, and confirm whether the multi-second
+  stalls disappear. Only if they persist on a fresh machine is it an engine bug (then
+  instrument the 19750->22470 post-render region in main_launcher.cpp).
+- On a clean run V2 reaches ~46 ms median in the worst (dense) region (~22 FPS) with
+  no holes; easy regions ~30 FPS. The CPU steady cost (request/clip/gen/surface, all
+  bounded) is the real target for 60, via Stage 2 (async producer) + Stage 4
+  (frontier residency).
+
 ## OVERHAUL V2 — Stage 1 LANDED (2026-06-07, READ FIRST)
 
 The generation overhaul (`generation-overhaul-v2.md`) is underway and Stage 1 (the
