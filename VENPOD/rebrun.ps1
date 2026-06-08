@@ -73,7 +73,7 @@ param(
     #   60fps -> ~60 FPS, stable, no holes; terrain COARSER (bounded generation)
     #   30fps -> ~30 FPS, stable, no holes; terrain DETAILED (high coverage)
     # Both use best-available-LOD render (no freezes/holes). "none" = legacy path.
-    [ValidateSet("none", "60fps", "30fps", "detail")]
+    [ValidateSet("none", "60fps", "30fps", "detail", "quality")]
     [string]$PerfMode = "none",
     # Raymarch render scale (the dominant FPS lever, since the frame is GPU-raymarch
     # bound). <1.0 renders the voxel raymarch at lower res then upscales: lower =
@@ -626,9 +626,13 @@ try {
         Remove-Item "env:$pvName" -ErrorAction SilentlyContinue
     }
     if ($PerfMode -ne "none") {
+        $quality = $PerfMode -eq "quality"
+        # quality mode = VISUAL CORRECTNESS first: fill coverage, full-res near+far,
+        # no GPU bandaids (fps is secondary). Other modes trade coverage/sharpness for fps.
         $bgScale = if ($PerfMode -eq "60fps") { "0.3" } else { "0.5" }  # far raymarch res
-        $pumpBudget = if ($PerfMode -eq "60fps") { "4" } else { "10" }  # cap mid clip/pump CPU
-        $surfBudget = if ($PerfMode -eq "60fps") { "4" } else { "8" }   # cap surface meshing CPU
+        $pumpBudget = if ($quality) { "24" } elseif ($PerfMode -eq "60fps") { "4" } else { "10" }
+        $surfBudget = if ($quality) { "24" } elseif ($PerfMode -eq "60fps") { "4" } else { "8" }
+        $useBgPass = -not $quality   # quality renders the far field full-res (no blocky distance)
         $env:VENPOD_STREAMING_V2 = "1"
         $env:VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH = "0"   # speculative; not needed under best-available
         # CPU caps: when MOVING, the mid-clipmap pump + surface meshing explode
@@ -656,12 +660,15 @@ try {
         $env:VENPOD_SPARSE_EXACT_ASYNC_VISIBLE = "1"
         $env:VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE = "1"
         # Low-res far/background raymarch (the GPU win); near terrain stays full-res.
-        $env:VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE = "1"
-        $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE = $bgScale
-        $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL = "1"
+        # quality mode disables it for a sharp full-res horizon.
+        if ($useBgPass) {
+            $env:VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE = "1"
+            $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE = $bgScale
+            $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL = "1"
+        }
         # Foreground raymarch (uncovered near/mid terrain) is the other half of the GPU
         # cost; render scale lowers it. -RenderScale overrides the per-mode default.
-        $rayScale = if ($RenderScale -gt 0) { "$RenderScale" } elseif ($PerfMode -eq "60fps") { "0.5" } else { "0.75" }
+        $rayScale = if ($RenderScale -gt 0) { "$RenderScale" } elseif ($quality) { "1.0" } elseif ($PerfMode -eq "60fps") { "0.5" } else { "0.75" }
         $env:VENPOD_RAYMARCH_RENDER_SCALE = $rayScale
         if ($useSparse) {
             # Open the world promptly at best-available LOD (V2); don't hold for proofs.
@@ -671,7 +678,11 @@ try {
             $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MAX_FRAME = "120"
             $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_FAIL_OPEN_AT_MAX_FRAME = "1"
         }
-        Write-Info "Perf mode: $PerfMode (V2 best-available + low-res far background pass $bgScale + foreground render scale $rayScale)"
+        if ($quality) {
+            Write-Info "Perf mode: quality (visual-first: full coverage pump ${pumpBudget}ms, async producers, full-res near+far; fps secondary)"
+        } else {
+            Write-Info "Perf mode: $PerfMode (V2 best-available + low-res far background pass $bgScale + foreground render scale $rayScale)"
+        }
     }
 
     Write-Host "VENPOD - Rebuild + Run" -ForegroundColor Magenta
