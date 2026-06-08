@@ -645,7 +645,7 @@ try {
         # quality mode = VISUAL CORRECTNESS first: fill coverage, full-res near+far,
         # no GPU bandaids (fps is secondary). Other modes trade coverage/sharpness for fps.
         $bgScale = if ($PerfMode -eq "60fps") { "0.3" } else { "0.5" }  # far raymarch res
-        $pumpBudget = if ($quality) { "24" } elseif ($PerfMode -eq "60fps") { "2" } else { "8" }
+        $pumpBudget = if ($quality) { "24" } elseif ($PerfMode -eq "60fps") { "16" } else { "12" }
         $surfBudget = if ($quality) { "24" } elseif ($PerfMode -eq "60fps") { "4" } else { "8" }
         $useBgPass = -not $quality   # quality renders the far field full-res (no blocky distance)
         $env:VENPOD_STREAMING_V2 = "1"
@@ -670,7 +670,7 @@ try {
         # Surface mesh APPLY (UpdateBrickWithExtractedFaces, default 256/frame) dominates
         # the post-fence cost (untracked ~12-23ms). Throttle it: workers still produce,
         # results apply over more frames (best-available shows coarse briefly). quality=high.
-        $surfApply = if ($quality) { "256" } elseif ($PerfMode -eq "60fps") { "32" } else { "96" }
+        $surfApply = if ($quality) { "256" } elseif ($PerfMode -eq "60fps") { "192" } else { "128" }
         $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME = $surfApply
         # Surface GPU upload (snapshot/stage/emit) every frame is a big main-thread post-fence
         # cost. Upload every Nth frame instead (best-available shows 1-frame-older surface).
@@ -694,17 +694,17 @@ try {
         # Cap async exact-gen apply per frame: consistent per-frame work tames the apply-
         # bunching that caused run-to-run fps variance. Verified: tightened to avg ~60-62,
         # min ~56-57 (crosses 60). 60fps mode only; quality/30fps keep the default 32.
-        if ($PerfMode -eq "60fps") { $env:VENPOD_SPARSE_EXACT_ASYNC_MAX_APPLY_PER_FRAME = "16" }
+        if ($PerfMode -eq "60fps") { $env:VENPOD_SPARSE_EXACT_ASYNC_MAX_APPLY_PER_FRAME = "96" }
         # Async MID-CLIPMAP voxel generation: move the mid-voxel pump (the 'clip' cost,
         # the last big synchronous CPU item ~9ms) off the main thread -> path to steady 60.
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_GEN = "1"
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_VISIBLE_CRITICAL_GEN = "1"
-        $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_ENQUEUE = "64"
-        $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_APPLY = "24"
+        $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_ENQUEUE = "128"
+        $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_APPLY = "128"
         # Mid-voxel interest radius is the dominant per-frame CPU driver (clip/req/upload
         # scale ~quadratically with it; default 8 -> ~9200 bricks). Shrink it for fps; the
         # far LOD + background pass fill beyond the mid-detail radius. quality keeps 8.
-        $midVoxRadius = if ($quality) { "8" } elseif ($PerfMode -eq "60fps") { "4" } else { "6" }
+        $midVoxRadius = if ($quality) { "8" } elseif ($PerfMode -eq "60fps") { "6" } else { "7" }
         $env:VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ = $midVoxRadius
         # Mid interest set is rebuilt EVERY frame (interestInterval=1) -- a big chunk of
         # 'clip'. Amortize it across frames (camera moves smoothly, the set barely changes
