@@ -4,7 +4,30 @@ Generated: 2026-06-05
 
 This is the compact survival file for the active VENPOD campaign. If chat compacts, first read `instruct.md` for the long-run operating contract, then resume from this file before reading the larger `handoff.md`, `debug-handoff.md`, `root.md`, or `debug.md`.
 
-## ARCHITECTURAL FPS CAP ~37-39 (2026-06-08, READ FIRST)
+## PERF: 7 -> 44 fps steady (2026-06-08, READ FIRST — supersedes the ~37-39 cap below)
+
+Broke through the ~37 cap. Steady ~43-44 fps (no-capture walk, vsync off), good visuals,
+no hitches. The chain of verified wins this round:
+- Routed the per-frame surface "Around" pumps to async (ExtractOrQueueSurfaceCoord) ->
+  surfExtract 8.2ms -> 0.04ms off main thread. (SparseVoxelWorld.cpp)
+- Enabled mid-clipmap interest SIGNATURE REUSE (footprint + voxel) in perf modes -> +8fps,
+  no recenter bursts (skips interest rebuild when footprint unchanged).
+- Async mid-clipmap noncritical voxel gen enabled; surface/mid apply budgets throttled
+  (32/24); mid voxel radius 6, interest interval 2. All verified via capvis.ps1 + fps logs.
+
+REMAINING ~10ms to steady 60 (CODE optimization, not env tuning -- env knobs exhausted):
+frame ~23ms = req ~7 (exact request PLANNER) + clip ~7 (mid clipmap APPLY/upload, interest
+rebuild already reused) + post/gen-spikes. Both req and clip run EVERY frame even at
+farCov=1.00/1.00 (world fully covered, nothing to do). The fix is a footprint-signature
+EARLY-OUT for the exact request planner (skip the scan when footprint unchanged + coverage
+full) and cross-frame incrementalization of the clip apply -- same idea as the mid interest
+signature reuse, applied to the request planner + clip apply. Where: reqMs/clipMs are
+measured in main_launcher (sparseSplit); the request build + clip apply are in SparseVoxelWorld
+PumpGeneration + the clipmap apply path. This is deeper code surgery; do it with capvis.ps1
+verification, carefully (a prior center-gated interest reuse regressed with recenter bursts --
+use the signature approach that did NOT regress).
+
+## ARCHITECTURAL FPS CAP ~37-39 (2026-06-08, superseded above)
 
 Extensive tuning (self-verified, vsync off, scripted walk): fps is PINNED ~37-39 regardless
 of async exact gen, async mid-clipmap gen, mid voxel radius, interest interval, surface apply
