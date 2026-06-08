@@ -16,6 +16,37 @@ Tool goal currently active:
 Drive VENPOD toward stable 60 FPS by identifying and patching structural engine bottlenecks at their source: preserve public-frame correctness and visual coverage, measure the dominant cost stage before each change, implement core dataflow/architecture fixes rather than tuning knobs, and reject changes that merely shift debt or trade FPS for instability.
 ```
 
+## OVERHAUL V2 — ~60 FPS REACHED in worst region (2026-06-07, READ FIRST)
+
+Three V2 dials together hit ~60 FPS, STABLE, in the dense/worst walk region
+(frames 600-1000), with NO multi-second stalls and NO screen holes:
+
+1. `VENPOD_STREAMING_V2=1` — best-available-LOD render, no force-generation (Stage 1).
+2. `VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS=4` — bound the mid-voxel pump. Under
+   V2 (no force-gen catch-up) this cleanly caps generation: clip 19->9, gen 15->1.5,
+   surfExtract 8->0.15, postWait 18->2, AND the multi-second GPU/present stalls vanish
+   (max 5186ms -> 33ms). [The same bound WITHOUT V2 exploded the backlog -> 36s; V2 is
+   what makes it safe.]
+3. `VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH=0` — the speculative surface-prefetch
+   raycast was thrashing (request 31.6ms, terrainSurfacePrefetch 26.7ms) re-prefetching
+   missing terrain every frame; unnecessary under best-available render. Off -> request
+   31.6->3.5.
+
+Result (dense region, deterministic walk): median ~16-20 ms (~50-63 FPS), p99 ~26 ms,
+max ~33 ms, noise tiny. From "26 FPS avg with 36-second freezes" at session start.
+
+TRADEOFF / open item: at pump budget 4 ms, mid-voxel coverage ~40-48% (terrain shown
+coarser) with missScreenPct=0 (no holes). Need to raise the pump budget to the
+coverage/fps sweet spot (max detail still holding ~60), then VISUAL-check (the bound +
+prefetch-off make terrain coarser; confirm acceptable, no pop-in/sky-leak under
+motion). Then bake the chosen values as V2 defaults and cut over.
+
+NOTE on measurement: validated via deterministic CPU sub-timers (clipMs/genMs/request)
++ stable median, which are immune to the GPU/present noise seen earlier. The earlier
+"environmental" multi-second stalls were the unbounded-pump generation overwhelming
+GPU upload/present; bounding the pump removed them (so they were engine-driven after
+all, not just environment).
+
 ## OVERHAUL V2 — session 2 findings (2026-06-07 late, READ FIRST)
 
 Continued the overhaul toward 60. Net: Stage 1 (V2) holds as the real win; further
