@@ -621,6 +621,7 @@ try {
         "VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION",
         "VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS",
         "VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME",
+        "VENPOD_SPARSE_SURFACE_UPLOAD_MIN_INTERVAL_FRAMES",
         "VENPOD_SPARSE_EXACT_ASYNC_GENERATION",
         "VENPOD_SPARSE_EXACT_ASYNC_VISIBLE",
         "VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE",
@@ -666,6 +667,11 @@ try {
         # results apply over more frames (best-available shows coarse briefly). quality=high.
         $surfApply = if ($quality) { "256" } elseif ($PerfMode -eq "60fps") { "32" } else { "96" }
         $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME = $surfApply
+        # Surface GPU upload (snapshot/stage/emit) every frame is a big main-thread post-fence
+        # cost. Upload every Nth frame instead (best-available shows 1-frame-older surface).
+        # Verified: interval 2 -> fps 46->54, steady (max 27ms). quality uploads every frame.
+        $surfUploadInterval = if ($quality) { "1" } elseif ($PerfMode -eq "60fps") { "2" } else { "1" }
+        $env:VENPOD_SPARSE_SURFACE_UPLOAD_MIN_INTERVAL_FRAMES = $surfUploadInterval
         # Async EXACT generation too: move brick generation (gen ~6-10ms while moving)
         # off the main thread. VISIBLE+PREFETCH lanes must be async or moving-play bricks
         # (visible lane) bail to synchronous. Generated bricks apply a frame later, then
