@@ -346,11 +346,13 @@ float4 main(PSInput input) : SV_Target {
     // Higher-contrast lighting for terrain depth/definition (was ambient-dominated and
     // washed out). Warm directional sun + cooler sky fill, with a slope-based ambient
     // occlusion (downward/horizontal faces receive less sky light).
-    const float3 sunColor = float3(1.06f, 0.99f, 0.86f);
-    const float3 skyFill = float3(0.43f, 0.48f, 0.56f);
+    const float3 sunColor = float3(1.04f, 0.99f, 0.88f);
+    const float3 skyFill = float3(0.48f, 0.52f, 0.58f);
     const float skyAccess = saturate(n.y * 0.5f + 0.5f);
-    float3 color = baseColor * (skyFill * (0.32f + 0.42f * skyAccess) + sunColor * diffuse * 0.80f);
-    color = max(color, baseColor * 0.28f);
+    // Gentle directional shading: lift side/under faces so the voxel-staircase steps
+    // don't read as harsh contour bands, while keeping some warm-sun/cool-sky depth.
+    float3 color = baseColor * (skyFill * (0.66f + 0.18f * skyAccess) + sunColor * diffuse * 0.44f);
+    color = max(color, baseColor * 0.46f);
     const float voxelTone = HashVoxelCell(floor(input.worldPos + n * 0.01f)) - 0.5f;
     const float terrainToneStrength = input.material == MAT_STONE
         ? (sideFace ? 0.026f : 0.055f)
