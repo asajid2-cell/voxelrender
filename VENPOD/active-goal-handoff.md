@@ -4,6 +4,37 @@ Generated: 2026-06-05
 
 This is the compact survival file for the active VENPOD campaign. If chat compacts, first read `instruct.md` for the long-run operating contract, then resume from this file before reading the larger `handoff.md`, `debug-handoff.md`, `root.md`, or `debug.md`.
 
+## MOVING-PLAY perf state (2026-06-07, READ FIRST — supersedes older fps claims)
+
+Real interactive play via `rebrun -PerfMode 60fps` (1920x1080, user machine): **~15 fps
+moving** (was 10). The fps lever is the GPU/CPU MIX, validated ONLY by (a) the scripted
+WALK test, not stationary headless, and (b) reading the user's real
+`build/bin/venpod_runtime.log` after they play. Stationary headless LIES (showed 48 fps
+where real moving was 7).
+
+Current perf-mode config (rebrun.ps1): V2 + mid-pump hard budget (4ms) + surface time
+budgets + render scale 0.5 + background pass ENABLE+scale 0.3 + prefetch off + relaxed
+startup gate. Dropped: aggressive gen bounds were wrong earlier; parallel surface
+extraction was tried + REVERTED (existing worker infra is contended: no offload + gapPrev
+stalls).
+
+Real moving-play frame breakdown (~65 ms = 15 fps), from user's log frame ~1032:
+- gpu ray ~19 ms (heavier than walk's ~6; user view = long horizon rays). render scale
+  0.5 + bg pass 0.3 already applied. -RenderScale 0.4 cuts more (blurrier).
+- surfExtract ~20 ms median (p90 44, max 58) -- SURFACE MESHING on main thread. The
+  PRE-PUBLISH path (main_launcher ~14631 PumpSurfaceExtractionForCoords) does a BATCH
+  with NO time check inside the batch -> one call blows the 4ms budget. THIS is the next
+  contained code target: make the batch time-sliced (chunk + check
+  prePublishSurfaceTimeExpired between chunks), or thread it cleanly.
+- req ~10, gen ~6, clip ~9 ms -- synchronous streaming pipeline.
+
+Path to 60: get the synchronous CPU streaming (surfExtract + req + gen + clip ~45 ms)
+OFF the critical path. The honest big fix is a CLEAN async producer (fire-and-forget
+gen+mesh worker, NOT the contended existing parallel infra). Bounding-on-main-thread is
+whack-a-mole (each fix reveals the next unbounded stage). FPS counter is in (top-right,
+PERF_FRAME_END / smoothedFps). Painting still hitchy (edit sets EditedBrickCount>0 ->
+globally disables async+reuse; needs per-brick gating).
+
 ## Active Goal
 
 `streaming_playability_real_fix_campaign_20260604`
