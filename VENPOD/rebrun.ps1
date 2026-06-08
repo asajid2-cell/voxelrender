@@ -622,6 +622,8 @@ try {
         "VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS",
         "VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME",
         "VENPOD_SPARSE_SURFACE_UPLOAD_MIN_INTERVAL_FRAMES",
+        "VENPOD_SPARSE_SURFACE_COPY_FACE_BUDGET",
+        "VENPOD_SPARSE_SURFACE_COPY_REGION_BUDGET",
         "VENPOD_SPARSE_STATS_SINGLE_FLUSH",
         "VENPOD_SPARSE_EXACT_ASYNC_GENERATION",
         "VENPOD_SPARSE_EXACT_ASYNC_VISIBLE",
@@ -672,6 +674,10 @@ try {
         # Surface GPU upload (snapshot/stage/emit) every frame is a big main-thread post-fence
         # cost. Upload every Nth frame instead (best-available shows 1-frame-older surface).
         # Verified: interval 2 -> fps 46->54, steady (max 27ms). quality uploads every frame.
+        # Upload every 3rd frame: amortizes the per-upload FIXED cost (snapshot build/begin).
+        # (Tested interval 1 + bounded copy to spread it -> WORSE ~47fps: the fixed per-call
+        # cost x every-frame exceeds the spike x 1/3. The spike needs incremental-snapshot
+        # rework to remove, not spreading.)
         $surfUploadInterval = if ($quality) { "1" } elseif ($PerfMode -eq "60fps") { "3" } else { "2" }
         $env:VENPOD_SPARSE_SURFACE_UPLOAD_MIN_INTERVAL_FRAMES = $surfUploadInterval
         # Skip the per-frame stats FlushStats (~2.25ms pure telemetry overhead). Single-flush
