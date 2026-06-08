@@ -4,6 +4,33 @@ Generated: 2026-06-05
 
 This is the compact survival file for the active VENPOD campaign. If chat compacts, first read `instruct.md` for the long-run operating contract, then resume from this file before reading the larger `handoff.md`, `debug-handoff.md`, `root.md`, or `debug.md`.
 
+## ASYNC PRODUCER REWRITE landed — 7→30 fps (2026-06-07, READ FIRST)
+
+Real play now ~30 fps, dips to ~20 on turns (was 7-10). What got us here, in order:
+1. GPU fix (the original ceiling): render scale 0.5 + background-pass split (low-res far)
+   -> gpu ray 67->~6-9ms. (rebrun perf modes.)
+2. ASYNC PRODUCER REWRITE (the real architecture work, this session):
+   - Async SURFACE meshing worker pool (SparseVoxelWorld: queue+workers+results+apply,
+     modeled on async exact gen). surfExtract 20->2.5ms off main thread. Env
+     VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION (rebrun: 4 workers).
+   - Async EXACT generation enabled (existing infra): gen 6-10->1.5ms off main thread.
+     Env VENPOD_SPARSE_EXACT_ASYNC_GENERATION/_VISIBLE/_PREFETCH_LANE.
+   Both validated via scripted WALK (the only headless proxy that matches moving play)
+   + the user's real venpod_runtime.log. No holes (miss=0).
+
+NEXT WALL (precisely measured, user real log + CPU_DETAIL walk): clip (mid-clipmap)
+median ~10-15ms, and on TURN/recenter `clip=interest 8.3 + pump 13ms` = the turn-dip.
+The mid-voxel clipmap generation is STILL SYNCHRONOUS (separate subsystem:
+SparseClipmap.cpp, not SparseVoxelWorld). The pump hard budget (4ms) doesn't hold on
+recenter bursts (pump hits 13ms). FIX = async-ify mid-voxel clipmap generation (same
+pattern as the surface/exact producers) AND/OR throttle the recenter interest rebuild
+across frames. Secondary: surface inline-fallback (surfExtract spikes 3-9ms when the
+4 workers saturate on fast turns -> deeper queue / more workers); surface UPLOAD
+(untracked, snapshot/stage ~4-8ms). req ~6ms synchronous. gpu ~8ms.
+
+Frame budget to hit 60 (16.7ms) from ~33-48ms: clip (10-15) is the big one, then the
+untracked surface upload (~10) and req (~6). All well-identified.
+
 ## MOVING-PLAY perf state (2026-06-07, READ FIRST — supersedes older fps claims)
 
 Real interactive play via `rebrun -PerfMode 60fps` (1920x1080, user machine): **~15 fps

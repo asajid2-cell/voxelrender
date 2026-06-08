@@ -647,7 +647,7 @@ try {
         # path was contended). Best-available render shows coarser terrain until a mesh
         # lands. The synchronous surface budgets above still bound any inline fallback.
         $env:VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION = "1"
-        $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS = "3"
+        $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS = "4"
         # Async EXACT generation too: move brick generation (gen ~6-10ms while moving)
         # off the main thread. VISIBLE+PREFETCH lanes must be async or moving-play bricks
         # (visible lane) bail to synchronous. Generated bricks apply a frame later, then
