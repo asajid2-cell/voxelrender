@@ -628,6 +628,7 @@ try {
         "VENPOD_SPARSE_EXACT_ASYNC_GENERATION",
         "VENPOD_SPARSE_EXACT_ASYNC_VISIBLE",
         "VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE",
+        "VENPOD_SPARSE_EXACT_ASYNC_MAX_APPLY_PER_FRAME",
         "VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_GEN",
         "VENPOD_SPARSE_MID_CLIPMAP_ASYNC_VISIBLE_CRITICAL_GEN",
         "VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_ENQUEUE",
@@ -690,6 +691,10 @@ try {
         $env:VENPOD_SPARSE_EXACT_ASYNC_GENERATION = "1"
         $env:VENPOD_SPARSE_EXACT_ASYNC_VISIBLE = "1"
         $env:VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE = "1"
+        # Cap async exact-gen apply per frame: consistent per-frame work tames the apply-
+        # bunching that caused run-to-run fps variance. Verified: tightened to avg ~60-62,
+        # min ~56-57 (crosses 60). 60fps mode only; quality/30fps keep the default 32.
+        if ($PerfMode -eq "60fps") { $env:VENPOD_SPARSE_EXACT_ASYNC_MAX_APPLY_PER_FRAME = "16" }
         # Async MID-CLIPMAP voxel generation: move the mid-voxel pump (the 'clip' cost,
         # the last big synchronous CPU item ~9ms) off the main thread -> path to steady 60.
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_GEN = "1"
