@@ -7,7 +7,8 @@ param(
     [int]$Interval = 60,
     [int]$Count = 3,
     [int]$ExitFrame = 660,
-    [int]$Speed = 26
+    [int]$Speed = 26,
+    [int]$DebugMode = -1
 )
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
@@ -22,7 +23,7 @@ $env:VENPOD_SPARSE_WALK_TEST = "1"
 $env:VENPOD_SPARSE_WALK_TEST_SPEED = "$Speed"
 $env:VENPOD_SPARSE_WALK_TEST_FIXED_DT_MS = "16"
 try {
-    & (Join-Path $root "rebrun.ps1") -PerfMode $Mode -NoBuild -ExitAfterFrames $ExitFrame | Out-Null
+    & (Join-Path $root "rebrun.ps1") -PerfMode $Mode -NoBuild -ExitAfterFrames $ExitFrame -SparseDebugMode $DebugMode | Out-Null
 } finally {
     foreach ($v in "VENPOD_CAPTURE_DIR","VENPOD_CAPTURE_START_FRAME","VENPOD_CAPTURE_INTERVAL_FRAMES","VENPOD_CAPTURE_COUNT","VENPOD_CAPTURE_HIDE_UI","VENPOD_SPARSE_WALK_TEST","VENPOD_SPARSE_WALK_TEST_SPEED","VENPOD_SPARSE_WALK_TEST_FIXED_DT_MS") {
         Remove-Item "env:$v" -ErrorAction SilentlyContinue

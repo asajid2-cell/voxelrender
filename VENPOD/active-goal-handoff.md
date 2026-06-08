@@ -4,7 +4,32 @@ Generated: 2026-06-05
 
 This is the compact survival file for the active VENPOD campaign. If chat compacts, first read `instruct.md` for the long-run operating contract, then resume from this file before reading the larger `handoff.md`, `debug-handoff.md`, `root.md`, or `debug.md`.
 
-## CORRECTION — coherent world is ~24fps, "60fps" was a gutted/broken world (2026-06-08, READ FIRST)
+## CORRECTNESS BUG: distant terrain renders MUTED/low (pop-in) — diagnosis (2026-06-08, READ FIRST)
+
+SYMPTOM (user, verified): standing still at full coverage (h/v 1.00/1.00), distant terrain
+renders low/flat; walking forward, the real mountains "pop up" only when close. Real LOD bug.
+
+VERIFIED ground truth + ruled-out causes (each an experiment):
+- Terrain GENUINELY has tall mountains at distance: flat spawn basin (0-800u, ~sea level),
+  then heights 400-477 at 1400-6400u. [tmp/heightdump.cpp calls the real HeightAt; compile via
+  VsDevCmd + cl /I src tmp\heightdump.cpp src\Simulation\SparseTerrainGenerator.cpp]
+- NOT the height function: all 3 copies have the mountain terms (backdrop/route/silhouette):
+  SparseTerrainGenerator::HeightAt (near), FarVoxelOctree::TerrainHeight (FarVoxelOctree.cpp
+  ~1239), FarTerrainHeight (shader PS_Raymarch.hlsl ~714).
+- NOT mid clipmap cell size: MID_CELL 12->6 + MID_RINGS 5 -> distant still muted.
+- NOT mid coverage reach: MID_VOXEL_RADIUS_XZ 6->16 -> distant still muted.
+- Mid vertical interest correctly anchors per-column to TRUE terrain height (SparseClipmap.cpp
+  ~4258 terrainHeightForBrick -> real HeightAt).
+=> Muting is in the FAR LOD render path (far SVO octree + far heightfield raymarch,
+   PS_Raymarch.hlsl), NOT the mid clipmap.
+
+REMAINING SUSPECTS (need a rebuild to test): (a) far SVO octree occupancy too coarse to mark
+tall peak cells (FarVoxelOctree maxDepth=6); (b) far surface binary-search refine budget too
+low to resolve peaks (PS_Raymarch.hlsl FarSvoInteriorLeafSurfaceRecovery ~2564,
+ScaleFarFieldRefineBudget 3-6 iters); (c) far heightfield cell size + QuantizeTerrainTopHeight
+(~896-924). Fix is in the far representation + a rebuild + capture verify. NOT a perf knob.
+
+## CORRECTION — coherent world is ~24fps, "60fps" was a gutted/broken world (2026-06-08)
 
 The "steady 60" below was WRONG: it hit 60 by starving generation (radius 4 + mid apply 24),
 which collapsed vertical coverage to ~0.37 -> a fragmented/holey archipelago world (user-
