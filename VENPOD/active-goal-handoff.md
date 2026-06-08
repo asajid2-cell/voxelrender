@@ -4,7 +4,39 @@ Generated: 2026-06-05
 
 This is the compact survival file for the active VENPOD campaign. If chat compacts, first read `instruct.md` for the long-run operating contract, then resume from this file before reading the larger `handoff.md`, `debug-handoff.md`, `root.md`, or `debug.md`.
 
-## PROVEN: PS_Raymarch is at the GPU complexity LIMIT — must shrink before LOD fix (2026-06-08, READ FIRST — latest)
+## DISTANT-MUTING: full findings + dead-ends + viable paths (2026-06-08, READ FIRST — latest)
+
+CONFIRMED REAL BUG: walk-test camera sits at (192,256) = origin flat basin (terrain h~36,
+eye y~43). Height data: mountains h~450 at 1400-4200u in +Z/+XZ dirs -> should rise ~11deg on
+horizon, but render ~3-5deg (muted). 360-deg standing sweep: low in ALL dirs. So it's a real
+distant-render bug, camera correctly placed to see it. Renderer = mid-voxel DDA
+(RaymarchMidVoxelClipmap, enabled normal views via walkingMidVoxelDda default-on).
+
+DEAD ENDS (each a ~4-7min compile, all reverted):
+- Far heightfield height fix (raw-xz vs cell-center): no visible change -> heightfield isn't
+  the active distant renderer (SVO/DDA is).
+- Bigger march budget (runtime up to 320, OR constant 192): BOTH fail PSO creation
+  (0x-7FF8FFF2) even at 6.62MB < working 7.09MB. => it's NOT bytecode size; it's a hard GPU
+  per-shader/loop INSTRUCTION limit -- the unrolled march loop at ~192 exceeds what 128 stays
+  under. Cannot reach farther by adding march STEPS.
+- Raising MID_START (env, no recompile): no change. (Also wrong for up-rays: starting the
+  march at 2800 puts up-angled rays ABOVE the peaks.)
+- Debug-strip (frame.debugMode -> 0u, 97 sites): WORKS, drops bytecode to 6.62MB + compile to
+  ~255s. Good enabler, but didn't fix the pipeline-fail from the budget (limit is loop instrs).
+
+OPEN CONTRADICTION: budget 128 already REACHES ~2500u (past the 2000u peak) yet the peak
+renders low -> suggests the distant high-Y peak bricks aren't being HIT (coverage/sampling/
+up-ray geometry), NOT pure march reach. Unresolved.
+
+VIABLE NEXT PATHS (pipeline-safe = don't grow the loop): (1) bigger/air-skip march STEP SIZE
+(reach farther w/o more steps; lines ~1846/1860/1878 t+=max(cellSize,4)); (2) investigate why
+distant high-Y bricks aren't hit (debug modes are RUNTIME, no recompile: capvis.ps1 -DebugMode
+59/65/67); (3) the real unblock: SPLIT PS_Raymarch by render path so the mid-DDA gets its own
+shader with room for a bigger budget + fast iteration. Debug-strip first (frees room + ~255s
+compile). Tools: tmp/heightdump.cpp, capvis.ps1 -DebugMode/-Speed 0 + WALK_TEST_YAW_DEG_PER_SEC
+for a standing 360 sweep.
+
+## PROVEN: PS_Raymarch is at the GPU complexity LIMIT (2026-06-08, superseded by full findings above)
 
 NEW conclusive finding + corrected LOD diagnosis:
 - The distant-muting is the MID-CLIPMAP 3D voxel DDA (RaymarchMidVoxelClipmap, PS_Raymarch
