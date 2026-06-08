@@ -16,6 +16,32 @@ Tool goal currently active:
 Drive VENPOD toward stable 60 FPS by identifying and patching structural engine bottlenecks at their source: preserve public-frame correctness and visual coverage, measure the dominant cost stage before each change, implement core dataflow/architecture fixes rather than tuning knobs, and reject changes that merely shift debt or trade FPS for instability.
 ```
 
+## CRITICAL RE-DIAGNOSIS: real-play fps is GPU-RAYMARCH-bound (2026-06-07, READ FIRST)
+
+Real interactive play (rebrun, 1080p, ground-level view) runs ~10 FPS. Root cause is
+NOT CPU streaming (the whole V2/pump/bench effort) -- it is the GPU voxel raymarch
+shader. Per-frame PERF line at the spawn/ground view:
+`gpu=frame/upload/pre/surface/ray/...: 68/0.1/0/0.7/66.8/...` -> ray = 66.8 ms; CPU
+prep (req+gen+clip) only ~20 ms; `wait=39.75` (CPU blocked on GPU). The engine
+already adaptively downscales (`rayScale=0.81`) because it is GPU-bound.
+
+The bench's "60 FPS" was real but NON-REPRESENTATIVE: those camera views had cheap
+rays (~9 ms). Ground-level horizon views (long rays through dense near terrain) are
+the raymarch worst case (~67 ms). So the V2/pump/surface CPU work (this session) was
+necessary for stability (killed 36s freezes, holes, stalls) but CANNOT raise a
+GPU-bound framerate.
+
+The real FPS lever is GPU raymarch cost. `VENPOD_RAYMARCH_RENDER_SCALE` (default 1.0)
+is dominant: 0.5 -> ray 67->33 ms, fps 10->~21-30 (960x540 upscaled, softer). Wired
+into rebrun perf modes (60fps->0.5, 30fps->0.8) + `-RenderScale` override. Solid 60
+at 1080p needs ~0.35 (soft) OR real raymarch shader optimization (empty-space
+skipping / DDA efficiency / shorter far distance) -- that is the "sharp AND fast" fix
+and the true next target. Secondary: exact-brick generation (genMs) spikes ~18-27 ms
+while the world streams in (not bounded by the mid-pump budget) -- bound it too.
+
+Other knobs: `VENPOD_RAYMARCH_MAX_DISTANCE_SCALE`, `VENPOD_RAYMARCH_MAX_STEPS_SCALE`
+(main_launcher.cpp ~4074-4078). Shader: assets/shaders/Graphics/PS_Raymarch.hlsl.
+
 ## OVERHAUL V2 — ~60 FPS REACHED in worst region (2026-06-07, READ FIRST)
 
 Three V2 dials together hit ~60 FPS, STABLE, in the dense/worst walk region
