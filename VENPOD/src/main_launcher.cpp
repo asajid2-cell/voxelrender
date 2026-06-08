@@ -19878,6 +19878,37 @@ int RunSandbox(int argc, char* argv[]) {
         const auto& physicsStats = physicsDispatcher->GetStats();
 
         if (!hideUiForCapture) {
+            // Dedicated FPS counter, top-right, away from the metrics blob.
+            {
+                const ImGuiIO& fpsIo = ImGui::GetIO();
+                const float fpsPanelW = 150.0f;
+                ImGui::SetNextWindowPos(
+                    ImVec2(fpsIo.DisplaySize.x - fpsPanelW - 12.0f, 12.0f),
+                    ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(fpsPanelW, 0.0f), ImGuiCond_Always);
+                ImGui::SetNextWindowBgAlpha(0.40f);
+                const ImGuiWindowFlags fpsFlags =
+                    ImGuiWindowFlags_NoSavedSettings |
+                    ImGuiWindowFlags_NoDecoration |
+                    ImGuiWindowFlags_NoMove |
+                    ImGuiWindowFlags_NoInputs |
+                    ImGuiWindowFlags_NoFocusOnAppearing |
+                    ImGuiWindowFlags_NoNav;
+                if (ImGui::Begin("##fps_counter", nullptr, fpsFlags)) {
+                    const ImVec4 fpsColor = smoothedFps >= 55.0f
+                        ? ImVec4(0.40f, 1.00f, 0.45f, 1.0f)
+                        : (smoothedFps >= 28.0f
+                            ? ImVec4(1.00f, 0.85f, 0.30f, 1.0f)
+                            : ImVec4(1.00f, 0.40f, 0.40f, 1.0f));
+                    ImGui::SetWindowFontScale(1.9f);
+                    ImGui::TextColored(fpsColor, "%.0f FPS", smoothedFps);
+                    ImGui::SetWindowFontScale(1.0f);
+                    ImGui::Text("%.1f ms avg", smoothedFrameMs);
+                    // Instantaneous readout makes hitches visible at a glance.
+                    ImGui::Text("now %.0f / %.1f ms", instantFps, lastRawFrameMs);
+                }
+                ImGui::End();
+            }
             ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f), ImGuiCond_FirstUseEver);
             const ImGuiIO& metricsIo = ImGui::GetIO();
             const float metricsMaxWidth = std::min(
