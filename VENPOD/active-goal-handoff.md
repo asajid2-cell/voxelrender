@@ -4,7 +4,26 @@ Generated: 2026-06-05
 
 This is the compact survival file for the active VENPOD campaign. If chat compacts, first read `instruct.md` for the long-run operating contract, then resume from this file before reading the larger `handoff.md`, `debug-handoff.md`, `root.md`, or `debug.md`.
 
-## PERF: 7 -> ~46 fps steady + INSTRUMENTED clip breakdown (2026-06-08, READ FIRST)
+## PERF: 7 -> ~52 fps steady + VISUAL OVERHAUL (2026-06-08, READ FIRST — latest)
+
+Final: steady ~52 fps (50-56, no-capture walk, vsync off), good visuals (capture-verified),
+no hitches. 7.4x from the original broken 7-10fps. THE breakthrough beyond ~44: the
+per-frame surface GPU upload (snapshot/stage/emit, ~8ms post-fence) was uploading EVERY
+frame. VENPOD_SPARSE_SURFACE_UPLOAD_MIN_INTERVAL_FRAMES=3 (upload every 3rd frame,
+best-available shows <=2-frame-older surface, imperceptible) -> fps 44->52, verified
+steady across runs. Also: mid pump hard budget 2ms (clip generation bounded; async
+noncritical fills the rest).
+
+LAST ~3ms TO 60: the surface upload is a SPIKE (~8ms on every 3rd frame -> that frame dips
+to ~37fps while others hit ~62). To make it steady-60 needs an INCREMENTAL/deferred upload
+(spread the snapshot build+stage across frames via copy queue / persistent staging) so
+there's no periodic spike -- the deferred-upload renderer pipeline. CPU-bound (wait=0, GPU
+ray ~11ms hidden); GPU is NOT the limiter so render scale won't help further.
+
+Note: walk fps has async-timing variance (worker apply timing non-deterministic), band
+~50-56 at interval 3.
+
+## PERF: 7 -> ~46 fps steady + INSTRUMENTED clip breakdown (2026-06-08, superseded above)
 
 Final state: steady ~45-46 fps (no-capture walk, vsync off), good visuals (capture-verified),
 no hitches. Instrumented the clip pump (the goal's "read logs"): clip = synchronous
