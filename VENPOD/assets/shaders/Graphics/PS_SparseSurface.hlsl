@@ -276,13 +276,23 @@ float4 main(PSInput input) : SV_Target {
             sin(input.worldPos.x * -0.031f + input.worldPos.z * 0.096f - t * 0.73f) * 0.5f;
         const float2 waterCell = abs(frac(input.worldPos.xz / 12.0f) - 0.5f);
         const float edgeGrid = (1.0f - smoothstep(0.465f, 0.497f, max(waterCell.x, waterCell.y))) * 0.045f;
-        float3 waterColor = lerp(float3(0.12f, 0.34f, 0.44f), float3(0.20f, 0.50f, 0.58f), 0.45f + ripple * 0.12f);
+        // Reflective water: deep base color + fresnel sky reflection + sun glint, so it
+        // reads as water (bright reflective horizon, darker looking straight down).
+        const float3 viewDir = normalize(frame.cameraPosition.xyz - input.worldPos);
+        const float ndotv = saturate(viewDir.y);                 // water normal ~ up
+        const float fresnel = 0.03f + 0.97f * pow(1.0f - ndotv, 5.0f);
+        const float3 reflDir = reflect(-viewDir, float3(0.0f, 1.0f, 0.0f));
+        const float3 skyRefl = lerp(float3(0.74f, 0.85f, 0.96f), float3(0.32f, 0.52f, 0.84f), saturate(reflDir.y));
+        const float3 sunDir = normalize(float3(0.45f, 0.82f, 0.34f));
+        const float glint = pow(saturate(dot(reflDir, sunDir)), 200.0f);
+        float3 deep = lerp(float3(0.07f, 0.22f, 0.30f), float3(0.05f, 0.15f, 0.23f),
+            saturate((input.distance - 30.0f) / 420.0f));
+        deep *= 1.0f + ripple * 0.06f;
+        float3 waterColor = lerp(deep, skyRefl, saturate(fresnel * 0.90f));
+        waterColor += float3(1.0f, 0.96f, 0.82f) * glint * 1.6f;
         waterColor = lerp(waterColor, float3(0.58f, 0.72f, 0.80f), edgeGrid);
-        const float viewFacing = saturate(dot(normalize(frame.cameraPosition.xyz - input.worldPos), n));
-        const float sheen = pow(1.0f - viewFacing, 3.0f);
-        waterColor += float3(0.08f, 0.12f, 0.13f) * sheen;
         const float fog = saturate((input.distance - 900.0f) / 3500.0f);
-        return float4(lerp(waterColor, float3(0.62f, 0.70f, 0.78f), fog * 0.22f), 1.0f);
+        return float4(lerp(waterColor, skyRefl, fog * 0.22f), 1.0f);
     }
     if (underwaterView &&
         (input.material == MAT_SAND || input.material == MAT_DIRT || input.material == MAT_STONE)) {

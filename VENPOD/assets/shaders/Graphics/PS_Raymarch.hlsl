@@ -3357,6 +3357,29 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     return false;
 }
 
+// Reflective water surface: fresnel-weighted sky reflection + sun glint + depth-darkened
+// base, with a gentle animated ripple normal. Replaces the old flat teal plane.
+float3 ShadeWaterSurface(float3 rayDir, float3 hitPos, float waterT) {
+    const float t = (float)(frame.frameIndex & 8191u) * 0.02f;
+    const float2 rip = float2(
+        sin(hitPos.x * 0.080f + hitPos.z * 0.050f + t),
+        sin(hitPos.z * 0.070f - hitPos.x * 0.060f + t * 0.8f));
+    const float3 n = normalize(float3(rip.x * 0.05f, 1.0f, rip.y * 0.05f));
+    const float ndotv = saturate(dot(n, -rayDir));
+    const float fresnel = 0.03f + 0.97f * pow(1.0f - ndotv, 5.0f);
+    float3 refl = reflect(rayDir, n);
+    refl.y = abs(refl.y);
+    const float3 skyRefl = SkyColor(refl);
+    const float glint = pow(saturate(dot(refl, SkySunDirection())), 200.0f);
+    const float depth = saturate((waterT - 40.0f) / 600.0f);
+    const float3 deep = lerp(float3(0.10f, 0.27f, 0.35f), float3(0.05f, 0.16f, 0.24f), depth);
+    float3 color = lerp(deep, skyRefl, saturate(fresnel * 0.88f));
+    color += float3(1.0f, 0.96f, 0.82f) * glint * 1.7f;
+    const float fog = saturate((waterT - 650.0f) / 3800.0f);
+    color = lerp(color, SkyColor(rayDir), fog * 0.38f);
+    return color;
+}
+
 bool RaymarchFarWater(float3 rayOrigin, float3 rayDir, float startDist, out RayHit waterHit) {
     waterHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
 
@@ -3384,11 +3407,7 @@ bool RaymarchFarWater(float3 rayOrigin, float3 rayDir, float startDist, out RayH
         return false;
     }
 
-    const float shimmer = 0.5f + 0.5f * sin(hitPos.x * 0.035f + hitPos.z * 0.041f);
-    float3 waterColor = lerp(float3(0.19f, 0.34f, 0.42f), float3(0.34f, 0.50f, 0.56f), shimmer * 0.16f);
-    const float fog = saturate((waterT - 650.0f) / 3800.0f);
-    waterColor = lerp(waterColor, SkyColor(rayDir), fog * 0.38f);
-    waterHit = MakeHit(float4(waterColor, 1.0f), waterT);
+    waterHit = MakeHit(float4(ShadeWaterSurface(rayDir, hitPos, waterT), 1.0f), waterT);
     return true;
 }
 
@@ -3611,11 +3630,7 @@ bool TryResolveWaterOccluderForBackgroundHit(
         }
 
         const float3 hitPos = rayOrigin + rayDir * waterT;
-        const float shimmer = 0.5f + 0.5f * sin(hitPos.x * 0.035f + hitPos.z * 0.041f);
-        float3 waterColor = lerp(float3(0.19f, 0.34f, 0.42f), float3(0.34f, 0.50f, 0.56f), shimmer * 0.16f);
-        const float fog = saturate((waterT - 650.0f) / 3800.0f);
-        waterColor = lerp(waterColor, SkyColor(rayDir), fog * 0.38f);
-        waterHit = MakeHit(float4(waterColor, 1.0f), waterT);
+        waterHit = MakeHit(float4(ShadeWaterSurface(rayDir, hitPos, waterT), 1.0f), waterT);
         hasWater = true;
     }
 
@@ -3688,11 +3703,7 @@ bool TryResolveDeterministicWaterBeforeBackground(
         return false;
     }
 
-    const float shimmer = 0.5f + 0.5f * sin(hitPos.x * 0.035f + hitPos.z * 0.041f);
-    float3 waterColor = lerp(float3(0.19f, 0.34f, 0.42f), float3(0.34f, 0.50f, 0.56f), shimmer * 0.16f);
-    const float fog = saturate((waterT - 650.0f) / 3800.0f);
-    waterColor = lerp(waterColor, SkyColor(rayDir), fog * 0.38f);
-    waterHit = MakeHit(float4(waterColor, 1.0f), waterT);
+    waterHit = MakeHit(float4(ShadeWaterSurface(rayDir, hitPos, waterT), 1.0f), waterT);
     return true;
 }
 
