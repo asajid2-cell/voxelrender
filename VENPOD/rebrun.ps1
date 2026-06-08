@@ -670,7 +670,7 @@ try {
         # Surface GPU upload (snapshot/stage/emit) every frame is a big main-thread post-fence
         # cost. Upload every Nth frame instead (best-available shows 1-frame-older surface).
         # Verified: interval 2 -> fps 46->54, steady (max 27ms). quality uploads every frame.
-        $surfUploadInterval = if ($quality) { "1" } elseif ($PerfMode -eq "60fps") { "2" } else { "1" }
+        $surfUploadInterval = if ($quality) { "1" } elseif ($PerfMode -eq "60fps") { "3" } else { "2" }
         $env:VENPOD_SPARSE_SURFACE_UPLOAD_MIN_INTERVAL_FRAMES = $surfUploadInterval
         # Async EXACT generation too: move brick generation (gen ~6-10ms while moving)
         # off the main thread. VISIBLE+PREFETCH lanes must be async or moving-play bricks
