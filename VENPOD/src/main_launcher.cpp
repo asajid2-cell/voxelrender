@@ -878,7 +878,13 @@ int RunSandbox(int argc, char* argv[]) {
                 : GetExecutableDirectorySandbox() / "venpod_runtime.log";
         auto fileLogger = spdlog::basic_logger_mt("venpod_file", logPath.string(), true);
         spdlog::set_default_logger(fileLogger);
-        spdlog::flush_on(spdlog::level::info);
+        // Was flush_on(info): every info line flushed to disk SYNCHRONOUSLY. With
+        // per-frame PERF logging that is a ~1KB synchronous disk flush every frame,
+        // showing up as large uninstrumented gapPrev stalls (measurement artifact +
+        // real overhead). Only flush warnings/errors immediately; info lines are
+        // buffered (no per-line disk sync, no periodic big-flush stall) and flushed
+        // on clean exit (which the bench relies on).
+        spdlog::flush_on(spdlog::level::warn);
         spdlog::info("  Log path: {}", logPath.string());
     }
 
@@ -22587,6 +22593,11 @@ int RunSandbox(int argc, char* argv[]) {
     }
 
     spdlog::info("Shutting down...");
+    // Info is buffered (not flushed per-line); flush now so post-run log parsing
+    // (perf bench) sees the complete log.
+    if (auto defaultLogger = spdlog::default_logger()) {
+        defaultLogger->flush();
+    }
 
     // CRITICAL: Wait for all GPU work to complete before cleanup
     // This prevents OBJECT_DELETED_WHILE_STILL_IN_USE errors
