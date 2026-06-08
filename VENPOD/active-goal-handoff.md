@@ -4,9 +4,19 @@ Generated: 2026-06-05
 
 This is the compact survival file for the active VENPOD campaign. If chat compacts, first read `instruct.md` for the long-run operating contract, then resume from this file before reading the larger `handoff.md`, `debug-handoff.md`, `root.md`, or `debug.md`.
 
-## PERF: 7 -> ~55 fps steady + VISUAL OVERHAUL (2026-06-08, READ FIRST — latest)
+## PERF: 7 -> ~57 fps steady (touches 60) + VISUAL OVERHAUL (2026-06-08, READ FIRST)
 
-Final: steady ~55 fps (52-59 band, no-capture walk speed 26, vsync off), good visuals
+Latest: steady ~57 fps (55-60 band, no-capture walk speed 26 = sprint stress, vsync off),
+good visuals. Final tuning gain: mid voxel radius 6->4 (60fps mode) shrank the periodic
+interest-rebuild spike (10-12ms, scales with interest volume) -> ~55->57fps; capture-verified
+far LOD fills seamlessly beyond the smaller mid radius. Radius 3 = no further gain (rebuild
+no longer the cap); surfApply 16 = avg 59 but dips to 41 (worse steadiness) -> kept 32.
+The remaining cap is the periodic SURFACE-UPLOAD STAGING spike (surfStage data + surfEmit
+fixed per-call); spreading it (interval 1) is worse due to the fixed per-emit cost -> needs
+incremental snapshot STAGING (the deep rework, sole remaining blocker to locked 60). At
+realistic (non-sprint) gameplay speeds the lower frontier churn likely sits at 60.
+
+(older) Final: steady ~55 fps (52-59 band, no-capture walk speed 26, vsync off), good visuals
 (capture-verified), no hitches. 7.9x from broken 7-10fps. Tuned config (rebrun 60fps mode):
 V2 + async surface(+Around routing)/exact/mid producers + interest signature reuse +
 mid-pump hard budget 2ms + surface apply 32 + surface UPLOAD every 3 frames +
