@@ -1065,9 +1065,19 @@ uint32_t SparseClipmapTileCache::QueueAsyncVoxelGenerationMatchingPriority(
         }
         return queuedAsync;
     }
+    // Bound the scan: while moving, the queue holds a large persistent missing-voxel
+    // backlog (single async worker can't clear it instantly). Scanning the whole queue
+    // every frame to find enqueue candidates was the dominant 'clip' pump cost. Cap the
+    // scan; the queue persists so unscanned coords are picked up on following frames
+    // (best-available render shows them coarse until then). No correctness change.
+    uint32_t scanned = 0u;
+    const uint32_t scanCap = std::max<uint32_t>(asyncEnqueueLimit * 6u, 384u);
     for (auto it = m_voxelGenerationQueue.begin();
-         it != m_voxelGenerationQueue.end() && queuedAsync < asyncEnqueueLimit;
+         it != m_voxelGenerationQueue.end() &&
+             queuedAsync < asyncEnqueueLimit &&
+             scanned < scanCap;
          ++it) {
+        ++scanned;
         const SparseVoxelClipmapCoord coord = *it;
         const bool visiblePriority =
             m_visiblePriorityVoxelSet.find(coord) != m_visiblePriorityVoxelSet.end() ||
