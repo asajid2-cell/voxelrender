@@ -68,7 +68,13 @@ param(
     [int]$SparseGpuRaycastMaxFallbackPct = 95,
     [int]$SparseGpuRaycastMinAccepted = 1,
     [switch]$SparseGpuRaycastStrict,
-    [int]$ExitAfterFrames = 0
+    [int]$ExitAfterFrames = 0,
+    # Generation Overhaul V2 performance modes (see generation-overhaul-v2.md):
+    #   60fps -> ~60 FPS, stable, no holes; terrain COARSER (bounded generation)
+    #   30fps -> ~30 FPS, stable, no holes; terrain DETAILED (high coverage)
+    # Both use best-available-LOD render (no freezes/holes). "none" = legacy path.
+    [ValidateSet("none", "60fps", "30fps", "detail")]
+    [string]$PerfMode = "none"
 )
 
 $ErrorActionPreference = "Stop"
@@ -198,6 +204,9 @@ $savedEnv = @{
     VENPOD_SPARSE_GPU_RAYCAST_MAX_FALLBACK_PCT = $env:VENPOD_SPARSE_GPU_RAYCAST_MAX_FALLBACK_PCT
     VENPOD_SPARSE_GPU_RAYCAST_MIN_ACCEPTED = $env:VENPOD_SPARSE_GPU_RAYCAST_MIN_ACCEPTED
     VENPOD_EXIT_AFTER_FRAMES = $env:VENPOD_EXIT_AFTER_FRAMES
+    VENPOD_STREAMING_V2 = $env:VENPOD_STREAMING_V2
+    VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS = $env:VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS
+    VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH = $env:VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH
 }
 
 function Restore-Env {
@@ -565,6 +574,43 @@ try {
     }
     if ($BoundaryTest) { $env:VENPOD_ENABLE_TEST_MODES = "1" }
     if ($ExitAfterFrames -gt 0) { $env:VENPOD_EXIT_AFTER_FRAMES = "$ExitAfterFrames" }
+
+    # Generation Overhaul V2 performance modes. Applied AFTER the sparse env setup so
+    # they override the startup render gate (the bounded pump cannot reach the default
+    # 95% mid-voxel coverage gate, so open at the achievable coverage with fail-open).
+    Remove-Item env:VENPOD_STREAMING_V2 -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS -ErrorAction SilentlyContinue
+    if ($PerfMode -ne "none") {
+        $pumpBudget = if ($PerfMode -eq "60fps") { "4" } else { "12" }  # 30fps/detail -> 12
+        $surfBudget = if ($PerfMode -eq "60fps") { "4" } else { "10" }  # 30fps/detail -> 10
+        $env:VENPOD_STREAMING_V2 = "1"
+        $env:VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS = $pumpBudget
+        $env:VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH = "0"
+        # Bound surface extraction (meshing) too -- the post-open pre-publish budget
+        # defaults to 40ms. Under V2 best-available, unmeshed bricks just render coarser.
+        $env:VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET = "1"
+        $env:VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS = $surfBudget
+        $env:VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $surfBudget
+        $env:VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $surfBudget
+        if ($useSparse) {
+            # V2 renders best-available LOD, so holding the public render for high
+            # coverage proofs is counterproductive (the bounded pump fills coverage
+            # slowly). Open the world promptly at best-available and let it refine:
+            # drop the mid-voxel/surface coverage proofs, keep far-SVO background +
+            # shader safety, and fail-open quickly.
+            $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MID_VOXEL_PROOF = "0"
+            $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_SURFACE_PROOF = "0"
+            $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MIN_READY_BRICKS = "128"
+            $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MAX_FRAME = "120"
+            $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_FAIL_OPEN_AT_MAX_FRAME = "1"
+        }
+        Write-Info "Perf mode: $PerfMode (V2 best-available render, mid-pump budget ${pumpBudget}ms, surface-prefetch off)"
+    }
 
     Write-Host "VENPOD - Rebuild + Run" -ForegroundColor Magenta
     Write-Info "Config: $Config"
