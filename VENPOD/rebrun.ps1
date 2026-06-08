@@ -620,13 +620,16 @@ try {
         "VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS",
         "VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION",
         "VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS",
+        "VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME",
         "VENPOD_SPARSE_EXACT_ASYNC_GENERATION",
         "VENPOD_SPARSE_EXACT_ASYNC_VISIBLE",
         "VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE",
         "VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_GEN",
         "VENPOD_SPARSE_MID_CLIPMAP_ASYNC_VISIBLE_CRITICAL_GEN",
         "VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_ENQUEUE",
-        "VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_APPLY")) {
+        "VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_APPLY",
+        "VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ",
+        "VENPOD_SPARSE_MID_INTEREST_INTERVAL")) {
         Remove-Item "env:$pvName" -ErrorAction SilentlyContinue
     }
     if ($PerfMode -ne "none") {
@@ -656,6 +659,11 @@ try {
         # lands. The synchronous surface budgets above still bound any inline fallback.
         $env:VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION = "1"
         $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS = "4"
+        # Surface mesh APPLY (UpdateBrickWithExtractedFaces, default 256/frame) dominates
+        # the post-fence cost (untracked ~12-23ms). Throttle it: workers still produce,
+        # results apply over more frames (best-available shows coarse briefly). quality=high.
+        $surfApply = if ($quality) { "256" } elseif ($PerfMode -eq "60fps") { "96" } else { "160" }
+        $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME = $surfApply
         # Async EXACT generation too: move brick generation (gen ~6-10ms while moving)
         # off the main thread. VISIBLE+PREFETCH lanes must be async or moving-play bricks
         # (visible lane) bail to synchronous. Generated bricks apply a frame later, then
@@ -669,6 +677,16 @@ try {
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_VISIBLE_CRITICAL_GEN = "1"
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_ENQUEUE = "64"
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_APPLY = "48"
+        # Mid-voxel interest radius is the dominant per-frame CPU driver (clip/req/upload
+        # scale ~quadratically with it; default 8 -> ~9200 bricks). Shrink it for fps; the
+        # far LOD + background pass fill beyond the mid-detail radius. quality keeps 8.
+        $midVoxRadius = if ($quality) { "8" } elseif ($PerfMode -eq "60fps") { "6" } else { "7" }
+        $env:VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ = $midVoxRadius
+        # Mid interest set is rebuilt EVERY frame (interestInterval=1) -- a big chunk of
+        # 'clip'. Amortize it across frames (camera moves smoothly, the set barely changes
+        # frame-to-frame). quality keeps 1 for max responsiveness.
+        $midInterestInterval = if ($quality) { "1" } elseif ($PerfMode -eq "60fps") { "2" } else { "2" }
+        $env:VENPOD_SPARSE_MID_INTEREST_INTERVAL = $midInterestInterval
         # Low-res far/background raymarch (the GPU win); near terrain stays full-res.
         # quality mode disables it for a sharp full-res horizon.
         if ($useBgPass) {
