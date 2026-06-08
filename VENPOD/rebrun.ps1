@@ -664,7 +664,7 @@ try {
         # Surface mesh APPLY (UpdateBrickWithExtractedFaces, default 256/frame) dominates
         # the post-fence cost (untracked ~12-23ms). Throttle it: workers still produce,
         # results apply over more frames (best-available shows coarse briefly). quality=high.
-        $surfApply = if ($quality) { "256" } elseif ($PerfMode -eq "60fps") { "96" } else { "160" }
+        $surfApply = if ($quality) { "256" } elseif ($PerfMode -eq "60fps") { "32" } else { "96" }
         $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME = $surfApply
         # Async EXACT generation too: move brick generation (gen ~6-10ms while moving)
         # off the main thread. VISIBLE+PREFETCH lanes must be async or moving-play bricks
@@ -678,7 +678,7 @@ try {
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_GEN = "1"
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_VISIBLE_CRITICAL_GEN = "1"
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_ENQUEUE = "64"
-        $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_APPLY = "48"
+        $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_APPLY = "24"
         # Mid-voxel interest radius is the dominant per-frame CPU driver (clip/req/upload
         # scale ~quadratically with it; default 8 -> ~9200 bricks). Shrink it for fps; the
         # far LOD + background pass fill beyond the mid-detail radius. quality keeps 8.
