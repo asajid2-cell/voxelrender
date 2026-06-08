@@ -4,6 +4,23 @@ Generated: 2026-06-05
 
 This is the compact survival file for the active VENPOD campaign. If chat compacts, first read `instruct.md` for the long-run operating contract, then resume from this file before reading the larger `handoff.md`, `debug-handoff.md`, `root.md`, or `debug.md`.
 
+## ARCHITECTURAL FPS CAP ~37-39 (2026-06-08, READ FIRST)
+
+Extensive tuning (self-verified, vsync off, scripted walk): fps is PINNED ~37-39 regardless
+of async exact gen, async mid-clipmap gen, mid voxel radius, interest interval, surface apply
+throttle, or vsync. Frame ~27ms = serial main-thread coordination: request planner ~5ms +
+clipmap interest/apply ~6ms (`clip`) + surface apply/upload ~9ms (`untracked`/postWait) + GPU
+~11ms (overlapped, wait=0). Cutting any one component does NOT raise fps -> the others fill in
+or it's coordination-bound. This is an ARCHITECTURAL cap, not tunable.
+
+PATH TO STEADY 60 (the remaining work, a dedicated rearchitecting project, NOT env tuning):
+- Deferred/threaded GPU surface upload pipeline (the `untracked` ~9ms BuildGpuSnapshot/stage/
+  emit + async-mesh apply must leave the critical path; range allocator is already on).
+- Request-planner optimization (`req` ~5ms scans the interest set every frame).
+- Clipmap interest/apply (`clip` ~6ms) cross-frame incrementalization.
+These are core-loop rearchitecting, risky to rush; do them as a focused effort with the
+capvis.ps1 self-verify loop. Tuning is exhausted at ~37-39fps steady.
+
 ## VISUAL OVERHAUL + SELF-VERIFY landed (2026-06-07, READ FIRST)
 
 Self-verification loop established: `capvis.ps1` runs the scripted walk in a mode, captures
