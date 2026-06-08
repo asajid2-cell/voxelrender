@@ -622,7 +622,11 @@ try {
         "VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS",
         "VENPOD_SPARSE_EXACT_ASYNC_GENERATION",
         "VENPOD_SPARSE_EXACT_ASYNC_VISIBLE",
-        "VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE")) {
+        "VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE",
+        "VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_GEN",
+        "VENPOD_SPARSE_MID_CLIPMAP_ASYNC_VISIBLE_CRITICAL_GEN",
+        "VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_ENQUEUE",
+        "VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_APPLY")) {
         Remove-Item "env:$pvName" -ErrorAction SilentlyContinue
     }
     if ($PerfMode -ne "none") {
@@ -659,6 +663,12 @@ try {
         $env:VENPOD_SPARSE_EXACT_ASYNC_GENERATION = "1"
         $env:VENPOD_SPARSE_EXACT_ASYNC_VISIBLE = "1"
         $env:VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE = "1"
+        # Async MID-CLIPMAP voxel generation: move the mid-voxel pump (the 'clip' cost,
+        # the last big synchronous CPU item ~9ms) off the main thread -> path to steady 60.
+        $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_GEN = "1"
+        $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_VISIBLE_CRITICAL_GEN = "1"
+        $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_ENQUEUE = "64"
+        $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_APPLY = "48"
         # Low-res far/background raymarch (the GPU win); near terrain stays full-res.
         # quality mode disables it for a sharp full-res horizon.
         if ($useBgPass) {
