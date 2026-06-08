@@ -4,7 +4,30 @@ Generated: 2026-06-05
 
 This is the compact survival file for the active VENPOD campaign. If chat compacts, first read `instruct.md` for the long-run operating contract, then resume from this file before reading the larger `handoff.md`, `debug-handoff.md`, `root.md`, or `debug.md`.
 
-## PERF: 7 -> 44 fps steady (2026-06-08, READ FIRST — supersedes the ~37-39 cap below)
+## PERF: 7 -> ~46 fps steady + INSTRUMENTED clip breakdown (2026-06-08, READ FIRST)
+
+Final state: steady ~45-46 fps (no-capture walk, vsync off), good visuals (capture-verified),
+no hitches. Instrumented the clip pump (the goal's "read logs"): clip = synchronous
+GenerateVoxelBrick generation (bounded by VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS;
+verified budget 1ms -> clip 5.3 / fps 46, budget 4 -> clip 7 / fps 43) PLUS ~5ms residual
+NON-generation clip overhead (async-mid apply/GPU-upload + enqueue scan + interest).
+
+Frame floor (~21ms) = req ~4ms (exact request planner: prep+terrain-critical+hierarchy+
+pressure-trim+miss-feedback+hidden-exact sub-phases) + clip ~5.5ms + post/untracked ~7ms
+(surface GPU snapshot/stage/emit + async apply) + present. GPU (~10ms ray) is hidden under
+this (CPU-bound, wait=0).
+
+THE LAST ~5ms TO 60 IS GPU-UPLOAD COORDINATION ON THE MAIN THREAD: the async producers
+generate/mesh off-thread, but APPLYING results = GPU upload (StageSnapshot/EmitCopy for
+surface, mid brick page upload) which MUST be on the main thread (D3D12 command list). To
+break it needs a deferred/threaded upload pipeline (copy queue / persistent staging,
+multi-frame-in-flight) -- a core renderer rework, the genuine remaining project. Also
+candidate: req sub-phases miss-feedback + hidden-exact are visual-correctness diagnostics
+rebrun enables; disabling trades exact-hole-repair for ~1-2ms (risky for visual).
+Verified knobs exhausted: async surface(+Around)/exact/mid gen, signature reuse, pump
+hard budget, scan caps, radius, interest interval, apply throttles, render scale, vsync.
+
+## PERF: 7 -> 44 fps steady (2026-06-08, superseded above)
 
 Broke through the ~37 cap. Steady ~43-44 fps (no-capture walk, vsync off), good visuals,
 no hitches. The chain of verified wins this round:
