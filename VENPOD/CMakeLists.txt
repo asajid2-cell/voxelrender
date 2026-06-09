@@ -59,6 +59,7 @@ set(VENPOD_SOURCES
     # Graphics
     src/Graphics/FarVoxelOctree.cpp
     src/Graphics/BackbufferCapture.cpp
+    src/Graphics/MidVoxelGpuGenPoc.cpp
     src/Graphics/Renderer.cpp
     src/Graphics/SparseSurfaceGpuResources.cpp
     src/Graphics/SparseVoxelGpuResources.cpp
@@ -127,6 +128,7 @@ set(VENPOD_HEADERS
     # Graphics
     src/Graphics/FarVoxelOctree.h
     src/Graphics/BackbufferCapture.h
+    src/Graphics/MidVoxelGpuGenPoc.h
     src/Graphics/Renderer.h
     src/Graphics/SparseSurfaceGpuResources.h
     src/Graphics/SparseVoxelGpuResources.h

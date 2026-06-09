@@ -11,6 +11,7 @@
 #include "Graphics/FarVoxelOctree.h"
 #include "Graphics/SparseSurfaceGpuResources.h"
 #include "Graphics/SparseVoxelGpuResources.h"
+#include "Graphics/MidVoxelGpuGenPoc.h"  // DEV-ONLY: Phase-0 GPU mid-voxel gen parity POC
 #include "Graphics/VoxelRenderBackend.h"
 #include "Simulation/VoxelWorld.h"
 #include "Simulation/TerrainConstants.h"
@@ -2665,6 +2666,25 @@ int RunSandbox(int argc, char* argv[]) {
             sparseClipmapPolicy.Config().parallelWorkerColumnCache ? 1 : 0,
             sparseMidClipmapTileBudget);
     }
+
+    // DEV-ONLY (VENPOD_GPU_MIDGEN_POC): Phase-0 proof-of-concept that a compute
+    // shader can generate a mid-voxel LOD brick byte-identically to the CPU
+    // per-cell generator. Runs ONCE at startup, fully isolated behind the env
+    // flag, then normal startup continues. Never touches the live render/sim.
+    if (ReadUIntEnv("VENPOD_GPU_MIDGEN_POC", 0u) != 0u) {
+        Graphics::MidVoxelGpuGenPoc midGenPoc;
+        auto pocInit = midGenPoc.Initialize(
+            device->GetDevice(), renderer->GetShaderCompiler(), shaderPath);
+        if (!pocInit) {
+            spdlog::error("[MIDGEN-POC] init failed: {}", pocInit.error());
+        } else {
+            midGenPoc.RunParityCheck(
+                device->GetDevice(), *commandQueue, sparseClipmapPolicy);
+        }
+        midGenPoc.Shutdown();
+        commandQueue->Flush();
+    }
+
     Simulation::SparseBrickRequestPlanner sparseRequestPlanner({
         sparseRequestRadiusXz,
         sparseRequestRadiusY,
