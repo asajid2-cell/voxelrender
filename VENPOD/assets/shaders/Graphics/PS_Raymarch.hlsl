@@ -2010,13 +2010,25 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
 #endif
                 const float nearMidContext = 1.0f - saturate((hitDistance - startDistance) / 620.0f);
                 const float3 contextLift = lerp(SkyColor(rayDir), float3(0.48f, 0.52f, 0.48f), 0.35f);
+#ifndef RAYMARCH_MID_ONLY
                 color = lerp(color, contextLift, nearMidContext * 0.08f);
+#endif
                 if (interiorFallbackHit && !recoveredInteriorSurface) {
+#ifdef RAYMARCH_MID_ONLY
+                    // Mid pass: the analytic gradient normal gives interior-fallback (coarse,
+                    // surface-unresolved) cells a real surface, so skip the grey "continuity
+                    // tint" crutch that made distant terrain read as grey vertical smears. Only
+                    // keep the water tint; land cells render with true material color + gradient.
+                    if (material == MAT_WATER) {
+                        color = lerp(float3(0.12f, 0.32f, 0.36f), color, 0.45f);
+                    }
+#else
                     const float fallbackConfidence = 1.0f - saturate((actualCellSize - 4.0f) / 28.0f);
                     const float3 continuityTint = material == MAT_WATER
                         ? float3(0.12f, 0.32f, 0.36f)
                         : lerp(float3(0.38f, 0.43f, 0.36f), SkyColor(rayDir), 0.22f);
                     color = lerp(continuityTint, color, fallbackConfidence * 0.55f);
+#endif
                 }
                 color = max(color, baseColor.rgb * 0.54f + 0.045f);
                 float fogFactor = saturate((hitDistance - startDistance) / max(endDistance - startDistance, 1.0f));
