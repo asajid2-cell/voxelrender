@@ -636,6 +636,7 @@ try {
         "VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_VISIBLE_PUMP",
         "VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_PERSISTENT_WORKERS",
         "VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_PUMP_MAX_WORKERS",
+        "VENPOD_SPARSE_MID_VOXEL_COVERAGE_CATCHUP_BUDGET",
         "VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ",
         "VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION",
         "VENPOD_RAYMARCH_MID_PASS_ENABLE",
@@ -726,6 +727,10 @@ try {
         $env:VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_VISIBLE_PUMP = "1"
         $env:VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_PERSISTENT_WORKERS = "1"
         $env:VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_PUMP_MAX_WORKERS = "10"
+        # Frontier fill rate into virgin terrain: GPU generation freed the per-brick voxel
+        # fill, so the coverage-catchup budget can be raised 48->192 -> ~4x faster streaming
+        # when moving into new terrain, at no fps cost (verified ~59fps @ speed 44, no TDR).
+        $env:VENPOD_SPARSE_MID_VOXEL_COVERAGE_CATCHUP_BUDGET = "192"
         # Mid-voxel interest radius is the dominant per-frame CPU driver (clip/req/upload
         # scale ~quadratically with it; default 8 -> ~9200 bricks). Shrink it for fps; the
         # far LOD + background pass fill beyond the mid-detail radius. quality keeps 8.
