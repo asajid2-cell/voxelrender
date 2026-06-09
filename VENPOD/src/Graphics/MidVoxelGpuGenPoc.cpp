@@ -98,8 +98,15 @@ void MidVoxelGpuGenPoc::RunParityCheck(
 
     // Real pristine brick generator: a fresh, UNEDITED cache so the edited-overlay
     // branches in GenerateVoxelBrickPayload are inert (hasEditedOverlays == false).
+    // The CPU reference MUST do the full CPU voxel fill: when GPU mid-voxel
+    // generation is enabled on the live policy, GenerateVoxelBrickPayload early-outs
+    // with an EMPTY voxel vector (the GPU-gen skip), so clear that flag for the
+    // reference cache (mirrors the VENPOD_SPARSE_MID_CLIPMAP_GPU_VERIFY path).
+    Simulation::SparseClipmapConfig cpuRefConfig = policy.Config();
+    cpuRefConfig.enableGpuMidVoxelGeneration = false;
+    Simulation::SparseClipmapPolicy cpuRefPolicy(cpuRefConfig);
     Simulation::SparseClipmapTileCache cpuCache;
-    if (!cpuCache.Initialize(policy.Config())) {
+    if (!cpuCache.Initialize(cpuRefConfig)) {
         spdlog::error("[MIDGEN-POC] failed to init reference SparseClipmapTileCache; skipping");
         return;
     }
@@ -134,7 +141,7 @@ void MidVoxelGpuGenPoc::RunParityCheck(
         std::vector<uint32_t> cpuBrickVec;
         int32_t originX = 0, originY = 0, originZ = 0, cellSize = 1;
         if (!cpuCache.GenerateVoxelBrickPayloadForTest(
-                tc.coord, policy, cpuBrickVec, originX, originY, originZ, cellSize) ||
+                tc.coord, cpuRefPolicy, cpuBrickVec, originX, originY, originZ, cellSize) ||
             cpuBrickVec.size() != kBrickVoxelCount) {
             spdlog::error("[MIDGEN-POC] '{}': real brick generation failed; skipping", tc.label);
             continue;

@@ -796,6 +796,18 @@ float FarTerrainHeight(float2 xz, out float mountainMask, out float spireMask, o
         routeRidge * 218.0f;
     height = lerp(height, max(height, routeBackdropHeight), routeCorridor * routeRidge * routeNotch * 0.68f);
 
+    // Spawn landmass: lift low/submerged near-origin terrain onto a gently
+    // rolling land floor comfortably above sea level, fading out by ~2800u.
+    // Must match SparseTerrainGenerator::HeightAt / TH_HeightAt spawn-land block.
+    float spawnLandBand =
+        1.0f - FarSmooth01(saturate((originDistance - 200.0f) / 2600.0f));
+    float spawnLandFloor =
+        (FAR_SEA_LEVEL + 40.0f) +
+        broad * 28.0f +
+        ridgeHeight * 40.0f +
+        detail * 5.0f;
+    height = lerp(height, max(height, spawnLandFloor), spawnLandBand);
+
     mountainMask = saturate((ridgeHeight * 150.0f + max(height - 160.0f, 0.0f)) / 300.0f);
     spireMask = 0.0f;
     ravineMask = 0.0f;
