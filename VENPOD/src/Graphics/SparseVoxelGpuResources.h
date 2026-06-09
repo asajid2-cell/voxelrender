@@ -394,6 +394,11 @@ public:
     const DescriptorHandle& MidVoxelClipmapMetadataSRV() const { return m_midVoxelClipmapMetadata.GetShaderVisibleSRV(); }
     const DescriptorHandle& MidVoxelClipmapLookupSRV() const { return m_midVoxelClipmapLookup.GetShaderVisibleSRV(); }
     const DescriptorHandle& MidVoxelClipmapSamplesSRV() const { return m_midVoxelClipmapSamples.GetShaderVisibleSRV(); }
+    const DescriptorHandle& MidVoxelClipmapSamplesUAV() const { return m_midVoxelClipmapSamples.GetShaderVisibleUAV(); }
+    // Phase 1 GPU mid-voxel generation: direct access to the sample pool buffer so
+    // the MidVoxelGpuGenerator can transition it UAV<->SRV and bind it as a root
+    // UAV by GPU virtual address.
+    GPUBuffer& MidVoxelClipmapSamplesBuffer() { return m_midVoxelClipmapSamples; }
     const DescriptorHandle& PhysicsWorkPacketsSRV() const { return m_physicsWorkPackets.GetShaderVisibleSRV(); }
     const DescriptorHandle& EditDeltasSRV() const { return m_editDeltas.GetShaderVisibleSRV(); }
     const DescriptorHandle& EditDeltaRangesSRV() const { return m_editDeltaRanges.GetShaderVisibleSRV(); }

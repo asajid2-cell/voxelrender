@@ -1,18 +1,17 @@
 // =============================================================================
-// VENPOD Phase-0 POC: GPU mid-voxel brick generation parity harness (dev-only).
+// VENPOD Phase-1 POC: GPU mid-voxel BATCH generation parity harness (dev-only).
 // =============================================================================
 
 #include "MidVoxelGpuGenPoc.h"
 
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <cstring>
+#include <vector>
 
 #include <spdlog/spdlog.h>
 
 #include "RHI/DX12CommandQueue.h"
-#include "../Simulation/SparseTerrainGenerator.h"
 #include "../Simulation/SparseVoxelTypes.h"
 #include "../Simulation/TerrainConstants.h"
 #include "../Utils/BitPacking.h"
@@ -23,67 +22,39 @@ namespace {
 
 constexpr uint32_t kBrickVoxelCount = 4096u;   // 16^3 == SPARSE_BRICK_VOXEL_COUNT
 
-// Constant buffer payload mirroring CS_GenerateMidVoxelBricks.hlsl `GenParams`.
-struct GenParams {
-    int32_t  originX;
-    int32_t  originY;
-    int32_t  originZ;
-    int32_t  cellSize;
-    uint32_t seed;
-    uint32_t brickCount;
-    uint32_t pad0;
-    uint32_t pad1;
-};
-
 } // namespace
 
 Result<void> MidVoxelGpuGenPoc::Initialize(
     ID3D12Device* device,
     ShaderCompiler& shaderCompiler,
-    const std::filesystem::path& shaderPath)
+    const std::filesystem::path& shaderPath,
+    uint32_t seed)
 {
     if (!device) {
         return Error("MidVoxelGpuGenPoc: null device");
     }
 
-    const std::filesystem::path csPath =
-        shaderPath / "Compute" / "CS_GenerateMidVoxelBricks.hlsl";
-
-    auto compileResult = shaderCompiler.CompileComputeShader(csPath, L"main", true);
-    if (!compileResult) {
-        return Error("MidVoxelGpuGenPoc: failed to compile CS: {}", compileResult.error());
-    }
-    auto& compiledShader = compileResult.value();
-    if (!compiledShader.IsValid()) {
-        return Error("MidVoxelGpuGenPoc: CS compilation failed: {}", compiledShader.errors);
+    auto genResult = m_generator.Initialize(device, shaderCompiler, shaderPath, seed);
+    if (!genResult) {
+        return Error("MidVoxelGpuGenPoc: generator init failed: {}", genResult.error());
     }
 
-    ComputePipelineDesc desc;
-    desc.computeShader = compiledShader;
-    desc.debugName = "CS_GenerateMidVoxelBricks";
-    // b0: 8x 32-bit constants (GenParams).
-    desc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 8 });
-    // u0: root UAV (bound by GPU virtual address; no descriptor heap needed).
-    desc.rootParams.push_back({ RootParamType::UnorderedAccess, 0, 0, 1 });
+    const uint64_t poolBytes =
+        static_cast<uint64_t>(kMaxBatchSlots) * kBrickVoxelCount * sizeof(uint32_t);
 
-    auto pipeResult = m_pipeline.Initialize(device, desc);
-    if (!pipeResult) {
-        return Error("MidVoxelGpuGenPoc: pipeline init failed: {}", pipeResult.error());
-    }
-
-    auto outResult = m_outSamples.Initialize(
+    auto outResult = m_samplePool.Initialize(
         device,
-        static_cast<uint64_t>(kBrickVoxelCount) * sizeof(uint32_t),
+        poolBytes,
         BufferUsage::StructuredBuffer | BufferUsage::UnorderedAccess,
         sizeof(uint32_t),
-        "MidVoxelGpuGenPoc_OutSamples");
+        "MidVoxelGpuGenPoc_SamplePool");
     if (!outResult) {
-        return Error("MidVoxelGpuGenPoc: out buffer init failed: {}", outResult.error());
+        return Error("MidVoxelGpuGenPoc: sample pool init failed: {}", outResult.error());
     }
 
     auto readbackResult = m_readback.Initialize(
         device,
-        static_cast<uint64_t>(kBrickVoxelCount) * sizeof(uint32_t),
+        poolBytes,
         BufferUsage::Readback,
         sizeof(uint32_t),
         "MidVoxelGpuGenPoc_Readback");
@@ -119,7 +90,6 @@ void MidVoxelGpuGenPoc::RunParityCheck(
         return;
     }
 
-    const uint32_t seed = policy.Config().seed;
     const auto rings = policy.BuildRings();
     if (rings.empty()) {
         spdlog::error("[MIDGEN-POC] policy produced no rings (clipmap disabled?); skipping");
@@ -128,7 +98,6 @@ void MidVoxelGpuGenPoc::RunParityCheck(
 
     // Real pristine brick generator: a fresh, UNEDITED cache so the edited-overlay
     // branches in GenerateVoxelBrickPayload are inert (hasEditedOverlays == false).
-    // GPU output is compared against this real brick (incl. VisualSurface bits).
     Simulation::SparseClipmapTileCache cpuCache;
     if (!cpuCache.Initialize(policy.Config())) {
         spdlog::error("[MIDGEN-POC] failed to init reference SparseClipmapTileCache; skipping");
@@ -136,9 +105,6 @@ void MidVoxelGpuGenPoc::RunParityCheck(
     }
 
     // Test coords spanning classifier branches. {ring, x, y, z} in BRICK units.
-    // origin = Floor(coord * brickWorldSize), brickWorldSize = cellSize * 16.
-    // For the default config (minCellSize=16) ring 0 -> cellSize 16, brick spans
-    // 256 world units; brick y-index k covers world Y [256k, 256k+255].
     struct TestCoord {
         Simulation::SparseVoxelClipmapCoord coord;
         const char* label;
@@ -152,78 +118,87 @@ void MidVoxelGpuGenPoc::RunParityCheck(
         { { 0,  0, -2,  0 }, "bedrock floor (very low Y, -512..-257)" },
     }};
 
-    uint32_t matches = 0;
+    // ---- Build the BATCH of requests + the CPU reference bricks per dest slot ----
+    std::vector<MidVoxelBrickGenRequest> requests;
+    std::vector<std::vector<uint32_t>> cpuBricks;   // indexed by dest slot
+    std::vector<const char*> slotLabels;
+    requests.reserve(testCoords.size());
+    cpuBricks.reserve(testCoords.size());
+
     for (const auto& tc : testCoords) {
         const int32_t ringIndex = tc.coord.ring;
         if (ringIndex < 0 || static_cast<size_t>(ringIndex) >= rings.size()) {
             spdlog::warn("[MIDGEN-POC] '{}': ring {} out of range; skipping", tc.label, ringIndex);
             continue;
         }
-        // ---- CPU reference: the REAL pristine resident brick ----
         std::vector<uint32_t> cpuBrickVec;
-        int32_t originX = 0;
-        int32_t originY = 0;
-        int32_t originZ = 0;
-        int32_t cellSize = 1;
+        int32_t originX = 0, originY = 0, originZ = 0, cellSize = 1;
         if (!cpuCache.GenerateVoxelBrickPayloadForTest(
                 tc.coord, policy, cpuBrickVec, originX, originY, originZ, cellSize) ||
             cpuBrickVec.size() != kBrickVoxelCount) {
             spdlog::error("[MIDGEN-POC] '{}': real brick generation failed; skipping", tc.label);
             continue;
         }
-        const uint32_t* cpuBrick = cpuBrickVec.data();
-
-        // ---- GPU dispatch ----
-        m_cmdAllocator->Reset();
-        m_cmdList->Reset(m_cmdAllocator.Get(), nullptr);
-
-        m_outSamples.TransitionTo(m_cmdList.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-        m_pipeline.Bind(m_cmdList.Get());
-
-        GenParams params{};
-        params.originX = originX;
-        params.originY = originY;
-        params.originZ = originZ;
-        params.cellSize = cellSize;
-        params.seed = seed;
-        params.brickCount = 1u;
-        params.pad0 = 0u;
-        params.pad1 = 0u;
-        m_pipeline.SetRoot32BitConstants(
-            m_cmdList.Get(), 0, sizeof(params) / 4u, &params);
-
-        // Root UAV bound directly by GPU virtual address (root param index 1).
-        m_cmdList->SetComputeRootUnorderedAccessView(
-            1, m_outSamples.GetGPUVirtualAddress());
-
-        // 4096 voxels / 64 threads per group -> 1 group (shader strides anyway).
-        m_pipeline.Dispatch(m_cmdList.Get(), 1, 1, 1);
-
-        D3D12_RESOURCE_BARRIER uavBarrier = {};
-        uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        uavBarrier.UAV.pResource = m_outSamples.GetResource();
-        m_cmdList->ResourceBarrier(1, &uavBarrier);
-
-        m_outSamples.TransitionTo(m_cmdList.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE);
-        m_cmdList->CopyBufferRegion(
-            m_readback.GetResource(), 0,
-            m_outSamples.GetResource(), 0,
-            static_cast<uint64_t>(kBrickVoxelCount) * sizeof(uint32_t));
-
-        m_cmdList->Close();
-        ID3D12CommandList* lists[] = { m_cmdList.Get() };
-        commandQueue.ExecuteCommandLists(lists, 1);
-        const uint64_t fence = commandQueue.Signal();
-        commandQueue.WaitForFenceValue(fence);
-
-        // ---- Readback + byte compare ----
-        const uint32_t* gpuBrick = static_cast<const uint32_t*>(m_readback.Map());
-        if (!gpuBrick) {
-            spdlog::error("[MIDGEN-POC] '{}': failed to map readback buffer", tc.label);
-            continue;
+        if (requests.size() >= kMaxBatchSlots) {
+            spdlog::warn("[MIDGEN-POC] batch slot cap reached; truncating");
+            break;
         }
+        MidVoxelBrickGenRequest req{};
+        req.originX = originX;
+        req.originY = originY;
+        req.originZ = originZ;
+        req.cellSize = cellSize;
+        req.destSlot = static_cast<uint32_t>(requests.size());  // unique slot per request
+        requests.push_back(req);
+        cpuBricks.push_back(std::move(cpuBrickVec));
+        slotLabels.push_back(tc.label);
+    }
 
+    if (requests.empty()) {
+        spdlog::error("[MIDGEN-POC] no valid test coords; skipping");
+        return;
+    }
+
+    // ---- Single batch dispatch into the sample pool, then read back ----
+    m_cmdAllocator->Reset();
+    m_cmdList->Reset(m_cmdAllocator.Get(), nullptr);
+
+    const bool dispatched = m_generator.GenerateBricks(
+        m_cmdList.Get(),
+        m_samplePool,
+        requests.data(),
+        static_cast<uint32_t>(requests.size()),
+        /*transitionSamplePool=*/true);
+    if (!dispatched) {
+        spdlog::error("[MIDGEN-POC] batch dispatch failed");
+        m_cmdList->Close();
+        return;
+    }
+
+    m_samplePool.TransitionTo(m_cmdList.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE);
+    const uint64_t copyBytes =
+        static_cast<uint64_t>(requests.size()) * kBrickVoxelCount * sizeof(uint32_t);
+    m_cmdList->CopyBufferRegion(
+        m_readback.GetResource(), 0,
+        m_samplePool.GetResource(), 0,
+        copyBytes);
+
+    m_cmdList->Close();
+    ID3D12CommandList* lists[] = { m_cmdList.Get() };
+    commandQueue.ExecuteCommandLists(lists, 1);
+    const uint64_t fence = commandQueue.Signal();
+    commandQueue.WaitForFenceValue(fence);
+
+    const uint32_t* gpuPool = static_cast<const uint32_t*>(m_readback.Map());
+    if (!gpuPool) {
+        spdlog::error("[MIDGEN-POC] failed to map readback buffer");
+        return;
+    }
+
+    uint32_t matches = 0;
+    for (uint32_t slot = 0; slot < requests.size(); ++slot) {
+        const uint32_t* gpuBrick = gpuPool + static_cast<size_t>(slot) * kBrickVoxelCount;
+        const uint32_t* cpuBrick = cpuBricks[slot].data();
         bool match = true;
         uint32_t firstDiff = 0;
         for (uint32_t i = 0; i < kBrickVoxelCount; ++i) {
@@ -233,33 +208,32 @@ void MidVoxelGpuGenPoc::RunParityCheck(
                 break;
             }
         }
-
+        const auto& req = requests[slot];
         if (match) {
             ++matches;
             spdlog::info(
-                "[MIDGEN-POC] coord(ring={},x={},y={},z={}) origin=({},{},{}) cell={} "
-                "match=true  ({}) [{}]",
-                tc.coord.ring, tc.coord.x, tc.coord.y, tc.coord.z,
-                originX, originY, originZ, cellSize, "all 4096 voxels equal", tc.label);
+                "[MIDGEN-POC] slot={} origin=({},{},{}) cell={} match=true "
+                "(all 4096 voxels equal) [{}]",
+                req.destSlot, req.originX, req.originY, req.originZ, req.cellSize,
+                slotLabels[slot]);
         } else {
             const uint32_t cpuV = cpuBrick[firstDiff];
             const uint32_t gpuV = gpuBrick[firstDiff];
             spdlog::error(
-                "[MIDGEN-POC] coord(ring={},x={},y={},z={}) origin=({},{},{}) cell={} "
-                "match=FALSE firstDiffIdx={} cpu=0x{:08X}(mat={}) gpu=0x{:08X}(mat={}) [{}]",
-                tc.coord.ring, tc.coord.x, tc.coord.y, tc.coord.z,
-                originX, originY, originZ, cellSize,
+                "[MIDGEN-POC] slot={} origin=({},{},{}) cell={} match=FALSE "
+                "firstDiffIdx={} cpu=0x{:08X}(mat={}) gpu=0x{:08X}(mat={}) [{}]",
+                req.destSlot, req.originX, req.originY, req.originZ, req.cellSize,
                 firstDiff,
                 cpuV, static_cast<uint32_t>(Utils::UnpackMaterial(cpuV)),
                 gpuV, static_cast<uint32_t>(Utils::UnpackMaterial(gpuV)),
-                tc.label);
+                slotLabels[slot]);
         }
-
-        m_readback.Unmap();
     }
 
-    spdlog::info("[MIDGEN-POC] parity check complete: {}/{} bricks matched",
-        matches, static_cast<uint32_t>(testCoords.size()));
+    m_readback.Unmap();
+
+    spdlog::info("[MIDGEN-POC] BATCH parity check complete: {}/{} bricks matched",
+        matches, static_cast<uint32_t>(requests.size()));
     (void)device;
 }
 
@@ -267,8 +241,8 @@ void MidVoxelGpuGenPoc::Shutdown() {
     m_cmdList.Reset();
     m_cmdAllocator.Reset();
     m_readback.Shutdown();
-    m_outSamples.Shutdown();
-    m_pipeline.Shutdown();
+    m_samplePool.Shutdown();
+    m_generator.Shutdown();
 }
 
 } // namespace VENPOD::Graphics

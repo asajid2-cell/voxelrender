@@ -12,6 +12,7 @@
 #include "Graphics/SparseSurfaceGpuResources.h"
 #include "Graphics/SparseVoxelGpuResources.h"
 #include "Graphics/MidVoxelGpuGenPoc.h"  // DEV-ONLY: Phase-0 GPU mid-voxel gen parity POC
+#include "Graphics/MidVoxelGpuGenerator.h"  // Phase-1 GPU mid-voxel sample generator
 #include "Graphics/VoxelRenderBackend.h"
 #include "Simulation/VoxelWorld.h"
 #include "Simulation/TerrainConstants.h"
@@ -2560,6 +2561,13 @@ int RunSandbox(int argc, char* argv[]) {
     const uint32_t sparseMidVoxelHighAltitudeHandoffMaxMissing =
         ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_HANDOFF_MAX_MISSING", 384u);
     sparseClipmapConfig.seed = sparseWorldConfig.seed;
+    // Phase 1: GPU mid-voxel clipmap sample generation (CS_GenerateMidVoxelBricks).
+    // CPU still owns residency/metadata/lookup; samples come from the compute pass.
+    sparseClipmapConfig.enableGpuMidVoxelGeneration =
+        sparseBackendRequested &&
+        ReadUIntEnv("VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION", 0u) != 0u;
+    const bool enableSparseMidVoxelGpuGeneration =
+        sparseClipmapConfig.enableGpuMidVoxelGeneration;
     const uint32_t sparseMidClipmapTileBudget = ReadUIntEnv("VENPOD_SPARSE_MID_TILE_BUDGET", 72u);
     const uint32_t sparseMidClipmapHeightTileBudget =
         ReadUIntEnv(
@@ -2674,7 +2682,8 @@ int RunSandbox(int argc, char* argv[]) {
     if (ReadUIntEnv("VENPOD_GPU_MIDGEN_POC", 0u) != 0u) {
         Graphics::MidVoxelGpuGenPoc midGenPoc;
         auto pocInit = midGenPoc.Initialize(
-            device->GetDevice(), renderer->GetShaderCompiler(), shaderPath);
+            device->GetDevice(), renderer->GetShaderCompiler(), shaderPath,
+            sparseClipmapConfig.seed);
         if (!pocInit) {
             spdlog::error("[MIDGEN-POC] init failed: {}", pocInit.error());
         } else {
@@ -2683,6 +2692,26 @@ int RunSandbox(int argc, char* argv[]) {
         }
         midGenPoc.Shutdown();
         commandQueue->Flush();
+    }
+
+    // Phase 1: GPU mid-voxel sample generator. Owns the batch CS PSO + a request
+    // upload ring; dispatched each frame the voxel clipmap snapshot changes when
+    // VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION=1.
+    Graphics::MidVoxelGpuGenerator midVoxelGpuGenerator;
+    bool midVoxelGpuGeneratorReady = false;
+    if (enableSparseMidVoxelGpuGeneration) {
+        auto genInit = midVoxelGpuGenerator.Initialize(
+            device->GetDevice(), renderer->GetShaderCompiler(), shaderPath,
+            sparseClipmapConfig.seed);
+        if (!genInit) {
+            spdlog::error("[MIDGEN] generator init failed: {}; falling back to CPU mid-voxel gen",
+                genInit.error());
+            sparseClipmapConfig.enableGpuMidVoxelGeneration = false;
+        } else {
+            midVoxelGpuGeneratorReady = true;
+            spdlog::info("[MIDGEN] GPU mid-voxel sample generation ENABLED (seed={})",
+                sparseClipmapConfig.seed);
+        }
     }
 
     Simulation::SparseBrickRequestPlanner sparseRequestPlanner({
@@ -2774,6 +2803,53 @@ int RunSandbox(int argc, char* argv[]) {
                 "Sparse backend GPU resources initialized: page-table path active{}",
                 enableSparseSurfaceAuthoritative ? " with surface-authoritative raster near field" : "");
             sparseGpuPageTableResetPending = true;
+
+            // Phase 1 dev verification (VENPOD_SPARSE_MID_CLIPMAP_GPU_VERIFY=1):
+            // dispatch a batch of representative bricks into the REAL live sample
+            // pool via the generator, read those slots back, and byte-compare to
+            // CPU GenerateVoxelBrickPayloadForTest. Proves the live pool + UAV +
+            // slot-offset math end-to-end (deterministic, screen-noise-free).
+            if (midVoxelGpuGeneratorReady &&
+                ReadUIntEnv("VENPOD_SPARSE_MID_CLIPMAP_GPU_VERIFY", 0u) != 0u) {
+                // CPU reference cache MUST do the full CPU voxel fill (the GPU-gen
+                // skip would leave voxels empty), so clear the flag for this cache.
+                Simulation::SparseClipmapConfig verifyCacheConfig =
+                    sparseClipmapPolicy.Config();
+                verifyCacheConfig.enableGpuMidVoxelGeneration = false;
+                Simulation::SparseClipmapPolicy verifyPolicy(verifyCacheConfig);
+                Simulation::SparseClipmapTileCache verifyCache;
+                if (verifyCache.Initialize(verifyCacheConfig)) {
+                    const Simulation::SparseVoxelClipmapCoord verifyCoords[] = {
+                        { 0,  0,  0,  0 }, { 0,  2,  1,  2 }, { 0,  0, -1,  0 },
+                        { 0,  6, -1,  0 }, { 0, 18,  2, 14 }, { 0,  0, -2,  0 },
+                    };
+                    std::vector<Graphics::MidVoxelBrickGenRequest> verifyReqs;
+                    std::vector<std::vector<uint32_t>> verifyCpu;
+                    uint32_t destSlot = 0u;
+                    for (const auto& c : verifyCoords) {
+                        std::vector<uint32_t> brick;
+                        int32_t ox = 0, oy = 0, oz = 0, cs = 1;
+                        if (verifyCache.GenerateVoxelBrickPayloadForTest(
+                                c, verifyPolicy, brick, ox, oy, oz, cs) &&
+                            brick.size() == 4096u) {
+                            Graphics::MidVoxelBrickGenRequest req{};
+                            req.originX = ox; req.originY = oy; req.originZ = oz;
+                            req.cellSize = cs; req.destSlot = destSlot++;
+                            verifyReqs.push_back(req);
+                            verifyCpu.push_back(std::move(brick));
+                        }
+                    }
+                    const uint32_t matched = midVoxelGpuGenerator.VerifyLiveSamplePool(
+                        device->GetDevice(), *commandQueue,
+                        sparseGpuResources.MidVoxelClipmapSamplesBuffer(),
+                        verifyReqs, verifyCpu);
+                    spdlog::info("[MIDGEN-VERIFY] live-pool check: {}/{} matched",
+                        matched, static_cast<uint32_t>(verifyReqs.size()));
+                    commandQueue->Flush();
+                } else {
+                    spdlog::error("[MIDGEN-VERIFY] failed to init verify cache");
+                }
+            }
         }
 
         if (enableSparseSurfaceUpload) {
@@ -15278,6 +15354,34 @@ int RunSandbox(int argc, char* argv[]) {
                         if (uploadVoxelClipmapPending) {
                             sparseMidClipmapUploadedVoxelSerial = sparseClipmapTileCache.VoxelDirtySerial();
                             sparseClipmapTileCache.ClearVoxelDirtyRange();
+                            // Phase 1: metadata+lookup are now uploaded; the voxel
+                            // SAMPLES for the resident GPU-gen bricks are produced
+                            // by the compute dispatch here, on the same command
+                            // list, BEFORE the raymarch pass reads them. The
+                            // generator brackets the dispatch with a SRV<->UAV
+                            // transition + UAV barrier, so the raymarch reads a
+                            // fresh, SRV-state sample pool. destSlot == the CPU-
+                            // allocated voxel slot in metadata/lookup.
+                            if (midVoxelGpuGeneratorReady &&
+                                !sparseMidClipmapSnapshotForUpload.voxelGpuGenRequests.empty()) {
+                                static_assert(
+                                    sizeof(Simulation::SparseMidVoxelGpuGenRequest) ==
+                                        sizeof(Graphics::MidVoxelBrickGenRequest),
+                                    "SparseMidVoxelGpuGenRequest must match MidVoxelBrickGenRequest layout");
+                                const auto& reqs =
+                                    sparseMidClipmapSnapshotForUpload.voxelGpuGenRequests;
+                                const bool dispatched = midVoxelGpuGenerator.GenerateBricks(
+                                    commandList.Get(),
+                                    sparseGpuResources.MidVoxelClipmapSamplesBuffer(),
+                                    reinterpret_cast<const Graphics::MidVoxelBrickGenRequest*>(
+                                        reqs.data()),
+                                    static_cast<uint32_t>(reqs.size()),
+                                    /*transitionSamplePool=*/true);
+                                if (!dispatched) {
+                                    spdlog::warn("[MIDGEN] GenerateBricks dispatch failed for {} requests",
+                                        reqs.size());
+                                }
+                            }
                         }
                     } else {
                         ++sparseMidClipmapUploadRetriesLastFrame;

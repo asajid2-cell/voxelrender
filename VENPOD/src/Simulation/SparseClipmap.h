@@ -68,6 +68,12 @@ struct SparseClipmapConfig {
     bool parallelVoxelPumpPersistentWorkers = false;
     uint32_t parallelVoxelPumpMaxWorkers = 4;
     uint32_t parallelVoxelPumpMinBricks = 8;
+    // Phase 1: when true, the mid-voxel clipmap fills its sample pool via the GPU
+    // compute shader (CS_GenerateMidVoxelBricks) instead of CPU GenerateVoxel-
+    // BrickPayload. The CPU pump still owns residency/metadata/lookup; only the
+    // expensive per-voxel SAMPLES move to the GPU. Edited bricks fall back to the
+    // CPU fill (v1). Env: VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION.
+    bool enableGpuMidVoxelGeneration = false;
     uint32_t seed = 12345u;
 };
 
@@ -137,6 +143,20 @@ struct SparseClipmapSampleRange {
     uint32_t slotCount = 0;
 };
 
+// Phase 1: a single GPU mid-voxel brick generation request. Mirrors the HLSL
+// BrickGenRequest / C++ MidVoxelBrickGenRequest (32 bytes). The CPU pump decides
+// origin/cellSize/destSlot; the GPU CS fills the brick's voxel samples.
+struct SparseMidVoxelGpuGenRequest {
+    int32_t originX = 0;
+    int32_t originY = 0;
+    int32_t originZ = 0;
+    int32_t cellSize = 1;
+    uint32_t destSlot = 0;
+    uint32_t pad0 = 0;
+    uint32_t pad1 = 0;
+    uint32_t pad2 = 0;
+};
+
 struct SparseClipmapGpuSnapshot {
     std::vector<uint32_t> metadata;
     std::vector<uint32_t> lookup;
@@ -146,6 +166,10 @@ struct SparseClipmapGpuSnapshot {
     std::vector<uint32_t> voxelSamples;
     std::vector<SparseClipmapSampleRange> heightSampleRanges;
     std::vector<SparseClipmapSampleRange> voxelSampleRanges;
+    // Phase 1: when GPU mid-voxel generation is enabled, the resident bricks whose
+    // samples must be (re)generated on the GPU this snapshot. voxelSamples is left
+    // empty for these (the CPU never packs them); the dispatch fills the pool.
+    std::vector<SparseMidVoxelGpuGenRequest> voxelGpuGenRequests;
     uint32_t tileCount = 0;
     uint32_t tileSampleSide = 0;
     uint32_t lookupCapacity = 0;
@@ -783,6 +807,11 @@ private:
         int32_t originZ = 0;
         uint32_t nonAirSamples = 0;
         uint32_t surfaceSamples = 0;
+        // Phase 1: true if this brick's voxel SAMPLES are produced on the GPU
+        // (CS_GenerateMidVoxelBricks). When set, `voxels` is left empty (the CPU
+        // never pays for the per-voxel fill) and BuildGpuSnapshot skips copying
+        // samples for this slot, emitting a GPU gen request instead.
+        bool gpuGenerated = false;
         std::vector<uint32_t> voxels;
     };
     struct AsyncVoxelGenerationRequest {

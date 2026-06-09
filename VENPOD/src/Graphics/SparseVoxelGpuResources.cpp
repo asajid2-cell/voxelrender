@@ -312,10 +312,15 @@ Result<void> SparseVoxelGpuResources::Initialize(
         return Error("Failed to create sparse mid voxel clipmap lookup SRV: {}", result.error());
     }
 
+    // Phase 1 GPU mid-voxel generation: the sample pool can be written by the
+    // CS_GenerateMidVoxelBricks compute shader (UAV) in addition to the CPU
+    // upload path (COPY_DEST). The MidVoxelGpuGenerator binds it as a root UAV by
+    // GPU virtual address, so no UAV descriptor is strictly required, but we add
+    // the UnorderedAccess usage so the resource is created UAV-capable.
     result = m_midVoxelClipmapSamples.Initialize(
         device,
         m_stats.midVoxelClipmapSampleBytes,
-        BufferUsage::StructuredBuffer,
+        BufferUsage::StructuredBuffer | BufferUsage::UnorderedAccess,
         sizeof(uint32_t),
         "SparseMidVoxelClipmapSamples");
     if (!result) {
@@ -326,6 +331,11 @@ Result<void> SparseVoxelGpuResources::Initialize(
     if (!result) {
         Shutdown();
         return Error("Failed to create sparse mid voxel clipmap sample SRV: {}", result.error());
+    }
+    result = m_midVoxelClipmapSamples.CreateUAV(device, heapManager);
+    if (!result) {
+        Shutdown();
+        return Error("Failed to create sparse mid voxel clipmap sample UAV: {}", result.error());
     }
 
     result = m_missFeedback.Initialize(

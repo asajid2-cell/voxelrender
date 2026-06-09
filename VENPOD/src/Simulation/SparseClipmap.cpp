@@ -4861,6 +4861,25 @@ void SparseClipmapTileCache::GenerateVoxelBrickPayload(
         static_cast<double>(brick.coord.y) * static_cast<double>(brickWorldSize));
     brick.originZ = FloorToInt32Clamped(
         static_cast<double>(brick.coord.z) * static_cast<double>(brickWorldSize));
+
+    // ---- Phase 1: GPU mid-voxel generation skip ----
+    // When enabled AND this cache has no edits (v1 keeps edited bricks on the CPU
+    // path to avoid edit-overlay divergence), DON'T pay for the per-voxel fill.
+    // The origin/cellSize above are all the metadata+lookup builder needs; the
+    // sample pool is filled later by the GPU dispatch. Mark the brick so the
+    // snapshot emits a gen request instead of copying CPU samples.
+    {
+        const bool hasEdits = m_edits && m_edits->EditedBrickCount() != 0u;
+        if (m_config.enableGpuMidVoxelGeneration && !hasEdits) {
+            brick.gpuGenerated = true;
+            brick.voxels.clear();
+            brick.nonAirSamples = 0;
+            brick.surfaceSamples = 0;
+            return;
+        }
+    }
+    brick.gpuGenerated = false;
+
     brick.voxels.resize(SPARSE_BRICK_VOXEL_COUNT);
     brick.nonAirSamples = 0;
     brick.surfaceSamples = 0;
@@ -5704,12 +5723,18 @@ bool SparseClipmapTileCache::BuildGpuSnapshot(
             ? 0u
             : outSnapshot.heightSampleRanges.front().startSlot;
     }
+    // Phase 1: with GPU mid-voxel generation, samples are produced by the compute
+    // dispatch (not staged/uploaded), so emit NO CPU sample copy ranges. The
+    // metadata+lookup are still CPU-built and uploaded as usual.
+    const bool gpuVoxelGen = m_config.enableGpuMidVoxelGeneration;
     if (includeVoxelLayer) {
-        outSnapshot.voxelSampleRanges = BuildCoalescedSampleRanges(
-            m_dirtyVoxelSlots,
-            maxVoxelBricks,
-            m_dirtyVoxelStartSlot,
-            m_dirtyVoxelEndSlot);
+        outSnapshot.voxelSampleRanges = gpuVoxelGen
+            ? std::vector<SparseClipmapSampleRange>{}
+            : BuildCoalescedSampleRanges(
+                m_dirtyVoxelSlots,
+                maxVoxelBricks,
+                m_dirtyVoxelStartSlot,
+                m_dirtyVoxelEndSlot);
         const uint32_t voxelPayloadSlotCount =
             CountSampleRangeSlots(outSnapshot.voxelSampleRanges);
         outSnapshot.voxelMetadata.assign(static_cast<size_t>(maxVoxelBricks + 1u) * 4u, 0u);
@@ -5795,7 +5820,13 @@ bool SparseClipmapTileCache::BuildGpuSnapshot(
     if (includeVoxelLayer) {
         for (uint32_t voxelSlot = 0; voxelSlot < static_cast<uint32_t>(m_voxelBricks.size()); ++voxelSlot) {
             const VoxelBrickPayload& brick = m_voxelBricks[voxelSlot];
-            if (brick.slot == UINT32_MAX || brick.voxels.empty()) {
+            // GPU-generated bricks are resident with EMPTY voxels (samples come
+            // from the compute dispatch), so don't treat empty voxels as absent
+            // for them. CPU bricks still require non-empty voxels.
+            const bool brickResident =
+                brick.slot != UINT32_MAX &&
+                (brick.gpuGenerated || !brick.voxels.empty());
+            if (!brickResident) {
                 continue;
             }
             if (voxelSlot >= maxVoxelBricks) {
@@ -5803,6 +5834,21 @@ bool SparseClipmapTileCache::BuildGpuSnapshot(
             }
             maxUsedVoxelSlot = std::max(maxUsedVoxelSlot, voxelSlot);
             ++residentVoxelEntries;
+
+            // Phase 1: emit a GPU gen request for this resident slot. destSlot is
+            // the CPU-allocated voxelSlot, which MUST equal the metadata/lookup
+            // slot below (same loop variable) so the raymarch reads the brick the
+            // CS wrote.
+            if (gpuVoxelGen && brick.gpuGenerated) {
+                SparseMidVoxelGpuGenRequest req;
+                req.originX = brick.originX;
+                req.originY = brick.originY;
+                req.originZ = brick.originZ;
+                req.cellSize = std::max(1, RoundToInt32Clamped(
+                    static_cast<double>(brick.cellSize)));
+                req.destSlot = voxelSlot;
+                outSnapshot.voxelGpuGenRequests.push_back(req);
+            }
 
             const size_t metadataBase = static_cast<size_t>(voxelSlot + 1u) * 4u;
             outSnapshot.voxelMetadata[metadataBase + 0u] = static_cast<uint32_t>(brick.originX);

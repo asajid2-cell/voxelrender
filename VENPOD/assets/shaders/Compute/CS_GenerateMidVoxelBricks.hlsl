@@ -36,12 +36,26 @@
 
 #include "../Common/TerrainHeight.hlsli"
 
-cbuffer GenParams : register(b0) {
-    int4  originAndCell;   // x=originX, y=originY, z=originZ, w=cellSize
-    uint4 misc;            // x=seed, y=brickCount (=1), z=pad, w=pad
+// Batch request: one entry per brick to generate this dispatch. 32 bytes, matches
+// the C++ BrickGenRequest in MidVoxelGpuGenerator.h. The CPU pump decides origin/
+// cellSize/destSlot (residency policy); the GPU only generates the voxel samples.
+struct BrickGenRequest {
+    int  originX;
+    int  originY;
+    int  originZ;
+    int  cellSize;
+    uint destSlot;   // sample pool slot: writes OutSamples[destSlot*4096 + idx]
+    uint pad0;
+    uint pad1;
+    uint pad2;
 };
 
-RWStructuredBuffer<uint> OutSamples : register(u0);   // 4096 uints, brick 0
+cbuffer GenParams : register(b0) {
+    uint4 misc;            // x=seed, y=requestCount, z=pad, w=pad
+};
+
+StructuredBuffer<BrickGenRequest> Requests : register(t0);  // requestCount entries
+RWStructuredBuffer<uint> OutSamples : register(u0);   // brick b -> [b*4096 .. +4095]
 
 #define HALO_SIDE 18              // SPARSE_BRICK_SIZE + 2
 #define HALO_COUNT (HALO_SIDE * HALO_SIDE)   // 324
@@ -93,12 +107,22 @@ int WorldMaxByHalo(int origin, int h, int cell, int sampleStep) {
 }
 
 [numthreads(256, 1, 1)]
-void main(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID) {
-    const int originX = originAndCell.x;
-    const int originY = originAndCell.y;
-    const int originZ = originAndCell.z;
-    const int cellSize = max(1, originAndCell.w);
+void main(uint3 dtid : SV_DispatchThreadID,
+          uint3 gtid : SV_GroupThreadID,
+          uint3 gid  : SV_GroupID) {
+    // One thread group per brick; group index selects the request.
+    const uint reqIndex = gid.x;
+    if (reqIndex >= misc.y) {
+        return;
+    }
+    const BrickGenRequest req = Requests[reqIndex];
+    const int originX = req.originX;
+    const int originY = req.originY;
+    const int originZ = req.originZ;
+    const int cellSize = max(1, req.cellSize);
     const uint seed = misc.x;
+    // Base offset into the shared sample pool for this brick's destination slot.
+    const uint outBase = req.destSlot * 4096u;
     const int sampleStep = max(1, cellSize);          // RoundToInt32Clamped(cellSize)
     const int surfaceBandDepth = max(sampleStep * 2, 2);
     const bool coarse = (float)cellSize > 1.5f;        // ring.cellSize > 1.5f
@@ -163,13 +187,13 @@ void main(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID) {
 
     if (fullAirAboveTerrain || fullAirAboveColumns) {
         for (int y = 0; y < 16; ++y) {
-            OutSamples[x + y * 16 + z * 256] = airVoxel;
+            OutSamples[outBase + x + y * 16 + z * 256] = airVoxel;
         }
         return;
     }
     if (fullStone) {
         for (int y = 0; y < 16; ++y) {
-            OutSamples[x + y * 16 + z * 256] = stoneStaticVoxel;
+            OutSamples[outBase + x + y * 16 + z * 256] = stoneStaticVoxel;
         }
         return;
     }
@@ -285,7 +309,7 @@ void main(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID) {
         // (1) surface-band Stone deep-fill.
         if (cellMaxWorldY > TH_TERRAIN_MIN_Y + 2 &&
             (float)(cellMaxWorldY + surfaceBandDepth) < minHorizontalColumnHeight) {
-            OutSamples[x + y * 16 + z * 256] = stoneStaticVoxel;
+            OutSamples[outBase + x + y * 16 + z * 256] = stoneStaticVoxel;
             continue;
         }
 
@@ -365,6 +389,6 @@ void main(uint3 dtid : SV_DispatchThreadID, uint3 gtid : SV_GroupThreadID) {
             outVoxel = airVoxel;
         }
 
-        OutSamples[x + y * 16 + z * 256] = outVoxel;
+        OutSamples[outBase + x + y * 16 + z * 256] = outVoxel;
     }
 }
