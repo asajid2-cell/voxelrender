@@ -275,10 +275,10 @@ float TH_HeightAt(int worldX, int worldZ, uint seed) {
     height = TH_Lerp(height, max(height, routeBackdropHeight), routeCorridor * routeRidge * routeNotch * 0.68f);
 
     // Spawn landmass: lift low/submerged near-origin terrain onto a gently
-    // rolling land floor comfortably above sea level, fading out by ~2800u.
+    // rolling land floor comfortably above sea level, fading out by ~9500u.
     // PARITY: matches CPU SparseTerrainGenerator::HeightAt spawn-land block.
     float spawnLandBand =
-        1.0f - TH_Smooth01(saturate((originDistance - 200.0f) / 2600.0f));
+        1.0f - TH_Smooth01(saturate((originDistance - 200.0f) / 9300.0f));
     float spawnLandFloor =
         (float)TH_SEA_LEVEL_Y + 40.0f +
         broad * 28.0f +

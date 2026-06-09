@@ -233,9 +233,11 @@ float SparseTerrainGenerator::HeightAt(int32_t worldX, int32_t worldZ) const {
     height = Lerp(height, std::max(height, routeBackdropHeight), routeCorridor * routeRidge * routeNotch * 0.68f);
 
     // Spawn landmass: lift low/submerged near-origin terrain onto a gently
-    // rolling land floor comfortably above sea level, fading out by ~2800u.
+    // rolling land floor comfortably above sea level, fading out by ~9500u so the
+    // whole render ring is solid land, not a flooded basin (the mid-ground beyond the
+    // old 2800u fade reverted to water + fragmented banks).
     const float spawnLandBand =
-        1.0f - Smooth01(std::clamp((originDistance - 200.0f) / 2600.0f, 0.0f, 1.0f));
+        1.0f - Smooth01(std::clamp((originDistance - 200.0f) / 9300.0f, 0.0f, 1.0f));
     const float spawnLandFloor =
         static_cast<float>(SEA_LEVEL_Y) + 40.0f +
         broad * 28.0f +

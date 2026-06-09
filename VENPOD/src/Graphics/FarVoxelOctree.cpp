@@ -1316,10 +1316,10 @@ float FarVoxelOctree::TerrainHeight(float x, float z) const {
         (routeCorridor * routeRidge * routeNotch * 0.68f);
 
     // Spawn landmass: lift low/submerged near-origin terrain onto a gently
-    // rolling land floor comfortably above sea level, fading out by ~2800u.
-    // Must match SparseTerrainGenerator::HeightAt / TH_HeightAt / FarTerrainHeight.
+    // rolling land floor comfortably above sea level, fading out by ~9500u.
+    // Must match SparseTerrainGenerator::HeightAt / TH_HeightAt (the geometry copies).
     const float spawnLandBand =
-        1.0f - Smooth01(std::clamp((originDistance - 200.0f) / 2600.0f, 0.0f, 1.0f));
+        1.0f - Smooth01(std::clamp((originDistance - 200.0f) / 9300.0f, 0.0f, 1.0f));
     const float spawnLandFloor =
         static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y) + 40.0f +
         broad * 28.0f +
