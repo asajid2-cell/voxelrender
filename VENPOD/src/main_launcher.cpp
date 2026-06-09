@@ -26,6 +26,7 @@
 #include "Simulation/SparsePagePublishQueue.h"
 #include "Simulation/SparseRuntimeBudget.h"
 #include "Simulation/SparseVoxelWorld.h"
+#include "Simulation/SparseTerrainGenerator.h"  // DEV-ONLY render audit ground truth
 #include "Input/InputManager.h"
 #include "Input/BrushController.h"
 #include "UI/ImGuiBackend.h"
@@ -4003,6 +4004,39 @@ int RunSandbox(int argc, char* argv[]) {
     float sparseWalkFeetAboveTerrainLastFrame = 0.0f;
     uint64_t lastFarSvoUploadProgressBytes = UINT64_MAX;
     const uint32_t exitAfterFrames = ReadUIntEnv("VENPOD_EXIT_AFTER_FRAMES", 0u);
+
+    // ===== DEV-ONLY render audit (VENPOD_RENDER_AUDIT) =====
+    // Emits, at a fixed settled frame, two datasets per sampled camera ray:
+    // ACTUAL (read back from the GPU raymarch audit UAV) vs EXPECTED (CPU ground
+    // truth marched against SparseTerrainGenerator::HeightAt). Off by default;
+    // zero impact on normal runs.
+    const bool renderAuditEnabled = ReadUIntEnv("VENPOD_RENDER_AUDIT", 0u) != 0u;
+    const uint32_t renderAuditFrame = ReadUIntEnv("VENPOD_RENDER_AUDIT_FRAME", 200u);
+    bool renderAuditCaptureQueued = false;  // shader wrote + readback queued this frame
+    bool renderAuditReported = false;       // summary already emitted
+    // Camera state captured at the audit frame so the CPU ground-truth march
+    // reconstructs the exact same rays the shader used.
+    glm::vec3 renderAuditCamPos(0.0f);
+    glm::vec3 renderAuditCamForward(0.0f, 0.0f, 1.0f);
+    glm::vec3 renderAuditCamRight(1.0f, 0.0f, 0.0f);
+    glm::vec3 renderAuditCamUp(0.0f, 1.0f, 0.0f);
+    float renderAuditFov = 1.0f;
+    float renderAuditAspect = 1.0f;
+    if (renderAuditEnabled) {
+        spdlog::info(
+            "[RENDER-AUDIT] enabled; capturing at frame {} (set VENPOD_RENDER_AUDIT_FRAME to change)",
+            renderAuditFrame);
+    }
+    // ===== DEV-ONLY composite-truth audit (runs alongside the raymarch audit) =====
+    // Reads back the FINAL composited back buffer (all 3 layers: raster exact
+    // surface + uber-raymarch + mid-pass gradient) on the audit frame, classifies
+    // each sampled on-screen pixel into SKY/WATER/TERRAIN by color, reconstructs
+    // the same camera ray, marches CPU HeightAt for the EXPECTED kind, and reports
+    // the definitive on-screen mismatch table. Gated behind VENPOD_RENDER_AUDIT.
+    bool compositeAuditCaptureQueued = false;  // back buffer readback queued this frame
+    bool compositeAuditReported = false;       // composite summary already emitted
+    PendingBackbufferCapture compositeAuditCapture;  // final-color readback (RENDER_TARGET source)
+
     BackbufferCaptureConfig backbufferCapture = {};
     const bool backgroundPassCaptureEnabled =
         ReadUIntEnv("VENPOD_RAYMARCH_BACKGROUND_PASS_CAPTURE", 0u) != 0u;
@@ -18631,6 +18665,12 @@ int RunSandbox(int argc, char* argv[]) {
             1.0f);
         cameraParams.renderQuality = currentRenderQuality;
         cameraParams.frameIndex = static_cast<uint32_t>(frameCount);
+        // DEV-ONLY render audit fires on the exact settled audit frame via a
+        // dedicated extra draw (below); the normal draw is never audit-armed.
+        const bool renderAuditThisFrame =
+            renderAuditEnabled &&
+            !renderAuditReported &&
+            frameCount == static_cast<uint64_t>(renderAuditFrame);
         cameraParams.backgroundPassSurfaceRaymarchFill =
             backgroundPassSurfaceRaymarchFillThisFrame || sparseStartupPublicRenderHeld;
         cameraParams.renderOwnershipStatsEnabled =
@@ -19860,6 +19900,49 @@ int RunSandbox(int argc, char* argv[]) {
                     cameraParams,
                     &brushPreview,
                     &characterPreview);
+            }
+            // ===== DEV-ONLY render audit: dedicated extra draw =====
+            // After the normal frame, run the full near/mid/far raymarch over EVERY
+            // pixel (stencil disabled, surface-authoritative forced off) so the
+            // audit UAV captures what the LOD raymarch resolves per pixel, then copy
+            // it to the readback buffer. The audit draw's pixels are discarded.
+            if (renderAuditThisFrame &&
+                renderer->EnsureRenderAuditPipeline() &&
+                renderer->EnsureRenderAuditBuffer(window->GetWidth(), window->GetHeight())) {
+                renderAuditCamPos = renderCameraPos;
+                renderAuditCamForward = cameraForward;
+                renderAuditCamRight = cameraRight;
+                renderAuditCamUp = cameraUp;
+                renderAuditFov = fov;
+                renderAuditAspect = aspectRatio;
+
+                Graphics::Renderer::CameraParams auditCam = cameraParams;
+                auditCam.renderAuditEnabled = true;
+                // Force the full LOD raymarch (not background-only) by clearing
+                // the surface-authoritative / raymarch-fill ownership flags.
+                Graphics::Renderer::SparseNearField auditNear = sparseNearField;
+                auditNear.surfaceAuthoritative = false;
+                auditNear.surfaceRaymarchFill = false;
+
+                renderer->RenderVoxels(
+                    commandList.Get(),
+                    voxelWorld->GetReadBufferSRV(),
+                    voxelWorld->GetReadChunkValidMaskSRV(),
+                    voxelWorld->GetPaletteSRV(),
+                    renderGridSizeX,
+                    renderGridSizeY,
+                    renderGridSizeZ,
+                    auditCam,
+                    renderRegionOrigin.x,
+                    renderRegionOrigin.y,
+                    renderRegionOrigin.z,
+                    nullptr,
+                    nullptr,
+                    &sparseFarField,
+                    &auditNear,
+                    /*auditDrawMode=*/true);
+                renderer->QueueRenderAuditReadback(commandList.Get());
+                renderAuditCaptureQueued = true;
             }
         } else {
             if (gpuTimestampHeap) {
@@ -22673,6 +22756,26 @@ int RunSandbox(int argc, char* argv[]) {
             }
         }
 
+        // ===== DEV-ONLY composite-truth audit: queue final back-buffer readback =====
+        // The back buffer is fully composited (all 3 layers) and still in
+        // RENDER_TARGET state here (EndFrame transitions it to PRESENT below), so
+        // this is the exact image the BMP capture path saves. Reuse the same
+        // readback/copy approach to capture the real on-screen color.
+        if (renderAuditThisFrame && !compositeAuditReported) {
+            PendingBackbufferCapture capture = {};
+            if (QueueBackbufferCapture(
+                    device->GetDevice(),
+                    commandList.Get(),
+                    window->GetBackBuffer(frameIndex),
+                    static_cast<uint32_t>(frameCount),
+                    std::filesystem::current_path(),
+                    capture)) {
+                capture.path = std::filesystem::current_path() / "render_audit_composite_frame.bmp";
+                compositeAuditCapture = std::move(capture);
+                compositeAuditCaptureQueued = true;
+            }
+        }
+
         // End frame - transitions back buffer to present state
         renderer->EndFrame(commandList.Get(), frameIndex);
         if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
@@ -22731,6 +22834,423 @@ int RunSandbox(int argc, char* argv[]) {
             spdlog::info("FRAME_STAGE {} signaled fence {}", frameCount, ctx.fenceValue);
         }
         voxelWorld->NotifyBrushEditFeedbackFence(ctx.fenceValue);
+
+        // ===== DEV-ONLY render audit: process the captured frame =====
+        // The fullscreen raymarch wrote ACTUAL per-pixel hits to the audit UAV and
+        // we queued a copy into the readback buffer on this same command list.
+        // Flush so the GPU finishes, map the readback, march the CPU ground truth
+        // (EXPECTED) along the same rays, diff, and emit the per-distance-bucket
+        // mismatch summary plus CSVs. One-shot; never runs again.
+        if (renderAuditCaptureQueued && !renderAuditReported) {
+            commandQueue->Flush();  // wait for the audit-write + copy to retire
+
+            std::vector<float> auditData;
+            uint32_t auditW = 0, auditH = 0;
+            if (renderer->ReadRenderAuditResults(auditData, auditW, auditH) &&
+                auditW > 0 && auditH > 0) {
+                Simulation::SparseTerrainGenerator groundTruth(sparseWorldConfig.seed);
+                constexpr float kSeaLevel = static_cast<float>(Simulation::SEA_LEVEL_Y);
+                constexpr float kFarCap = 9200.0f;
+
+                const glm::vec3 camPos = renderAuditCamPos;
+                const glm::vec3 fwd = renderAuditCamForward;
+                const glm::vec3 rgt = renderAuditCamRight;
+                const glm::vec3 upv = renderAuditCamUp;
+                const float tanHalfFov = std::tan(renderAuditFov * 0.5f);
+                const float aspect = renderAuditAspect;
+
+                // Ground-truth first-visible-surface march along a ray. Returns
+                // expected distance/Y/kind (0=sky,1=land,2=water).
+                auto marchExpected = [&](const glm::vec3& dir,
+                                         float& outDist, float& outY, int& outKind) {
+                    outDist = 1e20f; outY = 0.0f; outKind = 0;
+                    float t = 1.0f;
+                    float prevAbove = 1.0f;  // sign of (ray.y - visibleSurface) at previous step
+                    bool havePrev = false;
+                    while (t < kFarCap) {
+                        const glm::vec3 p = camPos + dir * t;
+                        const float terrainTop = groundTruth.HeightAt(
+                            static_cast<int32_t>(std::floor(p.x)),
+                            static_cast<int32_t>(std::floor(p.z)));
+                        const bool isLand = terrainTop > kSeaLevel;
+                        const float visibleSurface = isLand ? terrainTop : kSeaLevel;
+                        const float above = p.y - visibleSurface;  // >0 means ray is above surface
+                        if (havePrev && above <= 0.0f && prevAbove > 0.0f) {
+                            // Crossed the visible surface between the previous step and t.
+                            outDist = t;
+                            outY = p.y;
+                            outKind = isLand ? 1 : 2;
+                            return;
+                        }
+                        if (above <= 0.0f && !havePrev) {
+                            // Started already inside terrain (rare); treat as hit now.
+                            outDist = t; outY = p.y; outKind = isLand ? 1 : 2;
+                            return;
+                        }
+                        prevAbove = above;
+                        havePrev = true;
+                        // Step scales with distance: fine near, coarse far.
+                        const float step = std::clamp(t * 0.01f, 2.0f, 24.0f);
+                        t += step;
+                    }
+                };
+
+                // Sample grid: every 8th pixel, denser in the lower 2/3 where
+                // terrain lives (sample every 4th row below the horizon band).
+                const uint32_t W = auditW, H = auditH;
+                // The process working dir is build\bin, so write the CSVs there
+                // directly (a relative "build/bin" would nest a second copy).
+                std::filesystem::path binDir = std::filesystem::current_path();
+                std::error_code ec;
+                std::filesystem::create_directories(binDir, ec);
+                std::ofstream raysCsv(binDir / "render_audit_rays.csv");
+                raysCsv << "pixelX,pixelY,rayDist_actual,actualY,actualLOD,actualMat,"
+                           "expectedDist,expectedY,expectedKind,yDiff,distDiff,classification\n";
+
+                constexpr int kBuckets = 10;  // 0-1000 ... 9000-10000
+                struct Bucket {
+                    uint64_t count = 0, match = 0, hole = 0, seeThrough = 0,
+                             wrongHeight = 0, lodOk = 0;
+                    double sumAbsY = 0.0; double maxAbsY = 0.0;
+                    uint64_t lodHist[5] = {0,0,0,0,0};
+                } buckets[kBuckets];
+
+                auto classifyName = [](int c) -> const char* {
+                    switch (c) {
+                        case 0: return "MATCH";
+                        case 1: return "HOLE";
+                        case 2: return "SEE_THROUGH";
+                        case 3: return "WRONG_HEIGHT";
+                        default: return "LOD_OK";
+                    }
+                };
+
+                uint64_t sampledRays = 0;
+                for (uint32_t py = 0; py < H; py += 8) {
+                    for (uint32_t px = 0; px < W; px += 8) {
+                        const size_t idx = (static_cast<size_t>(py) * W + px) * 4u;
+                        if (idx + 3 >= auditData.size()) continue;
+                        const float actualDist = auditData[idx + 0];
+                        const float actualY = auditData[idx + 1];
+                        uint32_t lodBits, matBits;
+                        std::memcpy(&lodBits, &auditData[idx + 2], sizeof(uint32_t));
+                        std::memcpy(&matBits, &auditData[idx + 3], sizeof(uint32_t));
+                        const uint32_t actualLOD = lodBits;
+                        const uint32_t actualMat = matBits;
+                        const bool actualMiss = actualDist > 1.0e9f || actualLOD == 0u;
+
+                        // Reconstruct the exact shader ray for this pixel.
+                        const float ndcX = ((static_cast<float>(px) + 0.5f) / static_cast<float>(W)) * 2.0f - 1.0f;
+                        float ndcY = ((static_cast<float>(py) + 0.5f) / static_cast<float>(H)) * 2.0f - 1.0f;
+                        ndcY = -ndcY;
+                        glm::vec3 dir = glm::normalize(
+                            fwd + rgt * (ndcX * tanHalfFov * aspect) + upv * (ndcY * tanHalfFov));
+
+                        float expDist, expY; int expKind;
+                        marchExpected(dir, expDist, expY, expKind);
+                        const bool expectSolid = (expKind != 0);
+
+                        // Classify. 0=MATCH 1=HOLE 2=SEE_THROUGH 3=WRONG_HEIGHT 4=LOD_OK
+                        int cls;
+                        float yDiff = (actualMiss || !expectSolid) ? 0.0f : (actualY - expY);
+                        float distDiff = (actualMiss || expDist > 1e9f) ? 0.0f : (actualDist - expDist);
+                        const float kYTol = 12.0f;
+                        if (!expectSolid) {
+                            // Expected sky. If actual also sky -> MATCH, else LOD_OK (drew something past horizon).
+                            cls = actualMiss ? 0 : 4;
+                        } else if (actualMiss) {
+                            cls = 1;  // HOLE: expected solid surface, rendered sky/miss
+                        } else if (expKind == 1 && actualLOD == 0u) {
+                            cls = 1;  // HOLE
+                        } else if (distDiff > 80.0f && distDiff > 0.18f * expDist) {
+                            cls = 2;  // SEE_THROUGH: drew a surface well behind the true one
+                        } else if (std::fabs(yDiff) > kYTol) {
+                            cls = 3;  // WRONG_HEIGHT
+                        } else {
+                            cls = 0;  // MATCH
+                        }
+
+                        // Bucket by EXPECTED distance.
+                        int b = -1;
+                        if (expectSolid && expDist < 1e9f) {
+                            b = std::min(kBuckets - 1, static_cast<int>(expDist / 1000.0f));
+                        }
+                        if (b >= 0) {
+                            Bucket& bk = buckets[b];
+                            bk.count++;
+                            if (actualLOD <= 4u) bk.lodHist[actualLOD]++;
+                            switch (cls) {
+                                case 0: bk.match++; break;
+                                case 1: bk.hole++; break;
+                                case 2: bk.seeThrough++; break;
+                                case 3: bk.wrongHeight++; break;
+                                default: bk.lodOk++; break;
+                            }
+                            if (!actualMiss) {
+                                const double ay = std::fabs(static_cast<double>(yDiff));
+                                bk.sumAbsY += ay;
+                                if (ay > bk.maxAbsY) bk.maxAbsY = ay;
+                            }
+                        }
+
+                        raysCsv << px << ',' << py << ','
+                                << actualDist << ',' << actualY << ',' << actualLOD << ','
+                                << actualMat << ',' << expDist << ',' << expY << ','
+                                << (expKind == 0 ? "sky" : (expKind == 1 ? "land" : "water")) << ','
+                                << yDiff << ',' << distDiff << ',' << classifyName(cls) << '\n';
+                        sampledRays++;
+                    }
+                }
+                raysCsv.close();
+
+                std::ofstream sumCsv(binDir / "render_audit_summary.csv");
+                sumCsv << "bucket,rays,pctMatch,pctHole,pctSeeThrough,pctWrongHeight,pctLodOk,"
+                          "meanAbsYDiff,maxAbsYDiff,lod_sky,lod_nearExact,lod_midVoxel,lod_farSVO,lod_background\n";
+
+                spdlog::info("[RENDER-AUDIT] ===== EXPECTED vs ACTUAL, bucketed by expected distance =====");
+                spdlog::info("[RENDER-AUDIT] seed={} cam=({:.1f},{:.1f},{:.1f}) sampledRays={} ({}x{})",
+                    sparseWorldConfig.seed, camPos.x, camPos.y, camPos.z, sampledRays, auditW, auditH);
+                spdlog::info("[RENDER-AUDIT] {:>11} {:>6} {:>6} {:>6} {:>7} {:>7} {:>6} {:>8} {:>8} | LOD sky/near/mid/far/bg",
+                    "bucket", "rays", "MATCH", "HOLE", "SEE", "WRONGH", "LODok", "mean|dY|", "max|dY|");
+                for (int i = 0; i < kBuckets; ++i) {
+                    const Bucket& bk = buckets[i];
+                    char label[24];
+                    std::snprintf(label, sizeof(label), "%d-%d", i * 1000, (i + 1) * 1000);
+                    if (bk.count == 0) {
+                        spdlog::info("[RENDER-AUDIT] {:>11} {:>6} (no expected-solid rays)", label, 0);
+                        sumCsv << label << ",0,0,0,0,0,0,0,0,0,0,0,0,0\n";
+                        continue;
+                    }
+                    const double c = static_cast<double>(bk.count);
+                    const double pM = 100.0 * bk.match / c;
+                    const double pHole = 100.0 * bk.hole / c;
+                    const double pSee = 100.0 * bk.seeThrough / c;
+                    const double pWrong = 100.0 * bk.wrongHeight / c;
+                    const double pLod = 100.0 * bk.lodOk / c;
+                    const double meanY = bk.sumAbsY / c;
+                    spdlog::info(
+                        "[RENDER-AUDIT] {:>11} {:>6} {:>5.1f}% {:>5.1f}% {:>6.1f}% {:>6.1f}% {:>5.1f}% {:>8.1f} {:>8.1f} | {}/{}/{}/{}/{}",
+                        label, bk.count, pM, pHole, pSee, pWrong, pLod, meanY, bk.maxAbsY,
+                        bk.lodHist[0], bk.lodHist[1], bk.lodHist[2], bk.lodHist[3], bk.lodHist[4]);
+                    sumCsv << label << ',' << bk.count << ','
+                           << pM << ',' << pHole << ',' << pSee << ',' << pWrong << ',' << pLod << ','
+                           << meanY << ',' << bk.maxAbsY << ','
+                           << bk.lodHist[0] << ',' << bk.lodHist[1] << ',' << bk.lodHist[2] << ','
+                           << bk.lodHist[3] << ',' << bk.lodHist[4] << '\n';
+                }
+                sumCsv.close();
+                spdlog::info("[RENDER-AUDIT] wrote {} and {}",
+                    (binDir / "render_audit_rays.csv").string(),
+                    (binDir / "render_audit_summary.csv").string());
+                if (auto dl = spdlog::default_logger()) dl->flush();
+            } else {
+                spdlog::warn("[RENDER-AUDIT] readback unavailable; no audit emitted");
+            }
+            renderAuditReported = true;
+            renderAuditCaptureQueued = false;
+        }
+
+        // ===== DEV-ONLY composite-truth audit: process the final back buffer =====
+        // Definitive on-screen truth. Classify each sampled FINAL-COLOR pixel into
+        // SKY / WATER / TERRAIN (calibrated from the captured frame), reconstruct
+        // the same camera ray as the raymarch audit, march CPU HeightAt for the
+        // EXPECTED kind, diff, and emit the per-distance mismatch table + CSV. The
+        // back-buffer copy was queued before EndFrame; the Flush above (or here)
+        // guarantees it has retired. One-shot.
+        if (compositeAuditCaptureQueued && !compositeAuditReported) {
+            commandQueue->Flush();  // ensure the back-buffer copy has retired
+
+            const PendingBackbufferCapture& cap = compositeAuditCapture;
+            bool mapped = false;
+            void* mappedPtr = nullptr;
+            if (cap.readback && cap.width > 0 && cap.height > 0 && cap.rowPitch > 0) {
+                const uint64_t needBytes =
+                    static_cast<uint64_t>(cap.rowPitch) * (cap.height - 1u) +
+                    static_cast<uint64_t>(cap.width) * 4u;
+                const D3D12_RANGE readRange{0, static_cast<SIZE_T>(needBytes)};
+                if (SUCCEEDED(cap.readback->Map(0, &readRange, &mappedPtr)) && mappedPtr) {
+                    mapped = true;
+                }
+            }
+
+            if (mapped) {
+                // Also persist the BMP so the color classification can be eyeballed.
+                WriteBackbufferBmp(cap);
+
+                const uint32_t W = cap.width, H = cap.height;
+                const uint32_t pitch = cap.rowPitch;
+                const auto* base = static_cast<const uint8_t*>(mappedPtr);
+                // Swapchain is R8G8B8A8_UNORM. Return linear [0,1] RGB for a pixel.
+                auto pixelRGB = [&](uint32_t x, uint32_t y, float& r, float& g, float& b) {
+                    const uint8_t* px = base + static_cast<size_t>(y) * pitch + static_cast<size_t>(x) * 4u;
+                    r = px[0] / 255.0f; g = px[1] / 255.0f; b = px[2] / 255.0f;
+                };
+
+                // --- Calibrate sky reference from the top rows (always sky) ---
+                double skyR = 0.0, skyG = 0.0, skyB = 0.0; uint32_t skyN = 0;
+                for (uint32_t y = 0; y < std::min<uint32_t>(H, 16u); ++y) {
+                    for (uint32_t x = 0; x < W; x += 8) {
+                        float r, g, b; pixelRGB(x, y, r, g, b);
+                        skyR += r; skyG += g; skyB += b; ++skyN;
+                    }
+                }
+                if (skyN > 0) { skyR /= skyN; skyG /= skyN; skyB /= skyN; }
+                const float skyLum = static_cast<float>(0.299 * skyR + 0.587 * skyG + 0.114 * skyB);
+
+                // Classify a final on-screen color into 0=SKY 1=WATER 2=TERRAIN.
+                // Sky:   bright, blue-dominant, small R/G separation, B near sky ref.
+                // Water: blue/teal-dominant but DARK (engine deep water 0.05-0.30),
+                //        G>=R, low luminance, clearly dimmer than sky.
+                // Terrain: everything else (tan/sand, green, grey stone).
+                auto classifyColor = [&](float r, float g, float b) -> int {
+                    const float lum = 0.299f * r + 0.587f * g + 0.114f * b;
+                    const bool blueDom = (b > r + 0.04f) && (b >= g - 0.02f);
+                    // Sky: near the sampled sky color OR bright blue-dominant.
+                    const bool nearSky =
+                        std::fabs(r - static_cast<float>(skyR)) < 0.16f &&
+                        std::fabs(g - static_cast<float>(skyG)) < 0.16f &&
+                        std::fabs(b - static_cast<float>(skyB)) < 0.16f;
+                    if ((nearSky && lum > skyLum * 0.80f) ||
+                        (blueDom && lum > 0.52f && b > 0.62f)) {
+                        return 0;  // SKY
+                    }
+                    // Water: blue/teal-dominant, darker than sky, greenish-blue.
+                    const bool tealish = (b > r + 0.03f) && (g > r - 0.02f);
+                    if (tealish && lum < 0.50f && b > 0.18f && b < 0.78f) {
+                        return 1;  // WATER
+                    }
+                    return 2;      // TERRAIN
+                };
+
+                // Ground-truth march (same math as the raymarch audit).
+                Simulation::SparseTerrainGenerator gtruth(sparseWorldConfig.seed);
+                constexpr float kSeaLevel = static_cast<float>(Simulation::SEA_LEVEL_Y);
+                constexpr float kFarCap = 9200.0f;
+                const glm::vec3 camPos = renderAuditCamPos;
+                const glm::vec3 fwd = renderAuditCamForward;
+                const glm::vec3 rgt = renderAuditCamRight;
+                const glm::vec3 upv = renderAuditCamUp;
+                const float tanHalfFov = std::tan(renderAuditFov * 0.5f);
+                const float aspect = renderAuditAspect;
+
+                // Returns expected distance and kind: 0=SKY 1=TERRAIN 2=WATER.
+                auto marchExpected = [&](const glm::vec3& dir, float& outDist, int& outKind) {
+                    outDist = 1e20f; outKind = 0;
+                    float t = 1.0f;
+                    float prevAbove = 1.0f; bool havePrev = false;
+                    while (t < kFarCap) {
+                        const glm::vec3 p = camPos + dir * t;
+                        const float terrainTop = gtruth.HeightAt(
+                            static_cast<int32_t>(std::floor(p.x)),
+                            static_cast<int32_t>(std::floor(p.z)));
+                        const bool isLand = terrainTop > kSeaLevel;
+                        const float visibleSurface = isLand ? terrainTop : kSeaLevel;
+                        const float above = p.y - visibleSurface;
+                        if ((havePrev && above <= 0.0f && prevAbove > 0.0f) ||
+                            (above <= 0.0f && !havePrev)) {
+                            outDist = t; outKind = isLand ? 1 : 2; return;
+                        }
+                        prevAbove = above; havePrev = true;
+                        t += std::clamp(t * 0.01f, 2.0f, 24.0f);
+                    }
+                };
+
+                std::filesystem::path binDir = std::filesystem::current_path();
+                std::ofstream cCsv(binDir / "render_audit_composite.csv");
+                cCsv << "bucket,rays,pctMatch,pctHoleSky,pctWaterForLand,pctLandForWater,"
+                        "actualSky,actualWater,actualTerrain\n";
+
+                constexpr int kBuckets = 10;
+                struct CBucket {
+                    uint64_t count = 0, match = 0, holeSky = 0, waterForLand = 0,
+                             landForWater = 0;
+                    uint64_t aSky = 0, aWater = 0, aTerrain = 0;
+                } cb[kBuckets];
+
+                uint64_t sampled = 0, calSky = 0, calWater = 0, calTerrain = 0;
+                for (uint32_t py = 0; py < H; py += 8) {
+                    for (uint32_t px = 0; px < W; px += 8) {
+                        float r, g, b; pixelRGB(px, py, r, g, b);
+                        const int actualKind = classifyColor(r, g, b);  // 0 sky 1 water 2 terrain
+                        if (actualKind == 0) ++calSky;
+                        else if (actualKind == 1) ++calWater;
+                        else ++calTerrain;
+
+                        const float ndcX = ((static_cast<float>(px) + 0.5f) / static_cast<float>(W)) * 2.0f - 1.0f;
+                        float ndcY = ((static_cast<float>(py) + 0.5f) / static_cast<float>(H)) * 2.0f - 1.0f;
+                        ndcY = -ndcY;
+                        glm::vec3 dir = glm::normalize(
+                            fwd + rgt * (ndcX * tanHalfFov * aspect) + upv * (ndcY * tanHalfFov));
+
+                        float expDist; int expKind;  // 0 sky 1 terrain 2 water
+                        marchExpected(dir, expDist, expKind);
+                        if (expKind == 0) continue;  // expected sky: not bucketed (no hole possible)
+
+                        int b10 = std::min(kBuckets - 1, static_cast<int>(expDist / 1000.0f));
+                        CBucket& bk = cb[b10];
+                        bk.count++;
+                        if (actualKind == 0) bk.aSky++;
+                        else if (actualKind == 1) bk.aWater++;
+                        else bk.aTerrain++;
+
+                        // expKind: 1=TERRAIN expected, 2=WATER expected.
+                        // actualKind: 0=SKY 1=WATER 2=TERRAIN.
+                        if (expKind == 1) {            // expected TERRAIN
+                            if (actualKind == 2) bk.match++;
+                            else if (actualKind == 0) bk.holeSky++;       // see-through to sky
+                            else bk.waterForLand++;                       // bank shown as water
+                        } else {                       // expected WATER
+                            if (actualKind == 1) bk.match++;
+                            else if (actualKind == 0) bk.holeSky++;       // see-through to sky
+                            else bk.landForWater++;                       // water shown as land
+                        }
+                        ++sampled;
+                    }
+                }
+
+                const D3D12_RANGE noWrite{0, 0};
+                cap.readback->Unmap(0, &noWrite);
+
+                spdlog::info("[COMPOSITE-AUDIT] ===== FINAL ON-SCREEN COLOR vs EXPECTED, by expected distance =====");
+                spdlog::info("[COMPOSITE-AUDIT] seed={} cam=({:.1f},{:.1f},{:.1f}) sampled={} ({}x{}) bmp={}",
+                    sparseWorldConfig.seed, camPos.x, camPos.y, camPos.z, sampled, W, H, cap.path.string());
+                spdlog::info("[COMPOSITE-AUDIT] skyRef rgb=({:.2f},{:.2f},{:.2f}) lum={:.2f} | "
+                    "frame class counts sky={} water={} terrain={}",
+                    skyR, skyG, skyB, skyLum, calSky, calWater, calTerrain);
+                spdlog::info("[COMPOSITE-AUDIT] {:>11} {:>6} {:>7} {:>9} {:>13} {:>13} | actual sky/water/terrain",
+                    "bucket", "rays", "MATCH", "HOLE(sky)", "WATER_FOR_LAND", "LAND_FOR_WATER");
+                for (int i = 0; i < kBuckets; ++i) {
+                    const CBucket& bk = cb[i];
+                    char label[24];
+                    std::snprintf(label, sizeof(label), "%d-%d", i * 1000, (i + 1) * 1000);
+                    if (bk.count == 0) {
+                        spdlog::info("[COMPOSITE-AUDIT] {:>11} {:>6} (no expected-solid rays)", label, 0);
+                        cCsv << label << ",0,0,0,0,0,0,0,0\n";
+                        continue;
+                    }
+                    const double c = static_cast<double>(bk.count);
+                    const double pM = 100.0 * bk.match / c;
+                    const double pHole = 100.0 * bk.holeSky / c;
+                    const double pWFL = 100.0 * bk.waterForLand / c;
+                    const double pLFW = 100.0 * bk.landForWater / c;
+                    spdlog::info(
+                        "[COMPOSITE-AUDIT] {:>11} {:>6} {:>6.1f}% {:>8.1f}% {:>12.1f}% {:>12.1f}% | {}/{}/{}",
+                        label, bk.count, pM, pHole, pWFL, pLFW, bk.aSky, bk.aWater, bk.aTerrain);
+                    cCsv << label << ',' << bk.count << ','
+                         << pM << ',' << pHole << ',' << pWFL << ',' << pLFW << ','
+                         << bk.aSky << ',' << bk.aWater << ',' << bk.aTerrain << '\n';
+                }
+                cCsv.close();
+                spdlog::info("[COMPOSITE-AUDIT] wrote {} and {}",
+                    (binDir / "render_audit_composite.csv").string(), cap.path.string());
+                if (auto dl = spdlog::default_logger()) dl->flush();
+            } else {
+                spdlog::warn("[COMPOSITE-AUDIT] back-buffer readback unavailable; no composite audit emitted");
+            }
+            compositeAuditReported = true;
+            compositeAuditCaptureQueued = false;
+            compositeAuditCapture = PendingBackbufferCapture{};
+        }
 
         // Submit background chunk generation after the frame has been queued.
         // This keeps generation from sitting in front of the render pass on the

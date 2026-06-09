@@ -83,6 +83,14 @@ struct SparseSurfaceBrickRange {
 StructuredBuffer<SparseSurfaceFace> SparseSurfaceFaces : register(t16);
 StructuredBuffer<SparseSurfaceBrickRange> SparseSurfaceRanges : register(t17);
 RWStructuredBuffer<uint> RenderOwnershipStats : register(u0);
+// DEV-ONLY render audit output. One float4 per screen pixel:
+//   x = actual hit distance (1e20 == sky/miss)
+//   y = actual world-space hit Y
+//   z = asfloat(lodSourceId)  0=sky/miss 1=near-exact 2=mid-voxel-DDA 3=far-SVO/heightfield 4=background
+//   w = asfloat(materialId)
+// Written ONLY when frame.surfaceRasterParams.w > 0.5 (the audit flag), so the
+// hot path is untouched when audit is off.
+RWStructuredBuffer<float4> AuditOut : register(u1);
 
 static const uint SPARSE_BRICK_SIZE = 16u;
 static const uint SPARSE_BRICK_VOXEL_COUNT = 4096u;
@@ -6267,6 +6275,52 @@ PSOutput main(PSInput input) {
                 voxelColor.rgb = lerp(voxelColor.rgb, brushPreview.rgb, brushPreview.a);
             }
         }
+    }
+
+    // ===== DEV-ONLY render audit write =====
+    // Gated by the audit flag in surfaceRasterParams.w (CPU sets it ONLY when
+    // VENPOD_RENDER_AUDIT is on). Store already-computed hit values; no extra
+    // marching. lodSource is attributed from the engine's own ownership distances
+    // (backgroundOwnershipParams: x=mid start, y=far handoff, z=mid end) so the
+    // band reflects which LOD layer actually owned the pixel.
+    if (frame.surfaceRasterParams.w > 0.5f) {
+        const uint auditWidth = (uint)max(frame.viewportWidth, 1.0f);
+        const uint auditIndex = pixelCoord.y * auditWidth + pixelCoord.x;
+
+        const float hitDist = depthDistance;
+        const bool isMiss = hitDist > 1.0e9f;
+        const float hitWorldY = cameraPos.y + rayDir.y * hitDist;
+
+        // Material of the owning hit, from the shaded color path is not directly
+        // available here, so report MAT_AIR for sky/miss and a coarse non-air
+        // marker otherwise (1). The classification in CPU uses lodSource + Y.
+        uint auditMaterial = isMiss ? (uint)MAT_AIR : 1u;
+
+        const float midStart = frame.backgroundOwnershipParams.x;
+        const float farHandoff = frame.backgroundOwnershipParams.y;
+        const float midEnd = frame.backgroundOwnershipParams.z;
+        const bool ownershipValid = frame.backgroundOwnershipParams.w > 0.5f;
+
+        uint lodSource;
+        if (isMiss) {
+            lodSource = 0u;                 // sky / miss
+        } else if (!ownershipValid) {
+            lodSource = 1u;                 // near exact (no LOD metadata)
+        } else if (midStart > 0.0f && hitDist < midStart) {
+            lodSource = 1u;                 // near exact surface
+        } else if (midEnd > 0.0f && hitDist < midEnd) {
+            lodSource = 2u;                 // mid-voxel DDA
+        } else if (farHandoff > 0.0f && hitDist < farHandoff + (midEnd - midStart)) {
+            lodSource = 3u;                 // far SVO / heightfield
+        } else {
+            lodSource = 4u;                 // background
+        }
+
+        AuditOut[auditIndex] = float4(
+            hitDist,
+            hitWorldY,
+            asfloat(lodSource),
+            asfloat(auditMaterial));
     }
 
     output.color = voxelColor;

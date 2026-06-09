@@ -17,6 +17,7 @@
 #include "../Core/Window.h"
 #include "../Utils/Result.h"
 #include <array>
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 
@@ -117,6 +118,10 @@ public:
         float exactNearDistance = 0.0f;
         uint32_t worldSeed = 12345u;
         uint32_t debugMode = 0;
+        // DEV-ONLY render audit. When true the fullscreen raymarch writes per-pixel
+        // hit (distance, worldY, lodSource, material) into the audit UAV. Gated
+        // entirely by VENPOD_RENDER_AUDIT; zero impact when false.
+        bool renderAuditEnabled = false;
     };
 
     // Brush preview parameters for rendering
@@ -204,7 +209,12 @@ public:
         const BrushPreview* brushPreview = nullptr,
         const CharacterPreview* characterPreview = nullptr,
         const SparseFarField* sparseFarField = nullptr,
-        const SparseNearField* sparseNearField = nullptr
+        const SparseNearField* sparseNearField = nullptr,
+        // DEV-ONLY: when true this is the dedicated render-audit draw. It binds the
+        // depth/stencil-disabled audit PSO, skips the background/mid composite
+        // splits, and renders the full raymarch over every pixel into the bound
+        // (main) render target so the audit UAV is written everywhere.
+        bool auditDrawMode = false
     );
 
     void RenderSparseSurfaceFaces(
@@ -241,6 +251,20 @@ public:
     // Accessors
     DescriptorHeapManager& GetHeapManager() { return m_heapManager; }
     ShaderCompiler& GetShaderCompiler() { return m_shaderCompiler; }
+
+    // ===== DEV-ONLY render audit (VENPOD_RENDER_AUDIT) =====
+    // Lazily create a screen-sized RWStructuredBuffer<float4> that the fullscreen
+    // raymarch writes per-pixel hit data into. Returns false if creation failed.
+    bool EnsureRenderAuditBuffer(uint32_t width, uint32_t height);
+    // Build the depth/stencil-disabled audit PSO if not already created.
+    bool EnsureRenderAuditPipeline();
+    // Copy the audit UAV into a readback buffer after the draw (call before the
+    // command list is closed/executed). Transitions the UAV to COPY_SOURCE and
+    // back to UAV.
+    void QueueRenderAuditReadback(ID3D12GraphicsCommandList* cmdList);
+    // Map the readback buffer (after the GPU has finished the frame that wrote it)
+    // and copy width*height float4 values into out. Returns false if unavailable.
+    bool ReadRenderAuditResults(std::vector<float>& out, uint32_t& width, uint32_t& height);
     DX12GraphicsPipeline& GetFullscreenPipeline() { return m_fullscreenPipeline; }
     ID3D12DescriptorHeap* GetShaderVisibleHeap() const { return m_heapManager.GetShaderVisibleCbvSrvUavHeap(); }
     ID3D12Device* GetDevice() const { return m_device->GetDevice(); }
@@ -297,6 +321,19 @@ private:
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_sparseSurfaceConstantUploads;
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_overlayConstantUploads;
     GPUBuffer m_dummyRenderOwnershipUAV;
+
+    // DEV-ONLY render audit. m_renderAuditUAV is a screen-sized
+    // RWStructuredBuffer<float4>; m_renderAuditReadback mirrors it for CPU map.
+    // Only allocated when EnsureRenderAuditBuffer() is first called.
+    // m_renderAuditPipeline is a depth/stencil-disabled clone of the fullscreen
+    // raymarch PSO used so the audit draw evaluates every pixel.
+    DX12GraphicsPipeline m_renderAuditPipeline;
+    GPUBuffer m_renderAuditUAV;
+    GPUBuffer m_renderAuditReadback;
+    uint32_t m_renderAuditWidth = 0;
+    uint32_t m_renderAuditHeight = 0;
+    bool m_renderAuditReadbackPending = false;
+
     uint32_t m_currentFrameIndex = 0;
     static constexpr uint64_t kFrameConstantUploadBytes = 512;
 

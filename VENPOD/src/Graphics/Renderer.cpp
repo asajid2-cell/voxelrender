@@ -347,6 +347,9 @@ void Renderer::Shutdown() {
         upload.Shutdown();
     }
     m_dummyRenderOwnershipUAV.Shutdown();
+    m_renderAuditPipeline.Shutdown();
+    m_renderAuditUAV.Shutdown();
+    m_renderAuditReadback.Shutdown();
     DestroyBackgroundPassResources();
     DestroyMidPassResources();
 
@@ -538,7 +541,8 @@ void Renderer::RenderVoxels(
     const BrushPreview* brushPreview,
     const CharacterPreview* characterPreview,
     const SparseFarField* sparseFarField,
-    const SparseNearField* sparseNearField)
+    const SparseNearField* sparseNearField,
+    bool auditDrawMode)
 {
     if (!cmdList) return;
 
@@ -546,7 +550,10 @@ void Renderer::RenderVoxels(
     ID3D12DescriptorHeap* heaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
     cmdList->SetDescriptorHeaps(1, heaps);
 
+    // The audit draw renders the full raymarch into the already-bound main render
+    // target at full resolution, with no background/mid composite split.
     const bool useBackgroundPassSplit =
+        !auditDrawMode &&
         UseBackgroundPassSplit() &&
         m_backgroundPassColor.Get() &&
         m_backgroundPassDepth.Get() &&
@@ -593,8 +600,15 @@ void Renderer::RenderVoxels(
             nullptr);
     }
 
-    // Bind fullscreen pipeline
-    m_fullscreenPipeline.Bind(cmdList);
+    // Bind fullscreen pipeline (or the depth/stencil-disabled audit clone).
+    if (auditDrawMode) {
+        // Render the full-res audit pass directly into the main render target.
+        SetMainRenderTarget(cmdList);
+        SetViewportAndScissor(cmdList, m_width, m_height);
+        m_renderAuditPipeline.Bind(cmdList);
+    } else {
+        m_fullscreenPipeline.Bind(cmdList);
+    }
     cmdList->OMSetStencilRef(0);
 
     FrameConstantsCpu constants = {};
@@ -738,6 +752,13 @@ void Renderer::RenderVoxels(
     constants.surfaceRasterParams[0] = NonNegativeFiniteOr(camera.surfaceRasterMaxDistance, 0.0f);
     constants.surfaceRasterParams[1] = 0.0f;
     constants.surfaceRasterParams[2] = 0.0f;
+    // w = DEV-ONLY render audit flag. Only set when audit is enabled AND the
+    // audit UAV is allocated, so the shader's gated audit write stays off
+    // entirely otherwise.
+    const bool renderAuditActiveThisDraw =
+        camera.renderAuditEnabled &&
+        m_renderAuditUAV.GetShaderVisibleUAV().IsValid();
+    constants.surfaceRasterParams[3] = renderAuditActiveThisDraw ? 1.0f : 0.0f;
 
     const bool sparseNearEnabled =
         sparseNearField &&
@@ -863,6 +884,16 @@ void Renderer::RenderVoxels(
         renderOwnershipEnabled
             ? sparseNearField->renderOwnershipUAV.gpu
             : m_dummyRenderOwnershipUAV.GetShaderVisibleUAV().gpu);
+    // u1: render audit. Bind the real audit buffer when the flag is on and it is
+    // allocated; otherwise the dummy keeps the root signature satisfied.
+    const bool auditBindThisDraw =
+        camera.renderAuditEnabled &&
+        m_renderAuditUAV.GetShaderVisibleUAV().IsValid();
+    cmdList->SetGraphicsRootDescriptorTable(
+        20,
+        auditBindThisDraw
+            ? m_renderAuditUAV.GetShaderVisibleUAV().gpu
+            : m_dummyRenderOwnershipUAV.GetShaderVisibleUAV().gpu);
 
     // Draw fullscreen triangle. The force-color probe intentionally leaves the
     // lower-resolution target at a known clear color to test RTV/SRV/composite
@@ -895,6 +926,7 @@ void Renderer::RenderVoxels(
     // miss) and alpha-over blends it on top, so mid terrain gets the heavy
     // analytic-gradient shading while the full pass keeps near/far/sky.
     const bool useMidPassSplit =
+        !auditDrawMode &&
         m_config.midPassEnabled &&
         m_midPassPipeline.GetPSO() != nullptr &&
         m_midCompositePipeline.GetPSO() != nullptr &&
@@ -955,6 +987,11 @@ void Renderer::RenderVoxels(
             renderOwnershipEnabled
                 ? sparseNearField->renderOwnershipUAV.gpu
                 : m_dummyRenderOwnershipUAV.GetShaderVisibleUAV().gpu);
+        // u1: the mid-only variant never writes the audit buffer (it returns
+        // early), but the root signature still requires u1 to be bound.
+        cmdList->SetGraphicsRootDescriptorTable(
+            20,
+            m_dummyRenderOwnershipUAV.GetShaderVisibleUAV().gpu);
 
         cmdList->DrawInstanced(3, 1, 0, 0);
 
@@ -1425,6 +1462,17 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
     pipelineDesc.rootParams.push_back({
         RootParamType::DescriptorTable,
         0,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+    });
+    // u1: DEV-ONLY render audit per-pixel hit buffer. The shader only writes it
+    // when frame.surfaceRasterParams.w > 0.5 (VENPOD_RENDER_AUDIT). It is always
+    // bound (dummy when audit is off) so the root signature stays static.
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        1,  // register u1
         0,
         D3D12_SHADER_VISIBILITY_PIXEL,
         1,
@@ -2251,6 +2299,180 @@ Result<void> Renderer::CreateMidPassResources() {
         m_midPassSrv.heapIndex,
         m_midPassStagingSrv.heapIndex);
     return {};
+}
+
+// =============================================================================
+// DEV-ONLY render audit (VENPOD_RENDER_AUDIT)
+// =============================================================================
+
+bool Renderer::EnsureRenderAuditPipeline() {
+    if (m_renderAuditPipeline.GetPSO() != nullptr) {
+        return true;
+    }
+    if (!m_fullscreenPS.IsValid() || !m_fullscreenVS.IsValid()) {
+        spdlog::error("RenderAudit: fullscreen shaders unavailable for audit PSO");
+        return false;
+    }
+
+    // Clone the fullscreen raymarch PSO description but disable depth AND stencil
+    // so the audit draw shades EVERY pixel (the normal pass is stencil-gated so it
+    // skips pixels the raster surface owns). Reuses the same already-compiled PS,
+    // so this does NOT trigger another multi-minute shader recompile.
+    GraphicsPipelineDesc desc;
+    desc.vertexShader = m_fullscreenVS;
+    desc.pixelShader = m_fullscreenPS;
+    desc.debugName = "RenderAuditPipeline";
+
+    // b0 CBV + t0..t17 SRVs + u0 + u1 (must match the fullscreen root signature).
+    RootParameter cbv;
+    cbv.type = RootParamType::ConstantBuffer;
+    cbv.shaderRegister = 0;
+    cbv.registerSpace = 0;
+    cbv.visibility = D3D12_SHADER_VISIBILITY_ALL;
+    desc.rootParams.push_back(cbv);
+    for (uint32_t reg = 0; reg <= 17; ++reg) {
+        desc.rootParams.push_back({
+            RootParamType::DescriptorTable, reg, 0,
+            D3D12_SHADER_VISIBILITY_PIXEL, 1, D3D12_DESCRIPTOR_RANGE_TYPE_SRV });
+    }
+    desc.rootParams.push_back({
+        RootParamType::DescriptorTable, 0, 0,
+        D3D12_SHADER_VISIBILITY_PIXEL, 1, D3D12_DESCRIPTOR_RANGE_TYPE_UAV }); // u0
+    desc.rootParams.push_back({
+        RootParamType::DescriptorTable, 1, 0,
+        D3D12_SHADER_VISIBILITY_PIXEL, 1, D3D12_DESCRIPTOR_RANGE_TYPE_UAV }); // u1
+
+    desc.staticSamplers.push_back({
+        0, 0,
+        D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_SHADER_VISIBILITY_PIXEL });
+
+    desc.rtvFormats.push_back(DXGI_FORMAT_R8G8B8A8_UNORM);
+    desc.inputLayout.clear();
+    // No depth/stencil: every pixel runs the PS.
+    desc.depthEnable = false;
+    desc.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    desc.stencilEnable = false;
+    desc.dsvFormat = DXGI_FORMAT_UNKNOWN;
+    desc.frontCounterClockwise = true;
+    desc.cullMode = D3D12_CULL_MODE_NONE;
+
+    ID3D12Device* device = GetDevice();
+    if (!device) {
+        return false;
+    }
+    auto result = m_renderAuditPipeline.Initialize(device, desc);
+    if (!result) {
+        spdlog::error("RenderAudit: failed to create audit PSO: {}", result.error());
+        return false;
+    }
+    spdlog::info("RenderAudit: audit PSO created (depth/stencil disabled)");
+    return true;
+}
+
+bool Renderer::EnsureRenderAuditBuffer(uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0) {
+        return false;
+    }
+    if (m_renderAuditUAV.GetShaderVisibleUAV().IsValid() &&
+        m_renderAuditWidth == width &&
+        m_renderAuditHeight == height) {
+        return true;
+    }
+
+    m_renderAuditUAV.Shutdown();
+    m_renderAuditReadback.Shutdown();
+    m_renderAuditWidth = 0;
+    m_renderAuditHeight = 0;
+    m_renderAuditReadbackPending = false;
+
+    ID3D12Device* device = GetDevice();
+    if (!device) {
+        return false;
+    }
+
+    const uint64_t elementCount = static_cast<uint64_t>(width) * static_cast<uint64_t>(height);
+    const uint64_t byteCount = elementCount * sizeof(float) * 4ull; // float4 per pixel
+
+    auto result = m_renderAuditUAV.Initialize(
+        device,
+        byteCount,
+        BufferUsage::StructuredBuffer | BufferUsage::UnorderedAccess,
+        sizeof(float) * 4u,
+        "RenderAuditUAV");
+    if (!result) {
+        spdlog::error("RenderAudit: failed to create UAV buffer: {}", result.error());
+        return false;
+    }
+    result = m_renderAuditUAV.CreateUAV(device, m_heapManager);
+    if (!result) {
+        spdlog::error("RenderAudit: failed to create UAV view: {}", result.error());
+        m_renderAuditUAV.Shutdown();
+        return false;
+    }
+
+    result = m_renderAuditReadback.Initialize(
+        device,
+        byteCount,
+        BufferUsage::Readback,
+        sizeof(float) * 4u,
+        "RenderAuditReadback");
+    if (!result) {
+        spdlog::error("RenderAudit: failed to create readback buffer: {}", result.error());
+        m_renderAuditUAV.Shutdown();
+        return false;
+    }
+
+    m_renderAuditWidth = width;
+    m_renderAuditHeight = height;
+    spdlog::info("RenderAudit: allocated {}x{} audit buffer ({} bytes)", width, height, byteCount);
+    return true;
+}
+
+void Renderer::QueueRenderAuditReadback(ID3D12GraphicsCommandList* cmdList) {
+    if (!cmdList ||
+        !m_renderAuditUAV.GetShaderVisibleUAV().IsValid() ||
+        m_renderAuditReadback.GetResource() == nullptr) {
+        return;
+    }
+
+    // The shader wrote the UAV during the fullscreen draw. Move it to COPY_SOURCE,
+    // copy into the readback buffer, then restore so a later draw can write again.
+    m_renderAuditUAV.TransitionTo(cmdList, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmdList->CopyResource(
+        m_renderAuditReadback.GetResource(),
+        m_renderAuditUAV.GetResource());
+    m_renderAuditUAV.TransitionTo(cmdList, D3D12_RESOURCE_STATE_COMMON);
+    m_renderAuditReadbackPending = true;
+}
+
+bool Renderer::ReadRenderAuditResults(std::vector<float>& out, uint32_t& width, uint32_t& height) {
+    if (!m_renderAuditReadbackPending ||
+        m_renderAuditReadback.GetResource() == nullptr ||
+        m_renderAuditWidth == 0 ||
+        m_renderAuditHeight == 0) {
+        return false;
+    }
+
+    const size_t floatCount =
+        static_cast<size_t>(m_renderAuditWidth) *
+        static_cast<size_t>(m_renderAuditHeight) * 4u;
+
+    void* mapped = m_renderAuditReadback.Map();
+    if (!mapped) {
+        return false;
+    }
+    out.resize(floatCount);
+    std::memcpy(out.data(), mapped, floatCount * sizeof(float));
+    m_renderAuditReadback.Unmap();
+
+    width = m_renderAuditWidth;
+    height = m_renderAuditHeight;
+    m_renderAuditReadbackPending = false;
+    return true;
 }
 
 } // namespace VENPOD::Graphics
