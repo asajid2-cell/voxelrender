@@ -699,8 +699,8 @@ try {
         # the last big synchronous CPU item ~9ms) off the main thread -> path to steady 60.
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_GEN = "1"
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_VISIBLE_CRITICAL_GEN = "1"
-        $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_ENQUEUE = "128"
-        $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_APPLY = "128"
+        $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_ENQUEUE = "256"
+        $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_APPLY = "256"
         # Mid-voxel interest radius is the dominant per-frame CPU driver (clip/req/upload
         # scale ~quadratically with it; default 8 -> ~9200 bricks). Shrink it for fps; the
         # far LOD + background pass fill beyond the mid-detail radius. quality keeps 8.
