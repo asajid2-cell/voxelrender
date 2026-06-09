@@ -873,6 +873,52 @@ void Renderer::RenderVoxels(
         cmdList->SetGraphicsRootDescriptorTable(0, m_backgroundPassSrv.gpu);
         cmdList->DrawInstanced(3, 1, 0, 0);
     }
+
+    // Mid-only raymarch overlay. The full raymarch pass has now drawn (and, in
+    // the background-pass-split case, composited) to the MAIN render target.
+    // This second pipeline re-shades the same fullscreen triangle with the
+    // RAYMARCH_MID_ONLY variant (alpha=1 on a mid-terrain hit, alpha=0 on a
+    // miss) and alpha-over blends it on top, so mid terrain gets the heavy
+    // analytic-gradient shading while the full pass keeps near/far/sky.
+    if (m_config.midPassEnabled && m_midPassPipeline.GetPSO() != nullptr) {
+        // Ensure we draw to the MAIN full-resolution RTV (the split path above
+        // already rebinds it; do it unconditionally so the non-split path and
+        // the full-res viewport are guaranteed for the overlay).
+        SetMainRenderTarget(cmdList);
+        m_midPassPipeline.Bind(cmdList);
+        ID3D12DescriptorHeap* midHeaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
+        cmdList->SetDescriptorHeaps(1, midHeaps);
+        cmdList->OMSetStencilRef(0);
+
+        // Re-set the exact same root bindings used by the fullscreen draw above.
+        // The mid pipeline shares the fullscreen root signature layout.
+        cmdList->SetGraphicsRootConstantBufferView(0, frameConstantsUpload.GetGPUVirtualAddress());
+        cmdList->SetGraphicsRootDescriptorTable(1, voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(2, materialPaletteSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(3, farFieldEnabled ? sparseFarField->nodeSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(4, farFieldEnabled ? sparseFarField->pageSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(5, farFieldEnabled ? sparseFarField->pageIndexSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(6, chunkValidMaskSRV.IsValid() ? chunkValidMaskSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(7, (sparseNearEnabled && (sparseBindingMask & (1u << 0))) ? sparseNearField->brickPoolSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(8, (sparseNearEnabled && (sparseBindingMask & (1u << 1))) ? sparseNearField->pageTableSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(9, (sparseNearEnabled && (sparseBindingMask & (1u << 2))) ? sparseNearField->occupancySRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(10, (sparseNearEnabled && (sparseBindingMask & (1u << 3))) ? sparseNearField->pageGenerationSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(11, (midClipmapEnabled && (sparseBindingMask & (1u << 4))) ? sparseNearField->midClipmapMetadataSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(12, (midClipmapEnabled && (sparseBindingMask & (1u << 5))) ? sparseNearField->midClipmapLookupSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(13, (midClipmapEnabled && (sparseBindingMask & (1u << 6))) ? sparseNearField->midClipmapSamplesSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(14, (midClipmapEnabled && (sparseBindingMask & (1u << 7))) ? sparseNearField->midVoxelClipmapMetadataSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(15, (midClipmapEnabled && (sparseBindingMask & (1u << 8))) ? sparseNearField->midVoxelClipmapLookupSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(16, (midClipmapEnabled && (sparseBindingMask & (1u << 9))) ? sparseNearField->midVoxelClipmapSamplesSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(17, (surfaceEnabled && (sparseBindingMask & (1u << 10))) ? sparseNearField->surfaceFacesSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(18, (surfaceEnabled && (sparseBindingMask & (1u << 11))) ? sparseNearField->surfaceRangesSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(
+            19,
+            renderOwnershipEnabled
+                ? sparseNearField->renderOwnershipUAV.gpu
+                : m_dummyRenderOwnershipUAV.GetShaderVisibleUAV().gpu);
+
+        cmdList->DrawInstanced(3, 1, 0, 0);
+    }
 }
 
 void Renderer::RenderSparseSurfaceFaces(
@@ -1371,6 +1417,57 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
     }
 
     spdlog::info("Fullscreen pipeline created successfully");
+
+    // Optionally build a second "mid-only" raymarch overlay pipeline that reuses
+    // this exact pipeline description (root signature, depth/stencil, RTV) but
+    // swaps in the RAYMARCH_MID_ONLY shader variant and alpha-over blending. It
+    // is composited over the full raymarch pass at draw time.
+    if (m_config.midPassEnabled) {
+        auto midResult = CreateMidPassPipeline(device, pipelineDesc);
+        if (!midResult) {
+            return Error("Failed to create mid pass pipeline: {}", midResult.error());
+        }
+    }
+
+    return {};
+}
+
+Result<void> Renderer::CreateMidPassPipeline(ID3D12Device* device, GraphicsPipelineDesc fullscreenDesc) {
+    // Compile the mid-only variant of PS_Raymarch (RAYMARCH_MID_ONLY=1). This is
+    // the small analytic-gradient shading path that does not fit the full
+    // uber-shader PSO, so it gets its own pipeline.
+    std::filesystem::path psPath = m_config.shaderPath / "Graphics" / "PS_Raymarch.hlsl";
+
+    ShaderCompileOptions psOptions;
+    psOptions.entryPoint = L"main";
+    psOptions.target = L"ps_6_0";
+    psOptions.debugInfo = m_config.debugShaders;
+    psOptions.optimizationLevel3 = true;
+    psOptions.defines.push_back(L"RAYMARCH_MID_ONLY=1");
+    auto psResult = m_shaderCompiler.CompileFromFile(psPath, psOptions);
+    if (!psResult) {
+        return Error("Failed to compile mid pass pixel shader: {}", psResult.error());
+    }
+    m_midPassPS = psResult.value();
+    if (!m_midPassPS.IsValid()) {
+        return Error("Mid pass pixel shader compilation failed: {}", m_midPassPS.errors);
+    }
+
+    // Reuse the fullscreen pipeline description verbatim (same root params,
+    // sampler, RTV format, depth/stencil, cull) and only swap the pixel shader
+    // and enable alpha-over blending so the mid terrain composites over the
+    // already-drawn full raymarch pass.
+    fullscreenDesc.vertexShader = m_fullscreenVS;
+    fullscreenDesc.pixelShader = m_midPassPS;
+    fullscreenDesc.blendEnable = true;
+    fullscreenDesc.debugName = "MidPassPipeline";
+
+    auto result = m_midPassPipeline.Initialize(device, fullscreenDesc);
+    if (!result) {
+        return Error("Failed to create mid pass pipeline: {}", result.error());
+    }
+
+    spdlog::info("Mid pass pipeline created successfully");
     return {};
 }
 

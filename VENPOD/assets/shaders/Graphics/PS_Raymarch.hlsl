@@ -1981,12 +1981,33 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
                     hitDistance,
                     ring0MidVoxel ? 0.52f : 0.72f);
                 baseColor.rgb = ApplyWaterlineWetTerrainTint(baseColor.rgb, material, hitPos.y, normal.y, 0.78f);
+#ifdef RAYMARCH_MID_ONLY
+                // ANALYTIC GRADIENT NORMAL (mid-only pass): central-difference the terrain
+                // height field instead of the blocky 6-neighbor voxel-face normal, so the
+                // terraced coarse LOD shades as real mountain slopes. Epsilon scales with the
+                // LOD cell -> low-pass filters height noise to the geometry frequency (no
+                // shimmer). smoothstep geomorph keeps crisp voxel normals near, smooth far.
+                // (Lives only in the mid-only PSO; the 4 FarTerrainHeight inlines are too heavy
+                // for the uber-shader's PSO to compile, which is the whole reason for the split.)
+                float gradE = max(actualCellSize * 1.5f, 10.0f);
+                float gmmN, gsmN, grmN;
+                float ghL = FarTerrainHeight(hitPos.xz - float2(gradE, 0.0f), gmmN, gsmN, grmN);
+                float ghR = FarTerrainHeight(hitPos.xz + float2(gradE, 0.0f), gmmN, gsmN, grmN);
+                float ghD = FarTerrainHeight(hitPos.xz - float2(0.0f, gradE), gmmN, gsmN, grmN);
+                float ghU = FarTerrainHeight(hitPos.xz + float2(0.0f, gradE), gmmN, gsmN, grmN);
+                float3 gradNormal = normalize(float3(ghL - ghR, 2.0f * gradE, ghD - ghU));
+                float midSmoothBlend = smoothstep(512.0f, 1400.0f, hitDistance);
+                float3 shadeNormal = normalize(lerp(normal, gradNormal, midSmoothBlend));
+                float ndotl = max(dot(shadeNormal, SkySunDirection()), 0.0f);
+                float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.42f + ndotl * 0.82f + 0.06f);
+#else
                 float3 shadeNormal = DistantLodShadeNormal(
                     normal,
                     hitDistance,
                     ring0MidVoxel ? 0.34f : 0.18f);
                 float ndotl = saturate(dot(shadeNormal, SkySunDirection()) * 0.62f + 0.28f);
                 float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.76f + ndotl * 0.34f);
+#endif
                 const float nearMidContext = 1.0f - saturate((hitDistance - startDistance) / 620.0f);
                 const float3 contextLift = lerp(SkyColor(rayDir), float3(0.48f, 0.52f, 0.48f), 0.35f);
                 color = lerp(color, contextLift, nearMidContext * 0.08f);
@@ -2003,7 +2024,11 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
                     voxelHit = MakeHit(float4(float3(fogFactor, fogFactor, fogFactor), 1.0f), hitDistance);
                     return true;
                 }
+#ifdef RAYMARCH_MID_ONLY
+                color = lerp(color, SkyColor(rayDir), fogFactor * 0.12f);
+#else
                 color = lerp(color, SkyColor(rayDir), fogFactor * 0.34f);
+#endif
                 if (frame.debugMode == 9u) {
                     color = lerp(color, float3(1.0f, 0.58f, 0.10f), 0.52f);
                 }
@@ -6138,6 +6163,24 @@ PSOutput main(PSInput input) {
         right * ndc.x * tanHalfFov * aspectRatio +
         up * ndc.y * tanHalfFov
     );
+
+#ifdef RAYMARCH_MID_ONLY
+    // MID-ONLY pass: a separate, simpler PSO (DXC strips far/background/near via dead-code
+    // elimination) that renders ONLY the mid-voxel DDA with the analytic gradient shading
+    // (which is too heavy to fit the uber-shader's PSO). Drawn over the full pass with alpha
+    // blending: alpha=1 where mid terrain is hit (gradient color wins), alpha=0 elsewhere
+    // (full pass's far/background/sky shows through). No depth needed.
+    {
+        RayHit midHit;
+        bool midGot = RaymarchMidVoxelClipmap(cameraPos, rayDir, 1.0f, midHit);
+        if (!midGot || midHit.distance > 1.0e9f) {
+            output.color = float4(0.0f, 0.0f, 0.0f, 0.0f);   // miss -> transparent
+        } else {
+            output.color = float4(midHit.color.rgb, 1.0f);   // mid terrain -> opaque (gradient)
+        }
+        return output;
+    }
+#endif
 
     if (frame.debugMode == 42u) {
         output.color = float4(0.08f, 0.16f, 0.22f, 1.0f);

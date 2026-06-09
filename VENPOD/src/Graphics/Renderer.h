@@ -38,6 +38,7 @@ struct RendererConfig {
     bool backgroundPassForceColor = false;
     bool backgroundPassCompositeDebug = false;
     bool backgroundPassCompositeForceColor = false;
+    bool midPassEnabled = false;
 };
 
 class Renderer {
@@ -245,6 +246,11 @@ public:
 
 private:
     Result<void> CreateFullscreenPipeline(ID3D12Device* device);
+    // Builds the "mid-only" raymarch overlay PSO. It reuses the fullscreen
+    // raymarch pipeline's root signature / depth-stencil / RTV description
+    // (passed in as fullscreenDesc) and only swaps the pixel shader for the
+    // RAYMARCH_MID_ONLY=1 variant plus alpha-over blending.
+    Result<void> CreateMidPassPipeline(ID3D12Device* device, GraphicsPipelineDesc fullscreenDesc);
     Result<void> CreateSparseSurfacePipeline(ID3D12Device* device);
     Result<void> CreateOverlayPipeline(ID3D12Device* device);
     Result<void> CreateBackgroundCompositePipeline(ID3D12Device* device);
@@ -269,12 +275,14 @@ private:
 
     // Fullscreen rendering pipeline
     DX12GraphicsPipeline m_fullscreenPipeline;
+    DX12GraphicsPipeline m_midPassPipeline;
     DX12GraphicsPipeline m_sparseSurfacePipeline;
     DX12GraphicsPipeline m_overlayPipeline;
     DX12GraphicsPipeline m_backgroundCompositePipeline;
     ComPtr<ID3D12CommandSignature> m_sparseSurfaceDrawSignature;
     CompiledShader m_fullscreenVS;
     CompiledShader m_fullscreenPS;
+    CompiledShader m_midPassPS;
     CompiledShader m_sparseSurfaceVS;
     CompiledShader m_sparseSurfacePS;
     CompiledShader m_overlayPS;
