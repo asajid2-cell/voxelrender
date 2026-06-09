@@ -1332,12 +1332,21 @@ float FarVoxelOctree::TerrainHeight(float x, float z) const {
 
     // VISUAL PASS iter1 (small consistent block steps): PARITY mirror of CPU terrace
     // quantization (3-unit step on lowland/plains band, fading into hills).
+    // VISUAL PASS iter2 (coherent shore): PARITY mirror — also fade the terrace OUT
+    // near/below the waterline (off by SEA+8, full by SEA+40) for a smooth sloped
+    // shore instead of a stepped staircase into the water plane.
     const float terraceStep = 3.0f;
-    const float terraceBlend =
+    const float terraceUpperFade =
         1.0f - Smooth01(std::clamp(
             (height - static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y + 64)) / 150.0f,
             0.0f,
             1.0f));
+    const float terraceShoreFade =
+        Smooth01(std::clamp(
+            (height - static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y + 8)) / 32.0f,
+            0.0f,
+            1.0f));
+    const float terraceBlend = terraceUpperFade * terraceShoreFade;
     if (terraceBlend > 0.0f) {
         const float terraced = std::floor(height / terraceStep) * terraceStep;
         height = height + (terraced - height) * terraceBlend;

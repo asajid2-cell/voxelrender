@@ -256,10 +256,19 @@ float SparseTerrainGenerator::HeightAt(int32_t worldX, int32_t worldZ) const {
     // band to a 3-unit terrace so flats render as clean block plateaus rather than
     // a 1-voxel contour gradient. The blend fades out as terrain rises into the
     // hill/mountain band (above SEA+150) so peaks keep their full relief.
+    // VISUAL PASS iter2 (coherent shore): also fade the terrace OUT near and below
+    // the waterline (off by SEA+8, full by SEA+40). The terrace staircase used to
+    // run straight into the flat water plane, producing the ugly stepped/jagged
+    // coast. Suppressing it in the shore band lets the smooth shelf terms above
+    // form a coherent sloped beach where land meets sea.
     const float terraceStep = 3.0f;
-    const float terraceBlend =
+    const float terraceUpperFade =
         1.0f - Smooth01(std::clamp(
             (height - static_cast<float>(SEA_LEVEL_Y + 64)) / 150.0f, 0.0f, 1.0f));
+    const float terraceShoreFade =
+        Smooth01(std::clamp(
+            (height - static_cast<float>(SEA_LEVEL_Y + 8)) / 32.0f, 0.0f, 1.0f));
+    const float terraceBlend = terraceUpperFade * terraceShoreFade;
     if (terraceBlend > 0.0f) {
         const float terraced = std::floor(height / terraceStep) * terraceStep;
         height = Lerp(height, terraced, terraceBlend);

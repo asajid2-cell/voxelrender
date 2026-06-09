@@ -292,9 +292,15 @@ float TH_HeightAt(int worldX, int worldZ, uint seed) {
     // VISUAL PASS iter1 (small consistent block steps): PARITY mirror of CPU
     // terrace quantization (3-unit step on the lowland/plains band, fading out into
     // hills above SEA+64..+214). std::floor -> floor, std::clamp(,0,1) -> saturate.
+    // VISUAL PASS iter2 (coherent shore): PARITY mirror — also fade the terrace OUT
+    // near/below the waterline (off by SEA+8, full by SEA+40) so the shore is a
+    // smooth sloped beach, not a stepped staircase into the flat water plane.
     float terraceStep = 3.0f;
-    float terraceBlend =
+    float terraceUpperFade =
         1.0f - TH_Smooth01(saturate((height - (float)(TH_SEA_LEVEL_Y + 64)) / 150.0f));
+    float terraceShoreFade =
+        TH_Smooth01(saturate((height - (float)(TH_SEA_LEVEL_Y + 8)) / 32.0f));
+    float terraceBlend = terraceUpperFade * terraceShoreFade;
     if (terraceBlend > 0.0f) {
         float terraced = floor(height / terraceStep) * terraceStep;
         height = TH_Lerp(height, terraced, terraceBlend);

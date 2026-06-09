@@ -3358,11 +3358,21 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     int farStepBudget = frame.renderBudgetParams.z < 0.6f
         ? ScaleFarFieldStepBudget(28, 20, 14)
         : (frame.renderBudgetParams.z < 0.9f
-            ? ScaleFarFieldStepBudget(48, 36, 26)
-            : ScaleFarFieldStepBudget(64, 48, 34));
+            ? ScaleFarFieldStepBudget(40, 30, 22)
+            : ScaleFarFieldStepBudget(52, 40, 28));
+    // PERF (recover fps after the 0.12->0.22 silhouette widening): upward-grazing
+    // rays (rayDir.y > 0.06) only paint the thin mountain-tip silhouette band; past
+    // the peaks they march to budget and return sky. They need far fewer steps than
+    // downward rays that resolve a real surface, and the per-step height sample is
+    // the dominant far-march cost. Halving their budget cuts the cost the widened
+    // band added while keeping the continuous lit horizon (the silhouette band is
+    // still owned up to 0.22; downward/level rays keep the full budget).
+    if (rayDir.y > 0.06f) {
+        farStepBudget = max(farStepBudget / 2, 12);
+    }
     [loop]
     for (int i = 0; i < farStepBudget && t < farMaxDist; ++i) {
-        float distanceStep = lerp(96.0f, 360.0f, saturate(t / farMaxDist));
+        float distanceStep = lerp(128.0f, 420.0f, saturate(t / farMaxDist));
         float svoStep = frame.renderBudgetParams.z > 0.92f
             ? FarSvoSuggestedStep(rayOrigin, rayDir, t)
             : distanceStep;
