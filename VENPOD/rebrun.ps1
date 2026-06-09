@@ -633,6 +633,9 @@ try {
         "VENPOD_SPARSE_MID_CLIPMAP_ASYNC_VISIBLE_CRITICAL_GEN",
         "VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_ENQUEUE",
         "VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_APPLY",
+        "VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_VISIBLE_PUMP",
+        "VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_PERSISTENT_WORKERS",
+        "VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_PUMP_MAX_WORKERS",
         "VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ",
         "VENPOD_SPARSE_MID_INTEREST_INTERVAL",
         "VENPOD_SPARSE_MID_CLIPMAP_FOOTPRINT_INTEREST_SIGNATURE",
@@ -701,6 +704,12 @@ try {
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_VISIBLE_CRITICAL_GEN = "1"
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_ENQUEUE = "256"
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_APPLY = "256"
+        # Parallel VISIBLE mid-voxel pump across worker threads (default is single-threaded ->
+        # terrain you are looking at generates one brick at a time = 'streams in slowly'). 16
+        # cores available; 10 persistent workers fills the visible terrain much faster.
+        $env:VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_VISIBLE_PUMP = "1"
+        $env:VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_PERSISTENT_WORKERS = "1"
+        $env:VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_PUMP_MAX_WORKERS = "10"
         # Mid-voxel interest radius is the dominant per-frame CPU driver (clip/req/upload
         # scale ~quadratically with it; default 8 -> ~9200 bricks). Shrink it for fps; the
         # far LOD + background pass fill beyond the mid-detail radius. quality keeps 8.
