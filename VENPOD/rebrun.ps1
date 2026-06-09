@@ -637,6 +637,8 @@ try {
         "VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_PERSISTENT_WORKERS",
         "VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_PUMP_MAX_WORKERS",
         "VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ",
+        "VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION",
+        "VENPOD_RAYMARCH_MID_PASS_ENABLE",
         "VENPOD_SPARSE_MID_INTEREST_INTERVAL",
         "VENPOD_SPARSE_MID_CLIPMAP_FOOTPRINT_INTEREST_SIGNATURE",
         "VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE",
@@ -713,6 +715,19 @@ try {
         # Mid-voxel interest radius is the dominant per-frame CPU driver (clip/req/upload
         # scale ~quadratically with it; default 8 -> ~9200 bricks). Shrink it for fps; the
         # far LOD + background pass fill beyond the mid-detail radius. quality keeps 8.
+        # GPU mid-voxel terrain generation is the DEFAULT: the compute shader fills
+        # the sample pool (byte-identical to CPU), freeing the CPU per-voxel fill ->
+        # streaming keeps up at speed (no holes) + a larger render distance. Set
+        # VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION=0 to force the legacy CPU path.
+        if (-not $env:VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION) {
+            $env:VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION = "1"
+        }
+        # Mid-pass distant shading (low-res raymarch + analytic gradient normals,
+        # alpha-composited) is on by default too: distant terrain shades as real
+        # gradient-lit mountains instead of flat/grey. Set =0 to disable.
+        if (-not $env:VENPOD_RAYMARCH_MID_PASS_ENABLE) {
+            $env:VENPOD_RAYMARCH_MID_PASS_ENABLE = "1"
+        }
         # Phase 2: when GPU mid-voxel generation is ON, the CPU no longer pays the
         # per-voxel fill, so the grown render-distance bubble (radius default 12,
         # set in main_launcher when the GPU-gen flag is on) is affordable. Do NOT
