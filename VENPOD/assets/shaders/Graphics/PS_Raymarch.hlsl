@@ -1867,7 +1867,17 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
                     t = min(nextCellT, t + max(actualCellSize, 4.0f));
                     continue;
                 }
-                if (!exposedMidVoxel) {
+                // The FIRST solid mid-voxel the ray meets after air/missing is the
+                // front face of the coarse terrain volume. Its blocky 6-neighbor
+                // exposure normal often points sideways (a slope/bank cell whose
+                // up-neighbor is also solid), which previously made the
+                // normal-rejection below SKIP it -> the ray escaped to sky/water,
+                // punching the ragged mid-LOD holes (diagnosed via debugMode 65:
+                // the whole mid band shaded orange = side-face hits). A front face
+                // is solid land regardless of which way the voxel face points, so
+                // give ray-entry hits a sky-facing normal and never reject them.
+                const bool frontFaceMidVoxelSurface = rayEntryMidVoxelSurface;
+                if (!exposedMidVoxel || (frontFaceMidVoxelSurface && normal.y < 0.05f)) {
                     normal = normalize(float3(-rayDir.x, max(abs(rayDir.y), 0.35f), -rayDir.z));
                 }
                 const bool interiorFallbackHit =
@@ -1877,9 +1887,11 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
                     lowAltitudeGrazingSkylineRay && rayEntryMidVoxelSurface ? -0.04f : -0.18f;
                 const bool residentMidVoxelSurface =
                     taggedMidVoxelSurface || exposedMidVoxel || rayEntryMidVoxelSurface || allowVoxelOnlyInteriorFallback;
-                const bool rejectedMidVoxelNormal = residentMidVoxelSurface
-                    ? normal.y < surfaceMinNormalY
-                    : normal.y < minNormalY;
+                const bool rejectedMidVoxelNormal = frontFaceMidVoxelSurface
+                    ? false
+                    : (residentMidVoxelSurface
+                        ? normal.y < surfaceMinNormalY
+                        : normal.y < minNormalY);
                 if (rejectedMidVoxelNormal && !BackgroundDebugLayerMode()) {
                     previousMidVoxelWasAir = false;
                     t = min(nextCellT, t + max(actualCellSize, 4.0f));
