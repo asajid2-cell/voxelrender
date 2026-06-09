@@ -94,7 +94,14 @@ static const uint SPARSE_SAMPLE_EMPTY_SUBBRICK = 2u;
 static const uint SPARSE_SAMPLE_EMPTY_BRICK = 3u;
 static const uint MID_CLIPMAP_MAGIC = 0x56434C50u;
 static const uint MID_VOXEL_CLIPMAP_MAGIC = 0x56435658u;
-static const uint MID_CLIPMAP_MAX_SHADER_TILES = 256u;
+// Mid-HEIGHT clipmap resident-tile ceiling. This is ONLY a min() clamp on the
+// resident tile count + a compact-index bound check; the tile lookup is a hash
+// probe (LookupResidentMidClipmapTile) whose cost is independent of tile count,
+// so raising this does NOT unroll/bloat the PSO the way the voxel-brick cap does.
+// Grown 256 -> 512 so the GPU-gen larger world (ringCount=5, endDistance=9000)
+// can keep its full mid-height interest set (~285-306 tiles) resident; at 256 the
+// interest set overflowed and midCov(height) capped at 256/~296 ~= 0.87.
+static const uint MID_CLIPMAP_MAX_SHADER_TILES = 512u;
 static const uint MID_CLIPMAP_MAX_SHADER_RINGS = 8u;
 static const uint MID_CLIPMAP_LOOKUP_PROBES = 8u;
 static const uint MID_VOXEL_CLIPMAP_MAX_BRICKS = 16384u;

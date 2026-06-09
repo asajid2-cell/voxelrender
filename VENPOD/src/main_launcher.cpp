@@ -2608,6 +2608,20 @@ int RunSandbox(int argc, char* argv[]) {
         if (std::getenv("VENPOD_SPARSE_MID_VOXEL_MAX_BRICKS") == nullptr) {
             sparseClipmapConfig.maxVoxelBricks = 16384u;
         }
+        // maxTiles: capacity for the mid-HEIGHT clipmap tiles. The extra ring
+        // (4 -> 5) and grown range push the interested HEIGHT-tile set to
+        // ~285-306, but the resident tile cap was still 256 -> resident pinned at
+        // 256 while interest exceeded it, so midCov(height) capped at 256/~296
+        // ~= 0.87 (the moving "dip"; the voxel layer's capacity WAS grown to
+        // 16384 so its coverage already held ~1.0). 256 -> 512 gives comfortable
+        // headroom. Height tiles are tiny (33*33*4 ~= 4.3KB each), so +256 tiles
+        // adds only ~1.1 MB of sample buffer; metadata/lookup buffers auto-size
+        // off midClipmapMaxTiles. The shader's MID_CLIPMAP_MAX_SHADER_TILES was
+        // raised to 512 to match (it is only a count clamp, not a PSO-unrolling
+        // loop bound, so this is safe unlike the voxel-brick 16384 ceiling).
+        if (std::getenv("VENPOD_SPARSE_MID_MAX_TILES") == nullptr) {
+            sparseClipmapConfig.maxTiles = 512u;
+        }
     }
     const uint32_t sparseMidClipmapTileBudget = ReadUIntEnv("VENPOD_SPARSE_MID_TILE_BUDGET", 72u);
     const uint32_t sparseMidClipmapHeightTileBudget =
