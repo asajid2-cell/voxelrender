@@ -5622,6 +5622,31 @@ void SparseClipmapTileCache::GenerateVoxelBrickPayload(
     }
 }
 
+bool SparseClipmapTileCache::GenerateVoxelBrickPayloadForTest(
+    const SparseVoxelClipmapCoord& coord,
+    const SparseClipmapPolicy& policy,
+    std::vector<uint32_t>& outVoxels,
+    int32_t& outOriginX,
+    int32_t& outOriginY,
+    int32_t& outOriginZ,
+    int32_t& outCellSize)
+{
+    // Pristine path only: this cache has no edit store, so GenerateVoxelBrickPayload's
+    // edited-overlay branches are inert (hasEditedOverlays == false).
+    VoxelBrickPayload brick;
+    brick.coord = coord;
+    GenerateVoxelBrickPayload(brick, policy, nullptr, nullptr);
+    if (brick.voxels.size() != static_cast<size_t>(SPARSE_BRICK_VOXEL_COUNT)) {
+        return false;
+    }
+    outVoxels = brick.voxels;
+    outOriginX = brick.originX;
+    outOriginY = brick.originY;
+    outOriginZ = brick.originZ;
+    outCellSize = std::max(1, RoundToInt32Clamped(static_cast<double>(brick.cellSize)));
+    return true;
+}
+
 uint32_t SparseClipmapTileCache::PackSample(int32_t worldX, int32_t worldZ, float height) const {
     int32_t roundedHeight = FloorToInt32Clamped(height);
     uint32_t material = 0u;

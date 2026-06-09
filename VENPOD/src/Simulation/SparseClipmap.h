@@ -507,6 +507,20 @@ public:
     void SetFarSvoFallbackMetadata(const SparseClipmapFarSvoFallbackMetadata& metadata);
     uint32_t InvalidateEditedOverlays(const SparseEditStore& edits, const SparseClipmapPolicy& policy);
 
+    // DEV-ONLY (MidVoxelGpuGenPoc parity harness): generate the REAL pristine
+    // procedural brick for a coord on this (unedited) cache and return its packed
+    // voxels + origin/cellSize. Wraps the private GenerateVoxelBrickPayload; the
+    // VoxelBrickPayload struct is private so results are returned via out-params.
+    // Edited-overlay branches are inert here because a test cache has no edits.
+    bool GenerateVoxelBrickPayloadForTest(
+        const SparseVoxelClipmapCoord& coord,
+        const SparseClipmapPolicy& policy,
+        std::vector<uint32_t>& outVoxels,
+        int32_t& outOriginX,
+        int32_t& outOriginY,
+        int32_t& outOriginZ,
+        int32_t& outCellSize);
+
     const SparseClipmapCacheStats& GetStats() const { return m_stats; }
     uint32_t DirtySerial() const { return m_dirtySerial; }
     uint32_t HeightDirtySerial() const { return m_heightDirtySerial; }

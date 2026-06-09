@@ -467,4 +467,95 @@ uint TH_MidVoxelCellSample(int cellWorldX, int cellWorldY, int cellWorldZ, int c
     return TH_PackVoxel(TH_MAT_AIR, 0u, 0u, 0u);
 }
 
+// =============================================================================
+// Post-process helpers — exact ports of the neighbor-dependent rules in
+// SparseClipmap.cpp `GenerateVoxelBrickPayload` (the resident-brick path that
+// runs AFTER the raw per-cell sampleColumnCellVoxel).
+// =============================================================================
+
+// ===== State flag for the LOD render surface marker (Utils::StateFlags) =====
+#define TH_STATE_VISUALSURFACE  0x10u   // Bit 4
+
+// -----------------------------------------------------------------------------
+// TH_SampleColumnCellVoxelHR — exact port of the lambda `sampleColumnCellVoxel`
+// (SparseClipmap.cpp ~5143-5205), GENERATED branches only. Identical to
+// TH_MidVoxelCellSample but takes the column's height+relief + the explicit cell
+// Y bounds + preferredWorldY EXACTLY as the engine call site supplies them, and
+// the cell's world XZ comes from the chosen column (centerColumn or
+// maxFootprintColumn). Edited-cell short-circuit is omitted (pristine path).
+// PARITY: terrainTopY = FloorToInt32Clamped(height) == (int)floor(height) for
+// in-range heights. SaturatingAddInt32(topY,1) == topY+1 in range. clamp() on
+// ints matches std::clamp for lo<=hi (holds in every branch).
+// -----------------------------------------------------------------------------
+uint TH_SampleColumnCellVoxelHR(
+    int colWorldX, int colWorldZ, float height, float relief,
+    int minWorldY, int maxWorldY, int preferredWorldY, uint seed)
+{
+    if (maxWorldY <= TH_TERRAIN_MIN_Y + 2) {
+        int sampleY = clamp(preferredWorldY, minWorldY, maxWorldY);
+        return TH_SampleVoxel(colWorldX, sampleY, colWorldZ, height, relief, seed);
+    }
+
+    int terrainTopY = (int)floor(height);
+    bool submergedColumn = height < (float)TH_SEA_LEVEL_Y;
+    bool overlapsWater =
+        submergedColumn &&
+        minWorldY <= TH_SEA_LEVEL_Y &&
+        maxWorldY > terrainTopY;
+    if (overlapsWater) {
+        int waterMinY = max(minWorldY, terrainTopY + 1);
+        int waterMaxY = min(maxWorldY, TH_SEA_LEVEL_Y);
+        int sampleY = clamp(preferredWorldY, waterMinY, waterMaxY);
+        return TH_SampleVoxel(colWorldX, sampleY, colWorldZ, height, relief, seed);
+    }
+
+    if ((float)minWorldY <= height) {
+        int solidMaxY = min(maxWorldY, terrainTopY);
+        bool cellContainsTerrainTop = maxWorldY >= terrainTopY;
+        int representativeY = cellContainsTerrainTop ? terrainTopY : preferredWorldY;
+        int sampleY = clamp(representativeY, minWorldY, solidMaxY);
+        return TH_SampleVoxel(colWorldX, sampleY, colWorldZ, height, relief, seed);
+    }
+
+    return TH_PackVoxel(TH_MAT_AIR, 0u, 0u, 0u);
+}
+
+// -----------------------------------------------------------------------------
+// TH_ClassifyColumnCellMaterial — exact port of the lambda
+// `classifyColumnCellMaterial` (SparseClipmap.cpp ~5110-5142), pristine path
+// (edited short-circuit omitted). Returns the Material id (not packed voxel).
+// Only `height` of the column is used (relief unused here).
+// -----------------------------------------------------------------------------
+uint TH_ClassifyColumnCellMaterial(
+    float columnHeight, int minWorldY, int maxWorldY)
+{
+    if (maxWorldY <= TH_TERRAIN_MIN_Y + 2) {
+        return TH_MAT_BEDROCK;
+    }
+    int terrainTopY = (int)floor(columnHeight);
+    if (columnHeight < (float)TH_SEA_LEVEL_Y &&
+        minWorldY <= TH_SEA_LEVEL_Y &&
+        maxWorldY > terrainTopY) {
+        return TH_MAT_WATER;
+    }
+    if ((float)minWorldY <= columnHeight) {
+        return TH_MAT_STONE;
+    }
+    return TH_MAT_AIR;
+}
+
+// -----------------------------------------------------------------------------
+// TH_IsSurfaceNeighbor — exact port of the lambda `isSurfaceNeighbor`
+// (SparseClipmap.cpp ~5206-5214).
+// -----------------------------------------------------------------------------
+bool TH_IsSurfaceNeighbor(uint material, uint neighborMaterial) {
+    if (neighborMaterial == TH_MAT_AIR) {
+        return true;
+    }
+    if (material == TH_MAT_WATER && neighborMaterial != TH_MAT_WATER) {
+        return true;
+    }
+    return false;
+}
+
 #endif // VENPOD_TERRAIN_HEIGHT_HLSLI

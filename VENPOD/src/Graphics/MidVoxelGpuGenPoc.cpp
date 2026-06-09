@@ -35,90 +35,6 @@ struct GenParams {
     uint32_t pad1;
 };
 
-// Integer helpers matching SparseClipmap.cpp's *Clamped helpers for in-range
-// (small, finite) inputs, which is all the POC ever produces.
-int32_t FloorI(double v) { return static_cast<int32_t>(std::floor(v)); }
-int32_t CeilI(double v)  { return static_cast<int32_t>(std::ceil(v)); }
-int32_t RoundI(double v) { return static_cast<int32_t>(std::round(v)); }
-
-// CPU reference for `sampleColumnCellVoxel` (SparseClipmap.cpp ~5143-5205),
-// generated branches only, using the public terrain generator API. This is the
-// exact rule CS_GenerateMidVoxelBricks.hlsl ports.
-uint32_t CpuSampleColumnCell(
-    const Simulation::SparseTerrainGenerator& terrain,
-    int32_t colWorldX,
-    int32_t colWorldZ,
-    int32_t minWorldY,
-    int32_t maxWorldY,
-    int32_t preferredWorldY)
-{
-    const float height = terrain.HeightAt(colWorldX, colWorldZ);
-    const float relief = terrain.SurfaceReliefAtWithCenter(colWorldX, colWorldZ, height, 4);
-
-    if (maxWorldY <= Simulation::TERRAIN_MIN_Y + 2) {
-        const int32_t sampleY = std::clamp(preferredWorldY, minWorldY, maxWorldY);
-        return terrain.SampleGeneratedVoxelWithColumn(colWorldX, sampleY, colWorldZ, height, relief);
-    }
-
-    const int32_t terrainTopY = FloorI(static_cast<double>(height));
-    const bool submergedColumn = height < static_cast<float>(Simulation::SEA_LEVEL_Y);
-    const bool overlapsWater =
-        submergedColumn &&
-        minWorldY <= Simulation::SEA_LEVEL_Y &&
-        maxWorldY > terrainTopY;
-    if (overlapsWater) {
-        const int32_t waterMinY = std::max(minWorldY, terrainTopY + 1);
-        const int32_t waterMaxY = std::min(maxWorldY, Simulation::SEA_LEVEL_Y);
-        const int32_t sampleY = std::clamp(preferredWorldY, waterMinY, waterMaxY);
-        return terrain.SampleGeneratedVoxelWithColumn(colWorldX, sampleY, colWorldZ, height, relief);
-    }
-
-    if (static_cast<float>(minWorldY) <= height) {
-        const int32_t solidMaxY = std::min(maxWorldY, terrainTopY);
-        const bool cellContainsTerrainTop = maxWorldY >= terrainTopY;
-        const int32_t representativeY = cellContainsTerrainTop ? terrainTopY : preferredWorldY;
-        const int32_t sampleY = std::clamp(representativeY, minWorldY, solidMaxY);
-        return terrain.SampleGeneratedVoxelWithColumn(colWorldX, sampleY, colWorldZ, height, relief);
-    }
-
-    return Utils::PackVoxel(Utils::Material::Air, 0, 0, 0);
-}
-
-// Replicate the per-cell local->world mapping from GenerateVoxelBrickPayload
-// (SparseClipmap.cpp ~5216-5248) and fill a 4096-uint CPU reference brick.
-void BuildCpuReferenceBrick(
-    const Simulation::SparseTerrainGenerator& terrain,
-    int32_t originX,
-    int32_t originY,
-    int32_t originZ,
-    int32_t cellSize,
-    std::array<uint32_t, kBrickVoxelCount>& out)
-{
-    const double cs = static_cast<double>(std::max(1, cellSize));
-    for (int32_t lz = 0; lz < Simulation::SPARSE_BRICK_SIZE; ++lz) {
-        for (int32_t ly = 0; ly < Simulation::SPARSE_BRICK_SIZE; ++ly) {
-            for (int32_t lx = 0; lx < Simulation::SPARSE_BRICK_SIZE; ++lx) {
-                const int32_t colWorldX = originX + RoundI((static_cast<double>(lx) + 0.5) * cs);
-                const int32_t colWorldZ = originZ + RoundI((static_cast<double>(lz) + 0.5) * cs);
-
-                const int32_t minWorldY = originY + FloorI(static_cast<double>(ly) * cs);
-                const int32_t maxWorldY = std::max(
-                    minWorldY,
-                    originY + CeilI((static_cast<double>(ly) + 1.0) * cs) - 1);
-                const int32_t preferredWorldY =
-                    originY + RoundI((static_cast<double>(ly) + 0.5) * cs);
-
-                const uint32_t idx =
-                    static_cast<uint32_t>(lx) +
-                    static_cast<uint32_t>(ly) * 16u +
-                    static_cast<uint32_t>(lz) * 256u;
-                out[idx] = CpuSampleColumnCell(
-                    terrain, colWorldX, colWorldZ, minWorldY, maxWorldY, preferredWorldY);
-            }
-        }
-    }
-}
-
 } // namespace
 
 Result<void> MidVoxelGpuGenPoc::Initialize(
@@ -204,10 +120,18 @@ void MidVoxelGpuGenPoc::RunParityCheck(
     }
 
     const uint32_t seed = policy.Config().seed;
-    Simulation::SparseTerrainGenerator terrain(seed);
     const auto rings = policy.BuildRings();
     if (rings.empty()) {
         spdlog::error("[MIDGEN-POC] policy produced no rings (clipmap disabled?); skipping");
+        return;
+    }
+
+    // Real pristine brick generator: a fresh, UNEDITED cache so the edited-overlay
+    // branches in GenerateVoxelBrickPayload are inert (hasEditedOverlays == false).
+    // GPU output is compared against this real brick (incl. VisualSurface bits).
+    Simulation::SparseClipmapTileCache cpuCache;
+    if (!cpuCache.Initialize(policy.Config())) {
+        spdlog::error("[MIDGEN-POC] failed to init reference SparseClipmapTileCache; skipping");
         return;
     }
 
@@ -235,21 +159,19 @@ void MidVoxelGpuGenPoc::RunParityCheck(
             spdlog::warn("[MIDGEN-POC] '{}': ring {} out of range; skipping", tc.label, ringIndex);
             continue;
         }
-        const float cellSizeF = rings[static_cast<size_t>(ringIndex)].cellSize;
-        const int32_t cellSize = std::max(1, RoundI(static_cast<double>(cellSizeF)));
-        const int32_t brickWorldSize = std::max(1,
-            RoundI(static_cast<double>(cellSizeF) *
-                   static_cast<double>(Simulation::SPARSE_BRICK_SIZE)));
-        const int32_t originX = FloorI(
-            static_cast<double>(tc.coord.x) * static_cast<double>(brickWorldSize));
-        const int32_t originY = FloorI(
-            static_cast<double>(tc.coord.y) * static_cast<double>(brickWorldSize));
-        const int32_t originZ = FloorI(
-            static_cast<double>(tc.coord.z) * static_cast<double>(brickWorldSize));
-
-        // ---- CPU reference ----
-        std::array<uint32_t, kBrickVoxelCount> cpuBrick = {};
-        BuildCpuReferenceBrick(terrain, originX, originY, originZ, cellSize, cpuBrick);
+        // ---- CPU reference: the REAL pristine resident brick ----
+        std::vector<uint32_t> cpuBrickVec;
+        int32_t originX = 0;
+        int32_t originY = 0;
+        int32_t originZ = 0;
+        int32_t cellSize = 1;
+        if (!cpuCache.GenerateVoxelBrickPayloadForTest(
+                tc.coord, policy, cpuBrickVec, originX, originY, originZ, cellSize) ||
+            cpuBrickVec.size() != kBrickVoxelCount) {
+            spdlog::error("[MIDGEN-POC] '{}': real brick generation failed; skipping", tc.label);
+            continue;
+        }
+        const uint32_t* cpuBrick = cpuBrickVec.data();
 
         // ---- GPU dispatch ----
         m_cmdAllocator->Reset();
