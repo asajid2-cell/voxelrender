@@ -2568,6 +2568,47 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION", 0u) != 0u;
     const bool enableSparseMidVoxelGpuGeneration =
         sparseClipmapConfig.enableGpuMidVoxelGeneration;
+    // Phase 2: GROW the detailed mid-voxel render-distance bubble when GPU sample
+    // generation is on. The CPU pump no longer pays the per-voxel fill (skip in
+    // GenerateVoxelBrickPayload), so the bottleneck is no longer generation — it's
+    // the mid-voxel capacity/radius/range and the (low-res) raymarch. We can afford
+    // a much larger generated terrain bubble. These raise the DEFAULTS only; any
+    // value the user set explicitly via env still wins. The growth is GATED on the
+    // GPU-gen flag because the CPU-fallback pump cannot fill this many bricks per
+    // frame (coverage would collapse / freeze).
+    if (enableSparseMidVoxelGpuGeneration) {
+        // endDistance: how far the mid clipmap covers and the raymarch marches.
+        // 6400 -> 9000 (~1.4x further view before the far/sky fallback). The mid
+        // clipmap is geometric (cell size doubles per ring) so the existing DDA
+        // step budget still reaches this extended end with the added outer ring.
+        if (std::getenv("VENPOD_SPARSE_MID_END") == nullptr) {
+            sparseClipmapConfig.endDistance = 9000.0f;
+        }
+        // ringCount: one more geometric ring (cells double per ring) extends the
+        // far edge of the detailed volume substantially while adding relatively
+        // few bricks (the coarse outer ring covers a huge area per brick). 4 -> 5.
+        if (std::getenv("VENPOD_SPARSE_MID_RINGS") == nullptr) {
+            sparseClipmapConfig.ringCount = 5u;
+        }
+        // voxelBrickRadiusXz: the main "detailed render distance" knob for the
+        // generated terrain (the XZ bubble of resident bricks). 8 -> 9 (~1.27x the
+        // resident interest area). Kept modest so the interest count stays under
+        // the brick capacity below. NOTE: rebrun.ps1 perf-mode also overrides this
+        // env var (6/7/8); rebrun now SKIPS that override when GPU gen is on so
+        // this grown default wins.
+        if (std::getenv("VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ") == nullptr) {
+            sparseClipmapConfig.voxelBrickRadiusXz = 9u;
+        }
+        // maxVoxelBricks: capacity for the larger interest set (bigger radius +
+        // extra ring). 12288 -> 16384 (the HLSL cap MID_VOXEL_CLIPMAP_MAX_BRICKS in
+        // PS_Raymarch.hlsl is 16384; raising it past that triggers a pathological
+        // shader/driver compile hang, so 16384 is the hard ceiling here). GPU
+        // sample buffer = 16384 * 4096 * 4 = 256 MB (up from 192 MB); total sparse
+        // GPU budget ~0.82 GB, well within an 8 GB card.
+        if (std::getenv("VENPOD_SPARSE_MID_VOXEL_MAX_BRICKS") == nullptr) {
+            sparseClipmapConfig.maxVoxelBricks = 16384u;
+        }
+    }
     const uint32_t sparseMidClipmapTileBudget = ReadUIntEnv("VENPOD_SPARSE_MID_TILE_BUDGET", 72u);
     const uint32_t sparseMidClipmapHeightTileBudget =
         ReadUIntEnv(

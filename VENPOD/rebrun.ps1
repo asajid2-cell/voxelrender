@@ -713,8 +713,14 @@ try {
         # Mid-voxel interest radius is the dominant per-frame CPU driver (clip/req/upload
         # scale ~quadratically with it; default 8 -> ~9200 bricks). Shrink it for fps; the
         # far LOD + background pass fill beyond the mid-detail radius. quality keeps 8.
-        $midVoxRadius = if ($quality) { "8" } elseif ($PerfMode -eq "60fps") { "6" } else { "7" }
-        $env:VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ = $midVoxRadius
+        # Phase 2: when GPU mid-voxel generation is ON, the CPU no longer pays the
+        # per-voxel fill, so the grown render-distance bubble (radius default 12,
+        # set in main_launcher when the GPU-gen flag is on) is affordable. Do NOT
+        # override the radius here in that case -- let the grown C++ default win.
+        if ($env:VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION -ne "1") {
+            $midVoxRadius = if ($quality) { "8" } elseif ($PerfMode -eq "60fps") { "6" } else { "7" }
+            $env:VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ = $midVoxRadius
+        }
         # Mid interest set is rebuilt EVERY frame (interestInterval=1) -- a big chunk of
         # 'clip'. Amortize it across frames (camera moves smoothly, the set barely changes
         # frame-to-frame). quality keeps 1 for max responsiveness.
