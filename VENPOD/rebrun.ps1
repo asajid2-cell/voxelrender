@@ -706,6 +706,20 @@ try {
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_VISIBLE_CRITICAL_GEN = "1"
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_ENQUEUE = "256"
         $env:VENPOD_SPARSE_MID_CLIPMAP_ASYNC_NONCRITICAL_MAX_APPLY = "256"
+        # FRONTIER STREAMING (P2) -- investigated, NOT applied. Measured the
+        # mid-voxel frontier under a sustained Speed-44 walk (PERF_SPARSE
+        # midVoxInterest resident/wanted at 10-frame granularity): in steady-state
+        # motion the resident set already tracks wanted at ~99.3% (e.g.
+        # 12189-12288 / 12288) with the GPU-gen path freeing the CPU voxel fill --
+        # the streaming already keeps up. Raising the VISIBLE-CRITICAL apply/
+        # enqueue budget (16 -> 256), lowering motionLookaheadMinSpeed (64 -> 16),
+        # and enabling predicted-visible GPU-gen admission did NOT improve steady-
+        # state residency (still ~99.3%) but dropped fps from ~61-70 to ~37-44 (the
+        # extra per-frame interest rebuilds / applies are pure CPU cost here). So
+        # the frontier bottleneck the report describes is the interest-set RAMP
+        # when entering virgin terrain (inherent to growing the wanted set), not a
+        # residency/budget cap -- and the aggressive prefetch is a net regression.
+        # Left at defaults; see report for numbers.
         # Parallel VISIBLE mid-voxel pump across worker threads (default is single-threaded ->
         # terrain you are looking at generates one brick at a time = 'streams in slowly'). 16
         # cores available; 10 persistent workers fills the visible terrain much faster.

@@ -3228,8 +3228,12 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     // Keep this as a horizon/continuity fallback behind the caller-selected
     // transition distance. Earlier versions rejected steep downward rays here,
     // which made high-altitude stress views pop terrain pixels into miss/sky
-    // whenever Far SVO backed off under budget pressure.
-    if (rayDir.y > 0.04f) {
+    // whenever Far SVO backed off under budget pressure. The upward ceiling is
+    // 0.12 (was 0.04): distant mountain silhouettes (peaks up to
+    // FAR_TERRAIN_MAX_HEIGHT seen from ground level over the far ownership band)
+    // climb to rayDir.y ~ +0.07, so the old 0.04 ceiling leaked sky between the
+    // sparse far-SVO chunks. Rays that clear all peaks still return false (sky).
+    if (rayDir.y > 0.12f) {
         return false;
     }
 
@@ -4645,7 +4649,31 @@ bool RaymarchBackgroundField(
             backgroundLayer = BACKGROUND_LAYER_NONE;
         }
     }
-    if (includeSparseFarField && RaymarchSparseFarField(rayOrigin, rayDir, farStartDist, backgroundHit)) {
+    // FAR HORIZON CONTINUITY (P1). Beyond the far-handoff distance the only
+    // distant terrain owner in voxelTerrainOnly mode was the sparse far SVO,
+    // which paints fragmented chunks with sky leaking between them -- a broken
+    // horizon. Defer the far SVO for that distant low-angle band so the ray
+    // falls through to the continuous far heightfield (the single tail
+    // RaymarchFarTerrain call below, now enabled for voxelTerrainOnly). The far
+    // SVO still owns higher-angle / nearer rays. Using the existing tail call
+    // (rather than a second call site) keeps the shader compilable: a second
+    // inlined RaymarchFarTerrain blows up the DXC optimizer, and [noinline]
+    // fails DXC validation for the float4-carrying RayHit return.
+    //
+    // STARTUP-TDR SAFETY: deferral is gated on the mid-voxel ring being
+    // substantially resident (midResidencyParams.y voxel coverage ~0.04 at spawn
+    // -> ~1.0 once streamed); before then the far SVO keeps the horizon and the
+    // far-height tail stays gated off, so no whole-screen startup far march.
+    const bool deferFarSvoToFarHeightHorizon =
+        voxelTerrainOnly &&
+        frame.midFieldParams.x > 0.5f &&
+        frame.midResidencyParams.y >= 0.5f &&
+        frame.midResidencyParams.w >= 1.0f &&
+        rayOrigin.y <= 384.0f &&
+        rayDir.y > -0.20f &&
+        rayDir.y < 0.12f;
+    if (!deferFarSvoToFarHeightHorizon &&
+        includeSparseFarField && RaymarchSparseFarField(rayOrigin, rayDir, farStartDist, backgroundHit)) {
         RayHit resolvedWaterHit;
         if (TryResolveWaterOccluderForBackgroundHit(
                 rayOrigin, rayDir, farStartDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit)) {
@@ -4659,7 +4687,7 @@ bool RaymarchBackgroundField(
         }
         backgroundLayer = BACKGROUND_LAYER_NONE;
     }
-    if (hasWaterOccluder) {
+    if (hasWaterOccluder && !deferFarSvoToFarHeightHorizon) {
         backgroundHit = waterOccluderHit;
         backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
         if (BackgroundHitAllowedByExactNear(rayOrigin, rayDir, backgroundHit, backgroundLayer)) {
@@ -4697,8 +4725,8 @@ bool RaymarchBackgroundField(
         return true;
     }
     const bool heightAngleOk = allowWideHeightAngles
-        ? (rayDir.y < 0.04f)
-        : (rayDir.y > -0.28f && rayDir.y < 0.04f);
+        ? (rayDir.y < 0.12f)
+        : (rayDir.y > -0.28f && rayDir.y < 0.12f);
     // Mid/far sparse ownership starts are conservative visibility boundaries,
     // not proof that there is no terrain before them. Walking-height rays can
     // cross a real valley wall before the near sphere/box exit; if the fallback
@@ -4709,13 +4737,32 @@ bool RaymarchBackgroundField(
     const float heightContinuityStart = highAltitudeBackgroundView
         ? max(startDist, min(farStartDist, midStartDist))
         : max(64.0f, min(max(startDist, 160.0f), midStartDist));
-    const float heightStart = highAltitudeDownwardView
-        ? max(startDist, 32.0f)
-        : heightContinuityStart;
+    // In voxelTerrainOnly mode the only ray that reaches this tail is one the far
+    // SVO was deferred for (the distant low-angle horizon band) -- otherwise the
+    // function already returned above. Run the continuous far heightfield from
+    // the far-handoff distance to fill that band; if it misses (ray clears all
+    // distant terrain) the ray is genuine sky. Single far-height call site (no
+    // 2nd inline -> shader stays compilable). The far march is step-budget
+    // bounded (28-64 steps) and starts thousands of units out, so it is never a
+    // whole-screen startup march (and the deferral is gated on mid residency).
+    float heightStart;
+    bool farHeightAllowed;
     if (voxelTerrainOnly) {
-        return false;
+        if (!deferFarSvoToFarHeightHorizon) {
+            return false;
+        }
+        const float voxelFarHandoff = frame.backgroundOwnershipParams.w > 0.5f
+            ? max(frame.backgroundOwnershipParams.y, frame.midFieldParams.y + 1.0f)
+            : max(frame.midFieldParams.z, frame.midFieldParams.y + 1.0f);
+        heightStart = max(farStartDist, voxelFarHandoff);
+        farHeightAllowed = heightAngleOk;
+    } else {
+        heightStart = highAltitudeDownwardView
+            ? max(startDist, 32.0f)
+            : heightContinuityStart;
+        farHeightAllowed = heightAngleOk;
     }
-    if (heightAngleOk && RaymarchFarTerrain(rayOrigin, rayDir, heightStart, backgroundHit)) {
+    if (farHeightAllowed && RaymarchFarTerrain(rayOrigin, rayDir, heightStart, backgroundHit)) {
         backgroundLayer = BACKGROUND_LAYER_FAR_HEIGHT;
         if (BackgroundHitAllowedByExactNear(rayOrigin, rayDir, backgroundHit, backgroundLayer)) {
             return true;
