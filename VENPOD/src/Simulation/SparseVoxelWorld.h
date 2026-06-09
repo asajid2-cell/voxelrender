@@ -53,7 +53,11 @@ struct SparseVoxelWorldConfig {
     // so the frame never waits on meshing. Best-available render shows coarser terrain
     // until a coord's mesh lands.
     bool asyncSurfaceExtraction = false;
-    uint32_t asyncSurfaceExtractionMaxWorkers = 2;
+    // Default worker count for the async surface mesher. Raised 2->8: the exact-surface
+    // near-detail extraction is the moving-into-fresh-terrain throughput producer and runs
+    // entirely off the render thread, so more workers raise meshing throughput during the
+    // convergence transient without adding main-thread cost (16 logical cores available).
+    uint32_t asyncSurfaceExtractionMaxWorkers = 8;
     uint32_t asyncSurfaceExtractionQueueMax = 4096;
     uint32_t asyncSurfaceExtractionMaxApplyPerFrame = 256;
     bool persistentTerrainColumnCache = false;

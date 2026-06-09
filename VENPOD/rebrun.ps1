@@ -621,6 +621,7 @@ try {
         "VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION",
         "VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS",
         "VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME",
+        "VENPOD_SPARSE_SURFACE_EXTRACTION_BUDGET",
         "VENPOD_SPARSE_SURFACE_UPLOAD_MIN_INTERVAL_FRAMES",
         "VENPOD_SPARSE_SURFACE_COPY_FACE_BUDGET",
         "VENPOD_SPARSE_SURFACE_COPY_REGION_BUDGET",
@@ -672,7 +673,21 @@ try {
         # path was contended). Best-available render shows coarser terrain until a mesh
         # lands. The synchronous surface budgets above still bound any inline fallback.
         $env:VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION = "1"
-        $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS = "4"
+        # Worker count: 8 of 16 logical cores (was 4). The exact-surface mesher is the
+        # near-detail throughput producer; doubling the pool lets more bricks mesh in
+        # parallel while moving into fresh terrain (mirrors the mid-voxel parallel pump's
+        # 10-worker scaling). Meshing runs OFF the render thread, so this adds throughput
+        # without adding main-thread cost (verified: converged fps unregressed). quality=8 too.
+        $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS = "8"
+        # General surface-extraction enqueue budget (bricks/frame fed to the worker pool).
+        # With async meshing the per-frame pump only ENQUEUES (cheap), so the runtime
+        # pressure scaler that collapsed the effective budget to ~14-17/frame while moving
+        # was needlessly starving the producers. Raise the base 48->128 so the pump keeps
+        # the 8 workers fed during the convergence transient. Inline (non-async) fallback is
+        # still bounded by VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS, so this can't stall render.
+        if (-not $env:VENPOD_SPARSE_SURFACE_EXTRACTION_BUDGET) {
+            $env:VENPOD_SPARSE_SURFACE_EXTRACTION_BUDGET = if ($quality) { "128" } elseif ($PerfMode -eq "60fps") { "128" } else { "96" }
+        }
         # Surface mesh APPLY (UpdateBrickWithExtractedFaces, default 256/frame) dominates
         # the post-fence cost (untracked ~12-23ms). Throttle it: workers still produce,
         # results apply over more frames (best-available shows coarse briefly). quality=high.
