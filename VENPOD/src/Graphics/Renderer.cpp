@@ -255,6 +255,12 @@ Result<void> Renderer::Initialize(
             return Error("Failed to create background pass resources: {}", result.error());
         }
     }
+    if (m_config.midPassEnabled) {
+        result = CreateMidPassResources();
+        if (!result) {
+            return Error("Failed to create mid pass resources: {}", result.error());
+        }
+    }
 
     for (uint32_t i = 0; i < VENPOD::Window::BUFFER_COUNT; ++i) {
         char name[64] = {};
@@ -316,6 +322,12 @@ Result<void> Renderer::Initialize(
             return Error("Failed to create background composite pipeline: {}", result.error());
         }
     }
+    if (m_config.midPassEnabled) {
+        result = CreateMidCompositePipeline(device.GetDevice());
+        if (!result) {
+            return Error("Failed to create mid composite pipeline: {}", result.error());
+        }
+    }
     result = CreateSparseSurfaceDrawCommandSignature(device.GetDevice());
     if (!result) {
         return Error("Failed to create sparse surface draw command signature: {}", result.error());
@@ -336,6 +348,7 @@ void Renderer::Shutdown() {
     }
     m_dummyRenderOwnershipUAV.Shutdown();
     DestroyBackgroundPassResources();
+    DestroyMidPassResources();
 
     // Free RTV handles
     for (auto& handle : m_rtvHandles) {
@@ -352,6 +365,7 @@ void Renderer::Shutdown() {
     m_sparseSurfacePipeline.Shutdown();
     m_overlayPipeline.Shutdown();
     m_backgroundCompositePipeline.Shutdown();
+    m_midCompositePipeline.Shutdown();
     m_sparseSurfaceDrawSignature.Reset();
     m_shaderCompiler.Shutdown();
     if (m_imguiReservedSrv.IsValid()) {
@@ -880,11 +894,36 @@ void Renderer::RenderVoxels(
     // RAYMARCH_MID_ONLY variant (alpha=1 on a mid-terrain hit, alpha=0 on a
     // miss) and alpha-over blends it on top, so mid terrain gets the heavy
     // analytic-gradient shading while the full pass keeps near/far/sky.
-    if (m_config.midPassEnabled && m_midPassPipeline.GetPSO() != nullptr) {
-        // Ensure we draw to the MAIN full-resolution RTV (the split path above
-        // already rebinds it; do it unconditionally so the non-split path and
-        // the full-res viewport are guaranteed for the overlay).
-        SetMainRenderTarget(cmdList);
+    const bool useMidPassSplit =
+        m_config.midPassEnabled &&
+        m_midPassPipeline.GetPSO() != nullptr &&
+        m_midCompositePipeline.GetPSO() != nullptr &&
+        m_midCompositePipeline.GetRootSignature() != nullptr &&
+        m_midPassColor.Get() != nullptr &&
+        m_midPassRtv.IsValid() &&
+        m_midPassSrv.IsValid() &&
+        m_midPassWidth > 0 &&
+        m_midPassHeight > 0;
+    if (useMidPassSplit) {
+        // (i) Render the mid-only raymarch into the LOW-RES color target. The
+        // target encodes mid coverage in alpha (1 = mid hit, 0 = miss). It has
+        // no depth/stencil (the mid PSO disables both); ownership against the
+        // near surface is enforced at composite time via the main-RT stencil.
+        if (m_midPassColorState != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+            D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+                m_midPassColor.Get(),
+                m_midPassColorState,
+                D3D12_RESOURCE_STATE_RENDER_TARGET);
+            cmdList->ResourceBarrier(1, &barrier);
+            m_midPassColorState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        }
+
+        D3D12_CPU_DESCRIPTOR_HANDLE midRtv = m_midPassRtv.cpu;
+        cmdList->OMSetRenderTargets(1, &midRtv, FALSE, nullptr);
+        SetViewportAndScissor(cmdList, m_midPassWidth, m_midPassHeight);
+        const float midClearColor[] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        cmdList->ClearRenderTargetView(midRtv, midClearColor, 0, nullptr);
+
         m_midPassPipeline.Bind(cmdList);
         ID3D12DescriptorHeap* midHeaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
         cmdList->SetDescriptorHeaps(1, midHeaps);
@@ -917,6 +956,25 @@ void Renderer::RenderVoxels(
                 ? sparseNearField->renderOwnershipUAV.gpu
                 : m_dummyRenderOwnershipUAV.GetShaderVisibleUAV().gpu);
 
+        cmdList->DrawInstanced(3, 1, 0, 0);
+
+        // (ii) Upscale-composite the low-res mid target over the MAIN render
+        // target with bilinear filtering and alpha-over blending. The composite
+        // PSO's stencil EQUAL ref 0 test restricts writes to pixels the near
+        // surface did not own, mirroring the background composite.
+        D3D12_RESOURCE_BARRIER midBarrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_midPassColor.Get(),
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        cmdList->ResourceBarrier(1, &midBarrier);
+        m_midPassColorState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+        SetMainRenderTarget(cmdList);
+        m_midCompositePipeline.Bind(cmdList);
+        ID3D12DescriptorHeap* midCompositeHeaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
+        cmdList->SetDescriptorHeaps(1, midCompositeHeaps);
+        cmdList->OMSetStencilRef(0);
+        cmdList->SetGraphicsRootDescriptorTable(0, m_midPassSrv.gpu);
         cmdList->DrawInstanced(3, 1, 0, 0);
     }
 }
@@ -1130,6 +1188,12 @@ Result<void> Renderer::OnResize(uint32_t width, uint32_t height) {
     }
     if (UseBackgroundPassSplit()) {
         result = CreateBackgroundPassResources();
+        if (!result) {
+            return result;
+        }
+    }
+    if (m_config.midPassEnabled) {
+        result = CreateMidPassResources();
         if (!result) {
             return result;
         }
@@ -1459,7 +1523,15 @@ Result<void> Renderer::CreateMidPassPipeline(ID3D12Device* device, GraphicsPipel
     // already-drawn full raymarch pass.
     fullscreenDesc.vertexShader = m_fullscreenVS;
     fullscreenDesc.pixelShader = m_midPassPS;
-    fullscreenDesc.blendEnable = true;
+    // The low-res mid pass renders into its own cleared (transparent) color
+    // target, NOT over the main RT, so it does not alpha-blend here and does
+    // not need a depth/stencil test. The alpha-over composite happens later in
+    // m_midCompositePipeline (which performs the stencil==0 ownership test at
+    // full resolution). Disabling depth/stencil here means the low-res pass
+    // needs no matching-resolution DSV.
+    fullscreenDesc.blendEnable = false;
+    fullscreenDesc.depthEnable = false;
+    fullscreenDesc.stencilEnable = false;
     fullscreenDesc.debugName = "MidPassPipeline";
 
     auto result = m_midPassPipeline.Initialize(device, fullscreenDesc);
@@ -1732,6 +1804,86 @@ Result<void> Renderer::CreateBackgroundCompositePipeline(ID3D12Device* device) {
     return {};
 }
 
+Result<void> Renderer::CreateMidCompositePipeline(ID3D12Device* device) {
+    if (!m_config.midPassEnabled) {
+        return {};
+    }
+    std::filesystem::path psPath = m_config.shaderPath / "Graphics" / "PS_MidComposite.hlsl";
+
+    CompiledShader compositeVS = m_fullscreenVS;
+    if (!compositeVS.IsValid()) {
+        std::filesystem::path vsPath = m_config.shaderPath / "Graphics" / "VS_Fullscreen.hlsl";
+        auto vsResult = m_shaderCompiler.CompileVertexShader(vsPath, L"main", m_config.debugShaders);
+        if (!vsResult) {
+            return Error("Failed to compile mid composite vertex shader: {}", vsResult.error());
+        }
+        compositeVS = vsResult.value();
+    }
+
+    ShaderCompileOptions psOptions;
+    psOptions.entryPoint = L"main";
+    psOptions.target = L"ps_6_0";
+    psOptions.debugInfo = m_config.debugShaders;
+    psOptions.optimizationLevel3 = true;
+    auto psResult = m_shaderCompiler.CompileFromFile(psPath, psOptions);
+    if (!psResult) {
+        return Error("Failed to compile mid composite pixel shader: {}", psResult.error());
+    }
+    m_midCompositePS = psResult.value();
+    if (!m_midCompositePS.IsValid()) {
+        return Error("Mid composite pixel shader compilation failed: {}", m_midCompositePS.errors);
+    }
+
+    GraphicsPipelineDesc pipelineDesc;
+    pipelineDesc.vertexShader = compositeVS;
+    pipelineDesc.pixelShader = m_midCompositePS;
+    pipelineDesc.debugName = "MidCompositePipeline";
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        0,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    pipelineDesc.staticSamplers.push_back({
+        0,
+        0,
+        D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_SHADER_VISIBILITY_PIXEL
+    });
+    pipelineDesc.rtvFormats.push_back(DXGI_FORMAT_R8G8B8A8_UNORM);
+    pipelineDesc.inputLayout.clear();
+    // The upscaled mid composite only writes where the near surface did not own
+    // the pixel (stencil == 0), mirroring the fullscreen/background composite,
+    // and alpha-over blends so mid coverage (alpha) composites over the full
+    // pass already in the main RT.
+    pipelineDesc.depthEnable = true;
+    pipelineDesc.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pipelineDesc.depthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    pipelineDesc.stencilEnable = true;
+    pipelineDesc.stencilReadMask = 0xFFu;
+    pipelineDesc.stencilWriteMask = 0x00u;
+    pipelineDesc.frontStencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
+    pipelineDesc.frontStencilPassOp = D3D12_STENCIL_OP_KEEP;
+    pipelineDesc.frontStencilFailOp = D3D12_STENCIL_OP_KEEP;
+    pipelineDesc.frontStencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    pipelineDesc.dsvFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    pipelineDesc.cullMode = D3D12_CULL_MODE_NONE;
+    pipelineDesc.blendEnable = true;
+
+    auto result = m_midCompositePipeline.Initialize(device, pipelineDesc);
+    if (!result) {
+        return Error("Failed to create mid composite pipeline: {}", result.error());
+    }
+
+    spdlog::info("Mid composite pipeline created successfully");
+    return {};
+}
+
 Result<void> Renderer::CreateSparseSurfaceDrawCommandSignature(ID3D12Device* device) {
     if (!device) {
         return Error("Renderer::CreateSparseSurfaceDrawCommandSignature - device is null");
@@ -1989,6 +2141,115 @@ Result<void> Renderer::CreateBackgroundPassResources() {
         m_height,
         m_backgroundPassSrv.heapIndex,
         m_backgroundPassStagingSrv.heapIndex);
+    return {};
+}
+
+void Renderer::DestroyMidPassResources() {
+    if (m_midPassSrv.IsValid()) {
+        m_heapManager.FreeShaderVisibleCbvSrvUav(m_midPassSrv);
+    }
+    if (m_midPassStagingSrv.IsValid()) {
+        m_heapManager.FreeStagingCbvSrvUav(m_midPassStagingSrv);
+    }
+    if (m_midPassRtv.IsValid()) {
+        m_heapManager.FreeRtv(m_midPassRtv);
+    }
+    m_midPassColor.Reset();
+    m_midPassColorState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_midPassWidth = 0;
+    m_midPassHeight = 0;
+}
+
+Result<void> Renderer::CreateMidPassResources() {
+    if (!m_config.midPassEnabled) {
+        DestroyMidPassResources();
+        return {};
+    }
+    if (!m_device) {
+        return Error("Device not initialized");
+    }
+    ID3D12Device* device = m_device->GetDevice();
+    if (!device) {
+        return Error("D3D12 device not initialized");
+    }
+
+    DestroyMidPassResources();
+
+    const float scale = std::clamp(m_config.midPassScale, 0.25f, 1.0f);
+    m_midPassWidth = std::max(
+        1u,
+        static_cast<uint32_t>(std::lround(static_cast<float>(std::max(1u, m_width)) * scale)));
+    m_midPassHeight = std::max(
+        1u,
+        static_cast<uint32_t>(std::lround(static_cast<float>(std::max(1u, m_height)) * scale)));
+
+    auto heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+    D3D12_CLEAR_VALUE colorClear = {};
+    colorClear.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    colorClear.Color[0] = 0.0f;
+    colorClear.Color[1] = 0.0f;
+    colorClear.Color[2] = 0.0f;
+    colorClear.Color[3] = 0.0f;
+    auto colorDesc = CD3DX12_RESOURCE_DESC::Tex2D(
+        DXGI_FORMAT_R8G8B8A8_UNORM,
+        static_cast<UINT64>(m_midPassWidth),
+        static_cast<UINT>(m_midPassHeight),
+        1,
+        1,
+        1,
+        0,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+    HRESULT hr = device->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &colorDesc,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        &colorClear,
+        IID_PPV_ARGS(&m_midPassColor));
+    if (FAILED(hr)) {
+        DestroyMidPassResources();
+        return Error("Failed to create mid pass color target: 0x{:08X}", hr);
+    }
+    m_midPassColor->SetName(L"MidPassColor");
+    m_midPassColorState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+    m_midPassRtv = m_heapManager.AllocateRtv();
+    if (!m_midPassRtv.IsValid()) {
+        DestroyMidPassResources();
+        return Error("Failed to allocate mid pass RTV");
+    }
+    device->CreateRenderTargetView(m_midPassColor.Get(), nullptr, m_midPassRtv.cpu);
+
+    m_midPassStagingSrv = m_heapManager.AllocateStagingCbvSrvUav();
+    if (!m_midPassStagingSrv.IsValid()) {
+        DestroyMidPassResources();
+        return Error("Failed to allocate mid pass staging SRV");
+    }
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Texture2D.MostDetailedMip = 0;
+    srvDesc.Texture2D.MipLevels = 1;
+    srvDesc.Texture2D.PlaneSlice = 0;
+    srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+    device->CreateShaderResourceView(m_midPassColor.Get(), &srvDesc, m_midPassStagingSrv.cpu);
+    m_midPassSrv = m_heapManager.CopyToShaderVisible(device, m_midPassStagingSrv);
+    if (!m_midPassSrv.IsValid()) {
+        DestroyMidPassResources();
+        return Error("Failed to allocate mid pass shader-visible SRV");
+    }
+    device->CreateShaderResourceView(m_midPassColor.Get(), &srvDesc, m_midPassSrv.cpu);
+
+    spdlog::info(
+        "Mid pass resources created: {}x{} scale={:.3f} main={}x{} srvIndex={} stagingSrvIndex={}",
+        m_midPassWidth,
+        m_midPassHeight,
+        scale,
+        m_width,
+        m_height,
+        m_midPassSrv.heapIndex,
+        m_midPassStagingSrv.heapIndex);
     return {};
 }
 

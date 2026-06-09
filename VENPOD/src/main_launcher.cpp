@@ -1017,6 +1017,10 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_RAYMARCH_BACKGROUND_PASS_COMPOSITE_FORCE_COLOR", 0u) != 0u;
     const bool midPassEnableRequested =
         ReadUIntEnv("VENPOD_RAYMARCH_MID_PASS_ENABLE", 0u) != 0u;
+    const float midPassScale = std::clamp(
+        ReadFloatEnv("VENPOD_RAYMARCH_MID_PASS_SCALE", 0.5f),
+        0.25f,
+        1.0f);
     spdlog::info(
         "RAYMARCH_FLOOR_CONFIG renderScale={:.3f} output={}x{} preset={} explicitScale={}",
         raymarchRenderScale,
@@ -1077,6 +1081,7 @@ int RunSandbox(int argc, char* argv[]) {
     rendererConfig.backgroundPassCompositeDebug = backgroundPassCompositeDebug;
     rendererConfig.backgroundPassCompositeForceColor = backgroundPassCompositeForceColor;
     rendererConfig.midPassEnabled = midPassEnableRequested;
+    rendererConfig.midPassScale = midPassScale;
 
     // Find shader path
     std::filesystem::path exeDir = GetExecutableDirectorySandbox();

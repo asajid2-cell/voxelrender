@@ -39,6 +39,7 @@ struct RendererConfig {
     bool backgroundPassCompositeDebug = false;
     bool backgroundPassCompositeForceColor = false;
     bool midPassEnabled = false;
+    float midPassScale = 0.5f;
 };
 
 class Renderer {
@@ -259,6 +260,9 @@ private:
     Result<void> CreateDepthBuffer();
     Result<void> CreateBackgroundPassResources();
     void DestroyBackgroundPassResources();
+    Result<void> CreateMidPassResources();
+    void DestroyMidPassResources();
+    Result<void> CreateMidCompositePipeline(ID3D12Device* device);
     bool UseBackgroundPassSplit() const;
     void SetMainRenderTarget(ID3D12GraphicsCommandList* cmdList);
     void SetViewportAndScissor(ID3D12GraphicsCommandList* cmdList, uint32_t width, uint32_t height);
@@ -279,6 +283,7 @@ private:
     DX12GraphicsPipeline m_sparseSurfacePipeline;
     DX12GraphicsPipeline m_overlayPipeline;
     DX12GraphicsPipeline m_backgroundCompositePipeline;
+    DX12GraphicsPipeline m_midCompositePipeline;
     ComPtr<ID3D12CommandSignature> m_sparseSurfaceDrawSignature;
     CompiledShader m_fullscreenVS;
     CompiledShader m_fullscreenPS;
@@ -287,6 +292,7 @@ private:
     CompiledShader m_sparseSurfacePS;
     CompiledShader m_overlayPS;
     CompiledShader m_backgroundCompositePS;
+    CompiledShader m_midCompositePS;
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_frameConstantUploads;
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_sparseSurfaceConstantUploads;
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_overlayConstantUploads;
@@ -308,6 +314,17 @@ private:
     uint32_t m_backgroundPassWidth = 0;
     uint32_t m_backgroundPassHeight = 0;
     bool m_backgroundPassSurfaceRaymarchFillLastFrame = false;
+
+    // Low-resolution "mid" raymarch pass: rendered into a smaller color target
+    // (alpha = mid coverage) then bilinear-upscale composited over the main RT,
+    // mirroring the background pass split.
+    DescriptorHandle m_midPassRtv;
+    DescriptorHandle m_midPassStagingSrv;
+    DescriptorHandle m_midPassSrv;
+    ComPtr<ID3D12Resource> m_midPassColor;
+    D3D12_RESOURCE_STATES m_midPassColorState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    uint32_t m_midPassWidth = 0;
+    uint32_t m_midPassHeight = 0;
 
     // Configuration
     RendererConfig m_config;
