@@ -3174,8 +3174,11 @@ bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, ou
     float3 shadeNormal = DistantLodShadeNormal(nearestNormal, nearestT, 0.58f);
     float3 lightDir = SkySunDirection();
     float ndotl = saturate(dot(shadeNormal, lightDir) * 0.56f + 0.34f);
-    float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.74f + ndotl * 0.34f);
-    color = max(color, baseColor.rgb * 0.56f + 0.040f);
+    // Lifted ambient floor (was *0.74 + ndotl*0.34, floor 0.56) so residual far
+    // SVO (startup / nearer occluder rays) reads hazy-lit like the mid voxels
+    // rather than a dark detached blob, matching the far-height shading.
+    float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.90f + ndotl * 0.46f);
+    color = max(color, baseColor.rgb * 0.70f + 0.070f);
     const float farSvoGridFade = saturate((nearestT - 1200.0f) / 6200.0f);
     const float farSvoGrid = VoxelGridLine(
         hitPos.xz,
@@ -3189,7 +3192,7 @@ bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, ou
         farHit = MakeHit(float4(float3(debugFog, debugFog, debugFog), 1.0f), nearestT);
         return true;
     }
-    color = lerp(color, SkyColor(rayDir), fogFactor * 0.42f + horizonHaze * 0.14f);
+    color = lerp(color, SkyColor(rayDir), fogFactor * 0.54f + horizonHaze * 0.32f + 0.12f);
     farHit = MakeHit(float4(color, 1.0f), nearestT);
     return true;
 }
@@ -3261,7 +3264,10 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     // FAR_TERRAIN_MAX_HEIGHT seen from ground level over the far ownership band)
     // climb to rayDir.y ~ +0.07, so the old 0.04 ceiling leaked sky between the
     // sparse far-SVO chunks. Rays that clear all peaks still return false (sky).
-    if (rayDir.y > 0.12f) {
+    // Raised 0.12 -> 0.22: the far heightfield now owns the full distant
+    // silhouette band (the deferral hands it the mountain tips up to ~0.22 that
+    // the sparse SVO used to paint as detached dark blobs).
+    if (rayDir.y > 0.22f) {
         return false;
     }
 
@@ -3410,7 +3416,12 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
 
             float3 lightDir = normalize(float3(0.5f, 1.0f, 0.3f));
             float lighting = saturate(dot(normal, lightDir) * 0.58f + 0.34f);
-            float3 color = baseColor.rgb * (0.72f + lighting * 0.24f);
+            // Brighter, ambient-aware fill (was flat 0.72 + lighting*0.24). The
+            // old flat term read as a near-black silhouette against the bright
+            // sky; matching the mid-voxel visual language (SkyAmbient + ndotl)
+            // makes the distant terrain read as hazy-lit, not a dark blob.
+            float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.90f + lighting * 0.50f);
+            color = max(color, baseColor.rgb * 0.70f + 0.07f);
             const float farGridFade = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
             const float farGrid = VoxelGridLine(
                 hitPos.xz,
@@ -3418,11 +3429,11 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
                 lerp(0.044f, 0.018f, farGridFade));
             color *= lerp(1.0f, 0.965f, farGrid);
 
-            // Extra fog hides the fact that this is a heightfield fallback, not
-            // the exact editable voxel buffer.
+            // Atmospheric haze toward the sky keeps the distant silhouette
+            // hazy-lit rather than a hard dark edge.
             float fogFactor = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
             const float horizonHaze = saturate((0.20f - abs(rayDir.y)) / 0.20f);
-            color = lerp(color, SkyColor(rayDir), fogFactor * 0.46f + horizonHaze * 0.14f + 0.04f);
+            color = lerp(color, SkyColor(rayDir), fogFactor * 0.58f + horizonHaze * 0.34f + 0.14f);
             farHit = MakeHit(float4(color, 1.0f), hitT);
             return true;
         }
@@ -4692,14 +4703,21 @@ bool RaymarchBackgroundField(
     // substantially resident (midResidencyParams.y voxel coverage ~0.04 at spawn
     // -> ~1.0 once streamed); before then the far SVO keeps the horizon and the
     // far-height tail stays gated off, so no whole-screen startup far march.
+    // Widened from (-0.20, 0.12) to (-0.24, 0.22): debug mode 58 at spawn showed
+    // the sparse far SVO (blue) painting DETACHED chunks ABOVE the continuous
+    // far-height band (orange), specifically the distant mountain-silhouette tips
+    // that climb to rayDir.y ~0.12-0.20. Those tips were the dark floating blobs.
+    // Extending the band lets the continuous far heightfield own the whole
+    // distant silhouette (lower band + tips) so it reads as one coherent ridge
+    // instead of fragmented SVO chunks with sky between them.
     const bool deferFarSvoToFarHeightHorizon =
         voxelTerrainOnly &&
         frame.midFieldParams.x > 0.5f &&
         frame.midResidencyParams.y >= 0.5f &&
         frame.midResidencyParams.w >= 1.0f &&
         rayOrigin.y <= 384.0f &&
-        rayDir.y > -0.20f &&
-        rayDir.y < 0.12f;
+        rayDir.y > -0.24f &&
+        rayDir.y < 0.22f;
     if (!deferFarSvoToFarHeightHorizon &&
         includeSparseFarField && RaymarchSparseFarField(rayOrigin, rayDir, farStartDist, backgroundHit)) {
         RayHit resolvedWaterHit;
@@ -4783,7 +4801,11 @@ bool RaymarchBackgroundField(
             ? max(frame.backgroundOwnershipParams.y, frame.midFieldParams.y + 1.0f)
             : max(frame.midFieldParams.z, frame.midFieldParams.y + 1.0f);
         heightStart = max(farStartDist, voxelFarHandoff);
-        farHeightAllowed = heightAngleOk;
+        // The deferral gate above already bounds rayDir.y < 0.22 for this branch,
+        // so let the continuous far heightfield own the full silhouette band
+        // (including the mountain tips that heightAngleOk's 0.12 ceiling rejected
+        // and which the sparse SVO would otherwise paint as detached dark blobs).
+        farHeightAllowed = true;
     } else {
         heightStart = highAltitudeDownwardView
             ? max(startDist, 32.0f)
@@ -5073,8 +5095,11 @@ bool BuildDeterministicFarTerrainContinuityHit(
     baseColor.rgb = FarTerrainMaterialVariation(baseColor.rgb, material, hitPos.xz, hitPos.y, hitT);
     const float3 normal = DistantLodShadeNormal(FarTerrainNormal(hitPos.xz), hitT, 0.46f);
     const float ndotl = saturate(dot(normal, SkySunDirection()) * 0.56f + 0.34f);
-    float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.74f + ndotl * 0.34f);
-    color = max(color, baseColor.rgb * 0.56f + 0.040f);
+    // Lifted to match the brightened far-height / far-SVO shading (was *0.74 +
+    // ndotl*0.34, floor 0.56) so the resident-mid horizon continuity reads
+    // hazy-lit, not as a dark blob.
+    float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.90f + ndotl * 0.46f);
+    color = max(color, baseColor.rgb * 0.70f + 0.070f);
     const float gridFade = saturate((hitT - 1200.0f) / 6200.0f);
     const float grid = VoxelGridLine(hitPos.xz, FarFallbackCellSize(hitT), lerp(0.030f, 0.016f, gridFade));
     color *= lerp(1.0f, 0.970f, grid);
@@ -5085,7 +5110,7 @@ bool BuildDeterministicFarTerrainContinuityHit(
         continuityHit = MakeHit(float4(float3(debugFog, debugFog, debugFog), 1.0f), hitT);
         return true;
     }
-    color = lerp(color, SkyColor(rayDir), fogFactor * 0.42f + horizonHaze * 0.14f);
+    color = lerp(color, SkyColor(rayDir), fogFactor * 0.54f + horizonHaze * 0.32f + 0.12f);
     continuityHit = MakeHit(float4(color, 1.0f), hitT);
     return true;
 }
