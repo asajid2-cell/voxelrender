@@ -660,10 +660,15 @@ float FarTerrainHeight(float2 xz, out float mountainMask, out float spireMask, o
 
     float ridgeHeight = ridge * ridge;
 
+    // VISUAL PASS iter1 (landforms): mirror the CHEAP amplitude changes from the CPU
+    // HeightAt (broad 145 -> 92, detail 8 -> 3). These add no ops, so they do not
+    // risk the startup GPU TDR. The terrace quantization and spawn-landmass reshape
+    // are intentionally NOT applied in this per-step gradient/far fallback (see note
+    // below) to keep it cheap; the actual geometry copies carry those.
     float height = -64.0f;
-    height += broad * 145.0f;
+    height += broad * 92.0f;
     height += ridgeHeight * 150.0f;
-    height += detail * 8.0f;
+    height += detail * 3.0f;
 
     float2 originDelta = xz - float2(192.0f, 224.0f);
     float originDistance = length(originDelta);
@@ -1074,6 +1079,26 @@ float3 BackgroundTerrainMaterialVariation(
 
     const float materialStrength = saturate(strength * (material == MAT_STONE ? (0.72f + distanceBlend * 0.12f) : (0.58f + distanceBlend * 0.20f)));
     return lerp(baseColor, varied, materialStrength);
+}
+
+// Per-WORLD-VOXEL micro color jitter (lever 2). The per-cell variation above gives
+// large color patches; within a patch every block is identical, which is what still
+// reads as flat-colored terraces. This adds a stable per-integer-voxel brightness +
+// tiny hue skew (hashed on floor(worldPos)) so adjacent blocks differ subtly, like
+// natural block-to-block texture. Cheap: one FarHash3D + a few mul/add. Fades out
+// with distance so it never becomes far-field noise/shimmer.
+float3 PerVoxelColorJitter(float3 color, float3 worldPos, float distanceFromCamera) {
+    const int vx = (int)floor(worldPos.x);
+    const int vy = (int)floor(worldPos.y);
+    const int vz = (int)floor(worldPos.z);
+    const uint h = FarHash3D(vx, vy, vz, FarWorldSeed() + 911u);
+    const float j = (float)(h & 0xFFFFu) / 65535.0f * 2.0f - 1.0f;      // ~[-1,1]
+    const float j2 = (float)((h >> 16) & 0xFFFFu) / 65535.0f * 2.0f - 1.0f;
+    const float fade = 1.0f - saturate((distanceFromCamera - 240.0f) / 700.0f);
+    const float bright = 1.0f + j * 0.09f * fade;                        // +/-9% brightness
+    // tiny per-channel hue skew (a few %) so it's natural variation, not grey noise
+    const float3 hue = float3(1.0f + j2 * 0.030f, 1.0f + j * 0.018f, 1.0f - j2 * 0.024f);
+    return color * bright * lerp(float3(1.0f, 1.0f, 1.0f), hue, fade);
 }
 
 float3 DebugMaterialColor(uint material) {
@@ -2008,6 +2033,9 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
                     hitDistance,
                     ring0MidVoxel ? 0.52f : 0.72f);
                 baseColor.rgb = ApplyWaterlineWetTerrainTint(baseColor.rgb, material, hitPos.y, normal.y, 0.78f);
+                if (material == MAT_STONE || material == MAT_DIRT || material == MAT_SAND) {
+                    baseColor.rgb = PerVoxelColorJitter(baseColor.rgb, hitPos, hitDistance);
+                }
 #ifdef RAYMARCH_MID_ONLY
                 // ANALYTIC GRADIENT NORMAL (mid-only pass): central-difference the terrain
                 // height field instead of the blocky 6-neighbor voxel-face normal, so the

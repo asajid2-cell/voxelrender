@@ -96,10 +96,14 @@ float SparseTerrainGenerator::HeightAt(int32_t worldX, int32_t worldZ) const {
 
     const float ridgeHeight = ridge * ridge;
 
+    // VISUAL PASS iter1 (landforms): flatten the rolling base so plains read as
+    // playable flats with distinct hills, not a continuous contour gradient.
+    // broad 145 -> 92 (less mid-band roll), detail 8 -> 3 (less high-freq contour
+    // wobble). ridgeHeight kept at 150 so hills/mountains stay distinct.
     float height = -64.0f;
-    height += broad * 145.0f;
+    height += broad * 92.0f;
     height += ridgeHeight * 150.0f;
-    height += detail * 8.0f;
+    height += detail * 3.0f;
 
     const float originDx = x - 192.0f;
     const float originDz = z - 224.0f;
@@ -238,12 +242,28 @@ float SparseTerrainGenerator::HeightAt(int32_t worldX, int32_t worldZ) const {
     // old 2800u fade reverted to water + fragmented banks).
     const float spawnLandBand =
         1.0f - Smooth01(std::clamp((originDistance - 200.0f) / 9300.0f, 0.0f, 1.0f));
+    // VISUAL PASS iter1 (coast): raise the spawn land floor and reduce its noise so
+    // near-spawn ground is a solid coherent plain well above the waterline (no
+    // 1-voxel banks / thin slivers). +40 -> +56 base, noise softened.
     const float spawnLandFloor =
-        static_cast<float>(SEA_LEVEL_Y) + 40.0f +
-        broad * 28.0f +
+        static_cast<float>(SEA_LEVEL_Y) + 56.0f +
+        broad * 18.0f +
         ridgeHeight * 40.0f +
-        detail * 5.0f;
+        detail * 3.0f;
     height = Lerp(height, std::max(height, spawnLandFloor), spawnLandBand);
+
+    // VISUAL PASS iter1 (small consistent block steps): quantize the lowland/plains
+    // band to a 3-unit terrace so flats render as clean block plateaus rather than
+    // a 1-voxel contour gradient. The blend fades out as terrain rises into the
+    // hill/mountain band (above SEA+150) so peaks keep their full relief.
+    const float terraceStep = 3.0f;
+    const float terraceBlend =
+        1.0f - Smooth01(std::clamp(
+            (height - static_cast<float>(SEA_LEVEL_Y + 64)) / 150.0f, 0.0f, 1.0f));
+    if (terraceBlend > 0.0f) {
+        const float terraced = std::floor(height / terraceStep) * terraceStep;
+        height = Lerp(height, terraced, terraceBlend);
+    }
 
     return std::clamp(height, static_cast<float>(TERRAIN_MIN_Y), static_cast<float>(TERRAIN_MAX_Y));
 }

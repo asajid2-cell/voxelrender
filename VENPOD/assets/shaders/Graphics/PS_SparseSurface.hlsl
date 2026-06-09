@@ -366,11 +366,23 @@ float4 main(PSInput input) : SV_Target {
     const float skyAccess = saturate(litN.y * 0.5f + 0.5f);
     float3 color = baseColor * (skyFill * (0.40f + 0.30f * skyAccess) + sunColor * smoothDiffuse * 0.72f);
     color = max(color, baseColor * 0.30f);
-    const float voxelTone = HashVoxelCell(floor(input.worldPos + n * 0.01f)) - 0.5f;
+    // Per-WORLD-VOXEL micro variation (lever 2): brightness + tiny per-channel hue skew,
+    // hashed on the integer voxel position so adjacent blocks differ subtly (natural
+    // block-to-block texture, not screen noise). Stable as the camera moves.
+    const float3 voxelCell = floor(input.worldPos + n * 0.01f);
+    const float voxelTone = HashVoxelCell(voxelCell) - 0.5f;
+    const float voxelHue = HashVoxelCell(voxelCell + 17.31f) - 0.5f;
     const float terrainToneStrength = input.material == MAT_STONE
-        ? (sideFace ? 0.026f : 0.055f)
-        : (sideFace ? 0.045f : 0.12f);
-    color *= 1.0f + voxelTone * (underwaterView ? 0.014f : terrainToneStrength);
+        ? (sideFace ? 0.060f : 0.10f)
+        : (sideFace ? 0.075f : 0.14f);
+    const float brightJitter = underwaterView ? 0.014f : terrainToneStrength;
+    color *= 1.0f + voxelTone * brightJitter;
+    if (!underwaterView) {
+        // a few % hue skew so blocks read as varied material, not uniform tint
+        color *= float3(1.0f + voxelHue * 0.030f,
+                        1.0f + voxelTone * 0.016f,
+                        1.0f - voxelHue * 0.026f);
+    }
 
     const float3 absNormal = abs(n);
     float2 gridUv = input.worldPos.xy;

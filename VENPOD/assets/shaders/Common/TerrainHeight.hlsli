@@ -148,10 +148,12 @@ float TH_HeightAt(int worldX, int worldZ, uint seed) {
 
     float ridgeHeight = ridge * ridge;
 
+    // VISUAL PASS iter1 (landforms): PARITY mirror of CPU HeightAt. broad 145 -> 92,
+    // detail 8 -> 3. ridgeHeight kept at 150.
     float height = -64.0f;
-    height += broad * 145.0f;
+    height += broad * 92.0f;
     height += ridgeHeight * 150.0f;
-    height += detail * 8.0f;
+    height += detail * 3.0f;
 
     float originDx = x - 192.0f;
     float originDz = z - 224.0f;
@@ -279,12 +281,24 @@ float TH_HeightAt(int worldX, int worldZ, uint seed) {
     // PARITY: matches CPU SparseTerrainGenerator::HeightAt spawn-land block.
     float spawnLandBand =
         1.0f - TH_Smooth01(saturate((originDistance - 200.0f) / 9300.0f));
+    // VISUAL PASS iter1 (coast): PARITY mirror. +40 -> +56 base, noise softened.
     float spawnLandFloor =
-        (float)TH_SEA_LEVEL_Y + 40.0f +
-        broad * 28.0f +
+        (float)TH_SEA_LEVEL_Y + 56.0f +
+        broad * 18.0f +
         ridgeHeight * 40.0f +
-        detail * 5.0f;
+        detail * 3.0f;
     height = TH_Lerp(height, max(height, spawnLandFloor), spawnLandBand);
+
+    // VISUAL PASS iter1 (small consistent block steps): PARITY mirror of CPU
+    // terrace quantization (3-unit step on the lowland/plains band, fading out into
+    // hills above SEA+64..+214). std::floor -> floor, std::clamp(,0,1) -> saturate.
+    float terraceStep = 3.0f;
+    float terraceBlend =
+        1.0f - TH_Smooth01(saturate((height - (float)(TH_SEA_LEVEL_Y + 64)) / 150.0f));
+    if (terraceBlend > 0.0f) {
+        float terraced = floor(height / terraceStep) * terraceStep;
+        height = TH_Lerp(height, terraced, terraceBlend);
+    }
 
     // PARITY: final clamp to [TERRAIN_MIN_Y, TERRAIN_MAX_Y] as floats.
     return clamp(height, (float)TH_TERRAIN_MIN_Y, (float)TH_TERRAIN_MAX_Y);

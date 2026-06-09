@@ -1155,10 +1155,12 @@ float FarVoxelOctree::TerrainHeight(float x, float z) const {
         m_config.seed + 37u);
     const float ridgeHeight = ridge * ridge;
 
+    // VISUAL PASS iter1 (landforms): PARITY mirror of CPU HeightAt. broad 145 -> 92,
+    // detail 8 -> 3. ridgeHeight kept at 150.
     float height = -64.0f;
-    height += broad * 145.0f;
+    height += broad * 92.0f;
     height += ridgeHeight * 150.0f;
-    height += detail * 8.0f;
+    height += detail * 3.0f;
 
     const float originDx = x - 192.0f;
     const float originDz = z - 224.0f;
@@ -1320,12 +1322,26 @@ float FarVoxelOctree::TerrainHeight(float x, float z) const {
     // Must match SparseTerrainGenerator::HeightAt / TH_HeightAt (the geometry copies).
     const float spawnLandBand =
         1.0f - Smooth01(std::clamp((originDistance - 200.0f) / 9300.0f, 0.0f, 1.0f));
+    // VISUAL PASS iter1 (coast): PARITY mirror. +40 -> +56 base, noise softened.
     const float spawnLandFloor =
-        static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y) + 40.0f +
-        broad * 28.0f +
+        static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y) + 56.0f +
+        broad * 18.0f +
         ridgeHeight * 40.0f +
-        detail * 5.0f;
+        detail * 3.0f;
     height = height + (std::max(height, spawnLandFloor) - height) * spawnLandBand;
+
+    // VISUAL PASS iter1 (small consistent block steps): PARITY mirror of CPU terrace
+    // quantization (3-unit step on lowland/plains band, fading into hills).
+    const float terraceStep = 3.0f;
+    const float terraceBlend =
+        1.0f - Smooth01(std::clamp(
+            (height - static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y + 64)) / 150.0f,
+            0.0f,
+            1.0f));
+    if (terraceBlend > 0.0f) {
+        const float terraced = std::floor(height / terraceStep) * terraceStep;
+        height = height + (terraced - height) * terraceBlend;
+    }
 
     return std::clamp(
         height,
