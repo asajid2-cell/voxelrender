@@ -41,6 +41,14 @@ struct SparseVoxelWorldConfig {
     bool surfaceBuriedSolidFastPath = false;
     bool surfaceClassValueSortCache = false;
     bool surfaceClassPartialValueSort = false;
+    // PumpGenerationAround fully re-sorts every generation-class queue (and the
+    // legacy queue) twice per frame, even though only a small prefix (the per-frame
+    // brick budget) is ever popped. When set, the in-loop value/ticket sorts are
+    // replaced by their partial-sort variants bounded to the remaining budget, which
+    // produces a byte-identical consumed prefix while skipping the cost of fully
+    // ordering the hundreds-to-thousands of bricks in the queue tail during the
+    // moving-convergence transient. Pure CPU-prep reduction; no streaming-order change.
+    bool generationClassPartialValueSort = true;
     bool surfaceStrictTimeBudget = false;
     bool parallelSurfaceExtraction = false;
     bool parallelSurfaceExtractionTimeBudgeted = false;

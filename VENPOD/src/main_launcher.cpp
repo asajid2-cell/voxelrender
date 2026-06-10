@@ -1197,6 +1197,13 @@ int RunSandbox(int argc, char* argv[]) {
     sparseWorldConfig.surfaceClassPartialValueSort =
         sparseBackendRequested &&
         ReadUIntEnv("VENPOD_SPARSE_SURFACE_CLASS_PARTIAL_SORT", 0u) != 0u;
+    // Enabled by default: PumpGenerationAround's per-frame full re-sort of the
+    // generation-class/legacy queues is replaced by a partial sort bounded to the
+    // remaining brick budget. The consumed prefix is byte-identical, so streaming
+    // priority/coverage is unchanged; it only avoids ordering the unused queue tail
+    // during the moving-convergence transient. Set the env var to 0 to A/B-revert.
+    sparseWorldConfig.generationClassPartialValueSort =
+        ReadUIntEnv("VENPOD_SPARSE_GENERATION_CLASS_PARTIAL_SORT", 1u) != 0u;
     sparseWorldConfig.surfaceStrictTimeBudget =
         sparseBackendRequested &&
         ReadUIntEnv("VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET", 0u) != 0u;
@@ -2439,11 +2446,18 @@ int RunSandbox(int argc, char* argv[]) {
             "VENPOD_SPARSE_MID_HEIGHT_CLIPMAP",
             1u) != 0u;
     sparseClipmapConfig.startDistance =
-        static_cast<float>(ReadUIntEnv("VENPOD_SPARSE_MID_START", 1024u));
+        static_cast<float>(ReadUIntEnv("VENPOD_SPARSE_MID_START", 768u));
+    // VISUAL PASS iter1: shrink mid clipmap reach so the finer (cell 4) bricks
+    // can cover the visible spawn view within the 16384 brick budget. 6400 -> 3072.
     sparseClipmapConfig.endDistance =
-        static_cast<float>(ReadUIntEnv("VENPOD_SPARSE_MID_END", 6400u));
+        static_cast<float>(ReadUIntEnv("VENPOD_SPARSE_MID_END", 3072u));
+    // VISUAL PASS iter1: the #1 contour-slab fix. The mid-voxel raymarch quantizes
+    // terrain to cellSize cubes; at 12 that reads as 12-unit terrace contours.
+    // 12 -> 4 gives small consistent block steps (Minecraft-like). Brick budget is
+    // held by the reduced end/radius above/below (each brick covers 16*4=64u vs
+    // 16*12=192u, so a tighter ring keeps interest under the 16384 cap).
     sparseClipmapConfig.minCellSize =
-        static_cast<float>(ReadUIntEnv("VENPOD_SPARSE_MID_CELL", 12u));
+        static_cast<float>(ReadUIntEnv("VENPOD_SPARSE_MID_CELL", 4u));
     sparseClipmapConfig.nearExitPadding =
         static_cast<float>(ReadUIntEnv("VENPOD_SPARSE_MID_NEAR_PADDING", 12u));
     sparseClipmapConfig.ringCount = ReadUIntEnv("VENPOD_SPARSE_MID_RINGS", 4u);
@@ -2458,9 +2472,14 @@ int RunSandbox(int argc, char* argv[]) {
     // Keep the old env override so it can still be disabled for A/B testing.
     sparseClipmapConfig.voxelClipmapEnabled =
         ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_CLIPMAP", 1u) != 0u;
-    sparseClipmapConfig.voxelBrickRadiusXz = ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ", 8u);
-    sparseClipmapConfig.voxelBrickRadiusY = ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_RADIUS_Y", 4u);
-    sparseClipmapConfig.maxVoxelBricks = ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_MAX_BRICKS", 12288u);
+    // VISUAL PASS iter1: at cell 4 each ring-0 brick covers only 64u, so widen the
+    // resident XZ bubble to keep the visible spawn ground in fine bricks.
+    // ring-0 voxel bricks ~= (2*14+1)^2 * (2*5+1) = 29*29*11 = 9251 < 16384 cap.
+    sparseClipmapConfig.voxelBrickRadiusXz = ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ", 14u);
+    sparseClipmapConfig.voxelBrickRadiusY = ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_RADIUS_Y", 5u);
+    // VISUAL PASS iter1: 12288 -> 16384 (the HLSL hard ceiling) to fit the wider
+    // cell-4 ring-0 bubble above.
+    sparseClipmapConfig.maxVoxelBricks = ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_MAX_BRICKS", 16384u);
     const bool enableSparseMidVoxelWalkingDda =
         sparseBackendRequested && ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_WALK_DDA", 1u) != 0u;
     sparseClipmapConfig.voxelInterestCapacityPercent =
@@ -4353,6 +4372,33 @@ int RunSandbox(int argc, char* argv[]) {
     float perfPrePhysicsGapMs = 0.0f;
     float perfPreRenderGapMs = 0.0f;
     float perfPostRenderGapMs = 0.0f;
+    // UNTRACKED-DIVE instrumentation: fine-grained scoped timers around the
+    // genuinely un-bracketed slivers that fall between named phases / inside the
+    // four gap timers, so the "untracked 15-52ms" can be attributed.
+    float perfGpuTimingReadMs = 0.0f;   // ReadGpuTiming map+compute (13049-13051)
+    float perfEndFrameMs = 0.0f;        // renderer->EndFrame + ResolveQueryData (22690-22706)
+    float perfCmdFinalizeMs = 0.0f;     // commandList->Close + ExecuteCommandList (22709-22716)
+    float perfSwapBuffersMs = 0.0f;     // voxelWorld->SwapBuffers (22727)
+    float perfSignalGenMs = 0.0f;       // Signal + PumpChunkGeneration + prediction (22742-22767)
+    float perfLoggingMs = 0.0f;         // per-frame PERF spdlog block (observer cost)
+    // Last-frame snapshots of the post-render-region slivers. The PERF_UNTRACKED
+    // line is emitted before EndFrame/Close/Execute/Swap/logging run this frame,
+    // so those slivers are reported from the previous frame (same pattern as
+    // perfPostGenerationMsLastFrame / perfInputEndMsLastFrame).
+    float perfPostRenderGapMsLastFrame = 0.0f;
+    float perfEndFrameMsLastFrame = 0.0f;
+    float perfCmdFinalizeMsLastFrame = 0.0f;
+    float perfSwapBuffersMsLastFrame = 0.0f;
+    float perfSignalGenMsLastFrame = 0.0f;
+    float perfLoggingMsLastFrame = 0.0f;
+    // UNTRACKED-DIVE: measure the loop TAIL (from end-of-body to the top of the
+    // next iteration) and the FRAME_END logging cost, both of which are OUTSIDE
+    // the `body` timer but INSIDE rawMs. Data showed rawMs - body ~= 7-28ms on
+    // dip frames, so the residual untracked lives here.
+    uint64_t perfBodyEndCounter = 0;
+    float perfLoopTailMsLastFrame = 0.0f;   // body-end -> next loop top
+    float perfFrameEndLogMs = 0.0f;         // PERF_FRAME_END spdlog block cost
+    float perfFrameEndLogMsLastFrame = 0.0f;
     float perfPostGenerationMsLastFrame = 0.0f;
     float perfInputEndMsLastFrame = 0.0f;
     float perfFrameBodyMsLastFrame = 0.0f;
@@ -5324,6 +5370,11 @@ int RunSandbox(int argc, char* argv[]) {
         const auto ticksToMs = [performanceFrequency](uint64_t ticks) {
             return static_cast<float>(static_cast<double>(ticks) * 1000.0 / performanceFrequency);
         };
+        // UNTRACKED-DIVE: time from end of previous frame's body to this loop top.
+        if (perfBodyEndCounter != 0) {
+            perfLoopTailMsLastFrame =
+                ticksToMs(currentFrameCounter - perfBodyEndCounter);
+        }
         sparseWalkTerrainParityCorrectionsLastFrame = 0;
         sparseWalkTerrainHeightLastFrame = 0.0f;
         sparseWalkCameraAboveTerrainLastFrame = 0.0f;
@@ -5390,6 +5441,12 @@ int RunSandbox(int argc, char* argv[]) {
         perfPrePhysicsGapMs = 0.0f;
         perfPreRenderGapMs = 0.0f;
         perfPostRenderGapMs = 0.0f;
+        perfGpuTimingReadMs = 0.0f;
+        perfEndFrameMs = 0.0f;
+        perfCmdFinalizeMs = 0.0f;
+        perfSwapBuffersMs = 0.0f;
+        perfSignalGenMs = 0.0f;
+        perfLoggingMs = 0.0f;
         bool backgroundPassSurfaceRaymarchFillThisFrame =
             backgroundPassSurfaceRaymarchFillRequested;
         bool sparsePrefetchStageBudgetsActiveThisFrame =
@@ -13035,7 +13092,9 @@ int RunSandbox(int argc, char* argv[]) {
                 commandQueue->GetLastCompletedFenceValue());
         }
         if (gpuTimestampReadback && gpuTimestampFrequency != 0) {
+            uint64_t perfGpuTimingReadStart = SDL_GetPerformanceCounter();
             ReadGpuTiming(gpuTimestampReadback.Get(), gpuTimestampFrequency, frameIndex, gpuTiming);
+            perfGpuTimingReadMs = ticksToMs(SDL_GetPerformanceCounter() - perfGpuTimingReadStart);
         }
         uint64_t perfGapStart = SDL_GetPerformanceCounter();
         uint64_t perfSparseStepStart = perfGapStart;
@@ -20955,6 +21014,7 @@ int RunSandbox(int argc, char* argv[]) {
             perfSparseSurfaceSnapshotMs > 2.0f ||
             perfSparseSurfaceStageMs > 4.0f ||
             perfSparseSurfaceEmitMs > 1.0f;
+        const uint64_t perfLoggingStart = SDL_GetPerformanceCounter();
         if (enableRuntimeLog &&
             ((frameCount % static_cast<uint64_t>(perfSummaryLogInterval) == 0) ||
              sparseSurfaceSpikeLog)) {
@@ -20972,7 +21032,17 @@ int RunSandbox(int argc, char* argv[]) {
                 perfRenderSubmitMs +
                 perfPresentMs +
                 perfPostGenerationMsLastFrame +
-                perfInputEndMsLastFrame;
+                perfInputEndMsLastFrame +
+                // Fold the four inter-phase gap timers into the accounted total so
+                // 'untracked' stops double-counting the sparse-post pipeline gap, the
+                // pre-physics/pre-render gaps, and the post-render gap. PERF_BODYRECON
+                // proved these gaps (not a hidden GPU/Present stall) make up the
+                // entire previously-"untracked" slice; including them collapses
+                // untracked to ~0 so the field reflects reality.
+                perfPostWaitGapMs +
+                perfPrePhysicsGapMs +
+                perfPreRenderGapMs +
+                perfPostRenderGapMs;
             const float perfUntrackedMs =
                 std::max(0.0f, lastRawFrameMs - perfAccountedCpuMs);
             spdlog::info(
@@ -21046,6 +21116,78 @@ int RunSandbox(int argc, char* argv[]) {
                 farSvoUploadMsLastFrame,
                 farSvoUploadMsSmoothed,
                 farStatsLog.gpuUploadMs);
+            // ===== UNTRACKED-DIVE: dedicated breakdown of the "untracked" ms =====
+            // The original `untracked` excludes the four gap timers AND the
+            // post-render slivers. Here we attribute it explicitly. The
+            // post-render-region values (postRenderGap/endFrame/cmdFinalize/swap/
+            // signalGen/logging) are PREVIOUS-frame snapshots because this log
+            // emits before those run this frame.
+            const float untrackedGapSumMs =
+                perfPostWaitGapMs +
+                perfPrePhysicsGapMs +
+                perfPreRenderGapMs +
+                perfPostRenderGapMsLastFrame;
+            const float untrackedSliverSumMs =
+                perfGpuTimingReadMs +
+                perfEndFrameMsLastFrame +
+                perfCmdFinalizeMsLastFrame +
+                perfSwapBuffersMsLastFrame +
+                perfSignalGenMsLastFrame +
+                perfLoggingMsLastFrame;
+            // postRenderGap already contains endFrame+cmdFinalize+swap+signalGen+
+            // logging, so the residual within it (after subtracting those slivers)
+            // is the un-bracketed remainder of the post-render region.
+            const float postRenderResidualMs = std::max(0.0f,
+                perfPostRenderGapMsLastFrame -
+                (perfEndFrameMsLastFrame + perfCmdFinalizeMsLastFrame +
+                 perfSwapBuffersMsLastFrame + perfSignalGenMsLastFrame +
+                 perfLoggingMsLastFrame));
+            // residualUntracked = frame time NOT explained by accounted phases NOR
+            // by the four gap timers. If near 0, the gaps fully explain untracked.
+            const float residualUntrackedMs = std::max(0.0f,
+                lastRawFrameMs - (perfAccountedCpuMs + untrackedGapSumMs));
+            spdlog::info(
+                "PERF_UNTRACKED frame={} fps={:.1f} rawMs={:.2f} bodyPrev={:.2f} accounted={:.2f} untrackedOrig={:.2f} "
+                "gapSum={:.2f} gaps=postWait/prePhys/preRender/postRender:{:.2f}/{:.2f}/{:.2f}/{:.2f} "
+                "sliverSum={:.2f} slivers=gpuRead/endFrame/cmdFinalize/swap/signalGen/logging:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} "
+                "loopTail={:.2f} frameEndLog={:.2f} "
+                "postRenderResidual={:.2f} residualUntracked={:.2f} "
+                "namedPhases=prep/fence/chunk/phys/brush/render/present/postGen/inputEnd:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} "
+                "fenceWait={:.2f} gpuFrameMs={:.2f} gpuValid={}",
+                frameCount,
+                instantFps,
+                lastRawFrameMs,
+                perfFrameBodyMsLastFrame,
+                perfAccountedCpuMs,
+                perfUntrackedMs,
+                untrackedGapSumMs,
+                perfPostWaitGapMs,
+                perfPrePhysicsGapMs,
+                perfPreRenderGapMs,
+                perfPostRenderGapMsLastFrame,
+                untrackedSliverSumMs,
+                perfGpuTimingReadMs,
+                perfEndFrameMsLastFrame,
+                perfCmdFinalizeMsLastFrame,
+                perfSwapBuffersMsLastFrame,
+                perfSignalGenMsLastFrame,
+                perfLoggingMsLastFrame,
+                perfLoopTailMsLastFrame,
+                perfFrameEndLogMsLastFrame,
+                postRenderResidualMs,
+                residualUntrackedMs,
+                perfFramePrepMs,
+                perfFenceWaitMs,
+                perfChunkUpdateMs,
+                perfPhysicsSubmitMs,
+                perfBrushSubmitMs,
+                perfRenderSubmitMs,
+                perfPresentMs,
+                perfPostGenerationMsLastFrame,
+                perfInputEndMsLastFrame,
+                perfFenceWaitMs,
+                gpuTiming.valid ? gpuTiming.frameMs : 0.0,
+                gpuTiming.valid ? 1 : 0);
             if (sparseBackendRequested && sparseVoxelWorldReady) {
                 spdlog::info(
                     "PERF_BACKEND_PIPE frame={} configured=0x{:X} active=0x{:X} warn=0x{:X} cpu={} gpu={} ray={} near={} surfaceGpu={} surfaceRaster={} surfaceAuth={} mid={} far={} own={} coll={} phys={}",
@@ -22572,6 +22714,9 @@ int RunSandbox(int argc, char* argv[]) {
                     postNonReadySamples.empty() ? "none" : postNonReadySamples);
             }
         }
+        // UNTRACKED-DIVE: cost of the per-frame PERF/PERF_SPARSE logging block
+        // itself (observer effect; large with VENPOD_PERF_SUMMARY_LOG_INTERVAL=1).
+        perfLoggingMs = ticksToMs(SDL_GetPerformanceCounter() - perfLoggingStart);
 
         if (!hideUiForCapture) {
             ImDrawList* foregroundDrawList = ImGui::GetForegroundDrawList();
@@ -22675,6 +22820,7 @@ int RunSandbox(int argc, char* argv[]) {
         }
 
         // End frame - transitions back buffer to present state
+        uint64_t perfEndFrameStart = SDL_GetPerformanceCounter();
         renderer->EndFrame(commandList.Get(), frameIndex);
         if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
             spdlog::info("FRAME_STAGE {} render-end", frameCount);
@@ -22689,16 +22835,19 @@ int RunSandbox(int argc, char* argv[]) {
                 gpuTimestampReadback.Get(),
                 static_cast<UINT64>(gpuTimestampBase) * sizeof(uint64_t));
         }
+        perfEndFrameMs = ticksToMs(SDL_GetPerformanceCounter() - perfEndFrameStart);
         if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
             spdlog::info("FRAME_STAGE {} timestamp-resolved", frameCount);
         }
 
         // Close and execute command list
+        uint64_t perfCmdFinalizeStart = SDL_GetPerformanceCounter();
         commandList->Close();
         if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
             spdlog::info("FRAME_STAGE {} commandlist-closed", frameCount);
         }
         commandQueue->ExecuteCommandList(commandList.Get());
+        perfCmdFinalizeMs = ticksToMs(SDL_GetPerformanceCounter() - perfCmdFinalizeStart);
         if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
             spdlog::info("FRAME_STAGE {} commandlist-executed", frameCount);
         }
@@ -22712,7 +22861,9 @@ int RunSandbox(int argc, char* argv[]) {
         //   Frame N: chunks copied to WRITE (buffer 1), physics writes to buffer 1, render reads buffer 0
         //   Swap -> buffer 1 becomes READ, buffer 0 becomes WRITE
         //   Frame N+1: chunks copied to WRITE (now buffer 0), physics writes to buffer 0, render reads buffer 1
+        uint64_t perfSwapBuffersStart = SDL_GetPerformanceCounter();
         voxelWorld->SwapBuffers();
+        perfSwapBuffersMs = ticksToMs(SDL_GetPerformanceCounter() - perfSwapBuffersStart);
         if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
             spdlog::info("FRAME_STAGE {} buffers-swapped", frameCount);
         }
@@ -22727,11 +22878,13 @@ int RunSandbox(int argc, char* argv[]) {
         }
 
         // Signal fence for this frame
+        uint64_t perfSignalGenStart = SDL_GetPerformanceCounter();
         ctx.fenceValue = commandQueue->Signal();
         if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
             spdlog::info("FRAME_STAGE {} signaled fence {}", frameCount, ctx.fenceValue);
         }
         voxelWorld->NotifyBrushEditFeedbackFence(ctx.fenceValue);
+        perfSignalGenMs = ticksToMs(SDL_GetPerformanceCounter() - perfSignalGenStart);
 
         // Submit background chunk generation after the frame has been queued.
         // This keeps generation from sitting in front of the render pass on the
@@ -22759,6 +22912,48 @@ int RunSandbox(int argc, char* argv[]) {
         inputManager.EndFrame();
         perfInputEndMsLastFrame = ticksToMs(SDL_GetPerformanceCounter() - perfPhaseStart);
         perfFrameBodyMsLastFrame = ticksToMs(SDL_GetPerformanceCounter() - currentFrameCounter);
+        // ===== UNTRACKED-DIVE: full body partition at END of loop, where EVERY
+        // timer holds this frame's value (no current/previous mixing). bodyResidual
+        // is the time inside the body NOT covered by any named phase OR gap timer.
+        if (enableRuntimeLog &&
+            (frameCount % static_cast<uint64_t>(perfSummaryLogInterval) == 0)) {
+            const float bodyNamedSumMs =
+                perfFramePrepMs + perfFenceWaitMs + perfChunkUpdateMs +
+                perfPhysicsSubmitMs + perfBrushSubmitMs + perfRenderSubmitMs +
+                perfPresentMs + perfPostGenerationMsLastFrame + perfInputEndMsLastFrame;
+            const float bodyGapSumMs =
+                perfPostWaitGapMs + perfPrePhysicsGapMs + perfPreRenderGapMs +
+                perfPostRenderGapMs;
+            // postRenderGap already contains these slivers; report them so we can
+            // see what inside postRenderGap is un-bracketed.
+            const float postRenderResidualNowMs = std::max(0.0f,
+                perfPostRenderGapMs -
+                (perfEndFrameMs + perfCmdFinalizeMs + perfSwapBuffersMs +
+                 perfSignalGenMs + perfLoggingMs));
+            const float bodyResidualMs = std::max(0.0f,
+                perfFrameBodyMsLastFrame - (bodyNamedSumMs + bodyGapSumMs + perfGpuTimingReadMs));
+            spdlog::info(
+                "PERF_BODYRECON frame={} fps={:.1f} body={:.2f} namedSum={:.2f} gapSum={:.2f} gpuRead={:.2f} bodyResidual={:.2f} "
+                "gaps=postWait/prePhys/preRender/postRender:{:.2f}/{:.2f}/{:.2f}/{:.2f} "
+                "postRenderParts=endFrame/cmdFin/swap/signalGen/logging/residual:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} "
+                "named=prep/fence/chunk/phys/brush/render/present/postGen/inputEnd:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}",
+                frameCount, instantFps, perfFrameBodyMsLastFrame, bodyNamedSumMs, bodyGapSumMs,
+                perfGpuTimingReadMs, bodyResidualMs,
+                perfPostWaitGapMs, perfPrePhysicsGapMs, perfPreRenderGapMs, perfPostRenderGapMs,
+                perfEndFrameMs, perfCmdFinalizeMs, perfSwapBuffersMs, perfSignalGenMs, perfLoggingMs, postRenderResidualNowMs,
+                perfFramePrepMs, perfFenceWaitMs, perfChunkUpdateMs, perfPhysicsSubmitMs, perfBrushSubmitMs,
+                perfRenderSubmitMs, perfPresentMs, perfPostGenerationMsLastFrame, perfInputEndMsLastFrame);
+        }
+        // UNTRACKED-DIVE: snapshot post-render-region slivers for next frame's
+        // PERF_UNTRACKED line (that line emits before these run this frame).
+        perfPostRenderGapMsLastFrame = perfPostRenderGapMs;
+        perfEndFrameMsLastFrame = perfEndFrameMs;
+        perfCmdFinalizeMsLastFrame = perfCmdFinalizeMs;
+        perfSwapBuffersMsLastFrame = perfSwapBuffersMs;
+        perfSignalGenMsLastFrame = perfSignalGenMs;
+        perfLoggingMsLastFrame = perfLoggingMs;
+        perfFrameEndLogMsLastFrame = perfFrameEndLogMs;
+        const uint64_t perfFrameEndLogStart = SDL_GetPerformanceCounter();
         const bool perfFrameEndIntervalDue =
             perfFrameEndLogIntervalOverride &&
             (frameCount % static_cast<uint64_t>(perfFrameEndLogInterval) == 0);
@@ -22810,6 +23005,11 @@ int RunSandbox(int argc, char* argv[]) {
                 lastRawFrameMs);
             }
         }
+        // UNTRACKED-DIVE: cost of the PERF_FRAME_END logging block, and the
+        // loop-tail counter (everything past here until the next loop top is the
+        // un-bracketed tail that rawMs includes but body excludes).
+        perfFrameEndLogMs = ticksToMs(SDL_GetPerformanceCounter() - perfFrameEndLogStart);
+        perfBodyEndCounter = SDL_GetPerformanceCounter();
 
         frameCount++;
         if (traceFrameStages && frameCount <= kFrameStageTraceLimit) {

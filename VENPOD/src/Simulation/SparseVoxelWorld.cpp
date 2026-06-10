@@ -3798,18 +3798,37 @@ uint32_t SparseVoxelWorld::PumpGenerationAround(
         pending.reserve(maxBricks);
         for (SparseResidencyClass residencyClass : classOrder) {
             auto& classQueue = m_generationClassQueues[ResidencyClassQueueIndex(residencyClass)];
-            SortQueuedBricksByValue(
-                classQueue,
-                m_pool,
-                focus,
-                currentFrame,
-                m_config.streamingLaneQueuePriority);
-            SortQueueByStreamingTickets(
-                classQueue,
-                kStreamingTicketStageCpuGenerated,
-                &focus,
-                currentFrame,
-                true);
+            if (m_config.generationClassPartialValueSort) {
+                const size_t remainingBudget =
+                    std::max<size_t>(1u, static_cast<size_t>(maxBricks - processed));
+                PartialSortQueuedBricksByValue(
+                    classQueue,
+                    m_pool,
+                    focus,
+                    currentFrame,
+                    remainingBudget,
+                    m_config.streamingLaneQueuePriority);
+                SortQueueByStreamingTickets(
+                    classQueue,
+                    kStreamingTicketStageCpuGenerated,
+                    &focus,
+                    currentFrame,
+                    true,
+                    remainingBudget);
+            } else {
+                SortQueuedBricksByValue(
+                    classQueue,
+                    m_pool,
+                    focus,
+                    currentFrame,
+                    m_config.streamingLaneQueuePriority);
+                SortQueueByStreamingTickets(
+                    classQueue,
+                    kStreamingTicketStageCpuGenerated,
+                    &focus,
+                    currentFrame,
+                    true);
+            }
             while (processed < maxBricks &&
                    pending.size() < static_cast<size_t>(maxBricks) &&
                    PopFrontQueuedBrick(classQueue, m_pool, &coord)) {
@@ -3957,18 +3976,37 @@ uint32_t SparseVoxelWorld::PumpGenerationAround(
     if (processed < maxBricks) {
         for (SparseResidencyClass residencyClass : classOrder) {
             auto& classQueue = m_generationClassQueues[ResidencyClassQueueIndex(residencyClass)];
-            SortQueuedBricksByValue(
-                classQueue,
-                m_pool,
-                focus,
-                currentFrame,
-                m_config.streamingLaneQueuePriority);
-            SortQueueByStreamingTickets(
-                classQueue,
-                kStreamingTicketStageCpuGenerated,
-                &focus,
-                currentFrame,
-                true);
+            if (m_config.generationClassPartialValueSort) {
+                const size_t remainingBudget =
+                    std::max<size_t>(1u, static_cast<size_t>(maxBricks - processed));
+                PartialSortQueuedBricksByValue(
+                    classQueue,
+                    m_pool,
+                    focus,
+                    currentFrame,
+                    remainingBudget,
+                    m_config.streamingLaneQueuePriority);
+                SortQueueByStreamingTickets(
+                    classQueue,
+                    kStreamingTicketStageCpuGenerated,
+                    &focus,
+                    currentFrame,
+                    true,
+                    remainingBudget);
+            } else {
+                SortQueuedBricksByValue(
+                    classQueue,
+                    m_pool,
+                    focus,
+                    currentFrame,
+                    m_config.streamingLaneQueuePriority);
+                SortQueueByStreamingTickets(
+                    classQueue,
+                    kStreamingTicketStageCpuGenerated,
+                    &focus,
+                    currentFrame,
+                    true);
+            }
             while (processed < maxBricks &&
                    PopFrontQueuedBrick(classQueue, m_pool, &coord)) {
                 BrickResidentRecord record;
@@ -4007,18 +4045,37 @@ uint32_t SparseVoxelWorld::PumpGenerationAround(
     }
 
     if (processed < maxBricks) {
-        SortQueuedBricksByValue(
-            m_generationQueue,
-            m_pool,
-            focus,
-            currentFrame,
-            m_config.streamingLaneQueuePriority);
-        SortQueueByStreamingTickets(
-            m_generationQueue,
-            kStreamingTicketStageCpuGenerated,
-            &focus,
-            currentFrame,
-            true);
+        if (m_config.generationClassPartialValueSort) {
+            const size_t remainingBudget =
+                std::max<size_t>(1u, static_cast<size_t>(maxBricks - processed));
+            PartialSortQueuedBricksByValue(
+                m_generationQueue,
+                m_pool,
+                focus,
+                currentFrame,
+                remainingBudget,
+                m_config.streamingLaneQueuePriority);
+            SortQueueByStreamingTickets(
+                m_generationQueue,
+                kStreamingTicketStageCpuGenerated,
+                &focus,
+                currentFrame,
+                true,
+                remainingBudget);
+        } else {
+            SortQueuedBricksByValue(
+                m_generationQueue,
+                m_pool,
+                focus,
+                currentFrame,
+                m_config.streamingLaneQueuePriority);
+            SortQueueByStreamingTickets(
+                m_generationQueue,
+                kStreamingTicketStageCpuGenerated,
+                &focus,
+                currentFrame,
+                true);
+        }
         while (processed < maxBricks &&
                PopFrontQueuedBrick(m_generationQueue, m_pool, &coord)) {
             BrickResidentRecord record;
