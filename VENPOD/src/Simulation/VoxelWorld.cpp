@@ -658,8 +658,12 @@ Result<void> VoxelWorld::CreateMaterialPalette(
     // MAT_SAND (1) - Sandy beige
     setMaterial(1, 0.76f, 0.70f, 0.50f);
 
-    // MAT_WATER (2) - Blue transparent
-    setMaterial(2, 0.2f, 0.4f, 0.8f, 0.7f);
+    // MAT_WATER (2) - deep teal transparent. Matches the ocean/near-sheet deep
+    // family (ShadeWaterSurface deep ~(0.10,0.27,0.35)->(0.05,0.16,0.24)) so the
+    // palette-sampled water paths (raw mid voxels, mid column/closure proxies,
+    // far-height lakes) read as the same water as the analytic sheets instead of
+    // bright cornflower blue.
+    setMaterial(2, 0.07f, 0.20f, 0.28f, 0.7f);
 
     // MAT_STONE (3) - weathered warm rock
     setMaterial(3, 0.50f, 0.50f, 0.40f);

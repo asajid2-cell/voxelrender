@@ -21,7 +21,11 @@ constexpr uint32_t kMaterialStone = 3;
 constexpr uint32_t kMaterialDirt = 4;
 constexpr uint32_t kLeafFlag = 1;
 constexpr uint32_t kInteriorLeafFlag = 2;
-constexpr uint32_t kFarVoxelOctreeCacheVersion = 50;
+// 50 -> 51: the spawn-landmass reshape was added to TerrainHeight (commit 52b108f)
+// without bumping the version, so on-disk caches kept serving the OLD flooded-basin
+// world (stale tan disc + bright-blue MAT_WATER lakes in aerial views). Bump forces
+// a rebuild with the reshape so far-SVO content agrees with the geometry layers.
+constexpr uint32_t kFarVoxelOctreeCacheVersion = 51;
 constexpr uint64_t kMaxFarVoxelOctreeCacheBytes = 512ull * 1024ull * 1024ull;
 
 float Smooth01(float value) {

@@ -294,10 +294,13 @@ float4 main(PSInput input) : SV_Target {
         const float3 skyRefl = lerp(float3(0.74f, 0.85f, 0.96f), float3(0.32f, 0.52f, 0.84f), saturate(reflDir.y));
         const float3 sunDir = normalize(float3(0.45f, 0.72f, 0.28f)); // shared sun (SkySunDirection)
         const float glint = pow(saturate(dot(reflDir, sunDir)), 200.0f);
-        float3 deep = lerp(float3(0.07f, 0.22f, 0.30f), float3(0.05f, 0.15f, 0.23f),
+        // PALETTE UNIFICATION: canonical deep-water ramp shared with the far
+        // ocean plane (ShadeWaterSurface in PS_Raymarch.hlsl) so the near sheet
+        // and the analytic far water are the same color family at the handoff.
+        float3 deep = lerp(float3(0.10f, 0.27f, 0.35f), float3(0.05f, 0.16f, 0.24f),
             saturate((input.distance - 30.0f) / 420.0f));
         deep *= 1.0f + ripple * 0.06f;
-        float3 waterColor = lerp(deep, skyRefl, saturate(fresnel * 0.90f));
+        float3 waterColor = lerp(deep, skyRefl, saturate(fresnel * 0.88f));
         waterColor += float3(1.0f, 0.96f, 0.82f) * glint * 1.6f;
         waterColor = lerp(waterColor, float3(0.58f, 0.72f, 0.80f), edgeGrid);
         const float fog = saturate((input.distance - 900.0f) / 3500.0f);
