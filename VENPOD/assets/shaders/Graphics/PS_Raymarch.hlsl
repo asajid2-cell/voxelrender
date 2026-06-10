@@ -1740,6 +1740,21 @@ bool SampleResidentMidVoxelFallback(
 }
 
 bool ProceduralMidVoxelCellIsAir(float3 worldPos, float distanceFromCamera) {
+    // Exact early-outs hoisted ABOVE the heavy analytic height evaluation
+    // (FarTerrainHeightVoxelized inlines the full ~11-octave FarTerrainHeight).
+    // worldPos.y <= FAR_SEA_LEVEL is always solid: either y <= height, or
+    // height < y <= sea which the water rule below classified solid anyway
+    // (this also subsumes the old FAR_TERRAIN_MIN_HEIGHT + 2 check, -332 < -48).
+    if (worldPos.y <= FAR_SEA_LEVEL) {
+        return false;
+    }
+    // The quantized reshaped height can never exceed FAR_TERRAIN_MAX_HEIGHT
+    // (raw clamp 664; reshape floor SEA+56 only raises toward it) plus the max
+    // ceil() quantize step max(4, 28*0.75) = 21, so anything above 664+24 is
+    // provably air without evaluating the noise.
+    if (worldPos.y > FAR_TERRAIN_MAX_HEIGHT + 24.0f) {
+        return true;
+    }
     float mountainMask, spireMask, ravineMask;
     const float height = FarTerrainHeightVoxelized(
         worldPos.xz,
@@ -1747,16 +1762,7 @@ bool ProceduralMidVoxelCellIsAir(float3 worldPos, float distanceFromCamera) {
         mountainMask,
         spireMask,
         ravineMask);
-    if (worldPos.y <= FAR_TERRAIN_MIN_HEIGHT + 2.0f) {
-        return false;
-    }
-    if (worldPos.y <= height) {
-        return false;
-    }
-    if (worldPos.y <= FAR_SEA_LEVEL && height < FAR_SEA_LEVEL) {
-        return false;
-    }
-    return true;
+    return worldPos.y > height;
 }
 
 bool IsMidVoxelAirOrMissing(float3 worldPos, uint ring, float distanceFromCamera) {
@@ -2696,14 +2702,34 @@ bool FarSvoLeafSurfaceHit(
     float leafT0,
     float leafT1,
     float nodeSize,
+    inout float cachedOriginHeight,
     out float hitT,
     out float3 hitNormal,
     out uint hitMaterial);
+
+// Lazily computes (once per ray) the reshaped terrain height under rayOrigin.
+// rayOrigin is constant across every leaf a ray visits, but both leaf-surface
+// resolvers used to re-run the full FarTerrainHeight noise PER LEAF for it.
+// Sentinel -1e30 = not yet computed (real heights are clamped to >= -332).
+float CachedFarSvoOriginHeight(float3 rayOrigin, inout float cachedOriginHeight) {
+    if (cachedOriginHeight <= -1e29f) {
+        float originMountainMask, originSpireMask, originRavineMask;
+        cachedOriginHeight = FarSpawnLandReshapeHeight(
+            rayOrigin.xz,
+            FarTerrainHeight(
+                rayOrigin.xz,
+                originMountainMask,
+                originSpireMask,
+                originRavineMask));
+    }
+    return cachedOriginHeight;
+}
 
 bool FarSvoInteriorLeafSurfaceRecovery(
     float3 rayOrigin,
     float3 rayDir,
     float leafT0,
+    inout float cachedOriginHeight,
     out float hitT,
     out float3 hitNormal,
     out uint hitMaterial)
@@ -2727,14 +2753,7 @@ bool FarSvoInteriorLeafSurfaceRecovery(
         return false;
     }
 
-    float originMountainMask, originSpireMask, originRavineMask;
-    const float originHeight = FarSpawnLandReshapeHeight(
-        rayOrigin.xz,
-        FarTerrainHeight(
-            rayOrigin.xz,
-            originMountainMask,
-            originSpireMask,
-            originRavineMask));
+    const float originHeight = CachedFarSvoOriginHeight(rayOrigin, cachedOriginHeight);
     if (rayOrigin.y <= originHeight) {
         return false;
     }
@@ -2777,6 +2796,7 @@ bool TraverseFarVoxelPage(
     float3 pageMin,
     float pageSize,
     float startDist,
+    inout float cachedOriginHeight,
     inout float nearestT,
     inout float3 nearestNormal,
     inout uint nearestMaterial)
@@ -2833,6 +2853,7 @@ bool TraverseFarVoxelPage(
                     rayOrigin,
                     rayDir,
                     recoveryStartT,
+                    cachedOriginHeight,
                     candidateT,
                     candidateNormal,
                     candidateMaterial) &&
@@ -2868,6 +2889,7 @@ bool TraverseFarVoxelPage(
                     max(tNear, startDist),
                     min(tFar, nearestT),
                     nodeSize,
+                    cachedOriginHeight,
                     candidateT,
                     candidateNormal,
                     candidateMaterial) &&
@@ -2938,6 +2960,7 @@ bool FarSvoLeafSurfaceHit(
     float leafT0,
     float leafT1,
     float nodeSize,
+    inout float cachedOriginHeight,
     out float hitT,
     out float3 hitNormal,
     out uint hitMaterial)
@@ -2964,14 +2987,7 @@ bool FarSvoLeafSurfaceHit(
     float previousSigned = pos.y - height;
     float previousT = t;
     if (previousSigned <= 0.0f) {
-        float originMountainMask, originSpireMask, originRavineMask;
-        const float originHeight = FarSpawnLandReshapeHeight(
-            rayOrigin.xz,
-            FarTerrainHeight(
-                rayOrigin.xz,
-                originMountainMask,
-                originSpireMask,
-                originRavineMask));
+        const float originHeight = CachedFarSvoOriginHeight(rayOrigin, cachedOriginHeight);
         if (rayOrigin.y > originHeight) {
             float lo = 0.0f;
             float hi = t;
@@ -3067,7 +3083,12 @@ bool FarSvoLeafSurfaceHit(
     return false;
 }
 
-bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, out RayHit farHit) {
+// traversalCap: callers that can only ACCEPT a hit nearer than some bound pass
+// it here so the page DDA and octree traversal prune everything beyond it (it
+// simply seeds the same nearestT pruning the traversal already applies after
+// its first recorded hit). Any hit nearer than the cap is found identically;
+// callers without a bound pass 1e20f for the pre-existing behavior.
+bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, float traversalCap, out RayHit farHit) {
     farHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
 
     // The page-indexed far SVO is a high-detail distant voxel layer, not a
@@ -3121,7 +3142,9 @@ bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, ou
     // then traverses the octree for those candidate pages.
     const float farMaxDist = 10400.0f;
     float t = max(startDist, 32.0f);
-    float nearestT = 1e20f;
+    float nearestT = traversalCap;
+    bool anySvoHit = false;
+    float cachedOriginHeight = -1e30f;
     float3 nearestNormal = float3(0, 1, 0);
     uint nearestMaterial = MAT_STONE;
 
@@ -3189,16 +3212,19 @@ bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, ou
                 if (IntersectBox(rayOrigin, rayDir, pageMin, pageMin + pageSize, tNear, tFar) &&
                     tFar >= startDist &&
                     tNear <= nearestT) {
-                    TraverseFarVoxelPage(
+                    if (TraverseFarVoxelPage(
                         rayOrigin,
                         rayDir,
                         page.rootNode,
                         pageMin,
                         pageSize,
                         startDist,
+                        cachedOriginHeight,
                         nearestT,
                         nearestNormal,
-                        nearestMaterial);
+                        nearestMaterial)) {
+                        anySvoHit = true;
+                    }
                 }
             }
         }
@@ -3225,7 +3251,7 @@ bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, ou
             t = nextT + 0.5f;
         }
     }
-    if (nearestT >= 1e19f) {
+    if (!anySvoHit) {
         return false;
     }
 
@@ -4713,15 +4739,9 @@ bool RaymarchBackgroundField(
         frame.farFieldParams.z > 0.0f;
     RayHit elevatedFarSvoCandidateHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
     bool hasElevatedFarSvoCandidateHit = false;
-    if (farSvoCandidateView &&
-        RaymarchSparseFarField(
-            rayOrigin,
-            rayDir,
-            max(startDist, frame.midFieldParams.y),
-            elevatedFarSvoCandidateHit) &&
-        BackgroundHitAllowedByExactNear(rayOrigin, rayDir, elevatedFarSvoCandidateHit, BACKGROUND_LAYER_FAR_SVO)) {
-        hasElevatedFarSvoCandidateHit = true;
-    }
+    // [perf] The elevated far-SVO candidate march now runs AFTER the mid DDA
+    // (below) instead of eagerly here, so its traversal can be capped at the
+    // furthest distance either of its two consumers can still accept.
     const bool preferCheapMidVoxelColumn =
         frame.renderBudgetParams.z < 0.55f || BackgroundRenderQuality() < 0.62f;
     const bool preferForegroundMidColumn =
@@ -4756,8 +4776,38 @@ bool RaymarchBackgroundField(
     const float midVoxelStartDist = lowAltitudeVoxelTerrainView
         ? max(startDist, lowAltitudeVoxelContinuityStart)
         : startDist;
-    if (!skipFullMidVoxelDda &&
-        RaymarchMidVoxelClipmap(rayOrigin, rayDir, midVoxelStartDist, backgroundHit)) {
+    const bool hasMidVoxelDdaHit =
+        !skipFullMidVoxelDda &&
+        RaymarchMidVoxelClipmap(rayOrigin, rayDir, midVoxelStartDist, backgroundHit);
+    // [perf, result-identical reorder] The elevated far-SVO candidate used to
+    // march the full horizon-cone SVO BEFORE the mid DDA for every qualifying
+    // ray; with the mid ring converged (midCov 1.0) the consumers below then
+    // discarded almost every candidate because the mid hit is nearer. March it
+    // after the mid DDA instead, capped at the furthest distance any consumer
+    // can still accept:
+    //   - the mid-hit handoff (below) accepts only
+    //     candidate + frontBias(>=24) <= midHit.distance, and
+    //   - the water-occluder replacement accepts only
+    //     candidate <= waterHit.distance + frontBias(<=220).
+    // When neither consumer is reachable (no mid hit AND no water occluder)
+    // the candidate is never read, so the march is skipped entirely. Hits
+    // nearer than the cap are found identically (the cap only seeds the same
+    // nearestT pruning the traversal already applies after its first hit).
+    if (farSvoCandidateView && (hasMidVoxelDdaHit || hasWaterOccluder)) {
+        const float farSvoCandidateCap = max(
+            hasMidVoxelDdaHit ? backgroundHit.distance : 0.0f,
+            hasWaterOccluder ? waterOccluderHit.distance + 221.0f : 0.0f);
+        if (RaymarchSparseFarField(
+                rayOrigin,
+                rayDir,
+                max(startDist, frame.midFieldParams.y),
+                farSvoCandidateCap,
+                elevatedFarSvoCandidateHit) &&
+            BackgroundHitAllowedByExactNear(rayOrigin, rayDir, elevatedFarSvoCandidateHit, BACKGROUND_LAYER_FAR_SVO)) {
+            hasElevatedFarSvoCandidateHit = true;
+        }
+    }
+    if (hasMidVoxelDdaHit) {
         const bool midInteriorFallback =
             (backgroundHit.diagnosticFlags & RAY_DIAGNOSTIC_MID_INTERIOR_FALLBACK) != 0u;
         RayHit resolvedWaterHit;
@@ -4847,6 +4897,7 @@ bool RaymarchBackgroundField(
             rayOrigin,
             rayDir,
             highAltitudeDownwardView ? max(startDist, 32.0f) : max(startDist, frame.midFieldParams.y),
+            1e20f,
             backgroundHit)) {
         RayHit resolvedWaterHit;
         if (TryResolveWaterOccluderForBackgroundHit(
@@ -4901,7 +4952,7 @@ bool RaymarchBackgroundField(
         rayDir.y > -0.55f &&
         rayDir.y < 0.22f;
     if (!deferFarSvoToFarHeightHorizon &&
-        includeSparseFarField && RaymarchSparseFarField(rayOrigin, rayDir, farStartDist, backgroundHit)) {
+        includeSparseFarField && RaymarchSparseFarField(rayOrigin, rayDir, farStartDist, 1e20f, backgroundHit)) {
         RayHit resolvedWaterHit;
         if (TryResolveWaterOccluderForBackgroundHit(
                 rayOrigin, rayDir, farStartDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit)) {
