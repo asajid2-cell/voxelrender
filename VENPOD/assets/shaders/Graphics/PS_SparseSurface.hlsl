@@ -275,15 +275,24 @@ float4 main(PSInput input) : SV_Target {
             sin(input.worldPos.x * 0.072f + input.worldPos.z * 0.045f + t) * 0.5f +
             sin(input.worldPos.x * -0.031f + input.worldPos.z * 0.096f - t * 0.73f) * 0.5f;
         const float2 waterCell = abs(frac(input.worldPos.xz / 12.0f) - 0.5f);
-        const float edgeGrid = (1.0f - smoothstep(0.465f, 0.497f, max(waterCell.x, waterCell.y))) * 0.045f;
+        // Suppress the per-voxel edge grid on water SIDE faces: a side riser seen
+        // edge-on otherwise draws a hard cell line that, combined with the deep<->
+        // reflection flip below, reads as opaque diagonal staircase bands instead
+        // of one flat sheet. Top faces keep the subtle ripple-cell edge.
+        const float edgeGrid = (1.0f - smoothstep(0.465f, 0.497f, max(waterCell.x, waterCell.y)))
+            * (sideFace ? 0.006f : 0.045f);
         // Reflective water: deep base color + fresnel sky reflection + sun glint, so it
         // reads as water (bright reflective horizon, darker looking straight down).
+        // Treat ALL water fragments as a flat-up sheet: the voxel side faces have a
+        // horizontal normal, but using viewDir.y / (0,1,0) for fresnel+reflection on
+        // every face makes top and side fragments shade the same, removing the
+        // diagonal banding where adjacent top/side faces flipped deep<->sky.
         const float3 viewDir = normalize(frame.cameraPosition.xyz - input.worldPos);
         const float ndotv = saturate(viewDir.y);                 // water normal ~ up
         const float fresnel = 0.03f + 0.97f * pow(1.0f - ndotv, 5.0f);
         const float3 reflDir = reflect(-viewDir, float3(0.0f, 1.0f, 0.0f));
         const float3 skyRefl = lerp(float3(0.74f, 0.85f, 0.96f), float3(0.32f, 0.52f, 0.84f), saturate(reflDir.y));
-        const float3 sunDir = normalize(float3(0.45f, 0.82f, 0.34f));
+        const float3 sunDir = normalize(float3(0.45f, 0.72f, 0.28f)); // shared sun (SkySunDirection)
         const float glint = pow(saturate(dot(reflDir, sunDir)), 200.0f);
         float3 deep = lerp(float3(0.07f, 0.22f, 0.30f), float3(0.05f, 0.15f, 0.23f),
             saturate((input.distance - 30.0f) / 420.0f));
@@ -351,7 +360,10 @@ float4 main(PSInput input) : SV_Target {
         baseColor = lerp(baseColor, wetSediment, saturate(wetBoundary * 0.78f));
     }
 
-    const float3 lightDir = normalize(float3(0.45f, 0.82f, 0.34f));
+    // Shared sun direction: must match SkySunDirection() in PS_Raymarch.hlsl
+    // (normalize(0.45,0.72,0.28)) so the diffuse term does not shift at the
+    // near-exact -> mid/far LOD boundary (was a steeper normalize(0.45,0.82,0.34)).
+    const float3 lightDir = normalize(float3(0.45f, 0.72f, 0.28f));
     const float diffuse = saturate(dot(n, lightDir));
     // Higher-contrast lighting for terrain depth/definition (was ambient-dominated and
     // washed out). Warm directional sun + cooler sky fill, with a slope-based ambient

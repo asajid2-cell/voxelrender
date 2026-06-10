@@ -3334,9 +3334,15 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
                 return true;
             }
             baseColor.rgb = FarTerrainMaterialVariation(baseColor.rgb, material, hitPos.xz, previousHeight, hitT);
-            float3 lightDir = normalize(float3(0.5f, 1.0f, 0.3f));
+            // Shade identically to the loop-branch hit below: same shared sun,
+            // same ambient-aware fill, same ambient floor, same haze. The two
+            // branches resolve the SAME far surface, so a near-vertical-down
+            // first-hit must not read darker/less-hazed than the loop result a
+            // few pixels away (that mismatch is the dark backdrop blob).
+            float3 lightDir = SkySunDirection();
             float lighting = saturate(dot(normal, lightDir) * 0.58f + 0.34f);
-            float3 color = baseColor.rgb * (0.72f + lighting * 0.24f);
+            float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.90f + lighting * 0.50f);
+            color = max(color, baseColor.rgb * 0.70f + 0.07f);
             const float farGridFade = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
             const float farGrid = VoxelGridLine(
                 hitPos.xz,
@@ -3345,7 +3351,7 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             color *= lerp(1.0f, 0.965f, farGrid);
             float fogFactor = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
             const float horizonHaze = saturate((0.20f - abs(rayDir.y)) / 0.20f);
-            color = lerp(color, SkyColor(rayDir), fogFactor * 0.46f + horizonHaze * 0.14f + 0.04f);
+            color = lerp(color, SkyColor(rayDir), fogFactor * 0.58f + horizonHaze * 0.34f + 0.14f);
             farHit = MakeHit(float4(color, 1.0f), hitT);
             return true;
         }
@@ -3424,7 +3430,11 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             }
             baseColor.rgb = FarTerrainMaterialVariation(baseColor.rgb, material, hitPos.xz, height, hitT);
 
-            float3 lightDir = normalize(float3(0.5f, 1.0f, 0.3f));
+            // Single shared sun (was normalize(0.5,1.0,0.3), a steeper/higher
+            // sun than every other layer). Using SkySunDirection() so the far
+            // backdrop is lit from the same angle as the mid/near terrain in
+            // front of it -> no brightness/shading step at the mid/far seam.
+            float3 lightDir = SkySunDirection();
             float lighting = saturate(dot(normal, lightDir) * 0.58f + 0.34f);
             // Brighter, ambient-aware fill (was flat 0.72 + lighting*0.24). The
             // old flat term read as a near-black silhouette against the bright
