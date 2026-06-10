@@ -3177,8 +3177,8 @@ bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, ou
     // Lifted ambient floor (was *0.74 + ndotl*0.34, floor 0.56) so residual far
     // SVO (startup / nearer occluder rays) reads hazy-lit like the mid voxels
     // rather than a dark detached blob, matching the far-height shading.
-    float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.90f + ndotl * 0.46f);
-    color = max(color, baseColor.rgb * 0.70f + 0.070f);
+    float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.78f + ndotl * 0.42f);
+    color = max(color, baseColor.rgb * 0.62f + 0.050f);
     const float farSvoGridFade = saturate((nearestT - 1200.0f) / 6200.0f);
     const float farSvoGrid = VoxelGridLine(
         hitPos.xz,
@@ -3192,7 +3192,7 @@ bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, ou
         farHit = MakeHit(float4(float3(debugFog, debugFog, debugFog), 1.0f), nearestT);
         return true;
     }
-    color = lerp(color, SkyColor(rayDir), fogFactor * 0.54f + horizonHaze * 0.32f + 0.12f);
+    color = lerp(color, SkyColor(rayDir), fogFactor * 0.60f + horizonHaze * 0.36f + 0.16f);
     farHit = MakeHit(float4(color, 1.0f), nearestT);
     return true;
 }
@@ -3341,8 +3341,8 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             // few pixels away (that mismatch is the dark backdrop blob).
             float3 lightDir = SkySunDirection();
             float lighting = saturate(dot(normal, lightDir) * 0.58f + 0.34f);
-            float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.90f + lighting * 0.50f);
-            color = max(color, baseColor.rgb * 0.70f + 0.07f);
+            float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.78f + lighting * 0.40f);
+            color = max(color, baseColor.rgb * 0.58f + 0.04f);
             const float farGridFade = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
             const float farGrid = VoxelGridLine(
                 hitPos.xz,
@@ -3351,7 +3351,7 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             color *= lerp(1.0f, 0.965f, farGrid);
             float fogFactor = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
             const float horizonHaze = saturate((0.20f - abs(rayDir.y)) / 0.20f);
-            color = lerp(color, SkyColor(rayDir), fogFactor * 0.58f + horizonHaze * 0.34f + 0.14f);
+            color = lerp(color, SkyColor(rayDir), fogFactor * 0.62f + horizonHaze * 0.52f + 0.20f);
             farHit = MakeHit(float4(color, 1.0f), hitT);
             return true;
         }
@@ -3440,8 +3440,8 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             // old flat term read as a near-black silhouette against the bright
             // sky; matching the mid-voxel visual language (SkyAmbient + ndotl)
             // makes the distant terrain read as hazy-lit, not a dark blob.
-            float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.90f + lighting * 0.50f);
-            color = max(color, baseColor.rgb * 0.70f + 0.07f);
+            float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.78f + lighting * 0.40f);
+            color = max(color, baseColor.rgb * 0.58f + 0.04f);
             const float farGridFade = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
             const float farGrid = VoxelGridLine(
                 hitPos.xz,
@@ -3453,7 +3453,7 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             // hazy-lit rather than a hard dark edge.
             float fogFactor = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
             const float horizonHaze = saturate((0.20f - abs(rayDir.y)) / 0.20f);
-            color = lerp(color, SkyColor(rayDir), fogFactor * 0.58f + horizonHaze * 0.34f + 0.14f);
+            color = lerp(color, SkyColor(rayDir), fogFactor * 0.62f + horizonHaze * 0.52f + 0.20f);
             farHit = MakeHit(float4(color, 1.0f), hitT);
             return true;
         }
@@ -4736,7 +4736,7 @@ bool RaymarchBackgroundField(
         frame.midResidencyParams.y >= 0.5f &&
         frame.midResidencyParams.w >= 1.0f &&
         rayOrigin.y <= 384.0f &&
-        rayDir.y > -0.24f &&
+        rayDir.y > -0.55f &&
         rayDir.y < 0.22f;
     if (!deferFarSvoToFarHeightHorizon &&
         includeSparseFarField && RaymarchSparseFarField(rayOrigin, rayDir, farStartDist, backgroundHit)) {
