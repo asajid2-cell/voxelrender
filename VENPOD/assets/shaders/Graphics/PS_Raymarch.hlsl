@@ -3351,7 +3351,16 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             color *= lerp(1.0f, 0.965f, farGrid);
             float fogFactor = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
             const float horizonHaze = saturate((0.20f - abs(rayDir.y)) / 0.20f);
-            color = lerp(color, SkyColor(rayDir), fogFactor * 0.62f + horizonHaze * 0.52f + 0.20f);
+            // Dissolve distant far-height peaks into a continuous hazy ridge. The
+            // mid-far peaks read as detached lit chunks with sky gaps between them;
+            // ramp haze by DISTANCE across a wide horizon band (not just the up-tips)
+            // so far chunks melt to sky/haze while nearer mid terrain stays visible.
+            const float horizonHazeWide = saturate((0.35f - abs(rayDir.y)) / 0.35f);
+            const float midFarHaze = saturate((hitT - 3500.0f) / 5000.0f);
+            const float farHazeAmount = saturate(
+                fogFactor * 0.60f + horizonHazeWide * 0.42f
+                + midFarHaze * (0.42f + horizonHazeWide * 0.40f) + 0.20f);
+            color = lerp(color, SkyColor(rayDir), farHazeAmount);
             farHit = MakeHit(float4(color, 1.0f), hitT);
             return true;
         }
@@ -3453,7 +3462,22 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             // hazy-lit rather than a hard dark edge.
             float fogFactor = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
             const float horizonHaze = saturate((0.20f - abs(rayDir.y)) / 0.20f);
-            color = lerp(color, SkyColor(rayDir), fogFactor * 0.62f + horizonHaze * 0.52f + 0.20f);
+            // SILHOUETTE-TIP DISSOLVE (60fps mid-far): the far-height peaks read as
+            // detached floating chunks because their tips hold a hard lit edge
+            // against the sky while real geometry gaps between peaks expose sky. Ramp
+            // extra haze as the ray climbs the upward silhouette band (rayDir.y -> the
+            // 0.22 ceiling) so the distant tips melt into a continuous hazy ridge
+            // instead of isolated blocks. Shading-only; terrain height untouched.
+            // Dissolve distant far-height peaks into a continuous hazy ridge. The
+            // mid-far peaks read as detached lit chunks with sky gaps between them;
+            // ramp haze by DISTANCE across a wide horizon band (not just the up-tips)
+            // so far chunks melt to sky/haze while nearer mid terrain stays visible.
+            const float horizonHazeWide = saturate((0.35f - abs(rayDir.y)) / 0.35f);
+            const float midFarHaze = saturate((hitT - 3500.0f) / 5000.0f);
+            const float farHazeAmount = saturate(
+                fogFactor * 0.60f + horizonHazeWide * 0.42f
+                + midFarHaze * (0.42f + horizonHazeWide * 0.40f) + 0.20f);
+            color = lerp(color, SkyColor(rayDir), farHazeAmount);
             farHit = MakeHit(float4(color, 1.0f), hitT);
             return true;
         }
