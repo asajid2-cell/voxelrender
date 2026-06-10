@@ -3571,7 +3571,10 @@ int RunSandbox(int argc, char* argv[]) {
 
     // Camera rotation (pitch and yaw)
     float cameraPitch = -0.3f;  // Slight downward look to see terrain below
-    float cameraYaw = 0.0f;  // Look straight ahead (north)
+    // Initial heading override so scripted walk/fly tests can sweep different
+    // world directions (degrees; 0 = +X "north").
+    float cameraYaw = static_cast<float>(ReadIntEnv("VENPOD_CAMERA_INITIAL_YAW_DEG", 0)) *
+                      3.1415926535f / 180.0f;
 
     // Player physics for walking on terrain
     float cameraVelocityY = 0.0f;  // Vertical velocity for gravity
@@ -3606,6 +3609,12 @@ int RunSandbox(int argc, char* argv[]) {
                 static_cast<float>(scenicSpawn.worldZ) + 0.5f);
             cameraYaw = scenicSpawn.yaw;
             cameraPitch = scenicSpawn.pitch;
+            // The explicit heading override must also win over the scenic-spawn
+            // yaw so scripted flights can sweep arbitrary world directions.
+            const int initialYawDegEnv = ReadIntEnv("VENPOD_CAMERA_INITIAL_YAW_DEG", -36000);
+            if (initialYawDegEnv != -36000) {
+                cameraYaw = static_cast<float>(initialYawDegEnv) * 3.1415926535f / 180.0f;
+            }
             cameraVelocityY = 0.0f;
             spdlog::info(
                 "Sparse scenic spawn world=({:.1f},{:.1f},{:.1f}) groundY={} yaw={:.2f} pitch={:.2f} score={:.2f} forwardClearance={:.1f} localRelief={:.1f}",

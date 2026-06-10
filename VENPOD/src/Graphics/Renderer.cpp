@@ -827,8 +827,26 @@ void Renderer::RenderVoxels(
     constants.backgroundOwnershipParams[3] = midClipmapEnabled ? 1.0f : 0.0f;
     constants.midResidencyParams[0] =
         midClipmapEnabled ? ClampFinite(camera.midFieldHeightCoverage, 0.0f, 1.0f, 0.0f) : 0.0f;
-    constants.midResidencyParams[1] =
-        midClipmapEnabled ? ClampFinite(camera.midFieldVoxelCoverage, 0.0f, 1.0f, 0.0f) : 0.0f;
+    // World-consistency latch: shader gates (FarSpawnLandBand, the far-SVO
+    // horizon deferral) key on voxel coverage >= 0.5 only to hide the
+    // pre-residency startup flash. A transient mid-flight coverage dip (fast
+    // high-altitude flight) must NOT flip those gates off - doing so re-renders
+    // the entire far field as the unreshaped flooded basin (navy discs / blue
+    // lakes) until streaming catches up. Once coverage has been good this
+    // session, hold the published signal at the gate threshold; the live
+    // 0.04-usability checks keep their behavior via the unlatched lower range
+    // and the still-live resident counts in z/w.
+    {
+        const float liveVoxelCoverage =
+            midClipmapEnabled ? ClampFinite(camera.midFieldVoxelCoverage, 0.0f, 1.0f, 0.0f) : 0.0f;
+        static bool s_midResidencyEverGood = false;
+        if (liveVoxelCoverage >= 0.5f) {
+            s_midResidencyEverGood = true;
+        }
+        constants.midResidencyParams[1] = (s_midResidencyEverGood && midClipmapEnabled)
+            ? std::max(liveVoxelCoverage, 0.51f)
+            : liveVoxelCoverage;
+    }
     constants.midResidencyParams[2] = midClipmapEnabled ? static_cast<float>(camera.midFieldResidentHeightTiles) : 0.0f;
     constants.midResidencyParams[3] = midClipmapEnabled ? static_cast<float>(camera.midFieldResidentVoxelBricks) : 0.0f;
 
