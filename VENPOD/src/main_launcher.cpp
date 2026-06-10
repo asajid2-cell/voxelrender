@@ -35,6 +35,7 @@
 #include "Utils/BitPacking.h"
 #include <imgui.h>
 #include <spdlog/spdlog.h>
+#include <spdlog/async.h>
 #include <spdlog/sinks/basic_file_sink.h>
 #include <SDL3/SDL.h>
 #include <glm/glm.hpp>
@@ -878,14 +879,34 @@ int RunSandbox(int argc, char* argv[]) {
              std::strcmp(runtimeLogPathEnv, "1") != 0)
                 ? ResolveSandboxUserPath(runtimeLogPathEnv)
                 : GetExecutableDirectorySandbox() / "venpod_runtime.log";
-        auto fileLogger = spdlog::basic_logger_mt("venpod_file", logPath.string(), true);
+        // ASYNC logger. The previous synchronous basic_logger_mt performed the
+        // sink write (and, for warnings, the flush) on the CALLING thread.
+        // Stall-hunt evidence (fly_G_far/perf_run.log): every frame stall
+        // >100ms in that run -- including a 9.66s freeze attributed to the
+        // sparse request phase -- was an spdlog call blocking on a slow
+        // Z:-drive write/flush, charged to whichever frame phase happened to
+        // emit the line (request phase via PERF_SPARSE_SHADER_UNSAFE_FEEDBACK,
+        // collision prep via the per-frame SPARSE_WALK_TERRAIN_REBASE warn +
+        // flush_on(warn), the logging sliver via the PERF block). The async
+        // logger enqueues formatted messages (microseconds) and a single
+        // background worker does all sink writes AND the flush_on(warn)
+        // flushes off the frame thread. The 64K-slot queue rides out
+        // multi-second disk hiccups (~40 lines/frame * 60fps * 10s ~= 24K).
+        // Policy 'block' never drops lines (post-run tooling parses the log);
+        // the disk would have to stall ~half a minute before the frame thread
+        // waits. Log pattern/content is unchanged.
+        spdlog::init_thread_pool(65536, 1);
+        auto fileSink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(
+            logPath.string(), true);
+        auto fileLogger = std::make_shared<spdlog::async_logger>(
+            "venpod_file",
+            std::move(fileSink),
+            spdlog::thread_pool(),
+            spdlog::async_overflow_policy::block);
         spdlog::set_default_logger(fileLogger);
-        // Was flush_on(info): every info line flushed to disk SYNCHRONOUSLY. With
-        // per-frame PERF logging that is a ~1KB synchronous disk flush every frame,
-        // showing up as large uninstrumented gapPrev stalls (measurement artifact +
-        // real overhead). Only flush warnings/errors immediately; info lines are
-        // buffered (no per-line disk sync, no periodic big-flush stall) and flushed
-        // on clean exit (which the bench relies on).
+        // Only flush warnings/errors eagerly; with the async logger this flush
+        // runs on the background worker, never the frame thread. Info lines are
+        // flushed on clean exit (which the bench relies on).
         spdlog::flush_on(spdlog::level::warn);
         spdlog::info("  Log path: {}", logPath.string());
     }
@@ -6518,6 +6539,25 @@ int RunSandbox(int argc, char* argv[]) {
             const float scriptedWalkDt = sparseWalkTestFixedDt > 0.0f ? sparseWalkTestFixedDt : dt;
             cameraPos += horizontalForward * sparseWalkTestSpeed * scriptedWalkDt;
         }
+        // Diagnostic: the fly_G_far stall-hunt flight never actually moved (cam
+        // pinned at spawn x/z for 1368 frames), so scripted-flight captures can
+        // silently degrade into standing captures. Log the push gates cheaply so
+        // a frozen scripted camera is attributable from the log.
+        if (enableSparseWalkTest && (frameCount % 240u) == 0u) {
+            spdlog::info(
+                "SPARSE_WALK_GATE frame={} worldInput={} gameplayInput={} startupHeld={} "
+                "stressCam={} boundaryTest={} worldReady={} flight={} pauseVisible={} speed={:.1f}",
+                frameCount,
+                worldInputEnabled ? 1 : 0,
+                gameplayInputEnabled ? 1 : 0,
+                sparseStartupPublicRenderHeldThisFrame ? 1 : 0,
+                sparseStressCameraActive ? 1 : 0,
+                enableBoundaryTest ? 1 : 0,
+                sparseVoxelWorldReady ? 1 : 0,
+                flightMode ? 1 : 0,
+                pauseMenu.IsVisible() ? 1 : 0,
+                sparseWalkTestSpeed);
+        }
         enforceSparseWalkTerrainParity("post_horizontal_move");
 
         if (worldInputEnabled && flightMode && !enableBoundaryTest && !sparseStressCameraActive) {
@@ -10850,6 +10890,28 @@ int RunSandbox(int argc, char* argv[]) {
             perfSparseRequestStatsFlushMs =
                 ticksToMs(SDL_GetPerformanceCounter() - sparseRequestStatsFlushStart);
             perfSparseRequestPrepMs = ticksToMs(SDL_GetPerformanceCounter() - perfSparseSectionStart);
+            // Stall attribution: the request phase hosted the 9.66s monster
+            // stall (a blocking spdlog sink write, now async). Cheap spike warn
+            // so any FUTURE >50ms request-phase stall self-attributes to a
+            // sub-region without needing VENPOD_SPARSE_CPU_DETAIL.
+            if (perfSparseRequestPrepMs > 50.0f) {
+                spdlog::warn(
+                    "PERF_SPIKE_SPARSE_REQUEST frame={} reqMs={:.2f} trim={:.2f} brushRetry={:.2f} "
+                    "ownerFeedback={:.2f} diagSeed={:.2f} missFeedback={:.2f} hiddenExact={:.2f} "
+                    "hierarchy={:.2f} terrainCritical={:.2f} surfacePrefetch={:.2f} statsFlush={:.2f}",
+                    frameCount,
+                    perfSparseRequestPrepMs,
+                    perfSparseRequestPressureTrimMs,
+                    perfSparseRequestBrushRetryMs,
+                    perfSparseRequestOwnershipFeedbackMs,
+                    perfSparseRequestDiagnosticSeedMs,
+                    perfSparseRequestMissFeedbackMs,
+                    perfSparseRequestHiddenExactMs,
+                    perfSparseRequestHierarchyMs,
+                    perfSparseRequestTerrainCriticalMs,
+                    sparseTerrainSurfacePrefetchMsLastFrame,
+                    perfSparseRequestStatsFlushMs);
+            }
             perfSparseSectionStart = SDL_GetPerformanceCounter();
 
             const auto& sparseStatsBeforeGeneration = sparseVoxelWorld.GetStats();
@@ -12998,6 +13060,19 @@ int RunSandbox(int argc, char* argv[]) {
         enforceSparseWalkTerrainParity("post_collision");
 
         perfCollisionPrepMs = ticksToMs(SDL_GetPerformanceCounter() - perfPrepSectionStart);
+        // Stall attribution: collision prep hosted 77-158ms stalls that were the
+        // per-frame SPARSE_WALK_TERRAIN_REBASE warn synchronously flushing to
+        // disk (flush_on(warn), now async). Spike warn so any FUTURE >50ms
+        // collision-prep stall is visible as real collision work.
+        if (perfCollisionPrepMs > 50.0f) {
+            spdlog::warn(
+                "PERF_SPIKE_COLLISION_PREP frame={} collMs={:.2f} bodyColl=sampled/solid/liquid:{}/{}/{}",
+                frameCount,
+                perfCollisionPrepMs,
+                sparseBodyCollisionSampledLastFrame,
+                sparseBodyCollisionSolidLastFrame,
+                sparseBodyCollisionLiquidLastFrame);
+        }
 
         if (enableSparseWalkTest && (frameCount % 10u) == 0u) {
             spdlog::info(

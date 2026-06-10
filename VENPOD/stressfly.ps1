@@ -26,6 +26,9 @@ Add-Type -AssemblyName System.Drawing
 foreach ($r in $selected) {
     Get-Process VENPOD -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
     $env:VENPOD_VSYNC = "0"
+    # Without this, the walk-support rule resets x/z every frame at altitude and
+    # the "flight" silently stands still (all captures identical).
+    $env:VENPOD_SPARSE_REQUIRE_WALK_SUPPORT = "0"
     $env:VENPOD_SPARSE_WALK_MIN_CAMERA_ABOVE_TERRAIN_TENTHS = "$($r.AltTenths)"
     $env:VENPOD_SPARSE_WALK_TEST_PITCH_DEG = "$($r.Pitch)"
     $env:VENPOD_SPARSE_WALK_TEST_YAW_DEG_PER_SEC = "$($r.Yaw)"
@@ -36,7 +39,7 @@ foreach ($r in $selected) {
     if ($r.Perf) {
         Copy-Item build\bin\venpod_runtime.log "build\captures\$($r.Tag)\perf_run.log" -Force -EA SilentlyContinue
     }
-    foreach ($v in "VENPOD_SPARSE_WALK_MIN_CAMERA_ABOVE_TERRAIN_TENTHS","VENPOD_SPARSE_WALK_TEST_PITCH_DEG","VENPOD_SPARSE_WALK_TEST_YAW_DEG_PER_SEC","VENPOD_PERF_SUMMARY_LOG_INTERVAL","VENPOD_VSYNC") {
+    foreach ($v in "VENPOD_SPARSE_REQUIRE_WALK_SUPPORT","VENPOD_SPARSE_WALK_MIN_CAMERA_ABOVE_TERRAIN_TENTHS","VENPOD_SPARSE_WALK_TEST_PITCH_DEG","VENPOD_SPARSE_WALK_TEST_YAW_DEG_PER_SEC","VENPOD_PERF_SUMMARY_LOG_INTERVAL","VENPOD_VSYNC") {
         [Environment]::SetEnvironmentVariable($v, $null)
     }
 
