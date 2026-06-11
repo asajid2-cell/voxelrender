@@ -1043,7 +1043,7 @@ int RunSandbox(int argc, char* argv[]) {
     const float midPassScale = std::clamp(
         ReadFloatEnv("VENPOD_RAYMARCH_MID_PASS_SCALE", 0.5f),
         0.25f,
-        1.0f);
+        2.0f);
     spdlog::info(
         "RAYMARCH_FLOOR_CONFIG renderScale={:.3f} output={}x{} preset={} explicitScale={}",
         raymarchRenderScale,
@@ -2512,6 +2512,10 @@ int RunSandbox(int argc, char* argv[]) {
     sparseClipmapConfig.nearExitPadding =
         static_cast<float>(ReadUIntEnv("VENPOD_SPARSE_MID_NEAR_PADDING", 12u));
     sparseClipmapConfig.ringCount = ReadUIntEnv("VENPOD_SPARSE_MID_RINGS", 4u);
+    // Gentler-than-doubling ring growth keeps the visible mid finer (TANDEM):
+    // 2.0 = original (4/8/16/32), ~1.4 = 4/6/8/11/15/22 over the same range.
+    sparseClipmapConfig.ringGrowthFactor =
+        std::clamp(ReadFloatEnv("VENPOD_SPARSE_MID_RING_GROWTH", 2.0f), 1.1f, 2.0f);
     const float sparseMidVoxelPublicFineRingEndDistance =
         static_cast<float>(ReadUIntEnv("VENPOD_SPARSE_MID_PUBLIC_FINE_RING_END", 3400u));
     sparseClipmapConfig.tileRadius = ReadUIntEnv("VENPOD_SPARSE_MID_TILE_RADIUS", 3u);
