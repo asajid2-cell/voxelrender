@@ -1712,6 +1712,22 @@ int RunSandbox(int argc, char* argv[]) {
     const uint32_t sparsePredictivePrefetchMs = ReadUIntEnv("VENPOD_SPARSE_PREDICTIVE_PREFETCH_MS", 450u);
     const uint32_t sparseMotionVisibleMinSpeed =
         ReadUIntEnv("VENPOD_SPARSE_MOTION_VISIBLE_MIN_SPEED", 64u);
+    // Ground-walk speeds (26-50 u/s) sit below the legacy 64 u/s motion-visible gate, so the
+    // velocity-directed prefetch cone never fired while walking and the streaming leading edge
+    // exposed missing near bricks as analytic-water holes. Walking uses this lower threshold.
+    const uint32_t sparseMotionVisibleMinSpeedWalk =
+        ReadUIntEnv("VENPOD_SPARSE_MOTION_VISIBLE_MIN_SPEED_WALK", 14u);
+    // While the camera moves faster than this, burst the generation/upload budgets so the
+    // leading edge promotes before it reaches the screen (0 disables the burst).
+    const uint32_t sparseMotionStreamBurstMinSpeed =
+        ReadUIntEnv("VENPOD_SPARSE_MOTION_STREAM_BURST_MIN_SPEED", 8u);
+    const uint32_t sparseMotionStreamBurstScale =
+        std::clamp(ReadUIntEnv("VENPOD_SPARSE_MOTION_STREAM_BURST_SCALE", 2u), 1u, 4u);
+    // Moving-camera floor for the mid clipmap pump (bricks/frame, 0 disables).
+    // The runtime pressure clamps (12/20/36) otherwise stretch the marching
+    // ring's leading-edge bursts into multi-second visible streaming gaps.
+    const uint32_t sparseMidMotionPumpBurst =
+        ReadUIntEnv("VENPOD_SPARSE_MID_MOTION_PUMP_BURST", 64u);
     const uint32_t sparseMotionVisibleMaxRequests =
         ReadUIntEnv("VENPOD_SPARSE_MOTION_VISIBLE_MAX_REQUESTS", std::max(24u, sparseVisibleRequestBudget));
     const bool enableSparseHierarchicalRequests =
@@ -4797,6 +4813,7 @@ int RunSandbox(int argc, char* argv[]) {
     bool sparsePhysicsDiagnosticFluidSeedQueued = false;
     uint32_t sparseGenerationBudgetLastFrame = 0;
     uint32_t sparseUploadBudgetLastFrame = 0;
+    float sparseCameraSpeedLastFrame = 0.0f;
     uint32_t sparseMidClipmapBudgetLastFrame = 0;
     uint32_t sparseMidClipmapPumpCapActiveLastFrame = 0;
     uint32_t sparseMidClipmapCacheOnlyDeferForTerrainThrottleLastFrame = 0;
@@ -6775,6 +6792,7 @@ int RunSandbox(int argc, char* argv[]) {
             const glm::vec3 sparseAdmissionCameraDelta = cameraPos - lastSparseResidencyCameraWorld;
             const float sparseAdmissionSpeed =
                 dt > 0.001f ? glm::length(sparseAdmissionCameraDelta) / dt : 0.0f;
+            sparseCameraSpeedLastFrame = sparseAdmissionSpeed;
             uint32_t sparseFastRequestScaleThisFrame = 1;
             if (sparseFastRequestSpeed > 0u && sparseAdmissionSpeed > static_cast<float>(sparseFastRequestSpeed)) {
                 sparseFastRequestScaleThisFrame = std::min<uint32_t>(
@@ -10158,7 +10176,9 @@ int RunSandbox(int argc, char* argv[]) {
                         48u);
                 }
                 hierarchy.motionVisibleMinSpeed = static_cast<float>(
-                    flightMode ? std::min<uint32_t>(24u, sparseMotionVisibleMinSpeed) : sparseMotionVisibleMinSpeed);
+                    flightMode
+                        ? std::min<uint32_t>(24u, sparseMotionVisibleMinSpeed)
+                        : std::min<uint32_t>(sparseMotionVisibleMinSpeedWalk, sparseMotionVisibleMinSpeed));
                 hierarchy.motionVisibleRadiusXz =
                     std::max(hierarchy.nearVisibleRadiusXz, 2u + std::min<uint32_t>(3u, sparseFastRadiusBonus));
                 hierarchy.motionVisibleRadiusY =
@@ -10934,6 +10954,12 @@ int RunSandbox(int argc, char* argv[]) {
             if (sparseFeedbackPressure) {
                 sparseGenerationBudgetThisFrame =
                     std::max(sparseGenerationBudgetThisFrame, sparseFeedbackGenerationBudget);
+            }
+            if (sparseMotionStreamBurstMinSpeed > 0u &&
+                sparseCameraSpeedLastFrame >= static_cast<float>(sparseMotionStreamBurstMinSpeed)) {
+                sparseGenerationBudgetThisFrame = std::max(
+                    sparseGenerationBudgetThisFrame,
+                    sparseGenerationBudget * sparseMotionStreamBurstScale);
             }
             const uint32_t sparseGenerationOwnershipPressureLevel =
                 computeSparseEffectiveOwnershipPressureLevel();
@@ -12382,6 +12408,26 @@ int RunSandbox(int argc, char* argv[]) {
                 } else if (!sparseMidClipmapProtectedCatchup &&
                            sparseGenerationDecision.pressureClass == Simulation::SparseRuntimePressureClass::Moderate) {
                     sparseMidClipmapCpuBudgetThisFrame = std::min<uint32_t>(sparseMidClipmapCpuBudgetThisFrame, 36u);
+                }
+                // WALKING-HOLES FIX: while the camera moves, the marching mid
+                // ring queues a brick burst at every anchor shift; the pressure
+                // clamps above (12/20/36 per frame) stretched those bursts into
+                // 30-60 frame visible streaming gaps at the ring's leading edge
+                // that the analytic water sheet painted navy over dry basins.
+                // Mid voxel brick generation is ~microseconds per brick (192
+                // bricks pump in ~0.3 ms), so a bounded moving-camera floor
+                // drains the leading edge in a few frames at no measurable
+                // frame cost.
+                if (sparseMidMotionPumpBurst > 0u &&
+                    sparseMotionStreamBurstMinSpeed > 0u &&
+                    sparseCameraSpeedLastFrame >=
+                        static_cast<float>(sparseMotionStreamBurstMinSpeed)) {
+                    sparseMidClipmapCpuBudgetThisFrame = std::max<uint32_t>(
+                        sparseMidClipmapCpuBudgetThisFrame,
+                        std::min<uint32_t>(
+                            sparseMidMotionPumpBurst,
+                            sparseMidClipmapStatsForBudget.queuedTiles +
+                                sparseMidClipmapStatsForBudget.queuedVoxelBricks));
                 }
                 if (sparseMidClipmapCoverageCatchup) {
                     sparseMidClipmapCpuBudgetThisFrame = std::max<uint32_t>(
@@ -14080,6 +14126,12 @@ int RunSandbox(int argc, char* argv[]) {
             if (sparseFeedbackUploadPressure) {
                 sparseUploadBudgetThisFrame =
                     std::max(sparseUploadBudgetThisFrame, sparseFeedbackUploadBudget);
+            }
+            if (sparseMotionStreamBurstMinSpeed > 0u &&
+                sparseCameraSpeedLastFrame >= static_cast<float>(sparseMotionStreamBurstMinSpeed)) {
+                sparseUploadBudgetThisFrame = std::max(
+                    sparseUploadBudgetThisFrame,
+                    sparseUploadBudget * sparseMotionStreamBurstScale);
             }
             const uint32_t sparseUploadOwnershipPressureLevel =
                 computeSparseEffectiveOwnershipPressureLevel();

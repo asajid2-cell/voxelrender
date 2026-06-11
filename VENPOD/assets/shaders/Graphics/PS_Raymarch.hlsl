@@ -957,23 +957,62 @@ float FarSpawnLandBand(float2 xz) {
     return 1.0f - FarSmooth01(saturate((originDistance - 200.0f) / 9300.0f));
 }
 
-// Reshaped-height view for consumer sites: the CONSTANT part of the geometry
-// floor (SEA+56; geometry adds broad*18 + ridgeHeight*40 + detail*3, i.e.
-// +/-61u of noise). Exact agreement is not required at these sites: the far
-// backdrop only owns pixels where the band is small (beyond the ~5872u
-// handoff), bounding the height error under the 6-21u far voxel quantization,
-// and the water/material consumers only compare height against sea level,
-// which the constant floor answers identically inside the band.
-float FarSpawnLandReshapeHeight(float2 xz, float height) {
-    const float band = FarSpawnLandBand(xz);
-    return lerp(height, max(height, FAR_SEA_LEVEL + 56.0f), band);
+// Base of the geometry spawn-land floor's NOISE terms (broad*18 + detail*3;
+// see SparseTerrainGenerator::HeightAt / FarVoxelOctree::TerrainHeight:
+// floor = SEA+56 + broad*18 + ridgeHeight*40 + detail*3). broad and detail are
+// the SAME first/third noises FarTerrainHeight evaluates at this xz (identical
+// frequency/offset/seed), so wherever both are inlined at the same coordinate
+// the optimizer can share the hash chains. The ridgeHeight*40 term is NOT
+// evaluated here: every consumer already holds FarTerrainHeight's mountainMask
+// for this xz, and wherever the floor can matter (height <= 160) that mask is
+// exactly ridgeHeight/2 unsaturated, so ridgeHeight*40 == mountainMask*80 for
+// free (see FarSpawnLandReshapeHeight).
+// WHY THE NOISE TERMS MATTER (was a constant SEA+56): the geometry floor
+// carries -21..+61u of noise. In the band fade annulus the water/land
+// classification of a deep basin column is hyper-sensitive to the floor value
+// (lifted = lerp(h, max(h, floor), band) straddles SEA), so the constant floor
+// disagreed with geometry over whole basins: a hard circular arc at the mid
+// ring boundary (mid renders true navy water, far renders pale lifted "land")
+// plus tan far-SVO leaf fragments floating on mid water.
+float FarSpawnLandFloorBase(float2 xz) {
+    const uint worldSeed = FarWorldSeed();
+    const float broad = FarValueNoise2D(xz.x * 0.0045f, xz.y * 0.0045f, worldSeed + 11u);
+    const float detail = FarValueNoise2D(
+        xz.x * 0.035f - 13.0f,
+        xz.y * 0.035f + 29.0f,
+        worldSeed + 37u);
+    return (FAR_SEA_LEVEL + 56.0f) + broad * 18.0f + detail * 3.0f;
 }
 
-// Same floor with a precomputed band: the SVO leaf-resolution loops compute the
-// band ONCE per leaf (the leaf interval spans <= ~55u, so band drift across it
-// is < 0.6% of the 9300u ramp) and reapply the 2-op floor per height sample.
-float FarSpawnLandApplyFloor(float height, float band) {
-    return lerp(height, max(height, FAR_SEA_LEVEL + 56.0f), band);
+// Reshaped-height view for consumer sites, in geometry-floor NOISE parity.
+// mountainMask must be FarTerrainHeight's out mask for this same xz:
+//  - height <= 160: mask = saturate((ridgeHeight*150 + 0)/300) = ridgeHeight/2
+//    (unsaturated, ridgeHeight <= 1), so mask*80 == ridgeHeight*40 EXACTLY.
+//  - height > 160: the recovered floor tops out at 29 + 80 = 109 < 160 <
+//    height, so max(height, floor) ignores the floor either way. Safe.
+// BRANCHLESS ON PURPOSE (driver-JIT safety, 2026-06-10): an early-out
+// 'if (band <= 0) return height;' here — inlined ~dozens of times into deep
+// far-field control flow — deterministically crashed the NVIDIA driver at
+// EXECUTION time (nvwgf2umx.dll 0xC0000005, same fault offset, ~frame 58 of
+// the crash profile, exactly when the high-altitude background path first
+// activates). The unconditional form is semantics-identical: lerp(h, x, 0)
+// == h exactly and the floor terms are finite/bounded, so band == 0 still
+// returns the raw height bit-for-bit.
+float FarSpawnLandReshapeHeight(float2 xz, float height, float mountainMask) {
+    const float band = FarSpawnLandBand(xz);
+    const float floorHeight = FarSpawnLandFloorBase(xz) + mountainMask * 80.0f;
+    return lerp(height, max(height, floorHeight), band);
+}
+
+// Same floor with a precomputed band + per-leaf floor base: the SVO
+// leaf-resolution loops compute the band and the broad/detail floor base ONCE
+// per leaf (the leaf interval spans <= ~55u: band drift < 0.6% of the 9300u
+// ramp, broad/detail drift well under the leaf quantization) and reapply the
+// cheap floor per height sample. mountainMask is the per-sample mask from the
+// FarTerrainHeight call that produced `height`, recovering the per-sample
+// ridgeHeight*40 floor term exactly (see FarSpawnLandReshapeHeight).
+float FarSpawnLandApplyFloor(float height, float band, float floorBase, float mountainMask) {
+    return lerp(height, max(height, floorBase + mountainMask * 80.0f), band);
 }
 
 float FarTerrainHeightVoxelized(
@@ -993,7 +1032,7 @@ float FarTerrainHeightVoxelized(
     // recovery all agree with the reshaped geometry; FarTerrainHeight itself
     // stays untouched (in-function edits TDR the PSO, see FarSpawnLandBand).
     return QuantizeTerrainTopHeight(
-        FarSpawnLandReshapeHeight(sampleXz, rawHeight),
+        FarSpawnLandReshapeHeight(sampleXz, rawHeight, mountainMask),
         max(4.0f, cellSize * 0.75f));
 }
 
@@ -1008,12 +1047,13 @@ uint FarTerrainMaterial(float2 xz, float height, float mountainMask, float spire
     const float localRelief =
         max(max(abs(hx0 - height), abs(hx1 - height)), max(abs(hz0 - height), abs(hz1 - height)));
 
-    // Spawn-land agreement: classify against the reshaped height so the far
-    // material never paints MAT_WATER "lakes" (or below-sea sand bands) over
-    // terrain the geometry layers reshape into spawn land. The relief gradient
-    // above intentionally stays raw: the reshape is locally smooth, so relief
+    // Spawn-land agreement: every caller passes a height that ALREADY carries
+    // the spawn-land floor (FarTerrainHeightVoxelized / FarSpawnLandApplyFloor),
+    // so classify it directly. Re-applying the reshape here double-lifted the
+    // band-annulus heights by up to +24u, biasing the far material toward dry
+    // land over columns the geometry keeps as water. The relief gradient above
+    // intentionally stays raw: the reshape is locally smooth, so relief
     // differences cancel in the abs() terms.
-    height = FarSpawnLandReshapeHeight(xz, height);
 
     if (height < FAR_SEA_LEVEL) {
         return MAT_WATER;
@@ -1063,7 +1103,13 @@ float3 FarTerrainMaterialVariation(
         (float)(FarHash3D(cellX, cellY, cellZ, worldSeed + 131u) & 0xFFFFu) / 65535.0f;
     const float broad =
         (float)(FarHash3D(cellX >> 2, cellY, cellZ >> 2, worldSeed + 173u) & 0xFFFFu) / 65535.0f;
-    const float distanceBlend = saturate((distanceFromCamera - 700.0f) / 5200.0f);
+    // PALETTE UNIFICATION (altitude patchwork): ramp the variation in over
+    // ~500-2500u instead of 700-5900u. The old slow ramp left far ground at
+    // ~10-12% variation in the 1.5-3k band where mid voxels next to it carry
+    // ~45-55% (BackgroundTerrainMaterialVariation) -> far read as a flat pale
+    // base palette, a different art style. Matched gates: far dirt 0.56 /
+    // stone 0.74 at blend 1 vs mid ~0.54-0.60 converged.
+    const float distanceBlend = saturate((distanceFromCamera - 500.0f) / 2000.0f);
     const float farSoftening = saturate((distanceFromCamera - 1200.0f) / 4200.0f);
     const float materialPatch = lerp(patch, broad, 0.36f + farSoftening * 0.34f);
 
@@ -1947,10 +1993,19 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
         uint voxel;
         uint actualRing;
         float actualCellSize;
+        // ALTITUDE PATCHWORK FIX (complaint 2): high-altitude views may read
+        // coarser resident parents too. The fine rings' interest bubbles span
+        // only +-9 bricks of the camera in XZ (ring0 +-576u .. ring2 +-2304u),
+        // so at altitude most ground inside a fine ring's t-band has no
+        // preferred-ring brick; the coarse rings (ring3 +-4608u, ring4 +-9216u)
+        // DO cover it and midCov 1.00 keeps them resident. Refusing them
+        // painted that ground far-style with scattered fine-brick patches (the
+        // art-style patchwork). The angular acceptability test at the hit site
+        // below keeps parents from reading as fake block terrain.
         const bool allowCoarserParentFallback =
-            !highAltitudeVoxelView &&
-            rayDir.y > -0.58f &&
-            rayDir.y < 0.18f;
+            highAltitudeVoxelView ||
+            (rayDir.y > -0.58f &&
+             rayDir.y < 0.18f);
         if (SampleResidentMidVoxelFallback(pos, ring, allowCoarserParentFallback, voxel, actualRing, actualCellSize)) {
             float nextCellT = NextMidVoxelCellBoundaryT(rayOrigin, rayDir, t, actualCellSize);
             uint material = GetMaterial(voxel);
@@ -1964,13 +2019,21 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
                     return true;
                 }
                 if (highAltitudeVoxelView && actualRing > ring) {
-                    // In high-altitude views the far SVO is the more stable
-                    // distant authority. A coarser mid-voxel parent is useful
-                    // near the player, but here it reads as fake block terrain
-                    // and can hide the cleaner far-SVO result that follows.
-                    previousMidVoxelWasAir = false;
-                    t = min(nextCellT, t + max(actualCellSize, 4.0f));
-                    continue;
+                    // Accept the coarse parent only while its angular
+                    // footprint stays small (cell <= ~0.014 rad at the hit
+                    // distance). The bound is chosen so each ring's parent
+                    // becomes acceptable before the next-finer ring's interest
+                    // bubble runs out (16u cells by ~1143u vs ring1 +-1152u,
+                    // 32u by ~2286u vs ring2 +-2304u, 64u by ~4571u vs ring3
+                    // +-4608u, and t >= ground rho always), so the ground
+                    // reads as ONE mid-style radial resolution gradient
+                    // instead of a mid/far patchwork. Chunkier parents still
+                    // fall through to the far layers.
+                    if (actualCellSize > max(12.0f, t * 0.014f)) {
+                        previousMidVoxelWasAir = false;
+                        t = min(nextCellT, t + max(actualCellSize, 4.0f));
+                        continue;
+                    }
                 }
                 float3 normal;
                 const bool taggedMidVoxelSurface = IsResidentMidVoxelTaggedSurface(voxel);
@@ -2714,13 +2777,15 @@ bool FarSvoLeafSurfaceHit(
 float CachedFarSvoOriginHeight(float3 rayOrigin, inout float cachedOriginHeight) {
     if (cachedOriginHeight <= -1e29f) {
         float originMountainMask, originSpireMask, originRavineMask;
+        const float rawOriginHeight = FarTerrainHeight(
+            rayOrigin.xz,
+            originMountainMask,
+            originSpireMask,
+            originRavineMask);
         cachedOriginHeight = FarSpawnLandReshapeHeight(
             rayOrigin.xz,
-            FarTerrainHeight(
-                rayOrigin.xz,
-                originMountainMask,
-                originSpireMask,
-                originRavineMask));
+            rawOriginHeight,
+            originMountainMask);
     }
     return cachedOriginHeight;
 }
@@ -2746,9 +2811,15 @@ bool FarSvoInteriorLeafSurfaceRecovery(
     // every aerial ray over spawn land fell through to water/sky (the navy
     // flooded band and the pale miss halo).
     const float spawnBand = FarSpawnLandBand(pos.xz);
+    // Per-leaf noise-floor base (broad/detail); the ridge term rides the
+    // per-sample mountainMask inside FarSpawnLandApplyFloor. UNCONDITIONAL on
+    // purpose (driver-JIT safety, see FarSpawnLandReshapeHeight): when band is
+    // 0 the ApplyFloor lerp ignores the base, so gating it behind
+    // 'spawnBand > 0' only added a select to deep control flow.
+    const float spawnFloorBase = FarSpawnLandFloorBase(pos.xz);
     float mountainMask, spireMask, ravineMask;
-    float height = FarSpawnLandApplyFloor(
-        FarTerrainHeight(pos.xz, mountainMask, spireMask, ravineMask), spawnBand);
+    const float rawLeafHeight = FarTerrainHeight(pos.xz, mountainMask, spireMask, ravineMask);
+    float height = FarSpawnLandApplyFloor(rawLeafHeight, spawnBand, spawnFloorBase, mountainMask);
     if (pos.y > height) {
         return false;
     }
@@ -2769,8 +2840,8 @@ bool FarSvoInteriorLeafSurfaceRecovery(
         const float mid = (lo + hi) * 0.5f;
         const float3 midPos = rayOrigin + rayDir * mid;
         float mm, sm, rm;
-        const float midHeight = FarSpawnLandApplyFloor(
-            FarTerrainHeight(midPos.xz, mm, sm, rm), spawnBand);
+        const float rawMidHeight = FarTerrainHeight(midPos.xz, mm, sm, rm);
+        const float midHeight = FarSpawnLandApplyFloor(rawMidHeight, spawnBand, spawnFloorBase, mm);
         if (midPos.y > midHeight) {
             lo = mid;
         } else {
@@ -2784,6 +2855,15 @@ bool FarSvoInteriorLeafSurfaceRecovery(
 
     hitT = max(hi, 64.0f);
     const float3 hitPos = rayOrigin + rayDir * hitT;
+    // NOTE (altitude patchwork): do NOT quantize the xz fed to
+    // FarTerrainNormal/FarTerrainMaterial here. Both a FarFallbackCellSize
+    // cell-center and a fully branchless clamp+floor quantizer retriggered the
+    // nvlddmkm shader-program-header device loss at frame ~61 (the same
+    // driver-JIT bug documented at FarSpawnLandReshapeHeight) - these deeply
+    // inlined leaf functions tolerate no restructuring. The per-pixel
+    // normal/material aliasing is instead tamed at the far-SVO SHADE site
+    // (distance-adaptive DistantLodShadeNormal strength), which the driver
+    // accepts.
     hitNormal = FarTerrainNormal(hitPos.xz);
     hitMaterial = FarTerrainMaterial(hitPos.xz, height, mountainMask, spireMask, ravineMask);
     return true;
@@ -2981,9 +3061,13 @@ bool FarSvoLeafSurfaceHit(
     // below-sea basin) contained no crossing, so the whole reshaped landmass
     // fell through to water/sky in aerial views (navy band + miss halo).
     const float spawnBand = FarSpawnLandBand(pos.xz);
+    // Per-leaf noise-floor base (broad/detail); the ridge term rides the
+    // per-sample mountainMask inside FarSpawnLandApplyFloor. UNCONDITIONAL on
+    // purpose (driver-JIT safety, see FarSpawnLandReshapeHeight).
+    const float spawnFloorBase = FarSpawnLandFloorBase(pos.xz);
     float mountainMask, spireMask, ravineMask;
-    float height = FarSpawnLandApplyFloor(
-        FarTerrainHeight(pos.xz, mountainMask, spireMask, ravineMask), spawnBand);
+    const float rawEntryHeight = FarTerrainHeight(pos.xz, mountainMask, spireMask, ravineMask);
+    float height = FarSpawnLandApplyFloor(rawEntryHeight, spawnBand, spawnFloorBase, mountainMask);
     float previousSigned = pos.y - height;
     float previousT = t;
     if (previousSigned <= 0.0f) {
@@ -3000,8 +3084,8 @@ bool FarSvoLeafSurfaceHit(
                 const float mid = (lo + hi) * 0.5f;
                 const float3 midPos = rayOrigin + rayDir * mid;
                 float mm, sm, rm;
-                const float midHeight = FarSpawnLandApplyFloor(
-                    FarTerrainHeight(midPos.xz, mm, sm, rm), spawnBand);
+                const float rawMidHeight = FarTerrainHeight(midPos.xz, mm, sm, rm);
+                const float midHeight = FarSpawnLandApplyFloor(rawMidHeight, spawnBand, spawnFloorBase, mm);
                 if (midPos.y > midHeight) {
                     lo = mid;
                 } else {
@@ -3015,6 +3099,8 @@ bool FarSvoLeafSurfaceHit(
 
             hitT = max(hi, 64.0f);
             const float3 hitPos = rayOrigin + rayDir * hitT;
+            // NOTE: no xz quantization here - driver-JIT fragile, see
+            // FarSvoInteriorLeafSurfaceRecovery.
             hitNormal = FarTerrainNormal(hitPos.xz);
             hitMaterial = FarTerrainMaterial(hitPos.xz, height, mountainMask, spireMask, ravineMask);
             return true;
@@ -3041,8 +3127,9 @@ bool FarSvoLeafSurfaceHit(
     for (int sample = 0; sample < sampleBudget && t < leafT1; ++sample) {
         t = min(t + stepSize, leafT1);
         pos = rayOrigin + rayDir * t;
-        height = FarSpawnLandApplyFloor(
-            FarTerrainHeight(pos.xz, mountainMask, spireMask, ravineMask), spawnBand);
+        const float rawSampleHeight =
+            FarTerrainHeight(pos.xz, mountainMask, spireMask, ravineMask);
+        height = FarSpawnLandApplyFloor(rawSampleHeight, spawnBand, spawnFloorBase, mountainMask);
         const float signedDistance = pos.y - height;
 
         if (signedDistance <= 0.0f && previousSigned > 0.0f) {
@@ -3056,8 +3143,8 @@ bool FarSvoLeafSurfaceHit(
                 const float mid = (lo + hi) * 0.5f;
                 const float3 midPos = rayOrigin + rayDir * mid;
                 float mm, sm, rm;
-                const float midHeight = FarSpawnLandApplyFloor(
-                    FarTerrainHeight(midPos.xz, mm, sm, rm), spawnBand);
+                const float rawRefineHeight = FarTerrainHeight(midPos.xz, mm, sm, rm);
+                const float midHeight = FarSpawnLandApplyFloor(rawRefineHeight, spawnBand, spawnFloorBase, mm);
                 if (midPos.y > midHeight) {
                     lo = mid;
                 } else {
@@ -3071,6 +3158,8 @@ bool FarSvoLeafSurfaceHit(
 
             hitT = hi;
             const float3 hitPos = rayOrigin + rayDir * hitT;
+            // NOTE: no xz quantization here - driver-JIT fragile, see
+            // FarSvoInteriorLeafSurfaceRecovery.
             hitNormal = FarTerrainNormal(hitPos.xz);
             hitMaterial = FarTerrainMaterial(hitPos.xz, height, mountainMask, spireMask, ravineMask);
             return true;
@@ -3262,9 +3351,9 @@ bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, fl
         // Spawn-land agreement: validate nearby SVO hits against the RESHAPED
         // height; the raw height is below sea across the spawn band and used to
         // reject every legitimate reshaped-land hit here.
-        const float rawHeight = FarSpawnLandReshapeHeight(
-            hitPos.xz,
-            FarTerrainHeight(hitPos.xz, rawMountainMask, rawSpireMask, rawRavineMask));
+        const float rawSvoHeight =
+            FarTerrainHeight(hitPos.xz, rawMountainMask, rawSpireMask, rawRavineMask);
+        const float rawHeight = FarSpawnLandReshapeHeight(hitPos.xz, rawSvoHeight, rawMountainMask);
         const float surfaceTolerance = max(8.0f, FarFallbackCellSize(nearestT) * 0.75f);
         if (rawHeight < FAR_SEA_LEVEL ||
             hitPos.y > rawHeight + surfaceTolerance) {
@@ -3304,14 +3393,23 @@ bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, fl
         return true;
     }
     baseColor.rgb = FarTerrainMaterialVariation(baseColor.rgb, nearestMaterial, hitPos.xz, hitPos.y, nearestT);
-    float3 shadeNormal = DistantLodShadeNormal(nearestNormal, nearestT, 0.58f);
+    // PALETTE UNIFICATION (altitude patchwork): shade with the EXACT mid-voxel
+    // constants (ndotl *0.62+0.28, ambient *0.76 + ndotl*0.34, floor
+    // *0.54+0.045). The old combo (flatten 0.58, lifted *0.78+0.42, floor
+    // 0.62+0.050) lit far ground flatter and brighter than the mid voxels
+    // beside it -> washed/pale far vs crisp mid, two art styles.
+    // Flatten strength is mid-matched (0.34) NEAR but grows with distance:
+    // the SVO leaf normals are raw 3u-epsilon analytic samples, and past
+    // ~2km one pixel spans many world units, so unflattened they alias into
+    // grey per-pixel lighting speckle (a third art style). Branchless ramp;
+    // quantizing the leaf-sample xz instead is driver-JIT fatal (see the
+    // leaf-exit notes).
+    const float svoFlatten = 0.34f + saturate((nearestT - 1200.0f) / 2400.0f) * 0.44f;
+    float3 shadeNormal = DistantLodShadeNormal(nearestNormal, nearestT, svoFlatten);
     float3 lightDir = SkySunDirection();
-    float ndotl = saturate(dot(shadeNormal, lightDir) * 0.56f + 0.34f);
-    // Lifted ambient floor (was *0.74 + ndotl*0.34, floor 0.56) so residual far
-    // SVO (startup / nearer occluder rays) reads hazy-lit like the mid voxels
-    // rather than a dark detached blob, matching the far-height shading.
-    float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.78f + ndotl * 0.42f);
-    color = max(color, baseColor.rgb * 0.62f + 0.050f);
+    float ndotl = saturate(dot(shadeNormal, lightDir) * 0.62f + 0.28f);
+    float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.76f + ndotl * 0.34f);
+    color = max(color, baseColor.rgb * 0.54f + 0.045f);
     const float farSvoGridFade = saturate((nearestT - 1200.0f) / 6200.0f);
     const float farSvoGrid = VoxelGridLine(
         hitPos.xz,
@@ -3461,7 +3559,7 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
 
             float hitT = max(hi, 64.0f);
             float3 hitPos = rayOrigin + rayDir * hitT;
-            float3 normal = DistantLodShadeNormal(FarTerrainVoxelNormal(hitPos.xz, hitT), hitT, 0.52f);
+            float3 normal = DistantLodShadeNormal(FarTerrainVoxelNormal(hitPos.xz, hitT), hitT, 0.34f);
             uint material = FarTerrainMaterial(hitPos.xz, previousHeight, mountainMask, spireMask, ravineMask);
             float u = (material + 0.5f) / 256.0f;
             float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, u, 0);
@@ -3475,10 +3573,13 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             // branches resolve the SAME far surface, so a near-vertical-down
             // first-hit must not read darker/less-hazed than the loop result a
             // few pixels away (that mismatch is the dark backdrop blob).
+            // PALETTE UNIFICATION (altitude patchwork): both branches now use
+            // the EXACT mid-voxel shade constants so far-owned ground reads as
+            // the same art style as the mid voxels beside it.
             float3 lightDir = SkySunDirection();
-            float lighting = saturate(dot(normal, lightDir) * 0.58f + 0.34f);
-            float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.78f + lighting * 0.40f);
-            color = max(color, baseColor.rgb * 0.58f + 0.04f);
+            float lighting = saturate(dot(normal, lightDir) * 0.62f + 0.28f);
+            float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.76f + lighting * 0.34f);
+            color = max(color, baseColor.rgb * 0.54f + 0.045f);
             const float farGridFade = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
             const float farGrid = VoxelGridLine(
                 hitPos.xz,
@@ -3566,7 +3667,7 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
 
             float hitT = hi;
             float3 hitPos = rayOrigin + rayDir * hitT;
-            float3 normal = DistantLodShadeNormal(FarTerrainVoxelNormal(hitPos.xz, hitT), hitT, 0.52f);
+            float3 normal = DistantLodShadeNormal(FarTerrainVoxelNormal(hitPos.xz, hitT), hitT, 0.34f);
             uint material = FarTerrainMaterial(hitPos.xz, height, mountainMask, spireMask, ravineMask);
             float u = (material + 0.5f) / 256.0f;
             float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, u, 0);
@@ -3581,13 +3682,13 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             // backdrop is lit from the same angle as the mid/near terrain in
             // front of it -> no brightness/shading step at the mid/far seam.
             float3 lightDir = SkySunDirection();
-            float lighting = saturate(dot(normal, lightDir) * 0.58f + 0.34f);
-            // Brighter, ambient-aware fill (was flat 0.72 + lighting*0.24). The
-            // old flat term read as a near-black silhouette against the bright
-            // sky; matching the mid-voxel visual language (SkyAmbient + ndotl)
-            // makes the distant terrain read as hazy-lit, not a dark blob.
-            float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.78f + lighting * 0.40f);
-            color = max(color, baseColor.rgb * 0.58f + 0.04f);
+            float lighting = saturate(dot(normal, lightDir) * 0.62f + 0.28f);
+            // Ambient-aware fill matching the mid-voxel visual language
+            // (SkyAmbient + ndotl) so the distant terrain reads hazy-lit, not
+            // a dark blob. PALETTE UNIFICATION (altitude patchwork): now the
+            // EXACT mid-voxel constants -> one art style across the handoff.
+            float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.76f + lighting * 0.34f);
+            color = max(color, baseColor.rgb * 0.54f + 0.045f);
             const float farGridFade = saturate((hitT - 900.0f) / (farMaxDist - 900.0f));
             const float farGrid = VoxelGridLine(
                 hitPos.xz,
@@ -3703,7 +3804,7 @@ bool RaymarchFarWater(float3 rayOrigin, float3 rayDir, float startDist, out RayH
     // analytic sea sheet must not exist there (it painted a navy ocean band
     // over real land in aerial views). Consumer-site reshape; see
     // FarSpawnLandBand for why FarTerrainHeight cannot carry this term.
-    if (FarSpawnLandReshapeHeight(hitPos.xz, terrainHeight) >= FAR_SEA_LEVEL) {
+    if (FarSpawnLandReshapeHeight(hitPos.xz, terrainHeight, mountainMask) >= FAR_SEA_LEVEL) {
         return false;
     }
 
@@ -3888,6 +3989,15 @@ bool BackgroundHitAllowedByExactNear(float3 rayOrigin, float3 rayDir, RayHit hit
     return hit.distance >= surfaceOwnershipDistance;
 }
 
+// WALKING-HOLES NOTE: do NOT add a mid-voxel residency probe anywhere in the
+// RaymarchBackgroundField / water-resolver inline region. Two attempts (full
+// fallback sampler, then a single-ring SampleResidentMidVoxel probe adding only
+// ~12KB DXIL) both made CreateGraphicsPipelineState fail in the NVIDIA driver
+// JIT (0x-7FF8FFF2 family — same driver fragility as the FixA branchless
+// reshape). The pending-land water suppression is therefore driven only by the
+// exact near DDA's missing-brick signal (suppressPendingLandWater threading
+// below); the mid-ring leading edge is handled CPU-side by the moving-camera
+// mid clipmap pump burst in main_launcher.cpp.
 bool TryResolveWaterOccluderForBackgroundHit(
     float3 rayOrigin,
     float3 rayDir,
@@ -3895,10 +4005,21 @@ bool TryResolveWaterOccluderForBackgroundHit(
     RayHit backgroundHit,
     bool hasPrecomputedWaterOccluder,
     RayHit precomputedWaterOccluder,
-    out RayHit waterHit)
+    out RayHit waterHit,
+    bool suppressPendingLandWater = false)
 {
     waterHit = precomputedWaterOccluder;
     bool hasWater = hasPrecomputedWaterOccluder;
+
+    // WALKING-HOLES FIX: when the exact near DDA crossed a not-yet-streamed
+    // brick whose analytic terrain column is dry land above sea, the analytic
+    // water sheet must not own this ray. Without this gate, streaming holes at
+    // the exact/mid leading edge render as navy "water holes" on land until the
+    // page promotes; with it, the underlying mid/far land estimate shows
+    // through instead, which visually matches the surrounding terrain.
+    if (suppressPendingLandWater) {
+        return false;
+    }
 
     if (!hasWater) {
         if (rayOrigin.y < FAR_WATER_SURFACE_Y ||
@@ -3987,7 +4108,7 @@ bool TryResolveDeterministicWaterBeforeBackground(
     const float terrainHeight = FarTerrainHeight(hitPos.xz, mountainMask, spireMask, ravineMask);
     // Spawn-land agreement: no deterministic water where the geometry layers
     // reshape the basin into spawn land (see FarSpawnLandBand).
-    if (FarSpawnLandReshapeHeight(hitPos.xz, terrainHeight) >= FAR_SEA_LEVEL) {
+    if (FarSpawnLandReshapeHeight(hitPos.xz, terrainHeight, mountainMask) >= FAR_SEA_LEVEL) {
         return false;
     }
 
@@ -4708,7 +4829,8 @@ bool RaymarchBackgroundField(
     bool includeSparseFarField,
     bool allowWideHeightAngles,
     out RayHit backgroundHit,
-    out uint backgroundLayer)
+    out uint backgroundLayer,
+    bool suppressPendingLandWater = false)
 {
     backgroundHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
     backgroundLayer = BACKGROUND_LAYER_NONE;
@@ -4755,7 +4877,8 @@ bool RaymarchBackgroundField(
         RaymarchMidVoxelColumnClipmap(rayOrigin, rayDir, startDist, backgroundHit)) {
         RayHit resolvedWaterHit;
         if (TryResolveWaterOccluderForBackgroundHit(
-                rayOrigin, rayDir, startDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit)) {
+                rayOrigin, rayDir, startDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit,
+                suppressPendingLandWater)) {
             backgroundHit = resolvedWaterHit;
             backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
             return true;
@@ -4812,7 +4935,8 @@ bool RaymarchBackgroundField(
             (backgroundHit.diagnosticFlags & RAY_DIAGNOSTIC_MID_INTERIOR_FALLBACK) != 0u;
         RayHit resolvedWaterHit;
         if (TryResolveWaterOccluderForBackgroundHit(
-                rayOrigin, rayDir, startDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit)) {
+                rayOrigin, rayDir, startDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit,
+                suppressPendingLandWater)) {
             backgroundHit = resolvedWaterHit;
             backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
             return true;
@@ -4835,7 +4959,8 @@ bool RaymarchBackgroundField(
                     if (elevatedFarSvoCandidateHit.distance + frontBias <= backgroundHit.distance) {
                         RayHit resolvedWaterHit;
                         if (TryResolveWaterOccluderForBackgroundHit(
-                                rayOrigin, rayDir, startDist, elevatedFarSvoCandidateHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit)) {
+                                rayOrigin, rayDir, startDist, elevatedFarSvoCandidateHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit,
+                                suppressPendingLandWater)) {
                             backgroundHit = resolvedWaterHit;
                             backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
                             return true;
@@ -4855,7 +4980,8 @@ bool RaymarchBackgroundField(
         RaymarchMidVoxelColumnClipmap(rayOrigin, rayDir, startDist, backgroundHit)) {
         RayHit resolvedWaterHit;
         if (TryResolveWaterOccluderForBackgroundHit(
-                rayOrigin, rayDir, startDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit)) {
+                rayOrigin, rayDir, startDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit,
+                suppressPendingLandWater)) {
             backgroundHit = resolvedWaterHit;
             backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
             return true;
@@ -4901,7 +5027,8 @@ bool RaymarchBackgroundField(
             backgroundHit)) {
         RayHit resolvedWaterHit;
         if (TryResolveWaterOccluderForBackgroundHit(
-                rayOrigin, rayDir, startDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit)) {
+                rayOrigin, rayDir, startDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit,
+                suppressPendingLandWater)) {
             backgroundHit = resolvedWaterHit;
             backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
             return true;
@@ -4955,7 +5082,8 @@ bool RaymarchBackgroundField(
         includeSparseFarField && RaymarchSparseFarField(rayOrigin, rayDir, farStartDist, 1e20f, backgroundHit)) {
         RayHit resolvedWaterHit;
         if (TryResolveWaterOccluderForBackgroundHit(
-                rayOrigin, rayDir, farStartDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit)) {
+                rayOrigin, rayDir, farStartDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit,
+                suppressPendingLandWater)) {
             backgroundHit = resolvedWaterHit;
             backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
             return true;
@@ -4966,7 +5094,7 @@ bool RaymarchBackgroundField(
         }
         backgroundLayer = BACKGROUND_LAYER_NONE;
     }
-    if (hasWaterOccluder && !deferFarSvoToFarHeightHorizon) {
+    if (hasWaterOccluder && !deferFarSvoToFarHeightHorizon && !suppressPendingLandWater) {
         backgroundHit = waterOccluderHit;
         backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
         if (BackgroundHitAllowedByExactNear(rayOrigin, rayDir, backgroundHit, backgroundLayer)) {
@@ -4987,7 +5115,8 @@ bool RaymarchBackgroundField(
         RaymarchMidVoxelColumnClipmap(rayOrigin, rayDir, startDist, backgroundHit)) {
         RayHit resolvedWaterHit;
         if (TryResolveWaterOccluderForBackgroundHit(
-                rayOrigin, rayDir, startDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit)) {
+                rayOrigin, rayDir, startDist, backgroundHit, hasWaterOccluder, waterOccluderHit, resolvedWaterHit,
+                suppressPendingLandWater)) {
             backgroundHit = resolvedWaterHit;
             backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
             return true;
@@ -5320,7 +5449,10 @@ bool BuildDeterministicFarTerrainContinuityHit(
     float mountainMask;
     float spireMask;
     float ravineMask;
-    const float height = FarTerrainHeight(hitPos.xz, mountainMask, spireMask, ravineMask);
+    const float rawContinuityHeight = FarTerrainHeight(hitPos.xz, mountainMask, spireMask, ravineMask);
+    // Spawn-land agreement: FarTerrainMaterial classifies the height it is
+    // GIVEN, so this raw-height caller applies the reshape itself.
+    const float height = FarSpawnLandReshapeHeight(hitPos.xz, rawContinuityHeight, mountainMask);
 
     const uint material = FarTerrainMaterial(hitPos.xz, height, mountainMask, spireMask, ravineMask);
     if (material == MAT_AIR) {
@@ -5343,13 +5475,16 @@ bool BuildDeterministicFarTerrainContinuityHit(
 
     float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, (material + 0.5f) / 256.0f, 0);
     baseColor.rgb = FarTerrainMaterialVariation(baseColor.rgb, material, hitPos.xz, hitPos.y, hitT);
-    const float3 normal = DistantLodShadeNormal(FarTerrainNormal(hitPos.xz), hitT, 0.46f);
-    const float ndotl = saturate(dot(normal, SkySunDirection()) * 0.56f + 0.34f);
-    // Lifted to match the brightened far-height / far-SVO shading (was *0.74 +
-    // ndotl*0.34, floor 0.56) so the resident-mid horizon continuity reads
-    // hazy-lit, not as a dark blob.
-    float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.90f + ndotl * 0.46f);
-    color = max(color, baseColor.rgb * 0.70f + 0.070f);
+    // PALETTE UNIFICATION (altitude patchwork): shade with the EXACT mid-voxel
+    // constants, matching the far-height / far-SVO sites (the old extra-lifted
+    // *0.90+0.46 / floor 0.70+0.070 was the brightest far variant and read as
+    // a washed pale band against mid voxels).
+    // NOTE: no xz quantization here - driver-JIT fragile, see
+    // FarSvoInteriorLeafSurfaceRecovery.
+    const float3 normal = DistantLodShadeNormal(FarTerrainNormal(hitPos.xz), hitT, 0.34f);
+    const float ndotl = saturate(dot(normal, SkySunDirection()) * 0.62f + 0.28f);
+    float3 color = baseColor.rgb * (SkyAmbient(normal) * 0.76f + ndotl * 0.34f);
+    color = max(color, baseColor.rgb * 0.54f + 0.045f);
     const float gridFade = saturate((hitT - 1200.0f) / 6200.0f);
     const float grid = VoxelGridLine(hitPos.xz, FarFallbackCellSize(hitT), lerp(0.030f, 0.016f, gridFade));
     color *= lerp(1.0f, 0.970f, grid);
@@ -6000,6 +6135,7 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug) 
     float firstSparseMissingDist = 1e20f;
     int3 firstSparseMissingBrickCoord = int3(0, 0, 0);
     bool firstSparseMissingTerrainAdjacent = false;
+    bool firstSparseMissingLandAboveSea = false;
     bool sawLocalWater = false;
     RayHit nearWaterPlaneHit;
     const bool aboveWaterView = rayOrigin.y >= FAR_WATER_SURFACE_Y - 0.5f;
@@ -6062,6 +6198,11 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug) 
                 firstSparseMissingTerrainAdjacent =
                     firstMissingPos.y <= firstMissingTerrainHeight + 24.0f &&
                     firstMissingPos.y >= firstMissingTerrainHeight - 48.0f;
+                // Dry-land pending brick: its analytic column tops out above
+                // sea, so any water shown through this hole is a streaming
+                // artifact, not real water.
+                firstSparseMissingLandAboveSea =
+                    firstMissingTerrainHeight > FAR_SEA_LEVEL + 4.0f;
             }
             sawSparseMissing = true;
             firstSparseMissingDist = min(firstSparseMissingDist, dist);
@@ -6082,7 +6223,18 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug) 
         // Hit non-air voxel?
         if (material != MAT_AIR && !skipLocalWater) {
             const float hitWorldDistance = entryDist + dist;
+            // WALKING-HOLES FIX: a pending (not yet streamed) dry-land brick in
+            // front of the analytic sea-plane crossing means this ray tunneled
+            // through a streaming hole; the water plane must not preempt the
+            // real voxel hit behind it, or land holes flash navy while pages
+            // promote at the walk leading edge.
+            const bool pendingLandBeforeNearWater =
+                sawSparseMissing &&
+                firstSparseMissingTerrainAdjacent &&
+                firstSparseMissingLandAboveSea &&
+                (entryDist + firstSparseMissingDist) < nearWaterPlaneHit.distance;
             if (hasNearWaterPlane &&
+                !pendingLandBeforeNearWater &&
                 nearWaterPlaneHit.distance <= hitWorldDistance + 0.25f) {
                 // The water plane can be closer than the next voxel-DDA hit
                 // while a raster/extracted exact surface face still exists
@@ -6264,6 +6416,13 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug) 
             ? firstHoleStart
             : max(firstHoleStart, protectedHoleFillStart);
         const float firstSparseMissingWorldDist = entryDist + firstSparseMissingDist;
+        // WALKING-HOLES FIX: this branch fills a streaming hole (missing exact
+        // page). If the missing brick's analytic column is dry land, forbid the
+        // analytic water sheet from owning the fill — the mid/far land estimate
+        // shows through instead, so the hole reads as terrain, not navy water.
+        const bool suppressPendingLandWaterFill =
+            firstSparseMissingTerrainAdjacent &&
+            firstSparseMissingLandAboveSea;
         if (RaymarchBackgroundField(
             rayOrigin,
             rayDir,
@@ -6271,7 +6430,8 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug) 
             true,
             true,
             backgroundHit,
-            backgroundLayer)) {
+            backgroundLayer,
+            suppressPendingLandWaterFill)) {
             const float surfaceOwnershipDistance = max(frame.nearOwnershipParams.w, ExactNearDistance());
             const bool lowerLodTerrainBeforeExactSurfaceLimit =
                 backgroundLayer == BACKGROUND_LAYER_MID_VOXEL ||
