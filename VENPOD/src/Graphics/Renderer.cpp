@@ -839,8 +839,20 @@ void Renderer::RenderVoxels(
     {
         const float liveVoxelCoverage =
             midClipmapEnabled ? ClampFinite(camera.midFieldVoxelCoverage, 0.0f, 1.0f, 0.0f) : 0.0f;
+        // TANDEM fix (altitude flooded-world bug): the spawn-land reshape gate
+        // (FarSpawnLandBand) keys on this latched signal. The latch used to arm
+        // ONLY on voxel coverage >= 0.5, but when the camera starts/flies at
+        // altitude the mid-voxel bricks stay sparse and voxel coverage never
+        // reaches 0.5 -> the latch never arms -> the reshape stays OFF -> the far
+        // water/deterministic-water layers render the UN-reshaped flooded basin
+        // (ground-truth: a ground walk is a clean continent, a fly-from-altitude
+        // is flooded). HEIGHT coverage is reliably ~1.0 at altitude and is the
+        // correct "world is defined" signal for an analytic reshape, so arm on
+        // either. The render is held until ~frame 120 so no startup flash.
+        const float liveHeightCoverage =
+            midClipmapEnabled ? ClampFinite(camera.midFieldHeightCoverage, 0.0f, 1.0f, 0.0f) : 0.0f;
         static bool s_midResidencyEverGood = false;
-        if (liveVoxelCoverage >= 0.5f) {
+        if (liveVoxelCoverage >= 0.5f || liveHeightCoverage >= 0.5f) {
             s_midResidencyEverGood = true;
         }
         constants.midResidencyParams[1] = (s_midResidencyEverGood && midClipmapEnabled)

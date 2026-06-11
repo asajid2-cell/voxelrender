@@ -535,6 +535,15 @@ float3 SkyColor(float3 rayDir) {
     float3 horizonTint = float3(1.00f, 0.84f, 0.58f);
     float3 sky = lerp(lowerSky, upperSky, up);
     sky = lerp(sky, horizonTint, horizon * 0.42f);
+    // TANDEM fix (F1): far-height terrain hazes TOWARD SkyColor, but at moderate
+    // distance the far bumps stay only ~half-hazed and read as detached grey
+    // chunks against crisp sky in the gaps between ridge tops. Lift the
+    // near-horizon sky toward a pale atmosphere so the gaps match the semi-hazed
+    // bumps -> one coherent hazy ridge instead of floating chunks. Squared narrow
+    // band fades by rayDir.y ~0.30 (upper sky untouched); subtle (no F4 murk).
+    const float horizonAirBand = saturate((0.30f - abs(rayDir.y)) / 0.30f);
+    const float3 horizonAir = float3(0.80f, 0.84f, 0.88f);
+    sky = lerp(sky, horizonAir, horizonAirBand * horizonAirBand * 0.38f);
     sky += float3(1.00f, 0.72f, 0.34f) * sunBloom * 0.32f;
     sky += float3(1.00f, 0.93f, 0.74f) * sun * 1.75f;
     sky += float3(0.18f, 0.24f, 0.38f) * antiSun * 0.10f;
@@ -949,12 +958,18 @@ float2 FarFallbackCellCenter(float2 xz, float cellSize) {
 // while the public render stays HELD until frame ~120, so the far-field morph
 // from flooded basin to spawn land is never publicly visible.
 float FarSpawnLandBand(float2 xz) {
-    if (frame.midResidencyParams.y < 0.5f) {
-        return 0.0f;
-    }
     const float2 originDelta = xz - float2(192.0f, 224.0f);
     const float originDistance = length(originDelta);
-    return 1.0f - FarSmooth01(saturate((originDistance - 200.0f) / 9300.0f));
+    // TANDEM widen 9300 -> 35000: solid continent fills the render range (matches
+    // the geometry copies SparseTerrainGenerator/TerrainHeight/FarVoxelOctree).
+    const float rawBand = 1.0f - FarSmooth01(saturate((originDistance - 200.0f) / 90000.0f));
+    // BRANCHLESS residency gate (driver-JIT safety): the early-out
+    // 'if (midResidencyParams.y < 0.5) return 0' crashes the NVIDIA driver when
+    // this is inlined many times in the deep far path. step()-multiply is
+    // bit-identical (0 below the gate, rawBand at/above). The Renderer latch
+    // holds the published signal >= 0.51 once height OR voxel coverage is good,
+    // so the reshape stays active at altitude; this gate only hides the startup flash.
+    return rawBand * step(0.5f, frame.midResidencyParams.y);
 }
 
 // Base of the geometry spawn-land floor's NOISE terms (broad*18 + detail*3;
@@ -4022,44 +4037,18 @@ bool TryResolveWaterOccluderForBackgroundHit(
     }
 
     if (!hasWater) {
-        if (rayOrigin.y < FAR_WATER_SURFACE_Y ||
-            rayDir.y >= -0.015f ||
-            rayDir.y < -0.92f) {
-            return false;
-        }
-        const float waterT = (FAR_WATER_SURFACE_Y - rayOrigin.y) / rayDir.y;
-        // Background terrain can be deliberately started after the exact
-        // surface band. Water is a screen-space occluder for that fallback, so
-        // it must be probed from the ray, not from the delayed terrain handoff.
-        if (waterT < 32.0f || waterT > 10400.0f) {
-            return false;
-        }
-
-        const float3 terrainPos = rayOrigin + rayDir * backgroundHit.distance;
-        // Spawn-land agreement: the reshaped land floor sits at ~SEA+56, inside
-        // the +96 "submerged" tolerance, so at steep aerial angles this branch
-        // used to replace REAL reshaped-land hits with deterministic water (the
-        // navy flooded band). Inside the spawn band only genuinely submerged
-        // hits (below sea-8) may take water; the threshold relaxes back to +96
-        // as the band fades into the true ocean by ~9500u.
-        if (terrainPos.y >
-            FAR_WATER_SURFACE_Y + lerp(96.0f, -8.0f, FarSpawnLandBand(terrainPos.xz))) {
-            return false;
-        }
-
-        // If the first resident mid/far hit is just behind the sea plane, it is
-        // submerged terrain. Let deterministic water own that pixel even when
-        // the exact water brick has not streamed yet. This does not create water
-        // over missing dry land because it only applies after a real terrain hit
-        // at or below sea level.
-        const float waterLeadTolerance = LowerLodWaterlineTolerance(backgroundHit.distance);
-        if (waterT > backgroundHit.distance + waterLeadTolerance) {
-            return false;
-        }
-
-        const float3 hitPos = rayOrigin + rayDir * waterT;
-        waterHit = MakeHit(float4(ShadeWaterSurface(rayDir, hitPos, waterT), 1.0f), waterT);
-        hasWater = true;
+        // TANDEM (Codex root cause): this branch RE-SYNTHESIZES an analytic water
+        // plane when the precomputed RaymarchFarWater occluder was false. But
+        // RaymarchFarWater is the spawn-land-aware test (it self-suppresses over
+        // reshaped land, 3807); its synthesis-suppression here keys on the
+        // BACKGROUND hit being below sea (terrainPos.y), NOT the band, so for a
+        // low-fly (~250u) ray whose far terrain hit is below sea it resurrects the
+        // water plane band-independently over what is solid land at ground level.
+        // That is the stubborn altitude-only far-water overlay (band-/latch-
+        // independent). Trust the precomputed RaymarchFarWater verdict: if it
+        // found no water, do not re-synthesize. Real water keeps the occluder
+        // true and is unaffected. Removes ALU (driver-safe; shader at the PSO cliff).
+        return false;
     }
 
     const float3 backgroundPos = rayOrigin + rayDir * backgroundHit.distance;
@@ -6195,14 +6184,28 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug) 
                     mountainMask,
                     spireMask,
                     ravineMask);
+                // TANDEM (Codex diagnosis + shape, Claude applied): the RAW
+                // FarTerrainHeight misclassifies reshaped spawn-land continent
+                // columns (raw below sea) as below-sea, so the near-water plane
+                // AND the background-fill suppression both let FAR_WATER leak over
+                // the continent at altitude (ground views never reach these
+                // fallback paths, so ground is clean). This ONE source flag feeds
+                // both visible water paths. CHEAP lower-bound reshape (no noise:
+                // the spawn-land floor is always >= SEA+35 wherever the band is
+                // significant) - one branchless FarSpawnLandBand + lerp/max, once
+                // per ray. The full noise reshape (FarSpawnLandFloorBase x8) here
+                // crashed the driver JIT (598x DEVICE_REMOVED); this is driver-safe.
+                const float firstMissingSpawnBand =
+                    FarSpawnLandBand(firstMissingPos.xz);
+                const float cheapReshapedLandHeight = lerp(
+                    firstMissingTerrainHeight,
+                    max(firstMissingTerrainHeight, FAR_SEA_LEVEL + 35.0f),
+                    firstMissingSpawnBand);
                 firstSparseMissingTerrainAdjacent =
-                    firstMissingPos.y <= firstMissingTerrainHeight + 24.0f &&
-                    firstMissingPos.y >= firstMissingTerrainHeight - 48.0f;
-                // Dry-land pending brick: its analytic column tops out above
-                // sea, so any water shown through this hole is a streaming
-                // artifact, not real water.
+                    firstMissingPos.y <= cheapReshapedLandHeight + 24.0f &&
+                    firstMissingPos.y >= cheapReshapedLandHeight - 48.0f;
                 firstSparseMissingLandAboveSea =
-                    firstMissingTerrainHeight > FAR_SEA_LEVEL + 4.0f;
+                    cheapReshapedLandHeight > FAR_SEA_LEVEL + 4.0f;
             }
             sawSparseMissing = true;
             firstSparseMissingDist = min(firstSparseMissingDist, dist);

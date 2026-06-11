@@ -25,7 +25,13 @@ constexpr uint32_t kInteriorLeafFlag = 2;
 // without bumping the version, so on-disk caches kept serving the OLD flooded-basin
 // world (stale tan disc + bright-blue MAT_WATER lakes in aerial views). Bump forces
 // a rebuild with the reshape so far-SVO content agrees with the geometry layers.
-constexpr uint32_t kFarVoxelOctreeCacheVersion = 51;
+// 51 -> 52: spawn-land band widened 9300 -> 35000 (continent fills the render
+// range). Stale v51 cache would re-introduce the old water-ring archipelago.
+// 52 -> 53: band 35000 -> 90000 (TANDEM: at /35000 the band dropped to ~0.80 by
+// the 10.4k render edge, so the deepest basins there partial-lift just below sea
+// and a 250u low-fly saw that deep-basin-edge water at ~40%; /90000 holds band
+// ~0.96 to 10.4k -> solid land across the whole render range at every altitude).
+constexpr uint32_t kFarVoxelOctreeCacheVersion = 53;
 constexpr uint64_t kMaxFarVoxelOctreeCacheBytes = 512ull * 1024ull * 1024ull;
 
 float Smooth01(float value) {
@@ -1322,10 +1328,11 @@ float FarVoxelOctree::TerrainHeight(float x, float z) const {
         (routeCorridor * routeRidge * routeNotch * 0.68f);
 
     // Spawn landmass: lift low/submerged near-origin terrain onto a gently
-    // rolling land floor comfortably above sea level, fading out by ~9500u.
-    // Must match SparseTerrainGenerator::HeightAt / TH_HeightAt (the geometry copies).
+    // rolling land floor comfortably above sea level. TANDEM widen 9300 -> 35000
+    // (continent fills the render range). Must match SparseTerrainGenerator::HeightAt
+    // / TH_HeightAt (the geometry copies) - 35000.0f exactly.
     const float spawnLandBand =
-        1.0f - Smooth01(std::clamp((originDistance - 200.0f) / 9300.0f, 0.0f, 1.0f));
+        1.0f - Smooth01(std::clamp((originDistance - 200.0f) / 90000.0f, 0.0f, 1.0f));
     // VISUAL PASS iter1 (coast): PARITY mirror. +40 -> +56 base, noise softened.
     const float spawnLandFloor =
         static_cast<float>(VENPOD::Simulation::SEA_LEVEL_Y) + 56.0f +

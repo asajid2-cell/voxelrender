@@ -277,10 +277,12 @@ float TH_HeightAt(int worldX, int worldZ, uint seed) {
     height = TH_Lerp(height, max(height, routeBackdropHeight), routeCorridor * routeRidge * routeNotch * 0.68f);
 
     // Spawn landmass: lift low/submerged near-origin terrain onto a gently
-    // rolling land floor comfortably above sea level, fading out by ~9500u.
-    // PARITY: matches CPU SparseTerrainGenerator::HeightAt spawn-land block.
+    // rolling land floor comfortably above sea level. TANDEM widen 9300 -> 35000
+    // so the solid continent fills the render range (partial-reshape fragment
+    // zone pushed past the ~10k horizon). PARITY: must stay byte-identical to CPU
+    // SparseTerrainGenerator::HeightAt spawn-land block (35000.0f exactly).
     float spawnLandBand =
-        1.0f - TH_Smooth01(saturate((originDistance - 200.0f) / 9300.0f));
+        1.0f - TH_Smooth01(saturate((originDistance - 200.0f) / 90000.0f));
     // VISUAL PASS iter1 (coast): PARITY mirror. +40 -> +56 base, noise softened.
     float spawnLandFloor =
         (float)TH_SEA_LEVEL_Y + 56.0f +
