@@ -1663,6 +1663,8 @@ void SparseClipmapTileCache::UpdateInterest(
     m_voxelInterestEmittedLastFrame = 0;
     m_voxelInterestReusedLastFrame = 0;
     m_voxelInterestReuseAgeLastFrame = 0;
+    m_voxelInterestBudgetedRebuildsLastFrame = 0;
+    m_voxelInterestRingsRebuiltLastFrame = 0;
     m_backlogVoxelEnqueuedLastFrame = 0;
     m_backlogVoxelCarriedLastFrame = 0;
     m_backlogVoxelResidentSkipLastFrame = 0;
@@ -2041,36 +2043,124 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
     const auto heightPumpStart = std::chrono::steady_clock::now();
     uint32_t generated = 0;
     uint32_t evicted = 0;
-    while (policy.Config().heightClipmapEnabled &&
-           !m_generationQueue.empty() &&
-           generated < maxHeightTiles) {
-        const SparseClipmapTileCoord coord = m_generationQueue.front();
-        m_generationQueue.pop_front();
-        m_queuedSet.erase(coord);
+    // Height tile generation is the dominant clip-section pump cost on a moving camera:
+    // GenerateTile runs tileSampleSide^2 (33x33 = ~1089) heavy SparseTerrainGenerator
+    // HeightAt evaluations per tile, and a cell-cross enqueues a burst of tiles that
+    // generate single-threaded in one frame (measured: up to ~25ms). GenerateTile only
+    // touches its own m_tiles[slot] payload and reads const terrain/policy, so it is
+    // safe to fan across worker threads (exactly like the voxel brick pump below). The
+    // queue drain + slot allocation + slot-map/dirty bookkeeping stay single-threaded
+    // (they mutate shared maps); only the per-tile HeightAt work parallelizes. This is
+    // coverage-neutral by construction: identical tiles, identical maxHeightTiles budget,
+    // just off the single-thread critical path -- it cannot change which tiles stream.
+    const bool parallelHeightPumpAllowed =
+        policy.Config().heightClipmapEnabled &&
+        policy.Config().parallelHeightPump &&
+        policy.Config().parallelVoxelPumpMaxWorkers > 1u;
+    if (parallelHeightPumpAllowed) {
+        struct PendingHeightGeneration {
+            SparseClipmapTileCoord coord;
+            uint32_t slot = UINT32_MAX;
+        };
+        std::vector<PendingHeightGeneration> pendingHeight;
+        pendingHeight.reserve(maxHeightTiles);
+        while (!m_generationQueue.empty() && generated < maxHeightTiles) {
+            const SparseClipmapTileCoord coord = m_generationQueue.front();
+            m_generationQueue.pop_front();
+            m_queuedSet.erase(coord);
 
-        if (!m_interestSet.empty() && m_interestSet.find(coord) == m_interestSet.end()) {
-            continue;
-        }
+            if (!m_interestSet.empty() && m_interestSet.find(coord) == m_interestSet.end()) {
+                continue;
+            }
+            if (m_slotByCoord.find(coord) != m_slotByCoord.end()) {
+                continue;
+            }
 
-        if (m_slotByCoord.find(coord) != m_slotByCoord.end()) {
-            continue;
+            const bool wasFull = m_slotByCoord.size() >= m_tiles.size() && m_freeSlots.empty();
+            const uint32_t slot = AllocateSlot(coord, frameIndex);
+            if (slot == UINT32_MAX) {
+                break;
+            }
+            evicted += wasFull ? 1u : 0u;
+            m_tiles[slot].record.coord = coord;
+            m_tiles[slot].record.slot = slot;
+            m_tiles[slot].record.lastTouchedFrame = frameIndex;
+            pendingHeight.push_back({coord, slot});
+            ++generated;
         }
+        if (!pendingHeight.empty()) {
+            const bool useHeightWorkers =
+                pendingHeight.size() >=
+                    static_cast<size_t>(std::max(2u, policy.Config().parallelHeightPumpMinTiles));
+            const uint32_t heightWorkerCount = useHeightWorkers
+                ? std::min<uint32_t>(
+                      static_cast<uint32_t>(pendingHeight.size()),
+                      policy.Config().parallelVoxelPumpMaxWorkers)
+                : 1u;
+            if (heightWorkerCount <= 1u) {
+                for (const PendingHeightGeneration& item : pendingHeight) {
+                    GenerateTile(item.slot, policy);
+                }
+            } else {
+                std::vector<std::thread> heightWorkers;
+                heightWorkers.reserve(heightWorkerCount);
+                for (uint32_t worker = 0u; worker < heightWorkerCount; ++worker) {
+                    heightWorkers.emplace_back([this, &pendingHeight, &policy, worker, heightWorkerCount]() {
+                        const size_t begin =
+                            (pendingHeight.size() * static_cast<size_t>(worker)) /
+                            static_cast<size_t>(heightWorkerCount);
+                        const size_t end =
+                            (pendingHeight.size() * static_cast<size_t>(worker + 1u)) /
+                            static_cast<size_t>(heightWorkerCount);
+                        for (size_t index = begin; index < end; ++index) {
+                            GenerateTile(pendingHeight[index].slot, policy);
+                        }
+                    });
+                }
+                for (std::thread& worker : heightWorkers) {
+                    worker.join();
+                }
+            }
+            // Single-threaded commit: publish slots + dirty marks in queue order.
+            for (const PendingHeightGeneration& item : pendingHeight) {
+                m_slotByCoord[item.coord] = item.slot;
+                ++m_dirtySerial;
+                ++m_heightDirtySerial;
+                MarkHeightSlotDirty(item.slot);
+            }
+        }
+    } else {
+        while (policy.Config().heightClipmapEnabled &&
+               !m_generationQueue.empty() &&
+               generated < maxHeightTiles) {
+            const SparseClipmapTileCoord coord = m_generationQueue.front();
+            m_generationQueue.pop_front();
+            m_queuedSet.erase(coord);
 
-        const bool wasFull = m_slotByCoord.size() >= m_tiles.size() && m_freeSlots.empty();
-        const uint32_t slot = AllocateSlot(coord, frameIndex);
-        if (slot == UINT32_MAX) {
-            break;
+            if (!m_interestSet.empty() && m_interestSet.find(coord) == m_interestSet.end()) {
+                continue;
+            }
+
+            if (m_slotByCoord.find(coord) != m_slotByCoord.end()) {
+                continue;
+            }
+
+            const bool wasFull = m_slotByCoord.size() >= m_tiles.size() && m_freeSlots.empty();
+            const uint32_t slot = AllocateSlot(coord, frameIndex);
+            if (slot == UINT32_MAX) {
+                break;
+            }
+            evicted += wasFull ? 1u : 0u;
+            m_tiles[slot].record.coord = coord;
+            m_tiles[slot].record.slot = slot;
+            m_tiles[slot].record.lastTouchedFrame = frameIndex;
+            GenerateTile(slot, policy);
+            m_slotByCoord[coord] = slot;
+            ++generated;
+            ++m_dirtySerial;
+            ++m_heightDirtySerial;
+            MarkHeightSlotDirty(slot);
         }
-        evicted += wasFull ? 1u : 0u;
-        m_tiles[slot].record.coord = coord;
-        m_tiles[slot].record.slot = slot;
-        m_tiles[slot].record.lastTouchedFrame = frameIndex;
-        GenerateTile(slot, policy);
-        m_slotByCoord[coord] = slot;
-        ++generated;
-        ++m_dirtySerial;
-        ++m_heightDirtySerial;
-        MarkHeightSlotDirty(slot);
     }
     const auto heightPumpEnd = std::chrono::steady_clock::now();
 
@@ -3934,6 +4024,8 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
         m_voxelBacklogFirstFrame.clear();
         m_visiblePriorityVoxelSet.clear();
         m_lastVoxelInterestSignatureValid = false;
+        m_voxelInterestRebuildRingCursor = 0u;
+        m_voxelInterestRebuildInProgress = false;
         RefreshStats();
         m_stats.voxelInterestAnchors = 0;
         return;
@@ -4067,6 +4159,9 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
         m_lastVoxelInterestSignatureValid &&
         !m_voxelInterestSet.empty() &&
         voxelInterestReuseConfigCompatible &&
+        // Never short-circuit a budgeted rebuild that is still mid-sweep -- the
+        // remaining rings must keep getting refreshed instead of frozen as carried.
+        !m_voxelInterestRebuildInProgress &&
         voxelInterestReuseAge <= policy.Config().voxelInterestSignatureReuseMaxAgeFrames;
     if (voxelInterestSignatureReuse) {
         m_voxelInterestReusedLastFrame = 1u;
@@ -4113,9 +4208,28 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
         return;
     }
 
+    // Frame-budgeted (incremental) rebuild scheduling. On a footprint-cell cross the
+    // signature reuse fast path above is bypassed and we fall through to the full
+    // per-ring candidate scan, which spikes 'clip' to 20-75ms. Rather than rebuild
+    // every ring this frame, refresh only a budgeted subset and carry the remaining
+    // rings' coords from the prior interest set (the camera moved at most ~1 cell, so
+    // those carried rings are a strict superset-minus-edge of the correct set and
+    // stay fully covered). This converts the spike into a few small frames without
+    // ever dropping coverage. Disabled when: knob is 0, there is no prior set to carry
+    // (cold build), backlog-aware pump is on (its queue carry semantics differ), or
+    // the ring count is too small for budgeting to help.
+    const uint32_t voxelInterestRebuildRingsPerFrame =
+        policy.Config().voxelInterestRebuildRingsPerFrame;
+    const bool budgetedVoxelInterestRebuild =
+        voxelInterestRebuildRingsPerFrame > 0u &&
+        !backlogAwarePump &&
+        allowSignatureReuse &&
+        !m_voxelInterestSet.empty() &&
+        ringCount > voxelInterestRebuildRingsPerFrame;
+
     std::deque<SparseVoxelClipmapCoord> previousVoxelQueue;
     std::unordered_set<SparseVoxelClipmapCoord, SparseVoxelClipmapCoordHash> previousVoxelInterestSet;
-    if (policy.Config().drainReuseDiagnostics) {
+    if (policy.Config().drainReuseDiagnostics || budgetedVoxelInterestRebuild) {
         previousVoxelInterestSet = m_voxelInterestSet;
     }
     if (backlogAwarePump) {
@@ -4128,7 +4242,41 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
         m_queuedVoxelSet.clear();
         m_voxelBacklogFirstFrame.clear();
     }
+
+    // Pick the contiguous (wrapping) block of rings to rebuild this frame. The cursor
+    // persists across frames so successive crosses sweep every ring in turn; while the
+    // cursor has not yet covered the whole clipmap the rebuild is "in progress" and the
+    // signature must not be committed (so the next frame keeps finishing the spread).
+    std::vector<uint8_t> rebuildThisRing(ringCount, budgetedVoxelInterestRebuild ? 0u : 1u);
+    uint32_t ringsRebuiltThisFrame = ringCount;
+    if (budgetedVoxelInterestRebuild) {
+        if (m_voxelInterestRebuildRingCursor >= ringCount) {
+            m_voxelInterestRebuildRingCursor = 0u;
+        }
+        const uint32_t budget = std::min(voxelInterestRebuildRingsPerFrame, ringCount);
+        for (uint32_t i = 0; i < budget; ++i) {
+            const uint32_t ringIdx =
+                (m_voxelInterestRebuildRingCursor + i) % ringCount;
+            rebuildThisRing[ringIdx] = 1u;
+        }
+        ringsRebuiltThisFrame = budget;
+        m_voxelInterestRebuildRingCursor =
+            (m_voxelInterestRebuildRingCursor + budget) % ringCount;
+        // "In progress" until the cursor wraps back to ring 0 (a full sweep done).
+        m_voxelInterestRebuildInProgress = (m_voxelInterestRebuildRingCursor != 0u);
+        ++m_voxelInterestBudgetedRebuildsLastFrame;
+    } else {
+        m_voxelInterestRebuildRingCursor = 0u;
+        m_voxelInterestRebuildInProgress = false;
+    }
+    m_voxelInterestRingsRebuiltLastFrame = ringsRebuiltThisFrame;
+
     for (uint32_t ring = 0; ring < rings.size(); ++ring) {
+        if (ring < rebuildThisRing.size() && rebuildThisRing[ring] == 0u) {
+            // Carried ring: its coords are re-emitted below from the prior interest
+            // set. Skip the (expensive) candidate scan entirely.
+            continue;
+        }
         const float brickWorldSize = std::max(1.0f, rings[ring].cellSize * static_cast<float>(SPARSE_BRICK_SIZE));
         std::vector<VoxelInterestAnchor> anchors;
         anchors.reserve(3u + policy.Config().motionLookaheadSteps);
@@ -4670,6 +4818,37 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
         }
     }
 
+    // Carried rings (budgeted rebuild): re-emit the prior interest coords for every
+    // ring we deliberately skipped this frame. This is pure hash work -- no terrain
+    // scan, no candidate sort -- so it is cheap, and it keeps those rings fully
+    // covered with their last-known (>= correct) coords until their turn to refresh.
+    if (budgetedVoxelInterestRebuild) {
+        for (const SparseVoxelClipmapCoord& coord : previousVoxelInterestSet) {
+            const uint32_t coordRing =
+                coord.ring >= 0 ? static_cast<uint32_t>(coord.ring) : 0u;
+            if (coordRing < rebuildThisRing.size() && rebuildThisRing[coordRing] != 0u) {
+                // This ring was freshly rebuilt above; its coords are already emitted
+                // (and may legitimately differ from the prior set).
+                continue;
+            }
+            if (!m_voxelInterestSet.insert(coord).second) {
+                continue;
+            }
+            auto existing = m_voxelSlotByCoord.find(coord);
+            if (existing != m_voxelSlotByCoord.end()) {
+                m_voxelBricks[existing->second].lastTouchedFrame = frameIndex;
+                continue;
+            }
+            if (m_queuedVoxelSet.insert(coord).second) {
+                m_voxelGenerationQueue.push_back(coord);
+                ++m_backlogVoxelEnqueuedLastFrame;
+                if (backlogAwarePump) {
+                    m_voxelBacklogFirstFrame.emplace(coord, frameIndex);
+                }
+            }
+        }
+    }
+
     if (backlogAwarePump) {
         const auto backlogStart = voxelInterestDetail
             ? std::chrono::steady_clock::now()
@@ -4725,9 +4904,17 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
     RefreshStats();
     m_stats.voxelInterestAnchors = voxelAnchorCount;
     if (allowSignatureReuse) {
-        m_lastVoxelInterestSignature = voxelInterestSignature;
-        m_lastVoxelInterestSignatureValid = true;
-        m_lastVoxelInterestBuildFrame = frameIndex;
+        // While a budgeted rebuild is still sweeping the remaining rings we must NOT
+        // commit the new footprint signature: leaving the prior (now-stale) signature
+        // in place forces the next frame back onto the rebuild path so the sweep
+        // finishes, instead of being short-circuited by the reuse fast path with rings
+        // still carried. Only commit once the whole clipmap has been refreshed at the
+        // current footprint (cursor wrapped, in-progress cleared).
+        if (!m_voxelInterestRebuildInProgress) {
+            m_lastVoxelInterestSignature = voxelInterestSignature;
+            m_lastVoxelInterestSignatureValid = true;
+            m_lastVoxelInterestBuildFrame = frameIndex;
+        }
     }
 }
 
@@ -6445,6 +6632,8 @@ void SparseClipmapTileCache::RefreshStats(
     m_stats.parallelVoxelPumpWorkersLastFrame = m_parallelVoxelPumpWorkersLastFrame;
     m_stats.parallelVoxelPumpWallMsLastFrame = m_parallelVoxelPumpWallMsLastFrame;
     m_stats.interestReusedLastFrame = m_interestReusedLastFrame;
+    m_stats.voxelInterestRingsRebuiltLastFrame = m_voxelInterestRingsRebuiltLastFrame;
+    m_stats.voxelInterestBudgetedRebuildsLastFrame = m_voxelInterestBudgetedRebuildsLastFrame;
     m_stats.backlogAwarePumpActive = m_config.backlogAwarePump ? 1u : 0u;
     m_stats.pumpBudgetMs = m_effectivePumpBudgetMsLastFrame;
     m_stats.pumpBudgetHitLastFrame = m_pumpBudgetHitLastFrame;

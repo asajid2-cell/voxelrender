@@ -61,6 +61,16 @@ struct SparseClipmapConfig {
     bool voxelInterestDetail = false;
     bool voxelInterestSignatureReuse = false;
     uint32_t voxelInterestSignatureReuseMaxAgeFrames = 1;
+    // Frame-budgeted (incremental) voxel interest rebuild. When the camera crosses
+    // a footprint cell the signature reuse fast path is bypassed and the full
+    // per-ring candidate scan runs, spiking 'clip' to 20-75ms. Spreading that
+    // rebuild over a few frames (process only N rings per cross frame, carry the
+    // remaining rings' coords from the prior interest set) converts the one-frame
+    // spike into N small frames. This NEVER drops coverage: the camera moved at
+    // most ~1 cell, so the carried-over rings are a strict superset-minus-edge of
+    // the correct set and stay fully resident during the spread. 0 == disabled
+    // (atomic full rebuild every cross, the legacy behaviour).
+    uint32_t voxelInterestRebuildRingsPerFrame = 0;
     bool sharedVoxelColumnCache = false;
     bool directVoxelFootprintColumns = false;
     bool parallelWorkerColumnCache = false;
@@ -68,6 +78,17 @@ struct SparseClipmapConfig {
     bool parallelVoxelPumpPersistentWorkers = false;
     uint32_t parallelVoxelPumpMaxWorkers = 4;
     uint32_t parallelVoxelPumpMinBricks = 8;
+    // Parallel HEIGHT tile pump. GenerateTile runs ~tileSampleSide^2 heavy HeightAt
+    // evaluations per tile; a cell-cross bursts many tiles and they generate
+    // single-threaded in one frame (measured ~6-25ms, the dominant clip-section pump
+    // spike). Fanning the per-tile HeightAt work across workers is coverage-neutral
+    // (same tiles, same budget). Independent of parallelVoxelPump so the height win
+    // ships without changing voxel-pump behaviour. Reuses parallelVoxelPumpMaxWorkers
+    // for worker count. Height tiles are far more expensive than voxel bricks (~3ms/tile)
+    // so the serial-fallback threshold is its OWN small value below -- even the measured
+    // 4-6 tile cross burst is worth fanning across workers.
+    bool parallelHeightPump = true;
+    uint32_t parallelHeightPumpMinTiles = 2;
     // Phase 1: when true, the mid-voxel clipmap fills its sample pool via the GPU
     // compute shader (CS_GenerateMidVoxelBricks) instead of CPU GenerateVoxel-
     // BrickPayload. The CPU pump still owns residency/metadata/lookup; only the
@@ -209,6 +230,8 @@ struct SparseClipmapCacheStats {
     uint32_t heightInterestAnchors = 0;
     uint32_t voxelInterestAnchors = 0;
     uint32_t interestReusedLastFrame = 0;
+    uint32_t voxelInterestRingsRebuiltLastFrame = 0;
+    uint32_t voxelInterestBudgetedRebuildsLastFrame = 0;
     float pumpHeightMsLastFrame = 0.0f;
     float pumpVoxelMsLastFrame = 0.0f;
     uint32_t backlogAwarePumpActive = 0;
@@ -851,6 +874,13 @@ private:
     InterestSignature m_lastVoxelInterestSignature;
     bool m_lastVoxelInterestSignatureValid = false;
     uint32_t m_lastVoxelInterestBuildFrame = 0;
+    // Frame-budgeted voxel interest rebuild cursor: the next ring index to refresh
+    // on a footprint-cell cross. While >0 the spread is mid-flight (some rings are
+    // still carried from the prior set) so the signature must NOT be committed yet.
+    uint32_t m_voxelInterestRebuildRingCursor = 0;
+    bool m_voxelInterestRebuildInProgress = false;
+    uint32_t m_voxelInterestBudgetedRebuildsLastFrame = 0;
+    uint32_t m_voxelInterestRingsRebuiltLastFrame = 0;
     uint32_t m_lastInterestUpdateFrame = 0;
     uint32_t m_lastStatsFrame = 0;
     float m_lastCameraYForStats = 0.0f;

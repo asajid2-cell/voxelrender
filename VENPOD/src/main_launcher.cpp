@@ -1732,6 +1732,20 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_SPARSE_MOTION_VISIBLE_MAX_REQUESTS", std::max(24u, sparseVisibleRequestBudget));
     const bool enableSparseHierarchicalRequests =
         sparseBackendRequested && ReadUIntEnv("VENPOD_SPARSE_HIERARCHICAL_REQUESTS", 1u) != 0u;
+    // Cache the hierarchical request PLAN (the coord/source/class geometry) and
+    // replay it through requestSparseBrick every frame, skipping the expensive
+    // PlanHierarchical re-plan when none of its inputs changed. The plan is
+    // byte-identical between cell-crosses on a ground walk (brick-center moves on
+    // ~3-4% of frames), so this removes the steady ~1.4ms hierarchy bucket on the
+    // ~96% of frames that are not geometry-changing. Consumption (retention
+    // touches, re-requests of evicted bricks) still runs every frame over the
+    // cached coord list -> coverage is identical. A periodic force-rebuild and an
+    // immediate hard-invalidate on any ownership miss keep coverage self-healing.
+    const bool enableSparseHierarchicalPlanCache =
+        enableSparseHierarchicalRequests &&
+        ReadUIntEnv("VENPOD_SPARSE_HIERARCHICAL_PLAN_CACHE", 1u) != 0u;
+    const uint32_t sparseHierarchicalPlanCacheForceInterval =
+        std::max(1u, ReadUIntEnv("VENPOD_SPARSE_HIERARCHICAL_PLAN_CACHE_FORCE_INTERVAL", 8u));
     const bool enableSparseStressRequests =
         sparseBackendRequested && ReadUIntEnv("VENPOD_SPARSE_STRESS_REQUESTS", 0u) != 0u;
     const uint32_t sparseStressRadiusXz = ReadUIntEnv("VENPOD_SPARSE_STRESS_RADIUS_XZ", 5u);
@@ -2582,6 +2596,14 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv(
             "VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE_MAX_AGE",
             sparseClipmapConfig.voxelInterestSignatureReuseMaxAgeFrames);
+    // Frame-budgeted voxel interest rebuild: on a footprint-cell cross, refresh only
+    // this many rings and carry the rest from the prior (still-covered) interest set,
+    // turning the 20-75ms 'clip' spike into a few small frames. Default 2 (with the
+    // default 5-ring clipmap a cross is spread over ~3 frames). 0 disables.
+    sparseClipmapConfig.voxelInterestRebuildRingsPerFrame =
+        ReadUIntEnv(
+            "VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_REBUILD_RINGS_PER_FRAME",
+            2u);
     sparseClipmapConfig.sharedVoxelColumnCache =
         ReadUIntEnv("VENPOD_SPARSE_MID_CLIPMAP_SHARED_COLUMN_CACHE", 0u) != 0u;
     sparseClipmapConfig.directVoxelFootprintColumns =
@@ -2600,6 +2622,15 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv(
             "VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_PUMP_MIN_BRICKS",
             sparseClipmapConfig.parallelVoxelPumpMinBricks);
+    // Parallel HEIGHT tile pump (default ON): fans GenerateTile's heavy per-tile HeightAt
+    // work across workers so a cell-cross height burst no longer stalls the main thread.
+    // Coverage-neutral (same tiles/budget). Reuses the parallel-pump worker-count knobs.
+    sparseClipmapConfig.parallelHeightPump =
+        ReadUIntEnv("VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_HEIGHT_PUMP", 1u) != 0u;
+    sparseClipmapConfig.parallelHeightPumpMinTiles =
+        std::max(2u, ReadUIntEnv(
+            "VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_HEIGHT_PUMP_MIN_TILES",
+            sparseClipmapConfig.parallelHeightPumpMinTiles));
     const uint32_t sparseMidVoxelFarSvoDominantMotionSteps =
         std::min(
             sparseClipmapConfig.motionLookaheadSteps,
@@ -4590,6 +4621,44 @@ int RunSandbox(int argc, char* argv[]) {
     int32_t sparseTerrainCriticalSignatureForwardY = 0;
     int32_t sparseTerrainCriticalSignatureForwardZ = 0;
     uint64_t sparseTerrainCriticalSignatureEditRevision = 0;
+    // --- Hierarchical request plan cache (FIX 1) ---
+    // Signature of every input PlanHierarchical reads that can change plan geometry.
+    // If the signature matches the last build AND no force-rebuild / ownership-miss
+    // override fires, we replay sparseHierarchicalPlanCache instead of re-planning.
+    struct SparseHierarchicalPlanSignature {
+        Simulation::BrickCoord center{};
+        int32_t forwardX = 0;
+        int32_t forwardY = 0;
+        int32_t forwardZ = 0;
+        int32_t velBucketX = 0;
+        int32_t velBucketY = 0;
+        int32_t velBucketZ = 0;
+        int32_t predictionBucket = 0;
+        uint32_t ownershipPressureLevel = 0;
+        uint32_t rayGrid = 0;
+        uint32_t modeFlags = 0;
+        uint32_t fastRadiusBonus = 0;
+        uint64_t editRevision = 0;
+        bool valid = false;
+        bool operator==(const SparseHierarchicalPlanSignature& o) const {
+            return valid && o.valid &&
+                center == o.center &&
+                forwardX == o.forwardX && forwardY == o.forwardY && forwardZ == o.forwardZ &&
+                velBucketX == o.velBucketX && velBucketY == o.velBucketY && velBucketZ == o.velBucketZ &&
+                predictionBucket == o.predictionBucket &&
+                ownershipPressureLevel == o.ownershipPressureLevel &&
+                rayGrid == o.rayGrid &&
+                modeFlags == o.modeFlags &&
+                fastRadiusBonus == o.fastRadiusBonus &&
+                editRevision == o.editRevision;
+        }
+    };
+    std::vector<Simulation::SparseBrickRequest> sparseHierarchicalPlanCache;
+    SparseHierarchicalPlanSignature sparseHierarchicalPlanSignature{};
+    uint64_t sparseHierarchicalPlanCacheLastBuildFrame = 0;
+    uint32_t sparseHierarchicalPlanCacheHitLastFrame = 0;
+    uint32_t sparseHierarchicalPlanCacheRejectMaskLastFrame = 0;
+    uint32_t sparseHierarchicalPlanCacheSizeLastFrame = 0;
     uint32_t sparseStressRequestsLastFrame = 0;
     uint32_t sparseStressAcceptedLastFrame = 0;
     uint32_t sparseStressCursor = 0;
@@ -10251,7 +10320,98 @@ int RunSandbox(int argc, char* argv[]) {
                 uint32_t hierarchicalViewConeVisibleProtected = 0;
                 uint32_t hierarchicalViewConeVisibleDemoted = 0;
                 uint32_t hierarchicalViewConeSurfaceDemoted = 0;
-                for (const auto& request : sparseRequestPlanner.PlanHierarchical(hierarchy)) {
+
+                // --- Hierarchical plan cache decision (FIX 1) ---
+                // Build the plan-geometry signature, then either replay the cached
+                // plan (skipping PlanHierarchical) or re-plan and refresh the cache.
+                SparseHierarchicalPlanSignature sparseHierarchicalPlanSignatureThisFrame{};
+                sparseHierarchicalPlanSignatureThisFrame.valid = true;
+                sparseHierarchicalPlanSignatureThisFrame.center = sparseCenter;
+                // Forward quantized to the same 1/32 granularity the terrain-critical
+                // reuse path uses; coarse enough to ignore sub-cell jitter, fine
+                // enough that a real view turn invalidates.
+                sparseHierarchicalPlanSignatureThisFrame.forwardX =
+                    static_cast<int32_t>(std::lround(cameraForward.x * 32.0f));
+                sparseHierarchicalPlanSignatureThisFrame.forwardY =
+                    static_cast<int32_t>(std::lround(cameraForward.y * 32.0f));
+                sparseHierarchicalPlanSignatureThisFrame.forwardZ =
+                    static_cast<int32_t>(std::lround(cameraForward.z * 32.0f));
+                // Velocity drives the speculative predicted-origin coords
+                // (velocity * predictionSeconds). Bucket coarsely (per 8 u/s) so the
+                // signature flips when the predicted footprint would shift a brick,
+                // but does not thrash on micro-jitter.
+                sparseHierarchicalPlanSignatureThisFrame.velBucketX =
+                    static_cast<int32_t>(std::lround(sparseCameraVelocity.x / 8.0f));
+                sparseHierarchicalPlanSignatureThisFrame.velBucketY =
+                    static_cast<int32_t>(std::lround(sparseCameraVelocity.y / 8.0f));
+                sparseHierarchicalPlanSignatureThisFrame.velBucketZ =
+                    static_cast<int32_t>(std::lround(sparseCameraVelocity.z / 8.0f));
+                sparseHierarchicalPlanSignatureThisFrame.predictionBucket =
+                    static_cast<int32_t>(std::lround(hierarchy.predictionSeconds * 100.0f));
+                sparseHierarchicalPlanSignatureThisFrame.ownershipPressureLevel =
+                    hierarchy.ownershipPressureLevel;
+                sparseHierarchicalPlanSignatureThisFrame.rayGrid = sparseHierarchyRayGridThisFrame;
+                sparseHierarchicalPlanSignatureThisFrame.fastRadiusBonus = sparseFastRadiusBonus;
+                sparseHierarchicalPlanSignatureThisFrame.editRevision =
+                    sparseVoxelWorld.GetEdits().RevisionSerial();
+                // Pack every per-frame mode flag that reshapes the plan. Any change
+                // here forces a re-plan (different budgets / radii / cones).
+                sparseHierarchicalPlanSignatureThisFrame.modeFlags =
+                    (sparseBrushFocusedResidencyMode ? 0x1u : 0u) |
+                    (sparseFlightResidencyLightMode ? 0x2u : 0u) |
+                    (sparseTerrainScreenCriticalLodThrottleActive ? 0x4u : 0u) |
+                    (sparseBrushIntentPending ? 0x8u : 0u) |
+                    (hierarchy.brushIntentValid ? 0x10u : 0u) |
+                    ((sparseFastRequestScaleThisFrame > 1u) ? 0x20u : 0u) |
+                    (sparseTerrainCriticalActiveThisFrame ? 0x40u : 0u) |
+                    ((hierarchy.maxOwnershipRecoveryRequests > 0u) ? 0x80u : 0u);
+
+                uint32_t sparseHierarchicalPlanCacheRejectMask = 0u;
+                if (!enableSparseHierarchicalPlanCache) {
+                    sparseHierarchicalPlanCacheRejectMask |= 1u << 0;
+                }
+                if (!sparseHierarchicalPlanSignature.valid) {
+                    sparseHierarchicalPlanCacheRejectMask |= 1u << 1;
+                }
+                if (!(sparseHierarchicalPlanSignatureThisFrame == sparseHierarchicalPlanSignature)) {
+                    sparseHierarchicalPlanCacheRejectMask |= 1u << 2;
+                }
+                // Hard-invalidate on ANY ownership miss so under-streaming recovery is
+                // never delayed by a stale plan (protects midCov 1.00).
+                if (sparseOwnershipMissPctLastRetire != 0u ||
+                    sparseOwnershipUnsafeNearMissPctLastRetire != 0u) {
+                    sparseHierarchicalPlanCacheRejectMask |= 1u << 3;
+                }
+                // Periodic force-rebuild safety net: any un-modeled input drift
+                // self-heals within forceInterval frames.
+                if (sparseHierarchicalPlanCacheLastBuildFrame == 0ull ||
+                    (frameCount - sparseHierarchicalPlanCacheLastBuildFrame) >=
+                        static_cast<uint64_t>(sparseHierarchicalPlanCacheForceInterval)) {
+                    sparseHierarchicalPlanCacheRejectMask |= 1u << 4;
+                }
+                if (sparseHierarchicalPlanCache.empty()) {
+                    sparseHierarchicalPlanCacheRejectMask |= 1u << 5;
+                }
+                const bool sparseHierarchicalPlanCacheHit =
+                    enableSparseHierarchicalPlanCache &&
+                    sparseHierarchicalPlanCacheRejectMask == 0u;
+                if (!sparseHierarchicalPlanCacheHit) {
+                    sparseHierarchicalPlanCache = sparseRequestPlanner.PlanHierarchical(hierarchy);
+                    sparseHierarchicalPlanSignature = sparseHierarchicalPlanSignatureThisFrame;
+                    sparseHierarchicalPlanCacheLastBuildFrame = frameCount;
+                    sparseRequestFullRebuildThisFrame = 1u;
+                } else {
+                    sparseRequestFullRebuildThisFrame = 0u;
+                }
+                sparseHierarchicalPlanCacheHitLastFrame = sparseHierarchicalPlanCacheHit ? 1u : 0u;
+                sparseHierarchicalPlanCacheRejectMaskLastFrame =
+                    sparseHierarchicalPlanCacheHit ? 0u : sparseHierarchicalPlanCacheRejectMask;
+                sparseHierarchicalPlanCacheSizeLastFrame =
+                    static_cast<uint32_t>(std::min<size_t>(
+                        sparseHierarchicalPlanCache.size(),
+                        static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+
+                for (const auto& request : sparseHierarchicalPlanCache) {
                     const uint32_t sourceIndex = std::min<uint32_t>(
                         static_cast<uint32_t>(request.source),
                         Simulation::kSparseBrickRequestSourceCount - 1u);
@@ -10321,8 +10481,11 @@ int RunSandbox(int argc, char* argv[]) {
                      hierarchicalAcceptedVisible > 64u ||
                      frameCount % 120 == 0)) {
                     spdlog::info(
-                        "PERF_SPARSE_HIERARCHY_REQUESTS frame={} plannedVisible={} acceptedVisible={} viewProtected={} viewDemoted={} viewSurfaceDemoted={} viewCap={} plannedSrc=generic/view/coll/near/motion/recover/spec/stress:{}/{}/{}/{}/{}/{}/{}/{} acceptedSrc=generic/view/coll/near/motion/recover/spec/stress:{}/{}/{}/{}/{}/{}/{}/{}",
+                        "PERF_SPARSE_HIERARCHY_REQUESTS frame={} planCache=hit/rejectMask/size:{}/{}/{} plannedVisible={} acceptedVisible={} viewProtected={} viewDemoted={} viewSurfaceDemoted={} viewCap={} plannedSrc=generic/view/coll/near/motion/recover/spec/stress:{}/{}/{}/{}/{}/{}/{}/{} acceptedSrc=generic/view/coll/near/motion/recover/spec/stress:{}/{}/{}/{}/{}/{}/{}/{}",
                         frameCount,
+                        sparseHierarchicalPlanCacheHitLastFrame,
+                        sparseHierarchicalPlanCacheRejectMaskLastFrame,
+                        sparseHierarchicalPlanCacheSizeLastFrame,
                         hierarchicalPlannedVisible,
                         hierarchicalAcceptedVisible,
                         hierarchicalViewConeVisibleProtected,
@@ -21881,7 +22044,7 @@ int RunSandbox(int argc, char* argv[]) {
                             projectedVisibleMissing);
                     }
                     spdlog::info(
-                            "PERF_SPARSE_CPU_DETAIL frame={} reqMs={:.2f} genMs={:.2f} clipMs={:.2f} trimMs={:.2f} request=attempt/unique/dup/resident/nonresident/allocated/spec/vis/coll:{}/{}/{}/{}/{}/{}/{}/{}/{} reqBudget={}/{}/{}/{} reqSkip=free/class/total/reject/knownEmpty/buried/specBackpressure:{}/{}/{}/{}/{}/{}/{} centerDelta={}/{}/{} fullRebuild={} terrainPrefetch=ms/rays/budget/seen/new/cleanThrottle:{:.2f}/{}/{}/{}/{}/{} terrainPrefetchMidCacheThrottle={} trimScan=calls/records/candidates/evicted:{}/{}/{}/{} replacementScan=calls/records/candidates/evicted/scansBudget:{}/{}/{}/{}/{} pool=resident/free/trimStart:{}/{}/{} clip=interest/reuse/pump/genHeight/genVoxel/missingHeight/missingVoxel/cap/active:{:.2f}/{}/{:.2f}/{}/{}/{}/{}/{}/{} surface=extractMs/stageMs/extractQueued/extracted/buriedFast/sort/sortHit/strictPops/generalSkip/generalRemainingMs:{:.2f}/{:.2f}/{}/{}/{}/{}/{}/{}/{}/{:.2f} surfaceParallel=active/bricks/workers/wallMs:{}/{}/{}/{:.2f}",
+                            "PERF_SPARSE_CPU_DETAIL frame={} reqMs={:.2f} genMs={:.2f} clipMs={:.2f} trimMs={:.2f} request=attempt/unique/dup/resident/nonresident/allocated/spec/vis/coll:{}/{}/{}/{}/{}/{}/{}/{}/{} reqBudget={}/{}/{}/{} reqSkip=free/class/total/reject/knownEmpty/buried/specBackpressure:{}/{}/{}/{}/{}/{}/{} centerDelta={}/{}/{} fullRebuild={} terrainPrefetch=ms/rays/budget/seen/new/cleanThrottle:{:.2f}/{}/{}/{}/{}/{} terrainPrefetchMidCacheThrottle={} trimScan=calls/records/candidates/evicted:{}/{}/{}/{} replacementScan=calls/records/candidates/evicted/scansBudget:{}/{}/{}/{}/{} pool=resident/free/trimStart:{}/{}/{} clip=interest/reuse/pump/genHeight/genVoxel/missingHeight/missingVoxel/cap/active:{:.2f}/{}/{:.2f}/{}/{}/{}/{}/{}/{} clipBudget=ringsRebuilt/budgetCross:{}/{} surface=extractMs/stageMs/extractQueued/extracted/buriedFast/sort/sortHit/strictPops/generalSkip/generalRemainingMs:{:.2f}/{:.2f}/{}/{}/{}/{}/{}/{}/{}/{:.2f} surfaceParallel=active/bricks/workers/wallMs:{}/{}/{}/{:.2f}",
                         frameCount,
                         perfSparseRequestPrepMs,
                         perfSparseGenerationPrepMs,
@@ -21939,6 +22102,8 @@ int RunSandbox(int argc, char* argv[]) {
                         midStats.missingInterestedVoxelBricks,
                         sparseMidClipmapPumpMaxBricks,
                         sparseMidClipmapPumpCapActiveLastFrame,
+                        midStats.voxelInterestRingsRebuiltLastFrame,
+                        midStats.voxelInterestBudgetedRebuildsLastFrame,
                         perfSparseSurfaceExtractMs,
                         perfSparseSurfaceStageMs,
                         sparseWorldStats.surfaceExtractionQueuedBricks,
