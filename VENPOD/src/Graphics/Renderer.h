@@ -221,7 +221,13 @@ public:
         uint32_t surfaceVertexIdCapacityFaces = 0,
         const DescriptorHandle* surfaceRecordsSRV = nullptr,
         const DescriptorHandle* surfaceClustersSRV = nullptr,
-        const DescriptorHandle* renderOwnershipUAV = nullptr
+        const DescriptorHandle* renderOwnershipUAV = nullptr,
+        const DescriptorHandle* sparseBrickPoolSRV = nullptr,
+        const DescriptorHandle* sparsePageTableSRV = nullptr,
+        const DescriptorHandle* sparseOccupancySRV = nullptr,
+        const DescriptorHandle* sparsePageGenerationSRV = nullptr,
+        uint32_t sparseMaxBrickPages = 0,
+        uint32_t sparsePageTableCapacity = 0
     );
 
     void RenderOverlays(

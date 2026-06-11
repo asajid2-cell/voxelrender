@@ -20348,7 +20348,13 @@ int RunSandbox(int argc, char* argv[]) {
                 sparseSurfaceGpuResources.VertexIdCapacityFaces(),
                 &sparseSurfaceGpuResources.SurfaceRecordSRV(),
                 &sparseSurfaceGpuResources.SurfaceClusterSRV(),
-                cameraParams.renderOwnershipStatsEnabled ? &sparseNearField.renderOwnershipUAV : nullptr);
+                cameraParams.renderOwnershipStatsEnabled ? &sparseNearField.renderOwnershipUAV : nullptr,
+                &sparseNearField.brickPoolSRV,
+                &sparseNearField.pageTableSRV,
+                &sparseNearField.occupancySRV,
+                &sparseNearField.pageGenerationSRV,
+                sparseNearField.maxBrickPages,
+                sparseNearField.pageTableCapacity);
             if (sparseSurfaceGpuCullReady) {
                 sparseSurfaceGpuResources.QueueGpuCullStatsReadback(
                     commandList.Get(),
@@ -20381,7 +20387,13 @@ int RunSandbox(int argc, char* argv[]) {
                 sparseMidMeshGpuResources.VertexIdCapacityFaces(),
                 &sparseMidMeshGpuResources.SurfaceRecordSRV(),
                 &sparseMidMeshGpuResources.SurfaceClusterSRV(),
-                cameraParams.renderOwnershipStatsEnabled ? &sparseNearField.renderOwnershipUAV : nullptr);
+                cameraParams.renderOwnershipStatsEnabled ? &sparseNearField.renderOwnershipUAV : nullptr,
+                &sparseNearField.brickPoolSRV,
+                &sparseNearField.pageTableSRV,
+                &sparseNearField.occupancySRV,
+                &sparseNearField.pageGenerationSRV,
+                sparseNearField.maxBrickPages,
+                sparseNearField.pageTableCapacity);
         };
 
         // Sparse surfaces are the near-field owner. Draw them first so they

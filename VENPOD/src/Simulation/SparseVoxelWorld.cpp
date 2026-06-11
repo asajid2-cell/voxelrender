@@ -38,6 +38,23 @@ constexpr uint32_t SPARSE_PHYSICS_PACKET_STATUS_KNOWN_MASK =
     SPARSE_PHYSICS_PACKET_STATUS_MISSING_BELOW |
     SPARSE_PHYSICS_PACKET_STATUS_EDIT_DELTA_HIT;
 constexpr float kMaxSparseRaycastDistance = 8192.0f;
+
+enum class SparseSurfaceOccupancyClass : uint8_t {
+    Air = 0,
+    Solid = 1,
+    Water = 2
+};
+
+SparseSurfaceOccupancyClass SurfaceOccupancyClassForVoxel(uint32_t voxel) {
+    const uint8_t material = VENPOD::Utils::UnpackMaterial(voxel);
+    if (material == VENPOD::Utils::Material::Air) {
+        return SparseSurfaceOccupancyClass::Air;
+    }
+    if (material == VENPOD::Utils::Material::Water) {
+        return SparseSurfaceOccupancyClass::Water;
+    }
+    return SparseSurfaceOccupancyClass::Solid;
+}
 constexpr uint32_t kMaxSparseRaycastSteps = 32768;
 constexpr uint32_t kMaxSparseLocalPhysicsWorkPackets = 2048;
 constexpr uint32_t kStreamingTicketStageCpuGenerated = 1u << 0u;
@@ -6189,14 +6206,17 @@ bool SparseVoxelWorld::QueuePhysicsRegionNoStats(
 
 void SparseVoxelWorld::QueueRenderDirtyRegionNoStats(
     const BrickCoord& coord,
-    const SparseRenderDirtyRegion& region)
+    const SparseRenderDirtyRegion& region,
+    bool queueSurfaceDirty)
 {
     auto [regionIt, insertedRegion] = m_renderDirtyRegions.emplace(coord, region);
     if (!insertedRegion) {
         MergeSparseRegion(regionIt->second, region);
     }
     m_renderDirtyVoxelsQueuedLastFrame += SparseRegionVoxelCount(region);
-    QueueSurfaceDirtyRegionNoStats(coord, region);
+    if (queueSurfaceDirty) {
+        QueueSurfaceDirtyRegionNoStats(coord, region);
+    }
 }
 
 void SparseVoxelWorld::QueueSurfaceDirtyRegionNoStats(
@@ -7287,6 +7307,7 @@ uint32_t SparseVoxelWorld::EvaluateBrushEdit(
 
     std::unordered_set<BrickCoord, BrickCoordHash> touchedBricks;
     std::unordered_map<BrickCoord, SparsePhysicsDirtyRegion, BrickCoordHash> touchedPhysicsRegions;
+    std::unordered_map<BrickCoord, bool, BrickCoordHash> touchedSurfaceGeometryDirty;
     uint32_t edited = 0;
     uint32_t evaluated = 0;
 
@@ -7384,6 +7405,9 @@ uint32_t SparseVoxelWorld::EvaluateBrushEdit(
 
                 const BrickCoord editCoord = BrickCoord::FromWorldVoxel(x, y, z);
                 const LocalVoxelCoord editLocal = LocalVoxelFromWorld(x, y, z);
+                const bool surfaceGeometryChanged =
+                    SurfaceOccupancyClassForVoxel(currentVoxel) !=
+                    SurfaceOccupancyClassForVoxel(newVoxel);
                 if (commit) {
                     m_edits.SetVoxel(x, y, z, newVoxel);
                 }
@@ -7404,6 +7428,11 @@ uint32_t SparseVoxelWorld::EvaluateBrushEdit(
                     WakePhysicsSupportNeighborhoodNoStats(x, y, z);
                 }
                 touchedBricks.insert(editCoord);
+                auto [surfaceDirtyIt, insertedSurfaceDirty] =
+                    touchedSurfaceGeometryDirty.emplace(editCoord, surfaceGeometryChanged);
+                if (!insertedSurfaceDirty) {
+                    surfaceDirtyIt->second = surfaceDirtyIt->second || surfaceGeometryChanged;
+                }
                 SparsePhysicsDirtyRegion pointRegion;
                 pointRegion.minX = pointRegion.maxX = editLocal.x;
                 pointRegion.minY = pointRegion.maxY = editLocal.y;
@@ -7440,7 +7469,10 @@ uint32_t SparseVoxelWorld::EvaluateBrushEdit(
                 renderRegion.maxY = regionIt->second.maxY;
                 renderRegion.maxZ = regionIt->second.maxZ;
             }
-            if (QueueRegeneratedUploadForExistingPage(coord, &renderRegion)) {
+            const auto surfaceDirtyIt = touchedSurfaceGeometryDirty.find(coord);
+            const bool surfaceGeometryDirty =
+                surfaceDirtyIt == touchedSurfaceGeometryDirty.end() || surfaceDirtyIt->second;
+            if (QueueRegeneratedUploadForExistingPage(coord, &renderRegion, surfaceGeometryDirty)) {
                 ++queued;
             }
         }
@@ -8372,13 +8404,14 @@ void SparseVoxelWorld::AnnotateRenderDirtyUploadRange(SparseBrickUploadPacket* p
 
 bool SparseVoxelWorld::QueueRegeneratedUploadForExistingPage(
     const BrickCoord& coord,
-    const SparseRenderDirtyRegion* dirtyRegion)
+    const SparseRenderDirtyRegion* dirtyRegion,
+    bool surfaceGeometryDirty)
 {
     if (dirtyRegion) {
-        QueueRenderDirtyRegionNoStats(coord, *dirtyRegion);
+        QueueRenderDirtyRegionNoStats(coord, *dirtyRegion, surfaceGeometryDirty);
     } else if (m_renderDirtyRegions.find(coord) == m_renderDirtyRegions.end()) {
         SparseRenderDirtyRegion fullRegion;
-        QueueRenderDirtyRegionNoStats(coord, fullRegion);
+        QueueRenderDirtyRegionNoStats(coord, fullRegion, surfaceGeometryDirty);
     }
 
     if (!m_pool.TryGetPage(coord)) {
