@@ -1133,6 +1133,7 @@ int RunSandbox(int argc, char* argv[]) {
 
     SparseVoxelGpuResources sparseGpuResources;
     SparseSurfaceGpuResources sparseSurfaceGpuResources;
+    SparseSurfaceGpuResources sparseMidMeshGpuResources;
     Simulation::SparseVoxelWorld sparseVoxelWorld;
     bool sparseVoxelWorldReady = false;
     enum class SurfaceFillWaterProofResult : uint8_t {
@@ -2034,6 +2035,10 @@ int RunSandbox(int argc, char* argv[]) {
         sparseBackendRequested && ReadUIntEnv("VENPOD_SPARSE_SURFACE_UPLOAD", 1u) != 0u;
     const bool enableSparseSurfaceRaster =
         sparseBackendRequested && ReadUIntEnv("VENPOD_SPARSE_SURFACE_RASTER", 1u) != 0u;
+    const bool enableSparseMidMesh =
+        sparseBackendRequested &&
+        enableSparseSurfaceRaster &&
+        ReadUIntEnv("VENPOD_SPARSE_MID_MESH", 0u) != 0u;
     const bool enableSparseStartupPublicRenderSurfaceProof =
         enableSparseStartupPublicRenderGate &&
         enableSparseSurfaceAuthoritative &&
@@ -2487,6 +2492,9 @@ int RunSandbox(int argc, char* argv[]) {
     uint32_t sparseSurfaceDeferredPayloadsLastUpload = 0;
     uint32_t sparseSurfaceUploadRetriesLastFrame = 0;
     uint32_t sparseSurfaceRasterFacesLastFrame = 0;
+    uint32_t sparseMidMeshUploadedHeightSerial = 0;
+    uint32_t sparseMidMeshFaceCountLastUpload = 0;
+    uint32_t sparseMidMeshUploadRetriesLastFrame = 0;
     uint32_t sparseSurfaceExtractionBudgetLastFrame = 0;
     uint32_t sparseSurfaceLookaheadVisibleLastUpload = 0;
     Simulation::SparseClipmapConfig sparseClipmapConfig;
@@ -2781,6 +2789,15 @@ int RunSandbox(int argc, char* argv[]) {
     uint32_t sparseMidClipmapUploadedHeightSerial = 0;
     uint32_t sparseMidClipmapUploadedVoxelSerial = 0;
     uint32_t sparseMidClipmapUploadRetriesLastFrame = 0;
+    const uint32_t sparseMidMeshMaxFaces =
+        std::max(1024u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_MAX_FACES", 1u << 20));
+    const uint32_t sparseMidMeshMaxTiles =
+        ReadUIntEnv("VENPOD_SPARSE_MID_MESH_MAX_TILES", 0u);
+    const uint32_t sparseMidMeshTerraceStep =
+        std::max(1u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_TERRACE_STEP", 1u));
+    const float sparseMidMeshMaxDistance = std::max(
+        sparseClipmapPolicy.Config().endDistance,
+        ReadFloatEnv("VENPOD_SPARSE_MID_MESH_MAX_DISTANCE", sparseClipmapPolicy.Config().endDistance));
     uint64_t sparseMidClipmapEditRevisionSeen = 0;
     if (sparseBackendRequested) {
         sparseClipmapTileCacheReady = sparseClipmapTileCache.Initialize(sparseClipmapPolicy.Config());
@@ -3101,6 +3118,44 @@ int RunSandbox(int argc, char* argv[]) {
             }
         } else if (sparseBackendRequested) {
             spdlog::info("Sparse surface GPU upload disabled by VENPOD_SPARSE_SURFACE_UPLOAD=0");
+        }
+        if (enableSparseMidMesh && enableSparseSurfaceUpload) {
+            SparseSurfaceGpuConfig midMeshConfig;
+            midMeshConfig.maxFaces = sparseMidMeshMaxFaces;
+            midMeshConfig.maxBrickRanges =
+                ReadUIntEnv("VENPOD_SPARSE_MID_MESH_MAX_RANGES", midMeshConfig.maxBrickRanges);
+            midMeshConfig.maxDrawCommands =
+                ReadUIntEnv("VENPOD_SPARSE_MID_MESH_MAX_DRAW_COMMANDS", midMeshConfig.maxDrawCommands);
+            midMeshConfig.uploadBytesPerSlot =
+                ReadUIntEnv("VENPOD_SPARSE_MID_MESH_UPLOAD_SLOT_BYTES", midMeshConfig.uploadBytesPerSlot);
+            midMeshConfig.useRangeAllocator = false;
+            midMeshConfig.useFixedRangeTable = false;
+            midMeshConfig.useStableDrawSlots = false;
+            midMeshConfig.compactStableDrawCommands = false;
+            midMeshConfig.useGpuCull = false;
+            auto midMeshGpuResult = sparseMidMeshGpuResources.Initialize(
+                device->GetDevice(),
+                renderer->GetHeapManager(),
+                nullptr,
+                {},
+                midMeshConfig);
+            if (!midMeshGpuResult) {
+                spdlog::error("Sparse mid mesh GPU resource initialization failed: {}", midMeshGpuResult.error());
+            } else {
+                const auto& midMeshStats = sparseMidMeshGpuResources.GetStats();
+                spdlog::info(
+                    "Sparse mid mesh enabled: faces={} ranges={} drawCommands={} uploadSlotMB={:.2f} terraceStep={} maxTiles={} maxDistance={:.0f} iaFaces={}",
+                    midMeshConfig.maxFaces,
+                    midMeshConfig.maxBrickRanges,
+                    midMeshConfig.maxDrawCommands,
+                    static_cast<double>(midMeshConfig.uploadBytesPerSlot) / (1024.0 * 1024.0),
+                    sparseMidMeshTerraceStep,
+                    sparseMidMeshMaxTiles,
+                    sparseMidMeshMaxDistance,
+                    midMeshStats.iaStreamCapacityFaces);
+            }
+        } else if (sparseBackendRequested) {
+            spdlog::info("Sparse mid mesh path: {}", enableSparseMidMesh ? "upload disabled" : "disabled");
         }
         spdlog::info(
             "Sparse surface raster path: {} | stableNearCull={} | CPU frustum culling: {} dist={:.0f} padding={:.0f} interval={}",
@@ -14222,6 +14277,12 @@ int RunSandbox(int argc, char* argv[]) {
                     commandQueue->GetLastCompletedFenceValue(),
                     commandQueue->GetNextFenceValue());
             }
+            if (sparseMidMeshGpuResources.IsInitialized()) {
+                sparseMidMeshGpuResources.BeginFrame(
+                    frameIndex,
+                    commandQueue->GetLastCompletedFenceValue(),
+                    commandQueue->GetNextFenceValue());
+            }
             perfSparseBeginFrameMs = ticksToMs(SDL_GetPerformanceCounter() - perfSparseStepStart);
             perfSparseStepStart = SDL_GetPerformanceCounter();
             sparseSurfaceRasterFacesLastFrame = 0;
@@ -14246,6 +14307,7 @@ int RunSandbox(int argc, char* argv[]) {
             sparseValueSelectedUploadsLastFrame = 0;
             sparseMidClipmapUploadRetriesLastFrame = 0;
             sparseSurfaceUploadRetriesLastFrame = 0;
+            sparseMidMeshUploadRetriesLastFrame = 0;
             sparseUploadBudgetLastFrame = 0;
             sparseSurfaceExtractionBudgetLastFrame = 0;
             const auto& sparseStatsBeforeUpload = sparseVoxelWorld.GetStats();
@@ -15804,6 +15866,28 @@ int RunSandbox(int argc, char* argv[]) {
                     } else {
                         ++sparseMidClipmapUploadRetriesLastFrame;
                     }
+                }
+            }
+            if (enableSparseMidMesh &&
+                sparseMidMeshGpuResources.IsInitialized() &&
+                sparseClipmapTileCacheReady &&
+                sparseClipmapPolicy.IsEnabled() &&
+                sparseClipmapPolicy.Config().heightClipmapEnabled &&
+                sparseClipmapTileCache.HeightDirtySerial() != sparseMidMeshUploadedHeightSerial) {
+                Simulation::SparseSurfaceGpuSnapshot midMeshSnapshot;
+                SparseSurfaceUploadTicket midMeshTicket;
+                if (sparseClipmapTileCache.BuildMidHeightSurfaceSnapshot(
+                        midMeshSnapshot,
+                        sparseMidMeshMaxFaces,
+                        sparseMidMeshMaxTiles,
+                        sparseMidMeshTerraceStep) &&
+                    sparseMidMeshGpuResources.StageSnapshot(midMeshSnapshot, &midMeshTicket) &&
+                    sparseMidMeshGpuResources.EmitCopy(commandList.Get(), midMeshTicket)) {
+                    sparseMidMeshUploadedHeightSerial = sparseClipmapTileCache.HeightDirtySerial();
+                    sparseMidMeshFaceCountLastUpload = midMeshTicket.faceCount;
+                } else {
+                    ++sparseMidMeshUploadRetriesLastFrame;
+                    sparseMidMeshFaceCountLastUpload = 0u;
                 }
             }
             perfSparseMidUploadMs = ticksToMs(SDL_GetPerformanceCounter() - perfSparseStepStart);
@@ -20187,12 +20271,40 @@ int RunSandbox(int argc, char* argv[]) {
             }
             sparseSurfaceRasterFacesLastFrame = sparseNearField.surfaceFaceCount;
         };
+        const auto renderSparseMidMeshLayer = [&]() {
+            if (!enableSparseMidMesh ||
+                !sparseMidMeshGpuResources.IsInitialized()) {
+                return;
+            }
+            const auto& midMeshStats = sparseMidMeshGpuResources.GetStats();
+            if (midMeshStats.uploadedFaces == 0u || midMeshStats.uploadedSerial == 0u) {
+                return;
+            }
+            auto midMeshCamera = cameraParams;
+            midMeshCamera.surfaceRasterMaxDistance = sparseMidMeshMaxDistance;
+            renderer->RenderSparseSurfaceFaces(
+                commandList.Get(),
+                sparseMidMeshGpuResources.FaceBufferSRV(),
+                voxelWorld->GetPaletteSRV(),
+                midMeshStats.uploadedFaces,
+                midMeshCamera,
+                nullptr,
+                0u,
+                nullptr,
+                &sparseMidMeshGpuResources.VertexIdBufferView(),
+                &sparseMidMeshGpuResources.IndexBufferView(),
+                sparseMidMeshGpuResources.VertexIdCapacityFaces(),
+                &sparseMidMeshGpuResources.SurfaceRecordSRV(),
+                &sparseMidMeshGpuResources.SurfaceClusterSRV(),
+                cameraParams.renderOwnershipStatsEnabled ? &sparseNearField.renderOwnershipUAV : nullptr);
+        };
 
         // Sparse surfaces are the near-field owner. Draw them first so they
         // write depth/stencil; the fullscreen background raymarch runs only for
         // pixels not already owned by sparse raster surfaces.
         if (sparseRenderWorldThisFrame) {
             renderSparseSurfaceLayer();
+            renderSparseMidMeshLayer();
             if (gpuTimestampHeap) {
                 commandList->EndQuery(gpuTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, gpuTimestampBase + 3);
             }
@@ -23370,6 +23482,7 @@ int RunSandbox(int argc, char* argv[]) {
     chunkManager->Shutdown();
     voxelWorld->Shutdown();
     farVoxelOctree.Shutdown();
+    sparseMidMeshGpuResources.Shutdown();
     sparseSurfaceGpuResources.Shutdown();
     sparseGpuResources.Shutdown();
 

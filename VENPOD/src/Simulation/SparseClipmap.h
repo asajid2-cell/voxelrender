@@ -15,6 +15,7 @@
 namespace VENPOD::Simulation {
 
 class SparseEditStore;
+struct SparseSurfaceGpuSnapshot;
 
 inline constexpr uint32_t SPARSE_CLIPMAP_MAX_STATS_RINGS = 8u;
 
@@ -555,6 +556,11 @@ public:
         SparseClipmapGpuSnapshot& outSnapshot,
         bool includeHeightLayer = true,
         bool includeVoxelLayer = true) const;
+    bool BuildMidHeightSurfaceSnapshot(
+        SparseSurfaceGpuSnapshot& outSnapshot,
+        uint32_t maxFaces = 0,
+        uint32_t maxTiles = 0,
+        uint32_t terraceStep = 1) const;
     void SetEditStore(const SparseEditStore* edits);
     void SetFarSvoFallbackMetadata(const SparseClipmapFarSvoFallbackMetadata& metadata);
     uint32_t InvalidateEditedOverlays(const SparseEditStore& edits, const SparseClipmapPolicy& policy);
