@@ -1,4 +1,5 @@
 #include "../Common/SharedTypes.hlsli"
+#include "../Common/BitPacking.hlsli"
 
 cbuffer FrameConstantsCB : register(b0) {
     FrameConstants frame;
@@ -8,12 +9,31 @@ Texture1D<float4> MaterialPalette : register(t1);
 SamplerState PaletteSampler : register(s0);
 RWStructuredBuffer<uint> RenderOwnershipStats : register(u0);
 
+struct SparseBrickPageEntry {
+    int3 coord;
+    uint pageIndex;
+    uint generation;
+    uint flags;
+    uint occupancyWord0;
+    uint occupancyWord1;
+};
+
+StructuredBuffer<uint> SparseBrickVoxelPool : register(t6);
+StructuredBuffer<SparseBrickPageEntry> SparseBrickPageTable : register(t7);
+StructuredBuffer<uint2> SparseBrickOccupancy : register(t8);
+StructuredBuffer<uint> SparseBrickPageGenerations : register(t9);
+
 static const uint RENDER_OWNER_SURFACE = 9u;
 static const uint RENDER_OWNER_FRAME = 8u;
 static const uint RENDER_OWNER_WATER_CONTEXT = 12u;
 static const uint RENDER_OWNER_FAR_SURFACE = 21u;
 static const float FAR_SEA_LEVEL = -48.0f;
 static const float FAR_WATER_SURFACE_Y = FAR_SEA_LEVEL + 1.0f;
+static const uint SPARSE_BRICK_SIZE = 16u;
+static const uint SPARSE_BRICK_VOXEL_COUNT = 4096u;
+static const uint SPARSE_INVALID_PAGE = 0xFFFFFFFFu;
+static const uint SPARSE_TOMBSTONE_PAGE = 0xFFFFFFFEu;
+static const uint SPARSE_PAGE_TABLE_LOOKUP_PROBES = 256u;
 
 struct PSInput {
     float4 position : SV_Position;
@@ -27,6 +47,103 @@ struct PSInput {
 float HashVoxelCell(float3 cell) {
     const float3 p = frac(cell * float3(0.1031f, 0.11369f, 0.13787f));
     return frac((p.x + p.y + p.z) * (p.x + p.y * 19.19f + p.z * 7.31f));
+}
+
+int FloorModInt(int value, int modulus) {
+    int r = value % modulus;
+    return r < 0 ? r + modulus : r;
+}
+
+int FloorDiv16(int value) {
+    return value >= 0 ? value / 16 : -(((-value) + 15) / 16);
+}
+
+uint HashSparseBrickCoord(int3 coord) {
+    uint hash = 2166136261u;
+    hash = (hash ^ (uint)coord.x) * 16777619u;
+    hash = (hash ^ (uint)coord.y) * 16777619u;
+    hash = (hash ^ (uint)coord.z) * 16777619u;
+    return hash;
+}
+
+uint SparseLocalIndex(uint3 localVoxel) {
+    return localVoxel.x + localVoxel.y * SPARSE_BRICK_SIZE +
+        localVoxel.z * SPARSE_BRICK_SIZE * SPARSE_BRICK_SIZE;
+}
+
+bool LookupSparseBrick(int3 brickCoord, uint tableCapacity, out SparseBrickPageEntry result) {
+    result = (SparseBrickPageEntry)0;
+    if (tableCapacity == 0u || (tableCapacity & (tableCapacity - 1u)) != 0u) {
+        return false;
+    }
+
+    const uint mask = tableCapacity - 1u;
+    const uint start = HashSparseBrickCoord(brickCoord) & mask;
+    [loop]
+    for (uint probe = 0u; probe < SPARSE_PAGE_TABLE_LOOKUP_PROBES; ++probe) {
+        const uint slot = (start + probe) & mask;
+        SparseBrickPageEntry entry = SparseBrickPageTable[slot];
+        if (entry.pageIndex == SPARSE_INVALID_PAGE) {
+            return false;
+        }
+        if (entry.pageIndex == SPARSE_TOMBSTONE_PAGE) {
+            continue;
+        }
+        if (all(entry.coord == brickCoord)) {
+            result = entry;
+            return entry.generation != 0u;
+        }
+    }
+    return false;
+}
+
+bool TrySampleSparseSurfaceVoxel(int3 worldVoxel, out uint voxel) {
+    voxel = 0u;
+    if (frame.sparseNearParams.x < 0.5f) {
+        return false;
+    }
+    const uint maxPages = (uint)frame.sparseNearParams.y;
+    const uint tableCapacity = (uint)frame.sparseNearParams.z;
+    const int3 brickCoord = int3(
+        FloorDiv16(worldVoxel.x),
+        FloorDiv16(worldVoxel.y),
+        FloorDiv16(worldVoxel.z));
+    const uint3 localVoxel = uint3(
+        (uint)FloorModInt(worldVoxel.x, 16),
+        (uint)FloorModInt(worldVoxel.y, 16),
+        (uint)FloorModInt(worldVoxel.z, 16));
+
+    SparseBrickPageEntry entry;
+    if (!LookupSparseBrick(brickCoord, tableCapacity, entry) || entry.pageIndex >= maxPages) {
+        return false;
+    }
+    if (SparseBrickPageGenerations[entry.pageIndex] != entry.generation) {
+        return false;
+    }
+
+    const uint3 subCoord = localVoxel >> 2u;
+    const uint subIndex = subCoord.x + subCoord.y * 4u + subCoord.z * 16u;
+    const uint2 pageOccupancy = SparseBrickOccupancy[entry.pageIndex];
+    const uint occupancyWord = subIndex < 32u ? pageOccupancy.x : pageOccupancy.y;
+    const uint occupancyBit = subIndex < 32u ? subIndex : subIndex - 32u;
+    if (((occupancyWord >> occupancyBit) & 1u) == 0u) {
+        return false;
+    }
+
+    voxel = SparseBrickVoxelPool[entry.pageIndex * SPARSE_BRICK_VOXEL_COUNT + SparseLocalIndex(localVoxel)];
+    return true;
+}
+
+uint ResolveSparseSurfaceMaterial(uint bakedMaterial, float3 worldPos, float3 normal) {
+    uint liveVoxel = 0u;
+    const int3 sampleVoxel = int3(floor(worldPos - normalize(normal) * 0.01f));
+    if (TrySampleSparseSurfaceVoxel(sampleVoxel, liveVoxel)) {
+        const uint liveMaterial = GetMaterial(liveVoxel);
+        if (liveMaterial != MAT_AIR) {
+            return liveMaterial;
+        }
+    }
+    return bakedMaterial;
 }
 
 float UnderwaterCaustic(float3 worldPos) {
@@ -108,6 +225,7 @@ float3 DebugSurfaceOwnerMaterialColor(uint material) {
 }
 
 float4 main(PSInput input) : SV_Target {
+    const uint material = ResolveSparseSurfaceMaterial(input.material, input.worldPos, input.normal);
     const float surfaceDistance = distance(input.worldPos, frame.cameraPosition.xyz);
     const float exactNearDistance = max(frame.exactNearParams.x, 0.0f);
     const float protectedSurfaceDistance = max(exactNearDistance + 768.0f, 1536.0f);
@@ -115,7 +233,7 @@ float4 main(PSInput input) : SV_Target {
     const bool sparseWaterVoxelOccludedByPlane = false;
     float waterPlaneT = 0.0f;
     bool deterministicWaterBeforeSurface = false;
-    if (input.material != MAT_WATER && aboveWaterView) {
+    if (material != MAT_WATER && aboveWaterView) {
         const float3 toSurface = input.worldPos - frame.cameraPosition.xyz;
         const float rayLength = length(toSurface);
         if (rayLength > 0.001f) {
@@ -130,7 +248,7 @@ float4 main(PSInput input) : SV_Target {
         }
     }
     const bool sparseSubmergedTerrainOccludedByPlane =
-        input.material != MAT_WATER &&
+        material != MAT_WATER &&
         aboveWaterView &&
         (input.worldPos.y < FAR_WATER_SURFACE_Y - 0.05f ||
          deterministicWaterBeforeSurface);
@@ -169,7 +287,7 @@ float4 main(PSInput input) : SV_Target {
         return float4(nearBand, midBand, farBand, 1.0f);
     }
     if (frame.debugMode == 54u) {
-        return float4(DebugMaterialColor(input.material), 1.0f);
+        return float4(DebugMaterialColor(material), 1.0f);
     }
     if (frame.debugMode == 55u) {
         // Owner debug: exact sparse raster surfaces are the bounded near-field
@@ -195,7 +313,7 @@ float4 main(PSInput input) : SV_Target {
         return float4(fog, fog, fog, 1.0f);
     }
     if (frame.debugMode == 61u) {
-        return input.material == MAT_WATER
+        return material == MAT_WATER
             ? float4(0.02f, 0.88f, 1.0f, 1.0f)
             : float4(0.12f, 0.08f, 0.05f, 1.0f);
     }
@@ -231,10 +349,10 @@ float4 main(PSInput input) : SV_Target {
         return float4(distanceBand, distanceBand, distanceBand, 1.0f);
     }
     if (frame.debugMode == 56u) {
-        return float4(DebugSurfaceOwnerMaterialColor(input.material), 1.0f);
+        return float4(DebugSurfaceOwnerMaterialColor(material), 1.0f);
     }
 
-    const float u = ((float)input.material + 0.5f) / 256.0f;
+    const float u = ((float)material + 0.5f) / 256.0f;
     const float3 n = normalize(input.normal);
     const bool sideFace =
         input.faceDirection == 0u ||
@@ -243,10 +361,10 @@ float4 main(PSInput input) : SV_Target {
         input.faceDirection == 5u;
     float3 baseColor = MaterialPalette.SampleLevel(PaletteSampler, u, 0).rgb;
     const bool underwaterView = frame.cameraPosition.y < FAR_WATER_SURFACE_Y - 0.5f;
-    if (input.material == MAT_SAND || input.material == MAT_DIRT || input.material == MAT_STONE) {
-        baseColor = SparseSurfaceMaterialVariation(baseColor, input.material, input.worldPos, n);
+    if (material == MAT_SAND || material == MAT_DIRT || material == MAT_STONE) {
+        baseColor = SparseSurfaceMaterialVariation(baseColor, material, input.worldPos, n);
     }
-    if (input.material == MAT_WATER) {
+    if (material == MAT_WATER) {
         if (frame.farFieldGridParams.w > 0.5f) {
             InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_WATER_CONTEXT], 1u);
         }
@@ -307,7 +425,7 @@ float4 main(PSInput input) : SV_Target {
         return float4(lerp(waterColor, skyRefl, fog * 0.22f), 1.0f);
     }
     if (underwaterView &&
-        (input.material == MAT_SAND || input.material == MAT_DIRT || input.material == MAT_STONE)) {
+        (material == MAT_SAND || material == MAT_DIRT || material == MAT_STONE)) {
         const float basinNoise = HashVoxelCell(floor(input.worldPos / 7.0f));
         const float reefNoise = HashVoxelCell(floor((input.worldPos + 19.0f) / 19.0f));
         const float slope = saturate((0.72f - n.y) / 0.58f);
@@ -321,7 +439,7 @@ float4 main(PSInput input) : SV_Target {
         baseColor = lerp(baseColor, reefStone, rockBand * 0.52f);
     }
     float shorelineWetBoundary = 0.0f;
-    if (input.material == MAT_DIRT) {
+    if (material == MAT_DIRT) {
         const float steepFace = saturate((0.62f - n.y) / 0.55f);
         const float strata = HashVoxelCell(floor(float3(input.worldPos.x * 0.18f, input.worldPos.y * 0.55f, input.worldPos.z * 0.18f)));
         const float contour = 0.5f + 0.5f * sin(input.worldPos.y * 0.42f + strata * 6.28318f);
@@ -335,7 +453,7 @@ float4 main(PSInput input) : SV_Target {
         baseColor = lerp(baseColor, vegetatedBank, sideFace ? (1.0f - steepFace) * 0.18f : 0.0f);
         baseColor = lerp(baseColor, float3(0.47f, 0.45f, 0.37f), steepFace * (sideFace ? 0.14f : 0.72f));
     }
-    if (input.material == MAT_SAND && sideFace) {
+    if (material == MAT_SAND && sideFace) {
         const float strata = HashVoxelCell(floor(float3(
             input.worldPos.x * 0.14f,
             input.worldPos.y * 0.48f,
@@ -352,12 +470,12 @@ float4 main(PSInput input) : SV_Target {
         bankSand = lerp(bankSand, dampBankSand, waterlineFace * 0.46f);
         baseColor = lerp(baseColor, bankSand, lerp(0.62f, 0.82f, distanceBlend));
     }
-    if (input.material == MAT_SAND || input.material == MAT_DIRT || input.material == MAT_STONE) {
+    if (material == MAT_SAND || material == MAT_DIRT || material == MAT_STONE) {
         const float waterlineFace = 1.0f - saturate((input.worldPos.y - FAR_SEA_LEVEL + 2.0f) / 14.0f);
         const float verticalBank = saturate((0.54f - n.y) / 0.62f);
         const float wetBoundary = waterlineFace * (0.35f + verticalBank * 0.65f);
         shorelineWetBoundary = saturate(wetBoundary);
-        const float3 wetSediment = input.material == MAT_SAND
+        const float3 wetSediment = material == MAT_SAND
             ? float3(0.40f, 0.43f, 0.34f)
             : float3(0.34f, 0.39f, 0.34f);
         baseColor = lerp(baseColor, wetSediment, saturate(wetBoundary * 0.78f));
@@ -387,7 +505,7 @@ float4 main(PSInput input) : SV_Target {
     const float3 voxelCell = floor(input.worldPos + n * 0.01f);
     const float voxelTone = HashVoxelCell(voxelCell) - 0.5f;
     const float voxelHue = HashVoxelCell(voxelCell + 17.31f) - 0.5f;
-    const float terrainToneStrength = input.material == MAT_STONE
+    const float terrainToneStrength = material == MAT_STONE
         ? (sideFace ? 0.060f : 0.10f)
         : (sideFace ? 0.075f : 0.14f);
     const float brightJitter = underwaterView ? 0.014f : terrainToneStrength;
@@ -410,9 +528,9 @@ float4 main(PSInput input) : SV_Target {
     const float gridLine = 1.0f - smoothstep(0.455f, 0.495f, max(cell.x, cell.y));
     const float underwaterGridStrength =
         0.0005f + (1.0f - saturate((input.distance - 12.0f) / 80.0f)) * 0.0025f;
-    const float stoneGridScale = input.material == MAT_STONE ? 0.42f : 1.0f;
+    const float stoneGridScale = material == MAT_STONE ? 0.42f : 1.0f;
     const float sideSandGridScale =
-        (sideFace && input.material == MAT_SAND) ? 0.42f : 1.0f;
+        (sideFace && material == MAT_SAND) ? 0.42f : 1.0f;
     const float shorelineGridSuppression =
         1.0f - shorelineWetBoundary * (sideFace ? 0.82f : 0.54f);
     const float sideDistanceGridFade = sideFace

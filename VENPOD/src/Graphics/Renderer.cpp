@@ -1024,7 +1024,13 @@ void Renderer::RenderSparseSurfaceFaces(
     uint32_t surfaceVertexIdCapacityFaces,
     const DescriptorHandle* surfaceRecordsSRV,
     const DescriptorHandle* surfaceClustersSRV,
-    const DescriptorHandle* renderOwnershipUAV)
+    const DescriptorHandle* renderOwnershipUAV,
+    const DescriptorHandle* sparseBrickPoolSRV,
+    const DescriptorHandle* sparsePageTableSRV,
+    const DescriptorHandle* sparseOccupancySRV,
+    const DescriptorHandle* sparsePageGenerationSRV,
+    uint32_t sparseMaxBrickPages,
+    uint32_t sparsePageTableCapacity)
 {
     if (!cmdList || surfaceFaceCount == 0 || !surfaceFacesSRV.IsValid() || !materialPaletteSRV.IsValid()) {
         return;
@@ -1087,6 +1093,16 @@ void Renderer::RenderSparseSurfaceFaces(
     constants.surfaceRasterParams[0] = NonNegativeFiniteOr(camera.surfaceRasterMaxDistance, 0.0f);
     constants.surfaceRasterParams[1] = 0.0f;
     constants.surfaceRasterParams[2] = 0.0f;
+    const bool sparseMaterialLookupEnabled =
+        sparseBrickPoolSRV && sparseBrickPoolSRV->IsValid() &&
+        sparsePageTableSRV && sparsePageTableSRV->IsValid() &&
+        sparseOccupancySRV && sparseOccupancySRV->IsValid() &&
+        sparsePageGenerationSRV && sparsePageGenerationSRV->IsValid() &&
+        sparseMaxBrickPages > 0u &&
+        sparsePageTableCapacity > 0u;
+    constants.sparseNearParams[0] = sparseMaterialLookupEnabled ? 1.0f : 0.0f;
+    constants.sparseNearParams[1] = sparseMaterialLookupEnabled ? static_cast<float>(sparseMaxBrickPages) : 0.0f;
+    constants.sparseNearParams[2] = sparseMaterialLookupEnabled ? static_cast<float>(sparsePageTableCapacity) : 0.0f;
 
     static_assert(sizeof(constants) <= kFrameConstantUploadBytes);
     UploadBuffer& frameConstantsUpload = m_sparseSurfaceConstantUploads[m_currentFrameIndex];
@@ -1111,6 +1127,26 @@ void Renderer::RenderSparseSurfaceFaces(
         5,
         (surfaceClustersSRV && surfaceClustersSRV->IsValid())
             ? surfaceClustersSRV->gpu
+            : surfaceFacesSRV.gpu);
+    cmdList->SetGraphicsRootDescriptorTable(
+        6,
+        (sparseMaterialLookupEnabled && sparseBrickPoolSRV)
+            ? sparseBrickPoolSRV->gpu
+            : surfaceFacesSRV.gpu);
+    cmdList->SetGraphicsRootDescriptorTable(
+        7,
+        (sparseMaterialLookupEnabled && sparsePageTableSRV)
+            ? sparsePageTableSRV->gpu
+            : surfaceFacesSRV.gpu);
+    cmdList->SetGraphicsRootDescriptorTable(
+        8,
+        (sparseMaterialLookupEnabled && sparseOccupancySRV)
+            ? sparseOccupancySRV->gpu
+            : surfaceFacesSRV.gpu);
+    cmdList->SetGraphicsRootDescriptorTable(
+        9,
+        (sparseMaterialLookupEnabled && sparsePageGenerationSRV)
+            ? sparsePageGenerationSRV->gpu
             : surfaceFacesSRV.gpu);
     if (indirectDrawArgs && indirectDrawCommandCount > 0 && m_sparseSurfaceDrawSignature) {
         cmdList->ExecuteIndirect(
@@ -1644,6 +1680,38 @@ Result<void> Renderer::CreateSparseSurfacePipeline(ID3D12Device* device) {
         3,
         0,
         D3D12_SHADER_VISIBILITY_VERTEX,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        6,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        7,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        8,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        9,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
         1,
         D3D12_DESCRIPTOR_RANGE_TYPE_SRV
     });

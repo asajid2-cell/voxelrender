@@ -855,7 +855,8 @@ private:
         SparsePhysicsPriority priority);
     void QueueRenderDirtyRegionNoStats(
         const BrickCoord& coord,
-        const SparseRenderDirtyRegion& region);
+        const SparseRenderDirtyRegion& region,
+        bool queueSurfaceDirty = true);
     void QueueSurfaceDirtyRegionNoStats(
         const BrickCoord& coord,
         const SparseRenderDirtyRegion& region);
@@ -919,7 +920,8 @@ private:
     void MarkUploadQueueOrderDirty();
     bool QueueRegeneratedUploadForExistingPage(
         const BrickCoord& coord,
-        const SparseRenderDirtyRegion* dirtyRegion = nullptr);
+        const SparseRenderDirtyRegion* dirtyRegion = nullptr,
+        bool surfaceGeometryDirty = true);
     void AnnotateRenderDirtyUploadRange(SparseBrickUploadPacket* packet) const;
     uint32_t SampleEditedOrGeneratedVoxel(int32_t worldX, int32_t worldY, int32_t worldZ) const;
     uint32_t EvaluateBrushEdit(
