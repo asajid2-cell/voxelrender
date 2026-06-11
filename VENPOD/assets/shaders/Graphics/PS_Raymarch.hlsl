@@ -2247,6 +2247,19 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
                           + FarValueNoise2D(hitPos.x * 0.12f, (hitPos.z - gradE) * 0.12f, midDetailSeed) * midDetailAmp;
                 float ghU = FarTerrainHeight(hitPos.xz + float2(0.0f, gradE), gmmN, gsmN, grmN)
                           + FarValueNoise2D(hitPos.x * 0.12f, (hitPos.z + gradE) * 0.12f, midDetailSeed) * midDetailAmp;
+                // TANDEM TERRACE-MATCH: the near MESH reads "gorgeous" because it shows
+                // the VOXEL STAIRCASE (stepped terraces). The mid renders smooth
+                // FarTerrainHeight -> flat, a stark seam from the near. Quantize the
+                // mid height samples to a matching step so the central-difference
+                // normal renders the SAME terraced flat-tops + lit risers. Blend back
+                // to smooth in the far (hitDistance>~2.2k) so distant terrain doesn't
+                // alias the steps. terraceStep ~4u matches the near voxel-step scale.
+                const float terraceFade = 1.0f - saturate((hitDistance - 2200.0f) / 3200.0f);
+                const float terraceStep = 4.0f;
+                ghL = lerp(ghL, round(ghL / terraceStep) * terraceStep, terraceFade);
+                ghR = lerp(ghR, round(ghR / terraceStep) * terraceStep, terraceFade);
+                ghD = lerp(ghD, round(ghD / terraceStep) * terraceStep, terraceFade);
+                ghU = lerp(ghU, round(ghU / terraceStep) * terraceStep, terraceFade);
                 float3 gradNormal = normalize(float3(ghL - ghR, 2.0f * gradE, ghD - ghU));
                 // TANDEM crispness fix: the old 512-1400 ramp smoothed the mid
                 // terrain's crisp voxel-block faces into soft slopes by ~1.4k,
