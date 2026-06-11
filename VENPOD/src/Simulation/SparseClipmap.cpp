@@ -1,6 +1,7 @@
 #include "SparseClipmap.h"
 
 #include "SparseEditStore.h"
+#include "SparseSurfaceCache.h"
 #include "TerrainConstants.h"
 #include "Utils/BitPacking.h"
 
@@ -36,6 +37,33 @@ float FiniteOr(float value, float fallback) {
 
 double FiniteOr(double value, double fallback) {
     return std::isfinite(value) ? value : fallback;
+}
+
+int32_t UnpackMidHeightSurfaceSampleY(uint32_t packedSample) {
+    return static_cast<int32_t>(packedSample & 0xFFFFu) - 32768;
+}
+
+uint8_t UnpackMidHeightSurfaceSampleMaterial(uint32_t packedSample) {
+    return static_cast<uint8_t>((packedSample >> 16u) & 0xFFu);
+}
+
+int32_t QuantizeMidHeightSurfaceY(int32_t y, uint32_t terraceStep) {
+    const int32_t step = static_cast<int32_t>(std::max(1u, terraceStep));
+    return FloorDiv(y, step) * step;
+}
+
+uint32_t PackMidHeightSurfaceVoxel(uint8_t material, int32_t x, int32_t y, int32_t z) {
+    uint32_t hash = 2166136261u;
+    hash = (hash ^ static_cast<uint32_t>(x)) * 16777619u;
+    hash = (hash ^ static_cast<uint32_t>(y)) * 16777619u;
+    hash = (hash ^ static_cast<uint32_t>(z)) * 16777619u;
+    hash = (hash ^ 0x9E3779B9u) * 16777619u;
+    const uint8_t variant = static_cast<uint8_t>(hash & 0xFFu);
+    return Utils::PackVoxel(material, variant, 0, Utils::StateFlags::VisualSurface);
+}
+
+bool IsMidHeightSurfaceSolidMaterial(uint8_t material) {
+    return material != Utils::Material::Air && material != Utils::Material::Water;
 }
 
 float ElapsedMs(std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point end) {
@@ -6107,6 +6135,308 @@ bool SparseClipmapTileCache::BuildGpuSnapshot(
         outSnapshot.metadata[2] = outSnapshot.tileCount;
     }
     return residentHeightEntries > 0 || residentVoxelEntries > 0;
+}
+
+bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
+    SparseSurfaceGpuSnapshot& outSnapshot,
+    uint32_t maxFaces,
+    uint32_t maxTiles,
+    uint32_t terraceStep) const
+{
+    outSnapshot = {};
+    const uint32_t side = m_config.tileSampleSide;
+    if (!m_config.enabled ||
+        !m_config.heightClipmapEnabled ||
+        side < 2u ||
+        m_tiles.empty()) {
+        return false;
+    }
+
+    const uint32_t effectiveMaxFaces = maxFaces == 0u ? std::numeric_limits<uint32_t>::max() : maxFaces;
+    const uint32_t effectiveMaxTiles = maxTiles == 0u ? std::numeric_limits<uint32_t>::max() : maxTiles;
+    const uint32_t cellCount = side - 1u;
+    const uint32_t sampleCount = side * side;
+    const uint32_t splitLimit = kSparseSurfaceQuadExtentMask + 1u;
+    uint32_t emittedTiles = 0;
+
+    auto addFace = [&](
+        std::vector<SparseSurfaceFace>& faces,
+        SparseFaceDirection direction,
+        int32_t worldX,
+        int32_t worldY,
+        int32_t worldZ,
+        uint32_t width,
+        uint32_t height,
+        uint32_t voxel) -> bool
+    {
+        if (width == 0u || height == 0u) {
+            return true;
+        }
+        const uint32_t directionValue = static_cast<uint32_t>(direction);
+        for (uint32_t hOff = 0; hOff < height; hOff += splitLimit) {
+            const uint32_t hChunk = std::min(splitLimit, height - hOff);
+            for (uint32_t wOff = 0; wOff < width; wOff += splitLimit) {
+                const uint32_t wChunk = std::min(splitLimit, width - wOff);
+                if (outSnapshot.faces.size() + faces.size() >= effectiveMaxFaces) {
+                    return false;
+                }
+
+                SparseSurfaceFace face;
+                face.worldX = worldX;
+                face.worldY = worldY;
+                face.worldZ = worldZ;
+                switch (direction) {
+                case SparseFaceDirection::NegX:
+                case SparseFaceDirection::PosX:
+                    face.worldY = SaturatingAddInt32(worldY, static_cast<int32_t>(hOff));
+                    face.worldZ = SaturatingAddInt32(worldZ, static_cast<int32_t>(wOff));
+                    break;
+                case SparseFaceDirection::NegY:
+                case SparseFaceDirection::PosY:
+                    face.worldX = SaturatingAddInt32(worldX, static_cast<int32_t>(wOff));
+                    face.worldZ = SaturatingAddInt32(worldZ, static_cast<int32_t>(hOff));
+                    break;
+                case SparseFaceDirection::NegZ:
+                case SparseFaceDirection::PosZ:
+                default:
+                    face.worldX = SaturatingAddInt32(worldX, static_cast<int32_t>(wOff));
+                    face.worldY = SaturatingAddInt32(worldY, static_cast<int32_t>(hOff));
+                    break;
+                }
+                face.payload = PackSparseSurfacePayload(directionValue, voxel, wChunk, hChunk);
+                faces.push_back(face);
+            }
+        }
+        return true;
+    };
+
+    auto addRiser = [&](
+        std::vector<SparseSurfaceFace>& faces,
+        SparseFaceDirection direction,
+        int32_t boundaryX,
+        int32_t boundaryZ,
+        int32_t lowTopY,
+        uint32_t span,
+        uint32_t height,
+        uint32_t voxel) -> bool
+    {
+        if (height == 0u) {
+            return true;
+        }
+        int32_t faceX = boundaryX;
+        int32_t faceZ = boundaryZ;
+        if (direction == SparseFaceDirection::PosX) {
+            faceX = SaturatingAddInt32(boundaryX, -1);
+        } else if (direction == SparseFaceDirection::PosZ) {
+            faceZ = SaturatingAddInt32(boundaryZ, -1);
+        }
+        return addFace(faces, direction, faceX, lowTopY, faceZ, span, height, voxel);
+    };
+
+    for (uint32_t tileSlot = 0; tileSlot < static_cast<uint32_t>(m_tiles.size()); ++tileSlot) {
+        if (emittedTiles >= effectiveMaxTiles) {
+            break;
+        }
+        const TilePayload& tile = m_tiles[tileSlot];
+        if (tile.record.slot == UINT32_MAX ||
+            tile.packedSamples.size() < sampleCount ||
+            tile.record.cellSize <= 0.0f) {
+            continue;
+        }
+
+        const uint32_t cellSize = static_cast<uint32_t>(std::max(
+            1,
+            RoundToInt32Clamped(tile.record.cellSize)));
+        std::vector<SparseSurfaceFace> tileFaces;
+        tileFaces.reserve(static_cast<size_t>(cellCount) * static_cast<size_t>(cellCount) * 2u);
+
+        auto sampleAt = [&](uint32_t x, uint32_t z) -> uint32_t {
+            return tile.packedSamples[std::min(x, side - 1u) + std::min(z, side - 1u) * side];
+        };
+        auto sampleHeightAt = [&](uint32_t x, uint32_t z) -> int32_t {
+            return QuantizeMidHeightSurfaceY(UnpackMidHeightSurfaceSampleY(sampleAt(x, z)), terraceStep);
+        };
+        auto sampleMaterialAt = [&](uint32_t x, uint32_t z) -> uint8_t {
+            return UnpackMidHeightSurfaceSampleMaterial(sampleAt(x, z));
+        };
+        auto cellWorldX = [&](uint32_t x) -> int32_t {
+            return SaturatingAddInt32(
+                tile.record.originX,
+                static_cast<int32_t>(static_cast<int64_t>(x) * static_cast<int64_t>(cellSize)));
+        };
+        auto cellWorldZ = [&](uint32_t z) -> int32_t {
+            return SaturatingAddInt32(
+                tile.record.originZ,
+                static_cast<int32_t>(static_cast<int64_t>(z) * static_cast<int64_t>(cellSize)));
+        };
+
+        bool faceBudgetOk = true;
+        for (uint32_t z = 0; z < cellCount && faceBudgetOk; ++z) {
+            for (uint32_t x = 0; x < cellCount && faceBudgetOk; ++x) {
+                const uint8_t material = sampleMaterialAt(x, z);
+                if (!IsMidHeightSurfaceSolidMaterial(material)) {
+                    continue;
+                }
+                const int32_t h = sampleHeightAt(x, z);
+                const int32_t worldX = cellWorldX(x);
+                const int32_t worldZ = cellWorldZ(z);
+                const uint32_t voxel = PackMidHeightSurfaceVoxel(material, worldX, h, worldZ);
+
+                faceBudgetOk = addFace(
+                    tileFaces,
+                    SparseFaceDirection::PosY,
+                    worldX,
+                    h,
+                    worldZ,
+                    cellSize,
+                    cellSize,
+                    voxel);
+                if (!faceBudgetOk) {
+                    break;
+                }
+
+                const int32_t rightH = sampleHeightAt(x + 1u, z);
+                const uint8_t rightMaterial = sampleMaterialAt(x + 1u, z);
+                if (h != rightH) {
+                    const int32_t lowTopY = std::min(h, rightH) + 1;
+                    const uint32_t riserHeight = static_cast<uint32_t>(std::abs(h - rightH));
+                    const bool currentHigher = h > rightH;
+                    const uint8_t riserMaterial = currentHigher || !IsMidHeightSurfaceSolidMaterial(rightMaterial)
+                        ? material
+                        : rightMaterial;
+                    const uint32_t riserVoxel = PackMidHeightSurfaceVoxel(
+                        riserMaterial,
+                        SaturatingAddInt32(worldX, static_cast<int32_t>(cellSize)),
+                        std::max(h, rightH),
+                        worldZ);
+                    faceBudgetOk = addRiser(
+                        tileFaces,
+                        currentHigher ? SparseFaceDirection::PosX : SparseFaceDirection::NegX,
+                        SaturatingAddInt32(worldX, static_cast<int32_t>(cellSize)),
+                        worldZ,
+                        lowTopY,
+                        cellSize,
+                        riserHeight,
+                        riserVoxel);
+                    if (!faceBudgetOk) {
+                        break;
+                    }
+                }
+
+                const int32_t forwardH = sampleHeightAt(x, z + 1u);
+                const uint8_t forwardMaterial = sampleMaterialAt(x, z + 1u);
+                if (h != forwardH) {
+                    const int32_t lowTopY = std::min(h, forwardH) + 1;
+                    const uint32_t riserHeight = static_cast<uint32_t>(std::abs(h - forwardH));
+                    const bool currentHigher = h > forwardH;
+                    const uint8_t riserMaterial = currentHigher || !IsMidHeightSurfaceSolidMaterial(forwardMaterial)
+                        ? material
+                        : forwardMaterial;
+                    const uint32_t riserVoxel = PackMidHeightSurfaceVoxel(
+                        riserMaterial,
+                        worldX,
+                        std::max(h, forwardH),
+                        SaturatingAddInt32(worldZ, static_cast<int32_t>(cellSize)));
+                    faceBudgetOk = addRiser(
+                        tileFaces,
+                        currentHigher ? SparseFaceDirection::PosZ : SparseFaceDirection::NegZ,
+                        worldX,
+                        SaturatingAddInt32(worldZ, static_cast<int32_t>(cellSize)),
+                        lowTopY,
+                        cellSize,
+                        riserHeight,
+                        riserVoxel);
+                }
+            }
+        }
+
+        if (!faceBudgetOk) {
+            return false;
+        }
+        if (tileFaces.empty()) {
+            continue;
+        }
+
+        const BrickCoord coord{
+            tile.record.coord.x,
+            tile.record.coord.ring,
+            tile.record.coord.z
+        };
+        const uint32_t firstFace = static_cast<uint32_t>(outSnapshot.faces.size());
+        const uint32_t faceCount = static_cast<uint32_t>(tileFaces.size());
+        outSnapshot.faces.insert(outSnapshot.faces.end(), tileFaces.begin(), tileFaces.end());
+        const uint32_t directionMask = BuildSparseSurfaceDirectionMask(tileFaces);
+
+        SparseSurfaceBrickRange range;
+        range.coord = coord;
+        range.firstFace = firstFace;
+        range.faceCount = faceCount;
+        range.flags = SparseSurfacePackRecordFlags(kSparseSurfaceRangeValid, directionMask);
+        outSnapshot.brickFaceCounts.push_back({coord, faceCount});
+
+        SparseSurfaceRecord record;
+        record.coord = coord;
+        record.firstFace = firstFace;
+        record.faceCount = faceCount;
+        record.flags = range.flags;
+        record.generation = m_heightDirtySerial;
+        ComputeSparseSurfaceFaceBounds(
+            tileFaces.data(),
+            faceCount,
+            &record.minX,
+            &record.minY,
+            &record.minZ,
+            &record.maxX,
+            &record.maxY,
+            &record.maxZ);
+        outSnapshot.surfaceRecords.push_back(record);
+
+        SparseSurfaceDrawArgs args;
+        args.indexCountPerInstance = faceCount * 6u;
+        args.instanceCount = 1u;
+        args.startIndexLocation = firstFace * 6u;
+        args.baseVertexLocation = 0;
+        args.startInstanceLocation = 0u;
+        outSnapshot.drawArgs.push_back(args);
+
+        SparseSurfaceDrawBatch batch;
+        batch.coord = coord;
+        batch.firstFace = firstFace;
+        batch.faceCount = faceCount;
+        outSnapshot.drawBatches.push_back(batch);
+        ++emittedTiles;
+    }
+
+    if (outSnapshot.faces.empty()) {
+        return false;
+    }
+
+    outSnapshot.rangeCount = static_cast<uint32_t>(outSnapshot.drawArgs.size());
+    outSnapshot.visibleBricks = outSnapshot.rangeCount;
+    outSnapshot.visibleFaceCount = static_cast<uint32_t>(outSnapshot.faces.size());
+    outSnapshot.candidateBricks = outSnapshot.rangeCount;
+    outSnapshot.drawCommandCount = static_cast<uint32_t>(outSnapshot.drawArgs.size());
+    outSnapshot.serial = m_heightDirtySerial;
+    outSnapshot.rangeTableCapacity = NextPowerOfTwo(std::max(1u, outSnapshot.rangeCount * 2u));
+    outSnapshot.ranges.resize(outSnapshot.rangeTableCapacity);
+    const uint32_t mask = outSnapshot.rangeTableCapacity - 1u;
+    for (size_t i = 0; i < outSnapshot.surfaceRecords.size(); ++i) {
+        SparseSurfaceBrickRange range;
+        range.coord = outSnapshot.surfaceRecords[i].coord;
+        range.firstFace = outSnapshot.surfaceRecords[i].firstFace;
+        range.faceCount = outSnapshot.surfaceRecords[i].faceCount;
+        range.flags = outSnapshot.surfaceRecords[i].flags;
+        uint32_t slot = HashBrickCoord32(range.coord) & mask;
+        for (uint32_t probe = 0; probe < outSnapshot.rangeTableCapacity; ++probe) {
+            SparseSurfaceBrickRange& entry = outSnapshot.ranges[slot];
+            if (entry.flags == 0u) {
+                entry = range;
+                break;
+            }
+            slot = (slot + 1u) & mask;
+        }
+    }
+    return true;
 }
 
 void SparseClipmapTileCache::ClearHeightDirtyRange() {
