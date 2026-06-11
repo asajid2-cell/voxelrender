@@ -211,6 +211,35 @@ struct SparseClipmapGpuSnapshot {
     uint32_t frameIndex = 0;
 };
 
+struct SparseMidHeightSurfaceBuildConfig {
+    uint32_t maxFaces = 0;
+    uint32_t maxTiles = 0;
+    uint32_t terraceStep = 1;
+    uint32_t lodBaseMerge = 1;
+    uint32_t lodMaxMerge = 4;
+    bool lodEnabled = true;
+    bool emitWater = true;
+    bool distanceCull = true;
+    bool frustumCull = false;
+    float cameraX = 0.0f;
+    float cameraY = 0.0f;
+    float cameraZ = 0.0f;
+    float forwardX = 0.0f;
+    float forwardY = 0.0f;
+    float forwardZ = 1.0f;
+    float rightX = 1.0f;
+    float rightY = 0.0f;
+    float rightZ = 0.0f;
+    float upX = 0.0f;
+    float upY = 1.0f;
+    float upZ = 0.0f;
+    float fovYRadians = 1.04719755f;
+    float aspectRatio = 1.7777778f;
+    float minDistance = 0.0f;
+    float maxDistance = 9000.0f;
+    float cullPadding = 128.0f;
+};
+
 struct SparseClipmapCacheStats {
     uint32_t residentTiles = 0;
     uint32_t queuedTiles = 0;
@@ -558,9 +587,7 @@ public:
         bool includeVoxelLayer = true) const;
     bool BuildMidHeightSurfaceSnapshot(
         SparseSurfaceGpuSnapshot& outSnapshot,
-        uint32_t maxFaces = 0,
-        uint32_t maxTiles = 0,
-        uint32_t terraceStep = 1) const;
+        const SparseMidHeightSurfaceBuildConfig& buildConfig = {}) const;
     void SetEditStore(const SparseEditStore* edits);
     void SetFarSvoFallbackMetadata(const SparseClipmapFarSvoFallbackMetadata& metadata);
     uint32_t InvalidateEditedOverlays(const SparseEditStore& edits, const SparseClipmapPolicy& policy);
