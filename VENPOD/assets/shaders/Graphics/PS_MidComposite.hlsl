@@ -21,22 +21,29 @@ struct PSOutput {
 PSOutput main(PSInput input) {
     PSOutput output;
     const float2 uv = saturate(input.uv);
-    // TANDEM sharpness fix: the mid pass renders at half-res (e.g. 480x270) and
-    // bilinear-upscales, which blurs the mid terrain (the dominant "fuzzy mid" vs
-    // the crisp full-res near). Recover edge definition with a cheap 5-tap unsharp
-    // mask (center minus the 4-neighbor average). Outside the uber-shader, so no
-    // driver/PSO risk. Alpha (mid coverage) is passed through untouched so the
-    // alpha-over composite still works.
+    // TANDEM AA (replaces the earlier unsharp): the mid is RAYMARCHED coarse voxel
+    // blocks (16-32u cells), so the offensive "pixelated vs real voxels" look is
+    // edge ALIASING on the block stair-steps. The old 5-tap UNSHARP sharpened
+    // those steps -> WORSE at native 1:1. Instead apply a cheap edge-aware FXAA-
+    // style luma blend: a 5-tap box blur, applied only where local luma varies
+    // (an edge), leaving flat material untouched. Outside the uber-shader, so no
+    // driver/PSO risk. Alpha (mid coverage) is passed through untouched.
     uint texW, texH;
     MidColor.GetDimensions(texW, texH);
     const float2 texel = float2(1.0f / max(texW, 1u), 1.0f / max(texH, 1u));
     const float4 c = MidColor.Sample(MidSampler, uv);
-    const float3 neighbors =
-        MidColor.Sample(MidSampler, uv + float2(texel.x, 0.0f)).rgb +
-        MidColor.Sample(MidSampler, uv - float2(texel.x, 0.0f)).rgb +
-        MidColor.Sample(MidSampler, uv + float2(0.0f, texel.y)).rgb +
-        MidColor.Sample(MidSampler, uv - float2(0.0f, texel.y)).rgb;
-    const float3 sharpened = c.rgb + (c.rgb - neighbors * 0.25f) * 0.55f;
-    output.color = float4(saturate(sharpened), c.a);
+    const float4 n = MidColor.Sample(MidSampler, uv - float2(0.0f, texel.y));
+    const float4 s = MidColor.Sample(MidSampler, uv + float2(0.0f, texel.y));
+    const float4 e = MidColor.Sample(MidSampler, uv + float2(texel.x, 0.0f));
+    const float4 w = MidColor.Sample(MidSampler, uv - float2(texel.x, 0.0f));
+    const float3 L = float3(0.299f, 0.587f, 0.114f);
+    const float lc = dot(c.rgb, L);
+    const float ln = dot(n.rgb, L), ls = dot(s.rgb, L), le = dot(e.rgb, L), lw = dot(w.rgb, L);
+    const float lumaRange = max(lc, max(max(ln, ls), max(le, lw))) -
+                            min(lc, min(min(ln, ls), min(le, lw)));
+    const float3 aa = (n.rgb + s.rgb + e.rgb + w.rgb + c.rgb * 2.0f) / 6.0f;
+    const float edge = smoothstep(0.025f, 0.10f, lumaRange);
+    const float3 rgb = lerp(c.rgb, aa, edge * 0.45f);
+    output.color = float4(saturate(rgb), c.a);
     return output;
 }

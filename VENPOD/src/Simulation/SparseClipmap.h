@@ -25,6 +25,11 @@ struct SparseClipmapConfig {
     float minCellSize = 16.0f;
     float nearExitPadding = 8.0f;
     uint32_t ringCount = 4;
+    // Ring cell-size growth per ring. 2.0 = original doubling (cells 4/8/16/32 ->
+    // the visible mid coarsens to 16-32u jaggy blocks). A gentler factor (~1.4)
+    // with more rings keeps the visible mid much finer (4/6/8/11..) for ~the same
+    // brick budget -> closer to near-voxel fidelity (TANDEM mid-quality work).
+    float ringGrowthFactor = 2.0f;
     bool heightClipmapEnabled = true;
     uint32_t tileRadius = 2;
     uint32_t tileSampleSide = 33;

@@ -283,7 +283,10 @@ SparseClipmapPolicy::SparseClipmapPolicy(const SparseClipmapConfig& config)
     m_config.tileRadius = std::clamp<uint32_t>(m_config.tileRadius, 1u, 8u);
     m_config.tileSampleSide = std::clamp<uint32_t>(m_config.tileSampleSide, 9u, 65u);
     m_config.maxTiles = std::max(m_config.maxTiles, m_config.ringCount);
-    m_config.voxelBrickRadiusXz = std::clamp<uint32_t>(m_config.voxelBrickRadiusXz, 1u, 8u);
+    // TANDEM (fine-mid): clamp raised 8 -> 32 so the fine cell-4 voxel bubble can
+    // reach the visible mid (radius 8 ~= 512u, radius 24 ~= 1536u, radius 32 ~= 2k).
+    // Gated by the 49152 brick cap + ring-0 quota bias below.
+    m_config.voxelBrickRadiusXz = std::clamp<uint32_t>(m_config.voxelBrickRadiusXz, 1u, 32u);
     m_config.voxelBrickRadiusY = std::clamp<uint32_t>(m_config.voxelBrickRadiusY, 0u, 4u);
     m_config.maxVoxelBricks = std::max(m_config.maxVoxelBricks, m_config.ringCount);
     m_config.voxelInterestCapacityPercent = std::clamp<uint32_t>(
@@ -402,7 +405,7 @@ float SparseClipmapPolicy::CellSizeForDistance(float distanceFromCamera) const {
     const uint32_t ring = std::min(
         static_cast<uint32_t>(std::floor(t * static_cast<float>(m_config.ringCount))),
         m_config.ringCount - 1u);
-    return m_config.minCellSize * static_cast<float>(1u << ring);
+    return m_config.minCellSize * std::pow(m_config.ringGrowthFactor, static_cast<float>(ring));
 }
 
 std::vector<SparseClipmapRing> SparseClipmapPolicy::BuildRings() const {
@@ -419,7 +422,7 @@ std::vector<SparseClipmapRing> SparseClipmapPolicy::BuildRings() const {
         rings.push_back({
             m_config.startDistance + span * startT,
             m_config.startDistance + span * endT,
-            m_config.minCellSize * static_cast<float>(1u << ring)
+            m_config.minCellSize * std::pow(m_config.ringGrowthFactor, static_cast<float>(ring))
         });
     }
     return rings;
@@ -4053,17 +4056,28 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
         static_cast<uint32_t>(
             (static_cast<uint64_t>(m_voxelBricks.size()) *
              static_cast<uint64_t>(policy.Config().voxelInterestCapacityPercent)) / 100u));
+    // TANDEM (fine-mid): when the fine voxel bubble is grown large (radiusXz>12),
+    // ring 0 (cell-4) needs the lion's share of the budget to actually FILL out to
+    // ~1.5-2k (e.g. radius 24 -> ~21.6k of 49k). The original gentle near-bias
+    // (~31% to ring 0) starves it -> the fine bubble can't cover and the visible
+    // mid stays coarse. So in fine-mid mode use a strong cubic ring-0 bias; the
+    // outer rings (coarse, few bricks) still get enough for the far silhouettes.
+    // The DEFAULT config (small radius) keeps the original gentle bias unchanged.
+    const bool fineMidMode = radiusXz > 12;
+    auto ringWeight = [&](uint32_t ring) -> uint64_t {
+        const uint32_t near = (ringCount - ring);
+        return fineMidMode
+            ? static_cast<uint64_t>(near) * near * near    // strong ring-0 bias
+            : static_cast<uint64_t>(near) + ringCount;     // original gentle bias
+    };
     std::vector<uint32_t> ringQuotas(ringCount, 1u);
     uint64_t ringWeightSum = 0;
     for (uint32_t ring = 0; ring < ringCount; ++ring) {
-        // Keep a near-ring priority, but do not starve the outer rings. Those
-        // rings carry the mountain silhouettes, and visible gaps there read as
-        // broken world coverage rather than a graceful far LOD transition.
-        ringWeightSum += static_cast<uint64_t>((ringCount - ring) + ringCount);
+        ringWeightSum += ringWeight(ring);
     }
     uint32_t assignedRingQuota = 0;
     for (uint32_t ring = 0; ring < ringCount; ++ring) {
-        const uint32_t weight = (ringCount - ring) + ringCount;
+        const uint32_t weight = static_cast<uint32_t>(ringWeight(ring));
         ringQuotas[ring] = std::max<uint32_t>(
             1u,
             static_cast<uint32_t>(

@@ -2206,7 +2206,8 @@ Result<void> Renderer::CreateMidPassResources() {
 
     DestroyMidPassResources();
 
-    const float scale = std::clamp(m_config.midPassScale, 0.25f, 1.0f);
+    // Allow >1.0 = SSAA supersample of the mid pass (diagnostic + quality lever).
+    const float scale = std::clamp(m_config.midPassScale, 0.25f, 2.0f);
     m_midPassWidth = std::max(
         1u,
         static_cast<uint32_t>(std::lround(static_cast<float>(std::max(1u, m_width)) * scale)));

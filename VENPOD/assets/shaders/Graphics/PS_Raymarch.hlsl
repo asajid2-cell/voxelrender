@@ -104,7 +104,12 @@ static const uint MID_VOXEL_CLIPMAP_MAGIC = 0x56435658u;
 static const uint MID_CLIPMAP_MAX_SHADER_TILES = 512u;
 static const uint MID_CLIPMAP_MAX_SHADER_RINGS = 8u;
 static const uint MID_CLIPMAP_LOOKUP_PROBES = 8u;
-static const uint MID_VOXEL_CLIPMAP_MAX_BRICKS = 16384u;
+// TANDEM (fine-mid): raised 16384 -> 49152 to extend the fine cell-4 voxel bubble
+// over the visible mid (~512u -> ~2k). This is a min() CLAMP (line ~1724), NOT a
+// shader array/unroll, so it does not bloat the PSO; the old "hard ceiling" was
+// brick generation/upload pressure (49152*4096*4 = 768 MiB sample pool), which the
+// GPU mid-voxel generator + throttled dispatch handles. Must match the CPU cap.
+static const uint MID_VOXEL_CLIPMAP_MAX_BRICKS = 49152u;
 // The CPU sparse page table probes until it reaches an empty slot. Runtime
 // eviction leaves tombstones behind, so valid ready-to-render bricks can sit
 // past a short probe window even at modest load. Keep the shader probe budget
@@ -2219,12 +2224,29 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
                 // shimmer). smoothstep geomorph keeps crisp voxel normals near, smooth far.
                 // (Lives only in the mid-only PSO; the 4 FarTerrainHeight inlines are too heavy
                 // for the uber-shader's PSO to compile, which is the whole reason for the split.)
-                float gradE = max(actualCellSize * 1.5f, 10.0f);
+                // TANDEM ROOT-CAUSE FIX (fine-mid): FarTerrainHeight's finest detail
+                // term is freq 0.035 (~28u wavelength), so the mid renders as flat
+                // ~16u facets vs the near's fine HeightAt (41 detail terms, sub-meter)
+                // -> the user's "pixelated vs real voxels". Add a bounded high-freq
+                // detail octave (freq 0.12 ~= 8u, amplitude fading out by ~3k) to each
+                // gradient tap so the shading normal captures fine ~8u relief, much
+                // closer to the near look -- WITHOUT editing the deeply-inlined
+                // FarTerrainHeight body (the known TDR/PSO cliff). Just 4 extra
+                // TH_ValueNoise2D taps in the lighter mid-only PSO; finer gradE (4u)
+                // resolves the new detail; the fade keeps it from far-field shimmer.
+                float gradE = max(actualCellSize * 1.0f, 4.0f);
                 float gmmN, gsmN, grmN;
-                float ghL = FarTerrainHeight(hitPos.xz - float2(gradE, 0.0f), gmmN, gsmN, grmN);
-                float ghR = FarTerrainHeight(hitPos.xz + float2(gradE, 0.0f), gmmN, gsmN, grmN);
-                float ghD = FarTerrainHeight(hitPos.xz - float2(0.0f, gradE), gmmN, gsmN, grmN);
-                float ghU = FarTerrainHeight(hitPos.xz + float2(0.0f, gradE), gmmN, gsmN, grmN);
+                const float midDetailAmp =
+                    6.0f * (1.0f - saturate((hitDistance - 500.0f) / 2600.0f));
+                const uint midDetailSeed = FarWorldSeed() + 53u;
+                float ghL = FarTerrainHeight(hitPos.xz - float2(gradE, 0.0f), gmmN, gsmN, grmN)
+                          + FarValueNoise2D((hitPos.x - gradE) * 0.12f, hitPos.z * 0.12f, midDetailSeed) * midDetailAmp;
+                float ghR = FarTerrainHeight(hitPos.xz + float2(gradE, 0.0f), gmmN, gsmN, grmN)
+                          + FarValueNoise2D((hitPos.x + gradE) * 0.12f, hitPos.z * 0.12f, midDetailSeed) * midDetailAmp;
+                float ghD = FarTerrainHeight(hitPos.xz - float2(0.0f, gradE), gmmN, gsmN, grmN)
+                          + FarValueNoise2D(hitPos.x * 0.12f, (hitPos.z - gradE) * 0.12f, midDetailSeed) * midDetailAmp;
+                float ghU = FarTerrainHeight(hitPos.xz + float2(0.0f, gradE), gmmN, gsmN, grmN)
+                          + FarValueNoise2D(hitPos.x * 0.12f, (hitPos.z + gradE) * 0.12f, midDetailSeed) * midDetailAmp;
                 float3 gradNormal = normalize(float3(ghL - ghR, 2.0f * gradE, ghD - ghU));
                 // TANDEM crispness fix: the old 512-1400 ramp smoothed the mid
                 // terrain's crisp voxel-block faces into soft slopes by ~1.4k,
@@ -2245,6 +2267,12 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
                 float ndotl = saturate(dot(shadeNormal, SkySunDirection()) * 0.62f + 0.28f);
                 float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.76f + ndotl * 0.34f);
 #endif
+                // TANDEM terrace-definition: the 60fps mid (MID_ONLY) path had NO
+                // grid cue, so it read as flat material islands. Add a real
+                // block/terrace outline so the mid steps read like the near surface.
+                const float midBlockGrid =
+                    VoxelGridLine(hitPos.xz, max(actualCellSize, 4.0f), 0.12f);
+                color *= lerp(1.0f, 0.82f, midBlockGrid);
                 const float nearMidContext = 1.0f - saturate((hitDistance - startDistance) / 620.0f);
                 const float3 contextLift = lerp(SkyColor(rayDir), float3(0.48f, 0.52f, 0.48f), 0.35f);
 #ifndef RAYMARCH_MID_ONLY
@@ -2399,8 +2427,10 @@ RayHit MakeMidVoxelColumnClipmapHit(float3 rayOrigin, float3 rayDir, float hitT,
     float3 shadeNormal = DistantLodShadeNormal(normal, hitT, 0.16f);
     float ndotl = saturate(dot(shadeNormal, SkySunDirection()) * 0.58f + 0.40f);
     float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.92f + ndotl * 0.46f);
-    const float grid = VoxelGridLine(hitPos.xz, max(cellSize, 4.0f), 0.020f);
-    color *= lerp(1.0f, 0.94f, grid);
+    // TANDEM: column-proxy mid has a flat up normal, so the voxel grid line is its
+    // only block/terrace cue - strengthen it from ~invisible (0.02) to a real outline.
+    const float grid = VoxelGridLine(hitPos.xz, max(cellSize, 4.0f), 0.14f);
+    color *= lerp(1.0f, 0.78f, grid);
     const float startDistance = max(frame.midFieldParams.y, 1.0f);
     const float endDistance = max(frame.midFieldParams.z, startDistance + 1.0f);
     const float fogFactor = saturate((hitT - startDistance) / max(endDistance - startDistance, 1.0f));
@@ -2660,13 +2690,17 @@ bool RaymarchMidClipmap(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             0.64f);
         baseColor.rgb = ApplyWaterlineWetTerrainTint(baseColor.rgb, material, hitPos.y, normal.y, 0.62f);
         float3 lightDir = SkySunDirection();
-        // Smooth-shade the voxel staircase (bias lighting normal toward macro-up so step
-        // risers don't read as contour bands); keep some true-normal slope definition.
-        float3 litNormal = normalize(normal + float3(0.0f, 1.0f, 0.0f) * 1.35f);
+        // TANDEM terrace-definition fix: the near surface reads "gorgeous" because
+        // its stacked terrace STEPS catch directional light on the risers. The old
+        // up*1.35 bias flattened that out ("so risers don't read as contour bands")
+        // - but those bands ARE the look the user wants. Reduce the up-bias so the
+        // block/riser normals catch the sun (terrace banding like near), and make
+        // the voxel grid line a real block/terrace outline (was ~invisible 0.02).
+        float3 litNormal = normalize(normal + float3(0.0f, 1.0f, 0.0f) * 0.55f);
         float ndotl = saturate(dot(litNormal, lightDir));
-        float3 color = baseColor.rgb * (SkyAmbient(litNormal) * 0.82f + ndotl * 0.60f);
-        const float midGrid = VoxelGridLine(hitPos.xz, max(MidClipmapCellSize(hitT), 4.0f), 0.020f);
-        color *= lerp(1.0f, 0.985f, midGrid);
+        float3 color = baseColor.rgb * (SkyAmbient(litNormal) * 0.74f + ndotl * 0.74f);
+        const float midGrid = VoxelGridLine(hitPos.xz, max(MidClipmapCellSize(hitT), 4.0f), 0.12f);
+        color *= lerp(1.0f, 0.82f, midGrid);
         float fogFactor = saturate((hitT - startDistance) / max(endDistance - startDistance, 1.0f));
         color = lerp(color, SkyColor(rayDir), fogFactor * 0.24f);
         if (frame.debugMode == 8u) {
