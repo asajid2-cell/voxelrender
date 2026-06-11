@@ -1183,7 +1183,13 @@ float3 BackgroundTerrainMaterialVariation(
     float distanceFromCamera,
     float strength)
 {
-    const float cellScale = lerp(10.0f, 22.0f, saturate((distanceFromCamera - 900.0f) / 3600.0f));
+    // TANDEM grain fix (w/ Codex): the per-cell color variation read as a
+    // "static TV filter" across the mid band - small (10-22u) high-contrast cells
+    // render as only a few pixels each at mid distance, and the old distance ramp
+    // AMPLIFIED them. Fix = ~3x larger cells (coherent patches) + lower per-cell
+    // contrast + the strength now FADES with distance (atmospheric coherence)
+    // instead of growing. Near-field keeps enough variation to not read flat.
+    const float cellScale = lerp(30.0f, 68.0f, saturate((distanceFromCamera - 900.0f) / 3600.0f));
     const int cellX = (int)floor(worldPos.x / cellScale);
     const int cellY = (int)floor(worldPos.y / max(cellScale, 1.0f));
     const int cellZ = (int)floor(worldPos.z / cellScale);
@@ -1203,22 +1209,25 @@ float3 BackgroundTerrainMaterialVariation(
         const float3 warmStone = float3(0.60f, 0.56f, 0.44f);
         const float3 lichenStone = float3(0.42f, 0.49f, 0.32f);
         const float lowAltitudeLichen = (1.0f - saturate((worldPos.y - FAR_SEA_LEVEL - 32.0f) / 220.0f));
-        varied = lerp(coolStone, warmStone, stonePatch * 0.72f + 0.12f);
+        varied = lerp(coolStone, warmStone, stonePatch * 0.46f + 0.22f);
         const float ledgeLichen = (1.0f - slope) * smoothstep(0.54f, 0.92f, largePatch);
-        varied = lerp(varied, lichenStone, saturate(ledgeLichen * 0.28f + lowAltitudeLichen * 0.20f));
+        varied = lerp(varied, lichenStone, saturate(ledgeLichen * 0.12f + lowAltitudeLichen * 0.08f));
     } else if (material == MAT_DIRT) {
         const float3 grassDirt = float3(0.36f, 0.52f, 0.25f);
         const float3 exposedDirt = float3(0.48f, 0.42f, 0.31f);
         const float3 dryScrub = float3(0.50f, 0.49f, 0.32f);
         varied = lerp(grassDirt, exposedDirt, slope * 0.68f + highExposure * 0.22f);
-        varied = lerp(varied, dryScrub, smoothstep(0.62f, 0.94f, largePatch) * 0.22f);
+        varied = lerp(varied, dryScrub, smoothstep(0.62f, 0.94f, largePatch) * 0.10f);
     } else if (material == MAT_SAND) {
         const float3 dampSand = float3(0.58f, 0.53f, 0.36f);
         const float3 drySand = float3(0.78f, 0.70f, 0.44f);
-        varied = lerp(dampSand, drySand, patch * 0.72f + (1.0f - slope) * 0.18f);
+        varied = lerp(dampSand, drySand, patch * 0.36f + (1.0f - slope) * 0.10f);
     }
 
-    const float materialStrength = saturate(strength * (material == MAT_STONE ? (0.72f + distanceBlend * 0.12f) : (0.58f + distanceBlend * 0.20f)));
+    // INVERTED distance ramp: variation strength now FADES with distance
+    // (distanceBlend) instead of growing, so the mid/far reads as coherent
+    // smooth material under haze, not per-cell static. ~0.31 near-mid -> ~0.18-0.26 far.
+    const float materialStrength = saturate(strength * (material == MAT_STONE ? (0.54f - distanceBlend * 0.18f) : (0.48f - distanceBlend * 0.20f)));
     return lerp(baseColor, varied, materialStrength);
 }
 
@@ -1235,10 +1244,10 @@ float3 PerVoxelColorJitter(float3 color, float3 worldPos, float distanceFromCame
     const uint h = FarHash3D(vx, vy, vz, FarWorldSeed() + 911u);
     const float j = (float)(h & 0xFFFFu) / 65535.0f * 2.0f - 1.0f;      // ~[-1,1]
     const float j2 = (float)((h >> 16) & 0xFFFFu) / 65535.0f * 2.0f - 1.0f;
-    const float fade = 1.0f - saturate((distanceFromCamera - 240.0f) / 700.0f);
-    const float bright = 1.0f + j * 0.09f * fade;                        // +/-9% brightness
-    // tiny per-channel hue skew (a few %) so it's natural variation, not grey noise
-    const float3 hue = float3(1.0f + j2 * 0.030f, 1.0f + j * 0.018f, 1.0f - j2 * 0.024f);
+    const float fade = 1.0f - saturate((distanceFromCamera - 180.0f) / 440.0f);
+    const float bright = 1.0f + j * 0.045f * fade;                       // +/-4.5% brightness (was 9%)
+    // tiny per-channel hue skew (halved) so it's natural variation, not grey noise
+    const float3 hue = float3(1.0f + j2 * 0.014f, 1.0f + j * 0.010f, 1.0f - j2 * 0.012f);
     return color * bright * lerp(float3(1.0f, 1.0f, 1.0f), hue, fade);
 }
 
