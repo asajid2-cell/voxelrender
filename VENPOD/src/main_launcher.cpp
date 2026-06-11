@@ -2495,6 +2495,9 @@ int RunSandbox(int argc, char* argv[]) {
     uint32_t sparseMidMeshUploadedHeightSerial = 0;
     uint32_t sparseMidMeshFaceCountLastUpload = 0;
     uint32_t sparseMidMeshUploadRetriesLastFrame = 0;
+    bool sparseMidMeshUploadedCullValid = false;
+    glm::vec3 sparseMidMeshUploadedCullCamera{0.0f, 0.0f, 0.0f};
+    glm::vec3 sparseMidMeshUploadedCullForward{0.0f, 0.0f, 1.0f};
     uint32_t sparseSurfaceExtractionBudgetLastFrame = 0;
     uint32_t sparseSurfaceLookaheadVisibleLastUpload = 0;
     Simulation::SparseClipmapConfig sparseClipmapConfig;
@@ -2795,9 +2798,31 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_SPARSE_MID_MESH_MAX_TILES", 0u);
     const uint32_t sparseMidMeshTerraceStep =
         std::max(1u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_TERRACE_STEP", 1u));
+    const bool sparseMidMeshLodEnabled =
+        ReadUIntEnv("VENPOD_SPARSE_MID_MESH_LOD", 1u) != 0u;
+    const uint32_t sparseMidMeshLodBaseMerge =
+        std::max(1u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_LOD_BASE_MERGE", 1u));
+    const uint32_t sparseMidMeshLodMaxMerge =
+        std::max(sparseMidMeshLodBaseMerge, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_LOD_MAX_MERGE", 4u));
+    const bool sparseMidMeshEmitWater =
+        ReadUIntEnv("VENPOD_SPARSE_MID_MESH_WATER", 1u) != 0u;
+    const bool sparseMidMeshDistanceCull =
+        ReadUIntEnv("VENPOD_SPARSE_MID_MESH_DISTANCE_CULL", 1u) != 0u;
+    const bool sparseMidMeshFrustumCull =
+        ReadUIntEnv("VENPOD_SPARSE_MID_MESH_FRUSTUM_CULL", 0u) != 0u;
+    const float sparseMidMeshMinDistance =
+        std::max(0.0f, ReadFloatEnv("VENPOD_SPARSE_MID_MESH_MIN_DISTANCE", sparseExactNearDistance));
     const float sparseMidMeshMaxDistance = std::max(
-        sparseClipmapPolicy.Config().endDistance,
+        sparseMidMeshMinDistance + 1.0f,
         ReadFloatEnv("VENPOD_SPARSE_MID_MESH_MAX_DISTANCE", sparseClipmapPolicy.Config().endDistance));
+    const float sparseMidMeshCullPadding =
+        std::max(0.0f, ReadFloatEnv("VENPOD_SPARSE_MID_MESH_CULL_PADDING", 192.0f));
+    const float sparseMidMeshCullRebuildDistance =
+        std::max(32.0f, ReadFloatEnv("VENPOD_SPARSE_MID_MESH_CULL_REBUILD_DISTANCE", 256.0f));
+    const uint32_t sparseMidMeshCullTurnDegrees =
+        std::min(90u, std::max(1u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_CULL_TURN_DEGREES", 12u)));
+    const float sparseMidMeshCullTurnDot =
+        std::cos(static_cast<float>(sparseMidMeshCullTurnDegrees) * 0.017453292519943295f);
     uint64_t sparseMidClipmapEditRevisionSeen = 0;
     if (sparseBackendRequested) {
         sparseClipmapTileCacheReady = sparseClipmapTileCache.Initialize(sparseClipmapPolicy.Config());
@@ -3144,14 +3169,21 @@ int RunSandbox(int argc, char* argv[]) {
             } else {
                 const auto& midMeshStats = sparseMidMeshGpuResources.GetStats();
                 spdlog::info(
-                    "Sparse mid mesh enabled: faces={} ranges={} drawCommands={} uploadSlotMB={:.2f} terraceStep={} maxTiles={} maxDistance={:.0f} iaFaces={}",
+                    "Sparse mid mesh enabled: faces={} ranges={} drawCommands={} uploadSlotMB={:.2f} terraceStep={} lod={}/{}-{} water={} distCull={} frustumCull={} minMax={:.0f}/{:.0f} maxTiles={} iaFaces={}",
                     midMeshConfig.maxFaces,
                     midMeshConfig.maxBrickRanges,
                     midMeshConfig.maxDrawCommands,
                     static_cast<double>(midMeshConfig.uploadBytesPerSlot) / (1024.0 * 1024.0),
                     sparseMidMeshTerraceStep,
-                    sparseMidMeshMaxTiles,
+                    sparseMidMeshLodEnabled ? 1 : 0,
+                    sparseMidMeshLodBaseMerge,
+                    sparseMidMeshLodMaxMerge,
+                    sparseMidMeshEmitWater ? 1 : 0,
+                    sparseMidMeshDistanceCull ? 1 : 0,
+                    sparseMidMeshFrustumCull ? 1 : 0,
+                    sparseMidMeshMinDistance,
                     sparseMidMeshMaxDistance,
+                    sparseMidMeshMaxTiles,
                     midMeshStats.iaStreamCapacityFaces);
             }
         } else if (sparseBackendRequested) {
@@ -15872,22 +15904,75 @@ int RunSandbox(int argc, char* argv[]) {
                 sparseMidMeshGpuResources.IsInitialized() &&
                 sparseClipmapTileCacheReady &&
                 sparseClipmapPolicy.IsEnabled() &&
-                sparseClipmapPolicy.Config().heightClipmapEnabled &&
-                sparseClipmapTileCache.HeightDirtySerial() != sparseMidMeshUploadedHeightSerial) {
+                sparseClipmapPolicy.Config().heightClipmapEnabled) {
+                const glm::vec3 normalizedMidMeshCullForward = glm::normalize(cameraForward);
+                const bool midMeshContentChanged =
+                    sparseClipmapTileCache.HeightDirtySerial() != sparseMidMeshUploadedHeightSerial;
+                const bool midMeshCullMoved =
+                    !sparseMidMeshUploadedCullValid ||
+                    glm::length(cameraPos - sparseMidMeshUploadedCullCamera) >= sparseMidMeshCullRebuildDistance;
+                const bool midMeshCullTurned =
+                    !sparseMidMeshUploadedCullValid ||
+                    glm::dot(normalizedMidMeshCullForward, sparseMidMeshUploadedCullForward) <
+                        sparseMidMeshCullTurnDot;
+                if (!midMeshContentChanged && !midMeshCullMoved && !midMeshCullTurned) {
+                    // Current mesh still matches resident height tiles and the conservative cull window.
+                } else {
                 Simulation::SparseSurfaceGpuSnapshot midMeshSnapshot;
                 SparseSurfaceUploadTicket midMeshTicket;
-                if (sparseClipmapTileCache.BuildMidHeightSurfaceSnapshot(
-                        midMeshSnapshot,
-                        sparseMidMeshMaxFaces,
-                        sparseMidMeshMaxTiles,
-                        sparseMidMeshTerraceStep) &&
+                Simulation::SparseMidHeightSurfaceBuildConfig midMeshBuildConfig;
+                midMeshBuildConfig.maxFaces = sparseMidMeshMaxFaces;
+                midMeshBuildConfig.maxTiles = sparseMidMeshMaxTiles;
+                midMeshBuildConfig.terraceStep = sparseMidMeshTerraceStep;
+                midMeshBuildConfig.lodEnabled = sparseMidMeshLodEnabled;
+                midMeshBuildConfig.lodBaseMerge = sparseMidMeshLodBaseMerge;
+                midMeshBuildConfig.lodMaxMerge = sparseMidMeshLodMaxMerge;
+                midMeshBuildConfig.emitWater = sparseMidMeshEmitWater;
+                midMeshBuildConfig.distanceCull = sparseMidMeshDistanceCull;
+                midMeshBuildConfig.frustumCull = sparseMidMeshFrustumCull;
+                midMeshBuildConfig.cameraX = cameraPos.x;
+                midMeshBuildConfig.cameraY = cameraPos.y;
+                midMeshBuildConfig.cameraZ = cameraPos.z;
+                midMeshBuildConfig.forwardX = cameraForward.x;
+                midMeshBuildConfig.forwardY = cameraForward.y;
+                midMeshBuildConfig.forwardZ = cameraForward.z;
+                midMeshBuildConfig.rightX = cameraRight.x;
+                midMeshBuildConfig.rightY = cameraRight.y;
+                midMeshBuildConfig.rightZ = cameraRight.z;
+                midMeshBuildConfig.upX = cameraUp.x;
+                midMeshBuildConfig.upY = cameraUp.y;
+                midMeshBuildConfig.upZ = cameraUp.z;
+                midMeshBuildConfig.fovYRadians = fov;
+                midMeshBuildConfig.aspectRatio = aspectRatio;
+                midMeshBuildConfig.minDistance = sparseMidMeshMinDistance;
+                midMeshBuildConfig.maxDistance = sparseMidMeshMaxDistance;
+                midMeshBuildConfig.cullPadding = sparseMidMeshCullPadding;
+                if (sparseClipmapTileCache.BuildMidHeightSurfaceSnapshot(midMeshSnapshot, midMeshBuildConfig) &&
                     sparseMidMeshGpuResources.StageSnapshot(midMeshSnapshot, &midMeshTicket) &&
                     sparseMidMeshGpuResources.EmitCopy(commandList.Get(), midMeshTicket)) {
                     sparseMidMeshUploadedHeightSerial = sparseClipmapTileCache.HeightDirtySerial();
                     sparseMidMeshFaceCountLastUpload = midMeshTicket.faceCount;
+                    sparseMidMeshUploadedCullValid = true;
+                    sparseMidMeshUploadedCullCamera = cameraPos;
+                    sparseMidMeshUploadedCullForward = normalizedMidMeshCullForward;
+                    spdlog::info(
+                        "Sparse mid mesh upload: serial={} faces={} tiles={} lod={}/{}-{} water={} minMax={:.0f}/{:.0f} camera=({:.0f},{:.0f},{:.0f})",
+                        midMeshTicket.serial,
+                        midMeshTicket.faceCount,
+                        midMeshTicket.visibleBricks,
+                        sparseMidMeshLodEnabled ? 1 : 0,
+                        sparseMidMeshLodBaseMerge,
+                        sparseMidMeshLodMaxMerge,
+                        sparseMidMeshEmitWater ? 1 : 0,
+                        sparseMidMeshMinDistance,
+                        sparseMidMeshMaxDistance,
+                        cameraPos.x,
+                        cameraPos.y,
+                        cameraPos.z);
                 } else {
                     ++sparseMidMeshUploadRetriesLastFrame;
                     sparseMidMeshFaceCountLastUpload = 0u;
+                }
                 }
             }
             perfSparseMidUploadMs = ticksToMs(SDL_GetPerformanceCounter() - perfSparseStepStart);
