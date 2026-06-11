@@ -237,11 +237,16 @@ float SparseTerrainGenerator::HeightAt(int32_t worldX, int32_t worldZ) const {
     height = Lerp(height, std::max(height, routeBackdropHeight), routeCorridor * routeRidge * routeNotch * 0.68f);
 
     // Spawn landmass: lift low/submerged near-origin terrain onto a gently
-    // rolling land floor comfortably above sea level, fading out by ~9500u so the
-    // whole render ring is solid land, not a flooded basin (the mid-ground beyond the
-    // old 2800u fade reverted to water + fragmented banks).
+    // rolling land floor comfortably above sea level. TANDEM widen 9300 -> 35000
+    // (Codex co-design): the old /9300 band dropped to ~0.69 by 4k and faded out
+    // by ~9500u, so deep basins in the mid-distance got only PARTIAL lift and
+    // stayed below sea -> the "ring turns into water" archipelago of fragmented
+    // banks inside the render range. /35000 keeps the band ~full (>=0.96) out to
+    // ~5k and ~1.0 to 15k, pushing the partial-reshape fragment zone past the
+    // ~10k render horizon so the whole visible world is a solid believable
+    // continent. Must stay byte-identical to TerrainHeight.hlsli TH_HeightAt.
     const float spawnLandBand =
-        1.0f - Smooth01(std::clamp((originDistance - 200.0f) / 9300.0f, 0.0f, 1.0f));
+        1.0f - Smooth01(std::clamp((originDistance - 200.0f) / 90000.0f, 0.0f, 1.0f));
     // VISUAL PASS iter1 (coast): raise the spawn land floor and reduce its noise so
     // near-spawn ground is a solid coherent plain well above the waterline (no
     // 1-voxel banks / thin slivers). +40 -> +56 base, noise softened.
