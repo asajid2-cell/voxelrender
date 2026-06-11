@@ -111,3 +111,20 @@ GATES: (a) midCov 1.00 converged both headings + stress (dips are startup-only f
 DEVICE_HUNG across ~16 runs + stress-fly. Worst-case cell-cross hitch cut 26-42%.
 FILES: SparseClipmap.cpp/.h (parallel height pump + per-ring interest budget),
 main_launcher.cpp (env knobs, default ON). Partner's PUMP_SPLIT diag reverted by track.
+
+---
+## mid LOD screen-space-error review (2026-06-11)
+TANDEM watcher started; partner turn was still running when local source+math reached a verdict.
+LOCAL VERDICT:
+- Screen-space ring boundaries are valid math, but with the actual 60deg vertical FOV and half-res
+  mid pass a 4u cell is already below a 3px footprint at MID_START=768. Literal K=3-5 therefore
+  makes the 1-3k visible band coarser, not finer.
+- Current SparseClipmap rings are not true annular screen-space shells: UpdateVoxelInterest still
+  builds a camera/forward bubble per ring. Replacing BuildRings boundaries alone changes preferred
+  LOD/anchor distances, but does not make brick count proportional to screen pixels.
+- Any ring-growth/boundary change must update CPU policy, CPU feedback/projection paths, shader
+  MidClipmapRingCellSize/preferred-ring selection, and include the new layout params in the
+  interest signature. Current ringGrowthFactor is not represented in the signature.
+ACTIONABLE: Do not ship K=3-5 screen-space boundaries as the next quality fix. If tested, use it as
+a diagnostic with K near 1px/full-scale or 1.5px at 1080, and prioritize projected-visible admission
+or AA/TAA/geomorph for the remaining jaggies.
