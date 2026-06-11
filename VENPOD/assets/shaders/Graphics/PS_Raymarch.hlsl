@@ -1213,14 +1213,16 @@ float3 BackgroundTerrainMaterialVariation(
         const float ledgeLichen = (1.0f - slope) * smoothstep(0.54f, 0.92f, largePatch);
         varied = lerp(varied, lichenStone, saturate(ledgeLichen * 0.12f + lowAltitudeLichen * 0.08f));
     } else if (material == MAT_DIRT) {
-        const float3 grassDirt = float3(0.36f, 0.52f, 0.25f);
+        // TANDEM palette tune: greener grass, quieter dry-scrub so the mid reads
+        // as clean grassland matching the near surface, not loud olive/tan.
+        const float3 grassDirt = float3(0.32f, 0.58f, 0.24f);
         const float3 exposedDirt = float3(0.48f, 0.42f, 0.31f);
-        const float3 dryScrub = float3(0.50f, 0.49f, 0.32f);
+        const float3 dryScrub = float3(0.45f, 0.50f, 0.30f);
         varied = lerp(grassDirt, exposedDirt, slope * 0.68f + highExposure * 0.22f);
         varied = lerp(varied, dryScrub, smoothstep(0.62f, 0.94f, largePatch) * 0.10f);
     } else if (material == MAT_SAND) {
-        const float3 dampSand = float3(0.58f, 0.53f, 0.36f);
-        const float3 drySand = float3(0.78f, 0.70f, 0.44f);
+        const float3 dampSand = float3(0.56f, 0.52f, 0.37f);
+        const float3 drySand = float3(0.72f, 0.66f, 0.43f);
         varied = lerp(dampSand, drySand, patch * 0.36f + (1.0f - slope) * 0.10f);
     }
 
@@ -2224,7 +2226,14 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
                 float ghD = FarTerrainHeight(hitPos.xz - float2(0.0f, gradE), gmmN, gsmN, grmN);
                 float ghU = FarTerrainHeight(hitPos.xz + float2(0.0f, gradE), gmmN, gsmN, grmN);
                 float3 gradNormal = normalize(float3(ghL - ghR, 2.0f * gradE, ghD - ghU));
-                float midSmoothBlend = smoothstep(512.0f, 1400.0f, hitDistance);
+                // TANDEM crispness fix: the old 512-1400 ramp smoothed the mid
+                // terrain's crisp voxel-block faces into soft slopes by ~1.4k,
+                // which read as "fuzzy" vs the crisp near surface (the user wants
+                // mid to match the gorgeous near). Push the smoothing out to
+                // 2500-6500 so the visible mid keeps its block-face normals (crisp,
+                // like near); only the genuine far gradient-smooths (where blocks
+                // would alias/shimmer anyway).
+                float midSmoothBlend = smoothstep(2500.0f, 6500.0f, hitDistance);
                 float3 shadeNormal = normalize(lerp(normal, gradNormal, midSmoothBlend));
                 float ndotl = max(dot(shadeNormal, SkySunDirection()), 0.0f);
                 float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.42f + ndotl * 0.82f + 0.06f);

@@ -20,6 +20,23 @@ struct PSOutput {
 
 PSOutput main(PSInput input) {
     PSOutput output;
-    output.color = MidColor.Sample(MidSampler, saturate(input.uv));
+    const float2 uv = saturate(input.uv);
+    // TANDEM sharpness fix: the mid pass renders at half-res (e.g. 480x270) and
+    // bilinear-upscales, which blurs the mid terrain (the dominant "fuzzy mid" vs
+    // the crisp full-res near). Recover edge definition with a cheap 5-tap unsharp
+    // mask (center minus the 4-neighbor average). Outside the uber-shader, so no
+    // driver/PSO risk. Alpha (mid coverage) is passed through untouched so the
+    // alpha-over composite still works.
+    uint texW, texH;
+    MidColor.GetDimensions(texW, texH);
+    const float2 texel = float2(1.0f / max(texW, 1u), 1.0f / max(texH, 1u));
+    const float4 c = MidColor.Sample(MidSampler, uv);
+    const float3 neighbors =
+        MidColor.Sample(MidSampler, uv + float2(texel.x, 0.0f)).rgb +
+        MidColor.Sample(MidSampler, uv - float2(texel.x, 0.0f)).rgb +
+        MidColor.Sample(MidSampler, uv + float2(0.0f, texel.y)).rgb +
+        MidColor.Sample(MidSampler, uv - float2(0.0f, texel.y)).rgb;
+    const float3 sharpened = c.rgb + (c.rgb - neighbors * 0.25f) * 0.55f;
+    output.color = float4(saturate(sharpened), c.a);
     return output;
 }
