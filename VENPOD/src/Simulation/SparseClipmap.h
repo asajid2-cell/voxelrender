@@ -585,6 +585,10 @@ public:
         SparseClipmapGpuSnapshot& outSnapshot,
         bool includeHeightLayer = true,
         bool includeVoxelLayer = true) const;
+    // Mark the GPU-gen sample slots emitted in `snapshot.voxelGpuGenRequests` as uploaded
+    // so they are not re-dispatched on the next snapshot. Call ONLY after the upload +
+    // compute dispatch for this snapshot actually succeed (so a rejected upload retries).
+    void MarkVoxelGpuSamplesUploaded(const SparseClipmapGpuSnapshot& snapshot);
     bool BuildMidHeightSurfaceSnapshot(
         SparseSurfaceGpuSnapshot& outSnapshot,
         const SparseMidHeightSurfaceBuildConfig& buildConfig = {}) const;
@@ -610,6 +614,14 @@ public:
     uint32_t DirtySerial() const { return m_dirtySerial; }
     uint32_t HeightDirtySerial() const { return m_heightDirtySerial; }
     uint32_t VoxelDirtySerial() const { return m_voxelDirtySerial; }
+    // L3 motion guard: XZ distance from the camera to the nearest INTERESTED height
+    // tile that is not yet resident (FLT_MAX when full coverage). Fed to the renderer
+    // per frame so the shader can suppress the bare far-water fallback beyond the
+    // streamed region (it painted sea over un-streamed dry mountains at speed).
+    float NearestMissingHeightTileDistance(
+        float cameraX,
+        float cameraZ,
+        const SparseClipmapPolicy& policy) const;
     void ClearHeightDirtyRange();
     void ClearVoxelDirtyRange();
 
@@ -873,6 +885,14 @@ private:
         // never pays for the per-voxel fill) and BuildGpuSnapshot skips copying
         // samples for this slot, emitting a GPU gen request instead.
         bool gpuGenerated = false;
+        // PERF: true once this brick's GPU samples have been (re)generated via a
+        // voxelGpuGenRequest. GPU gen is DETERMINISTIC from the brick's coord, and the
+        // sample pool is indexed by `slot`, so an unchanged brick keeps valid samples and
+        // must NOT be re-dispatched. Without this, BuildGpuSnapshot re-emitted a gen
+        // request for ALL ~12k resident bricks on every metadata upload -> full re-dispatch
+        // every frame during streaming, starving new-terrain gen and dropping fps. Reset to
+        // false in MarkVoxelSlotDirty (any change/slot-reuse) so the brick re-generates.
+        bool gpuGenSamplesUploaded = false;
         std::vector<uint32_t> voxels;
     };
     struct AsyncVoxelGenerationRequest {

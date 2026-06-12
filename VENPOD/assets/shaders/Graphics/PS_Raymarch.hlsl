@@ -2033,9 +2033,16 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
         // painted that ground far-style with scattered fine-brick patches (the
         // art-style patchwork). The angular acceptability test at the hit site
         // below keeps parents from reading as fake block terrain.
+        // TANDEM (codex converged): the DDA accepts downward rays all the way to
+        // minAllowedRayY (-0.68 at low alt), but coarser-parent fallback used to cut
+        // off at -0.58, so a band of steep-downward rays marched yet was forbidden from
+        // sampling resident COARSE voxel bricks when the fine ring-0 brick was missing
+        // -> they hit the missing-sample path, returned false, and the smooth column
+        // proxy won (debug 69 ORANGE). Widen the fallback to match the DDA's accepted
+        // downward range so those rays sample resident parent rings instead.
         const bool allowCoarserParentFallback =
             highAltitudeVoxelView ||
-            (rayDir.y > -0.58f &&
+            (rayDir.y >= minAllowedRayY &&
              rayDir.y < 0.18f);
         if (SampleResidentMidVoxelFallback(pos, ring, allowCoarserParentFallback, voxel, actualRing, actualCellSize)) {
             float nextCellT = NextMidVoxelCellBoundaryT(rayOrigin, rayDir, t, actualCellSize);
@@ -2205,10 +2212,16 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
                 const bool ring0MidVoxel =
                     actualRing == 0u &&
                     actualCellSize <= 12.5f;
+                // REAL VOXELS (Codex): key color variation off the VOXEL CELL CENTER, not the
+                // continuous hit position, so each voxel is a flat uniform color (crisp) like the
+                // near mesh instead of a smooth gradient across the cell face.
+                const float voxelColorCell = max(actualCellSize, 1.0f);
+                const float3 voxelColorPos =
+                    floor(hitPos / voxelColorCell) * voxelColorCell + voxelColorCell * 0.5f;
                 baseColor.rgb = BackgroundTerrainMaterialVariation(
                     baseColor.rgb,
                     material,
-                    hitPos,
+                    voxelColorPos,
                     normal,
                     hitDistance,
                     ring0MidVoxel ? 0.52f : 0.72f);
@@ -2268,8 +2281,12 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
                 // 2500-6500 so the visible mid keeps its block-face normals (crisp,
                 // like near); only the genuine far gradient-smooths (where blocks
                 // would alias/shimmer anyway).
-                float midSmoothBlend = smoothstep(2500.0f, 6500.0f, hitDistance);
-                float3 shadeNormal = normalize(lerp(normal, gradNormal, midSmoothBlend));
+                // REAL VOXELS (user): the lerp toward the heightfield gradNormal is what
+                // made the mid shade as a SMOOTH heightfield instead of crisp voxel cubes
+                // like the near mesh -- and every prior "crispness fix" only pushed the
+                // blend distance out, never removed it. Shade with the actual voxel FACE
+                // normal so the mid reads as real stacked voxels (flat-lit cube faces).
+                float3 shadeNormal = normal;
                 float ndotl = max(dot(shadeNormal, SkySunDirection()), 0.0f);
                 float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.42f + ndotl * 0.82f + 0.06f);
 #else
@@ -2424,7 +2441,16 @@ float MidClipmapCellSize(float distanceFromCamera) {
 
 RayHit MakeMidVoxelColumnClipmapHit(float3 rayOrigin, float3 rayDir, float hitT, uint material, float cellSize) {
     float3 hitPos = rayOrigin + rayDir * hitT;
+    // The real height-gradient normal gives slopes proper light/shadow form (fixing the
+    // flat-lit striped-wall look) BUT pushes the full uber-shader past the NVIDIA JIT/PSO
+    // cliff (0x-7FF8FFF2). So enable it ONLY in the small RAYMARCH_MID_ONLY pass (which has
+    // PSO room + compiles in ~1s); that pass composites the form-shaded column OVER the
+    // full pass's flat column. The full uber-shader keeps the cheap flat normal.
+#ifdef RAYMARCH_MID_ONLY
+    float3 normal = MidClipmapNormal(hitPos.xz, hitT);
+#else
     float3 normal = float3(0.0f, 1.0f, 0.0f);
+#endif
     float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, (material + 0.5f) / 256.0f, 0);
     if (frame.debugMode == 54u || frame.debugMode == 56u) {
         return MakeHit(float4(DebugMaterialColor(material), 1.0f), hitT);
@@ -2435,15 +2461,15 @@ RayHit MakeMidVoxelColumnClipmapHit(float3 rayOrigin, float3 rayDir, float hitT,
         hitPos,
         normal,
         hitT,
-        0.64f);
+        0.32f);  // was 0.64 — the per-column jitter was a primary stripe source
     baseColor.rgb = ApplyWaterlineWetTerrainTint(baseColor.rgb, material, hitPos.y, normal.y, 0.62f);
     float3 shadeNormal = DistantLodShadeNormal(normal, hitT, 0.16f);
     float ndotl = saturate(dot(shadeNormal, SkySunDirection()) * 0.58f + 0.40f);
     float3 color = baseColor.rgb * (SkyAmbient(shadeNormal) * 0.92f + ndotl * 0.46f);
-    // TANDEM: column-proxy mid has a flat up normal, so the voxel grid line is its
-    // only block/terrace cue - strengthen it from ~invisible (0.02) to a real outline.
-    const float grid = VoxelGridLine(hitPos.xz, max(cellSize, 4.0f), 0.14f);
-    color *= lerp(1.0f, 0.78f, grid);
+    // With a real slope normal now driving form shading, the grid line no longer has
+    // to fake the terrace cue — weaken it so it stops reading as extra vertical striping.
+    const float grid = VoxelGridLine(hitPos.xz, max(cellSize, 4.0f), 0.06f);
+    color *= lerp(1.0f, 0.88f, grid);
     const float startDistance = max(frame.midFieldParams.y, 1.0f);
     const float endDistance = max(frame.midFieldParams.z, startDistance + 1.0f);
     const float fogFactor = saturate((hitT - startDistance) / max(endDistance - startDistance, 1.0f));
@@ -2475,9 +2501,20 @@ bool RaymarchMidVoxelColumnClipmap(float3 rayOrigin, float3 rayDir, float startD
 
     // This is the safe mid-distance terrain context for walking views: it
     // draws block-stepped top surfaces instead of the full shell volume.
+#ifdef RAYMARCH_MID_ONLY
+    // Mid pass: cover steep upward slopes too. During fast motion the mid-voxel DDA
+    // bricks lag, so the full pass falls back to the flat column proxy on the upper
+    // part of close slopes = the striped walls. Letting the form-shaded column (real
+    // MidClipmapNormal) cover those rays replaces the stripes with coherent slope form.
+    // Still exclude near-vertical sky rays (the height march returns no hit anyway).
+    if (rayDir.y > 0.32f) {
+        return false;
+    }
+#else
     if (rayDir.y > 0.06f) {
         return false;
     }
+#endif
 
     const float startDistance = max(frame.midFieldParams.y, 1.0f);
     const float endDistance = max(frame.midFieldParams.z, startDistance + 1.0f);
@@ -3503,10 +3540,12 @@ bool RaymarchSparseFarField(float3 rayOrigin, float3 rayDir, float startDist, fl
         farHit = MakeHit(float4(float3(debugFog, debugFog, debugFog), 1.0f), nearestT);
         return true;
     }
+    // HAZE FIX (native-res milky band): cut the far-SVO horizon-band weight + the
+    // 0.16 floor (kept the distance ramp) so far SVO hits read as terrain, not sky.
     color = lerp(
         color,
         SkyColor(rayDir),
-        (fogFactor * 0.60f + horizonHaze * 0.36f + 0.16f) * FarHazeDowncastScale(rayDir.y));
+        (fogFactor * 0.58f + horizonHaze * 0.22f + 0.05f) * FarHazeDowncastScale(rayDir.y));
     farHit = MakeHit(float4(color, 1.0f), nearestT);
     return true;
 }
@@ -3674,9 +3713,13 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             // so far chunks melt to sky/haze while nearer mid terrain stays visible.
             const float horizonHazeWide = saturate((0.35f - abs(rayDir.y)) / 0.35f);
             const float midFarHaze = saturate((hitT - 3500.0f) / 5000.0f);
+            // HAZE FIX (native-res milky band): the horizon-band haze + the 0.20
+            // unconditional floor saturated the far ridge base to fully-sky = the milky
+            // washout. Keep the distance ramp (fogFactor) for real atmospheric depth,
+            // but cut the horizon-band weights + floor so the ridge reads as terrain.
             const float farHazeAmount = saturate(
-                fogFactor * 0.60f + horizonHazeWide * 0.42f
-                + midFarHaze * (0.42f + horizonHazeWide * 0.40f) + 0.20f)
+                fogFactor * 0.58f + horizonHazeWide * 0.24f
+                + midFarHaze * (0.30f + horizonHazeWide * 0.20f) + 0.05f)
                 * FarHazeDowncastScale(rayDir.y);
             color = lerp(color, SkyColor(rayDir), farHazeAmount);
             farHit = MakeHit(float4(color, 1.0f), hitT);
@@ -3792,9 +3835,13 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             // so far chunks melt to sky/haze while nearer mid terrain stays visible.
             const float horizonHazeWide = saturate((0.35f - abs(rayDir.y)) / 0.35f);
             const float midFarHaze = saturate((hitT - 3500.0f) / 5000.0f);
+            // HAZE FIX (native-res milky band): the horizon-band haze + the 0.20
+            // unconditional floor saturated the far ridge base to fully-sky = the milky
+            // washout. Keep the distance ramp (fogFactor) for real atmospheric depth,
+            // but cut the horizon-band weights + floor so the ridge reads as terrain.
             const float farHazeAmount = saturate(
-                fogFactor * 0.60f + horizonHazeWide * 0.42f
-                + midFarHaze * (0.42f + horizonHazeWide * 0.40f) + 0.20f)
+                fogFactor * 0.58f + horizonHazeWide * 0.24f
+                + midFarHaze * (0.30f + horizonHazeWide * 0.20f) + 0.05f)
                 * FarHazeDowncastScale(rayDir.y);
             color = lerp(color, SkyColor(rayDir), farHazeAmount);
             farHit = MakeHit(float4(color, 1.0f), hitT);
@@ -4873,6 +4920,11 @@ bool VoxelTerrainOnly() {
 }
 
 bool DiagnosticFarTerrainWouldHit(float3 rayOrigin, float3 rayDir, float startDist, out float hitT);
+bool BuildDeterministicFarTerrainContinuityHit(
+    float3 rayOrigin,
+    float3 rayDir,
+    float diagnosticTerrainT,
+    out RayHit continuityHit);
 float TerrainDiagnosticStartDistance();
 bool TryBuildResidentMidVoxelClosureHit(float3 rayOrigin, float3 rayDir, float terrainT, out RayHit closureHit);
 
@@ -4884,7 +4936,11 @@ bool RaymarchBackgroundField(
     bool allowWideHeightAngles,
     out RayHit backgroundHit,
     out uint backgroundLayer,
-    bool suppressPendingLandWater = false)
+    bool suppressPendingLandWater = false,
+    // L3 lane A: the caller saw a missing NEAR brick during motion (guard armed) —
+    // admit this ray to the far-height march below instead of letting the miss
+    // tail classify it as sky (the white wedges at speed). Scalar plumbing only.
+    bool forceNearMotionTerrainFill = false)
 {
     backgroundHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
     backgroundLayer = BACKGROUND_LAYER_NONE;
@@ -4918,11 +4974,14 @@ bool RaymarchBackgroundField(
     // [perf] The elevated far-SVO candidate march now runs AFTER the mid DDA
     // (below) instead of eagerly here, so its traversal can be capped at the
     // furthest distance either of its two consumers can still accept.
-    const bool preferCheapMidVoxelColumn =
-        frame.renderBudgetParams.z < 0.55f || BackgroundRenderQuality() < 0.62f;
-    const bool preferForegroundMidColumn =
-        lowAltitudeVoxelTerrainView &&
-        rayDir.y <= 0.06f;
+    // REAL VOXELS, NOT SMOOTH APPROXIMATIONS: the column proxy + height clipmap are
+    // smooth heightfield approximations, NOT voxel terrain. The mid must render as real
+    // voxels (the DDA) like the near. The engine traded voxels for the cheap smooth column
+    // whenever the budget dipped < 0.55 or for downward views -- but with huge perf headroom
+    // (68-120fps) that trade is wrong. Force the real voxel DDA as the primary mid render;
+    // the column/height remain only as later fallbacks where the DDA has no resident brick.
+    const bool preferCheapMidVoxelColumn = false;
+    const bool preferForegroundMidColumn = false;
     const bool allowMidVoxelColumnProxy = !voxelTerrainOnly || preferForegroundMidColumn;
     RayHit deferredMidInteriorHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
     bool hasDeferredMidInteriorHit = false;
@@ -5148,7 +5207,21 @@ bool RaymarchBackgroundField(
         }
         backgroundLayer = BACKGROUND_LAYER_NONE;
     }
-    if (hasWaterOccluder && !deferFarSvoToFarHeightHorizon && !suppressPendingLandWater) {
+    // L3 MOTION GUARD (CPU-fed, O(1) per ray): surfaceRasterParams.y carries the
+    // nearest missing-visible-height-tile distance, computed on the CPU each frame
+    // (0 = guard off / startup, preserving prior behavior). A bare water hit BEYOND
+    // that distance lies in terrain that has NOT streamed yet — accepting it painted
+    // a sea sheet over dry mountains during fast motion ("navy over dry basins",
+    // two-judge verified). Suppress the water there and let the step-budget-bounded
+    // far heightfield own the ray below. Scalar compares only: the two earlier
+    // per-ray terrain-probe fixes both TDR'd the device (see LOOPS.md L-10).
+    const float midStreamSafeDistance = frame.surfaceRasterParams.y;
+    const bool waterBeyondStreamedMid =
+        midStreamSafeDistance > 0.0f &&
+        hasWaterOccluder &&
+        waterOccluderHit.distance > midStreamSafeDistance;
+    if (hasWaterOccluder && !waterBeyondStreamedMid &&
+        !deferFarSvoToFarHeightHorizon && !suppressPendingLandWater) {
         backgroundHit = waterOccluderHit;
         backgroundLayer = BACKGROUND_LAYER_FAR_WATER;
         if (BackgroundHitAllowedByExactNear(rayOrigin, rayDir, backgroundHit, backgroundLayer)) {
@@ -5220,7 +5293,13 @@ bool RaymarchBackgroundField(
         // whole-screen fallback fill.
         const bool highAltitudeVoxelGapFill =
             highAltitudeBackgroundView && rayDir.y < -0.35f;
-        if (!deferFarSvoToFarHeightHorizon && !highAltitudeVoxelGapFill) {
+        // L3 MOTION GUARD: rays whose bare water fallback was suppressed (the water
+        // crossing lies beyond the streamed mid) must reach the far heightfield here
+        // instead of falling to sky — otherwise suppressing the navy sheet would just
+        // trade it for sky holes. Start the march at the guard edge so the streamed
+        // zone (owned by the mesh/mid layers) isn't re-marched.
+        const bool motionTerrainFill = waterBeyondStreamedMid || forceNearMotionTerrainFill;
+        if (!deferFarSvoToFarHeightHorizon && !highAltitudeVoxelGapFill && !motionTerrainFill) {
             return false;
         }
         const float voxelFarHandoff = frame.backgroundOwnershipParams.w > 0.5f
@@ -5228,7 +5307,9 @@ bool RaymarchBackgroundField(
             : max(frame.midFieldParams.z, frame.midFieldParams.y + 1.0f);
         heightStart = deferFarSvoToFarHeightHorizon
             ? max(farStartDist, voxelFarHandoff)
-            : max(startDist, 32.0f);
+            : (waterBeyondStreamedMid
+                ? max(startDist, max(midStreamSafeDistance - 192.0f, 32.0f))
+                : max(startDist, 32.0f));
         // The deferral gate above already bounds rayDir.y < 0.22 for this branch,
         // so let the continuous far heightfield own the full silhouette band
         // (including the mountain tips that heightAngleOk's 0.12 ceiling rejected
@@ -5364,9 +5445,14 @@ RayHit DebugBackgroundLayerHit(RayHit hit, uint layer) {
             const float nearContext = 1.0f - saturate((hit.distance - ownershipRadius) / 2200.0f);
             const float farContext = saturate((hit.distance - frame.midFieldParams.y) /
                 max(frame.midFieldParams.z - frame.midFieldParams.y, 1.0f));
+            // HAZE FIX (native-res milky-band): this is a SECOND atmosphere blend
+            // stacked on top of the per-hit far haze (the far SVO/heightfield shading
+            // already hazes toward sky), so the mid/far got double/triple-washed ->
+            // the milky "static-TV" band. Cut to ~1/3 so the first, tuned haze carries
+            // the atmospheric read without the redundant wash.
             const float layerWeight =
-                (layer == BACKGROUND_LAYER_FAR_SVO || layer == BACKGROUND_LAYER_FAR_HEIGHT) ? 0.24f : 0.18f;
-            const float atmosphere = saturate(nearContext * layerWeight + farContext * 0.10f);
+                (layer == BACKGROUND_LAYER_FAR_SVO || layer == BACKGROUND_LAYER_FAR_HEIGHT) ? 0.08f : 0.06f;
+            const float atmosphere = saturate(nearContext * layerWeight + farContext * 0.035f);
             const float3 contextSky = SkyColor(float3(0.0f, -0.06f, 0.998f));
             hit.color.rgb = lerp(hit.color.rgb, contextSky, atmosphere);
         }
@@ -6491,6 +6577,18 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug) 
         const bool suppressPendingLandWaterFill =
             firstSparseMissingTerrainAdjacent &&
             firstSparseMissingLandAboveSea;
+        // L3 lane A (white wedges at speed): a missing NEAR brick was found on this
+        // ray but the strict nearSparseHole window can refuse to flag grazing
+        // lower-corner rays -> they fell through to the sky tail. When the motion
+        // guard is armed, force the background field to admit these rays to the
+        // far-height march so streaming holes read as terrain, never sky.
+        const bool nearMotionStreamGap =
+            frame.surfaceRasterParams.y > 0.0f &&
+            lowSurfaceAuthorityView &&
+            !highAltitudeBackgroundView &&
+            rayDir.y > -0.88f &&
+            rayDir.y < -0.005f &&
+            firstSparseMissingWorldDist < max(ExactNearDistance(), 224.0f) + 96.0f;
         if (RaymarchBackgroundField(
             rayOrigin,
             rayDir,
@@ -6499,7 +6597,8 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug) 
             true,
             backgroundHit,
             backgroundLayer,
-            suppressPendingLandWaterFill)) {
+            suppressPendingLandWaterFill || nearMotionStreamGap,
+            nearMotionStreamGap)) {
             const float surfaceOwnershipDistance = max(frame.nearOwnershipParams.w, ExactNearDistance());
             const bool lowerLodTerrainBeforeExactSurfaceLimit =
                 backgroundLayer == BACKGROUND_LAYER_MID_VOXEL ||
@@ -6810,13 +6909,72 @@ PSOutput main(PSInput input) {
     // blending: alpha=1 where mid terrain is hit (gradient color wins), alpha=0 elsewhere
     // (full pass's far/background/sky shows through). No depth needed.
     {
+        // DEBUG 69 (mid-isolation / cause map): mirror RaymarchMidVoxelClipmap's GLOBAL
+        // early-outs (lines ~1929-1947) and paint a flat reason tint when one fires, so we
+        // can tell a global DDA-disable apart from a per-ray march miss. These conditions
+        // are all frame constants, so if one is true the WHOLE mid band shows that color.
+        //   RED     = bit4 off (DDA path disabled in sparseNearParams.w)
+        //   BLUE    = mid residency not ready (midResidencyParams.y/.w)
+        //   MAGENTA = background budget/quality gate dropped the mid
+        //   CYAN    = mid clipmap header not valid yet
+        //   PURPLE  = low-altitude DDA gate rejected this view (walk-DDA bit off)
+        //   WHITE   = this ray failed the DDA rayDir.y clamp
+        //   (none)  = global gates passed -> per-ray result below: GREEN hit / ORANGE march-miss
+        if (frame.debugMode == 69u) {
+            const uint snf69 = (uint)frame.sparseNearParams.w;
+            const uint4 hdr69 = MidVoxelClipmapMetadata[0];
+            const bool highAltitude69 = cameraPos.y > 384.0f;
+            const bool walkingDda69 = (snf69 & 32u) != 0u;
+            const bool diagnosticDda69 = frame.debugMode == 65u || frame.debugMode == 67u;
+            const bool walkingTopOnly69 = !highAltitude69 && !walkingDda69;
+            const float minRayY69 = highAltitude69 ? -1.01f : (walkingTopOnly69 ? -0.96f : -0.68f);
+            const float maxRayY69 = highAltitude69 ? 0.20f : 0.42f;
+            float3 reason69 = float3(-1.0f, -1.0f, -1.0f);
+            if ((snf69 & 4u) == 0u) {
+                reason69 = float3(1.0f, 0.0f, 0.0f);
+            } else if (frame.midResidencyParams.y < 0.04f || frame.midResidencyParams.w < 1.0f) {
+                reason69 = float3(0.0f, 0.0f, 1.0f);
+            } else if (frame.renderBudgetParams.z < 0.30f && BackgroundRenderQuality() < 0.45f) {
+                reason69 = float3(1.0f, 0.0f, 1.0f);
+            } else if (frame.midFieldParams.x < 0.5f || hdr69.x != MID_VOXEL_CLIPMAP_MAGIC || hdr69.z == 0u) {
+                reason69 = float3(0.0f, 1.0f, 1.0f);
+            } else if (!highAltitude69 && !walkingDda69 && !diagnosticDda69) {
+                reason69 = float3(0.48f, 0.0f, 1.0f);
+            } else if (rayDir.y > maxRayY69 || rayDir.y < minRayY69) {
+                reason69 = float3(1.0f, 1.0f, 1.0f);
+            }
+            if (reason69.x >= 0.0f) {
+                output.color = float4(reason69, 0.9f);
+                return output;
+            }
+        }
         RayHit midHit;
         bool midGot = RaymarchMidVoxelClipmap(cameraPos, rayDir, 1.0f, midHit);
-        if (!midGot || midHit.distance > 1.0e9f) {
-            output.color = float4(0.0f, 0.0f, 0.0f, 0.0f);   // miss -> transparent
-        } else {
-            output.color = float4(midHit.color.rgb, 1.0f);   // mid terrain -> opaque (gradient)
+        if (midGot && midHit.distance <= 1.0e9f) {
+            // DEBUG 69: a REAL resident mid-voxel DDA hit -> BRIGHT GREEN.
+            if (frame.debugMode == 69u) {
+                output.color = float4(0.05f, 1.0f, 0.10f, 1.0f);
+                return output;
+            }
+            output.color = float4(midHit.color.rgb, 1.0f);   // mid voxel DDA -> opaque (gradient)
+            return output;
         }
+        // DDA miss: render the form-shaded COLUMN proxy here (MidClipmapNormal is enabled
+        // in this variant only) so the flat full-pass column stops reading as a striped
+        // wall. This is the small mid-only PSO, off the uber-shader JIT cliff.
+        RayHit colHit;
+        if (RaymarchMidVoxelColumnClipmap(cameraPos, rayDir, 1.0f, colHit) && colHit.distance <= 1.0e9f) {
+            // DEBUG 69: global gates passed + resident bricks exist, but THIS ray's DDA
+            // march found no acceptable voxel, so the smooth column took over -> ORANGE.
+            // Orange = the per-ray miss we must kill (the real "smooth approximation").
+            if (frame.debugMode == 69u) {
+                output.color = float4(1.0f, 0.50f, 0.0f, 1.0f);
+                return output;
+            }
+            output.color = float4(colHit.color.rgb, 1.0f);   // form-shaded column -> opaque
+            return output;
+        }
+        output.color = float4(0.0f, 0.0f, 0.0f, 0.0f);       // miss -> transparent (full pass shows)
         return output;
     }
 #endif

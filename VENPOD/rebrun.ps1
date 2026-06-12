@@ -756,12 +756,10 @@ try {
         if (-not $env:VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION) {
             $env:VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION = "1"
         }
-        # Mid-pass distant shading (low-res raymarch + analytic gradient normals,
-        # alpha-composited) is on by default too: distant terrain shades as real
-        # gradient-lit mountains instead of flat/grey. Set =0 to disable.
-        if (-not $env:VENPOD_RAYMARCH_MID_PASS_ENABLE) {
-            $env:VENPOD_RAYMARCH_MID_PASS_ENABLE = "1"
-        }
+        # Mid overlay pass: no longer forced here. The launcher decides the default
+        # (OFF when the mesh-mid raster owns the band -- its default -- ON for the
+        # legacy raymarch-mid path). An explicit VENPOD_RAYMARCH_MID_PASS_ENABLE in
+        # the environment still wins everywhere.
         # Phase 2: when GPU mid-voxel generation is ON, the CPU no longer pays the
         # per-voxel fill, so the grown render-distance bubble (radius default 12,
         # set in main_launcher when the GPU-gen flag is on) is affordable. Do NOT

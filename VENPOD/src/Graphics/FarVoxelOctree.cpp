@@ -10,6 +10,8 @@
 #include <iterator>
 #include <limits>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <spdlog/spdlog.h>
 
 namespace VENPOD::Graphics {
@@ -213,6 +215,7 @@ std::filesystem::path FarVoxelOctreeCachePath(const FarVoxelOctreeConfig& config
     return std::filesystem::current_path() /
         ("venpod_far_svo_cache_r" + std::to_string(radius) +
          "_d" + std::to_string(config.maxDepth) +
+         "_lf" + std::to_string(static_cast<int32_t>(config.leafFloor)) +
          "_s" + std::to_string(config.seed) + ".bin");
 }
 
@@ -699,6 +702,204 @@ FarVoxelOctree::BuildResult FarVoxelOctree::BuildCpuData(const FarVoxelOctreeCon
     result.stats.pageCount = static_cast<uint32_t>(builder.m_pages.size());
     result.stats.nodeCount = static_cast<uint32_t>(builder.m_nodes.size());
     result.stats.pageIndexCount = static_cast<uint32_t>(builder.m_pageIndex.size());
+
+    // [P1 SVDAG materialization] Bottom-up de-duplicate identical subtrees into a real
+    // pointer-indirection DAG (the structure the new separate raymarch pass will consume).
+    // Format: DagNode{childPtrBase, childMask, material, flags} (16B, fixed-stride so a node
+    // is addressable by logical id) + a flat ChildPointers array. child c's node index =
+    // ChildPointers[childPtrBase + countbits(childMask & ((1<<c)-1))]. Two parents sharing a
+    // subtree both point their ChildPointers entry at the SAME DagNode id -> true DAG sharing
+    // (impossible in the contiguous-child tree). Leaves carry material/flags, no pointer block.
+    // Gated so normal runs (rebrun.ps1, env unset) pay nothing and behave byte-identically.
+    if (const char* analyze = std::getenv("VENPOD_FARVOXEL_DAG_ANALYZE");
+        analyze && analyze[0] == '1' && !builder.m_nodes.empty()) {
+        const auto matStart = std::chrono::steady_clock::now();
+        const size_t nodeTotal = builder.m_nodes.size();
+
+        struct DagNode {
+            uint32_t childPtrBase;
+            uint32_t childMask;
+            uint32_t material;
+            uint32_t flags;
+        };
+        std::vector<DagNode> dagNodes;
+        std::vector<uint32_t> childPointers;
+        dagNodes.reserve(nodeTotal / 16 + 16);
+        childPointers.reserve(nodeTotal / 8 + 16);
+
+        std::vector<uint32_t> canon(nodeTotal, 0xFFFFFFFFu);  // tree index -> DAG node id
+        std::unordered_map<std::string, uint32_t> uniqueMap;
+        uniqueMap.reserve(nodeTotal / 2 + 16);
+        std::string key;
+        key.reserve(48);
+        auto put = [&key](uint32_t value) {
+            key.push_back(static_cast<char>(value & 0xFFu));
+            key.push_back(static_cast<char>((value >> 8) & 0xFFu));
+            key.push_back(static_cast<char>((value >> 16) & 0xFFu));
+            key.push_back(static_cast<char>((value >> 24) & 0xFFu));
+        };
+        // Children always sit at higher indices than their parent within a page block,
+        // so descending index order canonicalizes children before their parents.
+        for (size_t reverse = 0; reverse < nodeTotal; ++reverse) {
+            const size_t index = nodeTotal - 1 - reverse;
+            const Node& node = builder.m_nodes[index];
+            const bool leaf = (node.flags & kLeafFlag) != 0u ||
+                              node.childMask == 0u ||
+                              node.childBase == 0xFFFFFFFFu;
+            key.clear();
+            uint32_t childDagIds[8];
+            uint32_t childDagCount = 0;
+            if (leaf) {
+                put(0xA11Eu);
+                put(node.flags & (kLeafFlag | kInteriorLeafFlag));
+                put(node.material);
+            } else {
+                put(0x1u);
+                put(node.childMask);
+                uint32_t compact = 0;
+                for (uint32_t child = 0; child < 8; ++child) {
+                    if ((node.childMask & (1u << child)) == 0u) {
+                        continue;
+                    }
+                    const uint32_t childIndex = node.childBase + compact;
+                    ++compact;
+                    const uint32_t childDagId =
+                        (childIndex < nodeTotal) ? canon[childIndex] : 0xFFFFFFFFu;
+                    childDagIds[childDagCount++] = childDagId;
+                    put(childDagId);
+                }
+            }
+            auto found = uniqueMap.find(key);
+            if (found != uniqueMap.end()) {
+                canon[index] = found->second;
+                continue;
+            }
+            const uint32_t newId = static_cast<uint32_t>(dagNodes.size());
+            DagNode dag{};
+            dag.material = node.material;
+            dag.flags = node.flags;
+            if (leaf) {
+                dag.childMask = 0u;
+                dag.childPtrBase = 0xFFFFFFFFu;
+            } else {
+                dag.childMask = node.childMask;
+                dag.childPtrBase = static_cast<uint32_t>(childPointers.size());
+                for (uint32_t k = 0; k < childDagCount; ++k) {
+                    childPointers.push_back(childDagIds[k]);
+                }
+            }
+            dagNodes.push_back(dag);
+            uniqueMap.emplace(key, newId);
+            canon[index] = newId;
+        }
+
+        // Structural integrity: every internal node's pointer block is in-bounds and every
+        // pointer references a valid DAG node.
+        bool structureOk = true;
+        for (size_t i = 0; i < dagNodes.size() && structureOk; ++i) {
+            const DagNode& dag = dagNodes[i];
+            const bool leaf = (dag.flags & kLeafFlag) != 0u ||
+                              dag.childMask == 0u ||
+                              dag.childPtrBase == 0xFFFFFFFFu;
+            if (leaf) {
+                continue;
+            }
+            const uint32_t count = CountBits(dag.childMask);
+            if (static_cast<uint64_t>(dag.childPtrBase) + count > childPointers.size()) {
+                structureOk = false;
+                break;
+            }
+            for (uint32_t k = 0; k < count; ++k) {
+                if (childPointers[dag.childPtrBase + k] >= dagNodes.size()) {
+                    structureOk = false;
+                    break;
+                }
+            }
+        }
+
+        // Correctness: re-expand the DAG and the tree in lockstep from a page root; every
+        // node must agree (leaf-ness, childMask, material, flags). Bounded visit budget keeps
+        // the one-time gated check cheap while still touching real terrain subtrees.
+        bool verifyOk = structureOk;
+        uint64_t verifyVisited = 0;
+        const uint64_t verifyBudget = 4'000'000;
+        if (verifyOk && !builder.m_pages.empty()) {
+            std::vector<std::pair<uint32_t, uint32_t>> stack;  // (treeIndex, dagId)
+            for (size_t p = 0; p < builder.m_pages.size() && p < 8 && verifyOk; ++p) {
+                const uint32_t treeRoot = builder.m_pages[p].rootNode;
+                if (treeRoot >= nodeTotal) {
+                    verifyOk = false;
+                    break;
+                }
+                stack.clear();
+                stack.emplace_back(treeRoot, canon[treeRoot]);
+                while (!stack.empty() && verifyVisited < verifyBudget) {
+                    const auto pair = stack.back();
+                    stack.pop_back();
+                    ++verifyVisited;
+                    const uint32_t treeIdx = pair.first;
+                    const uint32_t dagId = pair.second;
+                    if (treeIdx >= nodeTotal || dagId >= dagNodes.size()) {
+                        verifyOk = false;
+                        break;
+                    }
+                    const Node& tn = builder.m_nodes[treeIdx];
+                    const DagNode& dn = dagNodes[dagId];
+                    const bool tLeaf = (tn.flags & kLeafFlag) != 0u ||
+                                       tn.childMask == 0u ||
+                                       tn.childBase == 0xFFFFFFFFu;
+                    const bool dLeaf = (dn.flags & kLeafFlag) != 0u ||
+                                       dn.childMask == 0u ||
+                                       dn.childPtrBase == 0xFFFFFFFFu;
+                    if (tLeaf != dLeaf) {
+                        verifyOk = false;
+                        break;
+                    }
+                    if (tLeaf) {
+                        if (tn.material != dn.material ||
+                            (tn.flags & (kLeafFlag | kInteriorLeafFlag)) !=
+                                (dn.flags & (kLeafFlag | kInteriorLeafFlag))) {
+                            verifyOk = false;
+                            break;
+                        }
+                        continue;
+                    }
+                    if (tn.childMask != dn.childMask || tn.material != dn.material) {
+                        verifyOk = false;
+                        break;
+                    }
+                    uint32_t compact = 0;
+                    for (uint32_t child = 0; child < 8; ++child) {
+                        if ((tn.childMask & (1u << child)) == 0u) {
+                            continue;
+                        }
+                        const uint32_t treeChild = tn.childBase + compact;
+                        const uint32_t dagChild = childPointers[dn.childPtrBase + compact];
+                        ++compact;
+                        stack.emplace_back(treeChild, dagChild);
+                    }
+                }
+            }
+        }
+
+        const double matMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - matStart).count();
+        const size_t dagNodeCount = dagNodes.size();
+        const double ratio = dagNodeCount > 0
+            ? static_cast<double>(nodeTotal) / static_cast<double>(dagNodeCount)
+            : 0.0;
+        const double treeMiB = static_cast<double>(nodeTotal * sizeof(Node)) / (1024.0 * 1024.0);
+        const double dagMiB = static_cast<double>(
+            dagNodeCount * sizeof(DagNode) + childPointers.size() * sizeof(uint32_t)) /
+            (1024.0 * 1024.0);
+        spdlog::info(
+            "[DAG-MATERIALIZE] maxDepth={} leafFloor=16 pages={} : tree nodes={} ({:.1f} MiB) -> "
+            "DAG nodes={} ptrs={} ({:.2f}x, {:.1f} MiB) verify={} (visited {}) in {:.1f} ms",
+            builder.m_config.maxDepth, builder.m_pages.size(), nodeTotal, treeMiB,
+            dagNodeCount, childPointers.size(), ratio, dagMiB,
+            verifyOk ? "OK" : "FAIL", verifyVisited, matMs);
+    }
+
     result.stats.pageRadius = radius;
     result.stats.maxDepth = builder.m_config.maxDepth;
     result.stats.pageSize = builder.m_config.pageSize;
@@ -975,7 +1176,7 @@ void FarVoxelOctree::BuildNodeInto(uint32_t nodeIndex, const BuildBounds& bounds
         return;
     }
 
-    if (depth >= m_config.maxDepth || bounds.size <= 16.0f) {
+    if (depth >= m_config.maxDepth || bounds.size <= m_config.leafFloor) {
         const float centerX = bounds.x + bounds.size * 0.5f;
         const float centerZ = bounds.z + bounds.size * 0.5f;
         const float height = TerrainHeight(centerX, centerZ);
@@ -1367,6 +1568,185 @@ float FarVoxelOctree::TerrainHeight(float x, float z) const {
         height,
         static_cast<float>(VENPOD::Simulation::TERRAIN_MIN_Y),
         static_cast<float>(VENPOD::Simulation::TERRAIN_MAX_Y));
+}
+
+bool FarVoxelOctree::BuildDagFromTree(
+    const std::vector<Node>& treeNodes,
+    const std::vector<Page>& treePages,
+    std::vector<DagNodeGpu>& outNodes,
+    std::vector<uint32_t>& outChildPointers,
+    std::vector<DagPageGpu>& outPages)
+{
+    outNodes.clear();
+    outChildPointers.clear();
+    outPages.clear();
+    const size_t nodeTotal = treeNodes.size();
+    if (nodeTotal == 0) {
+        return false;
+    }
+    outNodes.reserve(nodeTotal / 16 + 16);
+    outChildPointers.reserve(nodeTotal / 8 + 16);
+
+    std::vector<uint32_t> canon(nodeTotal, 0xFFFFFFFFu);  // tree index -> DAG node id
+    std::unordered_map<std::string, uint32_t> uniqueMap;
+    uniqueMap.reserve(nodeTotal / 2 + 16);
+    std::string key;
+    key.reserve(48);
+    auto put = [&key](uint32_t value) {
+        key.push_back(static_cast<char>(value & 0xFFu));
+        key.push_back(static_cast<char>((value >> 8) & 0xFFu));
+        key.push_back(static_cast<char>((value >> 16) & 0xFFu));
+        key.push_back(static_cast<char>((value >> 24) & 0xFFu));
+    };
+    // Children sit at higher indices than their parent within each page block, so a
+    // descending walk canonicalizes children before parents (the same ordering the
+    // verified materialization measurement uses).
+    for (size_t reverse = 0; reverse < nodeTotal; ++reverse) {
+        const size_t index = nodeTotal - 1 - reverse;
+        const Node& node = treeNodes[index];
+        const bool leaf = (node.flags & kLeafFlag) != 0u ||
+                          node.childMask == 0u ||
+                          node.childBase == 0xFFFFFFFFu;
+        key.clear();
+        uint32_t childDagIds[8];
+        uint32_t childDagCount = 0;
+        if (leaf) {
+            put(0xA11Eu);
+            put(node.flags & (kLeafFlag | kInteriorLeafFlag));
+            put(node.material);
+        } else {
+            put(0x1u);
+            put(node.childMask);
+            uint32_t compact = 0;
+            for (uint32_t child = 0; child < 8; ++child) {
+                if ((node.childMask & (1u << child)) == 0u) {
+                    continue;
+                }
+                const uint32_t childIndex = node.childBase + compact;
+                ++compact;
+                const uint32_t childDagId =
+                    (childIndex < nodeTotal) ? canon[childIndex] : 0xFFFFFFFFu;
+                childDagIds[childDagCount++] = childDagId;
+                put(childDagId);
+            }
+        }
+        auto found = uniqueMap.find(key);
+        if (found != uniqueMap.end()) {
+            canon[index] = found->second;
+            continue;
+        }
+        const uint32_t newId = static_cast<uint32_t>(outNodes.size());
+        DagNodeGpu dag{};
+        dag.material = node.material;
+        dag.flags = node.flags;
+        if (leaf) {
+            dag.childMask = 0u;
+            dag.childPtrBase = 0xFFFFFFFFu;
+        } else {
+            dag.childMask = node.childMask;
+            dag.childPtrBase = static_cast<uint32_t>(outChildPointers.size());
+            for (uint32_t k = 0; k < childDagCount; ++k) {
+                outChildPointers.push_back(childDagIds[k]);
+            }
+        }
+        outNodes.push_back(dag);
+        uniqueMap.emplace(key, newId);
+        canon[index] = newId;
+    }
+
+    outPages.reserve(treePages.size());
+    for (const Page& page : treePages) {
+        DagPageGpu dagPage{};
+        dagPage.originX = page.originX;
+        dagPage.originY = page.originY;
+        dagPage.originZ = page.originZ;
+        dagPage.rootNode =
+            (page.rootNode < nodeTotal) ? canon[page.rootNode] : 0xFFFFFFFFu;
+        outPages.push_back(dagPage);
+    }
+    return !outNodes.empty();
+}
+
+void FarVoxelOctree::EnsureDagResident(
+    ID3D12Device* device,
+    ID3D12GraphicsCommandList* cmdList,
+    DescriptorHeapManager& heapManager)
+{
+    if (m_dagReady || m_dagBuildAttempted || !device || !cmdList) {
+        return;
+    }
+    const char* enable = std::getenv("VENPOD_FARVOXEL_DAG");
+    if (!(enable && enable[0] == '1')) {
+        return;  // P2 feature flag off -> DAG never built (zero cost, engine unchanged)
+    }
+    if (m_nodes.empty() || m_pages.empty()) {
+        return;  // tree not resident yet; retry on a later frame
+    }
+    m_dagBuildAttempted = true;
+
+    const auto buildStart = std::chrono::steady_clock::now();
+    std::vector<DagNodeGpu> dagNodes;
+    std::vector<uint32_t> childPointers;
+    std::vector<DagPageGpu> dagPages;
+    if (!BuildDagFromTree(m_nodes, m_pages, dagNodes, childPointers, dagPages) ||
+        dagNodes.empty() || childPointers.empty() || dagPages.empty()) {
+        spdlog::warn("FarVoxelOctree::EnsureDagResident - DAG build produced no data");
+        return;
+    }
+
+    const uint64_t nodeBytes = static_cast<uint64_t>(dagNodes.size()) * sizeof(DagNodeGpu);
+    const uint64_t ptrBytes = static_cast<uint64_t>(childPointers.size()) * sizeof(uint32_t);
+    const uint64_t pageBytes = static_cast<uint64_t>(dagPages.size()) * sizeof(DagPageGpu);
+
+    auto upload = [&](GPUBuffer& buffer, const void* data, uint64_t bytes, uint32_t stride,
+                      const char* name) -> bool {
+        auto result = buffer.InitializeWithData(
+            device, cmdList, data, bytes,
+            BufferUsage::Default | BufferUsage::StructuredBuffer, stride, name);
+        if (!result) {
+            spdlog::warn("FarVoxelOctree::EnsureDagResident - {} upload failed: {}",
+                         name, result.error());
+            return false;
+        }
+        auto srv = buffer.CreateSRV(device, heapManager);
+        if (!srv) {
+            spdlog::warn("FarVoxelOctree::EnsureDagResident - {} SRV failed: {}",
+                         name, srv.error());
+            return false;
+        }
+        buffer.TransitionTo(
+            cmdList,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        return true;
+    };
+
+    if (!upload(m_dagNodeBuffer, dagNodes.data(), nodeBytes, sizeof(DagNodeGpu),
+                "FarVoxelDag_Nodes") ||
+        !upload(m_dagChildPtrBuffer, childPointers.data(), ptrBytes, sizeof(uint32_t),
+                "FarVoxelDag_ChildPtrs") ||
+        !upload(m_dagPageBuffer, dagPages.data(), pageBytes, sizeof(DagPageGpu),
+                "FarVoxelDag_Pages")) {
+        return;
+    }
+
+    m_dagNodeCount = dagNodes.size();
+    m_dagChildPtrCount = childPointers.size();
+    m_dagPageCount = dagPages.size();
+    m_dagReady = true;
+
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - buildStart).count();
+    const double mib =
+        static_cast<double>(nodeBytes + ptrBytes + pageBytes) / (1024.0 * 1024.0);
+    spdlog::info(
+        "[DAG-RESIDENT] uploaded DAG: nodes={} ptrs={} pages={} ({:.1f} MiB) in {:.1f} ms; "
+        "SRVs valid={}",
+        m_dagNodeCount, m_dagChildPtrCount, m_dagPageCount, mib, ms,
+        (GetDagNodeSRV().IsValid() && GetDagChildPtrSRV().IsValid() &&
+         GetDagPageSRV().IsValid())
+            ? 1
+            : 0);
 }
 
 } // namespace VENPOD::Graphics

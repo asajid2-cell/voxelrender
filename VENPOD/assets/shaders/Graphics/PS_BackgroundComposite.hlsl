@@ -21,13 +21,11 @@ PSOutput main(PSInput input) {
 #if VENPOD_BACKGROUND_COMPOSITE_FORCE_COLOR
     output.color = float4(0.0f, 0.95f, 1.0f, 1.0f);
 #else
-    uint backgroundWidth = 1;
-    uint backgroundHeight = 1;
-    BackgroundColor.GetDimensions(backgroundWidth, backgroundHeight);
-    uint2 texel = min(
-        (uint2)floor(saturate(input.uv) * float2(backgroundWidth, backgroundHeight)),
-        uint2(backgroundWidth - 1, backgroundHeight - 1));
-    output.color = BackgroundColor.Load(int3(texel, 0));
+    // Linear filter the low-res (0.3-scale) background when upscaling to the main
+    // RT. The previous Load() point-sampled, which hard-upscaled ~576x324 -> 1080p
+    // with nearest-neighbor = the blocky "static-TV" mid/far in perf mode. The
+    // linear BackgroundSampler (s0) was declared but unused; use it.
+    output.color = BackgroundColor.SampleLevel(BackgroundSampler, saturate(input.uv), 0.0f);
     output.color.a = 1.0f;
 #endif
     return output;
