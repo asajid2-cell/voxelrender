@@ -57,3 +57,13 @@ vcpkg_installed/
 # OS noise
 Thumbs.db
 Desktop.ini
+
+# Dev-session artifacts (ledgers, scratch, checkpoints)
+VENPOD/tmp/
+VENPOD/LOOPS.md
+VENPOD/TANDEM.md
+imgui.ini
+**/imgui.ini
+*.bin
+refactor.md
+VENPOD/docs/assets/

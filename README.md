@@ -2,9 +2,15 @@
 
 **A from-scratch DirectX 12 engine that streams an infinite, editable voxel world — with terrain generated on the GPU and falling-sand-style material simulation.**
 
-![VENPOD rendering its streamed voxel world](docs/media/sparse-engine-contact-sheet.png)
+![Flying over VENPOD's streamed voxel terrain](docs/media/vista_orbit.gif)
 
-*Real in-engine captures: an infinite voxel landscape of cliffs, caves, and water you can fly through and reshape in real time.*
+*Real in-engine capture: an infinite voxel landscape streamed in sparse bricks as the camera flies — terraced valleys, mountain ranges, and lakes you can reshape in real time.*
+
+| | |
+| --- | --- |
+| ![Terraced valleys under a mountain wall](docs/media/hero_terraces.png) | ![Spire range at full render distance](docs/media/spire_range.png) |
+
+*Full-resolution stills from the engine's quality mode ([more clips](docs/media): mountain sweep, low cruise, valley orbit).*
 
 **Why it's hard:** no game engine, no graphics library — just raw DirectX 12. That means hand-managing GPU memory, descriptor heaps, command queues, and fence synchronization; writing a custom voxel renderer (DDA raymarch + rasterized sparse surfaces); generating terrain on the GPU with compute shaders; and simulating falling-sand-style materials (sand, water, lava) across the world.
 
@@ -27,7 +33,12 @@ Everything below is the engineering detail — architecture, build internals, co
 - Sparse near-field brick pool using `16 x 16 x 16` world-space bricks.
 - Generation-aware CPU/GPU page-table publication.
 - Rasterized sparse surface path with GPU culling and indirect draw commands.
-- Mid voxel/height clipmap continuity and async far SVO background ownership.
+- Full-resolution terrain LOD mesh as an always-present floor: distance-capped
+  quad sizes, slope-aware refinement, sliced cliff risers, and resident-aware
+  finer-LOD suppression so every distance band renders real stepped geometry.
+- Mid voxel/height clipmap continuity and async far SVO background ownership,
+  with a CPU-fed streamed-radius guard so un-streamed terrain never renders as
+  false water or sky during fast flight.
 - Legacy fullscreen HLSL raymarch renderer over a moving dense voxel window for
   fallback and comparison.
 - Conceptual vertical terrain range from `Y = -332` to `Y = 664`.
@@ -220,10 +231,13 @@ Current limitations:
   from the pause-menu metrics panel.
 - GPU brush feedback and GPU physics proposal application are guarded hybrid
   paths; CPU sparse authority remains the resilience fallback.
-- Mid/far terrain is coherent enough for smoke/regression gates, but the final
-  long-distance hierarchy still needs visual polish and more LOD work.
-- Public review media is generated on demand by `.\public_demo_capture.ps1`;
-  large MP4 artifacts are not checked into git.
+- Distant cliffs beyond ~5 km render as coarser stepped geometry by design (a
+  measured fps/fidelity tradeoff); `VENPOD_SPARSE_MID_MESH_MAX_DISTANCE=13900`
+  extends full terrain geometry to the render horizon for screenshot sessions.
+- At extreme flight speeds (200+ units/s) streaming can briefly lag the camera;
+  un-streamed terrain falls back to an analytic fill rather than holes.
+- The curated demo media lives in `docs/media`; the broader review suites are
+  generated on demand by the capture scripts and stay out of git.
 
 Generated build outputs are intentionally excluded from version control.
 
