@@ -8,13 +8,13 @@
 
 | | |
 | --- | --- |
-| ![Terraced valleys under a mountain wall](docs/media/hero_terraces.png) | ![Spire range at full render distance](docs/media/spire_range.png) |
+| ![Terraced valleys under a mountain wall](docs/media/hero_terraces.png) | ![A winding valley road through the terraces](docs/media/valley_road.png) |
 
 *Full-resolution stills from the engine's quality mode ([more clips](docs/media): mountain sweep, low cruise, valley orbit).*
 
-**Why it's hard:** no game engine, no graphics library — just raw DirectX 12. That means hand-managing GPU memory, descriptor heaps, command queues, and fence synchronization; writing a custom voxel renderer (DDA raymarch + rasterized sparse surfaces); generating terrain on the GPU with compute shaders; and simulating falling-sand-style materials (sand, water, lava) across the world.
+**Why it's hard:** no game engine, no graphics library — just raw DirectX 12. That means hand-managing GPU memory, descriptor heaps, command queues, and fence synchronization; writing a custom voxel renderer (DDA raymarch + rasterized sparse surfaces); generating terrain on the GPU with compute shaders; and simulating falling-sand-style materials across the world.
 
-**What you can do in it:** fly through an infinite world, paint and erase voxels to carve tunnels and build bridges, and watch sand / water / lava-style materials flow and settle — streamed in sparse bricks as you move, with your edits persisting.
+**What you can do in it:** fly through an infinite streamed world (above), then land and reshape it — paint and erase voxels with a brush, carve tunnels, and let sand/water-style materials flow and settle. Edits persist across streaming and can be saved between runs.
 
 **Run it** (Windows + a DirectX 12 GPU):
 
@@ -33,12 +33,12 @@ Everything below is the engineering detail — architecture, build internals, co
 - Sparse near-field brick pool using `16 x 16 x 16` world-space bricks.
 - Generation-aware CPU/GPU page-table publication.
 - Rasterized sparse surface path with GPU culling and indirect draw commands.
-- Full-resolution terrain LOD mesh as an always-present floor: distance-capped
-  quad sizes, slope-aware refinement, sliced cliff risers, and resident-aware
-  finer-LOD suppression so every distance band renders real stepped geometry.
-- Mid voxel/height clipmap continuity and async far SVO background ownership,
-  with a CPU-fed streamed-radius guard so un-streamed terrain never renders as
-  false water or sky during fast flight.
+- Full-resolution terrain LOD mesh as an always-present floor — every distance
+  band renders real stepped voxel geometry (distance-capped quad sizes,
+  slope-aware refinement, resident-aware LOD suppression).
+- Streaming that degrades honestly: a CPU-fed streamed-radius guard keeps
+  un-streamed terrain from ever rendering as false water or sky during fast
+  flight, backed by mid/height clipmaps and an async far SVO horizon.
 - Legacy fullscreen HLSL raymarch renderer over a moving dense voxel window for
   fallback and comparison.
 - Conceptual vertical terrain range from `Y = -332` to `Y = 664`.
@@ -65,9 +65,19 @@ Input / Camera
   -> ImGui diagnostics
 ```
 
-VENPOD now treats stable world-space sparse bricks as the main development
-architecture. Dense moving-buffer code still exists as a legacy path and as a
-small compatibility owner for some older buffers in sparse runtime mode.
+The engine's unit of streaming is a stable world-space sparse brick. A dense
+moving-buffer renderer is retained as a legacy comparison path.
+
+### Where to look in the code
+
+| Area | Path |
+| --- | --- |
+| DX12 device, swapchain, pipelines, GPU memory | `VENPOD/src/Graphics/Renderer.cpp`, `src/Graphics/DX12*` |
+| Voxel raymarcher (DDA, LOD layers, water/sky) | `VENPOD/assets/shaders/Graphics/PS_Raymarch.hlsl` |
+| Sparse streaming: bricks, clipmaps, terrain LOD mesh | `VENPOD/src/Simulation/SparseClipmap.cpp` |
+| GPU terrain generation (compute) | `VENPOD/assets/shaders/Compute/CS_GenerateMidVoxelBricks.hlsl` |
+| Far-field sparse voxel octree | `VENPOD/src/Graphics/FarVoxelOctree.cpp` |
+| Capture & regression harnesses | `VENPOD/democapture.ps1`, `VENPOD/sparse_regression.ps1` |
 
 ## Build
 
@@ -125,39 +135,17 @@ cd VENPOD
 .\rebrun.ps1 -SparseEditFile saves\review-edits.vsed
 ```
 
-To generate public review media from the in-engine DX12 capture path:
+To capture demo media (smooth 60fps flight clips and full-res stills) straight
+from the engine's DX12 capture path:
 
 ```powershell
 cd VENPOD
-.\public_demo_capture.ps1 -Config Release
+.\democapture.ps1 -Tag myclip -AltTenths 1800 -PitchDeg -22 -YawRate 12   # video
+.\democapture.ps1 -Tag stills -Mode quality -Stills                       # stills
 ```
 
-To generate one review reel that combines normal, high-flight, and
-waterline/submerged validated segments:
-
-```powershell
-cd VENPOD
-.\public_demo_capture.ps1 -Config Release -ReviewReel
-```
-
-To regenerate the broader visual review suite used by the completion ledger:
-
-```powershell
-cd VENPOD
-.\visual_review_capture.ps1 -Config Release
-```
-
-This produces normal, walk, long-walk, fast-flight, long-fast-flight,
-fast water-transition, long fast-water transition, waterline, and
-long-waterline contact sheets plus a manual checklist and CSV summary under
-`VENPOD/build/logs/visual_review_capture/`. Passing this
-wrapper does not by itself mean the visuals are accepted for release; it creates
-the evidence reviewers use for that decision.
-
-The full sparse regression gate also runs a short dense legacy fallback smoke so
-that comparison path stays covered. It also verifies the public demo capture
-runtime log for terrain ownership, mid/far ownership, visible far-SVO pixels,
-surface fragments, and zero sparse miss/unsafe-near-miss pixels:
+To run the visual regression gate (scripted flight scenarios, ownership and
+coverage checks against the runtime log):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\VENPOD\sparse_regression.ps1 -Config Release
