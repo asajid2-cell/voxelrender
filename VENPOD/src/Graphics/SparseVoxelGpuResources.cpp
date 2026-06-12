@@ -843,12 +843,21 @@ MidClipmapUploadPlan BuildMidClipmapUploadPlan(
         !snapshot.metadata.empty() &&
         !snapshot.lookup.empty() &&
         !snapshot.samples.empty();
+    // Do NOT require !voxelSamples.empty() here. With GPU mid-voxel generation
+    // (rebrun forces VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION=1) the snapshot emits
+    // ZERO voxel sample ranges -- the samples are produced by the compute dispatch --
+    // so voxelSamples is empty BY DESIGN. Gating the whole voxel layer on non-empty
+    // samples also suppressed the metadata+lookup upload, so the mid-voxel clipmap GPU
+    // metadata header (magic 0x56435658) was NEVER written; RaymarchMidVoxelClipmap then
+    // bailed at its header check on every ray and the smooth height column won every mid
+    // pixel (the "smooth approximation"). Metadata+lookup MUST upload regardless of
+    // samples (SparseClipmap.cpp BuildGpuSnapshot: "metadata+lookup are still CPU-built
+    // and uploaded as usual"). voxelSampleBytes is allowed to be 0 below.
     plan.uploadVoxelLayer =
         uploadVoxelLayer &&
         snapshot.voxelBrickCount > 0 &&
         !snapshot.voxelMetadata.empty() &&
-        !snapshot.voxelLookup.empty() &&
-        !snapshot.voxelSamples.empty();
+        !snapshot.voxelLookup.empty();
     if (!plan.uploadHeightLayer && !plan.uploadVoxelLayer) {
         return plan;
     }
@@ -2082,12 +2091,14 @@ bool SparseVoxelGpuResources::StageMidClipmapSnapshot(
         !snapshot.metadata.empty() &&
         !snapshot.lookup.empty() &&
         !snapshot.samples.empty();
+    // See BuildMidClipmapUploadPlan: deliberately NOT requiring non-empty voxelSamples.
+    // Under GPU mid-voxel gen the samples are empty by design; gating here too suppressed
+    // the metadata-header upload and left the mid-voxel DDA permanently disabled.
     uploadVoxelLayer =
         uploadVoxelLayer &&
         snapshot.voxelBrickCount > 0 &&
         !snapshot.voxelMetadata.empty() &&
-        !snapshot.voxelLookup.empty() &&
-        !snapshot.voxelSamples.empty();
+        !snapshot.voxelLookup.empty();
     if (!uploadHeightLayer && !uploadVoxelLayer) {
         return false;
     }
@@ -2157,10 +2168,14 @@ bool SparseVoxelGpuResources::StageMidClipmapSnapshot(
     if (plan.voxelMetadataBytes > 0) {
         std::memcpy(mapped + voxelMetadataOffset, snapshot.voxelMetadata.data(), static_cast<size_t>(plan.voxelMetadataBytes));
         std::memcpy(mapped + voxelLookupOffset, snapshot.voxelLookup.data(), static_cast<size_t>(plan.voxelLookupBytes));
-        std::memcpy(
-            mapped + voxelSamplesOffset,
-            snapshot.voxelSamples.data(),
-            static_cast<size_t>(plan.voxelSampleBytes));
+        // voxelSampleBytes is 0 under GPU mid-voxel gen (samples come from compute, not
+        // this staging copy); skip the memcpy so we never dereference an empty .data().
+        if (plan.voxelSampleBytes > 0) {
+            std::memcpy(
+                mapped + voxelSamplesOffset,
+                snapshot.voxelSamples.data(),
+                static_cast<size_t>(plan.voxelSampleBytes));
+        }
     }
     m_uploadWriteOffset = endOffset;
     m_stats.stagedBytesLastFrame += endOffset - metadataOffset;

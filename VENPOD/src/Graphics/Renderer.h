@@ -115,6 +115,10 @@ public:
         uint32_t midFieldResidentVoxelBricks = 0;
         float surfaceRasterMaxDistance = 0.0f;
         float exactNearDistance = 0.0f;
+        // L3 motion guard: nearest missing-visible-height-tile distance this frame
+        // (0 = guard off / startup). Shader reads it via surfaceRasterParams.y to
+        // suppress the bare far-water fallback beyond the streamed mid region.
+        float midStreamSafeDistance = 0.0f;
         uint32_t worldSeed = 12345u;
         uint32_t debugMode = 0;
     };
@@ -207,6 +211,23 @@ public:
         const SparseNearField* sparseNearField = nullptr
     );
 
+    // P2 editable-SVDAG pass: a separate fullscreen raymarch over the DAG, composited
+    // behind the near mesh via stencil==0 ownership (mirrors the fullscreen pass state)
+    // + alpha blend. Drawn AFTER RenderVoxels and BEFORE overlays; gated by the caller.
+    void RenderDagRaymarch(
+        ID3D12GraphicsCommandList* cmdList,
+        const DescriptorHandle& dagNodeSRV,
+        const DescriptorHandle& dagChildPtrSRV,
+        const DescriptorHandle& dagPageSRV,
+        const DescriptorHandle& dagPageIndexSRV,
+        const CameraParams& camera,
+        uint32_t dagPageCount,
+        uint32_t dagNodeCount,
+        float pageSize,
+        int32_t pageRadius,
+        float rootMinY
+    );
+
     void RenderSparseSurfaceFaces(
         ID3D12GraphicsCommandList* cmdList,
         const DescriptorHandle& surfaceFacesSRV,
@@ -258,6 +279,7 @@ private:
     // (passed in as fullscreenDesc) and only swaps the pixel shader for the
     // RAYMARCH_MID_ONLY=1 variant plus alpha-over blending.
     Result<void> CreateMidPassPipeline(ID3D12Device* device, GraphicsPipelineDesc fullscreenDesc);
+    Result<void> CreateDagRaymarchPipeline(ID3D12Device* device);
     Result<void> CreateSparseSurfacePipeline(ID3D12Device* device);
     Result<void> CreateOverlayPipeline(ID3D12Device* device);
     Result<void> CreateBackgroundCompositePipeline(ID3D12Device* device);
@@ -286,6 +308,7 @@ private:
     // Fullscreen rendering pipeline
     DX12GraphicsPipeline m_fullscreenPipeline;
     DX12GraphicsPipeline m_midPassPipeline;
+    DX12GraphicsPipeline m_dagRaymarchPipeline;
     DX12GraphicsPipeline m_sparseSurfacePipeline;
     DX12GraphicsPipeline m_overlayPipeline;
     DX12GraphicsPipeline m_backgroundCompositePipeline;
@@ -294,6 +317,7 @@ private:
     CompiledShader m_fullscreenVS;
     CompiledShader m_fullscreenPS;
     CompiledShader m_midPassPS;
+    CompiledShader m_dagRaymarchPS;
     CompiledShader m_sparseSurfaceVS;
     CompiledShader m_sparseSurfacePS;
     CompiledShader m_overlayPS;
@@ -302,6 +326,7 @@ private:
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_frameConstantUploads;
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_sparseSurfaceConstantUploads;
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_overlayConstantUploads;
+    std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_dagConstantUploads;
     GPUBuffer m_dummyRenderOwnershipUAV;
 
     uint32_t m_currentFrameIndex = 0;

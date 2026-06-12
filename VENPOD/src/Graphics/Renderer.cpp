@@ -288,6 +288,14 @@ Result<void> Renderer::Initialize(
         if (!result) {
             return Error("Failed to create overlay frame constants upload buffer: {}", result.error());
         }
+        std::snprintf(name, sizeof(name), "DagFrameConstants_%u", i);
+        result = m_dagConstantUploads[i].Initialize(
+            device.GetDevice(),
+            kFrameConstantUploadBytes,
+            name);
+        if (!result) {
+            return Error("Failed to create DAG frame constants upload buffer: {}", result.error());
+        }
     }
     result = m_dummyRenderOwnershipUAV.Initialize(
         device.GetDevice(),
@@ -307,6 +315,11 @@ Result<void> Renderer::Initialize(
     result = CreateFullscreenPipeline(device.GetDevice());
     if (!result) {
         return Error("Failed to create fullscreen pipeline: {}", result.error());
+    }
+    // P2 editable-SVDAG raymarch pipeline (separate pass; off the uber-shader).
+    result = CreateDagRaymarchPipeline(device.GetDevice());
+    if (!result) {
+        return Error("Failed to create DAG raymarch pipeline: {}", result.error());
     }
     result = CreateSparseSurfacePipeline(device.GetDevice());
     if (!result) {
@@ -736,7 +749,8 @@ void Renderer::RenderVoxels(
     constants.exactNearParams[2] = ClampFinite(camera.midFieldVoxelInterestCoverage, 0.0f, 1.0f, 0.0f);
     constants.exactNearParams[3] = ClampFinite(camera.midFieldVoxelWorstRingCoverage, 0.0f, 1.0f, 0.0f);
     constants.surfaceRasterParams[0] = NonNegativeFiniteOr(camera.surfaceRasterMaxDistance, 0.0f);
-    constants.surfaceRasterParams[1] = 0.0f;
+    // y = L3 motion guard: streamed-mid safe distance (0 = off). See CameraParams.
+    constants.surfaceRasterParams[1] = NonNegativeFiniteOr(camera.midStreamSafeDistance, 0.0f);
     constants.surfaceRasterParams[2] = 0.0f;
     constants.surfaceRasterParams[3] = 0.0f;
 
@@ -1608,6 +1622,149 @@ Result<void> Renderer::CreateMidPassPipeline(ID3D12Device* device, GraphicsPipel
 
     spdlog::info("Mid pass pipeline created successfully");
     return {};
+}
+
+Result<void> Renderer::CreateDagRaymarchPipeline(ID3D12Device* device) {
+    // Compile the separate DAG raymarch pixel shader (reuses the fullscreen VS).
+    std::filesystem::path psPath = m_config.shaderPath / "Graphics" / "PS_DagRaymarch.hlsl";
+    ShaderCompileOptions psOptions;
+    psOptions.entryPoint = L"main";
+    psOptions.target = L"ps_6_0";
+    psOptions.debugInfo = m_config.debugShaders;
+    psOptions.optimizationLevel3 = true;
+    auto psResult = m_shaderCompiler.CompileFromFile(psPath, psOptions);
+    if (!psResult) {
+        return Error("Failed to compile DAG raymarch pixel shader: {}", psResult.error());
+    }
+    m_dagRaymarchPS = psResult.value();
+    if (!m_dagRaymarchPS.IsValid()) {
+        return Error("DAG raymarch pixel shader compilation failed: {}", m_dagRaymarchPS.errors);
+    }
+
+    GraphicsPipelineDesc desc;
+    desc.vertexShader = m_fullscreenVS;
+    desc.pixelShader = m_dagRaymarchPS;
+
+    // b0: FrameConstants CBV
+    RootParameter cbv;
+    cbv.type = RootParamType::ConstantBuffer;
+    cbv.shaderRegister = 0;
+    cbv.registerSpace = 0;
+    cbv.visibility = D3D12_SHADER_VISIBILITY_ALL;
+    desc.rootParams.push_back(cbv);
+    // t0 DagNodes, t1 DagChildPointers, t2 DagPages, t3 DagPageIndex
+    for (uint32_t reg = 0; reg < 4; ++reg) {
+        desc.rootParams.push_back({
+            RootParamType::DescriptorTable,
+            reg,
+            0,
+            D3D12_SHADER_VISIBILITY_PIXEL,
+            1,
+            D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+        });
+    }
+
+    desc.rtvFormats.push_back(DXGI_FORMAT_R8G8B8A8_UNORM);
+    desc.inputLayout.clear();
+    // Mirror the fullscreen pass's stencil ownership exactly (paint only where the near
+    // mesh left stencil == 0), and add alpha blending so the DAG overwrites the existing
+    // mid/far background where a ray hits (alpha 1) and leaves it where it misses (alpha 0).
+    desc.depthEnable = true;
+    desc.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    desc.depthFunc = D3D12_COMPARISON_FUNC_LESS;
+    desc.stencilEnable = true;
+    desc.stencilReadMask = 0xFFu;
+    desc.stencilWriteMask = 0x00u;
+    desc.frontStencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
+    desc.frontStencilPassOp = D3D12_STENCIL_OP_KEEP;
+    desc.frontStencilFailOp = D3D12_STENCIL_OP_KEEP;
+    desc.frontStencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    desc.dsvFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    desc.blendEnable = true;
+    desc.cullMode = D3D12_CULL_MODE_NONE;
+    desc.debugName = "DagRaymarchPipeline";
+
+    auto result = m_dagRaymarchPipeline.Initialize(device, desc);
+    if (!result) {
+        return Error("Failed to create DAG raymarch pipeline: {}", result.error());
+    }
+    spdlog::info("DAG raymarch pipeline created successfully");
+    return {};
+}
+
+void Renderer::RenderDagRaymarch(
+    ID3D12GraphicsCommandList* cmdList,
+    const DescriptorHandle& dagNodeSRV,
+    const DescriptorHandle& dagChildPtrSRV,
+    const DescriptorHandle& dagPageSRV,
+    const DescriptorHandle& dagPageIndexSRV,
+    const CameraParams& camera,
+    uint32_t dagPageCount,
+    uint32_t dagNodeCount,
+    float pageSize,
+    int32_t pageRadius,
+    float rootMinY)
+{
+    if (!cmdList) return;
+    if (!dagNodeSRV.IsValid() || !dagChildPtrSRV.IsValid() ||
+        !dagPageSRV.IsValid() || !dagPageIndexSRV.IsValid()) {
+        return;
+    }
+    if (dagNodeCount == 0u || dagPageCount == 0u || pageSize <= 0.0f) {
+        return;
+    }
+    if (m_dagRaymarchPipeline.GetPSO() == nullptr) {
+        return;
+    }
+
+    ID3D12DescriptorHeap* heaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
+    cmdList->SetDescriptorHeaps(1, heaps);
+
+    m_dagRaymarchPipeline.Bind(cmdList);
+    cmdList->OMSetStencilRef(0);
+
+    FrameConstantsCpu constants = {};
+    constants.cameraPosition[0] = FiniteOr(camera.posX, 0.0f);
+    constants.cameraPosition[1] = FiniteOr(camera.posY, 0.0f);
+    constants.cameraPosition[2] = FiniteOr(camera.posZ, 0.0f);
+    constants.cameraPosition[3] = ClampFinite(camera.fov, 1.0f, 175.0f, 75.0f);
+    constants.cameraForward[0] = FiniteOr(camera.forwardX, 0.0f);
+    constants.cameraForward[1] = FiniteOr(camera.forwardY, 0.0f);
+    constants.cameraForward[2] = FiniteOr(camera.forwardZ, 1.0f);
+    constants.cameraForward[3] = std::max(0.001f, FiniteOr(camera.aspectRatio, 1.0f));
+    constants.cameraRight[0] = FiniteOr(camera.rightX, 1.0f);
+    constants.cameraRight[1] = FiniteOr(camera.rightY, 0.0f);
+    constants.cameraRight[2] = FiniteOr(camera.rightZ, 0.0f);
+    constants.cameraUp[0] = FiniteOr(camera.upX, 0.0f);
+    constants.cameraUp[1] = FiniteOr(camera.upY, 1.0f);
+    constants.cameraUp[2] = FiniteOr(camera.upZ, 0.0f);
+    constants.sunDirection[0] = 0.5f;
+    constants.sunDirection[1] = 1.0f;
+    constants.sunDirection[2] = 0.3f;
+    constants.sunDirection[3] = 1.0f;
+    constants.viewportWidth = static_cast<float>(m_width);
+    constants.viewportHeight = static_cast<float>(m_height);
+    constants.frameIndex = camera.frameIndex;
+    constants.debugMode = camera.debugMode;
+    constants.farFieldParams[0] = 1.0f;
+    constants.farFieldParams[1] = static_cast<float>(dagPageCount);
+    constants.farFieldParams[2] = static_cast<float>(dagNodeCount);
+    constants.farFieldParams[3] = pageSize;
+    constants.farFieldGridParams[0] = static_cast<float>(pageRadius);
+    constants.farFieldGridParams[1] = static_cast<float>(pageRadius * 2 + 1);
+    constants.farFieldGridParams[2] = rootMinY;
+    constants.farFieldGridParams[3] = 0.0f;
+
+    UploadBuffer& frameConstantsUpload = m_dagConstantUploads[m_currentFrameIndex];
+    if (void* mapped = frameConstantsUpload.GetMappedData()) {
+        std::memcpy(mapped, &constants, sizeof(constants));
+    }
+    cmdList->SetGraphicsRootConstantBufferView(0, frameConstantsUpload.GetGPUVirtualAddress());
+    cmdList->SetGraphicsRootDescriptorTable(1, dagNodeSRV.gpu);
+    cmdList->SetGraphicsRootDescriptorTable(2, dagChildPtrSRV.gpu);
+    cmdList->SetGraphicsRootDescriptorTable(3, dagPageSRV.gpu);
+    cmdList->SetGraphicsRootDescriptorTable(4, dagPageIndexSRV.gpu);
+    cmdList->DrawInstanced(3, 1, 0, 0);
 }
 
 Result<void> Renderer::CreateSparseSurfacePipeline(ID3D12Device* device) {
