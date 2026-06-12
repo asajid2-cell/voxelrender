@@ -2854,6 +2854,12 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_SPARSE_MID_MESH_FRUSTUM_CULL", 0u) != 0u;
     const float sparseMidMeshMinDistance =
         std::max(0.0f, ReadFloatEnv("VENPOD_SPARSE_MID_MESH_MIN_DISTANCE", sparseExactNearDistance));
+    // QUALITY KNOB: =13900 extends the mesh over the 9000-13900 far band, replacing
+    // the far field's coarse slab walls with real terraced geometry (layer-A/B
+    // verified) — but ground-walk fps measured 15-24 vs 31-54 at 9000 (the per-move
+    // mesh rebuild cost scales with range). Until the rebuild is throttled or
+    // incremental, the default stays at the clipmap end; raise the env for
+    // screenshot/quality sessions.
     const float sparseMidMeshMaxDistance = std::max(
         sparseMidMeshMinDistance + 1.0f,
         ReadFloatEnv("VENPOD_SPARSE_MID_MESH_MAX_DISTANCE", sparseClipmapPolicy.Config().endDistance));

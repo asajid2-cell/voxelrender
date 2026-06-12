@@ -260,3 +260,51 @@ Checkpoint policy: NO git commits (not sanctioned). Checkpoints = `git diff > tm
   G5: HUMAN-GATE — awaits the user's own run at original quality.
 - RESIDUAL RISKS / OPEN ITEMS (full disclosure): (1) speed-200 stress residuals (flat analytic fill + dark bottom fans while streaming is outrun); (2) far-band (>9000) reads softer/slabbier relative to the improved mid; (3) temporal flicker unproven from stills; (4) edit-path holes from the re-dispatch review (edit-halo invalidation, slot-only marking) — edit-related, not motion-critical, unfixed; (5) S3 0760 shadowed-notch watch item; (6) aerial fps lever not yet implemented.
 - Final checkpoint: ckpt_7_final.patch. All work uncommitted in the working tree by policy.
+
+---
+## 2026-06-12 (later) — G5 VERDICT + NEW LOOPS L6-L9
+USER G5: approx terrain GONE (confirmed good). TWO new user-visible bugs at GROUND level (their screenshot, 67fps):
+- BUG-1 "huge holes in front": broad dark grey-green band right in front of the camera.
+- BUG-2 "giant blocky cubes in back instead of real voxel terrain": massive flat cube walls in the background.
+- GOLDEN CLUE: both turn into REAL voxels when terrain is EDITED nearby (edit -> invalidation -> regen -> correct). The displayed data is stale/coarse/misclassified vs what regen produces.
+Verified state committed as a2134d1 (sanctioned by user).
+
+### L6 classify+confirm (running)
+UNIFYING HYPOTHESIS (to test, not assume): the mesh build iterates ALL resident tiles across ALL rings; overlapping coarse-ring tiles may draw giant quads + (via the all-air water fill) dark water sheets OVER/near areas the fine rings own. Editing invalidates the coarse overlay -> "real voxels". Experiments:
+- C1 canonical GROUND view (reproduce the user's shot)
+- C2 mesh OFF (mesh-drawn vs raymarch-drawn attribution)
+- C3 owner-58 ground (who owns the dark band)
+- C4 LOD merge 1 (merge vs ring-cell-size for the cubes)
+- code read: blockCullBounds / per-ring distance bands in BuildMidHeightSurfaceSnapshot
+- USER scenario correction: ground-level captures are occluded by local hills — the artifacts need SLIGHT ELEVATION (~70u, near-level pitch). C-runs re-launched as C1e-C4e at AltTenths 700 PitchDeg -6. Canonical user-vantage scenario S5 := this.
+- Code-read findings (suspects, pre-empirical): the mesh build culls ALL rings to ONE global 1024-9000 band — NO per-ring distance bands, NO finer-tile-coverage suppression -> overlapping coarse-ring tiles can draw giant quads (+ sea-level skirt WALLS on every tile border + all-air water fills) over/near fine-ring space. Depth decides; coarse quantized tops can win -> giant cubes + dark walls. Editing invalidates the coarse overlay -> "real voxels" (matches the golden clue).
+
+### 2026-06-12 — L6 classification results (user-vantage C-runs)
+- BUG-2 CLASSIFIED (empirical): C1e (mesh on, merge 2) reproduces the user's giant background cube walls; C2e (mesh OFF) renders the SAME region as fine-grained terrain -> the cubes ARE the mesh's coarse-ring tiles. C4e (merge cap 1) DRAMATICALLY improves them (stepped cliffs instead of slabs) -> dominant lever = LOD merge x coarse ring cell (32-64u cells x2 = 64-128u quads). Cost run in flight (faces @merge1 + fps).
+- C3e owner-58 with mesh: CONFOUNDED again (mesh doesn't draw under debug 58 — same e2c confound; disregard, noted).
+- BUG-1 (dark band in front) NOT yet reproduced on my path — C5 basin-vantage sweep in flight. Suspects (code-read): sea-level skirt WALLS on coarse tile borders near camera; all-air water fill on stale/coarse footprints; both mesh-drawn (C2e would kill them too).
+
+### 2026-06-12 — L7 fixes implemented (building)
+- Part 1 distance-based LOD merge (replaces ring-based): merge 1 within 2200u, 2 to 4800u, lodMaxMerge beyond — kills legit-far monolith quads near the player while keeping the face budget (global merge-1 measured 1.4M faces/26fps = rejected).
+- Part 2 resident-aware finer-coverage suppression: per tile, the 4 finer-ring child tiles (2:1 coord map, growth=2 confirmed) are checked for residency; per merged footprint, the block's quadrant is SKIPPED when its resident finer child renders the same area (hole-free by construction — only suppress what the finer tile actually draws; child border skirts seal seams). Kills coarse monoliths + their sea-level skirt walls/water fills INSIDE the fine band — the edit-fixes-it staleness class.
+- Codex design cross-check running in parallel; verification = user-vantage V1 + basin V2 captures + faces/fps + two judges.
+
+### 2026-06-12 — L7 VERIFIED (visual) + perf cleared + Codex design CONVERGED
+- V1 (user-vantage): the giant cube walls are GONE — terraced voxel terrain to the horizon (my native read). V2 basin: massively improved; remaining smaller slabs = the hole-free coarse fallback where finer children genuinely aren't resident during a fast sweep (correct tradeoff vs holes).
+- PERF CLEARED by stash-dance baseline: pre-L7 fps at the IDENTICAL V2 profile = 17.8-20.2 = post-L7's 15-22 -> L7 caused NO regression; that scenario was always near-streaming-heavy. Faces 1.06M (in budget).
+- Codex design cross-check CONVERGED post-hoc: option A (resident-aware suppression), 2x2 child map confirmed via tileWorldSize ratio == ringGrowthFactor, apply before ANY emission (matches the implementation); its robustness caveat (non-2 growth) now guarded (suppression disabled unless growth==2).
+- L8 regression battery building/capturing: S1 + S5(user-vantage) + S3@100.
+
+### 2026-06-12 — L8 verdict split -> quad-size-cap merge rule (L8b building)
+- Codex on L8: S5 (user vantage) PASS both bugs ("near dark band mostly fixed", no monoliths); S1 aerial + S3 motion FAIL on FAR-WATERLINE coarse slab walls at 3-7km (ring3/4 cells x merge>=2 = 64-128u quads) — the remaining piece of the user's "giant cubes in the back".
+- Fix v2 (building): merge rule now caps the merged quad's WORLD size by distance (<=2200u: no merging beyond native cell; <=5000u: 32u quads max; beyond: 64u) — coarse rings stop merging until far out; fine rings merge MORE at distance (face payback). L8b recapture battery queued (S1/S3/S5 + faces/fps).
+
+### 2026-06-12 — L8b judge divergence -> layer ground-truth A/B (escape from merge tweaking)
+- Codex FAILs L8b (slabs "not fixed", new dark block S3_0700 (360,475)-(435,535), S5 "regressed"); MY native reads saw the mesh band clearly improve (stepped cliffs, faces 1.06M->976k). DIVERGENCE. Codex's flagged coords concentrate in the UPPER skyline band — plausibly the FAR FIELD (>9000, far SVO/height layers untouched by all merge logic; the old 'fine' far now stands out against the crisp mid). No more merge tweaks until the owning LAYER is known.
+- A/B in flight: VENPOD_SPARSE_MID_MESH_MAX_DISTANCE=13900 extends the mesh over the flagged band — slabs turn fine => they were far-field; unchanged => mesh. Also self-checking Codex's 'new dark block' crop.
+
+### 2026-06-12 — L9 DONE: G5-round-2 bugs fixed; final verdicts
+- L9 chain: quad-size-cap merge -> layer A/B (panels persisted at 13900 => mesh cliffs, NOT far band) -> mechanism: tall cliff risers = single full-height quads with one baked variant (geometric+textural flat panels) -> CLIFF-RISER SLICING (24u segments, per-segment variant). Codex FINAL: PASS x3 on 'no giant uniform monolith walls'; residual reclassified as 'coarse distant cliff geometry — a quality tradeoff, not the original slab bug'. Faces 1.15M; zero TDRs.
+- Mesh range: default stays 9000 (ground fps 48-62 vs 15-24 at 13900 — dose-response measured); VENPOD_SPARSE_MID_MESH_MAX_DISTANCE=13900 documented as the quality knob. Structural enabler for a higher default: mesh rebuild throttle/incremental upload (documented, unimplemented).
+- S5 (user's vantage): PASS 3/3 (both bugs gone there). Near transient dark fill blocks during motion streaming: documented cosmetic (lane-A fill shading vs sunny terraces).
+- Residual list for G5 round 2: coarse distant cliff geometry (S1 aerial, 5-9km); far field >9000 skyline; motion transients at speed; the L-6 edit-path holes; aerial fps ~42.
