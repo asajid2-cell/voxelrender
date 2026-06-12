@@ -308,3 +308,19 @@ UNIFYING HYPOTHESIS (to test, not assume): the mesh build iterates ALL resident 
 - Mesh range: default stays 9000 (ground fps 48-62 vs 15-24 at 13900 — dose-response measured); VENPOD_SPARSE_MID_MESH_MAX_DISTANCE=13900 documented as the quality knob. Structural enabler for a higher default: mesh rebuild throttle/incremental upload (documented, unimplemented).
 - S5 (user's vantage): PASS 3/3 (both bugs gone there). Near transient dark fill blocks during motion streaming: documented cosmetic (lane-A fill shading vs sunny terraces).
 - Residual list for G5 round 2: coarse distant cliff geometry (S1 aerial, 5-9km); far field >9000 skyline; motion transients at speed; the L-6 edit-path holes; aerial fps ~42.
+
+---
+## 2026-06-12 (round 3) — G5: mountains+terrain GOOD (116fps); ONE remaining issue: the giant air/under-rendered band
+USER screenshot: broad dark grey-green flat band across the middle distance, sharp edges, terrain islands poking through, LIGHT-BLUE mesh-water patches at its edge (different material => the band is NOT mesh water). Metrics healthy (coverage 1.00/1.00, 414/512 tiles, eviction active).
+### L10 hypothesis (high-confidence, to verify): my L7 finer-coverage suppression reads m_slotByCoord WITHOUT validating the slot still holds that coord — stale entries after eviction/slot-reuse wrongly suppress coarse blocks -> mesh holes -> the raymarch/far-height fill (dark grey-green) shows through as the band. Same missing validation in NearestMissingHeightTileDistance. Fix = validate tile.record.coord == childCoord (correct regardless). Then verify at the user's vantage (high elevation, pitch ~-15) + judges + Codex code review in parallel.
+
+### 2026-06-12 — L10: BAND MECHANISM FOUND + FIXED (annular near/mesh gap at altitude)
+- Band fully reproduced at 300u alt (huge dark annulus + sky disc below the camera). A/B with VENPOD_SPARSE_MID_MESH_MIN_DISTANCE=0: BAND COMPLETELY GONE — continuous terraced terrain from under the camera to the horizon. Mechanism: the near raster covers a SLANT radius (<=1024) while the mesh started at XZ 1024 -> the gap annulus grows with camera height (why 70u captures missed it); the dark sheet was the miss-fill painting the gap.
+- BAKED: mesh min distance default 0 (the mesh is the always-present floor; near raster overdraws where resident; ~1% extra mesh area). Stale-slot coord validation also kept (correct regardless; Codex auditing eviction staleness in parallel).
+- Final battery in flight: high vantage + ground (z-fight check) + fps.
+
+### 2026-06-12 — L10 CLOSED: the giant band = the mesh's min-distance gap; min=0 shipped
+- Mechanism (A/B-proven): ANY positive mesh min distance leaves a disc/annulus the near raster does not reliably cover at altitude (near interest hugs the camera, not the ground below) -> the dark fill renders as the giant band. The altitude-corrected formula still left the 0-880u disc dark at 300u (judge-confirmed) -> final fix: mesh min distance DEFAULT 0 (the mesh is the always-present floor; near raster overdraws it where resident).
+- Verification basis: L10_V2_min0 high-altitude captures (band completely gone, terrain continuous under the camera) + L10_F2/L6_C1 ground captures (identical to pre-floor baseline, no chunky overdraw, no z-fighting) + G3 user-vantage clean. The final binary is functionally identical to that verified configuration (deltas: comments + altitude-correction code that is inert at min 0).
+- Codex audit: the stale-slot premise was WRONG (eviction erases mappings promptly) — the coord validation ships as defensive hardening only; comment corrected.
+- Last capture attempt failed on GPU buffer allocation (VRAM pressure — possibly the user's own running session). CAPTURES HALTED to avoid killing their instance. Remaining small item: the sky-colored disc directly below the camera at high altitude (steep-ray gate) — documented, not fixed.
