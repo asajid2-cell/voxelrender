@@ -6174,7 +6174,21 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     const uint32_t terraceStep = std::max(1u, buildConfig.terraceStep);
     const uint32_t lodBaseMerge = std::max(1u, buildConfig.lodBaseMerge);
     const uint32_t lodMaxMerge = std::max(lodBaseMerge, buildConfig.lodMaxMerge);
-    const float minDistance = std::max(0.0f, buildConfig.minDistance);
+    // ALTITUDE-CORRECTED MIN (round-3 band fix): buildConfig.minDistance is the near
+    // contract's SLANT radius, but this builder culls in XZ. At an elevated camera the
+    // near raster's GROUND footprint shrinks (sqrt(min^2 - camY^2)) while an XZ min
+    // stayed fixed -> an annular no-man's gap that rendered as a giant dark band of
+    // missing terrain (grows with altitude; invisible at ground level). Project the
+    // slant radius onto the ground, minus a seam margin; high cameras get min 0 (the
+    // mesh becomes the floor under them), ground cameras keep the fine near zone.
+    const float camAboveGround = std::max(0.0f, buildConfig.cameraHeightAboveTerrain);
+    const float configuredMin = std::max(0.0f, buildConfig.minDistance);
+    const float minDistance =
+        camAboveGround >= configuredMin
+            ? 0.0f
+            : std::max(
+                  0.0f,
+                  std::sqrt(configuredMin * configuredMin - camAboveGround * camAboveGround) - 96.0f);
     const float maxDistance = std::max(minDistance + 1.0f, buildConfig.maxDistance);
     const float cullPadding = std::max(0.0f, buildConfig.cullPadding);
     const float tanHalfFov = std::tan(std::clamp(buildConfig.fovYRadians, 0.1f, 3.0f) * 0.5f);
@@ -6409,9 +6423,16 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
                         SaturatingAddInt32(tile.record.coord.z, tile.record.coord.z) + dz
                     };
                     const auto childIt = m_slotByCoord.find(childCoord);
-                    if (childIt != m_slotByCoord.end()) {
+                    if (childIt != m_slotByCoord.end() &&
+                        childIt->second < m_tiles.size()) {
                         const TilePayload& childTile = m_tiles[childIt->second];
+                        // Defensive slot validation: only trust the coord->slot mapping
+                        // when the slot still holds THIS coord. (Audit showed eviction
+                        // erases mappings promptly, so this is hardening, not a fix —
+                        // the round-3 band bug was the altitude annulus in the min
+                        // distance, handled above.)
                         if (childTile.record.slot != UINT32_MAX &&
+                            childTile.record.coord == childCoord &&
                             childTile.packedSamples.size() >= sampleCount) {
                             childResident[dz * 2 + dx] = true;
                             anyChildResident = true;
@@ -6833,9 +6854,13 @@ float SparseClipmapTileCache::NearestMissingHeightTileDistance(
     float nearest = std::numeric_limits<float>::max();
     for (const SparseClipmapTileCoord& coord : m_interestSet) {
         const auto existing = m_slotByCoord.find(coord);
-        if (existing != m_slotByCoord.end()) {
+        if (existing != m_slotByCoord.end() && existing->second < m_tiles.size()) {
             const TilePayload& tile = m_tiles[existing->second];
-            if (tile.record.slot != UINT32_MAX && !tile.packedSamples.empty()) {
+            // Same stale-slot validation as the mesh suppression: only trust the
+            // mapping when the slot still holds THIS coord.
+            if (tile.record.slot != UINT32_MAX &&
+                tile.record.coord == coord &&
+                !tile.packedSamples.empty()) {
                 continue; // resident
             }
         }

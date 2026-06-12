@@ -224,6 +224,9 @@ struct SparseMidHeightSurfaceBuildConfig {
     float cameraX = 0.0f;
     float cameraY = 0.0f;
     float cameraZ = 0.0f;
+    // Camera height ABOVE LOCAL TERRAIN (not world Y): drives the altitude-corrected
+    // min-distance so the mesh meets the near raster's actual ground footprint.
+    float cameraHeightAboveTerrain = 0.0f;
     float forwardX = 0.0f;
     float forwardY = 0.0f;
     float forwardZ = 1.0f;

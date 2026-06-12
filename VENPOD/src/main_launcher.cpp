@@ -2852,8 +2852,14 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_SPARSE_MID_MESH_DISTANCE_CULL", 1u) != 0u;
     const bool sparseMidMeshFrustumCull =
         ReadUIntEnv("VENPOD_SPARSE_MID_MESH_FRUSTUM_CULL", 0u) != 0u;
+    // Default 0: the mesh is the always-present terrain floor under and around the
+    // camera. Any positive min leaves a disc/annulus that the near raster does NOT
+    // reliably cover at altitude (its interest hugs the camera, not the ground far
+    // below) — that gap rendered as the giant dark band (user round 3). Verified both
+    // ways at min=0: high-altitude clean (V2 A/B) AND ground-level identical to the
+    // pre-mesh-floor baseline (the near surface overdraws the mesh where resident).
     const float sparseMidMeshMinDistance =
-        std::max(0.0f, ReadFloatEnv("VENPOD_SPARSE_MID_MESH_MIN_DISTANCE", sparseExactNearDistance));
+        std::max(0.0f, ReadFloatEnv("VENPOD_SPARSE_MID_MESH_MIN_DISTANCE", 0.0f));
     // QUALITY KNOB: =13900 extends the mesh over the 9000-13900 far band, replacing
     // the far field's coarse slab walls with real terraced geometry (layer-A/B
     // verified) — but ground-walk fps measured 15-24 vs 31-54 at 9000 (the per-move
@@ -16031,6 +16037,11 @@ int RunSandbox(int argc, char* argv[]) {
                 midMeshBuildConfig.cameraX = cameraPos.x;
                 midMeshBuildConfig.cameraY = cameraPos.y;
                 midMeshBuildConfig.cameraZ = cameraPos.z;
+                midMeshBuildConfig.cameraHeightAboveTerrain = std::max(
+                    0.0f,
+                    cameraPos.y - sparseVoxelWorld.GetTerrain().HeightAt(
+                        static_cast<int32_t>(std::floor(cameraPos.x)),
+                        static_cast<int32_t>(std::floor(cameraPos.z))));
                 midMeshBuildConfig.forwardX = cameraForward.x;
                 midMeshBuildConfig.forwardY = cameraForward.y;
                 midMeshBuildConfig.forwardZ = cameraForward.z;
