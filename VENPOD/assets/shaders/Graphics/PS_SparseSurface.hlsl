@@ -143,7 +143,14 @@ uint ResolveSparseSurfaceMaterial(uint bakedMaterial, float3 worldPos, float3 no
                                   out bool liveErased) {
     liveErased = false;
     uint liveVoxel = 0u;
-    const int3 sampleVoxel = int3(floor(worldPos - normalize(normal) * 0.01f));
+    // Sample the voxel CENTRE behind the face (half a voxel along -normal), not a
+    // hair off the face. A tiny 0.01 offset sat right on the voxel boundary, so
+    // per-fragment floating-point jitter in worldPos made floor() land in
+    // different voxels for adjacent pixels of the same face - some discarded, some
+    // not - which rendered an erased patch as a torn/speckled "fork-dragged"
+    // surface instead of a clean hole. Half a voxel in lands every fragment of the
+    // face in the same owning voxel, so the whole face discards or stays together.
+    const int3 sampleVoxel = int3(floor(worldPos - normalize(normal) * 0.5f));
     if (TrySampleSparseSurfaceVoxel(sampleVoxel, liveVoxel)) {
         const uint liveMaterial = GetMaterial(liveVoxel);
         if (liveMaterial != MAT_AIR) {

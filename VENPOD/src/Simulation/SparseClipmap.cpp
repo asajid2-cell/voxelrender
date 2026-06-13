@@ -6551,6 +6551,37 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         return addFace(faces, direction, faceX, lowTopY, faceZ, span, height, voxel);
     };
 
+    // EDIT FOOTPRINT SUPPRESSION: the mid-height mesh is a 2.5D raster that draws
+    // first and writes stencil, blocking the fullscreen voxel raymarch (which DOES
+    // render the live carved/painted voxels) from those pixels. Over brush-edited
+    // XZ regions we therefore emit NO mesh cells, so the raymarch owns them and the
+    // edit renders crisply from the same voxel data the brush wrote (the legacy
+    // clean-edit invariant), instead of the mesh drawing torn/stale surface on top.
+    struct EditXzBox { int32_t minX, minZ, maxX, maxZ; };
+    std::vector<EditXzBox> editXzBoxes;
+    if (m_edits && m_edits->EditedBrickCount() != 0u) {
+        editXzBoxes.reserve(m_edits->EditedBrickCount());
+        m_edits->ForEachOverlay([&](const BrickEditOverlay& overlay) {
+            EditXzBox box{};
+            int32_t y = 0;
+            if (TryWorldVoxelFromBrickLocal(overlay.coord.x, 0, &box.minX) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.z, 0, &box.minZ) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.x, SPARSE_BRICK_SIZE - 1u, &box.maxX) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.z, SPARSE_BRICK_SIZE - 1u, &box.maxZ) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.y, 0, &y)) {
+                editXzBoxes.push_back(box);
+            }
+        });
+    }
+    auto cellInEditFootprint = [&](int32_t x0, int32_t z0, int32_t x1, int32_t z1) -> bool {
+        for (const EditXzBox& b : editXzBoxes) {
+            if (b.minX <= x1 && b.maxX >= x0 && b.minZ <= z1 && b.maxZ >= z0) {
+                return true;
+            }
+        }
+        return false;
+    };
+
     for (uint32_t tileSlot = 0; tileSlot < static_cast<uint32_t>(m_tiles.size()); ++tileSlot) {
         if (emittedTiles >= effectiveMaxTiles) {
             break;
@@ -6762,6 +6793,14 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             const uint32_t zEnd = std::min(cellCount, z + mergeCells);
             for (uint32_t x = 0; x < cellCount && faceBudgetOk; x += mergeCells) {
                 const uint32_t xEnd = std::min(cellCount, x + mergeCells);
+                // Skip mid-mesh cells over brush edits: emit no top, no riser, no
+                // all-air fill, so the voxel raymarch renders the live edit there.
+                if (!editXzBoxes.empty() &&
+                    cellInEditFootprint(
+                        cellWorldX(x), cellWorldZ(z),
+                        cellWorldX(xEnd), cellWorldZ(zEnd))) {
+                    continue;
+                }
                 SurfaceBlock block = aggregateSamples(x, z, xEnd, zEnd);
                 if (!block.present) {
                     // ALL-AIR FOOTPRINT FILL (Codex-traced #1 hole mechanism): a merged

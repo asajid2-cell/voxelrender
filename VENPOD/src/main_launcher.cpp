@@ -3845,8 +3845,11 @@ int RunSandbox(int argc, char* argv[]) {
     const float playerRadius =
         std::clamp(static_cast<float>(ReadUIntEnv("VENPOD_PLAYER_RADIUS_TENTHS", 15u)) * 0.1f, 0.5f, 4.0f);
 
-    // Flight mode toggle (double-click Space to enable/disable)
-    bool flightMode = false;
+    // Flight mode toggle (double-click Space to enable/disable). Test-only:
+    // VENPOD_SPARSE_WALK_TEST_FLY starts in flight so the elevated verification
+    // spawn doesn't fall to the ground during the startup render-hold (before the
+    // walk-test loop, which also honours the flag, begins running).
+    bool flightMode = ReadUIntEnv("VENPOD_SPARSE_WALK_TEST_FLY", 0u) != 0u;
     bool thirdPersonMode = false;
     const float thirdPersonDistance = 20.0f;
     const float thirdPersonHeight = 8.0f;
@@ -3875,6 +3878,17 @@ int RunSandbox(int argc, char* argv[]) {
             const int initialYawDegEnv = ReadIntEnv("VENPOD_CAMERA_INITIAL_YAW_DEG", -36000);
             if (initialYawDegEnv != -36000) {
                 cameraYaw = static_cast<float>(initialYawDegEnv) * 3.1415926535f / 180.0f;
+            }
+            // Test-only: lift the spawn into the air for an elevated, angled-down
+            // verification view of edits (seeing a paint mass / erase crater from
+            // above and the side is far clearer than grazing it at ground level).
+            if (const int eyeOffsetY = ReadIntEnv("VENPOD_SPARSE_WALK_TEST_EYE_OFFSET_Y", 0);
+                eyeOffsetY != 0) {
+                cameraPos.y += static_cast<float>(eyeOffsetY);
+                if (const int pitchEnv = ReadIntEnv("VENPOD_SPARSE_WALK_TEST_PITCH_DEG", -36000);
+                    pitchEnv != -36000) {
+                    cameraPitch = static_cast<float>(pitchEnv) * 3.1415926535f / 180.0f;
+                }
             }
             cameraVelocityY = 0.0f;
             spdlog::info(
@@ -6697,7 +6711,10 @@ int RunSandbox(int argc, char* argv[]) {
             !enableBoundaryTest &&
             sparseBackendRequested &&
             sparseVoxelWorldReady) {
-            flightMode = false;
+            // Test-only: VENPOD_SPARSE_WALK_TEST_FLY keeps flight mode on so the
+            // scripted camera holds its (elevated) altitude instead of falling -
+            // gives an airborne moving view to actually SEE edits from the side.
+            flightMode = ReadUIntEnv("VENPOD_SPARSE_WALK_TEST_FLY", 0u) != 0u;
             terrainReady = true;
             const float scriptedWalkDt = sparseWalkTestFixedDt > 0.0f ? sparseWalkTestFixedDt : dt;
             float baseScriptedYaw = cameraYaw + sparseWalkTestYawRate * scriptedWalkDt;
@@ -11845,6 +11862,11 @@ int RunSandbox(int argc, char* argv[]) {
                 // a full CPU brick regen is ~2.5ms — inline regeneration of a whole
                 // stroke's bricks was the measured 17ms/frame edit hitch).
                 sparseClipmapTileCache.PumpEditedBrickRegens(sparseClipmapFramePolicy, 2u);
+                // Drain edited height tiles too: this bumps the height-dirty serial
+                // (coalesced) so the mid-MESH rebuilds and re-applies its edit-
+                // footprint SUPPRESSION (punch-through holes over edits), letting the
+                // voxel raymarch render the live carve instead of the mesh occluding it.
+                sparseClipmapTileCache.PumpEditedHeightTileRegens(sparseClipmapFramePolicy, 2u);
                 sparseVoxelWorld.PumpRegeneratedEditUploads(3u);
                 const uint64_t sparseEditRevision = sparseVoxelWorld.GetEdits().RevisionSerial();
                 if (sparseEditRevision != sparseMidClipmapEditRevisionSeen) {
@@ -11853,13 +11875,20 @@ int RunSandbox(int argc, char* argv[]) {
                             sparseVoxelWorld.GetEdits(),
                             sparseClipmapFramePolicy,
                             sparseMidClipmapEditRevisionSeen);
+                    const uint32_t invalidatedHeightTiles =
+                        sparseClipmapTileCache.InvalidateEditedHeightTiles(
+                            sparseVoxelWorld.GetEdits(),
+                            sparseClipmapFramePolicy,
+                            sparseMidClipmapEditRevisionSeen);
                     sparseMidClipmapEditRevisionSeen = sparseEditRevision;
-                    if (enableRuntimeLog && invalidatedMidVoxelBricks != 0u) {
+                    if (enableRuntimeLog &&
+                        (invalidatedMidVoxelBricks != 0u || invalidatedHeightTiles != 0u)) {
                         spdlog::info(
-                            "SPARSE_MID_CLIPMAP_EDIT_INVALIDATE frame={} revision={} bricks={}",
+                            "SPARSE_MID_CLIPMAP_EDIT_INVALIDATE frame={} revision={} bricks={} heightTiles={}",
                             frameCount,
                             sparseEditRevision,
-                            invalidatedMidVoxelBricks);
+                            invalidatedMidVoxelBricks,
+                            invalidatedHeightTiles);
                     }
                 }
                 perfSparseClipmapInterestMs =
