@@ -4226,68 +4226,13 @@ void SparseClipmapTileCache::GenerateTile(uint32_t slot, const SparseClipmapPoli
         FloorToInt32Clamped(static_cast<double>(tile.record.coord.z) * static_cast<double>(tileWorldSize));
     tile.packedSamples.resize(static_cast<size_t>(side) * static_cast<size_t>(side));
 
-    // Edit-aware tiles: the mid-mesh raster reads these top-surface samples, so a
-    // carve/addition must move the sampled height or it stays hidden behind stale
-    // procedural ground. Collect the XZ AABBs of overlays that touch this tile;
-    // only sample cells intersecting one pay the column rescan (a brush footprint
-    // is a handful of cells), every other cell keeps the fast procedural path.
-    struct OverlayXzBox { int32_t minX, minZ, maxX, maxZ; };
-    std::vector<OverlayXzBox> overlayXzBoxes;
-    const int32_t tileWorldSpan = std::max(1, RoundToInt32Clamped(tileWorldSize));
-    const int32_t tileMinX = tile.record.originX;
-    const int32_t tileMaxX = SaturatingAddInt32(tile.record.originX, tileWorldSpan);
-    const int32_t tileMinZ = tile.record.originZ;
-    const int32_t tileMaxZ = SaturatingAddInt32(tile.record.originZ, tileWorldSpan);
-    if (m_edits && m_edits->EditedBrickCount() != 0u) {
-        m_edits->ForEachOverlay([&](const BrickEditOverlay& overlay) {
-            OverlayXzBox box{};
-            int32_t unusedY = 0;
-            if (TryWorldVoxelFromBrickLocal(overlay.coord.x, 0, &box.minX) &&
-                TryWorldVoxelFromBrickLocal(overlay.coord.z, 0, &box.minZ) &&
-                TryWorldVoxelFromBrickLocal(overlay.coord.x, SPARSE_BRICK_SIZE - 1u, &box.maxX) &&
-                TryWorldVoxelFromBrickLocal(overlay.coord.z, SPARSE_BRICK_SIZE - 1u, &box.maxZ) &&
-                TryWorldVoxelFromBrickLocal(overlay.coord.y, 0, &unusedY)) {
-                if (box.minX <= tileMaxX && box.maxX >= tileMinX &&
-                    box.minZ <= tileMaxZ && box.maxZ >= tileMinZ) {
-                    overlayXzBoxes.push_back(box);
-                }
-            }
-        });
-    }
-    const int32_t cellSpan = std::max(1, RoundToInt32Clamped(ring.cellSize));
-
-    // Re-derive the surface column top from explicit edits, walking down from any
-    // additions through procedural ground, lowering past contiguous erased voxels.
-    auto editAwareSample = [&](int32_t worldX, int32_t worldZ, float proceduralHeight) -> uint32_t {
-        constexpr int32_t kMaxAddition = 80;
-        constexpr int32_t kMaxCarve = 120;
-        const int32_t proceduralTopY = FloorToInt32Clamped(proceduralHeight);
-        const int32_t scanTop = SaturatingAddInt32(proceduralTopY, kMaxAddition);
-        const int32_t scanBottom = SaturatingAddInt32(proceduralTopY, -kMaxCarve);
-        for (int32_t y = scanTop; y >= scanBottom; --y) {
-            uint32_t editedVoxel = 0;
-            const bool hasEdit = m_edits->TryGetVoxel(worldX, y, worldZ, &editedVoxel);
-            const bool solid = hasEdit
-                ? (Utils::UnpackMaterial(editedVoxel) != Utils::Material::Air)
-                : (y <= proceduralTopY);
-            if (!solid) {
-                continue;
-            }
-            if (hasEdit) {
-                const uint8_t material = Utils::UnpackMaterial(editedVoxel) & 0xFFu;
-                const uint32_t biasedHeight = static_cast<uint32_t>(
-                    std::clamp<int64_t>(static_cast<int64_t>(y) + 32768ll, 0ll, 65535ll));
-                return biasedHeight | (static_cast<uint32_t>(material) << 16);
-            }
-            // Procedural top reached at a lowered height (carve floor): reuse the
-            // procedural material classification at the original column.
-            return PackSample(worldX, worldZ, static_cast<float>(y) + 0.5f);
-        }
-        // Whole scanned band is air (deep carve): clamp to the band floor so the
-        // mesh dips rather than holding stale ground.
-        return PackSample(worldX, worldZ, static_cast<float>(scanBottom) + 0.5f);
-    };
-
+    // The mid-height mesh is PROCEDURAL BACKGROUND ONLY. It is a 2.5D heightfield
+    // and cannot represent a 3D brush edit (overhang, carve, floating voxel) - an
+    // earlier attempt to make it edit-aware collapsed each edited column to one
+    // top height, which the mesh then stitched into vertical walls/sheets, and it
+    // also re-rastered solid ground over erased voxels. Edited regions are owned
+    // by the 3D voxel layers instead (the mid-voxel raymarch + near exact
+    // surface); the mesh is masked out over edit footprints downstream.
     for (uint32_t z = 0; z < side; ++z) {
         for (uint32_t x = 0; x < side; ++x) {
             const int32_t worldX = RoundToInt32Clamped(
@@ -4297,21 +4242,7 @@ void SparseClipmapTileCache::GenerateTile(uint32_t slot, const SparseClipmapPoli
                 static_cast<double>(tile.record.originZ) +
                 static_cast<double>(z) * static_cast<double>(ring.cellSize));
             const float height = m_terrain.HeightAt(worldX, worldZ);
-            bool cellEdited = false;
-            if (!overlayXzBoxes.empty()) {
-                const int32_t cellMaxX = SaturatingAddInt32(worldX, cellSpan - 1);
-                const int32_t cellMaxZ = SaturatingAddInt32(worldZ, cellSpan - 1);
-                for (const OverlayXzBox& box : overlayXzBoxes) {
-                    if (box.minX <= cellMaxX && box.maxX >= worldX &&
-                        box.minZ <= cellMaxZ && box.maxZ >= worldZ) {
-                        cellEdited = true;
-                        break;
-                    }
-                }
-            }
-            tile.packedSamples[x + z * side] = cellEdited
-                ? editAwareSample(worldX, worldZ, height)
-                : PackSample(worldX, worldZ, height);
+            tile.packedSamples[x + z * side] = PackSample(worldX, worldZ, height);
         }
     }
 }

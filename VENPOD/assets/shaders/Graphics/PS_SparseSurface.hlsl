@@ -134,7 +134,14 @@ bool TrySampleSparseSurfaceVoxel(int3 worldVoxel, out uint voxel) {
     return true;
 }
 
-uint ResolveSparseSurfaceMaterial(uint bakedMaterial, float3 worldPos, float3 normal) {
+// Resolves the live material for a rasterized surface fragment. Sets liveErased
+// when the live sparse voxel is RESIDENT and has been carved to air: the baked
+// face is stale (e.g. an erase removed it) and the caller must discard so the 3D
+// voxel raymarch behind it shows the real carve, instead of re-drawing the old
+// terrain (which made erasing look like it did nothing).
+uint ResolveSparseSurfaceMaterial(uint bakedMaterial, float3 worldPos, float3 normal,
+                                  out bool liveErased) {
+    liveErased = false;
     uint liveVoxel = 0u;
     const int3 sampleVoxel = int3(floor(worldPos - normalize(normal) * 0.01f));
     if (TrySampleSparseSurfaceVoxel(sampleVoxel, liveVoxel)) {
@@ -142,6 +149,8 @@ uint ResolveSparseSurfaceMaterial(uint bakedMaterial, float3 worldPos, float3 no
         if (liveMaterial != MAT_AIR) {
             return liveMaterial;
         }
+        // Resident and air = carved away. Stale baked face must not draw.
+        liveErased = true;
     }
     return bakedMaterial;
 }
@@ -225,9 +234,23 @@ float3 DebugSurfaceOwnerMaterialColor(uint material) {
 }
 
 float4 main(PSInput input) : SV_Target {
-    const uint material = ResolveSparseSurfaceMaterial(input.material, input.worldPos, input.normal);
     const float surfaceDistance = distance(input.worldPos, frame.cameraPosition.xyz);
     const float exactNearDistance = max(frame.exactNearParams.x, 0.0f);
+    bool liveErased = false;
+    const uint material = ResolveSparseSurfaceMaterial(input.material, input.worldPos, input.normal, liveErased);
+    // Only honour the erase-discard within the EXACT near-surface range. There the
+    // baked faces align with single voxels, so a live-air sample reliably means
+    // "this voxel was carved" -> drop the fragment and let the voxel raymarch show
+    // the carve. On the coarse mid-height mesh (beyond the near range) a face does
+    // NOT align with a voxel, so the inward sample can hit air on unedited terrain;
+    // discarding there punched black holes. Mid-distance carves are owned by the
+    // voxel layers separately, not by this raster discard.
+    const float eraseDiscardRange = exactNearDistance > 0.0f
+        ? exactNearDistance
+        : 192.0f;
+    if (liveErased && surfaceDistance <= eraseDiscardRange) {
+        discard;
+    }
     const float protectedSurfaceDistance = max(exactNearDistance + 768.0f, 1536.0f);
     const bool aboveWaterView = frame.cameraPosition.y >= FAR_WATER_SURFACE_Y - 0.5f;
     const bool sparseWaterVoxelOccludedByPlane = false;

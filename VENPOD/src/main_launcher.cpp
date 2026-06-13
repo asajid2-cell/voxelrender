@@ -1863,6 +1863,12 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseBrushPaintSmokeRealAim =
         enableSparseBrushPaintSmoke &&
         ReadUIntEnv("VENPOD_SPARSE_BRUSH_SMOKE_REAL_AIM", 0u) != 0u;
+    // Hold the RIGHT mouse button (erase) instead of left, so the smoke exercises
+    // the real erase path (IsErasing -> buildStroke false -> ray-follow), not the
+    // paint climb with an erase-mode override (which marches into the air).
+    const bool sparseBrushPaintSmokeErase =
+        enableSparseBrushPaintSmoke &&
+        ReadUIntEnv("VENPOD_SPARSE_BRUSH_SMOKE_ERASE", 0u) != 0u;
     const uint32_t sparseBrushPaintSmokeForcedCase =
         ReadUIntEnv("VENPOD_SPARSE_BRUSH_SMOKE_CASE", UINT32_MAX);
     const uint32_t sparseBrushPaintSmokeRadiusTenths =
@@ -11839,10 +11845,6 @@ int RunSandbox(int argc, char* argv[]) {
                 // a full CPU brick regen is ~2.5ms — inline regeneration of a whole
                 // stroke's bricks was the measured 17ms/frame edit hitch).
                 sparseClipmapTileCache.PumpEditedBrickRegens(sparseClipmapFramePolicy, 2u);
-                // Drain edit-invalidated HEIGHT tiles (the layer the mid mesh
-                // rasters): regenerating them with the edit-aware sampler is what
-                // makes carves/additions actually show through the mesh.
-                sparseClipmapTileCache.PumpEditedHeightTileRegens(sparseClipmapFramePolicy, 2u);
                 sparseVoxelWorld.PumpRegeneratedEditUploads(3u);
                 const uint64_t sparseEditRevision = sparseVoxelWorld.GetEdits().RevisionSerial();
                 if (sparseEditRevision != sparseMidClipmapEditRevisionSeen) {
@@ -11851,20 +11853,13 @@ int RunSandbox(int argc, char* argv[]) {
                             sparseVoxelWorld.GetEdits(),
                             sparseClipmapFramePolicy,
                             sparseMidClipmapEditRevisionSeen);
-                    const uint32_t invalidatedHeightTiles =
-                        sparseClipmapTileCache.InvalidateEditedHeightTiles(
-                            sparseVoxelWorld.GetEdits(),
-                            sparseClipmapFramePolicy,
-                            sparseMidClipmapEditRevisionSeen);
                     sparseMidClipmapEditRevisionSeen = sparseEditRevision;
-                    if (enableRuntimeLog &&
-                        (invalidatedMidVoxelBricks != 0u || invalidatedHeightTiles != 0u)) {
+                    if (enableRuntimeLog && invalidatedMidVoxelBricks != 0u) {
                         spdlog::info(
-                            "SPARSE_MID_CLIPMAP_EDIT_INVALIDATE frame={} revision={} bricks={} heightTiles={}",
+                            "SPARSE_MID_CLIPMAP_EDIT_INVALIDATE frame={} revision={} bricks={}",
                             frameCount,
                             sparseEditRevision,
-                            invalidatedMidVoxelBricks,
-                            invalidatedHeightTiles);
+                            invalidatedMidVoxelBricks);
                     }
                 }
                 perfSparseClipmapInterestMs =
@@ -13577,8 +13572,9 @@ int RunSandbox(int argc, char* argv[]) {
             fov,
             aspectRatio,
             (brushInputEnabled && inputManager.IsMouseButtonDown(Input::MouseButton::Left)) ||
-                sparseBrushPaintSmokeStroke,
-            brushInputEnabled && inputManager.IsMouseButtonDown(Input::MouseButton::Right),
+                (sparseBrushPaintSmokeStroke && !sparseBrushPaintSmokeErase),
+            (brushInputEnabled && inputManager.IsMouseButtonDown(Input::MouseButton::Right)) ||
+                (sparseBrushPaintSmokeStroke && sparseBrushPaintSmokeErase),
             brushInputEnabled ? inputManager.GetScrollDelta() : 0.0f,
             nullptr,  // No CPU voxel data (GPU raycasting now!)
             0
@@ -18550,8 +18546,9 @@ int RunSandbox(int argc, char* argv[]) {
             glm::vec3 intendedBrushWorld = responsiveAimWorld;
             const bool buildStroke = brushController.IsPainting() && !brushController.IsErasing();
             if (!buildStroke) {
-                buildStrokeState.active = false;
-                buildStrokeState.rayDistance = kBrushDefaultAimDistance;
+                // Reset only the close-ramp (opt-in) state here. active/rayDistance
+                // persist across the stroke - erase uses them for its carve-front
+                // depth clamp below, and they reset at stroke end (button release).
                 buildStrokeState.closeRampActive = false;
                 buildStrokeState.closeRampHorizontalDistance = 0.0f;
                 buildStrokeState.hasLastBrushRayDirection = false;
@@ -18589,11 +18586,33 @@ int RunSandbox(int argc, char* argv[]) {
                     buildStrokeState.active = true;
                     intendedBrushWorld = cameraPos + rayDir * buildStrokeState.rayDistance;
                 } else {
-                    // ERASE: carve at the surface the crosshair ray lands on; a
-                    // sweep follows the surface (continuous carve), a hold digs in.
-                    intendedBrushWorld = (brushHitValid && brushHitTracksCurrentRay)
-                        ? brushHitWorld
-                        : cameraPos + rayDir * kBrushDefaultAimDistance;
+                    // ERASE carve front: carve at the surface the crosshair ray
+                    // lands on. As the surface erodes, the raycast hit recedes (the
+                    // ray flies through the fresh hole to the next solid). Clamp how
+                    // fast the working depth may recede so a held erase digs a
+                    // controlled crater instead of the ray teleporting through the
+                    // hole to the far side of the world (which left one tiny pit then
+                    // erased empty air). Re-aiming to a NEARER surface snaps in
+                    // instantly so a sweep follows the surface (continuous carve).
+                    const float hitDistance = (brushHitValid && brushHitTracksCurrentRay)
+                        ? glm::length(brushHitWorld - cameraPos)
+                        : (buildStrokeState.active
+                               ? buildStrokeState.rayDistance
+                               : kBrushDefaultAimDistance);
+                    const float maxRecede = std::max(2.0f, brushController.GetRadius());
+                    if (!buildStrokeState.active) {
+                        buildStrokeState.rayDistance = std::clamp(
+                            hitDistance, 4.0f, kBrushMaxInteractionDistance);
+                    } else if (hitDistance < buildStrokeState.rayDistance) {
+                        buildStrokeState.rayDistance = std::max(4.0f, hitDistance);
+                    } else {
+                        buildStrokeState.rayDistance = std::clamp(
+                            std::min(hitDistance, buildStrokeState.rayDistance + maxRecede),
+                            4.0f,
+                            kBrushMaxInteractionDistance);
+                    }
+                    buildStrokeState.active = true;
+                    intendedBrushWorld = cameraPos + rayDir * buildStrokeState.rayDistance;
                 }
                 brushPos = (useStaticChunkLayout || sparseRuntimeTestMode)
                     ? intendedBrushWorld - regionOriginWorld
@@ -18797,7 +18816,8 @@ int RunSandbox(int argc, char* argv[]) {
                 }
             }
 
-            if (sparseBrushPaintSmokeActive && sparseRuntimeTestMode && buildStroke &&
+            if (sparseBrushPaintSmokeActive && sparseRuntimeTestMode &&
+                (buildStroke || sparseBrushPaintSmokeErase) &&
                 sparseBrushPaintSmokeRealAim && enableRuntimeLog) {
                 static int realAimLog = 0;
                 if ((realAimLog++ % 30) == 0) {
