@@ -11861,13 +11861,19 @@ int RunSandbox(int argc, char* argv[]) {
                 // Drain a couple of edit-invalidated mid bricks per frame (budgeted;
                 // a full CPU brick regen is ~2.5ms — inline regeneration of a whole
                 // stroke's bricks was the measured 17ms/frame edit hitch).
-                sparseClipmapTileCache.PumpEditedBrickRegens(sparseClipmapFramePolicy, 2u);
+                // Higher edit-propagation budgets reduce the "skipped voxels"
+                // speckle: during a stroke the mid-voxel regen, exact-brick upload,
+                // and mesh-suppression rebuild are all budgeted, so a too-small
+                // budget leaves some edited voxels un-updated for several frames
+                // (worse on erase - un-propagated removal still draws solid). Drain
+                // more per frame so edits land closer to complete each frame.
+                sparseClipmapTileCache.PumpEditedBrickRegens(sparseClipmapFramePolicy, 6u);
                 // Drain edited height tiles too: this bumps the height-dirty serial
                 // (coalesced) so the mid-MESH rebuilds and re-applies its edit-
                 // footprint SUPPRESSION (punch-through holes over edits), letting the
                 // voxel raymarch render the live carve instead of the mesh occluding it.
-                sparseClipmapTileCache.PumpEditedHeightTileRegens(sparseClipmapFramePolicy, 2u);
-                sparseVoxelWorld.PumpRegeneratedEditUploads(3u);
+                sparseClipmapTileCache.PumpEditedHeightTileRegens(sparseClipmapFramePolicy, 4u);
+                sparseVoxelWorld.PumpRegeneratedEditUploads(8u);
                 const uint64_t sparseEditRevision = sparseVoxelWorld.GetEdits().RevisionSerial();
                 if (sparseEditRevision != sparseMidClipmapEditRevisionSeen) {
                     const uint32_t invalidatedMidVoxelBricks =

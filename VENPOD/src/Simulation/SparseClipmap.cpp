@@ -1844,7 +1844,7 @@ uint32_t SparseClipmapTileCache::PumpEditedHeightTileRegens(
     // pauses (queue drains) and only force a mid-stroke refresh roughly twice a
     // second, instead of every few frames, so a long continuous stroke does not
     // spin full-mesh rebuilds it cannot show anyway.
-    if (drained || m_editHeightFramesSinceSerialBump >= 30u) {
+    if (drained || m_editHeightFramesSinceSerialBump >= 10u) {
         ++m_dirtySerial;
         ++m_heightDirtySerial;
         m_editHeightFramesSinceSerialBump = 0;
