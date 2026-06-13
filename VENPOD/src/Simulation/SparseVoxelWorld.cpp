@@ -8466,9 +8466,23 @@ uint32_t SparseVoxelWorld::PumpRegeneratedEditUploads(uint32_t maxBricks)
             continue;
         }
 
-        GeneratedSparseBrick brick = GenerateBrickWithCachedTerrainColumns(coord);
-        m_edits.ApplyToGeneratedBrick(brick);
-        m_generated[coord] = brick;
+        // The procedural base of a brick never changes when it is edited - only
+        // the painted/erased voxels do. So if we already hold the generated brick
+        // (it is resident/cached), skip the full 16^3 procedural regen entirely and
+        // just (re)apply the edit overlay in place. ApplyToGeneratedBrick SETS the
+        // edited voxels (idempotent) and recomputes occupancy/flags, so re-applying
+        // onto an already-edited cached brick is correct. This drops the
+        // ~2.5ms/brick procedural regen that dominated the per-stroke 'clip' cost
+        // (the source of both the edit hitch and, via its budget, the skip-voxel
+        // latency). Fall back to a full regen only when the brick is not cached.
+        auto generatedIt = m_generated.find(coord);
+        if (generatedIt != m_generated.end()) {
+            m_edits.ApplyToGeneratedBrick(generatedIt->second);
+        } else {
+            GeneratedSparseBrick brick = GenerateBrickWithCachedTerrainColumns(coord);
+            m_edits.ApplyToGeneratedBrick(brick);
+            m_generated[coord] = brick;
+        }
         ++pumped;
 
         if (state == BrickLifecycleState::UploadQueued) {
