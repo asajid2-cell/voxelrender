@@ -1837,7 +1837,14 @@ uint32_t SparseClipmapTileCache::PumpEditedHeightTileRegens(
     // stroke rebuilds the mesh a handful of times per second, not every frame.
     ++m_editHeightFramesSinceSerialBump;
     const bool drained = m_editHeightTileQueue.empty();
-    if (drained || m_editHeightFramesSinceSerialBump >= 5u) {
+    // The mid-MESH rebuild this serial bump triggers is a full snapshot + GPU
+    // upload (no partial-dirty path for this resource). The mesh is the mid-
+    // DISTANCE layer; the close ground the player carves is the mid-VOXEL
+    // raymarch, which reflects the edit live. So rebuild the mesh when the stroke
+    // pauses (queue drains) and only force a mid-stroke refresh roughly twice a
+    // second, instead of every few frames, so a long continuous stroke does not
+    // spin full-mesh rebuilds it cannot show anyway.
+    if (drained || m_editHeightFramesSinceSerialBump >= 30u) {
         ++m_dirtySerial;
         ++m_heightDirtySerial;
         m_editHeightFramesSinceSerialBump = 0;
