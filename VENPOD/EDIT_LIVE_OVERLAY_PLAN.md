@@ -65,6 +65,54 @@ UI hidden). Codex judges captures at full detail (my Read downsamples). NOTE:
 absolute ms is noisy on this box (background load) — compare clip-phase / path
 counts / A-B same-session, not raw frame ms across runs.
 
+## ATTEMPT 1 (shader-read) — HIT THE JIT CLIFF, reverted
+Implemented the full shader-read slice: editDeltaParams CB field + 3 SRVs
+(t18/t19/t20) on the fullscreen root sig (params 20/21/22) + ported
+TrySampleEditDelta into PS_Raymarch's TrySampleSparseBrickVoxel (overlay
+authoritative: one early check covers paint-into-empty AND erase-override). All
+plumbing was correct (compiled, gated off by editDeltaParams.x default 0).
+- Standalone dxc.exe (DXC 1.8.2502) compiles it fine at -O3.
+- The ENGINE in-process compile of the GIANT PS_Raymarch at -O3 EXPLODES: the
+  per-sample hash-probe+scan loops inline at every voxel-sample site -> 7.3MB
+  shader blob (normal is KB) -> PSO creation fails E_OUTOFMEMORY (0x8007000E).
+  Reducing probe 64->32 + simplifying the inner loop (drop revision tracking,
+  last-match-wins) got it to COMPILE (178s!) but still 7.3MB -> PSO OOM.
+CONCLUSION: per-sample edit-overlay LOOPS inside the inlined fullscreen PS are
+unviable on this compiler. This is the NVIDIA/DXC JIT cliff Codex warned about.
+Reverted the 4 files (SharedTypes, PS_Raymarch, Renderer.cpp/.h) to clean tree.
+
+## ATTEMPT 2 — compute pre-pass bakes deltas into the pool (VALIDATED w/ Codex)
+New CS_ApplyEditDeltasToPool: one thread per COALESCED latest-unique delta ->
+LookupSparseBrick -> reject missing/tombstone/oob/generation-mismatch -> write
+SparseBrickVoxelPool[pageIndex*4096+localIndex]=voxel + InterlockedOr the sub-brick
+occupancy bit (NON-AIR only). PS_Raymarch UNCHANGED (no compile explosion); edits
+go live; CPU regen/upload demotes to durable tier.
+
+CONCRETE STEPS (Codex-converged, see TANDEM.md):
+1. CPU: build a coalesced latest-unique (brickCoord,packedLocal) delta batch for
+   bake (compute thread order undefined). Reuse staging (StageEditDeltas) but ensure
+   coalesce. Stage to GPU each frame, NOT gated on physics, NOT consuming physics queue.
+2. New `CS_ApplyEditDeltasToPool.hlsl`: read delta SRV + page table + page gens;
+   RWStructuredBuffer<uint> SparseBrickVoxelPool (write voxel); InterlockedOr
+   RWStructuredBuffer occupancy (uint2 word; subIndex=(local>>2).x+y*4+z*16,
+   0..31->.x/32..63->.y) for non-air only; never clear bits for air (conservative).
+3. New dispatcher (SparseEditBakePass or in Renderer) + UAV descriptors/transition
+   helpers in SparseVoxelGpuResources (pool+occupancy already UAV-capable:
+   CreateUAV at SparseVoxelGpuResources.cpp:171 pool, :213 occupancy).
+4. main_launcher: hook AFTER all upload-ring copies, BEFORE RenderVoxels. Frame
+   order: copies -> transition pool+occupancy to UNORDERED_ACCESS (page table/gens/
+   deltas stay NON_PIXEL_SHADER_RESOURCE) -> dispatch -> UAV barriers -> transition
+   pool+occupancy back to NON_PIXEL|PIXEL_SHADER_RESOURCE -> render. Bake MUST be the
+   last writer to the pool before render (rerun/fence if any late copy).
+5. Phase 4: demote PumpEditedBrickRegens/PumpRegeneratedEditUploads/height pumps to
+   lazy/post-stroke (durable tier). Redundant-regen-skip (6188048) keeps it cheap.
+Do NOT bake mid-clipmap in v1 (near bricks are the authoritative live tier).
+REJECTED alternatives (Codex): lower -O3 (brittle driver bet), coarse 3D mask
+(still a per-sample fetch + 2nd exact lookup), separate live-edit pool (still needs
+PS changes). Bake wins: PS reads pool/occupancy exactly as today.
+
 ## Status
 - [x] Diagnosis + regression revert (6188048) + redundant-regen skip
-- [ ] Phase 1..4
+- [x] Attempt 1 (shader-read) — reverted, hit DXC -O3 in-process compile cliff
+- [ ] Attempt 2 (compute-bake) pending Codex architecture cross-check
+- [ ] Phase 3 (stencil landmine), Phase 4 (demote propagation)
