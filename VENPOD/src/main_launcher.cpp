@@ -18558,47 +18558,43 @@ int RunSandbox(int argc, char* argv[]) {
             }
 
             if (!enableBrushTraversalRamp) {
-                // DEFAULT crosshair-locked-depth placement (paint AND erase).
-                // The working depth is acquired from the raycast hit and then HELD
-                // until the aim ray turns meaningfully SINCE that acquisition (an
-                // intentional re-aim or a sweep) - NOT on per-frame hand jitter.
-                // The turn is measured against the ray we locked on, not last
-                // frame's ray; measuring frame-to-frame let tiny jitter re-acquire
-                // every few frames, and since PAINT raises the surface into the
-                // crosshair each stroke, every re-acquire snapped the depth to the
-                // new (closer) painted top and the brush climbed its own fill into
-                // a column up to the reticle. Holding steady now keeps the depth
-                // locked, so paint builds a bounded mound at the crosshair and a
-                // held erase carves one crater; turning re-acquires so erase
-                // follows the surface as you sweep (continuous carve, not dots).
-                const float aimTurnDot = buildStrokeState.aimDepthLocked
-                    ? glm::dot(glm::normalize(buildStrokeState.lockedAimRayDir), rayDir)
-                    : -1.0f;
-                // ~7 degrees of accumulated turn since the lock = intentional move.
-                const bool aimMoved = !buildStrokeState.aimDepthLocked || aimTurnDot < 0.9925f;
-                if (brushHitValid && brushHitTracksCurrentRay && aimMoved) {
-                    float acquiredDepth = std::clamp(
-                        glm::length(brushHitWorld - cameraPos),
-                        4.0f,
-                        kBrushMaxInteractionDistance);
-                    // Belt-and-suspenders for PAINT: even a re-aim must never pull
-                    // the depth CLOSER while painting unless the turn is large
-                    // (a real look-elsewhere), so a slow paint-sweep can't ratchet
-                    // the brush toward the camera up its own fresh fill.
-                    if (buildStroke && buildStrokeState.aimDepthLocked &&
-                        acquiredDepth < buildStrokeState.lockedAimDepth &&
-                        aimTurnDot > 0.94f) {
-                        acquiredDepth = buildStrokeState.lockedAimDepth;
+                // DEFAULT: the continuous raymarch-editing feel (the legacy sandbox
+                // behaviour the player likes), WITHOUT the close-traversal ramp
+                // that used to yank the brush down to the feet.
+                if (buildStroke) {
+                    // PAINT climb: march the brush toward the camera along the aim
+                    // ray each frame. Painting fills the air the brush passes
+                    // through, so the build creeps from the surface up the ray
+                    // toward your face (the "gets closer and closer until it's
+                    // right in front of you" 3D effect). Snap back out to a nearer
+                    // REAL surface if the player re-aims at one (min with the hit),
+                    // and stop ~4 units out so it ends in your face, not behind it.
+                    const float hitDistance = (brushHitValid && brushHitTracksCurrentRay)
+                        ? glm::length(brushHitWorld - cameraPos)
+                        : (buildStrokeState.active
+                               ? buildStrokeState.rayDistance
+                               : kBrushDefaultAimDistance);
+                    const float pullStep = std::max(
+                        kBrushStrokePullSpeed,
+                        brushController.GetRadius() * 38.0f) * std::max(dt, 0.0f);
+                    if (!buildStrokeState.active) {
+                        buildStrokeState.rayDistance = std::clamp(
+                            hitDistance, 4.0f, kBrushMaxInteractionDistance);
+                    } else {
+                        buildStrokeState.rayDistance = std::clamp(
+                            std::min(buildStrokeState.rayDistance, hitDistance) - pullStep,
+                            4.0f,
+                            kBrushMaxInteractionDistance);
                     }
-                    buildStrokeState.lockedAimDepth = acquiredDepth;
-                    buildStrokeState.lockedAimRayDir = rayDir;  // anchor on (re)acquire only
-                    buildStrokeState.aimDepthLocked = true;
+                    buildStrokeState.active = true;
+                    intendedBrushWorld = cameraPos + rayDir * buildStrokeState.rayDistance;
+                } else {
+                    // ERASE: carve at the surface the crosshair ray lands on; a
+                    // sweep follows the surface (continuous carve), a hold digs in.
+                    intendedBrushWorld = (brushHitValid && brushHitTracksCurrentRay)
+                        ? brushHitWorld
+                        : cameraPos + rayDir * kBrushDefaultAimDistance;
                 }
-                const float workDepth = buildStrokeState.aimDepthLocked
-                    ? buildStrokeState.lockedAimDepth
-                    : kBrushDefaultAimDistance;  // aimed at sky, never acquired
-                buildStrokeState.active = true;
-                intendedBrushWorld = cameraPos + rayDir * workDepth;
                 brushPos = (useStaticChunkLayout || sparseRuntimeTestMode)
                     ? intendedBrushWorld - regionOriginWorld
                     : voxelWorld->WorldToRenderLocal(intendedBrushWorld);
