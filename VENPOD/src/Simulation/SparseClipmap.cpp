@@ -1582,6 +1582,51 @@ void SparseClipmapTileCache::RefreshInterestTouchFrames(uint32_t frameIndex) {
     }
 }
 
+bool SparseClipmapTileCache::BrickIntersectsEditOverlays(
+    int32_t originX,
+    int32_t originY,
+    int32_t originZ,
+    int32_t worldSize,
+    int32_t halo) const
+{
+    if (!m_edits || m_edits->EditedBrickCount() == 0) {
+        return false;
+    }
+    // Cache the overlay world-AABBs; rebuild only when the edit revision moves.
+    // A few thousand overlays rebuild in tens of microseconds, and the per-brick
+    // test below is a linear pass over small structs — vastly cheaper than the
+    // CPU per-voxel fill it gates.
+    if (m_overlayAabbCacheRevision != m_edits->RevisionSerial()) {
+        m_overlayAabbCache.clear();
+        m_edits->ForEachOverlay([&](const BrickEditOverlay& overlay) {
+            OverlayAabb box{};
+            if (TryWorldVoxelFromBrickLocal(overlay.coord.x, 0, &box.minX) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.y, 0, &box.minY) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.z, 0, &box.minZ) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.x, SPARSE_BRICK_SIZE - 1u, &box.maxX) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.y, SPARSE_BRICK_SIZE - 1u, &box.maxY) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.z, SPARSE_BRICK_SIZE - 1u, &box.maxZ)) {
+                m_overlayAabbCache.push_back(box);
+            }
+        });
+        m_overlayAabbCacheRevision = m_edits->RevisionSerial();
+    }
+    const int32_t minX = originX - halo;
+    const int32_t minY = originY - halo;
+    const int32_t minZ = originZ - halo;
+    const int32_t maxX = SaturatingAddInt32(originX, worldSize - 1 + halo);
+    const int32_t maxY = SaturatingAddInt32(originY, worldSize - 1 + halo);
+    const int32_t maxZ = SaturatingAddInt32(originZ, worldSize - 1 + halo);
+    for (const OverlayAabb& box : m_overlayAabbCache) {
+        if (box.minX <= maxX && box.maxX >= minX &&
+            box.minY <= maxY && box.maxY >= minY &&
+            box.minZ <= maxZ && box.maxZ >= minZ) {
+            return true;
+        }
+    }
+    return false;
+}
+
 uint32_t SparseClipmapTileCache::InvalidateEditedOverlays(
     const SparseEditStore& edits,
     const SparseClipmapPolicy& policy,
@@ -5151,20 +5196,23 @@ void SparseClipmapTileCache::GenerateVoxelBrickPayload(
         static_cast<double>(brick.coord.z) * static_cast<double>(brickWorldSize));
 
     // ---- Phase 1: GPU mid-voxel generation skip ----
-    // When enabled AND this cache has no edits (v1 keeps edited bricks on the CPU
-    // path to avoid edit-overlay divergence), DON'T pay for the per-voxel fill.
-    // The origin/cellSize above are all the metadata+lookup builder needs; the
-    // sample pool is filled later by the GPU dispatch. Mark the brick so the
-    // snapshot emits a gen request instead of copying CPU samples.
-    {
-        const bool hasEdits = m_edits && m_edits->EditedBrickCount() != 0u;
-        if (m_config.enableGpuMidVoxelGeneration && !hasEdits) {
-            brick.gpuGenerated = true;
-            brick.voxels.clear();
-            brick.nonAirSamples = 0;
-            brick.surfaceSamples = 0;
-            return;
-        }
+    // Edited bricks stay on the CPU path (the GPU generator doesn't know edit
+    // overlays), but the check is PER BRICK: the old global "any edit anywhere
+    // disables GPU-gen for every brick" gate meant one brush stroke permanently
+    // dropped ALL streaming generation to the ~10x CPU fill — the measured
+    // 17ms/frame edit hitch that never recovered. Only bricks whose world AABB
+    // (plus a one-cell halo, matching the generator's sampling halo) overlaps an
+    // edit overlay pay the CPU path now.
+    if (m_config.enableGpuMidVoxelGeneration &&
+        !BrickIntersectsEditOverlays(
+            brick.originX, brick.originY, brick.originZ,
+            brickWorldSize,
+            std::max(1, RoundToInt32Clamped(ring.cellSize)))) {
+        brick.gpuGenerated = true;
+        brick.voxels.clear();
+        brick.nonAirSamples = 0;
+        brick.surfaceSamples = 0;
+        return;
     }
     brick.gpuGenerated = false;
 

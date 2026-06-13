@@ -1075,6 +1075,17 @@ private:
     // PumpEditedBrickRegens). The set mirrors the deque for O(1) dedup.
     std::deque<uint32_t> m_editRegenQueue;
     std::unordered_set<uint32_t> m_editRegenQueued;
+    // Cached world AABBs of all edit overlays (rebuilt on edit-revision change);
+    // backs the per-brick GPU-gen eligibility test so one edit no longer drops
+    // ALL brick generation to the CPU path.
+    struct OverlayAabb {
+        int32_t minX, minY, minZ, maxX, maxY, maxZ;
+    };
+    mutable std::vector<OverlayAabb> m_overlayAabbCache;
+    mutable uint64_t m_overlayAabbCacheRevision = ~0ull;
+    bool BrickIntersectsEditOverlays(
+        int32_t originX, int32_t originY, int32_t originZ,
+        int32_t worldSize, int32_t halo) const;
 };
 
 } // namespace VENPOD::Simulation
