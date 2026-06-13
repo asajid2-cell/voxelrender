@@ -11866,6 +11866,11 @@ int RunSandbox(int argc, char* argv[]) {
                 // (coalesced) so the mid-MESH rebuilds and re-applies its edit-
                 // footprint SUPPRESSION (punch-through holes over edits), letting the
                 // voxel raymarch render the live carve instead of the mesh occluding it.
+                // NOTE: this must run every frame even with the live bake on - the
+                // bake only owns the near brick pool, so the mid-MESH suppression
+                // still needs prompt invalidation or terrain slabs occlude the carve
+                // boundary for several frames (verified visual regression when this
+                // was coalesced to every 4th frame).
                 sparseClipmapTileCache.PumpEditedHeightTileRegens(sparseClipmapFramePolicy, 2u);
                 sparseVoxelWorld.PumpRegeneratedEditUploads(3u);
                 const uint64_t sparseEditRevision = sparseVoxelWorld.GetEdits().RevisionSerial();
@@ -20776,12 +20781,33 @@ int RunSandbox(int argc, char* argv[]) {
             // surface/raymarch draw (all upload-ring copies already emitted earlier).
             static const bool enableSparseEditLiveBake =
                 ReadUIntEnv("VENPOD_SPARSE_EDIT_LIVE_BAKE", 1u) != 0u;
+            // Only bake on frames where an edit actually happened. The brick pool
+            // RETAINS the baked voxels between frames, and the durable CPU regen
+            // makes them permanent, so re-baking when nothing changed is pure
+            // overhead (it was running every frame as long as any edit existed,
+            // adding a per-frame snapshot/stage + a pool SRV<->UAV barrier that
+            // serializes the GPU). A short cooldown after the last edit keeps the
+            // overlay live long enough for the durable regen to catch up against
+            // eviction/restream.
+            static uint64_t sparseEditBakeLastRevision = 0u;
+            static uint64_t sparseEditBakeLastChangeFrame = 0u;
+            const uint64_t sparseEditCurrentRevision = sparseVoxelWorld.GetEdits().RevisionSerial();
+            if (sparseEditCurrentRevision != sparseEditBakeLastRevision) {
+                sparseEditBakeLastChangeFrame = frameCount;
+                sparseEditBakeLastRevision = sparseEditCurrentRevision;
+            }
+            const bool sparseEditBakeActive =
+                (frameCount - sparseEditBakeLastChangeFrame) <= 30u;
             if (enableSparseEditLiveBake &&
+                sparseEditBakeActive &&
                 sparseGpuResources.IsInitialized() &&
                 physicsDispatcher->IsApplyEditDeltasToPoolReady() &&
                 sparseVoxelWorld.GetEdits().EditedBrickCount() != 0u) {
+                const uint64_t bakeSnapStart = SDL_GetPerformanceCounter();
                 std::vector<Simulation::SparseEditDelta> bakeDeltas =
                     sparseVoxelWorld.BuildGpuEditDeltaSnapshotForRender(8192u);
+                const double bakeSnapMs = ticksToMs(SDL_GetPerformanceCounter() - bakeSnapStart);
+                const uint64_t bakeStageStart = SDL_GetPerformanceCounter();
                 SparseEditDeltaGpuUploadTicket bakeTicket;
                 if (!bakeDeltas.empty() &&
                     sparseGpuResources.CanStageEditDeltas(bakeDeltas) &&
@@ -20801,6 +20827,13 @@ int RunSandbox(int argc, char* argv[]) {
                         sparseGpuResources.GetStats().pageTableCapacity,
                         sparseGpuResources.GetStats().maxBrickPages);
                     sparseGpuResources.EndEditDeltaBakeWrite(commandList.Get());
+                    if (enableRuntimeLog && (frameCount % 8u) == 0u) {
+                        spdlog::info(
+                            "SPARSE_EDIT_BAKE_DIAG frame={} snapMs={:.2f} stageMs={:.2f} deltas={} ranges={}",
+                            frameCount, bakeSnapMs,
+                            ticksToMs(SDL_GetPerformanceCounter() - bakeStageStart),
+                            bakeTicket.deltaCount, bakeTicket.rangeCount);
+                    }
                 }
             }
             renderSparseSurfaceLayer();
