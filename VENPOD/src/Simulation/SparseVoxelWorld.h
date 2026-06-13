@@ -640,6 +640,10 @@ public:
     const std::vector<SparsePhysicsWorkPacket>& GetLastPhysicsWorkPackets() const { return m_physicsStagedPackets; }
     const std::vector<SparseEditDelta>& GetPendingGpuEditDeltas() const { return m_edits.PendingGpuDeltas(); }
     std::vector<SparseEditDelta> BuildGpuEditDeltaSnapshotForPhysicsWork(uint32_t maxDeltas) const;
+    // Edited bricks most-recently-touched first, capped at maxDeltas: the live
+    // render edit-overlay bake covers what the player is actively editing; older
+    // edits fall through to the durable pool once regen bakes them.
+    std::vector<SparseEditDelta> BuildGpuEditDeltaSnapshotForRender(uint32_t maxDeltas) const;
     void ClearPendingGpuEditDeltas(uint32_t consumedCount) { m_edits.ClearPendingGpuDeltas(consumedCount); }
     void ClearPendingGpuEditDeltas() { m_edits.ClearPendingGpuDeltas(); }
     bool SaveEditsToFile(const std::filesystem::path& path);

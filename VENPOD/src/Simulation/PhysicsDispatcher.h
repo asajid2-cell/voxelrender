@@ -249,6 +249,25 @@ public:
         uint32_t frameIndex
     );
 
+    // Bake the staged live edit deltas straight into the resident brick voxel
+    // pool (+ occupancy) before the raymarch reads it. One thread per range
+    // (== one brick == one page) so each thread owns its page; no atomics.
+    void DispatchApplyEditDeltasToPool(
+        ID3D12GraphicsCommandList* cmdList,
+        const Graphics::DescriptorHandle& sparseEditDeltaSRV,
+        const Graphics::DescriptorHandle& sparseEditDeltaRangeSRV,
+        const Graphics::DescriptorHandle& sparsePageTableSRV,
+        const Graphics::DescriptorHandle& sparsePageGenerationsSRV,
+        const Graphics::DescriptorHandle& sparseBrickPoolUAV,
+        const Graphics::DescriptorHandle& sparseOccupancyUAV,
+        uint32_t editDeltaCount,
+        uint32_t editDeltaRangeCount,
+        uint32_t pageTableCapacity,
+        uint32_t maxBrickPages
+    );
+
+    bool IsApplyEditDeltasToPoolReady() const { return m_applyEditDeltasToPoolPipeline.IsValid(); }
+
     // Get command signature for indirect dispatch
     ID3D12CommandSignature* GetCommandSignature() const { return m_commandSignature.Get(); }
 
@@ -313,6 +332,12 @@ private:
         const std::filesystem::path& shaderPath
     );
 
+    Result<void> CreateApplyEditDeltasToPoolPipeline(
+        ID3D12Device* device,
+        Graphics::ShaderCompiler& shaderCompiler,
+        const std::filesystem::path& shaderPath
+    );
+
     Result<void> CreateSparsePhysicsPacketPipeline(
         ID3D12Device* device,
         Graphics::ShaderCompiler& shaderCompiler,
@@ -333,6 +358,7 @@ private:
     Graphics::DX12ComputePipeline m_sparseMissFeedbackPipeline;
     Graphics::DX12ComputePipeline m_sparseBrushFeedbackPipeline;
     Graphics::DX12ComputePipeline m_sparsePhysicsPacketPipeline;
+    Graphics::DX12ComputePipeline m_applyEditDeltasToPoolPipeline;
 
     // Command signature for indirect dispatch
     ComPtr<ID3D12CommandSignature> m_commandSignature;

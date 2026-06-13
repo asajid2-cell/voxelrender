@@ -158,6 +158,13 @@ Result<void> PhysicsDispatcher::Initialize(
         }
     }
 
+    // The live edit-overlay bake is a render-prep pass independent of physics, so
+    // create it regardless of whether sparse physics is enabled.
+    result = CreateApplyEditDeltasToPoolPipeline(device, shaderCompiler, shaderPath);
+    if (!result) {
+        spdlog::warn("Apply-edit-deltas-to-pool pipeline not created: {}", result.error());
+    }
+
     if (config.enableIndirectCommandSignature) {
         result = CreateCommandSignature(device);
         if (!result) {
@@ -1990,6 +1997,101 @@ Result<void> PhysicsDispatcher::CreateSparsePhysicsPacketPipeline(
 
     spdlog::info("Sparse physics packet pipeline created successfully");
     return {};
+}
+
+Result<void> PhysicsDispatcher::CreateApplyEditDeltasToPoolPipeline(
+    ID3D12Device* device,
+    Graphics::ShaderCompiler& shaderCompiler,
+    const std::filesystem::path& shaderPath)
+{
+    std::filesystem::path csPath = shaderPath / "Compute" / "CS_ApplyEditDeltasToPool.hlsl";
+
+    auto csResult = shaderCompiler.CompileComputeShader(csPath, L"main", true);
+    if (!csResult) {
+        return Error("Failed to compile CS_ApplyEditDeltasToPool.hlsl: {}", csResult.error());
+    }
+
+    Graphics::CompiledShader cs = csResult.value();
+    if (!cs.IsValid()) {
+        return Error("CS_ApplyEditDeltasToPool shader compilation failed: {}", cs.errors);
+    }
+
+    Graphics::ComputePipelineDesc pipelineDesc;
+    pipelineDesc.computeShader = cs;
+    pipelineDesc.debugName = "ApplyEditDeltasToPoolPipeline";
+
+    // b0: 4 uint constants (rangeCount, deltaCount, pageTableCapacity, maxBrickPages)
+    pipelineDesc.rootParams.push_back({ Graphics::RootParamType::Constants32Bit, 0, 0, 4 });
+    // t0: edit deltas, t1: per-brick ranges, t2: page table, t3: page generations
+    pipelineDesc.rootParams.push_back({ Graphics::RootParamType::DescriptorTable, 0, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_SRV });
+    pipelineDesc.rootParams.push_back({ Graphics::RootParamType::DescriptorTable, 1, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_SRV });
+    pipelineDesc.rootParams.push_back({ Graphics::RootParamType::DescriptorTable, 2, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_SRV });
+    pipelineDesc.rootParams.push_back({ Graphics::RootParamType::DescriptorTable, 3, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_SRV });
+    // u0: brick voxel pool (write), u1: occupancy (read-modify-write per page)
+    pipelineDesc.rootParams.push_back({ Graphics::RootParamType::DescriptorTable, 0, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_UAV });
+    pipelineDesc.rootParams.push_back({ Graphics::RootParamType::DescriptorTable, 1, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_UAV });
+
+    auto result = m_applyEditDeltasToPoolPipeline.Initialize(device, pipelineDesc);
+    if (!result) {
+        return Error("Failed to create apply-edit-deltas-to-pool pipeline: {}", result.error());
+    }
+
+    spdlog::info("Apply-edit-deltas-to-pool pipeline created successfully");
+    return {};
+}
+
+void PhysicsDispatcher::DispatchApplyEditDeltasToPool(
+    ID3D12GraphicsCommandList* cmdList,
+    const Graphics::DescriptorHandle& sparseEditDeltaSRV,
+    const Graphics::DescriptorHandle& sparseEditDeltaRangeSRV,
+    const Graphics::DescriptorHandle& sparsePageTableSRV,
+    const Graphics::DescriptorHandle& sparsePageGenerationsSRV,
+    const Graphics::DescriptorHandle& sparseBrickPoolUAV,
+    const Graphics::DescriptorHandle& sparseOccupancyUAV,
+    uint32_t editDeltaCount,
+    uint32_t editDeltaRangeCount,
+    uint32_t pageTableCapacity,
+    uint32_t maxBrickPages)
+{
+    if (!cmdList || !m_applyEditDeltasToPoolPipeline.IsValid() || !m_heapManager ||
+        !sparseEditDeltaSRV.IsValid() || !sparseEditDeltaRangeSRV.IsValid() ||
+        !sparsePageTableSRV.IsValid() || !sparsePageGenerationsSRV.IsValid() ||
+        !sparseBrickPoolUAV.IsValid() || !sparseOccupancyUAV.IsValid() ||
+        editDeltaRangeCount == 0 ||
+        editDeltaRangeCount > kMaxSparseDispatchEditDeltaRanges ||
+        editDeltaCount == 0 ||
+        editDeltaCount > kMaxSparseDispatchEditDeltas ||
+        editDeltaRangeCount > editDeltaCount ||
+        pageTableCapacity == 0 ||
+        !IsPowerOfTwo(pageTableCapacity) ||
+        maxBrickPages == 0) {
+        return;
+    }
+
+    ID3D12DescriptorHeap* heaps[] = { m_heapManager->GetShaderVisibleCbvSrvUavHeap() };
+    cmdList->SetDescriptorHeaps(1, heaps);
+    m_applyEditDeltasToPoolPipeline.Bind(cmdList);
+
+    struct ApplyEditDeltasConstants {
+        uint32_t rangeCount;
+        uint32_t deltaCount;
+        uint32_t pageTableCapacity;
+        uint32_t maxBrickPages;
+    } constants = {};
+    constants.rangeCount = editDeltaRangeCount;
+    constants.deltaCount = editDeltaCount;
+    constants.pageTableCapacity = pageTableCapacity;
+    constants.maxBrickPages = maxBrickPages;
+
+    m_applyEditDeltasToPoolPipeline.SetRoot32BitConstants(cmdList, 0, sizeof(constants) / 4, &constants);
+    m_applyEditDeltasToPoolPipeline.SetRootDescriptorTable(cmdList, 1, sparseEditDeltaSRV.gpu);
+    m_applyEditDeltasToPoolPipeline.SetRootDescriptorTable(cmdList, 2, sparseEditDeltaRangeSRV.gpu);
+    m_applyEditDeltasToPoolPipeline.SetRootDescriptorTable(cmdList, 3, sparsePageTableSRV.gpu);
+    m_applyEditDeltasToPoolPipeline.SetRootDescriptorTable(cmdList, 4, sparsePageGenerationsSRV.gpu);
+    m_applyEditDeltasToPoolPipeline.SetRootDescriptorTable(cmdList, 5, sparseBrickPoolUAV.gpu);
+    m_applyEditDeltasToPoolPipeline.SetRootDescriptorTable(cmdList, 6, sparseOccupancyUAV.gpu);
+    const uint32_t groupsX = (editDeltaRangeCount + 63u) / 64u;
+    m_applyEditDeltasToPoolPipeline.Dispatch(cmdList, groupsX, 1, 1);
 }
 
 } // namespace VENPOD::Simulation

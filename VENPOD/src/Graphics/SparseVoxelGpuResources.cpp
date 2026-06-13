@@ -1583,6 +1583,34 @@ bool SparseVoxelGpuResources::RetireBrushFeedback(
     return true;
 }
 
+void SparseVoxelGpuResources::BeginEditDeltaBakeWrite(ID3D12GraphicsCommandList* commandList) {
+    if (!m_stats.initialized || !commandList ||
+        !m_brickPool.GetShaderVisibleUAV().IsValid() ||
+        !m_occupancy.GetShaderVisibleUAV().IsValid()) {
+        return;
+    }
+    m_brickPool.TransitionTo(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_occupancy.TransitionTo(commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
+void SparseVoxelGpuResources::EndEditDeltaBakeWrite(ID3D12GraphicsCommandList* commandList) {
+    if (!m_stats.initialized || !commandList) {
+        return;
+    }
+    D3D12_RESOURCE_BARRIER uavBarriers[2] = {};
+    uavBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uavBarriers[0].UAV.pResource = m_brickPool.GetResource();
+    uavBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uavBarriers[1].UAV.pResource = m_occupancy.GetResource();
+    commandList->ResourceBarrier(2, uavBarriers);
+    m_brickPool.TransitionTo(
+        commandList,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    m_occupancy.TransitionTo(
+        commandList,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
 void SparseVoxelGpuResources::PrepareRenderOwnershipWrite(ID3D12GraphicsCommandList* commandList) {
     if (!m_stats.initialized || !commandList || !m_renderOwnership.GetResource() ||
         !m_renderOwnership.GetStagingUAV().IsValid() ||

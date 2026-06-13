@@ -409,6 +409,13 @@ public:
     const DescriptorHandle& BrushFeedbackUAV() const { return m_brushFeedback.GetShaderVisibleUAV(); }
     const DescriptorHandle& RenderOwnershipUAV() const { return m_renderOwnership.GetShaderVisibleUAV(); }
 
+    // Live edit-overlay bake: transition the brick pool + occupancy to UAV so a
+    // compute pass can write edits straight into them, then back to the raymarch's
+    // shader-resource state (with UAV barriers). Call Begin before the dispatch and
+    // End after, with the bake as the last writer to the pool before the raymarch.
+    void BeginEditDeltaBakeWrite(ID3D12GraphicsCommandList* commandList);
+    void EndEditDeltaBakeWrite(ID3D12GraphicsCommandList* commandList);
+
     void PrepareMissFeedbackWrite(ID3D12GraphicsCommandList* commandList);
     void QueueMissFeedbackReadback(ID3D12GraphicsCommandList* commandList, uint32_t frameIndex);
     bool RetireMissFeedback(uint32_t frameIndex, std::vector<Simulation::BrickCoord>& outMissingBricks);

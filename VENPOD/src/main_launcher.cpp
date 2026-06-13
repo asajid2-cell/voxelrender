@@ -20768,6 +20768,41 @@ int RunSandbox(int argc, char* argv[]) {
         // write depth/stencil; the fullscreen background raymarch runs only for
         // pixels not already owned by sparse raster surfaces.
         if (sparseRenderWorldThisFrame) {
+            // Live edit-overlay bake: write this frame's brush edits straight into
+            // the resident brick voxel pool (+ occupancy) right before the raymarch
+            // reads it, so paint/erase render with zero propagation latency. The CPU
+            // regen/upload path remains the durable tier for edits that age out of
+            // the capped overlay. This must be the LAST writer to the pool before the
+            // surface/raymarch draw (all upload-ring copies already emitted earlier).
+            static const bool enableSparseEditLiveBake =
+                ReadUIntEnv("VENPOD_SPARSE_EDIT_LIVE_BAKE", 1u) != 0u;
+            if (enableSparseEditLiveBake &&
+                sparseGpuResources.IsInitialized() &&
+                physicsDispatcher->IsApplyEditDeltasToPoolReady() &&
+                sparseVoxelWorld.GetEdits().EditedBrickCount() != 0u) {
+                std::vector<Simulation::SparseEditDelta> bakeDeltas =
+                    sparseVoxelWorld.BuildGpuEditDeltaSnapshotForRender(8192u);
+                SparseEditDeltaGpuUploadTicket bakeTicket;
+                if (!bakeDeltas.empty() &&
+                    sparseGpuResources.CanStageEditDeltas(bakeDeltas) &&
+                    sparseGpuResources.StageEditDeltas(bakeDeltas, &bakeTicket) &&
+                    sparseGpuResources.EmitEditDeltaCopy(commandList.Get(), bakeTicket)) {
+                    sparseGpuResources.BeginEditDeltaBakeWrite(commandList.Get());
+                    physicsDispatcher->DispatchApplyEditDeltasToPool(
+                        commandList.Get(),
+                        sparseGpuResources.EditDeltasSRV(),
+                        sparseGpuResources.EditDeltaRangesSRV(),
+                        sparseGpuResources.PageTableSRV(),
+                        sparseGpuResources.PageGenerationSRV(),
+                        sparseGpuResources.BrickPoolUAV(),
+                        sparseGpuResources.OccupancyUAV(),
+                        bakeTicket.deltaCount,
+                        bakeTicket.rangeCount,
+                        sparseGpuResources.GetStats().pageTableCapacity,
+                        sparseGpuResources.GetStats().maxBrickPages);
+                    sparseGpuResources.EndEditDeltaBakeWrite(commandList.Get());
+                }
+            }
             renderSparseSurfaceLayer();
             renderSparseMidMeshLayer();
             if (gpuTimestampHeap) {

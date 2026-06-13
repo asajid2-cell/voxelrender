@@ -6610,6 +6610,31 @@ uint32_t SparseVoxelWorld::RequeueLastPhysicsWorkPackets() {
     return requeued;
 }
 
+std::vector<SparseEditDelta> SparseVoxelWorld::BuildGpuEditDeltaSnapshotForRender(
+    uint32_t maxDeltas) const
+{
+    // Order edited bricks by recency (latest global revision first) so the
+    // capped snapshot always carries the bricks the player is actively editing.
+    std::vector<std::pair<uint64_t, BrickCoord>> byRecency;
+    byRecency.reserve(m_edits.EditedBrickCount());
+    m_edits.ForEachOverlay([&](const BrickEditOverlay& overlay) {
+        if (!overlay.voxels.empty()) {
+            byRecency.emplace_back(overlay.lastGlobalRevision, overlay.coord);
+        }
+    });
+    std::sort(byRecency.begin(), byRecency.end(),
+        [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    std::vector<BrickCoord> coords;
+    coords.reserve(byRecency.size());
+    for (const auto& entry : byRecency) {
+        coords.push_back(entry.second);
+    }
+    // BuildDeltaSnapshotForBricks stops at maxDeltas, so the most-recent bricks
+    // (front of coords) get in first; older ones spill to the durable pool.
+    return m_edits.BuildDeltaSnapshotForBricks(coords, maxDeltas);
+}
+
 std::vector<SparseEditDelta> SparseVoxelWorld::BuildGpuEditDeltaSnapshotForPhysicsWork(
     uint32_t maxDeltas) const
 {
