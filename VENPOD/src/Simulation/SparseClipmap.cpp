@@ -6562,12 +6562,30 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     if (m_edits && m_edits->EditedBrickCount() != 0u) {
         editXzBoxes.reserve(m_edits->EditedBrickCount());
         m_edits->ForEachOverlay([&](const BrickEditOverlay& overlay) {
+            if (overlay.voxels.empty()) {
+                return;
+            }
+            // Tight footprint: the XZ bounds of the ACTUAL edited voxels, not the
+            // whole 16^3 brick. A brush that touches a few voxels then suppresses
+            // only its real footprint, so the mesh hole hugs the carve and the
+            // raymarch/mesh seam sits at the carve rim instead of a brick edge
+            // (which left ragged slivers of stale terrain around the carve).
+            uint8_t minLocalX = SPARSE_BRICK_SIZE - 1u, minLocalZ = SPARSE_BRICK_SIZE - 1u;
+            uint8_t maxLocalX = 0u, maxLocalZ = 0u;
+            for (const auto& [localIndex, packedVoxel] : overlay.voxels) {
+                (void)packedVoxel;
+                const LocalVoxelCoord local = LocalVoxelFromIndex(localIndex);
+                minLocalX = std::min(minLocalX, local.x);
+                maxLocalX = std::max(maxLocalX, local.x);
+                minLocalZ = std::min(minLocalZ, local.z);
+                maxLocalZ = std::max(maxLocalZ, local.z);
+            }
             EditXzBox box{};
             int32_t y = 0;
-            if (TryWorldVoxelFromBrickLocal(overlay.coord.x, 0, &box.minX) &&
-                TryWorldVoxelFromBrickLocal(overlay.coord.z, 0, &box.minZ) &&
-                TryWorldVoxelFromBrickLocal(overlay.coord.x, SPARSE_BRICK_SIZE - 1u, &box.maxX) &&
-                TryWorldVoxelFromBrickLocal(overlay.coord.z, SPARSE_BRICK_SIZE - 1u, &box.maxZ) &&
+            if (TryWorldVoxelFromBrickLocal(overlay.coord.x, minLocalX, &box.minX) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.z, minLocalZ, &box.minZ) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.x, maxLocalX, &box.maxX) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.z, maxLocalZ, &box.maxZ) &&
                 TryWorldVoxelFromBrickLocal(overlay.coord.y, 0, &y)) {
                 editXzBoxes.push_back(box);
             }
