@@ -524,6 +524,12 @@ struct BuildStrokeState {
     bool hasStableAimDistance = false;
     float stableAimDistance = kBrushDefaultAimDistance;
     glm::vec3 stableAimWorldPosition{0.0f};
+    // Crosshair-locked aim depth for the DEFAULT brush feel: a held stroke edits
+    // at the surface depth it acquired on (re)aim, so paint doesn't ladder the
+    // surface toward the camera and erase doesn't drill through to the far wall.
+    bool aimDepthLocked = false;
+    float lockedAimDepth = kBrushDefaultAimDistance;
+    glm::vec3 lockedAimRayDir{0.0f, 0.0f, 1.0f};
     bool hasPreviewWorldPosition = false;
     glm::vec3 previewWorldPosition{0.0f};
 };
@@ -1850,6 +1856,13 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseBrushPaintSmokeFollowCamera =
         enableSparseBrushPaintSmoke &&
         ReadUIntEnv("VENPOD_SPARSE_BRUSH_SMOKE_FOLLOW_CAMERA", 0u) != 0u;
+    // Real-aim smoke: hold the brush button but DON'T override placement — let the
+    // actual GPU/CPU raycast hit (the crosshair ray) drive where the edit lands,
+    // reproducing the true interactive path so we can verify edits land where the
+    // camera looks (the scripted target override hid the real aim behavior).
+    const bool sparseBrushPaintSmokeRealAim =
+        enableSparseBrushPaintSmoke &&
+        ReadUIntEnv("VENPOD_SPARSE_BRUSH_SMOKE_REAL_AIM", 0u) != 0u;
     const uint32_t sparseBrushPaintSmokeForcedCase =
         ReadUIntEnv("VENPOD_SPARSE_BRUSH_SMOKE_CASE", UINT32_MAX);
     const uint32_t sparseBrushPaintSmokeRadiusTenths =
@@ -1872,6 +1885,14 @@ int RunSandbox(int argc, char* argv[]) {
     const uint32_t sparseBrushFeedbackMaxRecords =
         ReadUIntEnv("VENPOD_SPARSE_BRUSH_FEEDBACK_RECORDS", 8192u);
     const bool disableBrushInput = ReadUIntEnv("VENPOD_DISABLE_BRUSH_INPUT", 0u) != 0u;
+    // Traversal-ramp brush feel (OFF by default): when a held build stroke is
+    // active this pulls the brush back along the ray each frame and ramps it down
+    // to the player's feet to lay a walkable path. It actively OVERRIDES the
+    // crosshair aim, so a player point-editing sees the brush drag to their feet
+    // ("doesn't paint where I look"). Default off = the brush stays on the
+    // raycast hit under the crosshair. Set VENPOD_BRUSH_TRAVERSAL_RAMP=1 to opt in.
+    const bool enableBrushTraversalRamp =
+        ReadUIntEnv("VENPOD_BRUSH_TRAVERSAL_RAMP", 0u) != 0u;
     const uint32_t sparseMissFeedbackRayGrid = ReadUIntEnv("VENPOD_SPARSE_MISS_FEEDBACK_RAYS", 9u);
     const uint32_t sparseMissFeedbackDistance = ReadUIntEnv("VENPOD_SPARSE_MISS_FEEDBACK_DISTANCE", 384u);
     const uint32_t sparseMissFeedbackStride = std::max(4u, ReadUIntEnv("VENPOD_SPARSE_MISS_FEEDBACK_STRIDE", 8u));
@@ -18526,7 +18547,44 @@ int RunSandbox(int argc, char* argv[]) {
                 buildStrokeState.hasLastBrushRayDirection = false;
             }
 
-            if (brushHitValid && brushHitTracksCurrentRay) {
+            if (!enableBrushTraversalRamp) {
+                // DEFAULT crosshair-locked-depth placement (paint AND erase).
+                // Acquire the working depth from the raycast hit on the first
+                // stroke frame and whenever the aim ray turns (the player
+                // re-aimed). Hold it steady on a stationary aim: paint then
+                // builds a patch at the crosshair instead of laddering a column
+                // up toward the camera, and erase carves a crater instead of
+                // drilling along the ray to the far side of the world. If a
+                // frame's raycast misses, keep the locked depth rather than
+                // detaching to a fixed air distance (which dumped edits in
+                // mid-air = "doesn't paint where I look").
+                const float aimTurnDot = buildStrokeState.aimDepthLocked
+                    ? glm::dot(glm::normalize(buildStrokeState.lockedAimRayDir), rayDir)
+                    : -1.0f;
+                const bool aimMoved = !buildStrokeState.aimDepthLocked || aimTurnDot < 0.9986f;
+                if (brushHitValid && brushHitTracksCurrentRay &&
+                    (aimMoved || !buildStrokeState.aimDepthLocked)) {
+                    buildStrokeState.lockedAimDepth = std::clamp(
+                        glm::length(brushHitWorld - cameraPos),
+                        4.0f,
+                        kBrushMaxInteractionDistance);
+                    buildStrokeState.aimDepthLocked = true;
+                }
+                buildStrokeState.lockedAimRayDir = rayDir;
+                const float workDepth = buildStrokeState.aimDepthLocked
+                    ? buildStrokeState.lockedAimDepth
+                    : kBrushDefaultAimDistance;  // aimed at sky, never acquired
+                buildStrokeState.active = true;
+                intendedBrushWorld = cameraPos + rayDir * workDepth;
+                brushPos = (useStaticChunkLayout || sparseRuntimeTestMode)
+                    ? intendedBrushWorld - regionOriginWorld
+                    : voxelWorld->WorldToRenderLocal(intendedBrushWorld);
+                brushPos = glm::clamp(brushPos,
+                    glm::vec3(0.5f),
+                    glm::vec3(voxelWorld->GetGridSizeX() - 0.5f,
+                             voxelWorld->GetGridSizeY() - 0.5f,
+                             voxelWorld->GetGridSizeZ() - 0.5f));
+            } else if (brushHitValid && brushHitTracksCurrentRay) {
                 if (buildStroke) {
                     // Start held build strokes at the hit point, then actively
                     // pull the brush back along the current line of sight. If
@@ -18555,8 +18613,6 @@ int RunSandbox(int argc, char* argv[]) {
                         ? intendedBrushWorld - regionOriginWorld
                         : voxelWorld->WorldToRenderLocal(intendedBrushWorld);
                 } else {
-                    // Use GPU raycast hit position (on solid voxel face).
-                    // Convert the previous-frame world hit into the current toroidal render slot.
                     intendedBrushWorld = brushHitWorld;
                     brushPos = sparseRuntimeTestMode
                         ? brushHitWorld - regionOriginWorld
@@ -18568,13 +18624,13 @@ int RunSandbox(int argc, char* argv[]) {
                         brushPos.x, brushPos.y, brushPos.z, brushController.GetMaterial());
                 }
             } else {
-                // Fallback: keep build strokes at their current working
-                // distance so turning left/right follows the line of sight
-                // instead of teleporting the brush back in front of the player.
-                const float fallbackDistance = buildStroke
+                // Traversal-ramp fallback: keep build strokes at their current
+                // working distance so turning left/right follows the line of sight.
+                const bool rampPullback = buildStroke;
+                const float fallbackDistance = rampPullback
                     ? (buildStrokeState.active ? buildStrokeState.rayDistance : kBrushDefaultAimDistance)
                     : 12.0f;
-                if (buildStroke) {
+                if (rampPullback) {
                     buildStrokeState.active = true;
                     const float pullStep = std::max(
                         kBrushStrokePullSpeed,
@@ -18584,7 +18640,7 @@ int RunSandbox(int argc, char* argv[]) {
                         4.0f,
                         kBrushMaxInteractionDistance);
                 }
-                const glm::vec3 fallbackWorld = buildStroke
+                const glm::vec3 fallbackWorld = rampPullback
                     ? cameraPos + rayDir * buildStrokeState.rayDistance
                     : cameraPos + rayDir * fallbackDistance;
                 intendedBrushWorld = fallbackWorld;
@@ -18610,7 +18666,8 @@ int RunSandbox(int argc, char* argv[]) {
             const float intendedBrushEyeDistance = glm::length(intendedBrushWorld - cameraPos);
             const float closeRampWorldEligibility =
                 std::max(16.0f, brushController.GetRadius() * 3.0f + playerHeight + playerRadius);
-            if (buildStroke && intendedBrushEyeDistance <= closeRampWorldEligibility) {
+            if (buildStroke && enableBrushTraversalRamp &&
+                intendedBrushEyeDistance <= closeRampWorldEligibility) {
                 brushPos = ApplyCloseTraversalBrushFallback(
                     brushPos,
                     cameraPosLocal,
@@ -18656,7 +18713,8 @@ int RunSandbox(int argc, char* argv[]) {
                 }
             }
 
-            if (sparseBrushPaintSmokeActive && sparseRuntimeTestMode && buildStroke) {
+            if (sparseBrushPaintSmokeActive && sparseRuntimeTestMode && buildStroke &&
+                !sparseBrushPaintSmokeRealAim) {
                 const uint64_t paintFrame = frameCount - sparseBrushPaintSmokeStartFrame;
                 const uint32_t strokeIndex = static_cast<uint32_t>((paintFrame / 45ull) % 4ull);
                 int32_t targetX = 224 + static_cast<int32_t>((strokeIndex & 1u) * 8u);
@@ -18717,6 +18775,33 @@ int RunSandbox(int argc, char* argv[]) {
                             targetX, targetY, targetZ,
                             brushPlacementWorld.x, brushPlacementWorld.y, brushPlacementWorld.z);
                     }
+                }
+            }
+
+            if (sparseBrushPaintSmokeActive && sparseRuntimeTestMode && buildStroke &&
+                sparseBrushPaintSmokeRealAim && enableRuntimeLog) {
+                static int realAimLog = 0;
+                if ((realAimLog++ % 30) == 0) {
+                    // Angular error between where the edit will land and the
+                    // crosshair (center) ray: large = "doesn't paint where I look".
+                    const glm::vec3 toBrush = brushPlacementWorld - cameraPos;
+                    const float toBrushLen = glm::length(toBrush);
+                    const float cosErr = toBrushLen > 0.001f
+                        ? glm::dot(glm::normalize(toBrush), rayDir)
+                        : 1.0f;
+                    const float angErrDeg =
+                        std::acos(std::clamp(cosErr, -1.0f, 1.0f)) * 57.2957795f;
+                    spdlog::info(
+                        "SPARSE_BRUSH_REALAIM frame={} completed={} gpuValid={} hitValid={} tracksRay={} cam=({:.1f},{:.1f},{:.1f}) ray=({:.2f},{:.2f},{:.2f}) hitWorld=({:.1f},{:.1f},{:.1f}) brushWorld=({:.1f},{:.1f},{:.1f}) hitDist={:.1f} angErrDeg={:.1f}",
+                        frameCount,
+                        hasCompletedBrushQuery ? 1 : 0,
+                        gpuRaycastResult.hasValidPosition ? 1 : 0,
+                        brushHitValid ? 1 : 0, brushHitTracksCurrentRay ? 1 : 0,
+                        cameraPos.x, cameraPos.y, cameraPos.z,
+                        rayDir.x, rayDir.y, rayDir.z,
+                        brushHitWorld.x, brushHitWorld.y, brushHitWorld.z,
+                        brushPlacementWorld.x, brushPlacementWorld.y, brushPlacementWorld.z,
+                        toBrushLen, angErrDeg);
                 }
             }
 
@@ -19161,6 +19246,9 @@ int RunSandbox(int argc, char* argv[]) {
             buildStrokeState.hasLastBrushRayDirection = false;
             buildStrokeState.lastBrushMode = UINT32_MAX;
             buildStrokeState.sweepStampsLastFrame = 0;
+            // Release the crosshair aim-depth lock so the next stroke re-acquires
+            // its surface depth from a fresh raycast.
+            buildStrokeState.aimDepthLocked = false;
         }
         if (brushPlacementPreviewValid) {
             if (!buildStrokeState.hasPreviewWorldPosition) {
