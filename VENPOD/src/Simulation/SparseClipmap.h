@@ -597,7 +597,19 @@ public:
         const SparseMidHeightSurfaceBuildConfig& buildConfig = {}) const;
     void SetEditStore(const SparseEditStore* edits);
     void SetFarSvoFallbackMetadata(const SparseClipmapFarSvoFallbackMetadata& metadata);
-    uint32_t InvalidateEditedOverlays(const SparseEditStore& edits, const SparseClipmapPolicy& policy);
+    // sinceRevision: only overlays touched after this global edit revision are
+    // processed (0 = all, e.g. after load). Pass the previously-seen
+    // RevisionSerial so continuous painting costs O(new strokes), not
+    // O(every overlay ever made) — the edit-hitch fix. Invalidated bricks are
+    // QUEUED; call PumpEditedBrickRegens each frame to drain them on a budget.
+    uint32_t InvalidateEditedOverlays(
+        const SparseEditStore& edits,
+        const SparseClipmapPolicy& policy,
+        uint64_t sinceRevision = 0);
+    // Budgeted regeneration of edit-invalidated mid bricks (a full CPU brick
+    // rebuild is ~2.5ms; draining a couple per frame keeps editing hitch-free
+    // while the mid trails the stroke by a few invisible frames).
+    uint32_t PumpEditedBrickRegens(const SparseClipmapPolicy& policy, uint32_t maxBricks);
 
     // DEV-ONLY (MidVoxelGpuGenPoc parity harness): generate the REAL pristine
     // procedural brick for a coord on this (unedited) cache and return its packed
@@ -1059,6 +1071,10 @@ private:
     uint32_t m_dirtyVoxelEndSlot = 0;
     std::vector<uint32_t> m_dirtyHeightSlots;
     std::vector<uint32_t> m_dirtyVoxelSlots;
+    // Edit-invalidated bricks awaiting their budgeted regeneration (see
+    // PumpEditedBrickRegens). The set mirrors the deque for O(1) dedup.
+    std::deque<uint32_t> m_editRegenQueue;
+    std::unordered_set<uint32_t> m_editRegenQueued;
 };
 
 } // namespace VENPOD::Simulation

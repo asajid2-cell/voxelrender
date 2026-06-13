@@ -297,6 +297,7 @@ void SparseEditStore::SetVoxel(int32_t worldX, int32_t worldY, int32_t worldZ, u
         ++m_editedVoxelCount;
     }
     ++m_revisionSerial;
+    overlay.lastGlobalRevision = m_revisionSerial;
 }
 
 bool SparseEditStore::TryGetVoxel(

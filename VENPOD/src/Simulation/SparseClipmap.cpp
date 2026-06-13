@@ -1584,14 +1584,31 @@ void SparseClipmapTileCache::RefreshInterestTouchFrames(uint32_t frameIndex) {
 
 uint32_t SparseClipmapTileCache::InvalidateEditedOverlays(
     const SparseEditStore& edits,
-    const SparseClipmapPolicy& policy)
+    const SparseClipmapPolicy& policy,
+    uint64_t sinceRevision)
 {
     if (!policy.IsEnabled() || m_voxelBricks.empty()) {
         return 0;
     }
 
+    // EDIT-HITCH FIX: the old shape was O(all overlays ever made x all resident
+    // bricks) with a SYNCHRONOUS CPU regeneration of every brick under ANY
+    // historical overlay, re-run on every edit-revision bump -- during continuous
+    // painting that was ~17ms of pumpVoxel work EVERY frame ("we recheck
+    // everything"). Now: (1) only overlays touched since `sinceRevision` are
+    // considered, and (2) each maps to its overlapping mid bricks by direct grid
+    // math per ring (brick origin = coord * cellSize*BRICK_SIZE), expanded by one
+    // ring cell of halo (generation samples a 1-cell halo around the brick, so an
+    // edit just outside the core AABB must still invalidate -- the old version
+    // missed that). A fresh paint stroke touches 1-2 near bricks -> a handful of
+    // mid bricks across rings; the inline regeneration stays (it is small now and
+    // keeps edits responsive at distance).
+    const auto rings = policy.BuildRings();
     std::unordered_set<uint32_t> invalidatedSlots;
     edits.ForEachOverlay([&](const BrickEditOverlay& overlay) {
+        if (overlay.lastGlobalRevision <= sinceRevision) {
+            return;
+        }
         int32_t editMinX = 0;
         int32_t editMinY = 0;
         int32_t editMinZ = 0;
@@ -1607,44 +1624,83 @@ uint32_t SparseClipmapTileCache::InvalidateEditedOverlays(
             return;
         }
 
-        for (const auto& [coord, slot] : m_voxelSlotByCoord) {
-            (void)coord;
-            if (slot >= m_voxelBricks.size()) {
-                continue;
-            }
-            const VoxelBrickPayload& brick = m_voxelBricks[slot];
-            if (brick.slot == UINT32_MAX || invalidatedSlots.find(slot) != invalidatedSlots.end()) {
-                continue;
-            }
+        for (uint32_t ring = 0; ring < static_cast<uint32_t>(rings.size()); ++ring) {
             const int32_t brickWorldSize = std::max(1, RoundToInt32Clamped(
-                static_cast<double>(std::max(1.0f, brick.cellSize)) *
+                static_cast<double>(std::max(1.0f, rings[ring].cellSize)) *
                 static_cast<double>(SPARSE_BRICK_SIZE)));
-            const int32_t brickMinX = brick.originX;
-            const int32_t brickMinY = brick.originY;
-            const int32_t brickMinZ = brick.originZ;
-            const int32_t brickMaxX = SaturatingAddInt32(brick.originX, brickWorldSize - 1);
-            const int32_t brickMaxY = SaturatingAddInt32(brick.originY, brickWorldSize - 1);
-            const int32_t brickMaxZ = SaturatingAddInt32(brick.originZ, brickWorldSize - 1);
-            const bool overlaps =
-                editMinX <= brickMaxX && editMaxX >= brickMinX &&
-                editMinY <= brickMaxY && editMaxY >= brickMinY &&
-                editMinZ <= brickMaxZ && editMaxZ >= brickMinZ;
-            if (overlaps) {
-                invalidatedSlots.insert(slot);
+            const int32_t halo = std::max(1, RoundToInt32Clamped(
+                static_cast<double>(std::max(1.0f, rings[ring].cellSize))));
+            const int32_t cMinX = FloorDiv(editMinX - halo, brickWorldSize);
+            const int32_t cMaxX = FloorDiv(editMaxX + halo, brickWorldSize);
+            const int32_t cMinY = FloorDiv(editMinY - halo, brickWorldSize);
+            const int32_t cMaxY = FloorDiv(editMaxY + halo, brickWorldSize);
+            const int32_t cMinZ = FloorDiv(editMinZ - halo, brickWorldSize);
+            const int32_t cMaxZ = FloorDiv(editMaxZ + halo, brickWorldSize);
+            for (int32_t cz = cMinZ; cz <= cMaxZ; ++cz) {
+                for (int32_t cy = cMinY; cy <= cMaxY; ++cy) {
+                    for (int32_t cx = cMinX; cx <= cMaxX; ++cx) {
+                        const SparseVoxelClipmapCoord coord{
+                            static_cast<int32_t>(ring), cx, cy, cz };
+                        const auto it = m_voxelSlotByCoord.find(coord);
+                        if (it == m_voxelSlotByCoord.end() ||
+                            it->second >= m_voxelBricks.size()) {
+                            continue;
+                        }
+                        const VoxelBrickPayload& brick = m_voxelBricks[it->second];
+                        if (brick.slot != UINT32_MAX && brick.coord == coord) {
+                            invalidatedSlots.insert(it->second);
+                        }
+                    }
+                }
             }
         }
     });
 
+    // Regeneration is DEFERRED to a small per-frame budget (PumpEditedBrickRegens):
+    // a full CPU 16^3 brick rebuild costs ~2.5ms, and a moving brush invalidates
+    // several bricks per frame across rings — regenerating them inline was a
+    // sustained ~17ms/frame (the measured edit-hitch floor even after scoping the
+    // scan). These are mid-DISTANCE bricks; trailing an edit by a few frames is
+    // invisible, a 17ms frame is not. The brick stays visibly stale (not dirty-
+    // marked) until its budgeted regen runs.
     for (uint32_t slot : invalidatedSlots) {
-        GenerateVoxelBrick(slot, policy);
-        MarkVoxelSlotDirty(slot);
-    }
-    if (!invalidatedSlots.empty()) {
-        ++m_dirtySerial;
-        ++m_voxelDirtySerial;
-        RefreshStats(0, 0, static_cast<uint32_t>(invalidatedSlots.size()), 0);
+        if (m_editRegenQueued.insert(slot).second) {
+            m_editRegenQueue.push_back(slot);
+        }
     }
     return static_cast<uint32_t>(invalidatedSlots.size());
+}
+
+uint32_t SparseClipmapTileCache::PumpEditedBrickRegens(
+    const SparseClipmapPolicy& policy,
+    uint32_t maxBricks)
+{
+    if (m_editRegenQueue.empty() || !policy.IsEnabled()) {
+        return 0;
+    }
+    // Catch-up: if a fast stroke outpaces the drain, raise the budget a notch
+    // rather than letting the queue grow without bound.
+    if (m_editRegenQueue.size() > 16) {
+        maxBricks = std::max(maxBricks * 2u, 4u);
+    }
+    uint32_t regenerated = 0;
+    while (regenerated < maxBricks && !m_editRegenQueue.empty()) {
+        const uint32_t slot = m_editRegenQueue.front();
+        m_editRegenQueue.pop_front();
+        m_editRegenQueued.erase(slot);
+        if (slot >= m_voxelBricks.size() || m_voxelBricks[slot].slot == UINT32_MAX) {
+            continue; // evicted/reused since queued
+        }
+        GenerateVoxelBrick(slot, policy);
+        MarkVoxelSlotDirty(slot);
+        ++regenerated;
+    }
+    if (regenerated != 0) {
+        ++m_dirtySerial;
+        ++m_voxelDirtySerial;
+        RefreshStats(0, 0, regenerated, 0);
+    }
+    return regenerated;
 }
 
 void SparseClipmapTileCache::UpdateInterest(

@@ -11789,12 +11789,17 @@ int RunSandbox(int argc, char* argv[]) {
                             sparseOwnershipUnsafeNearMissPctLastRetire);
                     }
                 }
+                // Drain a couple of edit-invalidated mid bricks per frame (budgeted;
+                // a full CPU brick regen is ~2.5ms — inline regeneration of a whole
+                // stroke's bricks was the measured 17ms/frame edit hitch).
+                sparseClipmapTileCache.PumpEditedBrickRegens(sparseClipmapFramePolicy, 2u);
                 const uint64_t sparseEditRevision = sparseVoxelWorld.GetEdits().RevisionSerial();
                 if (sparseEditRevision != sparseMidClipmapEditRevisionSeen) {
                     const uint32_t invalidatedMidVoxelBricks =
                         sparseClipmapTileCache.InvalidateEditedOverlays(
                             sparseVoxelWorld.GetEdits(),
-                            sparseClipmapFramePolicy);
+                            sparseClipmapFramePolicy,
+                            sparseMidClipmapEditRevisionSeen);
                     sparseMidClipmapEditRevisionSeen = sparseEditRevision;
                     if (enableRuntimeLog && invalidatedMidVoxelBricks != 0u) {
                         spdlog::info(

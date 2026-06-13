@@ -117,6 +117,10 @@ struct BrickEditOverlay {
     BrickCoord coord;
     std::unordered_map<uint16_t, uint32_t> voxels;
     uint32_t revision = 0;
+    // Global RevisionSerial() value when this overlay was last touched. Lets
+    // consumers process only overlays changed since their last pass instead of
+    // re-walking every overlay ever made (the edit-hitch fix).
+    uint64_t lastGlobalRevision = 0;
     bool dirtyDisk = false;
     bool dirtyGpu = false;
 };
