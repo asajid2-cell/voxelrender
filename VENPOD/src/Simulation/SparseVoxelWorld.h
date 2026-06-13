@@ -591,6 +591,10 @@ public:
         int32_t hitNormalZ = 0,
         bool hasHitNormal = false,
         std::vector<SparseEditDelta>* outDeltas = nullptr);
+    // Drains the deferred edited-brick regen+upload queue (see
+    // QueueRegeneratedUploadForExistingPage): each entry is a full 16^3 brick
+    // rebuild + edit composite, far too expensive to run inline per brush stamp.
+    uint32_t PumpRegeneratedEditUploads(uint32_t maxBricks);
     CollisionSampleStatus SampleCollisionStatus(int32_t worldX, int32_t worldY, int32_t worldZ) const;
     SparseCollisionVolumeResult TestCollisionAabb(
         const SparseCollisionAabb& aabb,
@@ -941,6 +945,9 @@ private:
         bool commit,
         bool requestRenderBricks,
         std::vector<SparseEditDelta>* outDeltas);
+
+    std::deque<BrickCoord> m_pendingRegenUploadQueue;
+    std::unordered_set<BrickCoord, BrickCoordHash> m_pendingRegenUploadSet;
 
     SparseVoxelWorldConfig m_config;
     SparseBrickPool m_pool;

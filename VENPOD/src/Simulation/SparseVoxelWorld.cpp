@@ -8422,42 +8422,70 @@ bool SparseVoxelWorld::QueueRegeneratedUploadForExistingPage(
     m_pool.MarkHasPersistentEdits(coord);
     MarkResidencyClass(coord, SparseResidencyClass::Edited);
 
-    const BrickLifecycleState state = m_pool.GetState(coord);
-    if (state == BrickLifecycleState::Requested || state == BrickLifecycleState::GeneratingCPU) {
-        return false;
+    // The full 16^3 regen + edit composite is DEFERRED to a per-frame budget
+    // (PumpRegeneratedEditUploads). Running it inline was a measured ~31ms/frame
+    // while painting interactively: every stamp re-built every touched brick on
+    // the main thread. Lifecycle checks happen at drain time - the brick's state
+    // when the budgeted regen actually runs is what matters.
+    if (m_pendingRegenUploadSet.insert(coord).second) {
+        m_pendingRegenUploadQueue.push_back(coord);
     }
-
-    if (state == BrickLifecycleState::UploadingGPU) {
-        m_deferredDirtyAfterUpload[coord] = true;
-        ++m_renderDirtyUploadDeferredLastFrame;
-        return false;
-    }
-
-    if (state == BrickLifecycleState::EvictQueued || state == BrickLifecycleState::Evicted ||
-        state == BrickLifecycleState::Missing) {
-        return false;
-    }
-
-    GeneratedSparseBrick brick = GenerateBrickWithCachedTerrainColumns(coord);
-    m_edits.ApplyToGeneratedBrick(brick);
-    m_generated[coord] = brick;
-
-    if (state == BrickLifecycleState::UploadQueued) {
-        return false;
-    }
-
-    if (state == BrickLifecycleState::Resident) {
-        if (!m_pool.MarkDirty(coord)) {
-            return false;
-        }
-    }
-
-    if (!m_pool.QueueUpload(coord)) {
-        return false;
-    }
-    QueueUploadCoordBack(coord);
-    ++m_renderDirtyFullUploadsQueuedLastFrame;
     return true;
+}
+
+uint32_t SparseVoxelWorld::PumpRegeneratedEditUploads(uint32_t maxBricks)
+{
+    if (m_pendingRegenUploadQueue.empty()) {
+        return 0;
+    }
+    // Catch-up: a fast stroke must not let the visible-edit lag grow unbounded.
+    if (m_pendingRegenUploadQueue.size() > 24) {
+        maxBricks = std::max(maxBricks * 2u, 8u);
+    }
+    uint32_t pumped = 0;
+    while (pumped < maxBricks && !m_pendingRegenUploadQueue.empty()) {
+        const BrickCoord coord = m_pendingRegenUploadQueue.front();
+        m_pendingRegenUploadQueue.pop_front();
+        m_pendingRegenUploadSet.erase(coord);
+
+        if (!m_pool.TryGetPage(coord)) {
+            ++m_renderDirtyNonResidentLastFrame;
+            continue;
+        }
+        const BrickLifecycleState state = m_pool.GetState(coord);
+        if (state == BrickLifecycleState::Requested || state == BrickLifecycleState::GeneratingCPU) {
+            continue;
+        }
+        if (state == BrickLifecycleState::UploadingGPU) {
+            m_deferredDirtyAfterUpload[coord] = true;
+            ++m_renderDirtyUploadDeferredLastFrame;
+            continue;
+        }
+        if (state == BrickLifecycleState::EvictQueued || state == BrickLifecycleState::Evicted ||
+            state == BrickLifecycleState::Missing) {
+            continue;
+        }
+
+        GeneratedSparseBrick brick = GenerateBrickWithCachedTerrainColumns(coord);
+        m_edits.ApplyToGeneratedBrick(brick);
+        m_generated[coord] = brick;
+        ++pumped;
+
+        if (state == BrickLifecycleState::UploadQueued) {
+            continue;
+        }
+        if (state == BrickLifecycleState::Resident) {
+            if (!m_pool.MarkDirty(coord)) {
+                continue;
+            }
+        }
+        if (!m_pool.QueueUpload(coord)) {
+            continue;
+        }
+        QueueUploadCoordBack(coord);
+        ++m_renderDirtyFullUploadsQueuedLastFrame;
+    }
+    return pumped;
 }
 
 } // namespace VENPOD::Simulation

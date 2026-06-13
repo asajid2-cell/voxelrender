@@ -610,6 +610,17 @@ public:
     // rebuild is ~2.5ms; draining a couple per frame keeps editing hitch-free
     // while the mid trails the stroke by a few invisible frames).
     uint32_t PumpEditedBrickRegens(const SparseClipmapPolicy& policy, uint32_t maxBricks);
+    // Height-tile counterpart: queue resident height tiles whose XZ footprint is
+    // touched by overlays changed since `sinceRevision`. These feed the mid-mesh
+    // raster, the layer that was drawing stale procedural ground over carves.
+    uint32_t InvalidateEditedHeightTiles(
+        const SparseEditStore& edits,
+        const SparseClipmapPolicy& policy,
+        uint64_t sinceRevision = 0);
+    // Drain a budget of edit-invalidated height tiles, regenerating each with the
+    // edit-aware sampler. Bumps m_heightDirtySerial at most every few frames while
+    // draining (and once on drain) so the full mid-mesh rebuild is coalesced.
+    uint32_t PumpEditedHeightTileRegens(const SparseClipmapPolicy& policy, uint32_t maxTiles);
 
     // DEV-ONLY (MidVoxelGpuGenPoc parity harness): generate the REAL pristine
     // procedural brick for a coord on this (unedited) cache and return its packed
@@ -1075,6 +1086,18 @@ private:
     // PumpEditedBrickRegens). The set mirrors the deque for O(1) dedup.
     std::deque<uint32_t> m_editRegenQueue;
     std::unordered_set<uint32_t> m_editRegenQueued;
+    // Edit-invalidated HEIGHT tiles awaiting budgeted regeneration. The mid-mesh
+    // raster reads only these tiles' top-surface samples, so a carve stays
+    // visually hidden behind stale procedural ground until its tile regenerates
+    // (with the edit-aware sampler) and the mesh rebuilds. Separate from the
+    // voxel-brick queue because tiles are 2D (ring,x,z) and drive the mesh.
+    std::deque<uint32_t> m_editHeightTileQueue;
+    std::unordered_set<uint32_t> m_editHeightTileQueued;
+    // Coalesce the full-snapshot mid-mesh rebuild: bumping m_heightDirtySerial
+    // every drained tile would rebuild+upload the whole mesh every frame of a
+    // stroke (the 2fps trap). Instead bump at most every N frames while draining,
+    // and once when the queue empties.
+    uint32_t m_editHeightFramesSinceSerialBump = 0;
     // Cached world AABBs of all edit overlays (rebuilt on edit-revision change);
     // backs the per-brick GPU-gen eligibility test so one edit no longer drops
     // ALL brick generation to the CPU path.

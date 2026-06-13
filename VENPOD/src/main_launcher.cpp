@@ -1832,8 +1832,11 @@ int RunSandbox(int argc, char* argv[]) {
     const bool enableSparseBrushFeedbackMovingDiagnostic =
         enableSparseBrushFeedbackDiagnosticSeed &&
         ReadUIntEnv("VENPOD_SPARSE_BRUSH_FEEDBACK_MOVING_DIAGNOSTIC", 0u) != 0u;
+    // Deliberately NOT gated on brush feedback: with feedback envs unset the
+    // smoke drives the same CPU ApplyBrushEdit path interactive painting uses,
+    // which is the configuration that actually ships.
     const bool enableSparseBrushPaintSmoke =
-        enableSparseBrushFeedback &&
+        sparseBackendRequested &&
         ReadUIntEnv("VENPOD_SPARSE_BRUSH_PAINT_SMOKE", 0u) != 0u;
     const bool enableSparseBrushPaintMovingSmoke =
         enableSparseBrushPaintSmoke &&
@@ -1841,6 +1844,18 @@ int RunSandbox(int argc, char* argv[]) {
     const bool enableSparseBrushPaintNonresidentSmoke =
         enableSparseBrushPaintSmoke &&
         ReadUIntEnv("VENPOD_SPARSE_BRUSH_PAINT_NONRESIDENT_SMOKE", 0u) != 0u;
+    // Repro knobs for matching REAL interactive editing: aim the smoke at the
+    // terrain in front of the camera (instead of a fixed world spot the walk
+    // leaves behind), pin a single brush case, and scale the brush.
+    const bool sparseBrushPaintSmokeFollowCamera =
+        enableSparseBrushPaintSmoke &&
+        ReadUIntEnv("VENPOD_SPARSE_BRUSH_SMOKE_FOLLOW_CAMERA", 0u) != 0u;
+    const uint32_t sparseBrushPaintSmokeForcedCase =
+        ReadUIntEnv("VENPOD_SPARSE_BRUSH_SMOKE_CASE", UINT32_MAX);
+    const uint32_t sparseBrushPaintSmokeRadiusTenths =
+        ReadUIntEnv("VENPOD_SPARSE_BRUSH_SMOKE_RADIUS_TENTHS", 0u);
+    const uint32_t sparseBrushPaintSmokeFollowDistance =
+        std::max(8u, ReadUIntEnv("VENPOD_SPARSE_BRUSH_SMOKE_FOLLOW_DISTANCE", 24u));
     const uint32_t sparseBrushPaintSmokeStartFrame =
         ReadUIntEnv("VENPOD_SPARSE_BRUSH_PAINT_SMOKE_START_FRAME", 180u);
     const uint32_t sparseBrushPaintSmokeEndFrame = std::max(
@@ -11793,6 +11808,11 @@ int RunSandbox(int argc, char* argv[]) {
                 // a full CPU brick regen is ~2.5ms — inline regeneration of a whole
                 // stroke's bricks was the measured 17ms/frame edit hitch).
                 sparseClipmapTileCache.PumpEditedBrickRegens(sparseClipmapFramePolicy, 2u);
+                // Drain edit-invalidated HEIGHT tiles (the layer the mid mesh
+                // rasters): regenerating them with the edit-aware sampler is what
+                // makes carves/additions actually show through the mesh.
+                sparseClipmapTileCache.PumpEditedHeightTileRegens(sparseClipmapFramePolicy, 2u);
+                sparseVoxelWorld.PumpRegeneratedEditUploads(3u);
                 const uint64_t sparseEditRevision = sparseVoxelWorld.GetEdits().RevisionSerial();
                 if (sparseEditRevision != sparseMidClipmapEditRevisionSeen) {
                     const uint32_t invalidatedMidVoxelBricks =
@@ -11800,13 +11820,20 @@ int RunSandbox(int argc, char* argv[]) {
                             sparseVoxelWorld.GetEdits(),
                             sparseClipmapFramePolicy,
                             sparseMidClipmapEditRevisionSeen);
+                    const uint32_t invalidatedHeightTiles =
+                        sparseClipmapTileCache.InvalidateEditedHeightTiles(
+                            sparseVoxelWorld.GetEdits(),
+                            sparseClipmapFramePolicy,
+                            sparseMidClipmapEditRevisionSeen);
                     sparseMidClipmapEditRevisionSeen = sparseEditRevision;
-                    if (enableRuntimeLog && invalidatedMidVoxelBricks != 0u) {
+                    if (enableRuntimeLog &&
+                        (invalidatedMidVoxelBricks != 0u || invalidatedHeightTiles != 0u)) {
                         spdlog::info(
-                            "SPARSE_MID_CLIPMAP_EDIT_INVALIDATE frame={} revision={} bricks={}",
+                            "SPARSE_MID_CLIPMAP_EDIT_INVALIDATE frame={} revision={} bricks={} heightTiles={}",
                             frameCount,
                             sparseEditRevision,
-                            invalidatedMidVoxelBricks);
+                            invalidatedMidVoxelBricks,
+                            invalidatedHeightTiles);
                     }
                 }
                 perfSparseClipmapInterestMs =
@@ -18645,6 +18672,30 @@ int RunSandbox(int argc, char* argv[]) {
                     targetX = 608 + static_cast<int32_t>((orbit & 1u) * 16u);
                     targetZ = 592 + static_cast<int32_t>(((orbit >> 1u) & 1u) * 16u);
                 }
+                if (sparseBrushPaintSmokeFollowCamera) {
+                    // March the actual camera ray (full pitch) until it reaches the
+                    // terrain, so the brush lands on the ground the camera is
+                    // LOOKING AT — a flattened-forward offset drops the brush onto
+                    // whatever ground is N units ahead horizontally, which on a
+                    // downslope is well below the view (the carve happens off the
+                    // bottom of the screen and reads as "nothing happened").
+                    const float maxFollow =
+                        static_cast<float>(sparseBrushPaintSmokeFollowDistance) * 3.0f + 8.0f;
+                    float hitT = static_cast<float>(sparseBrushPaintSmokeFollowDistance);
+                    for (float t = 2.0f; t <= maxFollow; t += 1.0f) {
+                        const glm::vec3 p = cameraPos + cameraForward * t;
+                        const float groundH = sparseVoxelWorld.GetTerrain().HeightAt(
+                            static_cast<int32_t>(std::floor(p.x)),
+                            static_cast<int32_t>(std::floor(p.z)));
+                        if (p.y <= groundH) {
+                            hitT = t;
+                            break;
+                        }
+                    }
+                    const glm::vec3 hit = cameraPos + cameraForward * hitT;
+                    targetX = static_cast<int32_t>(std::floor(hit.x));
+                    targetZ = static_cast<int32_t>(std::floor(hit.z));
+                }
                 const int32_t targetY = static_cast<int32_t>(
                     std::floor(sparseVoxelWorld.GetTerrain().HeightAt(targetX, targetZ)));
                 brushPlacementWorld = glm::vec3(
@@ -18656,6 +18707,17 @@ int RunSandbox(int argc, char* argv[]) {
                 brushPlacementCloseRamp = false;
                 buildStrokeState.closeRampActive = false;
                 buildStrokeState.closeRampHorizontalDistance = 0.0f;
+                if (enableRuntimeLog) {
+                    static int smokePosLog = 0;
+                    if ((smokePosLog++ % 60) == 0) {
+                        spdlog::info(
+                            "SPARSE_BRUSH_SMOKE_POS frame={} cam=({:.1f},{:.1f},{:.1f}) fwd=({:.2f},{:.2f},{:.2f}) target=({},{},{}) brushWorld=({:.1f},{:.1f},{:.1f})",
+                            frameCount, cameraPos.x, cameraPos.y, cameraPos.z,
+                            cameraForward.x, cameraForward.y, cameraForward.z,
+                            targetX, targetY, targetZ,
+                            brushPlacementWorld.x, brushPlacementWorld.y, brushPlacementWorld.z);
+                    }
+                }
             }
 
             Input::BrushConstants brushConstants;
@@ -18678,8 +18740,11 @@ int RunSandbox(int argc, char* argv[]) {
             brushConstants.hasHitNormal = brushNormalUsable ? 1u : 0u;
             if (sparseBrushPaintSmokeActive && sparseRuntimeTestMode) {
                 const uint64_t paintFrame = frameCount - sparseBrushPaintSmokeStartFrame;
-                const uint32_t paintCase =
+                uint32_t paintCase =
                     static_cast<uint32_t>((paintFrame / 45ull) % kSparseBrushPaintSmokeCaseCount);
+                if (sparseBrushPaintSmokeForcedCase < kSparseBrushPaintSmokeCaseCount) {
+                    paintCase = sparseBrushPaintSmokeForcedCase;
+                }
                 switch (paintCase) {
                 case 0:
                     brushConstants.radius = 1.5f;
@@ -18703,6 +18768,10 @@ int RunSandbox(int argc, char* argv[]) {
                     break;
                 }
                 brushConstants.shape = static_cast<uint32_t>(Input::BrushShape::Sphere);
+                if (sparseBrushPaintSmokeRadiusTenths > 0u) {
+                    brushConstants.radius =
+                        static_cast<float>(sparseBrushPaintSmokeRadiusTenths) * 0.1f;
+                }
             }
 
             const uint32_t currentBrushKey =

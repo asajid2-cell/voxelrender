@@ -5,6 +5,8 @@
 #include "TerrainConstants.h"
 #include "Utils/BitPacking.h"
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1744,6 +1746,101 @@ uint32_t SparseClipmapTileCache::PumpEditedBrickRegens(
         ++m_dirtySerial;
         ++m_voxelDirtySerial;
         RefreshStats(0, 0, regenerated, 0);
+    }
+    return regenerated;
+}
+
+uint32_t SparseClipmapTileCache::InvalidateEditedHeightTiles(
+    const SparseEditStore& edits,
+    const SparseClipmapPolicy& policy,
+    uint64_t sinceRevision)
+{
+    if (!policy.IsEnabled() || m_tiles.empty()) {
+        return 0;
+    }
+    const auto rings = policy.BuildRings();
+    const uint32_t side = std::max(2u, policy.Config().tileSampleSide);
+    uint32_t queued = 0;
+    edits.ForEachOverlay([&](const BrickEditOverlay& overlay) {
+        if (overlay.lastGlobalRevision <= sinceRevision) {
+            return;
+        }
+        int32_t editMinX = 0, editMinZ = 0, editMaxX = 0, editMaxZ = 0, unusedY = 0;
+        if (!TryWorldVoxelFromBrickLocal(overlay.coord.x, 0, &editMinX) ||
+            !TryWorldVoxelFromBrickLocal(overlay.coord.z, 0, &editMinZ) ||
+            !TryWorldVoxelFromBrickLocal(overlay.coord.x, SPARSE_BRICK_SIZE - 1u, &editMaxX) ||
+            !TryWorldVoxelFromBrickLocal(overlay.coord.z, SPARSE_BRICK_SIZE - 1u, &editMaxZ) ||
+            !TryWorldVoxelFromBrickLocal(overlay.coord.y, 0, &unusedY)) {
+            return;
+        }
+        for (uint32_t ring = 0; ring < static_cast<uint32_t>(rings.size()); ++ring) {
+            const double cellSize = static_cast<double>(std::max(1.0f, rings[ring].cellSize));
+            const int32_t tileWorldSize = std::max(1, RoundToInt32Clamped(
+                cellSize * static_cast<double>(side - 1u)));
+            const int32_t halo = std::max(1, RoundToInt32Clamped(cellSize));
+            const int32_t cMinX = FloorDiv(editMinX - halo, tileWorldSize);
+            const int32_t cMaxX = FloorDiv(editMaxX + halo, tileWorldSize);
+            const int32_t cMinZ = FloorDiv(editMinZ - halo, tileWorldSize);
+            const int32_t cMaxZ = FloorDiv(editMaxZ + halo, tileWorldSize);
+            for (int32_t cz = cMinZ; cz <= cMaxZ; ++cz) {
+                for (int32_t cx = cMinX; cx <= cMaxX; ++cx) {
+                    const SparseClipmapTileCoord coord{ static_cast<int32_t>(ring), cx, cz };
+                    const auto it = m_slotByCoord.find(coord);
+                    if (it == m_slotByCoord.end() || it->second >= m_tiles.size()) {
+                        continue;
+                    }
+                    const uint32_t slot = it->second;
+                    if (m_tiles[slot].record.slot == UINT32_MAX ||
+                        !(m_tiles[slot].record.coord == coord)) {
+                        continue;
+                    }
+                    if (m_editHeightTileQueued.insert(slot).second) {
+                        m_editHeightTileQueue.push_back(slot);
+                        ++queued;
+                    }
+                }
+            }
+        }
+    });
+    return queued;
+}
+
+uint32_t SparseClipmapTileCache::PumpEditedHeightTileRegens(
+    const SparseClipmapPolicy& policy,
+    uint32_t maxTiles)
+{
+    if (m_editHeightTileQueue.empty() || !policy.IsEnabled()) {
+        m_editHeightFramesSinceSerialBump = 0;
+        return 0;
+    }
+    if (m_editHeightTileQueue.size() > 12) {
+        maxTiles = std::max(maxTiles * 2u, 4u);
+    }
+    uint32_t regenerated = 0;
+    while (regenerated < maxTiles && !m_editHeightTileQueue.empty()) {
+        const uint32_t slot = m_editHeightTileQueue.front();
+        m_editHeightTileQueue.pop_front();
+        m_editHeightTileQueued.erase(slot);
+        if (slot >= m_tiles.size() || m_tiles[slot].record.slot == UINT32_MAX) {
+            continue; // evicted/reused since queued
+        }
+        GenerateTile(slot, policy);
+        MarkHeightSlotDirty(slot);
+        ++regenerated;
+    }
+    if (regenerated == 0) {
+        return 0;
+    }
+    // Coalesce the full-snapshot mesh rebuild: bump the serial (which the launcher
+    // watches to rebuild+upload the whole mid mesh) at most every few frames while
+    // the queue is still draining, and always once it empties — so a sustained
+    // stroke rebuilds the mesh a handful of times per second, not every frame.
+    ++m_editHeightFramesSinceSerialBump;
+    const bool drained = m_editHeightTileQueue.empty();
+    if (drained || m_editHeightFramesSinceSerialBump >= 5u) {
+        ++m_dirtySerial;
+        ++m_heightDirtySerial;
+        m_editHeightFramesSinceSerialBump = 0;
     }
     return regenerated;
 }
@@ -4122,6 +4219,68 @@ void SparseClipmapTileCache::GenerateTile(uint32_t slot, const SparseClipmapPoli
         FloorToInt32Clamped(static_cast<double>(tile.record.coord.z) * static_cast<double>(tileWorldSize));
     tile.packedSamples.resize(static_cast<size_t>(side) * static_cast<size_t>(side));
 
+    // Edit-aware tiles: the mid-mesh raster reads these top-surface samples, so a
+    // carve/addition must move the sampled height or it stays hidden behind stale
+    // procedural ground. Collect the XZ AABBs of overlays that touch this tile;
+    // only sample cells intersecting one pay the column rescan (a brush footprint
+    // is a handful of cells), every other cell keeps the fast procedural path.
+    struct OverlayXzBox { int32_t minX, minZ, maxX, maxZ; };
+    std::vector<OverlayXzBox> overlayXzBoxes;
+    const int32_t tileWorldSpan = std::max(1, RoundToInt32Clamped(tileWorldSize));
+    const int32_t tileMinX = tile.record.originX;
+    const int32_t tileMaxX = SaturatingAddInt32(tile.record.originX, tileWorldSpan);
+    const int32_t tileMinZ = tile.record.originZ;
+    const int32_t tileMaxZ = SaturatingAddInt32(tile.record.originZ, tileWorldSpan);
+    if (m_edits && m_edits->EditedBrickCount() != 0u) {
+        m_edits->ForEachOverlay([&](const BrickEditOverlay& overlay) {
+            OverlayXzBox box{};
+            int32_t unusedY = 0;
+            if (TryWorldVoxelFromBrickLocal(overlay.coord.x, 0, &box.minX) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.z, 0, &box.minZ) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.x, SPARSE_BRICK_SIZE - 1u, &box.maxX) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.z, SPARSE_BRICK_SIZE - 1u, &box.maxZ) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.y, 0, &unusedY)) {
+                if (box.minX <= tileMaxX && box.maxX >= tileMinX &&
+                    box.minZ <= tileMaxZ && box.maxZ >= tileMinZ) {
+                    overlayXzBoxes.push_back(box);
+                }
+            }
+        });
+    }
+    const int32_t cellSpan = std::max(1, RoundToInt32Clamped(ring.cellSize));
+
+    // Re-derive the surface column top from explicit edits, walking down from any
+    // additions through procedural ground, lowering past contiguous erased voxels.
+    auto editAwareSample = [&](int32_t worldX, int32_t worldZ, float proceduralHeight) -> uint32_t {
+        constexpr int32_t kMaxAddition = 80;
+        constexpr int32_t kMaxCarve = 120;
+        const int32_t proceduralTopY = FloorToInt32Clamped(proceduralHeight);
+        const int32_t scanTop = SaturatingAddInt32(proceduralTopY, kMaxAddition);
+        const int32_t scanBottom = SaturatingAddInt32(proceduralTopY, -kMaxCarve);
+        for (int32_t y = scanTop; y >= scanBottom; --y) {
+            uint32_t editedVoxel = 0;
+            const bool hasEdit = m_edits->TryGetVoxel(worldX, y, worldZ, &editedVoxel);
+            const bool solid = hasEdit
+                ? (Utils::UnpackMaterial(editedVoxel) != Utils::Material::Air)
+                : (y <= proceduralTopY);
+            if (!solid) {
+                continue;
+            }
+            if (hasEdit) {
+                const uint8_t material = Utils::UnpackMaterial(editedVoxel) & 0xFFu;
+                const uint32_t biasedHeight = static_cast<uint32_t>(
+                    std::clamp<int64_t>(static_cast<int64_t>(y) + 32768ll, 0ll, 65535ll));
+                return biasedHeight | (static_cast<uint32_t>(material) << 16);
+            }
+            // Procedural top reached at a lowered height (carve floor): reuse the
+            // procedural material classification at the original column.
+            return PackSample(worldX, worldZ, static_cast<float>(y) + 0.5f);
+        }
+        // Whole scanned band is air (deep carve): clamp to the band floor so the
+        // mesh dips rather than holding stale ground.
+        return PackSample(worldX, worldZ, static_cast<float>(scanBottom) + 0.5f);
+    };
+
     for (uint32_t z = 0; z < side; ++z) {
         for (uint32_t x = 0; x < side; ++x) {
             const int32_t worldX = RoundToInt32Clamped(
@@ -4131,7 +4290,21 @@ void SparseClipmapTileCache::GenerateTile(uint32_t slot, const SparseClipmapPoli
                 static_cast<double>(tile.record.originZ) +
                 static_cast<double>(z) * static_cast<double>(ring.cellSize));
             const float height = m_terrain.HeightAt(worldX, worldZ);
-            tile.packedSamples[x + z * side] = PackSample(worldX, worldZ, height);
+            bool cellEdited = false;
+            if (!overlayXzBoxes.empty()) {
+                const int32_t cellMaxX = SaturatingAddInt32(worldX, cellSpan - 1);
+                const int32_t cellMaxZ = SaturatingAddInt32(worldZ, cellSpan - 1);
+                for (const OverlayXzBox& box : overlayXzBoxes) {
+                    if (box.minX <= cellMaxX && box.maxX >= worldX &&
+                        box.minZ <= cellMaxZ && box.maxZ >= worldZ) {
+                        cellEdited = true;
+                        break;
+                    }
+                }
+            }
+            tile.packedSamples[x + z * side] = cellEdited
+                ? editAwareSample(worldX, worldZ, height)
+                : PackSample(worldX, worldZ, height);
         }
     }
 }
@@ -5410,15 +5583,21 @@ void SparseClipmapTileCache::GenerateVoxelBrickPayload(
             *outVoxel = solidVoxel;
             return true;
         }
-        // Coarse mid-clipmap cells cover many authoritative voxels. A single
-        // erased voxel must not collapse the entire generated cell to air; the
-        // exact sparse page/surface layer owns that local edit. Solid edits are
-        // still allowed to punch through so additions remain visible. Once a
-        // brush produces a real cluster of AIR edits in a coarse cell, the
-        // generated mid context should stop showing stale procedural terrain.
-        const uint32_t coarseAirClusterThreshold = std::max<uint32_t>(
-            8u,
-            static_cast<uint32_t>(std::ceil(std::max(1.0f, ring.cellSize))));
+        // Coarse mid-clipmap cells cover many authoritative voxels. On the FINE
+        // rings the user actually carves into (the mid-voxel raymarch owns the
+        // near/mid ground), any air edit with no solid edit in the cell must show
+        // the carve — the old max(8,cellSize) threshold swallowed thin surface
+        // erases (a shallow crater rarely fills 8 air voxels in a cellSize-4
+        // cell), which read to the user as "deleting does nothing". Coarse FAR
+        // rings keep the high threshold so one sparse stray edit can't punch a
+        // huge distant hole; the exact near-surface layer refines the rim up
+        // close. Solid edits always punch through so additions stay visible.
+        const uint32_t coarseAirClusterThreshold =
+            ring.cellSize <= 16.0f
+                ? 1u
+                : std::max<uint32_t>(
+                      8u,
+                      static_cast<uint32_t>(std::ceil(std::max(1.0f, ring.cellSize))));
         const bool localAirEdit = foundAir && ring.cellSize <= 1.5f;
         const bool clusteredCoarseAirEdit =
             foundAir &&
@@ -5830,9 +6009,16 @@ void SparseClipmapTileCache::GenerateVoxelBrickPayload(
                         static_cast<int32_t>(z) + 1);
                     auto summaryIt = editedCellSummaries.find(cellKey);
                     if (summaryIt != editedCellSummaries.end()) {
-                        const uint32_t coarseAirClusterThreshold = std::max<uint32_t>(
-                            8u,
-                            static_cast<uint32_t>(std::ceil(std::max(1.0f, ring.cellSize))));
+                        // Must match tryEditedCellVoxel's threshold exactly: fine
+                        // rings honor any air edit (carve shows), coarse far rings
+                        // require a cluster. A mismatch here would let the rescue
+                        // below re-solidify a cell the sampler just cleared.
+                        const uint32_t coarseAirClusterThreshold =
+                            ring.cellSize <= 16.0f
+                                ? 1u
+                                : std::max<uint32_t>(
+                                      8u,
+                                      static_cast<uint32_t>(std::ceil(std::max(1.0f, ring.cellSize))));
                         const EditedCellSummary& summary = summaryIt->second;
                         clusteredCoarseAirEditForCell =
                             summary.foundAir &&

@@ -30,6 +30,7 @@ param(
     [switch]$SparseBrushFeedbackStrictResidentOnly,
     [switch]$SparseBrushFeedbackMovingDiagnostic,
     [switch]$SparseBrushPaintSmoke,
+    [switch]$SparseBrushSmokeUserPath,
     [switch]$SparseBrushPaintMovingSmoke,
     [switch]$SparseBrushPaintNonresidentSmoke,
     [string]$SparseEditFile = "",
@@ -515,6 +516,9 @@ try {
         $env:VENPOD_SPARSE_BRUSH_PAINT_SMOKE = "1"
     }
     if ($SparseBrushPaintMovingSmoke) { $env:VENPOD_SPARSE_BRUSH_PAINT_MOVING_SMOKE = "1" }
+    # User-path smoke: ONLY enables the scripted brush. No feedback pipeline, no
+    # debug colors, no physics disable - the exact config interactive play runs.
+    if ($SparseBrushSmokeUserPath) { $env:VENPOD_SPARSE_BRUSH_PAINT_SMOKE = "1" }
     if ($SparseBrushPaintNonresidentSmoke) { $env:VENPOD_SPARSE_BRUSH_PAINT_NONRESIDENT_SMOKE = "1" }
     if ($SparseEditFile -ne "") { $env:VENPOD_SPARSE_EDIT_FILE = $SparseEditFile }
     if ($SparseBrushFeedbackSmoke) { $env:VENPOD_SPARSE_BRUSH_FEEDBACK_DIAGNOSTIC_SEED = "1" }
