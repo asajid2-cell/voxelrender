@@ -12,6 +12,9 @@ param(
     [int]$DebugMode = -1,
     [int]$PitchDeg = -45,
     [switch]$RealAim,
+    [switch]$Physics,
+    [switch]$PaintStone,
+    [switch]$DenseCapture,
     [string]$Tag = ""
 )
 $ErrorActionPreference = "Continue"
@@ -30,9 +33,11 @@ $env:VENPOD_PERF_FRAME_END_LOG_INTERVAL = "1"
 $env:VENPOD_SPARSE_WALK_TEST = "1"
 $env:VENPOD_SPARSE_WALK_TEST_SPEED = "$WalkSpeed"
 $env:VENPOD_SPARSE_WALK_TEST_YAW_DEG_PER_SEC = "$YawDegPerSec"
+if ($env:DELREPRO_YAW_JITTER) { $env:VENPOD_SPARSE_WALK_TEST_YAW_JITTER_DEG_TENTHS = $env:DELREPRO_YAW_JITTER }
 $env:VENPOD_SPARSE_WALK_TEST_PITCH_DEG = "$PitchDeg"
 $env:VENPOD_SPARSE_WALK_TEST_FIXED_DT_MS = "16"
 if ($RealAim) { $env:VENPOD_SPARSE_BRUSH_SMOKE_REAL_AIM = "1" }
+if ($PaintStone) { $env:VENPOD_SPARSE_BRUSH_SMOKE_PAINT_STONE = "1" }
 $env:VENPOD_SPARSE_BRUSH_SMOKE_FOLLOW_CAMERA = "1"
 $env:VENPOD_SPARSE_BRUSH_SMOKE_FOLLOW_DISTANCE = "14"
 $env:VENPOD_SPARSE_BRUSH_SMOKE_CASE = "$Case"
@@ -40,22 +45,30 @@ $env:VENPOD_SPARSE_BRUSH_SMOKE_RADIUS_TENTHS = "$RadiusTenths"
 $env:VENPOD_SPARSE_BRUSH_PAINT_SMOKE_START_FRAME = "300"
 $env:VENPOD_SPARSE_BRUSH_PAINT_SMOKE_END_FRAME = "480"
 $env:VENPOD_CAPTURE_DIR = $cap
-$env:VENPOD_CAPTURE_START_FRAME = "290"
-$env:VENPOD_CAPTURE_INTERVAL_FRAMES = "60"
-$env:VENPOD_CAPTURE_COUNT = "8"
-
-if ($DebugMode -ge 0) {
-    .\rebrun.ps1 -PerfMode 60fps -NoBuild -SparseBrushSmokeUserPath -SparseDebugMode $DebugMode -ExitAfterFrames $Frames *> $null
+if ($DenseCapture) {
+    # Watch the column build: capture every 8 frames across the stroke.
+    $env:VENPOD_CAPTURE_START_FRAME = "300"
+    $env:VENPOD_CAPTURE_INTERVAL_FRAMES = "8"
+    $env:VENPOD_CAPTURE_COUNT = "20"
 } else {
-    .\rebrun.ps1 -PerfMode 60fps -NoBuild -SparseBrushSmokeUserPath -ExitAfterFrames $Frames *> $null
+    $env:VENPOD_CAPTURE_START_FRAME = "290"
+    $env:VENPOD_CAPTURE_INTERVAL_FRAMES = "60"
+    $env:VENPOD_CAPTURE_COUNT = "8"
+}
+
+$physArg = if ($Physics) { "-SparsePhysics" } else { "" }
+if ($DebugMode -ge 0) {
+    .\rebrun.ps1 -PerfMode 60fps -NoBuild -SparseBrushSmokeUserPath $physArg -SparseDebugMode $DebugMode -ExitAfterFrames $Frames *> $null
+} else {
+    .\rebrun.ps1 -PerfMode 60fps -NoBuild -SparseBrushSmokeUserPath $physArg -ExitAfterFrames $Frames *> $null
 }
 
 foreach ($v in @(
     "VENPOD_VSYNC","VENPOD_PERF_FRAME_END_LOG_INTERVAL",
     "VENPOD_SPARSE_WALK_TEST","VENPOD_SPARSE_WALK_TEST_SPEED",
     "VENPOD_SPARSE_WALK_TEST_YAW_DEG_PER_SEC","VENPOD_SPARSE_WALK_TEST_PITCH_DEG",
-    "VENPOD_SPARSE_WALK_TEST_FIXED_DT_MS",
-    "VENPOD_SPARSE_BRUSH_SMOKE_FOLLOW_CAMERA","VENPOD_SPARSE_BRUSH_SMOKE_FOLLOW_DISTANCE","VENPOD_SPARSE_BRUSH_SMOKE_REAL_AIM",
+    "VENPOD_SPARSE_WALK_TEST_FIXED_DT_MS","VENPOD_SPARSE_WALK_TEST_YAW_JITTER_DEG_TENTHS",
+    "VENPOD_SPARSE_BRUSH_SMOKE_FOLLOW_CAMERA","VENPOD_SPARSE_BRUSH_SMOKE_FOLLOW_DISTANCE","VENPOD_SPARSE_BRUSH_SMOKE_REAL_AIM","VENPOD_SPARSE_BRUSH_SMOKE_PAINT_STONE",
     "VENPOD_SPARSE_BRUSH_SMOKE_CASE","VENPOD_SPARSE_BRUSH_SMOKE_RADIUS_TENTHS",
     "VENPOD_SPARSE_BRUSH_PAINT_SMOKE_START_FRAME","VENPOD_SPARSE_BRUSH_PAINT_SMOKE_END_FRAME",
     "VENPOD_CAPTURE_DIR","VENPOD_CAPTURE_START_FRAME",
