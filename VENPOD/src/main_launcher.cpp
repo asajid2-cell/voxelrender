@@ -18568,6 +18568,14 @@ int RunSandbox(int argc, char* argv[]) {
         }
         perfPhysicsSubmitMs = ticksToMs(SDL_GetPerformanceCounter() - perfPhaseStart);
 
+        // This frame's brush edit deltas, collected as they are applied, so the
+        // live edit-overlay bake can write ONLY this frame's edits into the GPU
+        // brick pool (O(brush size)) instead of re-snapshotting the whole edit
+        // history every frame (which got slower the longer you painted). The pool
+        // retains prior frames' bakes and the durable regen recomposites the full
+        // overlay on any re-upload, so an incremental per-frame bake is sufficient.
+        std::vector<Simulation::SparseEditDelta> sparseLiveBakeFrameDeltas;
+
         perfGapStart = SDL_GetPerformanceCounter();
         // Apply brush painting AFTER physics (so brush changes aren't overwritten)
         // Use GPU raycast position, or fallback to fixed distance in empty air
@@ -19144,6 +19152,13 @@ int RunSandbox(int argc, char* argv[]) {
                 }
                 for (const auto& delta : sparseBrushDeltas) {
                     sparseBrushStrokeDeltaBricks.insert(delta.coord);
+                }
+                // Feed this stamp's deltas to the live edit-overlay bake (incremental).
+                if (!sparseBrushDeltas.empty()) {
+                    sparseLiveBakeFrameDeltas.insert(
+                        sparseLiveBakeFrameDeltas.end(),
+                        sparseBrushDeltas.begin(),
+                        sparseBrushDeltas.end());
                 }
                 if (sparseBrushFeedbackRecording) {
                     const bool shouldDispatchSparseBrushFeedback =
@@ -20781,37 +20796,22 @@ int RunSandbox(int argc, char* argv[]) {
             // surface/raymarch draw (all upload-ring copies already emitted earlier).
             static const bool enableSparseEditLiveBake =
                 ReadUIntEnv("VENPOD_SPARSE_EDIT_LIVE_BAKE", 1u) != 0u;
-            // Only bake on frames where an edit actually happened. The brick pool
-            // RETAINS the baked voxels between frames, and the durable CPU regen
-            // makes them permanent, so re-baking when nothing changed is pure
-            // overhead (it was running every frame as long as any edit existed,
-            // adding a per-frame snapshot/stage + a pool SRV<->UAV barrier that
-            // serializes the GPU). A short cooldown after the last edit keeps the
-            // overlay live long enough for the durable regen to catch up against
-            // eviction/restream.
-            static uint64_t sparseEditBakeLastRevision = 0u;
-            static uint64_t sparseEditBakeLastChangeFrame = 0u;
-            const uint64_t sparseEditCurrentRevision = sparseVoxelWorld.GetEdits().RevisionSerial();
-            if (sparseEditCurrentRevision != sparseEditBakeLastRevision) {
-                sparseEditBakeLastChangeFrame = frameCount;
-                sparseEditBakeLastRevision = sparseEditCurrentRevision;
-            }
-            const bool sparseEditBakeActive =
-                (frameCount - sparseEditBakeLastChangeFrame) <= 30u;
+            // Bake ONLY this frame's brush edits into the resident pool (incremental).
+            // The pool retains prior frames' bakes, and the durable CPU regen
+            // recomposites the full overlay on any re-upload/restream, so we never
+            // need to re-snapshot the whole edit history - that O(edits) per-frame
+            // snapshot was the "laggier the longer you paint" cost. With nothing
+            // edited this frame there is no work and no pool barrier at all.
             if (enableSparseEditLiveBake &&
-                sparseEditBakeActive &&
+                !sparseLiveBakeFrameDeltas.empty() &&
                 sparseGpuResources.IsInitialized() &&
-                physicsDispatcher->IsApplyEditDeltasToPoolReady() &&
-                sparseVoxelWorld.GetEdits().EditedBrickCount() != 0u) {
-                const uint64_t bakeSnapStart = SDL_GetPerformanceCounter();
-                std::vector<Simulation::SparseEditDelta> bakeDeltas =
-                    sparseVoxelWorld.BuildGpuEditDeltaSnapshotForRender(8192u);
-                const double bakeSnapMs = ticksToMs(SDL_GetPerformanceCounter() - bakeSnapStart);
-                const uint64_t bakeStageStart = SDL_GetPerformanceCounter();
+                physicsDispatcher->IsApplyEditDeltasToPoolReady()) {
+                if (sparseLiveBakeFrameDeltas.size() > 8192u) {
+                    sparseLiveBakeFrameDeltas.resize(8192u);
+                }
                 SparseEditDeltaGpuUploadTicket bakeTicket;
-                if (!bakeDeltas.empty() &&
-                    sparseGpuResources.CanStageEditDeltas(bakeDeltas) &&
-                    sparseGpuResources.StageEditDeltas(bakeDeltas, &bakeTicket) &&
+                if (sparseGpuResources.CanStageEditDeltas(sparseLiveBakeFrameDeltas) &&
+                    sparseGpuResources.StageEditDeltas(sparseLiveBakeFrameDeltas, &bakeTicket) &&
                     sparseGpuResources.EmitEditDeltaCopy(commandList.Get(), bakeTicket)) {
                     sparseGpuResources.BeginEditDeltaBakeWrite(commandList.Get());
                     physicsDispatcher->DispatchApplyEditDeltasToPool(
@@ -20827,13 +20827,6 @@ int RunSandbox(int argc, char* argv[]) {
                         sparseGpuResources.GetStats().pageTableCapacity,
                         sparseGpuResources.GetStats().maxBrickPages);
                     sparseGpuResources.EndEditDeltaBakeWrite(commandList.Get());
-                    if (enableRuntimeLog && (frameCount % 8u) == 0u) {
-                        spdlog::info(
-                            "SPARSE_EDIT_BAKE_DIAG frame={} snapMs={:.2f} stageMs={:.2f} deltas={} ranges={}",
-                            frameCount, bakeSnapMs,
-                            ticksToMs(SDL_GetPerformanceCounter() - bakeStageStart),
-                            bakeTicket.deltaCount, bakeTicket.rangeCount);
-                    }
                 }
             }
             renderSparseSurfaceLayer();
