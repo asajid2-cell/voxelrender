@@ -114,5 +114,21 @@ PS changes). Bake wins: PS reads pool/occupancy exactly as today.
 ## Status
 - [x] Diagnosis + regression revert (6188048) + redundant-regen skip
 - [x] Attempt 1 (shader-read) — reverted, hit DXC -O3 in-process compile cliff
-- [ ] Attempt 2 (compute-bake) pending Codex architecture cross-check
-- [ ] Phase 3 (stencil landmine), Phase 4 (demote propagation)
+- [x] Attempt 2 (compute-bake) — LANDED + verified (c0891ab). Codex PASS: speckle gone.
+- [x] Lag fix: bake is INCREMENTAL (this frame's brush deltas only, e182fb4) +
+      gated to active editing (4c4d7b0). A/B: bake now ~free (ON 33.0 vs OFF 33.8ms,
+      was ~60ms with the full-history snapshot). Codex PASS, no leftover stale voxels.
+- [x] Propagation demotion REVERTED — mid-mesh suppression must stay per-frame
+      (Codex caught terrain slabs occluding the carve when coalesced to every 4th).
+- [ ] REMAINING (separate, lower priority): ragged voxel rim / blocky terracing at
+      the carve edge (edge polish, NOT a bake bug). Phase 3 stencil landmine is moot
+      for near (raster discard + mesh suppression already handle it); mid-clipmap
+      live bake not done (near is the authoritative live tier).
+
+## How it works now (summary)
+Brush edit -> SparseEditStore (CPU). Each frame, the deltas applied THAT frame are
+captured (recordSparseBrushStamp -> sparseLiveBakeFrameDeltas) and staged; a compute
+pass (CS_ApplyEditDeltasToPool, one thread per range/brick) writes them into the
+resident GPU brick pool + occupancy right before the raymarch (PS_Raymarch unchanged).
+The CPU regen/upload remains the durable tier (recomposites full overlay on
+restream/regen). Toggle: VENPOD_SPARSE_EDIT_LIVE_BAKE (default 1).

@@ -4312,6 +4312,27 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_RAYMARCH_BACKGROUND_PASS_CAPTURE", 0u) != 0u;
     const bool backbufferCaptureIncludeHeld =
         ReadUIntEnv("VENPOD_CAPTURE_INCLUDE_HELD", 0u) != 0u;
+    // Edit telemetry: one flag (VENPOD_EDIT_TELEMETRY=1) turns on a robust,
+    // parseable per-frame EDIT_TELEM dump (brush path, what is edited/deleted,
+    // bake activity, propagation, perf breakdown, resource usage) AND auto-enables
+    // periodic framebuffer capture, so a real interactive session hands back
+    // everything needed to diagnose what the scripted smoke cannot see.
+    const bool editTelemetryEnabled =
+        ReadUIntEnv("VENPOD_EDIT_TELEMETRY", 0u) != 0u;
+    const uint32_t editTelemetryCaptureInterval =
+        std::max(1u, ReadUIntEnv("VENPOD_EDIT_TELEMETRY_CAPTURE_INTERVAL", 30u));
+    if (editTelemetryEnabled && std::getenv("VENPOD_CAPTURE_DIR") == nullptr) {
+        // Default capture dir next to the runtime log so the user only sets one flag.
+        static std::string editTelemetryCaptureDir = "edit_telemetry_frames";
+        const std::string intervalStr = std::to_string(editTelemetryCaptureInterval);
+        _putenv_s("VENPOD_CAPTURE_DIR", editTelemetryCaptureDir.c_str());
+        _putenv_s("VENPOD_CAPTURE_START_FRAME", "30");
+        _putenv_s("VENPOD_CAPTURE_INTERVAL_FRAMES", intervalStr.c_str());
+        _putenv_s("VENPOD_CAPTURE_COUNT", "100000");
+        _putenv_s("VENPOD_CAPTURE_HIDE_UI", "1");
+        spdlog::info("EDIT_TELEMETRY on: auto-enabling framebuffer capture to {} every {} frames",
+            editTelemetryCaptureDir, editTelemetryCaptureInterval);
+    }
     if (const char* captureDir = std::getenv("VENPOD_CAPTURE_DIR");
         captureDir && captureDir[0] != '\0') {
         backbufferCapture.outputDir = captureDir;
@@ -5682,7 +5703,50 @@ int RunSandbox(int argc, char* argv[]) {
         spdlog::info("Pause menu {}", open ? "opened" : "closed");
     };
 
+    // Per-frame edit telemetry accumulator (emitted as a parseable EDIT_TELEM line
+    // at frame end when VENPOD_EDIT_TELEMETRY is on). Reset at the top of each frame.
+    struct EditFrameTelemetry {
+        bool painting = false;
+        bool erasing = false;
+        bool gpuAuthoritativeBrush = false;   // real interactive path uses this
+        bool strictResidentBrush = false;
+        uint32_t brushMode = 0;
+        uint32_t brushMaterial = 0;
+        float brushRadius = 0.0f;
+        float brushWorldX = 0.0f, brushWorldY = 0.0f, brushWorldZ = 0.0f;
+        bool brushHasValidPos = false;
+        uint32_t stampsSubmitted = 0;
+        uint32_t stampsAccepted = 0;
+        uint32_t voxelsEvaluated = 0;
+        uint32_t voxelsEdited = 0;
+        uint32_t deltaCount = 0;
+        uint32_t deltaMismatches = 0;
+        uint32_t brickCount = 0;
+        uint32_t strictResidentDeferrals = 0;
+        // Bake (CS_ApplyEditDeltasToPool).
+        bool bakeEnabled = false;
+        bool bakeRan = false;
+        uint32_t bakeDeltasStaged = 0;
+        uint32_t bakeRanges = 0;
+        uint32_t bakeFrameDeltasCollected = 0;
+        bool bakeStageOk = false;
+        // GPU brush-feedback path (the GPU-authoritative apply).
+        uint32_t gpuBrushFeedbackApplied = 0;
+        uint32_t gpuBrushFeedbackMissingResident = 0;
+        uint32_t gpuBrushFeedbackPendingStrokes = 0;
+        // Propagation (durable tier).
+        uint32_t propMidRegen = 0;
+        uint32_t propHeightTiles = 0;
+        uint32_t propRegenUploads = 0;
+        uint32_t propInvalidatedBricks = 0;
+        uint32_t propInvalidatedTiles = 0;
+        // Sample of edited brick coords this frame (what is being edited/deleted).
+        std::vector<std::string> editedBrickSamples;
+        void Reset() { *this = EditFrameTelemetry{}; }
+    } editTelem;
+
     while (running) {
+        editTelem.Reset();
         uint64_t currentFrameCounter = SDL_GetPerformanceCounter();
         float dt = static_cast<float>(
             static_cast<double>(currentFrameCounter - lastFrameCounter) / performanceFrequency);
@@ -11861,7 +11925,8 @@ int RunSandbox(int argc, char* argv[]) {
                 // Drain a couple of edit-invalidated mid bricks per frame (budgeted;
                 // a full CPU brick regen is ~2.5ms — inline regeneration of a whole
                 // stroke's bricks was the measured 17ms/frame edit hitch).
-                sparseClipmapTileCache.PumpEditedBrickRegens(sparseClipmapFramePolicy, 2u);
+                editTelem.propMidRegen =
+                    sparseClipmapTileCache.PumpEditedBrickRegens(sparseClipmapFramePolicy, 2u);
                 // Drain edited height tiles too: this bumps the height-dirty serial
                 // (coalesced) so the mid-MESH rebuilds and re-applies its edit-
                 // footprint SUPPRESSION (punch-through holes over edits), letting the
@@ -11871,8 +11936,9 @@ int RunSandbox(int argc, char* argv[]) {
                 // still needs prompt invalidation or terrain slabs occlude the carve
                 // boundary for several frames (verified visual regression when this
                 // was coalesced to every 4th frame).
-                sparseClipmapTileCache.PumpEditedHeightTileRegens(sparseClipmapFramePolicy, 2u);
-                sparseVoxelWorld.PumpRegeneratedEditUploads(3u);
+                editTelem.propHeightTiles =
+                    sparseClipmapTileCache.PumpEditedHeightTileRegens(sparseClipmapFramePolicy, 2u);
+                editTelem.propRegenUploads = sparseVoxelWorld.PumpRegeneratedEditUploads(3u);
                 const uint64_t sparseEditRevision = sparseVoxelWorld.GetEdits().RevisionSerial();
                 if (sparseEditRevision != sparseMidClipmapEditRevisionSeen) {
                     const uint32_t invalidatedMidVoxelBricks =
@@ -11885,6 +11951,8 @@ int RunSandbox(int argc, char* argv[]) {
                             sparseVoxelWorld.GetEdits(),
                             sparseClipmapFramePolicy,
                             sparseMidClipmapEditRevisionSeen);
+                    editTelem.propInvalidatedBricks = invalidatedMidVoxelBricks;
+                    editTelem.propInvalidatedTiles = invalidatedHeightTiles;
                     sparseMidClipmapEditRevisionSeen = sparseEditRevision;
                     if (enableRuntimeLog &&
                         (invalidatedMidVoxelBricks != 0u || invalidatedHeightTiles != 0u)) {
@@ -19312,6 +19380,35 @@ int RunSandbox(int argc, char* argv[]) {
                 static_cast<uint32_t>(sparseBrushStrokeDeltaBricks.size());
             sparseBrushStrokeDeltaMismatchesLastFrame =
                 sparseBrushStrokeDeltaMismatchesThisFrame;
+            if (editTelemetryEnabled) {
+                editTelem.painting = brushController.IsPainting();
+                editTelem.erasing = brushController.IsErasing();
+                editTelem.gpuAuthoritativeBrush = useGpuAuthoritativeBrushFrame;
+                editTelem.strictResidentBrush = strictResidentGpuBrushFrame;
+                editTelem.brushMode = brushConstants.mode;
+                editTelem.brushMaterial = brushConstants.material;
+                editTelem.brushRadius = brushConstants.radius;
+                editTelem.brushWorldX = lastSubmittedBrushWorldPosition.x;
+                editTelem.brushWorldY = lastSubmittedBrushWorldPosition.y;
+                editTelem.brushWorldZ = lastSubmittedBrushWorldPosition.z;
+                editTelem.brushHasValidPos = acceptedAnyBrushStamp;
+                editTelem.stampsSubmitted = submittedBrushStamps;
+                editTelem.stampsAccepted = acceptedBrushStamps;
+                editTelem.voxelsEdited = sparseBrushStrokeDeltasThisFrame;
+                editTelem.deltaCount = sparseBrushStrokeDeltasThisFrame;
+                editTelem.deltaMismatches = sparseBrushStrokeDeltaMismatchesThisFrame;
+                editTelem.brickCount =
+                    static_cast<uint32_t>(sparseBrushStrokeDeltaBricks.size());
+                uint32_t sampleCount = 0;
+                for (const auto& brickCoord : sparseBrushStrokeDeltaBricks) {
+                    if (sampleCount >= 8u) { break; }
+                    editTelem.editedBrickSamples.push_back(
+                        std::to_string(brickCoord.x) + "," +
+                        std::to_string(brickCoord.y) + "," +
+                        std::to_string(brickCoord.z));
+                    ++sampleCount;
+                }
+            }
             if (sparseBrushFeedbackRecording && sparseBrushFeedbackQueuedLastFrame > 0) {
                 sparseGpuResources.QueueBrushFeedbackReadback(
                     commandList.Get(),
@@ -20796,6 +20893,9 @@ int RunSandbox(int argc, char* argv[]) {
             // surface/raymarch draw (all upload-ring copies already emitted earlier).
             static const bool enableSparseEditLiveBake =
                 ReadUIntEnv("VENPOD_SPARSE_EDIT_LIVE_BAKE", 1u) != 0u;
+            editTelem.bakeEnabled = enableSparseEditLiveBake;
+            editTelem.bakeFrameDeltasCollected =
+                static_cast<uint32_t>(sparseLiveBakeFrameDeltas.size());
             // Bake ONLY this frame's brush edits into the resident pool (incremental).
             // The pool retains prior frames' bakes, and the durable CPU regen
             // recomposites the full overlay on any re-upload/restream, so we never
@@ -20827,6 +20927,10 @@ int RunSandbox(int argc, char* argv[]) {
                         sparseGpuResources.GetStats().pageTableCapacity,
                         sparseGpuResources.GetStats().maxBrickPages);
                     sparseGpuResources.EndEditDeltaBakeWrite(commandList.Get());
+                    editTelem.bakeRan = true;
+                    editTelem.bakeStageOk = true;
+                    editTelem.bakeDeltasStaged = bakeTicket.deltaCount;
+                    editTelem.bakeRanges = bakeTicket.rangeCount;
                 }
             }
             renderSparseSurfaceLayer();
@@ -23972,6 +24076,64 @@ int RunSandbox(int argc, char* argv[]) {
         // un-bracketed tail that rawMs includes but body excludes).
         perfFrameEndLogMs = ticksToMs(SDL_GetPerformanceCounter() - perfFrameEndLogStart);
         perfBodyEndCounter = SDL_GetPerformanceCounter();
+
+        // ===== EDIT TELEMETRY =====
+        // One parseable line per frame (every frame while editing, every 15th frame
+        // idle) capturing the FULL edit pipeline + perf + resources, so a real
+        // interactive session reveals exactly what the scripted smoke cannot.
+        if (editTelemetryEnabled) {
+            const bool editingThisFrame =
+                editTelem.painting || editTelem.erasing ||
+                editTelem.deltaCount != 0u || editTelem.bakeRan ||
+                editTelem.propRegenUploads != 0u || editTelem.propInvalidatedBricks != 0u;
+            if (editingThisFrame || (frameCount % 15u) == 0u) {
+                const auto& gs = sparseGpuResources.GetStats();
+                const auto& edits = sparseVoxelWorld.GetEdits();
+                spdlog::info(
+                    "EDIT_TELEM frame={} fps={:.1f} body={:.2f} prep={:.2f} brush={:.2f} render={:.2f} present={:.2f} | "
+                    "brush: painting={} erasing={} path={} strict={} mode={} mat={} radius={:.2f} pos=({:.1f},{:.1f},{:.1f}) validPos={} "
+                    "stamps={}/{} voxelsEdited={} deltas={} mismatch={} bricks={} | "
+                    "bake: en={} ran={} collected={} staged={} ranges={} stageOk={} | "
+                    "prop: midRegen={} heightTiles={} regenUploads={} invBricks={} invTiles={} | "
+                    "store: editedBricks={} editedVoxels={} rev={} | "
+                    "res: poolMB={:.1f} residentBricks={} freePages={} ringUsedMB={:.2f}/{:.2f} stagedBricks={} stagedBytes={} editDeltaMB={:.2f}",
+                    frameCount, instantFps, perfFrameBodyMsLastFrame, perfFramePrepMs,
+                    perfBrushSubmitMs, perfRenderSubmitMs, perfPresentMs,
+                    editTelem.painting ? 1 : 0, editTelem.erasing ? 1 : 0,
+                    editTelem.gpuAuthoritativeBrush ? "gpuAuth" : "cpuCommit",
+                    editTelem.strictResidentBrush ? 1 : 0,
+                    editTelem.brushMode, editTelem.brushMaterial, editTelem.brushRadius,
+                    editTelem.brushWorldX, editTelem.brushWorldY, editTelem.brushWorldZ,
+                    editTelem.brushHasValidPos ? 1 : 0,
+                    editTelem.stampsAccepted, editTelem.stampsSubmitted,
+                    editTelem.voxelsEdited, editTelem.deltaCount, editTelem.deltaMismatches,
+                    editTelem.brickCount,
+                    editTelem.bakeEnabled ? 1 : 0, editTelem.bakeRan ? 1 : 0,
+                    editTelem.bakeFrameDeltasCollected, editTelem.bakeDeltasStaged,
+                    editTelem.bakeRanges, editTelem.bakeStageOk ? 1 : 0,
+                    editTelem.propMidRegen, editTelem.propHeightTiles,
+                    editTelem.propRegenUploads, editTelem.propInvalidatedBricks,
+                    editTelem.propInvalidatedTiles,
+                    static_cast<uint32_t>(edits.EditedBrickCount()),
+                    static_cast<uint64_t>(edits.EditedVoxelCount()), edits.RevisionSerial(),
+                    static_cast<double>(gs.brickPoolBytes) / (1024.0 * 1024.0),
+                    sparseVoxelWorld.GetStats().residentBricks,
+                    sparseVoxelWorld.GetStats().freePages,
+                    static_cast<double>(sparseUploadRingUsedBytesLastFrame) / (1024.0 * 1024.0),
+                    static_cast<double>(sparseUploadRingCapacityBytesLastFrame) / (1024.0 * 1024.0),
+                    gs.stagedBricksLastFrame, gs.stagedBytesLastFrame,
+                    static_cast<double>(gs.editDeltaBytes) / (1024.0 * 1024.0));
+                if (!editTelem.editedBrickSamples.empty()) {
+                    std::string brickList;
+                    for (const auto& s : editTelem.editedBrickSamples) {
+                        if (!brickList.empty()) { brickList += " "; }
+                        brickList += "(" + s + ")";
+                    }
+                    spdlog::info("EDIT_TELEM_BRICKS frame={} editedThisFrame={}",
+                        frameCount, brickList);
+                }
+            }
+        }
 
         frameCount++;
         if (traceFrameStages && frameCount <= kFrameStageTraceLimit) {
