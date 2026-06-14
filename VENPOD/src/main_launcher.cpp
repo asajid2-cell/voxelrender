@@ -2556,6 +2556,7 @@ int RunSandbox(int argc, char* argv[]) {
     uint32_t sparseMidMeshUploadedHeightSerial = 0;
     uint32_t sparseMidMeshFaceCountLastUpload = 0;
     uint32_t sparseMidMeshUploadRetriesLastFrame = 0;
+    uint64_t sparseMidMeshLastContentRebuildFrame = 0;
     bool sparseMidMeshUploadedCullValid = false;
     glm::vec3 sparseMidMeshUploadedCullCamera{0.0f, 0.0f, 0.0f};
     glm::vec3 sparseMidMeshUploadedCullForward{0.0f, 0.0f, 1.0f};
@@ -2915,6 +2916,16 @@ int RunSandbox(int argc, char* argv[]) {
         std::max(0.0f, ReadFloatEnv("VENPOD_SPARSE_MID_MESH_CULL_PADDING", 192.0f));
     const float sparseMidMeshCullRebuildDistance =
         std::max(32.0f, ReadFloatEnv("VENPOD_SPARSE_MID_MESH_CULL_REBUILD_DISTANCE", 256.0f));
+    // The mid-mesh is a full ~1.5M-face CPU snapshot rebuild (~60-86ms). Streaming
+    // new terrain into view (e.g. while looking around) bumps the height-dirty
+    // serial, which would otherwise force that full rebuild EVERY frame -> ~10fps.
+    // Coalesce content-triggered rebuilds to at most once per N frames so streaming
+    // can never spin per-frame full rebuilds; the mesh catches up all streamed
+    // tiles in one rebuild after the window. Mesh lags streamed terrain by up to N
+    // frames (brief pop-in) but framerate stays smooth. Camera TRANSLATION still
+    // rebuilds promptly (the disc must re-center). 0 disables the throttle.
+    const uint32_t sparseMidMeshContentRebuildThrottleFrames =
+        ReadUIntEnv("VENPOD_SPARSE_MID_MESH_REBUILD_THROTTLE_FRAMES", 20u);
     const uint32_t sparseMidMeshCullTurnDegrees =
         std::min(90u, std::max(1u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_CULL_TURN_DEGREES", 12u)));
     const float sparseMidMeshCullTurnDot =
@@ -16207,9 +16218,23 @@ int RunSandbox(int argc, char* argv[]) {
                     (!sparseMidMeshUploadedCullValid ||
                      glm::dot(normalizedMidMeshCullForward, sparseMidMeshUploadedCullForward) <
                          sparseMidMeshCullTurnDot);
-                if (!midMeshContentChanged && !midMeshCullMoved && !midMeshCullTurned) {
+                // Throttle CONTENT-triggered (streaming) rebuilds: a full 1.5M-face
+                // snapshot is ~60-86ms, and streaming bumps the serial constantly
+                // while looking around, so without this it rebuilds every frame
+                // (~10fps). Camera move/turn rebuilds stay prompt.
+                const bool contentRebuildThrottled =
+                    sparseMidMeshContentRebuildThrottleFrames != 0u &&
+                    sparseMidMeshUploadedCullValid &&
+                    (frameCount - sparseMidMeshLastContentRebuildFrame) <
+                        sparseMidMeshContentRebuildThrottleFrames;
+                const bool midMeshContentChangeDue =
+                    midMeshContentChanged && !contentRebuildThrottled;
+                if (!midMeshContentChangeDue && !midMeshCullMoved && !midMeshCullTurned) {
                     // Current mesh still matches resident height tiles and the conservative cull window.
                 } else {
+                    if (midMeshContentChanged) {
+                        sparseMidMeshLastContentRebuildFrame = frameCount;
+                    }
                 Simulation::SparseSurfaceGpuSnapshot midMeshSnapshot;
                 SparseSurfaceUploadTicket midMeshTicket;
                 Simulation::SparseMidHeightSurfaceBuildConfig midMeshBuildConfig;
