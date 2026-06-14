@@ -24206,6 +24206,18 @@ int RunSandbox(int argc, char* argv[]) {
                     perfSparseClipmapBudgetMs, perfSparseClipmapPumpMs, perfSparseTrimPrepMs,
                     perfSparsePostFeedbackMs, perfSparsePostRaycastMs, perfSparsePostMissFeedbackMs,
                     perfSparsePostBrushFeedbackMs);
+                // Request-prep + generation breakdown — the streaming hotspot (the
+                // real look-around lag is here, not the mesh).
+                spdlog::info(
+                    "PERF_SPARSE_REQ frame={} reqPrep={:.1f} = terrainCrit={:.1f} hierarchy={:.1f} statsFlush={:.1f} "
+                    "pressureTrim={:.1f} brushRetry={:.1f} ownerFeedback={:.1f} missFeedback={:.1f} hiddenExact={:.1f} || "
+                    "genPrep={:.1f}",
+                    frameCount, perfSparseRequestPrepMs,
+                    perfSparseRequestTerrainCriticalMs, perfSparseRequestHierarchyMs,
+                    perfSparseRequestStatsFlushMs, perfSparseRequestPressureTrimMs,
+                    perfSparseRequestBrushRetryMs, perfSparseRequestOwnershipFeedbackMs,
+                    perfSparseRequestMissFeedbackMs, perfSparseRequestHiddenExactMs,
+                    perfSparseGenerationPrepMs);
             }
         }
 
