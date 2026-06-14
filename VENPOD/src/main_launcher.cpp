@@ -16193,10 +16193,20 @@ int RunSandbox(int argc, char* argv[]) {
                 const bool midMeshCullMoved =
                     !sparseMidMeshUploadedCullValid ||
                     glm::length(cameraPos - sparseMidMeshUploadedCullCamera) >= sparseMidMeshCullRebuildDistance;
+                // Only rebuild on camera TURN when frustum culling is actually on -
+                // then a turn changes which faces survive the cull. With frustum
+                // cull OFF (the default), the mid-mesh is a view-INDEPENDENT disc
+                // around the camera, so a turn produces the identical mesh and the
+                // rebuild is pure waste. Measured: that wasted turn-rebuild is a
+                // ~61ms full 1.5M-face CPU snapshot, firing on every ~12deg turn -
+                // the dominant source of the spiky general lag (PERF_SPARSE_STEPS
+                // midMeshUpload=61-69ms). (camera TRANSLATION still re-centers the
+                // disc via midMeshCullMoved.)
                 const bool midMeshCullTurned =
-                    !sparseMidMeshUploadedCullValid ||
-                    glm::dot(normalizedMidMeshCullForward, sparseMidMeshUploadedCullForward) <
-                        sparseMidMeshCullTurnDot;
+                    sparseMidMeshFrustumCull &&
+                    (!sparseMidMeshUploadedCullValid ||
+                     glm::dot(normalizedMidMeshCullForward, sparseMidMeshUploadedCullForward) <
+                         sparseMidMeshCullTurnDot);
                 if (!midMeshContentChanged && !midMeshCullMoved && !midMeshCullTurned) {
                     // Current mesh still matches resident height tiles and the conservative cull window.
                 } else {
