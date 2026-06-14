@@ -2007,6 +2007,21 @@ void SparseClipmapTileCache::UpdateInterest(
     const bool useMotionLookahead =
         predictionSeconds > 0.0f &&
         velocityLenXz >= policy.Config().motionLookaheadMinSpeed;
+    // The forward/look-direction interest bias (the forward anchor + view fan)
+    // projects the streamed-terrain region toward where the camera LOOKS. That is
+    // useful while MOVING (pre-load the path), but while standing still it makes a
+    // pure camera TURN sweep the whole interest region around the player -> a flood
+    // of generate-ahead + evict-behind every frame = the measured look-around lag
+    // (genPrep/hiddenExact/pressureTrim spike on turn). Gate the look-bias on
+    // actually moving; when stationary, interest stays a camera-centred disc so
+    // turning in place re-streams nothing. Env-overridable for A/B.
+    // Opt-in (default OFF = old always-on look bias) until visually verified that
+    // dropping the look bias when stationary doesn't thin far-in-view coverage.
+    static const char* sparseInterestLookBiasEnv =
+        std::getenv("VENPOD_SPARSE_INTEREST_LOOK_BIAS_MOVING_ONLY");
+    static const bool sparseInterestLookBiasMovingOnly =
+        sparseInterestLookBiasEnv != nullptr && std::atoi(sparseInterestLookBiasEnv) != 0;
+    const bool applyLookBias = useMotionLookahead || !sparseInterestLookBiasMovingOnly;
     uint32_t heightAnchorCount = 0;
     if (policy.Config().heightClipmapEnabled) {
     for (uint32_t ring = 0; ring < rings.size(); ++ring) {
@@ -2026,13 +2041,15 @@ void SparseClipmapTileCache::UpdateInterest(
                 });
             }
         }
-        anchors.push_back(
-            {
-                cameraX + forwardNormX * tileWorldSize * std::max(1.0f, static_cast<float>(radius)),
-                cameraY + forwardY * tileWorldSize * 0.25f,
-                cameraZ + forwardNormZ * tileWorldSize * std::max(1.0f, static_cast<float>(radius)),
-                -std::max(1, radius / 2)
-            });
+        if (applyLookBias) {
+            anchors.push_back(
+                {
+                    cameraX + forwardNormX * tileWorldSize * std::max(1.0f, static_cast<float>(radius)),
+                    cameraY + forwardY * tileWorldSize * 0.25f,
+                    cameraZ + forwardNormZ * tileWorldSize * std::max(1.0f, static_cast<float>(radius)),
+                    -std::max(1, radius / 2)
+                });
+        }
         anchors.push_back({predictedX, predictedY, predictedZ, -std::max(1, radius / 2)});
 
         const auto queueHeightCoord = [&](const SparseClipmapTileCoord& coord) {
@@ -2095,8 +2112,9 @@ void SparseClipmapTileCache::UpdateInterest(
         // The screen can expose valley walls well outside the center ray. Queue
         // a bounded horizontal view fan so mid-distance height/column ownership
         // covers the visible silhouette without falling back to expensive
-        // per-pixel far terrain searches.
-        if (forwardLenXz > 0.001f) {
+        // per-pixel far terrain searches. Only while MOVING - when stationary this
+        // fan sweeps with the look direction and is the turn-in-place streaming lag.
+        if (applyLookBias && forwardLenXz > 0.001f) {
             const float rightX = forwardNormZ;
             const float rightZ = -forwardNormX;
             const float fanDistance =
