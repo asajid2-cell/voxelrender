@@ -51,3 +51,41 @@ INVARIANT we are enforcing:
 6. Bound exact-surface yaw work (caps + tighter trim).                             [G5,G4]
 
 Status: instrumenting first (commit 3 content) so gates are measurable.
+
+## Cost-center C — DIAGNOSED (hard data, 2026-06-14)
+Long stationary-yaw (1300 frames, ~5 rotations), resident-brick trajectory:
+  fixes ON : 11k->21k->27k->32k->32719->32714->32719 (PLATEAU at pool cap 32768)
+  fixes OFF: 4k->17k->24k->30k->32720->32697->32722 (SAME saturation)
+genPrep stays 5-9ms after saturation; frame rawMs WORSENS 32->48ms as it fills.
+=> NOT caused by my stationary fixes (A/B identical). NOT new content (it's reprocessing
+   at the ceiling). ROOT: exact-surface streaming (terrainCrit requests visible surface
+   for every viewed direction) accumulates the exact pool to its hard cap; generation
+   ~24 bricks/frame OUTPACES trim ~8 bricks/frame (sparseTrimBudget/PressureTrimBudget),
+   so the pool saturates and then evict-on-turn/regen-on-turn-back churns forever. The
+   full-look-around exact working set EXCEEDS the 32768-page pool.
+Candidate fixes (need tandem design + G4 hole-check; over-trim risks holes):
+  - rate-balance: scale pressure-trim budget with the free-page deficit so the pool
+    holds its reserve instead of saturating (evict only beyond keepRadius=13 => safe,
+    off-screen bricks). Gate Gc: resident plateaus BELOW cap (<= ~28672), genPrep
+    settles toward ~0 after one full rotation, frame rawMs stops worsening. G4 holds.
+  - or bound the viewed-direction accumulation (position-stable core + bounded
+    speculative), or tighten trim radius.
+
+## Cost-center C — FIX ATTEMPT FAILED THE GATE (honest result, 2026-06-14)
+Tandem (codex) corrected the approach: scaling the plain TrimResidentBricks is
+hole-risky (it ignores frustum/lastVisibleFrame; visible far surface reaches ~1024
+voxels >> keepRadius 13). Safe path: deficit-scaled VISIBILITY-AWARE
+TrimBackgroundResidentBricks (skips current-frame-visible) AFTER the terrain-critical
+probe. Implemented + measured (long stationary yaw):
+  - Pool bounding WORKS: resident 32719 -> plateaus ~28460 (free ~4040 reserve). ✓
+  - G4 holes: owner-map miss= pixels == 0 all run. SAFE. ✓
+  - Gate Gc FAILED: genPrep still 7-9ms, rawMs still ~48ms. NO frame-time win. ✗
+=> REVERTED. The drain bounds the pool but does NOT reduce the churn cost, because
+   the exact-surface generation churn is FUNDAMENTAL: turning to any new direction
+   generates that direction's exact surface bricks (~9ms genPrep, CPU-bound ~24/frame),
+   and the full-360 working set exceeds the pool no matter how you trim. Pool/trim
+   management can't fix it.
+REAL cost-C fix (substantial, next): (a) GPU terrain generation so regen-on-turn is
+   cheap (existing plan, see [[venpod-gpu-terrain-gen]]), OR (b) shrink the exact-surface
+   footprint (coarser surface LOD / shorter terrainCrit screen-critical distance) so the
+   surround fits the pool and turn-back hits cache. Not a trim tweak.
