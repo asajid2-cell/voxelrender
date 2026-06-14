@@ -61,5 +61,18 @@ BrickCoord for the existing per-brick snapshot/range machinery).
 
 ## Status
 - [x] Diagnosis + throttle bandaid (1198e8d) + turn-gate (a61108b)
-- [ ] P1 per-tile dirty extraction (edits+stream)  <- NEXT
-- [ ] P2 camera LOD bucketing · P3 drop throttle
+- [x] P1 per-tile face cache (9c6f5b1) — DONE + VERIFIED. Cache keyed by content
+      version (GenerateTile bumps -> edits/stream/regen invalidate only that tile) +
+      mergeCells LOD + childMask finer-ring residency + origin/ring + buildVersion.
+      This folds in P2 (LOD bucketing) since mergeCells is in the key. MEASURED:
+      mesh-on-edit 60-86ms EVERY frame -> p50 0.1ms; LOOKING/MOVING 68.6 -> 12.5ms
+      (15 -> 80 fps). Codex hole-check PASS (no tile-cache artifacts). Edits/streaming
+      now re-emit ONLY the changed tile.
+- REMAINING (polish, not the core overhaul):
+  - P1.5 incremental UPLOAD: the build still CPU-reassembles+uploads the full
+    snapshot when it runs (~23ms throttled spike). Faces+clipmap-samples are
+    entangled in one snapshot; needs the range-allocator dirty-payload path
+    (StageDirtyPayloadSnapshot) + dirtyBricks from cache misses. Then drop the
+    throttle and run per-frame.
+  - clipInterest ~19ms/frame during EDITING is now the editing bottleneck (the
+    mid-VOXEL clipmap interest scan) — separate system from the mesh.
