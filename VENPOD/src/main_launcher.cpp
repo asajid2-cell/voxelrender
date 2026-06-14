@@ -11936,8 +11936,20 @@ int RunSandbox(int argc, char* argv[]) {
                 // still needs prompt invalidation or terrain slabs occlude the carve
                 // boundary for several frames (verified visual regression when this
                 // was coalesced to every 4th frame).
-                editTelem.propHeightTiles =
-                    sparseClipmapTileCache.PumpEditedHeightTileRegens(sparseClipmapFramePolicy, 2u);
+                // A/B TOGGLE: VENPOD_SPARSE_EDIT_MESH_REBUILD=0 stops edits from
+                // triggering the full ~1.5M-face mid-MESH rebuild (and the
+                // O(total-edits) height-tile invalidation scan). This is the deep
+                // paint-lag source: every dab bumps the height-dirty serial, which
+                // regenerates the entire mid-mesh from scratch that frame. With it
+                // off, mid-distance edit suppression lags (procedural terrain may
+                // briefly show over a carve), but paint cost should collapse - the
+                // measurement that proves the mesh rebuild is the bottleneck.
+                static const bool sparseEditTriggersMeshRebuild =
+                    ReadUIntEnv("VENPOD_SPARSE_EDIT_MESH_REBUILD", 1u) != 0u;
+                if (sparseEditTriggersMeshRebuild) {
+                    editTelem.propHeightTiles =
+                        sparseClipmapTileCache.PumpEditedHeightTileRegens(sparseClipmapFramePolicy, 2u);
+                }
                 editTelem.propRegenUploads = sparseVoxelWorld.PumpRegeneratedEditUploads(3u);
                 const uint64_t sparseEditRevision = sparseVoxelWorld.GetEdits().RevisionSerial();
                 if (sparseEditRevision != sparseMidClipmapEditRevisionSeen) {
@@ -11946,11 +11958,12 @@ int RunSandbox(int argc, char* argv[]) {
                             sparseVoxelWorld.GetEdits(),
                             sparseClipmapFramePolicy,
                             sparseMidClipmapEditRevisionSeen);
-                    const uint32_t invalidatedHeightTiles =
-                        sparseClipmapTileCache.InvalidateEditedHeightTiles(
+                    const uint32_t invalidatedHeightTiles = sparseEditTriggersMeshRebuild
+                        ? sparseClipmapTileCache.InvalidateEditedHeightTiles(
                             sparseVoxelWorld.GetEdits(),
                             sparseClipmapFramePolicy,
-                            sparseMidClipmapEditRevisionSeen);
+                            sparseMidClipmapEditRevisionSeen)
+                        : 0u;
                     editTelem.propInvalidatedBricks = invalidatedMidVoxelBricks;
                     editTelem.propInvalidatedTiles = invalidatedHeightTiles;
                     sparseMidClipmapEditRevisionSeen = sparseEditRevision;
