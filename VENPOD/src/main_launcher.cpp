@@ -10629,11 +10629,26 @@ int RunSandbox(int argc, char* argv[]) {
                 // Forward quantized to the same 1/32 granularity the terrain-critical
                 // reuse path uses; coarse enough to ignore sub-cell jitter, fine
                 // enough that a real view turn invalidates.
-                sparseHierarchicalPlanSignatureThisFrame.forwardX =
+                // Stationary look-around fix: when the camera is not translating,
+                // pure yaw must NOT invalidate the hierarchical plan cache —
+                // re-planning re-issues the view-cone speculative requests that drive
+                // terrain generation (the stationary-turn churn). Below the motion
+                // threshold, zero forward so yaw replays the cached plan; forward
+                // returns the moment translation resumes. Matches the view-independent
+                // voxel interest in SparseClipmap (same env toggle).
+                static const bool sparseStationaryViewIndependentPlan = [] {
+                    const char* e = std::getenv("VENPOD_SPARSE_STATIONARY_VIEW_INDEPENDENT_INTEREST");
+                    return e == nullptr || std::atoi(e) != 0;
+                }();
+                const bool sparsePlanStationary =
+                    sparseStationaryViewIndependentPlan &&
+                    sparseTerrainCriticalReuseCameraSpeed <
+                        sparseClipmapPolicy.Config().motionLookaheadMinSpeed;
+                sparseHierarchicalPlanSignatureThisFrame.forwardX = sparsePlanStationary ? 0 :
                     static_cast<int32_t>(std::lround(cameraForward.x * 32.0f));
-                sparseHierarchicalPlanSignatureThisFrame.forwardY =
+                sparseHierarchicalPlanSignatureThisFrame.forwardY = sparsePlanStationary ? 0 :
                     static_cast<int32_t>(std::lround(cameraForward.y * 32.0f));
-                sparseHierarchicalPlanSignatureThisFrame.forwardZ =
+                sparseHierarchicalPlanSignatureThisFrame.forwardZ = sparsePlanStationary ? 0 :
                     static_cast<int32_t>(std::lround(cameraForward.z * 32.0f));
                 // Velocity drives the speculative predicted-origin coords
                 // (velocity * predictionSeconds). Bucket coarsely (per 8 u/s) so the
