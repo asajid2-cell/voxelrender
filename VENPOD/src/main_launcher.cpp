@@ -4320,17 +4320,21 @@ int RunSandbox(int argc, char* argv[]) {
     const bool editTelemetryEnabled =
         ReadUIntEnv("VENPOD_EDIT_TELEMETRY", 0u) != 0u;
     const uint32_t editTelemetryCaptureInterval =
-        std::max(1u, ReadUIntEnv("VENPOD_EDIT_TELEMETRY_CAPTURE_INTERVAL", 30u));
-    if (editTelemetryEnabled && std::getenv("VENPOD_CAPTURE_DIR") == nullptr) {
-        // Default capture dir next to the runtime log so the user only sets one flag.
+        std::max(1u, ReadUIntEnv("VENPOD_EDIT_TELEMETRY_CAPTURE_INTERVAL", 60u));
+    // Framebuffer capture is now OPT-IN (VENPOD_EDIT_TELEMETRY_CAPTURE=1) and
+    // BOUNDED, so the always-on telemetry LOG (cheap) can never cause disk/IO
+    // stalls during a long session. The log alone is enough to diagnose perf.
+    if (editTelemetryEnabled &&
+        ReadUIntEnv("VENPOD_EDIT_TELEMETRY_CAPTURE", 0u) != 0u &&
+        std::getenv("VENPOD_CAPTURE_DIR") == nullptr) {
         static std::string editTelemetryCaptureDir = "edit_telemetry_frames";
         const std::string intervalStr = std::to_string(editTelemetryCaptureInterval);
         _putenv_s("VENPOD_CAPTURE_DIR", editTelemetryCaptureDir.c_str());
-        _putenv_s("VENPOD_CAPTURE_START_FRAME", "30");
+        _putenv_s("VENPOD_CAPTURE_START_FRAME", "60");
         _putenv_s("VENPOD_CAPTURE_INTERVAL_FRAMES", intervalStr.c_str());
-        _putenv_s("VENPOD_CAPTURE_COUNT", "100000");
+        _putenv_s("VENPOD_CAPTURE_COUNT", "120");
         _putenv_s("VENPOD_CAPTURE_HIDE_UI", "1");
-        spdlog::info("EDIT_TELEMETRY on: auto-enabling framebuffer capture to {} every {} frames",
+        spdlog::info("EDIT_TELEMETRY capture on: framebuffer dumps to {} every {} frames (max 120)",
             editTelemetryCaptureDir, editTelemetryCaptureInterval);
     }
     if (const char* captureDir = std::getenv("VENPOD_CAPTURE_DIR");

@@ -7340,6 +7340,18 @@ uint32_t SparseVoxelWorld::EvaluateBrushEdit(
     const float normalY = static_cast<float>(hitNormalY);
     const float normalZ = static_cast<float>(hitNormalZ);
 
+    // Per-(x,z) column cache for the generated-terrain sample. HeightAt and
+    // SurfaceReliefAt are expensive multi-octave noise that depend ONLY on (x,z),
+    // but the brush loops x,y,z and previously recomputed them for every Y in the
+    // column - ~(brush height)x wasted noise per stamp, the dominant CPU brush
+    // cost. Compute height/relief once per column, reuse down the Y span.
+    const int32_t brushColW = std::max(0, brushBounds.endX - brushBounds.startX);
+    const int32_t brushColD = std::max(0, brushBounds.endZ - brushBounds.startZ);
+    struct BrushColumnSample { float height; float relief; bool computed; };
+    std::vector<BrushColumnSample> brushColumnCache(
+        static_cast<size_t>(brushColW) * static_cast<size_t>(brushColD),
+        BrushColumnSample{0.0f, 0.0f, false});
+
     for (int32_t z = brushBounds.startZ; z < brushBounds.endZ; ++z) {
         for (int32_t y = brushBounds.startY; y < brushBounds.endY; ++y) {
             for (int32_t x = brushBounds.startX; x < brushBounds.endX; ++x) {
@@ -7382,7 +7394,17 @@ uint32_t SparseVoxelWorld::EvaluateBrushEdit(
 
                 uint32_t currentVoxel = 0;
                 if (!m_edits.TryGetVoxel(x, y, z, &currentVoxel)) {
-                    currentVoxel = m_terrain.SampleGeneratedVoxel(x, y, z);
+                    const size_t colIdx =
+                        static_cast<size_t>(x - brushBounds.startX) +
+                        static_cast<size_t>(z - brushBounds.startZ) * static_cast<size_t>(brushColW);
+                    BrushColumnSample& col = brushColumnCache[colIdx];
+                    if (!col.computed) {
+                        col.height = m_terrain.HeightAt(x, z);
+                        col.relief = m_terrain.SurfaceReliefAt(x, z, 4);
+                        col.computed = true;
+                    }
+                    currentVoxel =
+                        m_terrain.SampleGeneratedVoxelWithColumn(x, y, z, col.height, col.relief);
                 }
 
                 const uint8_t currentMaterial = Utils::UnpackMaterial(currentVoxel);
