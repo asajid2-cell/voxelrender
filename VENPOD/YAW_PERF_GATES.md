@@ -89,3 +89,25 @@ REAL cost-C fix (substantial, next): (a) GPU terrain generation so regen-on-turn
    cheap (existing plan, see [[venpod-gpu-terrain-gen]]), OR (b) shrink the exact-surface
    footprint (coarser surface LOD / shorter terrainCrit screen-critical distance) so the
    surround fits the pool and turn-back hits cache. Not a trim tweak.
+
+## Cost-center C — EXHAUSTIVE characterization (2026-06-14, all tractable levers ruled out)
+Owner-map (warm stationary yaw) reframed it: the screen is dominated by the MID-VOXEL
+CLIPMAP (midVoxel=30990/46656 px = 66%, near exact=5967=13%), with lodParentHeld=29514
+(63% of px held waiting for finer-LOD children). => cost-C is the mid-voxel clipmap's
+LOD refinement, NOT exact-surface terrainCrit. The pool runs SATURATED (~32737/32768,
+99.8%) because the LOD greedily refines to fill all available memory.
+Warm-frame 46ms split: gpuMs 14.4 | reqPrep 13.3 (pressureTrim 5.4 + statsFlush 1.9 +
+hiddenExact 0.45) | genPrep 8.8 | surfExtract 7.5 | trim 4.2 | clipInterest 2.7 |
+midMeshUpload 0.01 (Commit 1 working). So ~11.5ms is O(pool) SCAN cost (trim/stats),
+~16ms is LOD refine (gen+extract), ~14ms is GPU raymarch of the dense voxel set.
+LEVERS TESTED + RULED OUT (all env-only, same-session, miss=0 throughout):
+  - SCREEN_CRITICAL_DISTANCE 1024->512->256: resident STILL 32737, no change.
+  - SURFACE_PREFETCH_DISTANCE 3072->384 (8x): resident STILL 32737, no change.
+  - MID_VOXEL_RADIUS_XZ 14->10->8: resident STILL 32737, no change (LOD greedy-fills).
+  - visibility-aware pool DRAIN: bounds resident 32737->28460 but NO frame-time win.
+  - incremental pressure trim ON: no win (trim cost unchanged).
+=> NOT a single hotspot, NOT tunable by footprint/trim knobs. Reducing cost-C needs
+   ARCHITECTURE: (a) GPU terrain generation (cheaper LOD refine -> cuts genPrep+surfExtract
+   ~16ms, see [[venpod-gpu-terrain-gen]]); (b) non-greedy LOD memory policy (target pool
+   headroom so trim/stats scans are cheaper + less refine churn); (c) reduce GPU raymarch
+   cost (14ms, 2.8M fragments / render scale). Footprint knobs and trim tuning are dead ends.
