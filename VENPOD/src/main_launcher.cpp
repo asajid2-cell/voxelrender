@@ -7291,9 +7291,37 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseAdmissionRuntimeDecision);
             uint32_t sparseProtectedRequestOverageThisFrame = 0;
             const uint64_t sparseRequestPressureTrimStart = SDL_GetPerformanceCounter();
+            // Stationary look-around fix: when the camera is not translating, the
+            // resident exact surround is stable and the generation queue should
+            // drain to empty. Letting generation-queue pressure trigger pressure-trim
+            // here evicts resident bricks the (now view-independent) interest still
+            // wants, which re-queues them and keeps the queue full forever — a
+            // self-sustaining evict/regen churn (genPrep + pressureTrim ~ every frame
+            // during a pure yaw). Below the motion threshold, suppress generation-queue
+            // pressure trim so the queue can drain; free-page pressure trim stays
+            // active so genuine OOM is still protected. Same env toggle as the
+            // interest/plan fixes.
+            static const bool sparseStationaryViewIndependentTrim = [] {
+                const char* e = std::getenv("VENPOD_SPARSE_STATIONARY_VIEW_INDEPENDENT_INTEREST");
+                return e == nullptr || std::atoi(e) != 0;
+            }();
+            const bool sparseTrimCameraStationary =
+                sparseStationaryViewIndependentTrim &&
+                sparseCameraSpeedLastFrame <
+                    sparseClipmapPolicy.Config().motionLookaheadMinSpeed;
+            // minFreePages defaults to pool/8 (~4096) as streaming headroom for
+            // terrain incoming AHEAD of motion. When stationary nothing new streams
+            // in, so that large reserve just forces the resident surround to be
+            // trimmed (free ~1441 < 4096) and regenerated forever. When stationary,
+            // only treat near-true-exhaustion as free-page pressure so the stable
+            // surround is retained and the generation queue drains.
+            const uint32_t sparseEffectiveMinFreePages = sparseTrimCameraStationary
+                ? std::min(sparseMinFreePages, 256u)
+                : sparseMinFreePages;
             const bool sparsePressureTrimFreePagePressure =
-                sparseVoxelWorld.GetStats().freePages <= sparseMinFreePages;
+                sparseVoxelWorld.GetStats().freePages <= sparseEffectiveMinFreePages;
             const bool sparsePressureTrimGenerationPressure =
+                !sparseTrimCameraStationary &&
                 sparseVoxelWorld.GenerationQueueSize() >= sparseSpeculativeBackpressureGenQueue;
             const bool sparsePressureTrimMissFeedbackPressure =
                 !sparseMissFeedbackPending.empty() && !sparsePressureTrimFreePageGuard;
@@ -7313,7 +7341,7 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseTrimRadiusY,
                     sparsePressureTrimBudget,
                     sparseResidencyFrame);
-                if (sparseVoxelWorld.GetStats().freePages <= sparseMinFreePages ||
+                if (sparseVoxelWorld.GetStats().freePages <= sparseEffectiveMinFreePages ||
                     (!sparsePressureTrimFreePageGuard && !sparseMissFeedbackPending.empty())) {
                     sparsePressureTrimLastFrame += sparseTrimSpeculativeFirstLastFrame
                         ? sparseVoxelWorld.TrimBackgroundResidentBricks(
