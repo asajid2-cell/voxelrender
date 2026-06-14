@@ -99,6 +99,18 @@ int32_t QuantizeFloatToInt(float value, float scale) {
     return RoundToInt32Clamped(static_cast<double>(FiniteOr(value, 0.0f)) * static_cast<double>(scale));
 }
 
+// When the camera is not translating, voxel interest is treated as view-INDEPENDENT
+// (a radial surround that loads once) so pure yaw does not rebuild interest or
+// re-request terrain generation. Default ON; escape hatch to restore the old
+// view-biased-always behavior for A/B. See the stationary look-around perf fix.
+bool StationaryViewIndependentInterestEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("VENPOD_SPARSE_STATIONARY_VIEW_INDEPENDENT_INTEREST");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 uint32_t QuantizeFloatToUint(float value, float scale) {
     const int32_t quantized = QuantizeFloatToInt(value, scale);
     return quantized <= 0 ? 0u : static_cast<uint32_t>(quantized);
@@ -1557,9 +1569,27 @@ SparseClipmapTileCache::InterestSignature SparseClipmapTileCache::BuildVoxelInte
     signature.cameraX = QuantizeFloatToInt(cameraX, cameraQuantum);
     signature.cameraY = QuantizeFloatToInt(cameraY, cameraYQuantum);
     signature.cameraZ = QuantizeFloatToInt(cameraZ, cameraQuantum);
-    signature.forwardX = QuantizeFloatToInt(forwardX, 4.0f);
-    signature.forwardY = QuantizeFloatToInt(forwardY, 4.0f);
-    signature.forwardZ = QuantizeFloatToInt(forwardZ, 4.0f);
+    // Stationary look-around fix: when the camera is NOT translating, the resident
+    // voxel working set is view-INDEPENDENT (a radial surround), so pure yaw must
+    // not invalidate the interest signature. Folding forward into the signature here
+    // made every camera turn rebuild voxel interest and re-request generation
+    // (genPrep ~9ms/frame churn while pressure-trim evicted behind). Drop forward
+    // from the signature below the motion threshold so turning reuses the cached
+    // interest set; forward returns the moment translation resumes (look-ahead).
+    const float signatureVelocityLen =
+        std::sqrt(velocityX * velocityX + velocityY * velocityY + velocityZ * velocityZ);
+    const bool signatureStationary =
+        StationaryViewIndependentInterestEnabled() &&
+        signatureVelocityLen < config.motionLookaheadMinSpeed;
+    if (signatureStationary) {
+        signature.forwardX = 0;
+        signature.forwardY = 0;
+        signature.forwardZ = 0;
+    } else {
+        signature.forwardX = QuantizeFloatToInt(forwardX, 4.0f);
+        signature.forwardY = QuantizeFloatToInt(forwardY, 4.0f);
+        signature.forwardZ = QuantizeFloatToInt(forwardZ, 4.0f);
+    }
     const float velocityQuantum = 1.0f / std::max(
         fineVoxelWorldSize,
         config.motionLookaheadMinSpeed);
@@ -4394,6 +4424,15 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
     const bool useMotionLookahead =
         predictionSeconds > 0.0f &&
         velocityLen >= policy.Config().motionLookaheadMinSpeed;
+    // Stationary look-around fix: below the motion threshold, drop the forward-biased
+    // anchors/fan so the resident voxel set is a radial surround (loads once, no holes
+    // behind when you turn). The signature also ignores forward when stationary, so
+    // the single moving->stationary transition builds this radial set and pure yaw
+    // afterwards reuses it with zero new generation. Forward bias returns on motion.
+    const bool stationaryRadialInterest =
+        StationaryViewIndependentInterestEnabled() &&
+        velocityLen < policy.Config().motionLookaheadMinSpeed;
+    const bool applyViewBias = !stationaryRadialInterest;
     uint32_t voxelAnchorCount = 0;
 
     const InterestSignature voxelInterestSignature = BuildVoxelInterestSignature(
@@ -4573,14 +4612,16 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
                 });
             }
         }
-        anchors.push_back(
-            {
-                cameraX + forwardNormX * brickWorldSize * static_cast<float>(std::max<int32_t>(2, radiusXz)),
-                cameraY + forwardNormY * brickWorldSize * 0.5f,
-                cameraZ + forwardNormZ * brickWorldSize * static_cast<float>(std::max<int32_t>(2, radiusXz)),
-                650u,
-                -std::max(1, radiusXz / 2)
-            });
+        if (applyViewBias) {
+            anchors.push_back(
+                {
+                    cameraX + forwardNormX * brickWorldSize * static_cast<float>(std::max<int32_t>(2, radiusXz)),
+                    cameraY + forwardNormY * brickWorldSize * 0.5f,
+                    cameraZ + forwardNormZ * brickWorldSize * static_cast<float>(std::max<int32_t>(2, radiusXz)),
+                    650u,
+                    -std::max(1, radiusXz / 2)
+                });
+        }
         const int32_t predictedAnchorRadiusBias = -std::max(1, radiusXz / 2);
         const int32_t predictedAnchorRadiusXz = std::max(1, radiusXz + predictedAnchorRadiusBias);
         const int32_t cameraAnchorCenterX = FloorToGridCoordClamped(cameraX, brickWorldSize, radiusXz + 2);
@@ -4598,7 +4639,7 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
         }
         const float forwardLenXzForRingAnchor =
             std::sqrt(forwardNormX * forwardNormX + forwardNormZ * forwardNormZ);
-        if (cameraY <= 384.0f && forwardLenXzForRingAnchor > 0.001f) {
+        if (applyViewBias && cameraY <= 384.0f && forwardLenXzForRingAnchor > 0.001f) {
             anchors.push_back({
                 cameraX + forwardNormX * rings[ring].endDistance,
                 cameraY + forwardNormY * brickWorldSize * 0.5f,
@@ -4893,19 +4934,22 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
                 }
             }
         }
-        addTerrainCenterlineCandidates(
-            cameraX,
-            cameraZ,
-            cameraX + forwardNormX * brickWorldSize * static_cast<float>(std::max<int32_t>(2, radiusXz)),
-            cameraZ + forwardNormZ * brickWorldSize * static_cast<float>(std::max<int32_t>(2, radiusXz)),
-            45u);
+        if (applyViewBias) {
+            addTerrainCenterlineCandidates(
+                cameraX,
+                cameraZ,
+                cameraX + forwardNormX * brickWorldSize * static_cast<float>(std::max<int32_t>(2, radiusXz)),
+                cameraZ + forwardNormZ * brickWorldSize * static_cast<float>(std::max<int32_t>(2, radiusXz)),
+                45u);
+        }
         // Add a small horizontal view fan at terrain height. The existing local
         // shell can spend the full quota near the camera, while the centerline
         // alone misses visible side valleys. These fan lines are bounded by the
         // same line-coordinate cap and resident-interest quota as every other
-        // mid-voxel target.
+        // mid-voxel target. Skipped when stationary (radial interest) so pure yaw
+        // does not re-target generation; the local shell covers the surround.
         const float forwardLenXz = std::sqrt(forwardNormX * forwardNormX + forwardNormZ * forwardNormZ);
-        if (forwardLenXz > 0.001f) {
+        if (applyViewBias && forwardLenXz > 0.001f) {
             const float rightX = forwardNormZ;
             const float rightZ = -forwardNormX;
             const float fanDistance =
