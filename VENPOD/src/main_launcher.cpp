@@ -24103,7 +24103,10 @@ int RunSandbox(int argc, char* argv[]) {
                 editTelem.painting || editTelem.erasing ||
                 editTelem.deltaCount != 0u || editTelem.bakeRan ||
                 editTelem.propRegenUploads != 0u || editTelem.propInvalidatedBricks != 0u;
-            if (editingThisFrame || (frameCount % 15u) == 0u) {
+            // Also log SLOW frames (>30ms) so the spiky frames are always captured,
+            // editing or not.
+            const bool slowFrameThisFrame = perfFrameBodyMsLastFrame > 30.0f;
+            if (editingThisFrame || slowFrameThisFrame || (frameCount % 15u) == 0u) {
                 const auto& gs = sparseGpuResources.GetStats();
                 const auto& edits = sparseVoxelWorld.GetEdits();
                 spdlog::info(
@@ -24149,6 +24152,25 @@ int RunSandbox(int argc, char* argv[]) {
                     spdlog::info("EDIT_TELEM_BRICKS frame={} editedThisFrame={}",
                         frameCount, brickList);
                 }
+                // CPU breakdown of the (mislabeled-"postWait") sparse-update region +
+                // the REAL GPU frame time, so a slow frame names its own spike and
+                // settles GPU-vs-CPU. Idle is fine; spikes hide in here.
+                spdlog::info(
+                    "PERF_SPARSE_STEPS frame={} body={:.1f} gpuMs={:.1f}(valid={}) fence={:.1f} postWaitRegion={:.1f} | "
+                    "midMeshUpload={:.1f} surfExtract={:.1f} surfStage={:.1f} surfEmit={:.1f} surfPlan={:.1f} surfSnap={:.1f} "
+                    "brickUpload={:.1f} midSnapshot={:.1f} publish={:.1f} | "
+                    "reqPrep={:.1f} genPrep={:.1f} clipInterest={:.1f} clipBudget={:.1f} clipPump={:.1f} trim={:.1f} "
+                    "postFeedback={:.1f} raycast={:.1f} missFeedback={:.1f} brushFeedback={:.1f}",
+                    frameCount, perfFrameBodyMsLastFrame,
+                    gpuTiming.valid ? gpuTiming.frameMs : 0.0, gpuTiming.valid ? 1 : 0,
+                    perfFenceWaitMs, perfPostWaitGapMs,
+                    perfSparseMidUploadMs, perfSparseSurfaceExtractMs, perfSparseSurfaceStageMs,
+                    perfSparseSurfaceEmitMs, perfSparseSurfacePlanMs, perfSparseSurfaceSnapshotMs,
+                    perfSparseBrickUploadMs, perfSparseMidSnapshotMs, perfSparsePublishMs,
+                    perfSparseRequestPrepMs, perfSparseGenerationPrepMs, perfSparseClipmapInterestMs,
+                    perfSparseClipmapBudgetMs, perfSparseClipmapPumpMs, perfSparseTrimPrepMs,
+                    perfSparsePostFeedbackMs, perfSparsePostRaycastMs, perfSparsePostMissFeedbackMs,
+                    perfSparsePostBrushFeedbackMs);
             }
         }
 
