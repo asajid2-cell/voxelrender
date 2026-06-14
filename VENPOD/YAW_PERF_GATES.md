@@ -111,3 +111,20 @@ LEVERS TESTED + RULED OUT (all env-only, same-session, miss=0 throughout):
    ~16ms, see [[venpod-gpu-terrain-gen]]); (b) non-greedy LOD memory policy (target pool
    headroom so trim/stats scans are cheaper + less refine churn); (c) reduce GPU raymarch
    cost (14ms, 2.8M fragments / render scale). Footprint knobs and trim tuning are dead ends.
+
+## Cost-C — the saturation is STRUCTURAL, not config-tunable (final, 2026-06-14)
+Added the upstream admission cap to the ruled-out list:
+  - MID_VOXEL_INTEREST_PCT 75->50->35->25: resident STILL ~32700, rawMs ~44-50 unchanged.
+Also clarified: residentBricks (EDIT_TELEM) = the EXACT brick pool (m_pool, cap 32768),
+SEPARATE from the mid-voxel clipmap (m_voxelBricks, cap 16384). The owner-map midVoxel
+pixel % is the CLIPMAP rendering; residentBricks is the EXACT pool. NEITHER is bounded
+by any tested knob — the EXACT pool saturates ~99.8% unconditionally.
+CONCLUSION: cost-C is NOT reachable by configuration. Every env lever is exhausted with
+hard data. A real fix requires CODE: (1) identify what fills the exact pool to capacity
+regardless of request distance/radius (bootstrap target? hidden-exact? a fill-available-
+memory policy?), then (2) add a HARD admission/resident TARGET upstream of generation
+(refine/admit only below target + benefit-scored, NOT a post-hoc drain), and likely
+(3) make per-frame O(pool) work scale with effective resident, not capacity. This is a
+dedicated multi-session non-greedy-LOD rewrite, plus possibly GPU terrain generation
+underneath it. In-turn env tuning is exhausted; the next step is a focused code effort
+starting from "what fills m_pool unconditionally". Harness: lodpolicy.ps1.
