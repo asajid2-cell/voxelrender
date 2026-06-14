@@ -4225,6 +4225,10 @@ void SparseClipmapTileCache::GenerateTile(uint32_t slot, const SparseClipmapPoli
     tile.record.originZ =
         FloorToInt32Clamped(static_cast<double>(tile.record.coord.z) * static_cast<double>(tileWorldSize));
     tile.packedSamples.resize(static_cast<size_t>(side) * static_cast<size_t>(side));
+    // This tile's content is being regenerated (initial stream-in, edit-driven
+    // regen, or eviction+reuse) - bump the version so the incremental mid-mesh
+    // re-emits ONLY this tile instead of the whole monolith.
+    ++tile.meshContentVersion;
 
     // The mid-height mesh is PROCEDURAL BACKGROUND ONLY. It is a 2.5D heightfield
     // and cannot represent a 3D brush edit (overhang, carve, floating voxel) - an
@@ -6381,7 +6385,7 @@ bool SparseClipmapTileCache::BuildGpuSnapshot(
 
 bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     SparseSurfaceGpuSnapshot& outSnapshot,
-    const SparseMidHeightSurfaceBuildConfig& buildConfig) const
+    const SparseMidHeightSurfaceBuildConfig& buildConfig)
 {
     outSnapshot = {};
     const uint32_t side = m_config.tileSampleSide;
@@ -6600,11 +6604,23 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         return false;
     };
 
+    // Build-config fingerprint for the per-tile mesh cache: anything (besides the
+    // per-tile content/LOD/child-residency keys) that changes a tile's emitted
+    // faces. Constant per session in practice, but keying on it keeps the cache
+    // correct if water/terrace/LOD config is toggled at runtime.
+    const uint32_t midMeshBuildVersion =
+        (side & 0xFFu) |
+        ((terraceStep & 0xFFu) << 8) |
+        ((lodBaseMerge & 0x3Fu) << 16) |
+        ((lodMaxMerge & 0x3Fu) << 22) |
+        (buildConfig.lodEnabled ? (1u << 28) : 0u) |
+        (buildConfig.emitWater ? (1u << 29) : 0u);
+
     for (uint32_t tileSlot = 0; tileSlot < static_cast<uint32_t>(m_tiles.size()); ++tileSlot) {
         if (emittedTiles >= effectiveMaxTiles) {
             break;
         }
-        const TilePayload& tile = m_tiles[tileSlot];
+        TilePayload& tile = m_tiles[tileSlot];
         if (tile.record.slot == UINT32_MAX ||
             tile.packedSamples.size() < sampleCount ||
             tile.record.cellSize <= 0.0f) {
@@ -6719,7 +6735,30 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             }
         }
 
+        // ===== INCREMENTAL MID-MESH: per-tile face cache =====
+        // Reuse this tile's previously emitted faces unless something that affects
+        // them changed: content (edit/stream/regen bump meshContentVersion), the
+        // camera-distance LOD (mergeCells), finer-ring child residency (childMask),
+        // the build config, or the tile slot being re-centered to a new coord. A hit
+        // skips the expensive per-cell emission below - so only changed tiles cost
+        // anything, instead of rebuilding the whole ~1.5M-face monolith every frame.
         std::vector<SparseSurfaceFace> tileFaces;
+        bool faceBudgetOk = true;
+        const uint32_t childMask =
+            (childResident[0] ? 1u : 0u) | (childResident[1] ? 2u : 0u) |
+            (childResident[2] ? 4u : 0u) | (childResident[3] ? 8u : 0u);
+        const bool meshCacheHit =
+            tile.meshCacheValid &&
+            tile.meshCacheContentVersion == tile.meshContentVersion &&
+            tile.meshCacheMergeCells == mergeCells &&
+            tile.meshCacheChildMask == childMask &&
+            tile.meshCacheBuildVersion == midMeshBuildVersion &&
+            tile.meshCacheOriginX == tile.record.originX &&
+            tile.meshCacheOriginZ == tile.record.originZ &&
+            tile.meshCacheRing == tile.record.coord.ring;
+        if (meshCacheHit) {
+            tileFaces = tile.meshCacheFaces;
+        } else {
         const uint32_t blockCountPerAxis = (cellCount + mergeCells - 1u) / mergeCells;
         tileFaces.reserve(static_cast<size_t>(blockCountPerAxis) * static_cast<size_t>(blockCountPerAxis) * 3u);
 
@@ -6806,7 +6845,7 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             return block;
         };
 
-        bool faceBudgetOk = true;
+        faceBudgetOk = true;
         for (uint32_t z = 0; z < cellCount && faceBudgetOk; z += mergeCells) {
             const uint32_t zEnd = std::min(cellCount, z + mergeCells);
             for (uint32_t x = 0; x < cellCount && faceBudgetOk; x += mergeCells) {
@@ -6997,6 +7036,21 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
                 }
             }
         }
+
+        // Store this tile's freshly emitted faces in its cache, keyed by what they
+        // depend on, so subsequent frames reuse them until the tile actually changes.
+        if (faceBudgetOk) {
+            tile.meshCacheFaces = tileFaces;
+            tile.meshCacheContentVersion = tile.meshContentVersion;
+            tile.meshCacheMergeCells = mergeCells;
+            tile.meshCacheChildMask = childMask;
+            tile.meshCacheBuildVersion = midMeshBuildVersion;
+            tile.meshCacheOriginX = tile.record.originX;
+            tile.meshCacheOriginZ = tile.record.originZ;
+            tile.meshCacheRing = tile.record.coord.ring;
+            tile.meshCacheValid = true;
+        }
+        } // end cache-miss emission (meshCacheHit ? reuse : emit)
 
         if (!faceBudgetOk) {
             return false;

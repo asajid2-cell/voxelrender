@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SparseTerrainGenerator.h"
+#include "SparseSurfaceExtractor.h"  // SparseSurfaceFace (per-tile mesh-face cache)
 
 #include <array>
 #include <condition_variable>
@@ -592,9 +593,12 @@ public:
     // so they are not re-dispatched on the next snapshot. Call ONLY after the upload +
     // compute dispatch for this snapshot actually succeed (so a rejected upload retries).
     void MarkVoxelGpuSamplesUploaded(const SparseClipmapGpuSnapshot& snapshot);
+    // Non-const: maintains a per-tile mesh-face cache so an unchanged tile is not
+    // re-emitted (the incremental mid-mesh — only edited/streamed/LOD-changed tiles
+    // re-extract instead of the whole 1.5M-face monolith).
     bool BuildMidHeightSurfaceSnapshot(
         SparseSurfaceGpuSnapshot& outSnapshot,
-        const SparseMidHeightSurfaceBuildConfig& buildConfig = {}) const;
+        const SparseMidHeightSurfaceBuildConfig& buildConfig = {});
     void SetEditStore(const SparseEditStore* edits);
     void SetFarSvoFallbackMetadata(const SparseClipmapFarSvoFallbackMetadata& metadata);
     // sinceRevision: only overlays touched after this global edit revision are
@@ -761,6 +765,21 @@ private:
     struct TilePayload {
         SparseClipmapTileRecord record;
         std::vector<uint32_t> packedSamples;
+        // Incremental mid-mesh: this tile's emitted surface faces, cached with the
+        // key they were built at. A build reuses them unless the key changed
+        // (content regen, camera-distance LOD, finer-ring child residency, or the
+        // tile slot was re-centered to a new coord). contentVersion is bumped by
+        // GenerateTile, so edits/streaming/regen invalidate only the affected tile.
+        uint64_t meshContentVersion = 0;
+        std::vector<SparseSurfaceFace> meshCacheFaces;
+        uint64_t meshCacheContentVersion = UINT64_MAX;
+        uint32_t meshCacheMergeCells = 0xFFFFFFFFu;
+        uint32_t meshCacheChildMask = 0xFFFFFFFFu;
+        uint32_t meshCacheBuildVersion = 0xFFFFFFFFu;
+        int32_t meshCacheOriginX = INT32_MIN;
+        int32_t meshCacheOriginZ = INT32_MIN;
+        int32_t meshCacheRing = -1;
+        bool meshCacheValid = false;
     };
 
     struct VoxelColumnSample {
