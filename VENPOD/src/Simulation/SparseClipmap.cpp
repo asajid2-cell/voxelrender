@@ -2045,12 +2045,20 @@ void SparseClipmapTileCache::UpdateInterest(
     // (genPrep/hiddenExact/pressureTrim spike on turn). Gate the look-bias on
     // actually moving; when stationary, interest stays a camera-centred disc so
     // turning in place re-streams nothing. Env-overridable for A/B.
-    // Opt-in (default OFF = old always-on look bias) until visually verified that
-    // dropping the look bias when stationary doesn't thin far-in-view coverage.
+    // Default ON (was opt-in): profiling proved a pure camera TURN (fixed position)
+    // sweeps the view-directional height interest, regenerating tiles -> HeightDirty
+    // Serial climbed 449->971 over one stationary 360 -> ~20 full 1.5M-face mid-mesh
+    // re-uploads of UNCHANGED terrain (41-58ms spikes). A/B: gating the look bias to
+    // moving-only cut those uploads 20->2. So honor the unified stationary toggle by
+    // default (look bias only while translating); the explicit env still forces A/B.
+    // useMotionLookahead is velocity(translation)-based, so pure yaw never counts as
+    // moving -> stationary turn keeps a camera-centred disc and re-streams nothing.
     static const char* sparseInterestLookBiasEnv =
         std::getenv("VENPOD_SPARSE_INTEREST_LOOK_BIAS_MOVING_ONLY");
     static const bool sparseInterestLookBiasMovingOnly =
-        sparseInterestLookBiasEnv != nullptr && std::atoi(sparseInterestLookBiasEnv) != 0;
+        sparseInterestLookBiasEnv != nullptr
+            ? std::atoi(sparseInterestLookBiasEnv) != 0
+            : StationaryViewIndependentInterestEnabled();
     const bool applyLookBias = useMotionLookahead || !sparseInterestLookBiasMovingOnly;
     uint32_t heightAnchorCount = 0;
     if (policy.Config().heightClipmapEnabled) {
