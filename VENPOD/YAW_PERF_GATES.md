@@ -128,3 +128,24 @@ memory policy?), then (2) add a HARD admission/resident TARGET upstream of gener
 dedicated multi-session non-greedy-LOD rewrite, plus possibly GPU terrain generation
 underneath it. In-turn env tuning is exhausted; the next step is a focused code effort
 starting from "what fills m_pool unconditionally". Harness: lodpolicy.ps1.
+
+## COST-C ROOT CAUSE FOUND (2026-06-14, tandem read-only trace) — hidden-exact accumulation
+Tandem DIVERGED then resolved by ground-truth. Added residency-class telemetry
+(res: ... spec= vis= coll= edit=). Decisive: the saturated pool is 99.9% VISIBLE class
+(resident 32690: VIS 32656, SPEC 0, COLL 34, EDIT 0). My "speculative-dominated" read
+was WRONG; codex's independent trace was RIGHT: the filler is HIDDEN-EXACT REPAIR
+(requestHiddenExactCoord main_launcher:9109, submits Visible, bypasses budgets when
+critical, keeps discovering coords, prunes ready ones at 16766 but the REPAIRED BRICKS
+PERSIST resident as Visible -> accumulate over every viewed direction).
+A/B PROOF (stationary yaw, VENPOD_SPARSE_HIDDEN_EXACT_MISS_FEEDBACK 1 vs 0):
+  ON : resident 32699 VIS 32665 warm_rawMs 51.1 miss 0
+  OFF: resident 21739 VIS 21705 warm_rawMs 38.1 miss 0  <- 11k fewer bricks, -13ms (25%), NO HOLES
+=> hidden-exact accumulation is the dominant cost-C filler AND it's safely removable in
+   pure look-around (no new hidden surface revealed -> miss stays 0). Choke point for any
+   gate: RequestBrickDetailed (SparseVoxelWorld.cpp:3341) or requestHiddenExactCoord (9109).
+   Real fix: bound/demote hidden-exact accumulation (repair the CURRENT view's hidden
+   surface, DEMOTE aged repaired bricks to trimmable class when no longer visible) so it
+   keeps working for movement/edits but stops hoarding all directions. MAX_TRACKED(8192)/
+   MAX_OUTSTANDING(4096) bound tracking, NOT the persisted resident bricks -> likely needs
+   the demote-on-age code fix, not just an env cap. Hole gate: must keep miss=0 while
+   MOVING/EDITING (where hidden surface is genuinely revealed), not just stationary.

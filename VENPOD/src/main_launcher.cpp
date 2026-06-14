@@ -24194,7 +24194,7 @@ int RunSandbox(int argc, char* argv[]) {
                     "bake: en={} ran={} collected={} staged={} ranges={} stageOk={} | "
                     "prop: midRegen={} heightTiles={} regenUploads={} invBricks={} invTiles={} | "
                     "store: editedBricks={} editedVoxels={} rev={} | "
-                    "res: poolMB={:.1f} residentBricks={} freePages={} ringUsedMB={:.2f}/{:.2f} stagedBricks={} stagedBytes={} editDeltaMB={:.2f}",
+                    "res: poolMB={:.1f} residentBricks={} freePages={} spec={} vis={} coll={} edit={} ringUsedMB={:.2f}/{:.2f} stagedBricks={} stagedBytes={} editDeltaMB={:.2f}",
                     frameCount, instantFps, perfFrameBodyMsLastFrame, perfFramePrepMs,
                     perfBrushSubmitMs, perfRenderSubmitMs, perfPresentMs,
                     editTelem.painting ? 1 : 0, editTelem.erasing ? 1 : 0,
@@ -24217,6 +24217,10 @@ int RunSandbox(int argc, char* argv[]) {
                     static_cast<double>(gs.brickPoolBytes) / (1024.0 * 1024.0),
                     sparseVoxelWorld.GetStats().residentBricks,
                     sparseVoxelWorld.GetStats().freePages,
+                    sparseVoxelWorld.GetStats().residentSpeculativeBricks,
+                    sparseVoxelWorld.GetStats().residentVisibleBricks,
+                    sparseVoxelWorld.GetStats().residentCollisionBricks,
+                    sparseVoxelWorld.GetStats().residentEditedBricks,
                     static_cast<double>(sparseUploadRingUsedBytesLastFrame) / (1024.0 * 1024.0),
                     static_cast<double>(sparseUploadRingCapacityBytesLastFrame) / (1024.0 * 1024.0),
                     gs.stagedBricksLastFrame, gs.stagedBytesLastFrame,
