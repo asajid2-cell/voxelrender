@@ -21471,6 +21471,24 @@ int RunSandbox(int argc, char* argv[]) {
                 ImGui::Text("Sparse mid interest anchors height %u | voxel %u",
                     midStats.heightInterestAnchors,
                     midStats.voxelInterestAnchors);
+                // Real-scale geometry counts. RASTER tris = the near exact-surface mesh +
+                // the far height mesh (each face = 2 tris); interior solid-solid faces are
+                // never emitted and back faces are GPU-culled, so this is exposed-front only.
+                // The MID band is RAYMARCHED (per-pixel, no triangles) -> counted as bricks.
+                {
+                    const uint64_t rasterFaces =
+                        static_cast<uint64_t>(sparseSurfaceRasterFacesLastFrame) +
+                        static_cast<uint64_t>(sparseMidMeshFaceCountLastUpload);
+                    ImGui::Text("Geometry: raster tris %.2fM (near-surf %u + far-mesh %u faces x2) | NOTE mid band is raymarched",
+                        static_cast<double>(rasterFaces) * 2.0 / 1.0e6,
+                        sparseSurfaceRasterFacesLastFrame,
+                        sparseMidMeshFaceCountLastUpload);
+                    const uint32_t nearResidentBricks = sparseVoxelWorld.GetStats().residentBricks;
+                    ImGui::Text("Voxels resident: near-exact %u bricks (%.1fM voxels) | mid clipmap %u bricks (raymarched)",
+                        nearResidentBricks,
+                        static_cast<double>(nearResidentBricks) * 4096.0 / 1.0e6,
+                        midStats.residentVoxelBricks);
+                }
                 ImGui::Text("Sparse GPU %s | pages %u | table %u | pool %.1f MB",
                     sparseStats.initialized ? "ready" : "unavailable",
                     sparseStats.maxBrickPages,

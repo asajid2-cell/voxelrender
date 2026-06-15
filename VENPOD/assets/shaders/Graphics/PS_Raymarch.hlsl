@@ -521,7 +521,7 @@ bool BackgroundDebugLayerMode() {
         frame.debugMode == 60u || frame.debugMode == 61u ||
         frame.debugMode == 62u || frame.debugMode == 63u ||
         frame.debugMode == 65u || frame.debugMode == 66u ||
-        frame.debugMode == 67u;
+        frame.debugMode == 67u || frame.debugMode == 70u;
 }
 
 float3 SkySunDirection() {
@@ -2207,6 +2207,26 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
                 }
                 if (frame.debugMode == 62u) {
                     voxelHit = MakeHit(float4(DebugClosureColor(hitPos), 1.0f), hitDistance);
+                    return true;
+                }
+                if (frame.debugMode == 70u) {
+                    // CHUNK VIZ: flat color per mid-voxel BRICK (16^3 cells). Each brick gets a
+                    // distinct hash color so you SEE its footprint, and the footprint visibly grows
+                    // per LOD ring (cell size doubles each ring). A ring-hue tint makes the LOD
+                    // bands readable too. Color-only; no behavior change.
+                    const float brickWorldSize = max(actualCellSize, 1.0f) * (float)SPARSE_BRICK_SIZE;
+                    const int3 chunkCoord = int3(floor(hitPos / brickWorldSize));
+                    uint h = 2166136261u;
+                    h = (h ^ (uint)chunkCoord.x) * 16777619u;
+                    h = (h ^ (uint)chunkCoord.y) * 16777619u;
+                    h = (h ^ (uint)chunkCoord.z) * 16777619u;
+                    const float3 chunkColor = float3(
+                        (float)((h) & 255u) / 255.0f,
+                        (float)((h >> 8u) & 255u) / 255.0f,
+                        (float)((h >> 16u) & 255u) / 255.0f);
+                    const float ringT = (float)(actualRing) / max((float)(header.w >> 24u), 1.0f);
+                    const float3 ringHue = float3(ringT, 1.0f - ringT, 0.35f + 0.5f * frac(ringT * 1.7f));
+                    voxelHit = MakeHit(float4(saturate(lerp(chunkColor, ringHue, 0.45f)), 1.0f), hitDistance);
                     return true;
                 }
                 const bool ring0MidVoxel =

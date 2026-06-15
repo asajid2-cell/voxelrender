@@ -302,6 +302,23 @@ float4 main(PSInput input) : SV_Target {
     if (frame.debugMode == 50u) {
         return float4(1.0f, 0.95f, 0.05f, 1.0f);
     }
+    if (frame.debugMode == 70u) {
+        // CHUNK VIZ (raster surface): flat hash color per 16-unit exact brick -- the
+        // 16^3 chunk you actually edit -- so the chunk grid is visible on the terrain you
+        // walk on. Far-mesh terraces span several cells, showing their coarser scale
+        // against the unit grid. (The mid-voxel raymarch band gets its own per-ring chunk
+        // color via the same debug mode in PS_Raymarch.) Color-only, no behavior change.
+        const int3 chunkCoord = int3(floor(input.worldPos / 16.0f));
+        uint h = 2166136261u;
+        h = (h ^ (uint)chunkCoord.x) * 16777619u;
+        h = (h ^ (uint)chunkCoord.y) * 16777619u;
+        h = (h ^ (uint)chunkCoord.z) * 16777619u;
+        return float4(
+            (float)((h) & 255u) / 255.0f,
+            (float)((h >> 8u) & 255u) / 255.0f,
+            (float)((h >> 16u) & 255u) / 255.0f,
+            1.0f);
+    }
     if (frame.debugMode == 51u) {
         const float heightDelta = input.worldPos.y - frame.cameraPosition.y;
         const float above = saturate(heightDelta / 160.0f);
