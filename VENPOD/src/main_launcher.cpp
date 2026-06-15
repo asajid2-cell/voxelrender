@@ -5126,6 +5126,20 @@ int RunSandbox(int argc, char* argv[]) {
     uint32_t sparseGenerationBudgetLastFrame = 0;
     uint32_t sparseUploadBudgetLastFrame = 0;
     float sparseCameraSpeedLastFrame = 0.0f;
+    // Hidden-exact STATIONARY GATE (Goal 2 cost-C fix). Hidden-exact repair re-probes the
+    // current view every frame and accumulates ~11k Visible exact bricks across all viewed
+    // directions, costing ~13ms of the warm look-around frame -- for OCCLUDED surface that is
+    // never seen (A/B + two-judge visual confirmed: disabling it has no holes and no visible
+    // quality loss in look-around/movement). Gate the miss-ray PROBE to when it can matter
+    // (translating / editing / startup) and disarm after a short stationary+no-edit hysteresis,
+    // so a pure camera turn stops the wasted probing. Downstream (requestHiddenExactCoord,
+    // generation, upload, surface, readiness accounting) is untouched -- only new probe
+    // emission is suppressed -- so already-admitted repair completes and startup is safe.
+    static const bool sparseHiddenExactStationaryGateEnabled =
+        ReadUIntEnv("VENPOD_SPARSE_HIDDEN_EXACT_STATIONARY_GATE", 1u) != 0u;
+    static const uint32_t sparseHiddenExactStationaryDisarmFrames =
+        ReadUIntEnv("VENPOD_SPARSE_HIDDEN_EXACT_STATIONARY_DISARM_FRAMES", 6u);
+    uint32_t sparseHiddenExactStationaryFrames = 0u;
     uint32_t sparseMidClipmapBudgetLastFrame = 0;
     uint32_t sparseMidClipmapPumpCapActiveLastFrame = 0;
     uint32_t sparseMidClipmapCacheOnlyDeferForTerrainThrottleLastFrame = 0;
@@ -7161,6 +7175,35 @@ int RunSandbox(int argc, char* argv[]) {
             const float sparseAdmissionSpeed =
                 dt > 0.001f ? glm::length(sparseAdmissionCameraDelta) / dt : 0.0f;
             sparseCameraSpeedLastFrame = sparseAdmissionSpeed;
+            // Hidden-exact STATIONARY QUIESCE (Goal 2 cost-C fix), computed once per frame so
+            // both the foreground-repair gate and the wide-raster clean gate use one value.
+            // Tandem-traced mechanism: with hidden-exact feedback on, the runtime "clean"
+            // counter rarely reaches idle during look-around, so wide exact-surface promotion
+            // stays blocked and the shader-unsafe FOREGROUND-REPAIR path keeps admitting
+            // Visible exact bricks until the pool saturates (~32k, ~+13ms). When stationary +
+            // not editing (post startup-gate-open) for the hysteresis window, quiesce: stop
+            // that non-critical fill and force the promotion clean state, returning to the
+            // FEEDBACK=0-like wide-raster steady state so trim drains the pool toward ~22k.
+            // Proven safe: hidden-exact off is miss=0 + visually identical across startup /
+            // look-around / move / reveal-stress / edit. Re-arms instantly on motion/edit.
+            {
+                const bool hiddenExactQuiesceTranslating =
+                    sparseCameraSpeedLastFrame >= sparseClipmapPolicy.Config().motionLookaheadMinSpeed;
+                const bool hiddenExactQuiesceEditing =
+                    brushController.IsPainting() || brushController.IsErasing();
+                if (hiddenExactQuiesceTranslating || hiddenExactQuiesceEditing) {
+                    sparseHiddenExactStationaryFrames = 0u;
+                } else if (sparseHiddenExactStationaryFrames < 0xFFFFFFFFu) {
+                    ++sparseHiddenExactStationaryFrames;
+                }
+            }
+            const bool hiddenExactStationaryQuiesced =
+                sparseHiddenExactStationaryGateEnabled &&
+                sparseStartupPublicRenderGateOpened &&
+                sparseCameraSpeedLastFrame < sparseClipmapPolicy.Config().motionLookaheadMinSpeed &&
+                !brushController.IsPainting() &&
+                !brushController.IsErasing() &&
+                sparseHiddenExactStationaryFrames >= sparseHiddenExactStationaryDisarmFrames;
             uint32_t sparseFastRequestScaleThisFrame = 1;
             if (sparseFastRequestSpeed > 0u && sparseAdmissionSpeed > static_cast<float>(sparseFastRequestSpeed)) {
                 sparseFastRequestScaleThisFrame = std::min<uint32_t>(
@@ -8174,6 +8217,7 @@ int RunSandbox(int argc, char* argv[]) {
                         shaderMissHighAltitudeFallbackRepairAllowed;
                     const bool shaderMissForegroundRepairActive =
                         enableSparseShaderUnsafeForegroundRepair &&
+                        !hiddenExactStationaryQuiesced &&
                         shaderMissForegroundRepairAllowedThisFrame &&
                         shaderMissFeedbackRecentForRepair &&
                         shaderMissForegroundRepairEligible >= sparseShaderUnsafeForegroundRepairMinNonReady;
@@ -8790,6 +8834,9 @@ int RunSandbox(int argc, char* argv[]) {
                     hiddenExactPostReleaseWarmupActive ||
                     hiddenExactRuntimeProbeInterval <= 1u ||
                     (frameCount % static_cast<uint64_t>(hiddenExactRuntimeProbeInterval)) == 0ull;
+                // (hidden-exact stationary quiesce is computed once per frame near the camera
+                // speed update; see hiddenExactStationaryQuiesced. The probe is unchanged --
+                // tandem proved the probe is NOT the resident filler.)
                 const bool hiddenExactGeneralProbeThisFrame =
                     hiddenExactStartupFullSweep ||
                     (!hiddenExactStartupProofMode &&
@@ -19901,8 +19948,24 @@ int RunSandbox(int argc, char* argv[]) {
                 enableSparseHiddenExactMissFeedback &&
                 sparseHiddenExactMissFeedbackMaxRequests > 0u &&
                 publicRenderOpenForBoundedWideRepair;
+            // Stationary quiesce (Goal 2 cost-C fix): force the wide-raster promotion clean
+            // state when quiesced, so the exact pool drains to the FEEDBACK=0-like ~22k steady
+            // state during look-around. Recomputed here from the function-scope frame counter
+            // (this site is in a different lexical block from the foreground-repair gate).
+            // Treat runtime hidden-exact as CLEAN for wide-raster promotion whenever the gate
+            // is enabled and the startup public-render gate has opened -- i.e. adopt the
+            // proven-safe FEEDBACK=0 wide-raster steady state at runtime, so the exact surface
+            // raster covers wide and terrain-critical never over-requests the pool to the cap.
+            // (Proven safe: hidden-exact OFF -- which is wide-promotion-always -- is miss=0 and
+            // visually identical across startup/look-around/move/reveal/edit.) The non-critical
+            // foreground REPAIR fill is separately suppressed only while stationary+not-editing,
+            // so edit/reveal repair still runs. Env escape: STATIONARY_GATE=0.
+            const bool hiddenExactWideRasterQuiesced =
+                sparseHiddenExactStationaryGateEnabled &&
+                sparseStartupPublicRenderGateOpened;
             const bool hiddenExactRuntimeCleanForWideRaster =
                 !enableSparseHiddenExactMissFeedback ||
+                hiddenExactWideRasterQuiesced ||
                 sparseHiddenExactRuntimeCleanFrames >= sparseHiddenExactMissCleanIdleFrames;
             const bool hiddenExactCurrentCleanForWideRaster =
                 sparseSurfacePromotionAcceptsCurrentHiddenExactClean &&
