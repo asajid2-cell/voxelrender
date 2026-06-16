@@ -17,6 +17,7 @@ param(
     $RebrunArgs
 )
 
+if ($null -eq $RebrunArgs) { $RebrunArgs = @() }  # never splat $null (leaks an empty positional arg)
 $resolved = $Path
 if (-not [System.IO.Path]::IsPathRooted($resolved)) {
     $resolved = Join-Path (Get-Location) $resolved

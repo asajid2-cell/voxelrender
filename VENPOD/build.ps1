@@ -71,6 +71,9 @@ Write-Step "Building ($Config)..."
 $startTime = Get-Date
 
 Push-Location $buildDir
+# Guard against an empty -Config (e.g. an empty splatted arg): a blank value makes
+# cmake swallow the next flag ("Invalid value used with --config" + usage dump).
+if ([string]::IsNullOrWhiteSpace($Config)) { $Config = "Release" }
 & cmake --build . --config $Config --parallel
 $buildResult = $LASTEXITCODE
 Pop-Location
