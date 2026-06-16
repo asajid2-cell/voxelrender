@@ -50,6 +50,17 @@ struct MidVoxelBrickGenRequest {
 };
 static_assert(sizeof(MidVoxelBrickGenRequest) == 32, "BrickGenRequest must be 32 bytes");
 
+// 16-byte resolved edit override, matches MidEditOverride in
+// CS_ApplyMidEditCellsToClipmap.hlsl and SparseMidVoxelEditOverride in
+// SparseClipmap.h. Scattered into the sample pool after the pristine gen.
+struct MidVoxelEditOverride {
+    uint32_t destSlot;
+    uint32_t localIndex;
+    uint32_t voxel;
+    uint32_t pad0;
+};
+static_assert(sizeof(MidVoxelEditOverride) == 16, "MidEditOverride must be 16 bytes");
+
 class MidVoxelGpuGenerator {
 public:
     MidVoxelGpuGenerator() = default;
@@ -86,6 +97,21 @@ public:
         uint32_t requestCount,
         bool transitionSamplePool);
 
+    // Phase B: true once the edit-override apply pipeline compiled. Gen still works
+    // without it (edits just won't bake into mid), so it is optional.
+    bool IsApplyValid() const { return m_applyPipeline.IsValid(); }
+
+    // Phase B: scatter `overrides` into the sample pool, overwriting the pristine
+    // samples CS_GenerateMidVoxelBricks just wrote for edited cells. The pool MUST
+    // already be in UNORDERED_ACCESS (call BeginMidVoxelGeneration first, run the
+    // gen dispatch with transitionSamplePool=false, then this). Emits a UAV barrier
+    // FIRST (gen -> apply ordering); does NOT transition state (caller's End does).
+    bool ApplyEditOverrides(
+        ID3D12GraphicsCommandList* cmdList,
+        GPUBuffer& samplePool,
+        const MidVoxelEditOverride* overrides,
+        uint32_t overrideCount);
+
     uint32_t Seed() const { return m_seed; }
 
     // Dev verification: dispatch `requests` into `liveSamplePool` (the REAL
@@ -100,6 +126,22 @@ public:
         const std::vector<MidVoxelBrickGenRequest>& requests,
         const std::vector<std::vector<uint32_t>>& cpuBricks);
 
+    // Debug parity (mid-edit bake): dispatch gen(pristine) + apply(overrides) into
+    // the live sample pool for `requests`, read back each request's destSlot, and
+    // byte-compare against cpuBricks[i] (the CPU GenerateVoxelBrickPayload-with-edits
+    // reference for the SAME brick). Logs strict AND VisualSurface-masked match counts
+    // + the first mismatch per brick. Synchronous (own list + fence). The masked pass
+    // ignores the VisualSurface bit (0x10<<24) because the bake conservatively tags ALL
+    // edited solids whereas the CPU tags only surface cells (visually identical: the
+    // extra-tagged interior cells are occluded). Returns the strict match count.
+    uint32_t VerifyEditedBricksAgainstCpu(
+        ID3D12Device* device,
+        DX12CommandQueue& commandQueue,
+        GPUBuffer& liveSamplePool,
+        const std::vector<MidVoxelBrickGenRequest>& requests,
+        const std::vector<MidVoxelEditOverride>& overrides,
+        const std::vector<std::vector<uint32_t>>& cpuBricks);
+
 private:
     Result<void> EnsureRequestCapacity(ID3D12Device* device, uint32_t requestCount);
 
@@ -111,6 +153,13 @@ private:
     std::array<uint32_t, kRequestRingSize> m_requestCapacity = { 0u, 0u, 0u };
     uint32_t m_requestRingCursor = 0u;
     uint32_t m_seed = 12345u;
+
+    // Phase B: edit-override apply pass (CS_ApplyMidEditCellsToClipmap) + its own
+    // triple-buffered upload ring (overrides differ per frame, in flight separately).
+    DX12ComputePipeline m_applyPipeline;
+    std::array<UploadBuffer, kRequestRingSize> m_overrideBuffers;
+    std::array<uint32_t, kRequestRingSize> m_overrideCapacity = { 0u, 0u, 0u };
+    uint32_t m_overrideRingCursor = 0u;
 };
 
 } // namespace VENPOD::Graphics

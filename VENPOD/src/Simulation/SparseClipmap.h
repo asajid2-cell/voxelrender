@@ -102,6 +102,12 @@ struct SparseClipmapConfig {
     // expensive per-voxel SAMPLES move to the GPU. Edited bricks fall back to the
     // CPU fill (v1). Env: VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION.
     bool enableGpuMidVoxelGeneration = false;
+    // Phase B: when true (and GPU mid gen is on), EDITED mid bricks are ALSO GPU-
+    // generated (pristine) and their edits applied by a trivial GPU scatter
+    // (CS_ApplyMidEditCellsToClipmap) instead of the expensive CPU full regen
+    // (GenerateVoxelBrickPayload). The CPU only builds the cheap per-cell edit
+    // overrides. Removes the edit-while-moving hitch. Env: VENPOD_MID_EDIT_BAKE.
+    bool enableGpuMidEditBake = false;
     uint32_t seed = 12345u;
 };
 
@@ -185,6 +191,19 @@ struct SparseMidVoxelGpuGenRequest {
     uint32_t pad2 = 0;
 };
 
+// Phase B: one resolved mid-voxel edit override. The CPU resolves each edited mid
+// cell to its final voxel via the tryEditedCellVoxel rule (cheap; reuses the same
+// summary aggregation as GenerateVoxelBrickPayload); the GPU apply pass
+// (CS_ApplyMidEditCellsToClipmap) scatters these into the sample pool AFTER the
+// pristine gen: OutSamples[destSlot*4096 + localIndex] = voxel. 16 bytes, mirrors
+// the HLSL MidEditOverride.
+struct SparseMidVoxelEditOverride {
+    uint32_t destSlot = 0;
+    uint32_t localIndex = 0;
+    uint32_t voxel = 0;
+    uint32_t pad0 = 0;
+};
+
 struct SparseClipmapGpuSnapshot {
     std::vector<uint32_t> metadata;
     std::vector<uint32_t> lookup;
@@ -198,6 +217,10 @@ struct SparseClipmapGpuSnapshot {
     // samples must be (re)generated on the GPU this snapshot. voxelSamples is left
     // empty for these (the CPU never packs them); the dispatch fills the pool.
     std::vector<SparseMidVoxelGpuGenRequest> voxelGpuGenRequests;
+    // Phase B: resolved edit overrides for the EDITED GPU-gen bricks in this snapshot,
+    // scattered into the sample pool by CS_ApplyMidEditCellsToClipmap AFTER the gen
+    // dispatch (a subset of voxelGpuGenRequests' bricks: those intersecting edits).
+    std::vector<SparseMidVoxelEditOverride> voxelEditOverrides;
     uint32_t tileCount = 0;
     uint32_t tileSampleSide = 0;
     uint32_t lookupCapacity = 0;
@@ -639,6 +662,17 @@ public:
         int32_t& outOriginY,
         int32_t& outOriginZ,
         int32_t& outCellSize);
+    // Debug parity (public; called from the render loop one-shot): gather up to
+    // `maxBricks` resident EDITED GPU-gen bricks (non-empty editOverrides) into
+    // parallel arrays the mid-edit-bake parity harness consumes: a gen request per
+    // brick, all their overrides (keyed by destSlot=slot), and the CPU full-regen-
+    // with-edits reference per brick. Returns the brick count.
+    uint32_t CollectMidEditBakeVerifyData(
+        const SparseClipmapPolicy& policy,
+        uint32_t maxBricks,
+        std::vector<SparseMidVoxelGpuGenRequest>& outRequests,
+        std::vector<SparseMidVoxelEditOverride>& outOverrides,
+        std::vector<std::vector<uint32_t>>& outCpuBricks);
 
     const SparseClipmapCacheStats& GetStats() const { return m_stats; }
     uint32_t DirtySerial() const { return m_dirtySerial; }
@@ -817,6 +851,19 @@ private:
         const SparseClipmapPolicy& policy,
         std::unordered_map<uint64_t, VoxelColumnSample>* externalColumnCache = nullptr,
         VoxelColumnCacheCounters* externalColumnCacheCounters = nullptr);
+    // Phase B: resolve the CURRENT edit overlay into brick.editOverrides (one entry
+    // per edited OWNED mid cell, via the tryEditedCellVoxel single-cell rule). Cheap
+    // (O(edited voxels in brick)); does NO procedural sampling. Called from the GPU-
+    // gen edited-brick branch instead of the full CPU GenerateVoxelBrickPayload regen.
+    void BuildMidEditOverridesForBrick(
+        VoxelBrickPayload& brick, const SparseClipmapRing& ring);
+    // Debug parity: CPU-reference payload for the brick at `slot`, generated with
+    // GPU mid gen + edit bake FORCED OFF (the full CPU regen WITH the current edit
+    // overlay). The mid-edit-bake parity harness compares this against the GPU
+    // gen+bake result for the same slot. Returns false if the slot is not resident.
+    bool GenerateEditedBrickCpuReferenceForSlot(
+        uint32_t slot, const SparseClipmapPolicy& policy,
+        std::vector<uint32_t>& outVoxels);
     bool GenerateVoxelBricksWithPersistentWorkers(
         const std::vector<uint32_t>& slots,
         const SparseClipmapPolicy& policy,
@@ -938,6 +985,12 @@ private:
         // every frame during streaming, starving new-terrain gen and dropping fps. Reset to
         // false in MarkVoxelSlotDirty (any change/slot-reuse) so the brick re-generates.
         bool gpuGenSamplesUploaded = false;
+        // Phase B: resolved (localIndex, voxel) edit overrides for this brick when it
+        // is a GPU-generated EDITED brick. Rebuilt by GenerateVoxelBrickPayload from
+        // the CURRENT edit overlay on each (re)generation (so an erased voxel reverts
+        // to the pristine base because no override is emitted for it); consumed by
+        // BuildGpuSnapshot, applied on GPU after the pristine gen. Empty otherwise.
+        std::vector<std::pair<uint32_t, uint32_t>> editOverrides;
         std::vector<uint32_t> voxels;
     };
     struct AsyncVoxelGenerationRequest {

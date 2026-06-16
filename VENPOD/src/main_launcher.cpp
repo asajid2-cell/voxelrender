@@ -2743,6 +2743,12 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION", 0u) != 0u;
     const bool enableSparseMidVoxelGpuGeneration =
         sparseClipmapConfig.enableGpuMidVoxelGeneration;
+    // Phase B: GPU mid-edit bake -- edited mid bricks go GPU-gen (pristine) + a GPU
+    // override scatter (CS_ApplyMidEditCellsToClipmap), instead of the ~8ms CPU full
+    // regen. Default ON when GPU mid gen is on; escape VENPOD_MID_EDIT_BAKE=0 for A/B.
+    sparseClipmapConfig.enableGpuMidEditBake =
+        sparseClipmapConfig.enableGpuMidVoxelGeneration &&
+        ReadUIntEnv("VENPOD_MID_EDIT_BAKE", 1u) != 0u;
     // Phase 2: GROW the detailed mid-voxel render-distance bubble when GPU sample
     // generation is on. The CPU pump no longer pays the per-voxel fill (skip in
     // GenerateVoxelBrickPayload), so the bottleneck is no longer generation — it's
@@ -16248,17 +16254,44 @@ int RunSandbox(int argc, char* argv[]) {
                                     sizeof(Simulation::SparseMidVoxelGpuGenRequest) ==
                                         sizeof(Graphics::MidVoxelBrickGenRequest),
                                     "SparseMidVoxelGpuGenRequest must match MidVoxelBrickGenRequest layout");
+                                static_assert(
+                                    sizeof(Simulation::SparseMidVoxelEditOverride) ==
+                                        sizeof(Graphics::MidVoxelEditOverride),
+                                    "SparseMidVoxelEditOverride must match MidVoxelEditOverride layout");
                                 const auto& reqs =
                                     sparseMidClipmapSnapshotForUpload.voxelGpuGenRequests;
-                                const bool dispatched =
-                                    midVoxelGpuGeneratorReady &&
-                                    midVoxelGpuGenerator.GenerateBricks(
+                                const auto& overrides =
+                                    sparseMidClipmapSnapshotForUpload.voxelEditOverrides;
+                                // Phase B: bracket gen + edit-apply as ONE pool UAV
+                                // window. Transition SRV->UAV once, gen writes pristine
+                                // samples, then the apply pass scatters edit overrides on
+                                // top (its own gen->apply UAV barrier), then UAV->SRV once
+                                // for the raymarch. Apply is the LAST writer before render.
+                                bool dispatched = false;
+                                if (midVoxelGpuGeneratorReady) {
+                                    auto& midSamplePool =
+                                        sparseGpuResources.MidVoxelClipmapSamplesBuffer();
+                                    midVoxelGpuGenerator.BeginMidVoxelGeneration(
+                                        commandList.Get(), midSamplePool);
+                                    dispatched = midVoxelGpuGenerator.GenerateBricks(
                                         commandList.Get(),
-                                        sparseGpuResources.MidVoxelClipmapSamplesBuffer(),
+                                        midSamplePool,
                                         reinterpret_cast<const Graphics::MidVoxelBrickGenRequest*>(
                                             reqs.data()),
                                         static_cast<uint32_t>(reqs.size()),
-                                        /*transitionSamplePool=*/true);
+                                        /*transitionSamplePool=*/false);
+                                    if (dispatched && !overrides.empty() &&
+                                        midVoxelGpuGenerator.IsApplyValid()) {
+                                        midVoxelGpuGenerator.ApplyEditOverrides(
+                                            commandList.Get(),
+                                            midSamplePool,
+                                            reinterpret_cast<const Graphics::MidVoxelEditOverride*>(
+                                                overrides.data()),
+                                            static_cast<uint32_t>(overrides.size()));
+                                    }
+                                    midVoxelGpuGenerator.EndMidVoxelGeneration(
+                                        commandList.Get(), midSamplePool);
+                                }
                                 if (!dispatched) {
                                     spdlog::warn("[MIDGEN] GenerateBricks dispatch failed/unready for {} requests (will retry)",
                                         reqs.size());
@@ -24127,6 +24160,50 @@ int RunSandbox(int argc, char* argv[]) {
         }
         voxelWorld->NotifyBrushEditFeedbackFence(ctx.fenceValue);
         perfSignalGenMs = ticksToMs(SDL_GetPerformanceCounter() - perfSignalGenStart);
+
+        // Phase B parity (VENPOD_MID_EDIT_BAKE_VERIFY=1): once edits exist, run the
+        // mid-edit-bake parity harness ONCE here, at a frame boundary (the frame's
+        // command list is already submitted + presented, the sample pool rests in
+        // SRV). It dispatches gen+apply for the resident edited bricks into the live
+        // pool on its own list, reads them back, and byte-compares vs the CPU full-
+        // regen-with-edits reference. Deterministic + screen-noise-free.
+        {
+            static const bool midEditBakeVerifyEnabled =
+                ReadUIntEnv("VENPOD_MID_EDIT_BAKE_VERIFY", 0u) != 0u;
+            static bool midEditBakeVerifyDone = false;
+            if (midEditBakeVerifyEnabled && !midEditBakeVerifyDone &&
+                midVoxelGpuGeneratorReady && sparseClipmapTileCacheReady) {
+                std::vector<Simulation::SparseMidVoxelGpuGenRequest> verifyReqs;
+                std::vector<Simulation::SparseMidVoxelEditOverride> verifyOverrides;
+                std::vector<std::vector<uint32_t>> verifyCpu;
+                const uint32_t collected = sparseClipmapTileCache.CollectMidEditBakeVerifyData(
+                    sparseClipmapPolicy, 32u, verifyReqs, verifyOverrides, verifyCpu);
+                if (collected > 0u) {
+                    static_assert(
+                        sizeof(Simulation::SparseMidVoxelGpuGenRequest) ==
+                            sizeof(Graphics::MidVoxelBrickGenRequest),
+                        "request layout mismatch");
+                    static_assert(
+                        sizeof(Simulation::SparseMidVoxelEditOverride) ==
+                            sizeof(Graphics::MidVoxelEditOverride),
+                        "override layout mismatch");
+                    std::vector<Graphics::MidVoxelBrickGenRequest> gReqs(verifyReqs.size());
+                    std::memcpy(gReqs.data(), verifyReqs.data(),
+                        verifyReqs.size() * sizeof(Graphics::MidVoxelBrickGenRequest));
+                    std::vector<Graphics::MidVoxelEditOverride> gOverrides(verifyOverrides.size());
+                    std::memcpy(gOverrides.data(), verifyOverrides.data(),
+                        verifyOverrides.size() * sizeof(Graphics::MidVoxelEditOverride));
+                    spdlog::info("[MIDBAKE-VERIFY] frame={} verifying {} edited bricks ({} overrides)",
+                        frameCount, collected, static_cast<uint32_t>(gOverrides.size()));
+                    midVoxelGpuGenerator.VerifyEditedBricksAgainstCpu(
+                        device->GetDevice(), *commandQueue,
+                        sparseGpuResources.MidVoxelClipmapSamplesBuffer(),
+                        gReqs, gOverrides, verifyCpu);
+                    commandQueue->Flush();
+                    midEditBakeVerifyDone = true;
+                }
+            }
+        }
 
         // Submit background chunk generation after the frame has been queued.
         // This keeps generation from sitting in front of the render pass on the

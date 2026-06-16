@@ -5388,18 +5388,29 @@ void SparseClipmapTileCache::GenerateVoxelBrickPayload(
     // 17ms/frame edit hitch that never recovered. Only bricks whose world AABB
     // (plus a one-cell halo, matching the generator's sampling halo) overlaps an
     // edit overlay pay the CPU path now.
-    if (m_config.enableGpuMidVoxelGeneration &&
-        !BrickIntersectsEditOverlays(
+    if (m_config.enableGpuMidVoxelGeneration) {
+        const bool editedBrick = BrickIntersectsEditOverlays(
             brick.originX, brick.originY, brick.originZ,
             brickWorldSize,
-            std::max(1, RoundToInt32Clamped(ring.cellSize)))) {
-        brick.gpuGenerated = true;
-        brick.voxels.clear();
-        brick.nonAirSamples = 0;
-        brick.surfaceSamples = 0;
-        return;
+            std::max(1, RoundToInt32Clamped(ring.cellSize)));
+        // Phase B: edited bricks ALSO go GPU-gen (pristine) + carry cheap resolved
+        // edit overrides scattered in by CS_ApplyMidEditCellsToClipmap, instead of
+        // the ~8ms CPU full regen. When the bake is OFF, edited bricks fall through
+        // to the CPU regen below (the A/B baseline / fallback).
+        if (!editedBrick || m_config.enableGpuMidEditBake) {
+            brick.gpuGenerated = true;
+            brick.voxels.clear();
+            brick.nonAirSamples = 0;
+            brick.surfaceSamples = 0;
+            brick.editOverrides.clear();
+            if (editedBrick) {
+                BuildMidEditOverridesForBrick(brick, ring);
+            }
+            return;
+        }
     }
     brick.gpuGenerated = false;
+    brick.editOverrides.clear();
 
     brick.voxels.resize(SPARSE_BRICK_VOXEL_COUNT);
     brick.nonAirSamples = 0;
@@ -6175,6 +6186,214 @@ void SparseClipmapTileCache::GenerateVoxelBrickPayload(
     }
 }
 
+void SparseClipmapTileCache::BuildMidEditOverridesForBrick(
+    VoxelBrickPayload& brick, const SparseClipmapRing& ring)
+{
+    brick.editOverrides.clear();
+    if (!m_edits || m_edits->EditedBrickCount() == 0) {
+        return;
+    }
+
+    const double cellSize = std::max(1.0, static_cast<double>(ring.cellSize));
+    const int32_t brickWorldSize = std::max(1, RoundToInt32Clamped(
+        cellSize * static_cast<double>(SPARSE_BRICK_SIZE)));
+    // Owned world region (the 16^3 mid cells; halo EXCLUDED). Halo edits only feed
+    // neighbor classification, which the GPU path does NOT reproduce -- the raymarch
+    // recomputes neighbor exposure live from the edited sample pool (Fork 2).
+    const int32_t minWorldX = brick.originX;
+    const int32_t minWorldY = brick.originY;
+    const int32_t minWorldZ = brick.originZ;
+    const int32_t maxWorldX = SaturatingAddInt32(brick.originX, brickWorldSize - 1);
+    const int32_t maxWorldY = SaturatingAddInt32(brick.originY, brickWorldSize - 1);
+    const int32_t maxWorldZ = SaturatingAddInt32(brick.originZ, brickWorldSize - 1);
+
+    // Per-owned-cell aggregation keyed by local voxel index (0..4095). This mirrors
+    // EditedCellSummary built by addEditedVoxelToCell: each edited world voxel is
+    // assigned to cell editCellIndex(world)-1 == floor((world-origin)/cellSize),
+    // identical to the per-cell single-cell tryEditedCellVoxel range (minCell==maxCell).
+    struct CellAgg {
+        uint32_t solidVoxel = 0;
+        uint32_t solidCount = 0;
+        uint32_t airCount = 0;
+        bool foundSolid = false;
+        bool foundAir = false;
+    };
+    std::unordered_map<uint32_t, CellAgg> cells;
+
+    m_edits->ForEachOverlay([&](const BrickEditOverlay& overlay) {
+        int32_t oMinX = 0, oMinY = 0, oMinZ = 0, oMaxX = 0, oMaxY = 0, oMaxZ = 0;
+        if (!TryWorldVoxelFromBrickLocal(overlay.coord.x, 0, &oMinX) ||
+            !TryWorldVoxelFromBrickLocal(overlay.coord.y, 0, &oMinY) ||
+            !TryWorldVoxelFromBrickLocal(overlay.coord.z, 0, &oMinZ) ||
+            !TryWorldVoxelFromBrickLocal(overlay.coord.x, SPARSE_BRICK_SIZE - 1u, &oMaxX) ||
+            !TryWorldVoxelFromBrickLocal(overlay.coord.y, SPARSE_BRICK_SIZE - 1u, &oMaxY) ||
+            !TryWorldVoxelFromBrickLocal(overlay.coord.z, SPARSE_BRICK_SIZE - 1u, &oMaxZ)) {
+            return;
+        }
+        if (oMinX > maxWorldX || oMaxX < minWorldX ||
+            oMinY > maxWorldY || oMaxY < minWorldY ||
+            oMinZ > maxWorldZ || oMaxZ < minWorldZ) {
+            return;
+        }
+        for (const auto& [localIndex, packedVoxel] : overlay.voxels) {
+            const LocalVoxelCoord local = LocalVoxelFromIndex(localIndex);
+            int32_t wx = 0, wy = 0, wz = 0;
+            if (!TryWorldVoxelFromBrickLocal(overlay.coord.x, local.x, &wx) ||
+                !TryWorldVoxelFromBrickLocal(overlay.coord.y, local.y, &wy) ||
+                !TryWorldVoxelFromBrickLocal(overlay.coord.z, local.z, &wz)) {
+                continue;
+            }
+            if (wx < minWorldX || wx > maxWorldX ||
+                wy < minWorldY || wy > maxWorldY ||
+                wz < minWorldZ || wz > maxWorldZ) {
+                continue;  // halo / outside owned region
+            }
+            const int32_t cx = std::clamp(
+                FloorToInt32Clamped(
+                    (static_cast<double>(wx) - static_cast<double>(brick.originX)) / cellSize),
+                0, static_cast<int32_t>(SPARSE_BRICK_SIZE) - 1);
+            const int32_t cy = std::clamp(
+                FloorToInt32Clamped(
+                    (static_cast<double>(wy) - static_cast<double>(brick.originY)) / cellSize),
+                0, static_cast<int32_t>(SPARSE_BRICK_SIZE) - 1);
+            const int32_t cz = std::clamp(
+                FloorToInt32Clamped(
+                    (static_cast<double>(wz) - static_cast<double>(brick.originZ)) / cellSize),
+                0, static_cast<int32_t>(SPARSE_BRICK_SIZE) - 1);
+            const uint32_t li = static_cast<uint32_t>(
+                cx + cy * SPARSE_BRICK_SIZE + cz * SPARSE_BRICK_SIZE * SPARSE_BRICK_SIZE);
+            CellAgg& agg = cells[li];
+            if (Utils::UnpackMaterial(packedVoxel) == Utils::Material::Air) {
+                agg.foundAir = true;
+                ++agg.airCount;
+            } else {
+                agg.solidVoxel = packedVoxel;
+                agg.foundSolid = true;
+                ++agg.solidCount;
+            }
+        }
+    });
+
+    if (cells.empty()) {
+        return;
+    }
+
+    // Resolve each cell with tryEditedCellVoxel's single-cell rule (SparseClipmap.cpp
+    // ~5594-5622): solid always wins; else air wins if a fine-ring air edit OR a
+    // clustered coarse-ring air edit. Otherwise no override (pristine base is kept).
+    const uint32_t airVoxel = Utils::PackVoxel(Utils::Material::Air, 0, 0, 0);
+    const uint32_t coarseAirClusterThreshold =
+        ring.cellSize <= 16.0f
+            ? 1u
+            : std::max<uint32_t>(
+                  8u,
+                  static_cast<uint32_t>(std::ceil(std::max(1.0f, ring.cellSize))));
+    brick.editOverrides.reserve(cells.size());
+    for (const auto& [li, agg] : cells) {
+        uint32_t overrideVoxel = 0;
+        bool hasOverride = false;
+        if (agg.foundSolid) {
+            // Tag the solid override as a VisualSurface. The mid raymarch
+            // (PS_Raymarch IsResidentMidVoxelTaggedSurface / accept-or-skip at
+            // ~2085) renders a solid mid voxel only if it is exposed OR tagged OR
+            // ray-entry. The CPU GenerateVoxelBrickPayload tags edited surface cells
+            // (incl. coarse slope-envelope cells that are NOT 6-neighbor-exposed),
+            // so omitting the tag here skipped those cells -> lattice/holey gaps
+            // around the edit (caught by Codex's pixel-diff). Tagging ALL edited
+            // solids is visually exact: an interior (buried) edited solid is occluded
+            // by the front surface cell the ray hits first, so its tag never draws;
+            // surface cells now always render, matching the CPU regen.
+            overrideVoxel = agg.solidVoxel |
+                (static_cast<uint32_t>(Utils::StateFlags::VisualSurface) << 24u);
+            hasOverride = true;
+        } else {
+            const bool localAirEdit = agg.foundAir && ring.cellSize <= 1.5f;
+            const bool clusteredCoarseAirEdit =
+                agg.foundAir &&
+                ring.cellSize > 1.5f &&
+                agg.solidCount == 0u &&
+                agg.airCount >= coarseAirClusterThreshold;
+            if (localAirEdit || clusteredCoarseAirEdit) {
+                overrideVoxel = airVoxel;
+                hasOverride = true;
+            }
+        }
+        if (hasOverride) {
+            brick.editOverrides.emplace_back(li, overrideVoxel);
+        }
+    }
+}
+
+bool SparseClipmapTileCache::GenerateEditedBrickCpuReferenceForSlot(
+    uint32_t slot, const SparseClipmapPolicy& policy,
+    std::vector<uint32_t>& outVoxels)
+{
+    if (slot >= m_voxelBricks.size() || m_voxelBricks[slot].slot == UINT32_MAX) {
+        return false;
+    }
+    const SparseVoxelClipmapCoord coord = m_voxelBricks[slot].coord;
+    // Force the CPU regen path (with edits) so we get the authoritative reference
+    // the GPU bake must reproduce. Restore the flags afterward.
+    const bool savedGen = m_config.enableGpuMidVoxelGeneration;
+    const bool savedBake = m_config.enableGpuMidEditBake;
+    m_config.enableGpuMidVoxelGeneration = false;
+    m_config.enableGpuMidEditBake = false;
+    VoxelBrickPayload ref;
+    ref.coord = coord;
+    GenerateVoxelBrickPayload(ref, policy, nullptr, nullptr);
+    m_config.enableGpuMidVoxelGeneration = savedGen;
+    m_config.enableGpuMidEditBake = savedBake;
+    if (ref.voxels.size() != static_cast<size_t>(SPARSE_BRICK_VOXEL_COUNT)) {
+        return false;
+    }
+    outVoxels = std::move(ref.voxels);
+    return true;
+}
+
+uint32_t SparseClipmapTileCache::CollectMidEditBakeVerifyData(
+    const SparseClipmapPolicy& policy,
+    uint32_t maxBricks,
+    std::vector<SparseMidVoxelGpuGenRequest>& outRequests,
+    std::vector<SparseMidVoxelEditOverride>& outOverrides,
+    std::vector<std::vector<uint32_t>>& outCpuBricks)
+{
+    outRequests.clear();
+    outOverrides.clear();
+    outCpuBricks.clear();
+    uint32_t collected = 0;
+    for (uint32_t slot = 0; slot < static_cast<uint32_t>(m_voxelBricks.size()); ++slot) {
+        if (collected >= maxBricks) {
+            break;
+        }
+        const VoxelBrickPayload& brick = m_voxelBricks[slot];
+        if (brick.slot == UINT32_MAX || !brick.gpuGenerated || brick.editOverrides.empty()) {
+            continue;
+        }
+        std::vector<uint32_t> cpuRef;
+        if (!GenerateEditedBrickCpuReferenceForSlot(slot, policy, cpuRef)) {
+            continue;
+        }
+        SparseMidVoxelGpuGenRequest req;
+        req.originX = brick.originX;
+        req.originY = brick.originY;
+        req.originZ = brick.originZ;
+        req.cellSize = std::max(1, RoundToInt32Clamped(
+            static_cast<double>(brick.cellSize)));
+        req.destSlot = slot;
+        outRequests.push_back(req);
+        for (const auto& entry : brick.editOverrides) {
+            SparseMidVoxelEditOverride ov;
+            ov.destSlot = slot;
+            ov.localIndex = entry.first;
+            ov.voxel = entry.second;
+            outOverrides.push_back(ov);
+        }
+        outCpuBricks.push_back(std::move(cpuRef));
+        ++collected;
+    }
+    return collected;
+}
+
 bool SparseClipmapTileCache::GenerateVoxelBrickPayloadForTest(
     const SparseVoxelClipmapCoord& coord,
     const SparseClipmapPolicy& policy,
@@ -6389,6 +6608,17 @@ bool SparseClipmapTileCache::BuildGpuSnapshot(
                     static_cast<double>(brick.cellSize)));
                 req.destSlot = voxelSlot;
                 outSnapshot.voxelGpuGenRequests.push_back(req);
+                // Phase B: emit this brick's resolved edit overrides (empty for
+                // pristine bricks). They are scattered into this same destSlot by
+                // CS_ApplyMidEditCellsToClipmap AFTER the pristine gen dispatch, so
+                // the gen+apply are always paired for an edited brick.
+                for (const auto& entry : brick.editOverrides) {
+                    SparseMidVoxelEditOverride ov;
+                    ov.destSlot = voxelSlot;
+                    ov.localIndex = entry.first;
+                    ov.voxel = entry.second;
+                    outSnapshot.voxelEditOverrides.push_back(ov);
+                }
                 // NOTE: the gpuGenSamplesUploaded flag is set by MarkVoxelGpuSamplesUploaded
                 // AFTER the upload+dispatch actually succeeds (not here) -- if the upload is
                 // rejected (ring overflow), the brick stays un-flagged + dirty and retries
