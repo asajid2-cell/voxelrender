@@ -7450,25 +7450,6 @@ int RunSandbox(int argc, char* argv[]) {
                         sparsePressureTrimBudget);
                 }
             }
-            // View-following trim: shed flown-past terrain (resident bricks not wanted
-            // within staleFrames) every frame, bounding the resident set to the current
-            // view so the pool recovers after a long flight. Independent of the pressure
-            // gate above (which only fires near pool-full); keyed off touch recency so
-            // the current surround (touched each frame) is always kept -> no holes, and
-            // the window absorbs budget-skip slack -> no evict-then-re-request churn.
-            // Pause during ACTIVE editing: at high speed + painting, evicting +
-            // re-streaming flown-past terrain churns against the heavy edit/stream
-            // work and hitches the edit frames. The brief accumulation during the
-            // edit is shed the moment editing stops (the trim resumes), so recovery
-            // is preserved while the edit window stays clean.
-            if (sparseViewFollowTrimEnabled && sparseViewFollowTrimBudget > 0 &&
-                !brushController.IsPainting() && !brushController.IsErasing()) {
-                sparsePressureTrimLastFrame += sparseVoxelWorld.TrimStaleResidentBricks(
-                    sparseResidencyFrame,
-                    sparseViewFollowTrimStaleFrames,
-                    sparseViewFollowTrimBudget,
-                    sparseViewFollowTrimScanBudget);
-            }
             perfSparseRequestPressureTrimMs =
                 ticksToMs(SDL_GetPerformanceCounter() - sparseRequestPressureTrimStart);
             sparseVoxelWorld.SetStatsRefreshDeferred(true);
@@ -11429,6 +11410,23 @@ int RunSandbox(int argc, char* argv[]) {
             sparseCpuDetailDeltaZLastFrame = sparseCpuDetailDeltaZ;
             sparseCpuDetailLastCenter = sparseCenter;
             sparseCpuDetailLastCenterValid = true;
+            // View-following trim: runs AFTER this frame's requests/touches so the
+            // current view AND just-turned-to terrain are fresh (lastTouchedFrame ==
+            // this frame) and therefore never evicted -- critical for the turn-around
+            // case (turning back toward flown-past terrain re-requests it THIS frame;
+            // evicting it pre-touch was a use-after-evict crash). Sheds only genuinely
+            // flown-past bricks (not wanted within staleFrames) to bound the working
+            // set so the engine recovers after a long flight. Recency-keyed (not the
+            // sticky class, not a radius); paused during active editing to avoid churn
+            // against edit/stream work (the brief accumulation is shed once editing stops).
+            if (sparseViewFollowTrimEnabled && sparseViewFollowTrimBudget > 0 &&
+                !brushController.IsPainting() && !brushController.IsErasing()) {
+                sparseVoxelWorld.TrimStaleResidentBricks(
+                    sparseResidencyFrame,
+                    sparseViewFollowTrimStaleFrames,
+                    sparseViewFollowTrimBudget,
+                    sparseViewFollowTrimScanBudget);
+            }
             const uint64_t sparseRequestStatsFlushStart = SDL_GetPerformanceCounter();
             sparseVoxelWorld.SetStatsRefreshDeferred(false);
             if (!enableSparseStatsSingleFlush) {
