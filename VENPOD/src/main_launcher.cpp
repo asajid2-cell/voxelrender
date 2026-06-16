@@ -5146,6 +5146,20 @@ int RunSandbox(int argc, char* argv[]) {
     static const uint32_t sparseHiddenExactStationaryDisarmFrames =
         ReadUIntEnv("VENPOD_SPARSE_HIDDEN_EXACT_STATIONARY_DISARM_FRAMES", 6u);
     uint32_t sparseHiddenExactStationaryFrames = 0u;
+    // Hidden-exact MOVING suppression (Goal 2 Phase 2). The same hidden-exact feedback
+    // the stationary gate quiesces also costs ~10ms/frame while MOVING (probe/request
+    // ~4.6ms + foreground-repair/surface/upload drains ~5ms). A/B (FEEDBACK=0) proved
+    // disabling it during straight-walk AND fast reveal-stress is miss=0 (no holes,
+    // every frame). Suppress the RUNTIME feedback whenever post-startup + not recently
+    // edited (covers stationary AND moving); startup (gate not open) + a short edit-
+    // grace window stay fully armed so edit-reveal still repairs. The frames-since-edit
+    // counter does NOT reset on translate (unlike the stationary counter), so steady
+    // movement is suppressed. Env escape: VENPOD_SPARSE_HIDDEN_EXACT_MOVING_GATE=0.
+    static const bool sparseHiddenExactMovingGateEnabled =
+        ReadUIntEnv("VENPOD_SPARSE_HIDDEN_EXACT_MOVING_GATE", 1u) != 0u;
+    static const uint32_t sparseHiddenExactEditGraceFrames =
+        ReadUIntEnv("VENPOD_SPARSE_HIDDEN_EXACT_EDIT_GRACE_FRAMES", 12u);
+    uint32_t sparseHiddenExactFramesSinceEdit = 0xFFFFFFFFu;
     uint32_t sparseMidClipmapBudgetLastFrame = 0;
     uint32_t sparseMidClipmapPumpCapActiveLastFrame = 0;
     uint32_t sparseMidClipmapCacheOnlyDeferForTerrainThrottleLastFrame = 0;
@@ -7210,6 +7224,23 @@ int RunSandbox(int argc, char* argv[]) {
                 !brushController.IsPainting() &&
                 !brushController.IsErasing() &&
                 sparseHiddenExactStationaryFrames >= sparseHiddenExactStationaryDisarmFrames;
+            // Phase 2: suppress hidden-exact RUNTIME feedback during steady movement
+            // (post-startup, past the edit-grace window). frames-since-edit ignores
+            // translation, so walking keeps it suppressed; editing re-arms it for
+            // editGrace frames so edit-reveal still repairs. hiddenExactRuntimeFeedback
+            // Active gates the runtime probe/request + downstream drains; startup sites
+            // keep using enableSparseHiddenExactMissFeedback directly.
+            if (brushController.IsPainting() || brushController.IsErasing()) {
+                sparseHiddenExactFramesSinceEdit = 0u;
+            } else if (sparseHiddenExactFramesSinceEdit < 0xFFFFFFFFu) {
+                ++sparseHiddenExactFramesSinceEdit;
+            }
+            const bool hiddenExactMovingSuppressed =
+                sparseHiddenExactMovingGateEnabled &&
+                sparseStartupPublicRenderGateOpened &&
+                sparseHiddenExactFramesSinceEdit >= sparseHiddenExactEditGraceFrames;
+            const bool hiddenExactRuntimeFeedbackActive =
+                enableSparseHiddenExactMissFeedback && !hiddenExactMovingSuppressed;
             uint32_t sparseFastRequestScaleThisFrame = 1;
             if (sparseFastRequestSpeed > 0u && sparseAdmissionSpeed > static_cast<float>(sparseFastRequestSpeed)) {
                 sparseFastRequestScaleThisFrame = std::min<uint32_t>(
@@ -8224,6 +8255,7 @@ int RunSandbox(int argc, char* argv[]) {
                     const bool shaderMissForegroundRepairActive =
                         enableSparseShaderUnsafeForegroundRepair &&
                         !hiddenExactStationaryQuiesced &&
+                        !hiddenExactMovingSuppressed &&
                         shaderMissForegroundRepairAllowedThisFrame &&
                         shaderMissFeedbackRecentForRepair &&
                         shaderMissForegroundRepairEligible >= sparseShaderUnsafeForegroundRepairMinNonReady;
@@ -8635,7 +8667,7 @@ int RunSandbox(int argc, char* argv[]) {
                 ticksToMs(SDL_GetPerformanceCounter() - sparseRequestPhaseStart);
             sparseRequestPhaseStart = SDL_GetPerformanceCounter();
 
-            if (enableSparseHiddenExactMissFeedback &&
+            if (hiddenExactRuntimeFeedbackActive &&
                 sparseHiddenExactMissFeedbackMaxRequests > 0u &&
                 enableSparseSurfaceRaster &&
                 sparseSurfaceRasterMaxDistance > 0.0f &&
