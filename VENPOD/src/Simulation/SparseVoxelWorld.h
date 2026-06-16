@@ -472,6 +472,19 @@ public:
         uint32_t keepRadiusXz,
         uint32_t keepRadiusY,
         uint32_t maxEvictions);
+    // View-following eviction: evict resident bricks NOT touched/wanted within the
+    // last `staleFrames` frames (lastTouchedFrame < currentFrame - staleFrames), i.e.
+    // terrain the camera has flown past. Keys off recency, NOT the sticky residency
+    // class (Visible is promote-only and never demotes, so it cannot be used to
+    // detect "no longer visible") and NOT a camera radius (which evicts in-view far
+    // surface -> holes). Collision/Edited/persistent-edit/physics bricks are always
+    // kept. Incremental cursor scan bounded by scanBudget. This is what bounds the
+    // resident set to the current view so the pool recovers after a long flight.
+    uint32_t TrimStaleResidentBricks(
+        uint32_t currentFrame,
+        uint32_t staleFrames,
+        uint32_t maxEvictions,
+        uint32_t scanBudget);
     uint32_t TrimBackgroundResidentBricks(
         const BrickCoord& center,
         uint32_t keepRadiusXz,
@@ -1085,6 +1098,7 @@ private:
     uint32_t m_replacementRecordsScannedLastFrame = 0;
     uint32_t m_replacementCandidatesLastFrame = 0;
     size_t m_trimResidentCursor = 0;
+    size_t m_trimStaleResidentCursor = 0;
     size_t m_trimBackgroundResidentCursor = 0;
     size_t m_trimQueuedBackgroundCursor = 0;
     uint32_t m_physicsWorkGeneration = 0;

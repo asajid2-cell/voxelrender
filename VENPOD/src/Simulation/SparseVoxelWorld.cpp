@@ -5412,6 +5412,93 @@ uint32_t SparseVoxelWorld::TrimResidentBricks(
     return evicted;
 }
 
+uint32_t SparseVoxelWorld::TrimStaleResidentBricks(
+    uint32_t currentFrame,
+    uint32_t staleFrames,
+    uint32_t maxEvictions,
+    uint32_t scanBudget)
+{
+    if (maxEvictions == 0 || currentFrame <= staleFrames) {
+        return 0;
+    }
+    const uint32_t staleBeforeFrame = currentFrame - staleFrames;
+
+    struct StaleTarget {
+        BrickCoord coord;
+        uint32_t pageIndex = INVALID_BRICK_PAGE;
+        uint32_t generation = 0;
+        uint32_t entryIndex = UINT32_MAX;
+    };
+    std::vector<StaleTarget> targets;
+
+    const auto& records = m_pool.Records();
+    const size_t recordCount = records.size();
+    if (recordCount == 0) {
+        return 0;
+    }
+    const size_t scanCount = (scanBudget == 0)
+        ? recordCount
+        : std::min<size_t>(recordCount, static_cast<size_t>(scanBudget));
+    const size_t startIndex = m_trimStaleResidentCursor % recordCount;
+    for (size_t i = 0; i < scanCount && targets.size() < maxEvictions; ++i) {
+        const auto& record = records[(startIndex + i) % recordCount];
+        if (record.pageIndex == INVALID_BRICK_PAGE ||
+            record.state != BrickLifecycleState::Resident ||
+            record.hasPersistentEdits ||
+            record.physicsActive ||
+            record.residencyClass == SparseResidencyClass::Collision ||
+            record.residencyClass == SparseResidencyClass::Edited) {
+            continue;
+        }
+        // Recency, not the sticky class: a brick touched/wanted within the window is
+        // still in (or near) the active view; only terrain not wanted for staleFrames
+        // (flown past) is shed. The window absorbs budget-skip / 1-frame-timing slack,
+        // so we never evict a brick that is about to be requested again -> no churn.
+        if (record.lastTouchedFrame >= staleBeforeFrame) {
+            continue;
+        }
+        uint32_t entryIndex = UINT32_MAX;
+        if (!m_pool.PageTable().TryGetEntryIndex(record.coord, &entryIndex)) {
+            continue;
+        }
+        targets.push_back({record.coord, record.pageIndex, record.generation, entryIndex});
+    }
+    m_trimStaleResidentCursor = (startIndex + scanCount) % recordCount;
+
+    uint32_t evicted = 0;
+    for (const StaleTarget& target : targets) {
+        if (evicted >= maxEvictions) {
+            break;
+        }
+        if (!m_pool.Evict(target.coord)) {
+            continue;
+        }
+        RemoveStreamingTicket(target.coord);
+        m_pendingSurfaceBricks.erase(target.coord);
+        m_surfaceExtractionQueuedSet.erase(target.coord);
+        MarkQueueAccountingDirty();
+        m_surfaceCache.RemoveBrick(target.coord);
+        m_generated.erase(target.coord);
+        m_deferredGeneratedDownstreamSet.erase(target.coord);
+        m_deferredDirtyAfterUpload.erase(target.coord);
+        m_renderDirtyRegions.erase(target.coord);
+        m_surfaceDirtyRegions.erase(target.coord);
+        m_invalidationQueue.push_back({
+            target.coord,
+            target.entryIndex,
+            target.pageIndex,
+            target.generation
+        });
+        ++evicted;
+    }
+
+    if (evicted != 0) {
+        m_evictedBricksLastFrame += evicted;
+        RefreshStats();
+    }
+    return evicted;
+}
+
 uint32_t SparseVoxelWorld::TrimBackgroundResidentBricks(
     const BrickCoord& center,
     uint32_t keepRadiusXz,

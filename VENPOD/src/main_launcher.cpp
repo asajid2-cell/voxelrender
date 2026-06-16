@@ -1421,6 +1421,19 @@ int RunSandbox(int argc, char* argv[]) {
         "VENPOD_SPARSE_TRIM_RADIUS_Y",
         sparseRequestRadiusY + 2u);
     const uint32_t sparseTrimBudget = ReadUIntEnv("VENPOD_SPARSE_TRIM_BUDGET", 8u);
+    // View-following trim: shed resident bricks not touched/wanted within the last
+    // staleFrames (terrain flown past), so the resident set tracks the current view
+    // instead of accumulating the whole flown path -> the pool recovers after a long
+    // flight. Recency-keyed (NOT the sticky Visible class, NOT a camera radius), runs
+    // every frame on an incremental scan. Default on; VENPOD_SPARSE_VIEW_FOLLOW_TRIM=0.
+    const bool sparseViewFollowTrimEnabled =
+        sparseBackendRequested && ReadUIntEnv("VENPOD_SPARSE_VIEW_FOLLOW_TRIM", 1u) != 0u;
+    const uint32_t sparseViewFollowTrimStaleFrames =
+        std::max(8u, ReadUIntEnv("VENPOD_SPARSE_VIEW_FOLLOW_TRIM_STALE_FRAMES", 120u));
+    const uint32_t sparseViewFollowTrimBudget =
+        ReadUIntEnv("VENPOD_SPARSE_VIEW_FOLLOW_TRIM_BUDGET", 256u);
+    const uint32_t sparseViewFollowTrimScanBudget =
+        ReadUIntEnv("VENPOD_SPARSE_VIEW_FOLLOW_TRIM_SCAN_BUDGET", 8192u);
     const uint32_t sparsePressureTrimBudget =
         ReadUIntEnv("VENPOD_SPARSE_PRESSURE_TRIM_BUDGET", sparseTrimBudget);
     const bool sparsePressureTrimFreePageGuard =
@@ -7436,6 +7449,25 @@ int RunSandbox(int argc, char* argv[]) {
                         sparseTrimRadiusY,
                         sparsePressureTrimBudget);
                 }
+            }
+            // View-following trim: shed flown-past terrain (resident bricks not wanted
+            // within staleFrames) every frame, bounding the resident set to the current
+            // view so the pool recovers after a long flight. Independent of the pressure
+            // gate above (which only fires near pool-full); keyed off touch recency so
+            // the current surround (touched each frame) is always kept -> no holes, and
+            // the window absorbs budget-skip slack -> no evict-then-re-request churn.
+            // Pause during ACTIVE editing: at high speed + painting, evicting +
+            // re-streaming flown-past terrain churns against the heavy edit/stream
+            // work and hitches the edit frames. The brief accumulation during the
+            // edit is shed the moment editing stops (the trim resumes), so recovery
+            // is preserved while the edit window stays clean.
+            if (sparseViewFollowTrimEnabled && sparseViewFollowTrimBudget > 0 &&
+                !brushController.IsPainting() && !brushController.IsErasing()) {
+                sparsePressureTrimLastFrame += sparseVoxelWorld.TrimStaleResidentBricks(
+                    sparseResidencyFrame,
+                    sparseViewFollowTrimStaleFrames,
+                    sparseViewFollowTrimBudget,
+                    sparseViewFollowTrimScanBudget);
             }
             perfSparseRequestPressureTrimMs =
                 ticksToMs(SDL_GetPerformanceCounter() - sparseRequestPressureTrimStart);
