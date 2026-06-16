@@ -28,6 +28,7 @@
 #include "Simulation/SparseVoxelWorld.h"
 #include "Input/InputManager.h"
 #include "Input/BrushController.h"
+#include "Tools/RunRecorder.h"
 #include "UI/ImGuiBackend.h"
 #include "UI/MaterialPalette.h"
 #include "UI/BrushPanel.h"
@@ -3810,6 +3811,17 @@ int RunSandbox(int argc, char* argv[]) {
     // Initialize Brush Controller
     Input::BrushController brushController;
     brushController.Initialize();
+    // Deterministic run record/replay (VENPOD_RECORD / VENPOD_REPLAY): capture the
+    // camera path so a real interactive session can be replayed identically for
+    // reproducible profiling + clean A/B.
+    Tools::RunRecorder runRecorder;
+    runRecorder.Initialize();
+    if (runRecorder.IsRecord()) {
+        spdlog::info("[RECORD] capturing run to a recording (flushed at exit)");
+    } else if (runRecorder.IsReplay()) {
+        spdlog::info("[REPLAY] driving the camera from a recording: {} frames",
+            runRecorder.ReplayFrameCount());
+    }
     if (const uint32_t brushRadiusTenths = ReadUIntEnv("VENPOD_BRUSH_RADIUS_TENTHS", 0u);
         brushRadiusTenths > 0u) {
         brushController.SetRadius(static_cast<float>(brushRadiusTenths) * 0.1f);
@@ -6737,7 +6749,24 @@ int RunSandbox(int argc, char* argv[]) {
             sparseStartupPublicRenderGateOpened = true;
             sparseStartupPublicRenderOpenedFrame = frameCount;
         }
-        const bool worldInputEnabled = gameplayInputEnabled && !sparseStartupPublicRenderHeldThisFrame;
+        // Replay: drive the camera from the recording and disable live input camera
+        // movement (mouse-look + WASD are gated by worldInputEnabled below; gravity is
+        // neutralized by zeroing vertical velocity and re-pinning the camera each
+        // frame). When the recording runs out, stop. Set BEFORE the camera is used.
+        if (runRecorder.IsReplay()) {
+            Tools::RunRecorder::Frame rf;
+            if (runRecorder.GetReplayFrame(frameCount, &rf)) {
+                cameraPos = glm::vec3(rf.posX, rf.posY, rf.posZ);
+                cameraYaw = rf.yaw;
+                cameraPitch = rf.pitch;
+                cameraVelocityY = 0.0f;
+            } else {
+                spdlog::info("[REPLAY] recording exhausted at frame {}; stopping", frameCount);
+                running = false;
+            }
+        }
+        const bool worldInputEnabled = gameplayInputEnabled &&
+            !sparseStartupPublicRenderHeldThisFrame && !runRecorder.IsReplay();
         const bool sparseStressCameraActive =
             enableSparseStressCamera &&
             !sparseStartupPublicRenderHeldThisFrame &&
@@ -13614,13 +13643,17 @@ int RunSandbox(int argc, char* argv[]) {
         // Apply gravity to vertical velocity (only when not in flight mode AND terrain is ready)
         // During startup, terrain might not be generated yet - disable gravity until
         // ground detection works to prevent falling through the world
-        if (gameplayInputEnabled && !flightMode && terrainReady && supportChunkReadyForWalking) {
+        if (gameplayInputEnabled && !flightMode && terrainReady && supportChunkReadyForWalking &&
+            !runRecorder.IsReplay()) {
             cameraVelocityY += gravity * dt;
         }
 
-        // Apply vertical velocity to camera position (only if terrain ready or flying)
+        // Apply vertical velocity to camera position (only if terrain ready or flying).
+        // On replay the camera Y comes verbatim from the recording, so skip gravity/
+        // vertical integration (it would drift the pinned path).
         const glm::vec3 cameraPosBeforeVerticalMovement = cameraPos;
-        if (gameplayInputEnabled && ((terrainReady && (supportChunkReadyForWalking || cameraVelocityY >= 0.0f)) || flightMode)) {
+        if (!runRecorder.IsReplay() &&
+            gameplayInputEnabled && ((terrainReady && (supportChunkReadyForWalking || cameraVelocityY >= 0.0f)) || flightMode)) {
             cameraPos.y += cameraVelocityY * dt;
         }
 
@@ -24488,6 +24521,23 @@ int RunSandbox(int argc, char* argv[]) {
             }
         }
 
+        // Record: capture this frame's final camera + brush intent (after all camera
+        // updates, before the frame counter advances) so replay reproduces it exactly.
+        if (runRecorder.IsRecord()) {
+            Tools::RunRecorder::Frame rf;
+            rf.posX = cameraPos.x;
+            rf.posY = cameraPos.y;
+            rf.posZ = cameraPos.z;
+            rf.yaw = cameraYaw;
+            rf.pitch = cameraPitch;
+            rf.material = brushController.GetMaterial();
+            rf.brushRadius = brushController.GetRadius();
+            rf.flags =
+                (brushController.IsPainting() ? Tools::RunRecorder::kFlagPainting : 0u) |
+                (brushController.IsErasing() ? Tools::RunRecorder::kFlagErasing : 0u);
+            runRecorder.RecordFrame(rf);
+        }
+
         frameCount++;
         if (traceFrameStages && frameCount <= kFrameStageTraceLimit) {
             spdlog::info("FRAME_STAGE {} complete", frameCount - 1);
@@ -24501,6 +24551,11 @@ int RunSandbox(int argc, char* argv[]) {
         // if (frameCount % 100 == 0) {
         //     spdlog::debug("Frame {}", frameCount);
         // }
+    }
+
+    if (runRecorder.IsRecord()) {
+        runRecorder.Shutdown();
+        spdlog::info("[RECORD] wrote {} frames to the recording", runRecorder.ReplayFrameCount());
     }
 
     spdlog::info("Shutting down...");
