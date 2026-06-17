@@ -1085,6 +1085,16 @@ private:
     // has populated the GPU mirrors, so dirty uploads are now valid.
     std::unordered_set<BrickCoord, BrickCoordHash> m_midMeshDirtyCoords;
     std::unordered_set<BrickCoord, BrickCoordHash> m_midMeshEmittedCoords;
+    // No-hole budget telemetry (and the seed of a real dirty worklist): tiles whose
+    // re-extraction was deferred by the time budget, keyed to the build counter at which
+    // they were first deferred, so we can report how long any tile has been drawing stale
+    // faces (stale age) and how many are pending. A tile leaves the set when it actually
+    // re-extracts. m_midMeshBuildCounter ticks once per build that runs (during a drain the
+    // catchup forces a build every frame, so build age ~= frame age = edit-lag frames).
+    std::unordered_map<BrickCoord, uint64_t, BrickCoordHash> m_midMeshTileDeferredSince;
+    uint64_t m_midMeshBuildCounter = 0;
+    uint32_t m_lastMidMeshMaxStaleAge = 0;
+    uint32_t m_lastMidMeshPendingCount = 0;
     uint32_t m_lastInterestUpdateFrame = 0;
     uint32_t m_lastStatsFrame = 0;
     // RefreshStats' heavy aggregation (iterating up to 16384 resident voxel bricks +

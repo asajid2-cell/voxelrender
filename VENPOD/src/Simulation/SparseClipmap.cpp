@@ -6694,6 +6694,9 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     HEIGHTAT_SCOPE("BuildMidHeightSurfaceSnapshot");
     outSnapshot = {};
     m_lastMidMeshDeferredTiles = 0;
+    if (buildConfig.emitDirtyPayload) {
+        ++m_midMeshBuildCounter;
+    }
     const uint32_t side = m_config.tileSampleSide;
     if (!m_config.enabled ||
         !m_config.heightClipmapEnabled ||
@@ -7135,6 +7138,12 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             // it is at most one edit/LOD step behind for a few frames. Re-fired via
             // LastMidMeshDeferredTiles until caught up.
             ++m_lastMidMeshDeferredTiles;
+            // Track how long this tile has been drawing stale faces (stale age / edit lag).
+            {
+                const BrickCoord deferCoord{
+                    tile.record.coord.x, tile.record.coord.ring, tile.record.coord.z};
+                m_midMeshTileDeferredSince.emplace(deferCoord, m_midMeshBuildCounter);
+            }
         } else {
             // Either under budget, OR a NEW tile with no reusable cache. A new tile must
             // NOT be deferred (skipping it would punch a hole - there is no old patch to
@@ -7142,6 +7151,12 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             // have a drawable version are budget-deferred (the branch above).
         ++rebuiltThisBuild;
         tileReEmitted = true;
+        // This tile is re-extracting now: it is no longer pending/stale.
+        {
+            const BrickCoord reExtractCoord{
+                tile.record.coord.x, tile.record.coord.ring, tile.record.coord.z};
+            m_midMeshTileDeferredSince.erase(reExtractCoord);
+        }
         const auto extractStart = std::chrono::steady_clock::now();
         const uint32_t blockCountPerAxis = (cellCount + mergeCells - 1u) / mergeCells;
         tileFaces.reserve(static_cast<size_t>(blockCountPerAxis) * static_cast<size_t>(blockCountPerAxis) * 3u);
@@ -7576,10 +7591,24 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         }
         m_midMeshEmittedCoords = std::move(emittedThisBuild);
     }
+    // Stale-tile age + pending count (no-hole budget telemetry). A pending tile is one whose
+    // re-extract was deferred and is still drawing stale faces; its age is builds since it was
+    // first deferred (~= frames during a drain, where catchup forces a build per frame).
+    {
+        uint32_t maxStaleAge = 0;
+        for (const auto& [coord, sinceBuild] : m_midMeshTileDeferredSince) {
+            const uint64_t age =
+                m_midMeshBuildCounter >= sinceBuild ? m_midMeshBuildCounter - sinceBuild : 0u;
+            maxStaleAge = std::max(maxStaleAge, static_cast<uint32_t>(age));
+        }
+        m_lastMidMeshMaxStaleAge = maxStaleAge;
+        m_lastMidMeshPendingCount = static_cast<uint32_t>(m_midMeshTileDeferredSince.size());
+    }
     if (rebuiltThisBuild > 0u || missNew + missRecenter + missLod + missContent + missChild + missBuildVer > 0u) {
         spdlog::info(
-            "MIDMESH_MISS_CAUSE emitted={} reExtract={} extractMs={:.2f} assemblyMs={:.2f} skipAssembly={} miss=new/recenter/lod/content/child/buildver:{}/{}/{}/{}/{}/{}",
+            "MIDMESH_MISS_CAUSE emitted={} reExtract={} extractMs={:.2f} assemblyMs={:.2f} skipAssembly={} pending={} maxStaleAge={} miss=new/recenter/lod/content/child/buildver:{}/{}/{}/{}/{}/{}",
             emittedTiles, rebuiltThisBuild, extractMsAccum, assemblyMsAccum, skipFullAssembly ? 1 : 0,
+            m_lastMidMeshPendingCount, m_lastMidMeshMaxStaleAge,
             missNew, missRecenter, missLod, missContent, missChild, missBuildVer);
     }
     return true;
