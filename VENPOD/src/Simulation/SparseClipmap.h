@@ -238,6 +238,12 @@ struct SparseClipmapGpuSnapshot {
 struct SparseMidHeightSurfaceBuildConfig {
     uint32_t maxFaces = 0;
     uint32_t maxTiles = 0;
+    // Per-build cap on EXPENSIVE per-tile re-emissions (cache misses). 0 = unlimited
+    // (old behavior). When the budget is hit, further changed tiles reuse their cached
+    // (stale, same-origin) faces this frame and are deferred to a later build — turning
+    // the ~150-290ms full-frontier rebuild into bounded per-frame chunks. The deferred
+    // count is reported via LastMidMeshDeferredTiles() so the caller can re-fire.
+    uint32_t maxRebuildTiles = 0;
     uint32_t terraceStep = 1;
     uint32_t lodBaseMerge = 1;
     uint32_t lodMaxMerge = 4;
@@ -622,6 +628,9 @@ public:
     bool BuildMidHeightSurfaceSnapshot(
         SparseSurfaceGpuSnapshot& outSnapshot,
         const SparseMidHeightSurfaceBuildConfig& buildConfig = {});
+    // Changed tiles that were deferred (over maxRebuildTiles) in the last build. >0 means
+    // the mid-mesh is mid-catch-up; the caller should re-fire the build next frame.
+    uint32_t LastMidMeshDeferredTiles() const { return m_lastMidMeshDeferredTiles; }
     void SetEditStore(const SparseEditStore* edits);
     void SetFarSvoFallbackMetadata(const SparseClipmapFarSvoFallbackMetadata& metadata);
     // sinceRevision: only overlays touched after this global edit revision are
@@ -678,6 +687,10 @@ public:
     uint32_t DirtySerial() const { return m_dirtySerial; }
     uint32_t HeightDirtySerial() const { return m_heightDirtySerial; }
     uint32_t VoxelDirtySerial() const { return m_voxelDirtySerial; }
+    // Engine main loop opts in: RefreshStats' heavy telemetry aggregation runs at most
+    // once per stats frame instead of on every (hundreds of) internal calls. Leave OFF
+    // for tests/isolated use so every RefreshStats() yields a complete snapshot.
+    void SetStatsHeavyRefreshOncePerFrame(bool enable) { m_statsHeavyRefreshOncePerFrame = enable; }
     // L3 motion guard: XZ distance from the camera to the nearest INTERESTED height
     // tile that is not yet resident (FLT_MAX when full coverage). Fed to the renderer
     // per frame so the shader can suppress the bare far-water fallback beyond the
@@ -1039,6 +1052,13 @@ private:
     uint32_t m_voxelInterestRingsRebuiltLastFrame = 0;
     uint32_t m_lastInterestUpdateFrame = 0;
     uint32_t m_lastStatsFrame = 0;
+    // RefreshStats' heavy aggregation (iterating up to 16384 resident voxel bricks +
+    // the generation queue) is TELEMETRY-ONLY but ran on all ~20 RefreshStats() calls
+    // per frame (~14% of frame CPU, the top profiled hot spot). Recompute it at most
+    // once per stats frame; UINT32_MAX so the first call each frame always runs it.
+    uint32_t m_lastFullStatsFrame = 0xFFFFFFFFu;
+    bool m_statsHeavyRefreshOncePerFrame = false;
+    uint32_t m_lastMidMeshDeferredTiles = 0;
     float m_lastCameraYForStats = 0.0f;
     uint32_t m_interestReusedLastFrame = 0;
     uint32_t m_pumpBudgetHitLastFrame = 0;

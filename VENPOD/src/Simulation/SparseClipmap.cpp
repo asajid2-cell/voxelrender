@@ -1,5 +1,6 @@
 #include "SparseClipmap.h"
 
+#include "Simulation/HeightAtAttribution.h"
 #include "SparseEditStore.h"
 #include "SparseSurfaceCache.h"
 #include "TerrainConstants.h"
@@ -4261,6 +4262,7 @@ void SparseClipmapTileCache::RecordVoxelGenerationTiming(
 }
 
 void SparseClipmapTileCache::GenerateTile(uint32_t slot, const SparseClipmapPolicy& policy) {
+    HEIGHTAT_SCOPE("ClipmapGenerateTile");
     if (slot >= m_tiles.size()) {
         return;
     }
@@ -4322,6 +4324,7 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
     float predictionSeconds,
     bool allowSignatureReuse)
 {
+    HEIGHTAT_SCOPE("UpdateVoxelInterest");
     m_lastStatsFrame = frameIndex;
     if (!policy.IsEnabled() || !policy.Config().voxelClipmapEnabled || m_voxelBricks.empty()) {
         m_voxelInterestSet.clear();
@@ -5363,6 +5366,7 @@ void SparseClipmapTileCache::GenerateVoxelBrickPayload(
     std::unordered_map<uint64_t, VoxelColumnSample>* externalColumnCache,
     VoxelColumnCacheCounters* externalColumnCacheCounters)
 {
+    HEIGHTAT_SCOPE("ClipmapVoxelBrickPayload");
 
     const auto rings = policy.BuildRings();
     if (brick.coord.ring < 0 || static_cast<uint32_t>(brick.coord.ring) >= rings.size()) {
@@ -6687,7 +6691,9 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     SparseSurfaceGpuSnapshot& outSnapshot,
     const SparseMidHeightSurfaceBuildConfig& buildConfig)
 {
+    HEIGHTAT_SCOPE("BuildMidHeightSurfaceSnapshot");
     outSnapshot = {};
+    m_lastMidMeshDeferredTiles = 0;
     const uint32_t side = m_config.tileSampleSide;
     if (!m_config.enabled ||
         !m_config.heightClipmapEnabled ||
@@ -6725,6 +6731,8 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     const float cullPadding = std::max(0.0f, buildConfig.cullPadding);
     const float tanHalfFov = std::tan(std::clamp(buildConfig.fovYRadians, 0.1f, 3.0f) * 0.5f);
     uint32_t emittedTiles = 0;
+    const uint32_t maxRebuildTiles = buildConfig.maxRebuildTiles;
+    uint32_t rebuiltThisBuild = 0;
 
     struct SurfaceBlock {
         bool present = false;
@@ -7056,9 +7064,31 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             tile.meshCacheOriginX == tile.record.originX &&
             tile.meshCacheOriginZ == tile.record.originZ &&
             tile.meshCacheRing == tile.record.coord.ring;
+        // A tile whose cached faces are for the SAME world location (origin/ring) but a
+        // stale content/LOD key can safely reuse those faces for one more frame — the
+        // mesh is just briefly behind. A re-centered/new tile cannot (its cache is for a
+        // different location), so it must rebuild or be skipped (brief frontier hole).
+        const bool cacheSameLocation =
+            tile.meshCacheValid &&
+            tile.meshCacheOriginX == tile.record.originX &&
+            tile.meshCacheOriginZ == tile.record.originZ &&
+            tile.meshCacheRing == tile.record.coord.ring;
+        const bool overRebuildBudget =
+            maxRebuildTiles != 0u && rebuiltThisBuild >= maxRebuildTiles;
         if (meshCacheHit) {
             tileFaces = tile.meshCacheFaces;
+        } else if (overRebuildBudget && cacheSameLocation) {
+            // Over the per-build rebuild budget: reuse this tile's stale (same-location)
+            // faces and defer the expensive re-emit to a later build.
+            tileFaces = tile.meshCacheFaces;
+            ++m_lastMidMeshDeferredTiles;
+        } else if (overRebuildBudget) {
+            // Re-centered/new tile with no reusable cache: defer entirely (brief mesh
+            // gap here, filled within a few frames as the budget drains).
+            ++m_lastMidMeshDeferredTiles;
+            continue;
         } else {
+        ++rebuiltThisBuild;
         const uint32_t blockCountPerAxis = (cellCount + mergeCells - 1u) / mergeCells;
         tileFaces.reserve(static_cast<size_t>(blockCountPerAxis) * static_cast<size_t>(blockCountPerAxis) * 3u);
 
@@ -7616,26 +7646,46 @@ void SparseClipmapTileCache::RefreshStats(
     uint32_t generatedVoxelLastFrame,
     uint32_t evictedVoxelLastFrame)
 {
-    PruneAsyncVisibleReservations(m_lastStatsFrame);
+    // Cheap O(1) fields kept fresh on EVERY call (callers may read these right after a
+    // mutation): sizes, deltas, serials.
     m_stats.residentTiles = static_cast<uint32_t>(m_slotByCoord.size());
     m_stats.queuedTiles = static_cast<uint32_t>(m_generationQueue.size());
     m_stats.interestedTiles = static_cast<uint32_t>(m_interestSet.size());
+    m_stats.generatedTilesLastFrame = generatedLastFrame;
+    m_stats.evictedTilesLastFrame = evictedLastFrame;
+    m_stats.dirtySerial = m_dirtySerial;
+    m_stats.snapshotTiles = m_stats.residentTiles;
+    m_stats.residentVoxelBricks = static_cast<uint32_t>(m_voxelSlotByCoord.size());
+    m_stats.queuedVoxelBricks = static_cast<uint32_t>(m_voxelGenerationQueue.size());
+    m_stats.backlogHeightBricks = m_stats.queuedTiles;
+    m_stats.backlogVoxelBricks = m_stats.queuedVoxelBricks;
+    m_stats.voxelRingCount = std::min<uint32_t>(
+        static_cast<uint32_t>(m_config.ringCount),
+        SPARSE_CLIPMAP_MAX_STATS_RINGS);
+    // Everything below is heavy TELEMETRY-ONLY aggregation — a 245-tile scan, the
+    // 16384-brick sweep, the generation-queue/reservation/priority loops, and ~60 field
+    // copies. RefreshStats is called HUNDREDS of times per frame from gen/evict
+    // bookkeeping, and running this each time was the #1 profiled hot spot (~14% of frame
+    // CPU on its own). It only feeds the PERF_SPARSE log + debug overlay, so run it at
+    // most once per stats frame; (void) the unused voxel deltas on skipped calls.
+    // Opt-in (engine main loop sets it): skip the heavy refresh if it already ran for
+    // this stats frame. OFF by default so unit tests / isolated callers — which don't
+    // advance m_lastStatsFrame — always get a fully refreshed snapshot.
+    if (m_statsHeavyRefreshOncePerFrame && m_lastFullStatsFrame == m_lastStatsFrame) {
+        (void)generatedVoxelLastFrame;
+        (void)evictedVoxelLastFrame;
+        return;
+    }
+    m_lastFullStatsFrame = m_lastStatsFrame;
+    PruneAsyncVisibleReservations(m_lastStatsFrame);
     m_stats.missingInterestedTiles = 0;
     for (const SparseClipmapTileCoord& coord : m_interestSet) {
         if (m_slotByCoord.find(coord) == m_slotByCoord.end()) {
             ++m_stats.missingInterestedTiles;
         }
     }
-    m_stats.generatedTilesLastFrame = generatedLastFrame;
-    m_stats.evictedTilesLastFrame = evictedLastFrame;
-    m_stats.dirtySerial = m_dirtySerial;
-    m_stats.snapshotTiles = m_stats.residentTiles;
-    m_stats.residentVoxelBricks = static_cast<uint32_t>(m_voxelSlotByCoord.size());
     m_stats.residentVoxelNonAirSamples = 0;
     m_stats.residentVoxelSurfaceSamples = 0;
-    m_stats.voxelRingCount = std::min<uint32_t>(
-        static_cast<uint32_t>(m_config.ringCount),
-        SPARSE_CLIPMAP_MAX_STATS_RINGS);
     m_stats.residentVoxelBricksByRing.fill(0u);
     m_stats.queuedVoxelBricksByRing.fill(0u);
     m_stats.interestedVoxelBricksByRing.fill(0u);
@@ -7650,9 +7700,6 @@ void SparseClipmapTileCache::RefreshStats(
             m_stats.residentVoxelSurfaceSamples += m_voxelBricks[slot].surfaceSamples;
         }
     }
-    m_stats.queuedVoxelBricks = static_cast<uint32_t>(m_voxelGenerationQueue.size());
-    m_stats.backlogHeightBricks = m_stats.queuedTiles;
-    m_stats.backlogVoxelBricks = m_stats.queuedVoxelBricks;
     m_stats.backlogVoxelOldestAge = 0;
     m_stats.backlogVoxelMaxAge = 0;
     m_stats.backlogVoxelAge0To30 = 0;

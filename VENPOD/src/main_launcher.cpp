@@ -24,11 +24,13 @@
 #include "Simulation/SparseCharacterController.h"
 #include "Simulation/SparseClipmap.h"
 #include "Simulation/SparsePagePublishQueue.h"
+#include "Simulation/HeightAtAttribution.h"
 #include "Simulation/SparseRuntimeBudget.h"
 #include "Simulation/SparseVoxelWorld.h"
 #include "Input/InputManager.h"
 #include "Input/BrushController.h"
 #include "Tools/RunRecorder.h"
+#include "Tools/SamplingProfiler.h"
 #include "UI/ImGuiBackend.h"
 #include "UI/MaterialPalette.h"
 #include "UI/BrushPanel.h"
@@ -1191,6 +1193,11 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_SPARSE_EXACT_ASYNC_VISIBLE", 0u) != 0u;
     sparseWorldConfig.asyncExactGenerationPrefetchLane =
         ReadUIntEnv("VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE", 0u) != 0u;
+    // Per-coord edit gate (default ON): lets edit-free bricks generate async even while
+    // edits exist elsewhere. Set VENPOD_SPARSE_EXACT_ASYNC_PERCOORD_EDIT_GATE=0 to fall
+    // back to the legacy global "any edit -> all sync" behavior (A/B + safety switch).
+    sparseWorldConfig.asyncExactGenerationPerCoordEditGate =
+        ReadUIntEnv("VENPOD_SPARSE_EXACT_ASYNC_PERCOORD_EDIT_GATE", 1u) != 0u;
     sparseWorldConfig.asyncExactGenerationQueueMax =
         ReadUIntEnv(
             "VENPOD_SPARSE_EXACT_ASYNC_QUEUE_MAX",
@@ -1220,6 +1227,12 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv(
             "VENPOD_SPARSE_EXACT_PARALLEL_GENERATION_MIN_BRICKS",
             sparseWorldConfig.parallelExactGenerationMinBricks);
+    // Keep fork-join parallel exact generation enabled WHILE edits exist (workers stay
+    // pristine; edit overlay applied serially post-join). Stops one edit from globally
+    // dropping generation to single-threaded. VENPOD_SPARSE_EXACT_PARALLEL_GENERATION_EDIT_AWARE=0
+    // restores the old behavior for A/B.
+    sparseWorldConfig.parallelExactGenerationEditAware =
+        ReadUIntEnv("VENPOD_SPARSE_EXACT_PARALLEL_GENERATION_EDIT_AWARE", 1u) != 0u;
     sparseWorldConfig.incrementalPressureTrim =
         sparseBackendRequested &&
         ReadUIntEnv("VENPOD_SPARSE_PRESSURE_TRIM_INCREMENTAL", 0u) != 0u;
@@ -2548,6 +2561,17 @@ int RunSandbox(int argc, char* argv[]) {
         std::max(1u, ReadUIntEnv("VENPOD_SPARSE_SURFACE_METADATA_CATCHUP_INTERVAL_FRAMES", 180u));
     const uint32_t sparseSurfaceMetadataCatchupRecordRatioPct =
         std::max(100u, ReadUIntEnv("VENPOD_SPARSE_SURFACE_METADATA_CATCHUP_RECORD_RATIO_PCT", 260u));
+    // While the player is actively editing, the surface dirty backlog routinely
+    // exceeds the full-catchup threshold. The old policy then ABANDONS the incremental
+    // dirty-stage path for a full ~1.4M-face re-stage (~9.6ms) every edit frame, even
+    // though the dirty path already defers excess bricks. That policy inversion is the
+    // dominant edit-time surfStage cost. Suppress the backlog- and metadata-triggered
+    // full catchups for a short window after the last edit so editing stays incremental;
+    // genuine upload OVERFLOW still forces a catchup. 0 disables (restores old policy).
+    const uint32_t sparseSurfaceFullCatchupEditIdleFrames =
+        ReadUIntEnv("VENPOD_SPARSE_SURFACE_FULL_CATCHUP_EDIT_IDLE_FRAMES", 30u);
+    uint64_t sparseSurfaceCatchupLastEditRevision = 0;
+    uint64_t sparseSurfaceCatchupLastEditFrame = 0;
     uint32_t sparseSurfaceUploadedSerial = 0;
     bool sparseSurfaceUploadedCullValid = false;
     uint64_t sparseSurfaceLastCullFrame = 0;
@@ -2574,6 +2598,15 @@ int RunSandbox(int argc, char* argv[]) {
     bool sparseMidMeshUploadedCullValid = false;
     glm::vec3 sparseMidMeshUploadedCullCamera{0.0f, 0.0f, 0.0f};
     glm::vec3 sparseMidMeshUploadedCullForward{0.0f, 0.0f, 1.0f};
+    // Back-off latch: when a mid-mesh build/upload FAILS (e.g. the snapshot overflows
+    // a GPU cap in dense terrain), the success-only cull latch never advances, so the
+    // cull-translation trigger keeps firing the full ~39ms BuildMidHeightSurfaceSnapshot
+    // EVERY frame and it fails identically -> ~17fps that "never recovers". Record the
+    // failed camera so we don't re-run an identical, certain-to-fail build until the
+    // camera actually moves enough to change the disc's tile coverage.
+    bool sparseMidMeshLastAttemptFailed = false;
+    glm::vec3 sparseMidMeshLastFailedCamera{0.0f, 0.0f, 0.0f};
+    uint32_t sparseMidMeshConsecutiveFailures = 0;
     uint32_t sparseSurfaceExtractionBudgetLastFrame = 0;
     uint32_t sparseSurfaceLookaheadVisibleLastUpload = 0;
     Simulation::SparseClipmapConfig sparseClipmapConfig;
@@ -2898,6 +2931,16 @@ int RunSandbox(int argc, char* argv[]) {
         std::max(1024u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_MAX_FACES", 1572864u));
     const uint32_t sparseMidMeshMaxTiles =
         ReadUIntEnv("VENPOD_SPARSE_MID_MESH_MAX_TILES", 0u);
+    // Per-build cap on expensive mid-mesh tile re-emissions: bounds the ~150-290ms
+    // full-frontier rebuild into per-frame chunks (deferred tiles reuse stale faces +
+    // catch up over the next few builds). 0 disables (old monolith behavior). ~64 tiles
+    // ~= a few ms/build. Stage 1 of the CPU refactor.
+    // Default OFF: empirically the mid-mesh cost is the full snapshot RE-ASSEMBLY +
+    // re-upload (every tile, even cache hits, copies its faces into the snapshot), not
+    // the per-tile emission this caps — so budgeting emission didn't move midMeshUpload.
+    // Kept available (set >0) for when the real fix (incremental upload) lands.
+    const uint32_t sparseMidMeshMaxRebuildTiles =
+        ReadUIntEnv("VENPOD_SPARSE_MID_MESH_MAX_REBUILD_TILES", 0u);
     const uint32_t sparseMidMeshTerraceStep =
         std::max(1u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_TERRACE_STEP", 1u));
     const bool sparseMidMeshLodEnabled =
@@ -2950,10 +2993,20 @@ int RunSandbox(int argc, char* argv[]) {
         std::min(90u, std::max(1u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_CULL_TURN_DEGREES", 12u)));
     const float sparseMidMeshCullTurnDot =
         std::cos(static_cast<float>(sparseMidMeshCullTurnDegrees) * 0.017453292519943295f);
+    // Suppress re-running the full ~39ms mid-mesh snapshot build when the previous
+    // attempt FAILED and the camera hasn't moved enough to change the result (the
+    // rebuild would just fail identically). 0 disables (to A/B the old runaway path).
+    const bool sparseMidMeshFailBackoffEnabled =
+        ReadUIntEnv("VENPOD_SPARSE_MID_MESH_FAIL_BACKOFF", 1u) != 0u;
     uint64_t sparseMidClipmapEditRevisionSeen = 0;
     if (sparseBackendRequested) {
         sparseClipmapTileCacheReady = sparseClipmapTileCache.Initialize(sparseClipmapPolicy.Config());
         sparseClipmapTileCache.SetEditStore(&sparseVoxelWorld.GetEdits());
+        // m_lastStatsFrame advances once per frame in the main loop, so collapse
+        // RefreshStats' heavy aggregation to once/frame (it was ~14% of frame CPU).
+        sparseClipmapTileCache.SetStatsHeavyRefreshOncePerFrame(true);
+        // Same for the voxel world's RefreshStats (fired ~84x/frame from bookkeeping).
+        sparseVoxelWorld.SetStatsRefreshOncePerFrame(true);
         spdlog::info(
             "Sparse mid clipmap {}: start={:.0f} end={:.0f} cell={:.0f} rings={} tileRadius={} tileSide={} maxTiles={} voxelSlots={} voxelInterest={}pct motion={}x@{:.0f} interestInterval={} footprintSignature={} voxelInterestReuse={}/{} backlogAware={} pumpBudgetMs={:.2f} drainDiag={} fallbackClassifier={} fallbackContractDiag={} farSvoFallbackProof={} asyncNoncritical={} asyncVisibleCritical={} parallelPump={} persistentParallelPump={} parallelPumpWorkers={} parallelPumpMin={} sharedColumnCache={} directFootprint={} parallelWorkerColumnCache={} budget={}",
             sparseClipmapPolicy.IsEnabled() ? "enabled" : "disabled",
@@ -3822,6 +3875,23 @@ int RunSandbox(int argc, char* argv[]) {
         spdlog::info("[REPLAY] driving the camera from a recording: {} frames",
             runRecorder.ReplayFrameCount());
     }
+
+    // VENPOD_PROFILE=1: sample the main thread's IP to find what actually eats CPU
+    // (and PROF_STALL-log the exact function during every spike). No-op otherwise.
+    Tools::SamplingProfiler samplingProfiler;
+    samplingProfiler.Start();
+
+    // VENPOD_HEIGHTAT_ATTRIB=1: tag the main (render) thread so HeightAt self-reports
+    // which scoped caller drives it, and how many UNIQUE columns each touches. Proves
+    // whether a hot caller samples per-voxel (calls>>uniq) or per-column (calls~=uniq)
+    // before we touch GPU terrain gen. No-op otherwise.
+    Simulation::HeightAtAttribution::Init();
+
+    // Replay v2 re-applies the recorded brush strokes (not just the camera) so the
+    // edit-driven CPU cost reproduces deterministically. Set from each replay frame,
+    // consumed by the brush UpdateFromMouse button args + the apply path.
+    bool replayBrushPainting = false;
+    bool replayBrushErasing = false;
     if (const uint32_t brushRadiusTenths = ReadUIntEnv("VENPOD_BRUSH_RADIUS_TENTHS", 0u);
         brushRadiusTenths > 0u) {
         brushController.SetRadius(static_cast<float>(brushRadiusTenths) * 0.1f);
@@ -6760,9 +6830,19 @@ int RunSandbox(int argc, char* argv[]) {
                 cameraYaw = rf.yaw;
                 cameraPitch = rf.pitch;
                 cameraVelocityY = 0.0f;
+                replayBrushPainting = (rf.flags & Tools::RunRecorder::kFlagPainting) != 0u;
+                replayBrushErasing = (rf.flags & Tools::RunRecorder::kFlagErasing) != 0u;
+                if (replayBrushPainting || replayBrushErasing) {
+                    // Reproduce the recorded brush material/size; the hit position is
+                    // recomputed from the (reproduced) camera raycast in the brush path.
+                    brushController.SetMaterial(rf.material);
+                    brushController.SetRadius(rf.brushRadius);
+                }
             } else {
                 spdlog::info("[REPLAY] recording exhausted at frame {}; stopping", frameCount);
                 running = false;
+                replayBrushPainting = false;
+                replayBrushErasing = false;
             }
         }
         const bool worldInputEnabled = gameplayInputEnabled &&
@@ -8178,6 +8258,7 @@ int RunSandbox(int argc, char* argv[]) {
                             }
                         }
                         ++shaderMissWaterProofCacheMisses;
+                        HEIGHTAT_SCOPE("WaterProofBrickScan");
                         const uint64_t proofStart = SDL_GetPerformanceCounter();
                         auto storeProof = [&](SurfaceFillWaterProofResult result) -> bool {
                             surfaceFillWaterProofCache[coord] = result;
@@ -9039,6 +9120,7 @@ int RunSandbox(int argc, char* argv[]) {
                 uint32_t hiddenExactRepairWaterRequestsThisFrame = 0u;
 
                 const auto hiddenExactSignedDistance = [&](const glm::vec3& p, int32_t* outX, int32_t* outY, int32_t* outZ) {
+                    HEIGHTAT_SCOPE("HiddenExactMarch");
                     const int32_t worldX = static_cast<int32_t>(std::floor(p.x));
                     const int32_t worldY = static_cast<int32_t>(std::floor(p.y));
                     const int32_t worldZ = static_cast<int32_t>(std::floor(p.z));
@@ -9089,6 +9171,7 @@ int RunSandbox(int argc, char* argv[]) {
                 };
 
                 const auto queueHiddenExactWaterForRay = [&](const glm::vec3& hiddenRayDir) {
+                    HEIGHTAT_SCOPE("WaterProbe");
                     if (hiddenRayDir.y >= -0.0001f) {
                         return false;
                     }
@@ -12211,6 +12294,12 @@ int RunSandbox(int argc, char* argv[]) {
                     const float safeAspect = std::max(0.1f, aspectRatio);
                     const float stepT = (endDistance - startDistance) /
                         static_cast<float>(maxMarchSteps);
+                    // HeightAt is hard-clamped to TERRAIN_MAX_Y, so any march step above
+                    // this ceiling is provably a miss (delta>0) - skip its HeightAt; an
+                    // above-ceiling ray that is also non-descending can never reach
+                    // terrain, so terminate it. Cuts the sky-span samples with zero
+                    // change to which coords get queued.
+                    const float kTerrainCeiling = static_cast<float>(Simulation::TERRAIN_MAX_Y);
 
                     std::unordered_set<
                         Simulation::SparseVoxelClipmapCoord,
@@ -12223,6 +12312,11 @@ int RunSandbox(int argc, char* argv[]) {
                     uint32_t acceptedCoords = 0u;
                     uint32_t residentSkipped = 0u;
                     uint32_t noParentSkipped = 0u;
+                    // Instrumentation: total march steps walked, steps whose HeightAt was
+                    // skipped by the ceiling envelope, and rays terminated early by it.
+                    uint64_t marchStepsTotal = 0u;
+                    uint64_t marchHeightAtSkipped = 0u;
+                    uint32_t marchRaysEarlyOut = 0u;
                     Simulation::SparseVoxelClipmapCoord firstAccepted{};
                     bool hasFirstAccepted = false;
 
@@ -12287,6 +12381,7 @@ int RunSandbox(int argc, char* argv[]) {
                         }
                     };
 
+                    HEIGHTAT_SCOPE("ParentHeldMarch");
                     for (uint32_t row = 0u; row < sampleRows; ++row) {
                         const float v = (static_cast<float>(row) + 0.5f) /
                             static_cast<float>(sampleRows);
@@ -12311,13 +12406,29 @@ int RunSandbox(int argc, char* argv[]) {
                             float previousDelta = std::numeric_limits<float>::max();
                             bool hadPrevious = false;
                             for (uint32_t step = 0u; step <= maxMarchSteps; ++step) {
+                                ++marchStepsTotal;
                                 const float t = startDistance + stepT * static_cast<float>(step);
                                 const glm::vec3 p = cameraPos + rayDir * t;
-                                const float terrainHeight =
-                                    sparseVoxelWorld.GetTerrain().HeightAt(
-                                        static_cast<int32_t>(std::floor(p.x)),
-                                        static_cast<int32_t>(std::floor(p.z)));
-                                const float delta = p.y - terrainHeight;
+                                // Above the terrain ceiling a hit is impossible (terrain
+                                // <= TERRAIN_MAX_Y < p.y, so delta>0). An ascending ray
+                                // never comes back down -> stop it. Otherwise skip only
+                                // the HeightAt and feed a positive sentinel delta so the
+                                // crossing logic/state is byte-identical to a full march.
+                                float delta;
+                                if (p.y > kTerrainCeiling) {
+                                    ++marchHeightAtSkipped;
+                                    if (rayDir.y >= 0.0f) {
+                                        ++marchRaysEarlyOut;
+                                        break;
+                                    }
+                                    delta = p.y - kTerrainCeiling;  // >0, same sign as a real sample
+                                } else {
+                                    const float terrainHeight =
+                                        sparseVoxelWorld.GetTerrain().HeightAt(
+                                            static_cast<int32_t>(std::floor(p.x)),
+                                            static_cast<int32_t>(std::floor(p.z)));
+                                    delta = p.y - terrainHeight;
+                                }
                                 if ((hadPrevious && previousDelta > 0.0f && delta <= 0.0f) ||
                                     (!hadPrevious && delta <= 0.0f)) {
                                     ++terrainHits;
@@ -12331,7 +12442,7 @@ int RunSandbox(int argc, char* argv[]) {
                     }
                     if (enableRuntimeLog) {
                         spdlog::info(
-                            "PERF_SPARSE_MID_VOXEL_PARENT_HELD_FEEDBACK frame={} mode=cpu_projected enabled=1 parentHeldPixels={} rays={} terrainHits={} candidates={} accepted={} residentSkip={} noParentSkip={} pending={} maxCoords={} elapsedMs={:.2f} firstPreferred={},{},{},{}",
+                            "PERF_SPARSE_MID_VOXEL_PARENT_HELD_FEEDBACK frame={} mode=cpu_projected enabled=1 parentHeldPixels={} rays={} terrainHits={} candidates={} accepted={} residentSkip={} noParentSkip={} stepsTotal={} heightAtSkipped={} raysEarlyOut={} pending={} maxCoords={} elapsedMs={:.2f} firstPreferred={},{},{},{}",
                             frameCount,
                             sparseOwnershipLodParentHeldPixelsLastRetire,
                             rayCount,
@@ -12340,6 +12451,9 @@ int RunSandbox(int argc, char* argv[]) {
                             acceptedCoords,
                             residentSkipped,
                             noParentSkipped,
+                            marchStepsTotal,
+                            marchHeightAtSkipped,
+                            marchRaysEarlyOut,
                             sparseMidVoxelRenderFeedbackQueue.size(),
                             maxAcceptedCoords,
                             ticksToMs(SDL_GetPerformanceCounter() - parentHeldFeedbackStart),
@@ -13893,9 +14007,11 @@ int RunSandbox(int argc, char* argv[]) {
             fov,
             aspectRatio,
             (brushInputEnabled && inputManager.IsMouseButtonDown(Input::MouseButton::Left)) ||
-                (sparseBrushPaintSmokeStroke && !sparseBrushPaintSmokeErase),
+                (sparseBrushPaintSmokeStroke && !sparseBrushPaintSmokeErase) ||
+                (runRecorder.IsReplay() && replayBrushPainting),
             (brushInputEnabled && inputManager.IsMouseButtonDown(Input::MouseButton::Right)) ||
-                (sparseBrushPaintSmokeStroke && sparseBrushPaintSmokeErase),
+                (sparseBrushPaintSmokeStroke && sparseBrushPaintSmokeErase) ||
+                (runRecorder.IsReplay() && replayBrushErasing),
             brushInputEnabled ? inputManager.GetScrollDelta() : 0.0f,
             nullptr,  // No CPU voxel data (GPU raycasting now!)
             0
@@ -16447,8 +16563,25 @@ int RunSandbox(int argc, char* argv[]) {
                         sparseMidMeshContentRebuildThrottleFrames;
                 const bool midMeshContentChangeDue =
                     midMeshContentChanged && !contentRebuildThrottled;
-                if (!midMeshContentChangeDue && !midMeshCullMoved && !midMeshCullTurned) {
-                    // Current mesh still matches resident height tiles and the conservative cull window.
+                // The previous attempt failed (overflowed a GPU cap) and the camera is
+                // still within the rebuild radius of that failure -> the rebuilt snapshot
+                // would cover the same tiles and fail identically. Don't burn ~39ms/frame
+                // re-building it; wait until the camera moves enough to change the disc.
+                const bool midMeshRetryFutile =
+                    sparseMidMeshFailBackoffEnabled &&
+                    sparseMidMeshLastAttemptFailed &&
+                    glm::length(cameraPos - sparseMidMeshLastFailedCamera) <
+                        sparseMidMeshCullRebuildDistance;
+                // The previous build hit the per-build rebuild budget and deferred some
+                // changed tiles — keep firing (even if the camera is still) until the
+                // mid-mesh has fully caught up. (Does NOT override the overflow backoff.)
+                const bool midMeshDeferredCatchup =
+                    sparseClipmapTileCache.LastMidMeshDeferredTiles() > 0u;
+                if (midMeshRetryFutile ||
+                    (!midMeshContentChangeDue && !midMeshCullMoved &&
+                     !midMeshCullTurned && !midMeshDeferredCatchup)) {
+                    // Current mesh still matches resident height tiles and the conservative
+                    // cull window, or a just-failed build would fail again unchanged.
                 } else {
                     if (midMeshContentChanged) {
                         sparseMidMeshLastContentRebuildFrame = frameCount;
@@ -16458,6 +16591,7 @@ int RunSandbox(int argc, char* argv[]) {
                 Simulation::SparseMidHeightSurfaceBuildConfig midMeshBuildConfig;
                 midMeshBuildConfig.maxFaces = sparseMidMeshMaxFaces;
                 midMeshBuildConfig.maxTiles = sparseMidMeshMaxTiles;
+                midMeshBuildConfig.maxRebuildTiles = sparseMidMeshMaxRebuildTiles;
                 midMeshBuildConfig.terraceStep = sparseMidMeshTerraceStep;
                 midMeshBuildConfig.lodEnabled = sparseMidMeshLodEnabled;
                 midMeshBuildConfig.lodBaseMerge = sparseMidMeshLodBaseMerge;
@@ -16487,14 +16621,22 @@ int RunSandbox(int argc, char* argv[]) {
                 midMeshBuildConfig.minDistance = sparseMidMeshMinDistance;
                 midMeshBuildConfig.maxDistance = sparseMidMeshMaxDistance;
                 midMeshBuildConfig.cullPadding = sparseMidMeshCullPadding;
-                if (sparseClipmapTileCache.BuildMidHeightSurfaceSnapshot(midMeshSnapshot, midMeshBuildConfig) &&
-                    sparseMidMeshGpuResources.StageSnapshot(midMeshSnapshot, &midMeshTicket) &&
-                    sparseMidMeshGpuResources.EmitCopy(commandList.Get(), midMeshTicket)) {
+                // Split the chain so a failure names the stage that rejected it and the
+                // snapshot's counts-vs-caps -> the replay log pins the exact overflow cap.
+                const bool midMeshBuilt =
+                    sparseClipmapTileCache.BuildMidHeightSurfaceSnapshot(midMeshSnapshot, midMeshBuildConfig);
+                const bool midMeshStaged =
+                    midMeshBuilt && sparseMidMeshGpuResources.StageSnapshot(midMeshSnapshot, &midMeshTicket);
+                const bool midMeshEmitted =
+                    midMeshStaged && sparseMidMeshGpuResources.EmitCopy(commandList.Get(), midMeshTicket);
+                if (midMeshEmitted) {
                     sparseMidMeshUploadedHeightSerial = sparseClipmapTileCache.HeightDirtySerial();
                     sparseMidMeshFaceCountLastUpload = midMeshTicket.faceCount;
                     sparseMidMeshUploadedCullValid = true;
                     sparseMidMeshUploadedCullCamera = cameraPos;
                     sparseMidMeshUploadedCullForward = normalizedMidMeshCullForward;
+                    sparseMidMeshLastAttemptFailed = false;
+                    sparseMidMeshConsecutiveFailures = 0;
                     spdlog::info(
                         "Sparse mid mesh upload: serial={} faces={} tiles={} lod={}/{}-{} water={} minMax={:.0f}/{:.0f} camera=({:.0f},{:.0f},{:.0f})",
                         midMeshTicket.serial,
@@ -16512,6 +16654,27 @@ int RunSandbox(int argc, char* argv[]) {
                 } else {
                     ++sparseMidMeshUploadRetriesLastFrame;
                     sparseMidMeshFaceCountLastUpload = 0u;
+                    sparseMidMeshLastAttemptFailed = true;
+                    sparseMidMeshLastFailedCamera = cameraPos;
+                    ++sparseMidMeshConsecutiveFailures;
+                    // Log the first failure + then sparsely (powers of two) so the
+                    // run.rec replay reveals which cap overflowed without log spam.
+                    if (sparseMidMeshConsecutiveFailures <= 2u ||
+                        (sparseMidMeshConsecutiveFailures &
+                         (sparseMidMeshConsecutiveFailures - 1u)) == 0u) {
+                        const auto& midMeshStats = sparseMidMeshGpuResources.GetStats();
+                        spdlog::warn(
+                            "MID_MESH_UPLOAD_FAIL frame={} consec={} stage={} faces={}(vis={})/{} "
+                            "ranges={} drawArgs={} surfRecords={} overflow={} camera=({:.0f},{:.0f},{:.0f})",
+                            frameCount, sparseMidMeshConsecutiveFailures,
+                            !midMeshBuilt ? "BUILD" : (!midMeshStaged ? "STAGE" : "EMIT"),
+                            midMeshSnapshot.faces.size(), midMeshSnapshot.visibleFaceCount,
+                            midMeshStats.maxFaces,
+                            midMeshSnapshot.ranges.size(), midMeshSnapshot.drawArgs.size(),
+                            midMeshSnapshot.surfaceRecords.size(),
+                            midMeshStats.uploadOverflowLastFrame ? 1 : 0,
+                            cameraPos.x, cameraPos.y, cameraPos.z);
+                    }
                 }
                 }
             }
@@ -17175,12 +17338,31 @@ int RunSandbox(int argc, char* argv[]) {
                     const bool surfaceOverflowNeedsFullCatchup =
                         surfaceGpuStatsForUpload.uploadOverflowLastFrame &&
                         surfaceFullCatchupFitsFaceBuffer;
+                    // Active-edit detection: a changing edit revision means the player is
+                    // mid-stroke. Within a short idle window after the last edit, do NOT
+                    // abandon the incremental dirty-stage path for a full re-stage on mere
+                    // backlog/metadata pressure (the dirty path defers excess itself).
+                    {
+                        const uint64_t currentEditRevision =
+                            sparseVoxelWorld.GetEdits().RevisionSerial();
+                        if (currentEditRevision != sparseSurfaceCatchupLastEditRevision) {
+                            sparseSurfaceCatchupLastEditRevision = currentEditRevision;
+                            sparseSurfaceCatchupLastEditFrame = frameCount;
+                        }
+                    }
+                    const bool surfaceEditingActive =
+                        sparseSurfaceFullCatchupEditIdleFrames != 0u &&
+                        frameCount <
+                            sparseSurfaceCatchupLastEditFrame +
+                                static_cast<uint64_t>(sparseSurfaceFullCatchupEditIdleFrames);
                     const bool forceSparseSurfaceFullCatchup =
                         surfaceOverflowNeedsFullCatchup ||
-                        (surfaceGpuCoverageBehind &&
+                        (!surfaceEditingActive &&
+                         surfaceGpuCoverageBehind &&
                          surfaceDirtyBacklogBeyondPatchBudget &&
                          surfaceAllocatorHasFullCatchupHeadroom) ||
-                        (surfaceMetadataCatchupDue && surfaceFullCatchupFitsFaceBuffer);
+                        (!surfaceEditingActive &&
+                         surfaceMetadataCatchupDue && surfaceFullCatchupFitsFaceBuffer);
                     if (forceSparseSurfaceFullCatchup &&
                         (frameCount % 120u) == 0u) {
                         spdlog::info(
@@ -23204,7 +23386,7 @@ int RunSandbox(int argc, char* argv[]) {
                     }
                     if (sparseWorldStats.asyncExactGenerationEnabled != 0u) {
                         spdlog::info(
-                            "PERF_SPARSE_EXACT_ASYNC frame={} enabled={} maxEnqueue={} lowPriorityMaxApply={} queueDepth={} resultDepth={} pending={} enqueued={} completed={} applied={} deferredLowPriority={} discarded={} syncFallback={} oldestAge={} workerMs={:.2f} applyMs={:.2f} enqueuedLane=cache/prefetch/repair/visible/public:{}/{}/{}/{}/{} appliedLane=cache/prefetch/repair/visible/public:{}/{}/{}/{}/{}",
+                            "PERF_SPARSE_EXACT_ASYNC frame={} enabled={} maxEnqueue={} lowPriorityMaxApply={} queueDepth={} resultDepth={} pending={} enqueued={} completed={} applied={} deferredLowPriority={} discarded={} syncFallback={} editGate=globalWouldSync/perCoordAsync/staleAtCompletion:{}/{}/{} oldestAge={} workerMs={:.2f} applyMs={:.2f} enqueuedLane=cache/prefetch/repair/visible/public:{}/{}/{}/{}/{} appliedLane=cache/prefetch/repair/visible/public:{}/{}/{}/{}/{}",
                             frameCount,
                             sparseWorldStats.asyncExactGenerationEnabled,
                             sparseWorldConfig.asyncExactGenerationMaxEnqueuePerFrame,
@@ -23218,6 +23400,9 @@ int RunSandbox(int argc, char* argv[]) {
                             sparseWorldStats.asyncExactGenerationDeferredLowPriorityApplyLastFrame,
                             sparseWorldStats.asyncExactGenerationDiscardedLastFrame,
                             sparseWorldStats.asyncExactGenerationSyncFallbackLastFrame,
+                            sparseWorldStats.asyncExactGenEditGateGlobalWouldSyncLastFrame,
+                            sparseWorldStats.asyncExactGenEditGatePerCoordAsyncLastFrame,
+                            sparseWorldStats.asyncExactGenEditStaleAtCompletionLastFrame,
                             sparseWorldStats.asyncExactGenerationOldestAge,
                             sparseWorldStats.asyncExactGenerationWorkerMsLastFrame,
                             sparseWorldStats.asyncExactGenerationApplyMsLastFrame,
@@ -24539,6 +24724,12 @@ int RunSandbox(int argc, char* argv[]) {
         }
 
         frameCount++;
+        samplingProfiler.MarkFrame(static_cast<uint32_t>(frameCount));
+        sparseVoxelWorld.SetStatsFrame(frameCount);
+        // Per-frame HeightAt caller attribution. Only emits on frames that actually
+        // called HeightAt on the main thread (steady frames stay silent). Hitch label
+        // is advisory; the per-caller calls-vs-unique ratio is the real signal.
+        Simulation::HeightAtAttribution::DumpAndReset(frameCount, lastRawFrameMs > 25.0f);
         if (traceFrameStages && frameCount <= kFrameStageTraceLimit) {
             spdlog::info("FRAME_STAGE {} complete", frameCount - 1);
         }
@@ -24557,6 +24748,9 @@ int RunSandbox(int argc, char* argv[]) {
         runRecorder.Shutdown();
         spdlog::info("[RECORD] wrote {} frames to the recording", runRecorder.ReplayFrameCount());
     }
+
+    // Join the sampler and dump the self-time profile (PROF_TOP) before teardown.
+    samplingProfiler.Stop();
 
     spdlog::info("Shutting down...");
     // Info is buffered (not flushed per-line); flush now so post-run log parsing

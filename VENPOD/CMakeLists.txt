@@ -90,6 +90,7 @@ set(VENPOD_SOURCES
     src/Simulation/SparseTerrainGenerator.cpp
     src/Simulation/SparseVoxelTypes.cpp
     src/Simulation/SparseVoxelWorld.cpp
+    src/Simulation/HeightAtAttribution.cpp
 
     # Input
     src/Input/InputManager.cpp
@@ -229,6 +230,8 @@ target_link_libraries(VENPOD PRIVATE
     # Windows system libraries
     user32.lib
     gdi32.lib
+    dbghelp.lib  # in-process sampling profiler (StackWalk/SymFromAddr)
+    winmm.lib    # timeBeginPeriod for tight (~1ms) sampling cadence
 )
 
 # =============================================================================
@@ -240,6 +243,8 @@ if(MSVC)
         /WX-        # Don't treat warnings as errors (for now)
         /permissive-  # Strict conformance mode
         /Zc:__cplusplus  # Correct __cplusplus macro
+        /Z7         # Embed debug info in .obj (no shared-PDB contention under Ninja);
+                    # keeps /O2 -> optimized build WITH symbols for the sampling profiler.
     )
     target_compile_definitions(VENPOD PRIVATE
         _CRT_SECURE_NO_WARNINGS
@@ -249,9 +254,11 @@ if(MSVC)
         WIN32_LEAN_AND_MEAN
     )
 
-    # Use Windows subsystem for WinMain entry point
+    # Use Windows subsystem for WinMain entry point.
+    # /DEBUG emits VENPOD.pdb (symbolization); /OPT:REF,ICF restore the size/opt the
+    # linker disables under /DEBUG so the profiled build still matches Release behavior.
     set_target_properties(VENPOD PROPERTIES
-        LINK_FLAGS "/SUBSYSTEM:WINDOWS /ENTRY:WinMainCRTStartup"
+        LINK_FLAGS "/SUBSYSTEM:WINDOWS /ENTRY:WinMainCRTStartup /DEBUG /OPT:REF /OPT:ICF"
     )
 endif()
 
@@ -307,6 +314,7 @@ add_executable(VENPODTests
     src/Simulation/SparseTerrainGenerator.cpp
     src/Simulation/SparseVoxelTypes.cpp
     src/Simulation/SparseVoxelWorld.cpp
+    src/Simulation/HeightAtAttribution.cpp
 )
 
 target_include_directories(VENPODTests PRIVATE

@@ -140,6 +140,10 @@ public:
         const std::vector<BrickCoord>& coords,
         uint32_t maxDeltas) const;
     uint32_t GetOverlayRevision(const BrickCoord& coord) const;
+    // Global RevisionSerial() value when this brick's overlay was last edited, or 0 if
+    // the brick has never been edited. Lets async generation detect (per-coord) whether
+    // an edit landed on a brick since a worker job was dispatched against it.
+    uint64_t OverlayGlobalRevision(const BrickCoord& coord) const;
     bool SaveToFile(const std::filesystem::path& path);
     bool LoadFromFile(const std::filesystem::path& path);
 

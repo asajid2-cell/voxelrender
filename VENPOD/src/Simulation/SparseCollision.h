@@ -83,6 +83,13 @@ public:
 private:
     static CollisionSampleStatus ClassifyVoxel(uint32_t voxel);
 
+    // Same as Sample(), but uses a terrain column (height+relief) the caller already
+    // computed for this (worldX,worldZ). HeightAt/SurfaceReliefAt are identical for
+    // every Y in a column, so volume/support scans hash the column once and reuse it
+    // here instead of recomputing procedural terrain noise per voxel.
+    CollisionSample SampleWithColumn(
+        int32_t worldX, int32_t worldY, int32_t worldZ, float height, float relief) const;
+
     const SparseTerrainGenerator& m_terrain;
     const SparseEditStore* m_edits = nullptr;
 };

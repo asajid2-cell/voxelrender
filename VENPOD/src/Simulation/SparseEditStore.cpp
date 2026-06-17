@@ -410,6 +410,14 @@ uint32_t SparseEditStore::GetOverlayRevision(const BrickCoord& coord) const {
     return overlayIt->second.revision;
 }
 
+uint64_t SparseEditStore::OverlayGlobalRevision(const BrickCoord& coord) const {
+    auto overlayIt = m_overlays.find(coord);
+    if (overlayIt == m_overlays.end()) {
+        return 0;
+    }
+    return overlayIt->second.lastGlobalRevision;
+}
+
 bool SparseEditStore::SaveToFile(const std::filesystem::path& path) {
     if (!IsSparseEditPersistencePathAllowed(path)) {
         return false;

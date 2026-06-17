@@ -28,6 +28,11 @@ struct SparseVoxelWorldConfig {
     bool asyncExactGeneration = false;
     bool asyncExactGenerationVisible = false;
     bool asyncExactGenerationPrefetchLane = false;
+    // When true, the async edit gate is PER-COORD (a brick whose dependency
+    // neighborhood is edit-free generates async even while edits exist elsewhere).
+    // When false, the legacy GLOBAL gate (any edit -> all gen sync). Toggle for A/B
+    // + a safety switch back to the conservative behavior.
+    bool asyncExactGenerationPerCoordEditGate = true;
     uint32_t asyncExactGenerationQueueMax = 256;
     uint32_t asyncExactGenerationMaxEnqueuePerFrame = 0;
     uint32_t asyncExactGenerationMaxApplyPerFrame = 32;
@@ -36,6 +41,17 @@ struct SparseVoxelWorldConfig {
     bool parallelExactGenerationPersistentWorkers = false;
     uint32_t parallelExactGenerationMaxWorkers = 4;
     uint32_t parallelExactGenerationMinBricks = 8;
+    // When true, the fork-join parallel exact-generation blocks (PumpGeneration /
+    // PumpGenerationAround) are allowed to run WHILE edits exist. Workers still
+    // generate only PRISTINE bricks (GenerateExactBrickForConfig never reads
+    // m_edits); the per-voxel edit overlay is applied SERIALLY on the main thread
+    // (ApplyToGeneratedBrick) in the post-join apply loop, before the payload is
+    // stored. Without this, one edit globally degrades exact generation to single-
+    // threaded for the rest of the session (the "editing halves fps and never
+    // recovers" regression). false restores the old globally-edit-disabled behavior
+    // for A/B. Async exact + surface-extraction paths are NOT covered (they are not
+    // yet edit-aware) and keep their own EditedBrickCount gates.
+    bool parallelExactGenerationEditAware = true;
     bool incrementalPressureTrim = false;
     uint32_t incrementalPressureTrimScanBudget = 32768;
     bool surfaceBuriedSolidFastPath = false;
@@ -141,6 +157,9 @@ struct SparseVoxelWorldStats {
     uint32_t asyncExactGenerationDeferredLowPriorityApplyLastFrame = 0;
     uint32_t asyncExactGenerationDiscardedLastFrame = 0;
     uint32_t asyncExactGenerationSyncFallbackLastFrame = 0;
+    uint32_t asyncExactGenEditGateGlobalWouldSyncLastFrame = 0;
+    uint32_t asyncExactGenEditGatePerCoordAsyncLastFrame = 0;
+    uint32_t asyncExactGenEditStaleAtCompletionLastFrame = 0;
     uint32_t asyncExactGenerationOldestAge = 0;
     uint32_t asyncExactGenerationEnqueuedCacheLaneLastFrame = 0;
     uint32_t asyncExactGenerationEnqueuedPrefetchLaneLastFrame = 0;
@@ -407,6 +426,11 @@ public:
     void BeginFrame();
     void SetStatsRefreshDeferred(bool deferred);
     void FlushStats();
+    // Engine opt-in: RefreshStats() is fired ~84x/frame from gen/upload/evict bookkeeping
+    // (a top profiled hot spot during edits). With this on, the full stats refresh runs
+    // at most once per stats frame; OFF for tests/isolated use (every call refreshes).
+    void SetStatsRefreshOncePerFrame(bool enable) { m_statsRefreshOncePerFrame = enable; }
+    void SetStatsFrame(uint64_t frame) { m_statsFrameHint = frame; }
 
     bool RequestBrick(const BrickCoord& coord);
     SparseBrickRequestResult RequestBrickDetailed(const BrickCoord& coord, bool allowEmptyFastPath = true);
@@ -865,6 +889,15 @@ private:
     uint32_t ApplyAsyncExactGenerationCompletions(uint32_t currentFrame);
     void StartAsyncExactGenerationWorkerIfNeeded();
     void StopAsyncExactGenerationWorker();
+    // Per-coord replacement for the old global "any edit -> all gen sync" gate. An exact
+    // brick's content depends ONLY on its own coord's edit overlay (ApplyToGeneratedBrick),
+    // so a brick whose dependency neighborhood has no edits can generate async even while
+    // edits exist elsewhere. The neighborhood is inflated by kAsyncExactGenEditHaloBricks
+    // (conservative margin; own-coord is the proven-minimal). False positive = extra sync
+    // (safe); false negative = stale data (forbidden) -> stay conservative.
+    static constexpr int32_t kAsyncExactGenEditHaloBricks = 1;
+    bool EditOverlapsExactGenDependency(const BrickCoord& coord) const;
+    uint64_t MaxEditRevisionInExactGenDependency(const BrickCoord& coord) const;
     bool TryQueueAsyncSurfaceExtraction(const BrickCoord& coord);
     uint32_t ApplyAsyncSurfaceExtractionCompletions();
     void StartAsyncSurfaceExtractionWorkerIfNeeded();
@@ -1040,6 +1073,11 @@ private:
     uint32_t m_asyncExactGenerationDeferredLowPriorityApplyLastFrame = 0;
     uint32_t m_asyncExactGenerationDiscardedLastFrame = 0;
     uint32_t m_asyncExactGenerationSyncFallbackLastFrame = 0;
+    // Per-coord edit-gate instrumentation (the edit-aware async relaxation).
+    uint32_t m_asyncExactGenEditGateGlobalWouldSyncLastFrame = 0;  // old global gate would have synced
+    uint32_t m_asyncExactGenEditGatePerCoordSyncLastFrame = 0;     // per-coord gate kept sync (real overlap)
+    uint32_t m_asyncExactGenEditGatePerCoordAsyncLastFrame = 0;    // per-coord gate unlocked async
+    uint32_t m_asyncExactGenEditStaleAtCompletionLastFrame = 0;    // edit landed during gen -> regen sync
     uint32_t m_asyncExactGenerationEnqueuedCacheLaneLastFrame = 0;
     uint32_t m_asyncExactGenerationEnqueuedPrefetchLaneLastFrame = 0;
     uint32_t m_asyncExactGenerationEnqueuedRepairLaneLastFrame = 0;
@@ -1104,6 +1142,9 @@ private:
     uint32_t m_physicsWorkGeneration = 0;
     bool m_statsRefreshDeferred = false;
     bool m_statsRefreshPending = false;
+    bool m_statsRefreshOncePerFrame = false;
+    uint64_t m_statsFrameHint = 0;
+    uint64_t m_lastFullStatsFrame = 0xFFFFFFFFFFFFFFFFull;
     std::thread m_asyncExactGenerationThread;
     std::mutex m_asyncExactGenerationMutex;
     std::condition_variable m_asyncExactGenerationCv;

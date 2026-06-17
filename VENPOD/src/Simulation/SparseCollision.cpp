@@ -1,11 +1,13 @@
 #include "SparseCollision.h"
 
+#include "Simulation/HeightAtAttribution.h"
 #include "Utils/BitPacking.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 namespace VENPOD::Simulation {
 
@@ -105,12 +107,23 @@ SparseCollisionAabb TranslateAabb(
 } // namespace
 
 CollisionSample SparseCollisionQuery::Sample(int32_t worldX, int32_t worldY, int32_t worldZ) const {
+    HEIGHTAT_SCOPE("CollisionSample");
     uint32_t voxel = 0;
     if (m_edits && m_edits->TryGetVoxel(worldX, worldY, worldZ, &voxel)) {
         return {ClassifyVoxel(voxel), voxel, true};
     }
 
     voxel = m_terrain.SampleGeneratedVoxel(worldX, worldY, worldZ);
+    return {ClassifyVoxel(voxel), voxel, false};
+}
+
+CollisionSample SparseCollisionQuery::SampleWithColumn(
+    int32_t worldX, int32_t worldY, int32_t worldZ, float height, float relief) const {
+    uint32_t voxel = 0;
+    if (m_edits && m_edits->TryGetVoxel(worldX, worldY, worldZ, &voxel)) {
+        return {ClassifyVoxel(voxel), voxel, true};
+    }
+    voxel = m_terrain.SampleGeneratedVoxelWithColumn(worldX, worldY, worldZ, height, relief);
     return {ClassifyVoxel(voxel), voxel, false};
 }
 
@@ -139,10 +152,31 @@ SparseCollisionVolumeResult SparseCollisionQuery::TestAabb(
 
     SparseCollisionVolumeResult result;
 
+    // Per-column terrain cache. HeightAt/SurfaceReliefAt are constant down a column,
+    // so compute them once per (x,z) and reuse them across the whole Y range below.
+    // Collapses collision terrain-noise cost from O(voxels) to O(columns).
+    const int32_t spanX = maxX - minX + 1;
+    const int32_t spanZ = maxZ - minZ + 1;
+    const size_t colCount = static_cast<size_t>(spanX) * static_cast<size_t>(spanZ);
+    thread_local std::vector<float> colHeight;
+    thread_local std::vector<float> colRelief;
+    colHeight.resize(colCount);
+    colRelief.resize(colCount);
+    for (int32_t z = minZ; z <= maxZ; ++z) {
+        for (int32_t x = minX; x <= maxX; ++x) {
+            const size_t idx = static_cast<size_t>(x - minX) +
+                               static_cast<size_t>(z - minZ) * static_cast<size_t>(spanX);
+            colHeight[idx] = m_terrain.HeightAt(x, z);
+            colRelief[idx] = m_terrain.SurfaceReliefAt(x, z, 4);
+        }
+    }
+
     for (int32_t z = minZ; z <= maxZ; ++z) {
         for (int32_t y = minY; y <= maxY; ++y) {
             for (int32_t x = minX; x <= maxX; ++x) {
-                const CollisionSample sample = Sample(x, y, z);
+                const size_t idx = static_cast<size_t>(x - minX) +
+                                   static_cast<size_t>(z - minZ) * static_cast<size_t>(spanX);
+                const CollisionSample sample = SampleWithColumn(x, y, z, colHeight[idx], colRelief[idx]);
                 ++result.sampledVoxels;
 
                 bool sampleBlocks = false;
@@ -264,10 +298,30 @@ SparseCollisionSupportResult SparseCollisionQuery::FindSupportBelow(
         return result;
     }
 
+    // Per-column terrain cache (see TestAabb): one HeightAt+relief per (x,z), reused
+    // across the entire Y drop range instead of recomputing terrain noise per voxel.
+    const int32_t spanX = maxX - minX + 1;
+    const int32_t spanZ = maxZ - minZ + 1;
+    const size_t colCount = static_cast<size_t>(spanX) * static_cast<size_t>(spanZ);
+    thread_local std::vector<float> colHeight;
+    thread_local std::vector<float> colRelief;
+    colHeight.resize(colCount);
+    colRelief.resize(colCount);
+    for (int32_t z = minZ; z <= maxZ; ++z) {
+        for (int32_t x = minX; x <= maxX; ++x) {
+            const size_t idx = static_cast<size_t>(x - minX) +
+                               static_cast<size_t>(z - minZ) * static_cast<size_t>(spanX);
+            colHeight[idx] = m_terrain.HeightAt(x, z);
+            colRelief[idx] = m_terrain.SurfaceReliefAt(x, z, 4);
+        }
+    }
+
     for (int32_t y = startY; y >= endY; --y) {
         for (int32_t z = minZ; z <= maxZ; ++z) {
             for (int32_t x = minX; x <= maxX; ++x) {
-                const CollisionSample sample = Sample(x, y, z);
+                const size_t idx = static_cast<size_t>(x - minX) +
+                                   static_cast<size_t>(z - minZ) * static_cast<size_t>(spanX);
+                const CollisionSample sample = SampleWithColumn(x, y, z, colHeight[idx], colRelief[idx]);
                 ++result.sampledVoxels;
                 if (sample.status == CollisionSampleStatus::KnownSolid) {
                     ++result.solidVoxels;

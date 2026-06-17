@@ -1,5 +1,6 @@
 #include "SparseVoxelWorld.h"
 
+#include "Simulation/HeightAtAttribution.h"
 #include "Simulation/TerrainConstants.h"
 #include "Utils/BitPacking.h"
 
@@ -228,6 +229,7 @@ SparseSurfaceExtractionResult ExtractSurfaceNoEditWithTerrain(
     const GeneratedSparseBrick& brick,
     SurfaceWorkerColumnCache& columnCache)
 {
+    HEIGHTAT_SCOPE("ExtractSurfaceNoEditWithTerrain");
     const auto cachedHeightAt = [&terrain, &columnCache](int32_t worldX, int32_t worldZ) {
         const SurfaceWorkerColumnKey key{worldX, worldZ};
         auto columnIt = columnCache.find(key);
@@ -991,6 +993,10 @@ bool SparseVoxelWorld::Initialize(const SparseVoxelWorldConfig& config) {
     m_asyncExactGenerationDeferredLowPriorityApplyLastFrame = 0;
     m_asyncExactGenerationDiscardedLastFrame = 0;
     m_asyncExactGenerationSyncFallbackLastFrame = 0;
+    m_asyncExactGenEditGateGlobalWouldSyncLastFrame = 0;
+    m_asyncExactGenEditGatePerCoordSyncLastFrame = 0;
+    m_asyncExactGenEditGatePerCoordAsyncLastFrame = 0;
+    m_asyncExactGenEditStaleAtCompletionLastFrame = 0;
     m_asyncExactGenerationEnqueuedCacheLaneLastFrame = 0;
     m_asyncExactGenerationEnqueuedPrefetchLaneLastFrame = 0;
     m_asyncExactGenerationEnqueuedRepairLaneLastFrame = 0;
@@ -1065,6 +1071,10 @@ void SparseVoxelWorld::BeginFrame() {
     m_asyncExactGenerationDeferredLowPriorityApplyLastFrame = 0;
     m_asyncExactGenerationDiscardedLastFrame = 0;
     m_asyncExactGenerationSyncFallbackLastFrame = 0;
+    m_asyncExactGenEditGateGlobalWouldSyncLastFrame = 0;
+    m_asyncExactGenEditGatePerCoordSyncLastFrame = 0;
+    m_asyncExactGenEditGatePerCoordAsyncLastFrame = 0;
+    m_asyncExactGenEditStaleAtCompletionLastFrame = 0;
     m_asyncExactGenerationEnqueuedCacheLaneLastFrame = 0;
     m_asyncExactGenerationEnqueuedPrefetchLaneLastFrame = 0;
     m_asyncExactGenerationEnqueuedRepairLaneLastFrame = 0;
@@ -2234,6 +2244,41 @@ bool SparseVoxelWorld::GenerateExactBricksWithPersistentWorkers(
     return true;
 }
 
+bool SparseVoxelWorld::EditOverlapsExactGenDependency(const BrickCoord& coord) const {
+    if (m_edits.EditedBrickCount() == 0u) {
+        return false;  // fast path: nothing edited anywhere
+    }
+    const int32_t h = kAsyncExactGenEditHaloBricks;
+    for (int32_t dz = -h; dz <= h; ++dz) {
+        for (int32_t dy = -h; dy <= h; ++dy) {
+            for (int32_t dx = -h; dx <= h; ++dx) {
+                if (m_edits.HasOverlay({coord.x + dx, coord.y + dy, coord.z + dz})) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+uint64_t SparseVoxelWorld::MaxEditRevisionInExactGenDependency(const BrickCoord& coord) const {
+    if (m_edits.EditedBrickCount() == 0u) {
+        return 0;
+    }
+    uint64_t maxRev = 0;
+    const int32_t h = kAsyncExactGenEditHaloBricks;
+    for (int32_t dz = -h; dz <= h; ++dz) {
+        for (int32_t dy = -h; dy <= h; ++dy) {
+            for (int32_t dx = -h; dx <= h; ++dx) {
+                maxRev = std::max(
+                    maxRev,
+                    m_edits.OverlayGlobalRevision({coord.x + dx, coord.y + dy, coord.z + dz}));
+            }
+        }
+    }
+    return maxRev;
+}
+
 bool SparseVoxelWorld::TryQueueAsyncExactGeneration(
     const BrickCoord& coord,
     const BrickResidentRecord& record,
@@ -2258,7 +2303,9 @@ bool SparseVoxelWorld::TryQueueAsyncExactGeneration(
         (record.residencyClass == SparseResidencyClass::Visible &&
          !m_config.asyncExactGenerationVisible &&
          !prefetchLaneAsyncAllowed) ||
-        m_edits.EditedBrickCount() != 0u) {
+        (m_config.asyncExactGenerationPerCoordEditGate
+             ? EditOverlapsExactGenDependency(coord)
+             : m_edits.EditedBrickCount() != 0u)) {
         return false;
     }
 
@@ -2280,6 +2327,14 @@ bool SparseVoxelWorld::TryQueueAsyncExactGeneration(
 
     if (!m_pool.MarkGeneratingCPU(coord)) {
         return false;
+    }
+
+    // This brick is committing to async despite passing all gates. If edits exist
+    // anywhere, the OLD global gate would have forced it synchronous; the per-coord
+    // gate let it go async because its own dependency neighborhood is edit-free.
+    if (m_edits.EditedBrickCount() != 0u) {
+        ++m_asyncExactGenEditGateGlobalWouldSyncLastFrame;
+        ++m_asyncExactGenEditGatePerCoordAsyncLastFrame;
     }
 
     AsyncExactGenerationRequest request;
@@ -2382,11 +2437,24 @@ uint32_t SparseVoxelWorld::ApplyAsyncExactGenerationCompletions(uint32_t current
 
         GeneratedSparseBrick brick = result.brick;
         SparseResidencyClass generatedClass = result.residencyClass;
-        if (m_edits.EditedBrickCount() != 0u ||
-            m_edits.RevisionSerial() != result.editRevision) {
+        // Per-coord stale check: the worker generated against edit-free terrain at
+        // dispatch (request.editRevision). If an edit has since landed on this brick's
+        // dependency neighborhood (max overlay revision there now exceeds the dispatch
+        // epoch), the async payload is stale -> regenerate synchronously + apply edits.
+        // An edit ELSEWHERE in the world no longer triggers a needless regen (the old
+        // global gate's waste). HasOverlay(coord) is a final belt-and-suspenders guard
+        // for the brick's own overlay regardless of the halo epoch arithmetic.
+        const bool staleAtCompletion =
+            m_config.asyncExactGenerationPerCoordEditGate
+                ? (m_edits.HasOverlay(result.coord) ||
+                   MaxEditRevisionInExactGenDependency(result.coord) > result.editRevision)
+                : (m_edits.EditedBrickCount() != 0u ||
+                   m_edits.RevisionSerial() != result.editRevision);
+        if (staleAtCompletion) {
             brick = GenerateBrickWithCachedTerrainColumns(result.coord);
             m_edits.ApplyToGeneratedBrick(brick);
             ++m_asyncExactGenerationSyncFallbackLastFrame;
+            ++m_asyncExactGenEditStaleAtCompletionLastFrame;
         }
 
         if (ApplyGeneratedBrickPayload(result.coord, brick, &generatedClass)) {
@@ -2758,6 +2826,7 @@ bool SparseVoxelWorld::PruneSurfaceExtractionQueuesIfNoPending() {
 }
 
 bool SparseVoxelWorld::ExtractSurfaceCoord(const BrickCoord& coord) {
+    HEIGHTAT_SCOPE("ExtractSurfaceCoord");
     auto pendingIt = m_pendingSurfaceBricks.find(coord);
     if (pendingIt == m_pendingSurfaceBricks.end()) {
         RemoveFirstSurfaceQueueCoord(coord);
@@ -3398,7 +3467,7 @@ uint32_t SparseVoxelWorld::PumpGeneration(uint32_t maxBricks, uint32_t currentFr
         m_config.parallelExactGeneration &&
         maxBricks >= m_config.parallelExactGenerationMinBricks &&
         m_generationQueue.size() >= static_cast<size_t>(m_config.parallelExactGenerationMinBricks) &&
-        m_edits.EditedBrickCount() == 0u;
+        (m_config.parallelExactGenerationEditAware || m_edits.EditedBrickCount() == 0u);
     if (processed < maxBricks && parallelGenerationAllowed) {
         struct PendingExactGeneration {
             BrickCoord coord;
@@ -3542,6 +3611,11 @@ uint32_t SparseVoxelWorld::PumpGeneration(uint32_t maxBricks, uint32_t currentFr
                     std::chrono::steady_clock::now() - parallelStart).count();
 
             for (size_t index = 0; index < pending.size(); ++index) {
+                // Workers generate PRISTINE bricks (no m_edits access); apply the edit
+                // overlay serially here on the main thread before storing the payload.
+                // No-op when the brick has no edits, so this is correct whether or not
+                // parallelExactGenerationEditAware is on.
+                m_edits.ApplyToGeneratedBrick(bricks[index]);
                 SparseResidencyClass generatedClass = pending[index].residencyClass;
                 if (ApplyGeneratedBrickPayload(pending[index].coord, bricks[index], &generatedClass)) {
                     IncrementResidencyClassCounter(
@@ -3804,7 +3878,7 @@ uint32_t SparseVoxelWorld::PumpGenerationAround(
     const bool parallelGenerationAllowed =
         m_config.parallelExactGeneration &&
         maxBricks >= m_config.parallelExactGenerationMinBricks &&
-        m_edits.EditedBrickCount() == 0u;
+        (m_config.parallelExactGenerationEditAware || m_edits.EditedBrickCount() == 0u);
     if (processed < maxBricks && parallelGenerationAllowed) {
         struct PendingExactGeneration {
             BrickCoord coord;
@@ -3976,6 +4050,11 @@ uint32_t SparseVoxelWorld::PumpGenerationAround(
                     std::chrono::steady_clock::now() - parallelStart).count();
 
             for (size_t index = 0; index < pending.size(); ++index) {
+                // Workers generate PRISTINE bricks (no m_edits access); apply the edit
+                // overlay serially here on the main thread before storing the payload.
+                // No-op when the brick has no edits, so this is correct whether or not
+                // parallelExactGenerationEditAware is on.
+                m_edits.ApplyToGeneratedBrick(bricks[index]);
                 SparseResidencyClass generatedClass = pending[index].residencyClass;
                 if (ApplyGeneratedBrickPayload(pending[index].coord, bricks[index], &generatedClass)) {
                     IncrementResidencyClassCounter(
@@ -7396,6 +7475,7 @@ uint32_t SparseVoxelWorld::EvaluateBrushEdit(
     bool requestRenderBricks,
     std::vector<SparseEditDelta>* outDeltas)
 {
+    HEIGHTAT_SCOPE("EvaluateBrushEdit");
     if (commit) {
         m_stats.brushVoxelsEvaluatedLastStroke = 0;
         m_stats.brushVoxelsEditedLastStroke = 0;
@@ -7427,18 +7507,12 @@ uint32_t SparseVoxelWorld::EvaluateBrushEdit(
     const float normalY = static_cast<float>(hitNormalY);
     const float normalZ = static_cast<float>(hitNormalZ);
 
-    // Per-(x,z) column cache for the generated-terrain sample. HeightAt and
-    // SurfaceReliefAt are expensive multi-octave noise that depend ONLY on (x,z),
-    // but the brush loops x,y,z and previously recomputed them for every Y in the
-    // column - ~(brush height)x wasted noise per stamp, the dominant CPU brush
-    // cost. Compute height/relief once per column, reuse down the Y span.
-    const int32_t brushColW = std::max(0, brushBounds.endX - brushBounds.startX);
-    const int32_t brushColD = std::max(0, brushBounds.endZ - brushBounds.startZ);
-    struct BrushColumnSample { float height; float relief; bool computed; };
-    std::vector<BrushColumnSample> brushColumnCache(
-        static_cast<size_t>(brushColW) * static_cast<size_t>(brushColD),
-        BrushColumnSample{0.0f, 0.0f, false});
-
+    // The generated-terrain sample needs HeightAt/SurfaceReliefAt, expensive
+    // multi-octave noise that depends ONLY on (x,z). The brush loops x,y,z so it is
+    // computed at most once per column via the FRAME-PERSISTENT member column cache
+    // (CachedTerrainHeightAt/ReliefAt) below. That member cache is shared across the
+    // brush's ~9.5 preview/apply calls per frame (a per-call-local cache recomputed
+    // the same columns every call - the dominant CPU edit cost).
     for (int32_t z = brushBounds.startZ; z < brushBounds.endZ; ++z) {
         for (int32_t y = brushBounds.startY; y < brushBounds.endY; ++y) {
             for (int32_t x = brushBounds.startX; x < brushBounds.endX; ++x) {
@@ -7481,17 +7555,10 @@ uint32_t SparseVoxelWorld::EvaluateBrushEdit(
 
                 uint32_t currentVoxel = 0;
                 if (!m_edits.TryGetVoxel(x, y, z, &currentVoxel)) {
-                    const size_t colIdx =
-                        static_cast<size_t>(x - brushBounds.startX) +
-                        static_cast<size_t>(z - brushBounds.startZ) * static_cast<size_t>(brushColW);
-                    BrushColumnSample& col = brushColumnCache[colIdx];
-                    if (!col.computed) {
-                        col.height = m_terrain.HeightAt(x, z);
-                        col.relief = m_terrain.SurfaceReliefAt(x, z, 4);
-                        col.computed = true;
-                    }
+                    const float colHeight = CachedTerrainHeightAt(x, z);
+                    const float colRelief = CachedTerrainReliefAt(x, z, 4);
                     currentVoxel =
-                        m_terrain.SampleGeneratedVoxelWithColumn(x, y, z, col.height, col.relief);
+                        m_terrain.SampleGeneratedVoxelWithColumn(x, y, z, colHeight, colRelief);
                 }
 
                 const uint8_t currentMaterial = Utils::UnpackMaterial(currentVoxel);
@@ -7795,6 +7862,17 @@ void SparseVoxelWorld::RefreshStats() {
         return;
     }
     m_statsRefreshPending = false;
+    // Cheap fields callers may read right after a mutation stay fresh every call.
+    m_stats.requestedBricks = m_pool.ResidentCount();
+    m_stats.generationQueuedBricks = static_cast<uint32_t>(m_generationQueue.size());
+    m_stats.uploadQueuedBricks = static_cast<uint32_t>(m_uploadQueue.size());
+    m_stats.generatedBricks = static_cast<uint32_t>(m_generated.size());
+    // The rest is telemetry-grade aggregation fired ~84x/frame; collapse it to once per
+    // stats frame (engine opt-in; OFF for tests so every call yields a full snapshot).
+    if (m_statsRefreshOncePerFrame && m_lastFullStatsFrame == m_statsFrameHint) {
+        return;
+    }
+    m_lastFullStatsFrame = m_statsFrameHint;
     if (m_queueClassStatsDirty ||
         m_cachedGenerationQueueSize != static_cast<uint32_t>(m_generationQueue.size()) ||
         m_cachedUploadQueueSize != static_cast<uint32_t>(m_uploadQueue.size()) ||
@@ -7896,6 +7974,9 @@ void SparseVoxelWorld::RefreshStats() {
         m_asyncExactGenerationDeferredLowPriorityApplyLastFrame;
     m_stats.asyncExactGenerationDiscardedLastFrame = m_asyncExactGenerationDiscardedLastFrame;
     m_stats.asyncExactGenerationSyncFallbackLastFrame = m_asyncExactGenerationSyncFallbackLastFrame;
+    m_stats.asyncExactGenEditGateGlobalWouldSyncLastFrame = m_asyncExactGenEditGateGlobalWouldSyncLastFrame;
+    m_stats.asyncExactGenEditGatePerCoordAsyncLastFrame = m_asyncExactGenEditGatePerCoordAsyncLastFrame;
+    m_stats.asyncExactGenEditStaleAtCompletionLastFrame = m_asyncExactGenEditStaleAtCompletionLastFrame;
     m_stats.asyncExactGenerationOldestAge = asyncOldestAge;
     m_stats.asyncExactGenerationEnqueuedCacheLaneLastFrame =
         m_asyncExactGenerationEnqueuedCacheLaneLastFrame;
@@ -8236,6 +8317,7 @@ void SparseVoxelWorld::RefreshStats() {
 }
 
 uint32_t SparseVoxelWorld::SampleEditedOrGeneratedVoxel(int32_t worldX, int32_t worldY, int32_t worldZ) const {
+    HEIGHTAT_SCOPE("SampleEditedOrGeneratedVoxel");
     uint32_t editedVoxel = 0;
     if (m_edits.TryGetVoxel(worldX, worldY, worldZ, &editedVoxel)) {
         return editedVoxel;

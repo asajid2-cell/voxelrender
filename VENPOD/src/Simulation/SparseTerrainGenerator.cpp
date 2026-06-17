@@ -1,11 +1,15 @@
 #include "SparseTerrainGenerator.h"
 
+#include "Simulation/HeightAtAttribution.h"
 #include "Simulation/TerrainConstants.h"
 #include "Utils/BitPacking.h"
 
 #include <algorithm>
 #include <cmath>
+#include <intrin.h>
 #include <limits>
+
+#pragma intrinsic(_ReturnAddress)
 
 namespace VENPOD::Simulation {
 
@@ -69,6 +73,7 @@ uint32_t SparseTerrainGenerator::Hash3D(int32_t x, int32_t y, int32_t z, uint32_
 }
 
 float SparseTerrainGenerator::ValueNoise2D(float x, float z, uint32_t seed) {
+    HeightAtAttribution::RecordNoise();
     const int32_t x0 = static_cast<int32_t>(std::floor(x));
     const int32_t z0 = static_cast<int32_t>(std::floor(z));
     const float fx = x - static_cast<float>(x0);
@@ -86,6 +91,7 @@ float SparseTerrainGenerator::ValueNoise2D(float x, float z, uint32_t seed) {
 }
 
 float SparseTerrainGenerator::HeightAt(int32_t worldX, int32_t worldZ) const {
+    HeightAtAttribution::RecordHeight(worldX, worldZ, _ReturnAddress());
     const float x = static_cast<float>(worldX);
     const float z = static_cast<float>(worldZ);
 
@@ -749,6 +755,7 @@ uint32_t SparseTerrainGenerator::SampleGeneratedSurfaceVoxel(
     int32_t worldZ,
     int32_t sampleStep) const
 {
+    HEIGHTAT_SCOPE("SampleGeneratedSurfaceVoxel");
     const uint32_t voxel = SampleGeneratedVoxel(worldX, worldY, worldZ);
     const uint8_t material = Utils::UnpackMaterial(voxel);
     if (material == Utils::Material::Air) {
@@ -786,6 +793,7 @@ uint32_t SparseTerrainGenerator::SampleGeneratedSurfaceVoxel(
 }
 
 GeneratedSparseBrick SparseTerrainGenerator::GenerateBrick(const BrickCoord& coord) const {
+    HEIGHTAT_SCOPE("GenerateBrick");
     GeneratedSparseBrick brick;
     brick.coord = coord;
     brick.voxels.fill(Utils::PackVoxel(Utils::Material::Air, 0, 0, 0));
@@ -806,16 +814,47 @@ GeneratedSparseBrick SparseTerrainGenerator::GenerateBrick(const BrickCoord& coo
     float reliefByColumn[SPARSE_BRICK_SIZE][SPARSE_BRICK_SIZE] = {};
     const int32_t minWorldY = worldYByLocal[0];
     const int32_t maxWorldY = worldYByLocal[SPARSE_BRICK_SIZE - 1];
+    // Pass 1: fill the column heightfield.
     for (uint8_t z = 0; z < SPARSE_BRICK_SIZE; ++z) {
         for (uint8_t x = 0; x < SPARSE_BRICK_SIZE; ++x) {
+            heightByColumn[z][x] = HeightAt(worldXByLocal[x], worldZByLocal[z]);
+        }
+    }
+    // Pass 2: relief from the now-complete grid. The ±offset neighbours are already
+    // computed as other columns' centers, so reuse them instead of 4 extra HeightAt per
+    // column (HeightAt was the top profiled hot spot, called 5x per column). Only
+    // neighbours OUTSIDE this brick fall back to HeightAt; the value is identical.
+    constexpr int32_t kReliefOffset = 4;
+    for (uint8_t z = 0; z < SPARSE_BRICK_SIZE; ++z) {
+        for (uint8_t x = 0; x < SPARSE_BRICK_SIZE; ++x) {
+            if (!(maxWorldY > TERRAIN_MIN_Y + 2 &&
+                  static_cast<float>(minWorldY) <= heightByColumn[z][x])) {
+                continue;
+            }
             const int32_t worldX = worldXByLocal[x];
             const int32_t worldZ = worldZByLocal[z];
-            heightByColumn[z][x] = HeightAt(worldX, worldZ);
-            if (maxWorldY > TERRAIN_MIN_Y + 2 &&
-                static_cast<float>(minWorldY) <= heightByColumn[z][x]) {
-                reliefByColumn[z][x] =
-                    SurfaceReliefAtWithCenter(worldX, worldZ, heightByColumn[z][x], 4);
+            const auto nbrHeight =
+                [&](int32_t lx, int32_t lz, int32_t wx, int32_t wz) -> float {
+                if (lx >= 0 && lx < SPARSE_BRICK_SIZE && lz >= 0 && lz < SPARSE_BRICK_SIZE) {
+                    return heightByColumn[lz][lx];
+                }
+                return HeightAt(wx, wz);
+            };
+            const int32_t lx = static_cast<int32_t>(x);
+            const int32_t lz = static_cast<int32_t>(z);
+            float lo = heightByColumn[z][x];
+            float hi = lo;
+            const float nbr[] = {
+                nbrHeight(lx - kReliefOffset, lz, worldX - kReliefOffset, worldZ),
+                nbrHeight(lx + kReliefOffset, lz, worldX + kReliefOffset, worldZ),
+                nbrHeight(lx, lz - kReliefOffset, worldX, worldZ - kReliefOffset),
+                nbrHeight(lx, lz + kReliefOffset, worldX, worldZ + kReliefOffset),
+            };
+            for (float h : nbr) {
+                lo = std::min(lo, h);
+                hi = std::max(hi, h);
             }
+            reliefByColumn[z][x] = hi - lo;
         }
     }
 
