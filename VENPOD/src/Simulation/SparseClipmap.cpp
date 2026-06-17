@@ -546,15 +546,6 @@ bool SparseClipmapTileCache::Initialize(const SparseClipmapConfig& config) {
     m_tiles.resize(m_config.maxTiles);
     m_freeSlots.clear();
     m_slotByCoord.clear();
-    // Re-init wipes all residency, so the mid-mesh dirty-worklist fast path must NOT trust
-    // its prior reference state (stale residency gen / camera margin / emitted set would let
-    // it skip tiles against a world that no longer exists). Bump the residency gen and force
-    // the next build to be a full scan that re-captures everything.
-    ++m_midMeshResidencyGen;
-    m_midMeshHasFullScanState = false;
-    m_midMeshEmittedCoords.clear();
-    m_midMeshDirtyCoords.clear();
-    m_midMeshTileDeferredSince.clear();
     m_generationQueue.clear();
     m_queuedSet.clear();
     m_interestSet.clear();
