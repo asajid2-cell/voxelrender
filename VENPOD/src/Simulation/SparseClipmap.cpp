@@ -6985,17 +6985,27 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             // Tiles with a large height range get finer merge so far cliffs step
             // like voxel terraces; flat tiles keep the cheap coarse quads.
             if (mergeCells > 1u) {
-                int32_t tileMinY = std::numeric_limits<int32_t>::max();
-                int32_t tileMaxY = std::numeric_limits<int32_t>::min();
-                for (uint32_t s = 0; s < sampleCount; s += 7u) {
-                    const uint32_t sample = tile.packedSamples[s];
-                    if (UnpackMidHeightSurfaceSampleMaterial(sample) == Utils::Material::Air) {
-                        continue;
+                // The height range is a function of the tile's samples only, so cache it
+                // keyed by content version - this scan ran on every LOD-merged tile every
+                // build (a chunk of the per-tile-loop cost) though the result rarely changes.
+                if (tile.meshCacheRangeVersion != tile.meshContentVersion) {
+                    int32_t scanMinY = std::numeric_limits<int32_t>::max();
+                    int32_t scanMaxY = std::numeric_limits<int32_t>::min();
+                    for (uint32_t s = 0; s < sampleCount; s += 7u) {
+                        const uint32_t sample = tile.packedSamples[s];
+                        if (UnpackMidHeightSurfaceSampleMaterial(sample) == Utils::Material::Air) {
+                            continue;
+                        }
+                        const int32_t sy = UnpackMidHeightSurfaceSampleY(sample);
+                        scanMinY = std::min(scanMinY, sy);
+                        scanMaxY = std::max(scanMaxY, sy);
                     }
-                    const int32_t sy = UnpackMidHeightSurfaceSampleY(sample);
-                    tileMinY = std::min(tileMinY, sy);
-                    tileMaxY = std::max(tileMaxY, sy);
+                    tile.meshCacheRangeMinY = scanMinY;
+                    tile.meshCacheRangeMaxY = scanMaxY;
+                    tile.meshCacheRangeVersion = tile.meshContentVersion;
                 }
+                const int32_t tileMinY = tile.meshCacheRangeMinY;
+                const int32_t tileMaxY = tile.meshCacheRangeMaxY;
                 if (tileMinY <= tileMaxY) {
                     const int32_t tileRange = tileMaxY - tileMinY;
                     if (tileRange > 192) {

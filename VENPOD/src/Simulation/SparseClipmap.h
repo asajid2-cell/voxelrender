@@ -848,6 +848,12 @@ private:
         int32_t meshCacheOriginZ = INT32_MIN;
         int32_t meshCacheRing = -1;
         bool meshCacheValid = false;
+        // Cached per-tile height range (the LOD slope-scan result). Depends only on the
+        // tile's samples (content), not the camera, so it's recomputed only when content
+        // changes - the slope scan ran on EVERY tile EVERY build (the per-tile-loop floor).
+        int32_t meshCacheRangeMinY = 0;
+        int32_t meshCacheRangeMaxY = 0;
+        uint64_t meshCacheRangeVersion = UINT64_MAX;
     };
 
     struct VoxelColumnSample {
