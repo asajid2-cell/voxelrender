@@ -2945,6 +2945,12 @@ int RunSandbox(int argc, char* argv[]) {
         std::max(1u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_TERRACE_STEP", 1u));
     const bool sparseMidMeshLodEnabled =
         ReadUIntEnv("VENPOD_SPARSE_MID_MESH_LOD", 1u) != 0u;
+    // P1.5: incremental mid-mesh UPLOAD. When on, the mid-mesh GPU resource uses the
+    // range allocator and the build emits a dirty payload so only re-extracted tiles
+    // re-upload (vs the full StageSnapshot spike). Default OFF until visual parity of
+    // the terrain floor is confirmed; the full path is unchanged when off.
+    const bool sparseMidMeshIncrementalUpload =
+        ReadUIntEnv("VENPOD_MIDMESH_INCREMENTAL_UPLOAD", 0u) != 0u;
     const uint32_t sparseMidMeshLodBaseMerge =
         std::max(1u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_LOD_BASE_MERGE", 1u));
     // Default merge cap 2 (was 4): both visual judges ranked the finer distant
@@ -3333,11 +3339,25 @@ int RunSandbox(int argc, char* argv[]) {
                 ReadUIntEnv("VENPOD_SPARSE_MID_MESH_MAX_DRAW_COMMANDS", midMeshConfig.maxDrawCommands);
             midMeshConfig.uploadBytesPerSlot =
                 ReadUIntEnv("VENPOD_SPARSE_MID_MESH_UPLOAD_SLOT_BYTES", midMeshConfig.uploadBytesPerSlot);
-            midMeshConfig.useRangeAllocator = false;
-            midMeshConfig.useFixedRangeTable = false;
-            midMeshConfig.useStableDrawSlots = false;
-            midMeshConfig.compactStableDrawCommands = false;
+            // P1.5: the range allocator + stable draw slots are what let the mid-mesh
+            // upload only dirty tiles (StageDirtyPayloadSnapshot). Off by default keeps
+            // the simple full-upload path.
+            midMeshConfig.useRangeAllocator = sparseMidMeshIncrementalUpload;
+            midMeshConfig.useFixedRangeTable = sparseMidMeshIncrementalUpload;
+            midMeshConfig.useStableDrawSlots = sparseMidMeshIncrementalUpload;
+            midMeshConfig.compactStableDrawCommands = sparseMidMeshIncrementalUpload;
             midMeshConfig.useGpuCull = false;
+            if (sparseMidMeshIncrementalUpload) {
+                // Per-frame upload budget: a camera recenter dirties ~all tiles at once;
+                // without a budget StageDirtyPayloadSnapshot uploads the whole ~1M-face
+                // mesh in one frame (the spike). Cap faces/regions per frame so the
+                // recenter drains over a few cheap frames instead (re-fired via
+                // HasMidMeshDirtyPayload). Tunable; default ~256k faces / 192 tiles.
+                midMeshConfig.maxPayloadCopyFacesPerFrame =
+                    ReadUIntEnv("VENPOD_MIDMESH_UPLOAD_FACE_BUDGET", 256u * 1024u);
+                midMeshConfig.maxPayloadCopyRegionsPerFrame =
+                    ReadUIntEnv("VENPOD_MIDMESH_UPLOAD_REGION_BUDGET", 192u);
+            }
             auto midMeshGpuResult = sparseMidMeshGpuResources.Initialize(
                 device->GetDevice(),
                 renderer->GetHeapManager(),
@@ -16577,9 +16597,13 @@ int RunSandbox(int argc, char* argv[]) {
                 // mid-mesh has fully caught up. (Does NOT override the overflow backoff.)
                 const bool midMeshDeferredCatchup =
                     sparseClipmapTileCache.LastMidMeshDeferredTiles() > 0u;
+                // P1.5: a budgeted incremental upload may have deferred dirty tiles to
+                // bound per-frame cost; keep firing (camera still) until they all upload.
+                const bool midMeshUploadCatchup =
+                    sparseMidMeshIncrementalUpload && sparseClipmapTileCache.HasMidMeshDirtyPayload();
                 if (midMeshRetryFutile ||
                     (!midMeshContentChangeDue && !midMeshCullMoved &&
-                     !midMeshCullTurned && !midMeshDeferredCatchup)) {
+                     !midMeshCullTurned && !midMeshDeferredCatchup && !midMeshUploadCatchup)) {
                     // Current mesh still matches resident height tiles and the conservative
                     // cull window, or a just-failed build would fail again unchanged.
                 } else {
@@ -16591,6 +16615,12 @@ int RunSandbox(int argc, char* argv[]) {
                 Simulation::SparseMidHeightSurfaceBuildConfig midMeshBuildConfig;
                 midMeshBuildConfig.maxFaces = sparseMidMeshMaxFaces;
                 midMeshBuildConfig.maxTiles = sparseMidMeshMaxTiles;
+                // Re-extraction budget stays opt-in (env): budgeting per-build re-emit
+                // would defer re-centered tiles and briefly drop them (transient floor
+                // holes during a recenter). The incremental path already skips the full
+                // faces re-assembly + budgets the UPLOAD, which is hole-free. Set
+                // VENPOD_SPARSE_MID_MESH_MAX_REBUILD_TILES>0 to also spread re-extraction
+                // (accepts brief holes for a lower peak).
                 midMeshBuildConfig.maxRebuildTiles = sparseMidMeshMaxRebuildTiles;
                 midMeshBuildConfig.terraceStep = sparseMidMeshTerraceStep;
                 midMeshBuildConfig.lodEnabled = sparseMidMeshLodEnabled;
@@ -16621,14 +16651,47 @@ int RunSandbox(int argc, char* argv[]) {
                 midMeshBuildConfig.minDistance = sparseMidMeshMinDistance;
                 midMeshBuildConfig.maxDistance = sparseMidMeshMaxDistance;
                 midMeshBuildConfig.cullPadding = sparseMidMeshCullPadding;
+                midMeshBuildConfig.emitDirtyPayload = sparseMidMeshIncrementalUpload;
                 // Split the chain so a failure names the stage that rejected it and the
                 // snapshot's counts-vs-caps -> the replay log pins the exact overflow cap.
                 const bool midMeshBuilt =
                     sparseClipmapTileCache.BuildMidHeightSurfaceSnapshot(midMeshSnapshot, midMeshBuildConfig);
-                const bool midMeshStaged =
-                    midMeshBuilt && sparseMidMeshGpuResources.StageSnapshot(midMeshSnapshot, &midMeshTicket);
-                const bool midMeshEmitted =
-                    midMeshStaged && sparseMidMeshGpuResources.EmitCopy(commandList.Get(), midMeshTicket);
+                // P1.5: prefer the incremental dirty-payload upload (only re-extracted
+                // tiles); fall back to the full StageSnapshot when it can't apply (first
+                // upload before the GPU mirrors are primed, or nothing dirty resolves a
+                // payload). Ack the dirty set ONLY after EmitCopy commits (retry-safe).
+                bool midMeshStaged = false;
+                bool midMeshEmitted = false;
+                bool midMeshDirtyUpload = false;
+                if (midMeshBuilt && sparseMidMeshIncrementalUpload) {
+                    SparseSurfaceUploadTicket midMeshDirtyTicket;
+                    if (sparseMidMeshGpuResources.StageDirtyPayloadSnapshot(midMeshSnapshot, &midMeshDirtyTicket) &&
+                        sparseMidMeshGpuResources.EmitCopy(commandList.Get(), midMeshDirtyTicket)) {
+                        // Partial ack: clear exactly the tiles the GPU committed; budgeted
+                        // overflow stays dirty + re-fires next frame (drains the recenter).
+                        sparseClipmapTileCache.AckMidMeshDirtyUpload(midMeshDirtyTicket.uploadedPayloadBricks);
+                        midMeshTicket = midMeshDirtyTicket;
+                        midMeshStaged = true;
+                        midMeshEmitted = true;
+                        midMeshDirtyUpload = true;
+                    }
+                }
+                if (!midMeshEmitted) {
+                    // Full StageSnapshot needs the assembled faces. A primed incremental
+                    // build skips assembly (empty faces); if its dirty stage didn't apply
+                    // this frame, keep the prior GPU state + dirty set and retry next frame
+                    // rather than uploading an empty buffer (which would blank the floor).
+                    const bool fullUploadValid = midMeshBuilt && !midMeshSnapshot.faces.empty();
+                    midMeshStaged =
+                        fullUploadValid && sparseMidMeshGpuResources.StageSnapshot(midMeshSnapshot, &midMeshTicket);
+                    midMeshEmitted =
+                        midMeshStaged && sparseMidMeshGpuResources.EmitCopy(commandList.Get(), midMeshTicket);
+                    if (midMeshEmitted && sparseMidMeshIncrementalUpload) {
+                        // The full upload re-seeded the whole GPU buffer; all dirty covered.
+                        sparseClipmapTileCache.AckMidMeshDirtyUploadAll();
+                    }
+                }
+                (void)midMeshDirtyUpload;
                 if (midMeshEmitted) {
                     sparseMidMeshUploadedHeightSerial = sparseClipmapTileCache.HeightDirtySerial();
                     sparseMidMeshFaceCountLastUpload = midMeshTicket.faceCount;
@@ -21326,14 +21389,21 @@ int RunSandbox(int argc, char* argv[]) {
             }
             auto midMeshCamera = cameraParams;
             midMeshCamera.surfaceRasterMaxDistance = sparseMidMeshMaxDistance;
+            // P1.5: with the range allocator on, faces live in non-contiguous range slots,
+            // so the draw MUST be indirect (per-brick draw args) - a linear face draw would
+            // read the gaps. Without it, the simple contiguous linear draw.
+            const bool useMidMeshIndirect =
+                sparseMidMeshIncrementalUpload &&
+                sparseMidMeshGpuResources.DrawArgsResource() != nullptr &&
+                midMeshStats.uploadedDrawCommands > 0u;
             renderer->RenderSparseSurfaceFaces(
                 commandList.Get(),
                 sparseMidMeshGpuResources.FaceBufferSRV(),
                 voxelWorld->GetPaletteSRV(),
                 midMeshStats.uploadedFaces,
                 midMeshCamera,
-                nullptr,
-                0u,
+                useMidMeshIndirect ? sparseMidMeshGpuResources.DrawArgsResource() : nullptr,
+                useMidMeshIndirect ? midMeshStats.uploadedDrawCommands : 0u,
                 nullptr,
                 &sparseMidMeshGpuResources.VertexIdBufferView(),
                 &sparseMidMeshGpuResources.IndexBufferView(),

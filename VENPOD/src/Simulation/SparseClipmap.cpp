@@ -6733,6 +6733,13 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     uint32_t emittedTiles = 0;
     const uint32_t maxRebuildTiles = buildConfig.maxRebuildTiles;
     uint32_t rebuiltThisBuild = 0;
+    // P1.5: once the GPU is primed (a prior build emitted tiles), the dirty upload path
+    // reads each tile's PERSISTENT meshCacheFaces via drawBatch.faces and never touches
+    // outSnapshot.faces - so skip the full faces RE-ASSEMBLY (the per-build ~1M-face
+    // memcpy that is the actual mid-mesh spike). The first build (emitted set empty) still
+    // assembles so the full StageSnapshot can prime the GPU mirrors.
+    const bool skipFullAssembly =
+        buildConfig.emitDirtyPayload && !m_midMeshEmittedCoords.empty();
 
     struct SurfaceBlock {
         bool present = false;
@@ -7052,6 +7059,7 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         // anything, instead of rebuilding the whole ~1.5M-face monolith every frame.
         std::vector<SparseSurfaceFace> tileFaces;
         bool faceBudgetOk = true;
+        bool tileReEmitted = false;  // P1.5: this tile re-extracted (faces changed) this build
         const uint32_t childMask =
             (childResident[0] ? 1u : 0u) | (childResident[1] ? 2u : 0u) |
             (childResident[2] ? 4u : 0u) | (childResident[3] ? 8u : 0u);
@@ -7089,6 +7097,7 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             continue;
         } else {
         ++rebuiltThisBuild;
+        tileReEmitted = true;
         const uint32_t blockCountPerAxis = (cellCount + mergeCells - 1u) / mergeCells;
         tileFaces.reserve(static_cast<size_t>(blockCountPerAxis) * static_cast<size_t>(blockCountPerAxis) * 3u);
 
@@ -7396,7 +7405,11 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         };
         const uint32_t firstFace = static_cast<uint32_t>(outSnapshot.faces.size());
         const uint32_t faceCount = static_cast<uint32_t>(tileFaces.size());
-        outSnapshot.faces.insert(outSnapshot.faces.end(), tileFaces.begin(), tileFaces.end());
+        if (!skipFullAssembly) {
+            // Full path: concatenate every tile's faces for StageSnapshot. Skipped on
+            // primed dirty builds (drawBatch.faces points at the persistent cache instead).
+            outSnapshot.faces.insert(outSnapshot.faces.end(), tileFaces.begin(), tileFaces.end());
+        }
         const uint32_t directionMask = BuildSparseSurfaceDirectionMask(tileFaces);
 
         SparseSurfaceBrickRange range;
@@ -7435,11 +7448,24 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         batch.coord = coord;
         batch.firstFace = firstFace;
         batch.faceCount = faceCount;
+        // P1.5: point at this tile's PERSISTENT cached faces (valid until the next build /
+        // tile mutation) so StageDirtyPayloadSnapshot can upload just this tile.
+        batch.faces = tile.meshCacheFaces.data();
         outSnapshot.drawBatches.push_back(batch);
+        if (buildConfig.emitDirtyPayload) {
+            // Dirty if the tile re-extracted (faces changed) or is new to the GPU (not in
+            // the previous build's emitted set). Accumulates until a successful upload
+            // calls AckMidMeshDirtyUpload(); retry-safe across throttled/failed frames.
+            if (tileReEmitted || m_midMeshEmittedCoords.find(coord) == m_midMeshEmittedCoords.end()) {
+                m_midMeshDirtyCoords.insert(coord);
+            }
+        }
         ++emittedTiles;
     }
 
-    if (outSnapshot.faces.empty()) {
+    // Nothing emitted -> no snapshot. Keyed on drawBatches (one per non-empty tile) so a
+    // primed dirty build with skipped face assembly (empty faces) still succeeds.
+    if (outSnapshot.drawBatches.empty()) {
         return false;
     }
 
@@ -7467,6 +7493,32 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             }
             slot = (slot + 1u) & mask;
         }
+    }
+
+    if (buildConfig.emitDirtyPayload) {
+        // Derive this build's emitted coords from the per-tile draw batches; removed =
+        // previously-emitted minus now-emitted (evicted / re-centered tiles). dirty =
+        // accumulated dirty set intersected with still-emitted tiles. The faces pointers
+        // in drawBatches let StageDirtyPayloadSnapshot upload only these.
+        std::unordered_set<BrickCoord, BrickCoordHash> emittedThisBuild;
+        emittedThisBuild.reserve(outSnapshot.drawBatches.size());
+        for (const SparseSurfaceDrawBatch& batch : outSnapshot.drawBatches) {
+            emittedThisBuild.insert(batch.coord);
+        }
+        outSnapshot.removedBricks.clear();
+        for (const BrickCoord& prev : m_midMeshEmittedCoords) {
+            if (emittedThisBuild.find(prev) == emittedThisBuild.end()) {
+                outSnapshot.removedBricks.push_back({prev, m_heightDirtySerial});
+            }
+        }
+        outSnapshot.dirtyBricks.clear();
+        outSnapshot.dirtyBricks.reserve(m_midMeshDirtyCoords.size());
+        for (const BrickCoord& dirty : m_midMeshDirtyCoords) {
+            if (emittedThisBuild.find(dirty) != emittedThisBuild.end()) {
+                outSnapshot.dirtyBricks.push_back({dirty, m_heightDirtySerial});
+            }
+        }
+        m_midMeshEmittedCoords = std::move(emittedThisBuild);
     }
     return true;
 }

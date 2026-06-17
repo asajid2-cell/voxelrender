@@ -248,6 +248,10 @@ struct SparseMidHeightSurfaceBuildConfig {
     uint32_t lodBaseMerge = 1;
     uint32_t lodMaxMerge = 4;
     bool lodEnabled = true;
+    // P1.5 incremental upload: when true, the build also tracks per-tile dirty/removed
+    // coords + sets drawBatch.faces pointers so the caller can StageDirtyPayloadSnapshot
+    // (upload only re-extracted tiles) instead of StageSnapshot (full re-upload).
+    bool emitDirtyPayload = false;
     bool emitWater = true;
     bool distanceCull = true;
     bool frustumCull = false;
@@ -631,6 +635,19 @@ public:
     // Changed tiles that were deferred (over maxRebuildTiles) in the last build. >0 means
     // the mid-mesh is mid-catch-up; the caller should re-fire the build next frame.
     uint32_t LastMidMeshDeferredTiles() const { return m_lastMidMeshDeferredTiles; }
+    // P1.5: clear exactly the tiles the GPU committed this frame (the upload is
+    // per-frame BUDGETED, so a mass recenter drains over several frames). Retry-safe:
+    // a failed/deferred tile stays dirty. Call only after EmitCopy succeeds.
+    void AckMidMeshDirtyUpload(const std::vector<BrickCoord>& uploaded) {
+        for (const BrickCoord& coord : uploaded) {
+            m_midMeshDirtyCoords.erase(coord);
+        }
+    }
+    // Full StageSnapshot fallback re-seeds the whole GPU buffer -> everything is covered.
+    void AckMidMeshDirtyUploadAll() { m_midMeshDirtyCoords.clear(); }
+    // True while dirty tiles remain un-uploaded -> the caller should re-fire the build
+    // next frame to drain the budgeted upload backlog (no full-frame spike).
+    bool HasMidMeshDirtyPayload() const { return !m_midMeshDirtyCoords.empty(); }
     void SetEditStore(const SparseEditStore* edits);
     void SetFarSvoFallbackMetadata(const SparseClipmapFarSvoFallbackMetadata& metadata);
     // sinceRevision: only overlays touched after this global edit revision are
@@ -1050,6 +1067,14 @@ private:
     bool m_voxelInterestRebuildInProgress = false;
     uint32_t m_voxelInterestBudgetedRebuildsLastFrame = 0;
     uint32_t m_voxelInterestRingsRebuiltLastFrame = 0;
+    // P1.5 incremental mid-mesh upload state (emitDirtyPayload builds only).
+    // m_midMeshDirtyCoords: synthetic tile coords whose faces changed but have not yet
+    // been acknowledged as uploaded (persists across frames until AckMidMeshDirtyUpload).
+    // m_midMeshEmittedCoords: synthetic coords emitted by the previous build, to derive
+    // removed (evicted/re-centered) tiles. m_midMeshIncrementalPrimed: a full StageSnapshot
+    // has populated the GPU mirrors, so dirty uploads are now valid.
+    std::unordered_set<BrickCoord, BrickCoordHash> m_midMeshDirtyCoords;
+    std::unordered_set<BrickCoord, BrickCoordHash> m_midMeshEmittedCoords;
     uint32_t m_lastInterestUpdateFrame = 0;
     uint32_t m_lastStatsFrame = 0;
     // RefreshStats' heavy aggregation (iterating up to 16384 resident voxel bricks +
