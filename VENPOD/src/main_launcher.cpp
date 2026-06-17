@@ -16631,13 +16631,6 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseMidMeshIncrementalUpload
                         ? static_cast<float>(ReadUIntEnv("VENPOD_MIDMESH_REBUILD_MS", 12u))
                         : 0.0f;
-                // Dirty-worklist fast path: skip per-tile work for provably-unchanged tiles
-                // when camera buckets + residency are stable. EXPERIMENTAL - default OFF even
-                // with incremental upload on, pending GPU validation that visibleMissing stays
-                // 0. Enable with VENPOD_MIDMESH_DIRTY_WORKLIST=1.
-                midMeshBuildConfig.skipUnchangedTiles =
-                    sparseMidMeshIncrementalUpload &&
-                    ReadUIntEnv("VENPOD_MIDMESH_DIRTY_WORKLIST", 0u) != 0u;
                 midMeshBuildConfig.terraceStep = sparseMidMeshTerraceStep;
                 midMeshBuildConfig.lodEnabled = sparseMidMeshLodEnabled;
                 midMeshBuildConfig.lodBaseMerge = sparseMidMeshLodBaseMerge;
@@ -16720,11 +16713,8 @@ int RunSandbox(int argc, char* argv[]) {
                     // must have a resident GPU range. visibleMissing>0 == a wanted tile has
                     // no geometry == a floor hole. The invariant is visibleMissing==0.
                     const auto& midMeshCovStats = sparseMidMeshGpuResources.GetStats();
-                    // Total tiles the build WANTED drawn (emitted + fast-path-skipped). On a
-                    // fast-path build drawBatches holds only the dirty subset, so using it here
-                    // would report a false visibleMissing=0; the build's own count is correct.
                     const uint32_t midMeshExpectedTiles =
-                        sparseClipmapTileCache.LastMidMeshExpectedTiles();
+                        static_cast<uint32_t>(midMeshSnapshot.drawBatches.size());
                     const uint32_t midMeshResidentTiles = midMeshCovStats.allocatedFaceRanges;
                     const uint32_t midMeshVisibleMissing =
                         midMeshExpectedTiles > midMeshResidentTiles

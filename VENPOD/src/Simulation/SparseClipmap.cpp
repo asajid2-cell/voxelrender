@@ -2268,7 +2268,6 @@ uint32_t SparseClipmapTileCache::AllocateSlot(
 
     const SparseClipmapTileCoord oldCoord = m_tiles[bestSlot].record.coord;
     m_slotByCoord.erase(oldCoord);
-    ++m_midMeshResidencyGen;  // eviction changes residency -> invalidate mid-mesh fast path
     m_tiles[bestSlot].packedSamples.clear();
     m_tiles[bestSlot].record = {};
     m_tiles[bestSlot].record.slot = bestSlot;
@@ -2421,7 +2420,6 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
             // Single-threaded commit: publish slots + dirty marks in queue order.
             for (const PendingHeightGeneration& item : pendingHeight) {
                 m_slotByCoord[item.coord] = item.slot;
-                ++m_midMeshResidencyGen;  // new resident tile -> invalidate mid-mesh fast path
                 ++m_dirtySerial;
                 ++m_heightDirtySerial;
                 MarkHeightSlotDirty(item.slot);
@@ -2454,7 +2452,6 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
             m_tiles[slot].record.lastTouchedFrame = frameIndex;
             GenerateTile(slot, policy);
             m_slotByCoord[coord] = slot;
-            ++m_midMeshResidencyGen;  // new resident tile -> invalidate mid-mesh fast path
             ++generated;
             ++m_dirtySerial;
             ++m_heightDirtySerial;
@@ -6746,33 +6743,6 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     // assembles so the full StageSnapshot can prime the GPU mirrors.
     const bool skipFullAssembly =
         buildConfig.emitDirtyPayload && !m_midMeshEmittedCoords.empty();
-    // DIRTY-WORKLIST FAST PATH: when the camera buckets + residency are provably unchanged
-    // since the last FULL scan, every tile's mergeCells (LOD) and childMask are unchanged, so
-    // any tile whose content is also unchanged is a guaranteed cache hit whose GPU range
-    // persists - skip ALL its per-tile work (childResident lookups + emission). Only
-    // content-changed tiles are processed. The full scan is the correct fallback and
-    // re-captures the reference state below. cameraMove is measured from the last full scan
-    // (not the last build) because the margin was computed at that camera position.
-    const float midMeshCameraMoveX = buildConfig.cameraX - m_midMeshLastFullScanCameraX;
-    const float midMeshCameraMoveZ = buildConfig.cameraZ - m_midMeshLastFullScanCameraZ;
-    const float midMeshCameraMove =
-        std::sqrt(midMeshCameraMoveX * midMeshCameraMoveX + midMeshCameraMoveZ * midMeshCameraMoveZ);
-    const bool midMeshFastPath =
-        buildConfig.skipUnchangedTiles &&
-        buildConfig.emitDirtyPayload &&
-        m_midMeshHasFullScanState &&
-        !m_midMeshEmittedCoords.empty() &&
-        m_midMeshResidencyGen == m_midMeshLastFullScanResidencyGen &&
-        midMeshCameraMove < m_midMeshMinBucketMargin;
-    m_lastMidMeshSkippedTiles = 0;
-    // Coords skipped this build (still resident, just not re-emitted) - folded back into the
-    // emitted set so they are NOT mistaken for removed/evicted tiles (which would hole).
-    std::unordered_set<BrickCoord, BrickCoordHash> midMeshSkippedCoords;
-    // Min distance any tile sits from a LOD-bucket boundary (2200/5000, matching the LOD block
-    // below), recomputed on every full scan; the fast path engages only while the camera has
-    // moved less than this since that scan. FLT_MAX when LOD is off (no buckets to cross).
-    float midMeshFullScanMinMargin =
-        buildConfig.lodEnabled ? std::numeric_limits<float>::max() : std::numeric_limits<float>::max();
     // Cache-miss cause counters (instrument the re-extraction churn source): NEW tile,
     // RECENTER (slot's world origin/ring changed), LOD (mergeCells flip at same world
     // location), CONTENT (edit/stream regen), CHILD (finer-ring residency), BUILDVER.
@@ -6984,27 +6954,6 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             continue;
         }
 
-        // FAST-PATH SKIP: in a fast-path build, mergeCells + childMask are provably unchanged
-        // for every tile (camera buckets + residency stable since the last full scan). So a
-        // tile whose content + build version + world location are also unchanged is a
-        // guaranteed cache hit; its GPU range persists, so emit nothing and skip the
-        // childResident lookups + per-tile emission entirely. Record it as still-resident.
-        if (midMeshFastPath &&
-            tile.meshCacheValid &&
-            !tile.meshCacheFaces.empty() &&
-            tile.meshCacheContentVersion == tile.meshContentVersion &&
-            tile.meshCacheBuildVersion == midMeshBuildVersion &&
-            tile.meshCacheOriginX == tile.record.originX &&
-            tile.meshCacheOriginZ == tile.record.originZ &&
-            tile.meshCacheRing == tile.record.coord.ring) {
-            const BrickCoord skipCoord{
-                tile.record.coord.x, tile.record.coord.ring, tile.record.coord.z};
-            midMeshSkippedCoords.insert(skipCoord);
-            ++emittedTiles;
-            ++m_lastMidMeshSkippedTiles;
-            continue;
-        }
-
         const uint32_t cellSize = static_cast<uint32_t>(std::max(
             1,
             RoundToInt32Clamped(tile.record.cellSize)));
@@ -7021,14 +6970,6 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         const float tileCamDz = tileCenterZ - buildConfig.cameraZ;
         const float tileCamDist = std::sqrt(tileCamDx * tileCamDx + tileCamDz * tileCamDz) -
             static_cast<float>(tileWorldSize) * 0.70711f;
-        // On a full scan, track how close the nearest tile sits to either LOD-bucket boundary
-        // (2200 / 5000, matching the block below). The fast path may then engage until the
-        // camera moves more than that, since no tile can cross a boundary within that margin.
-        if (buildConfig.skipUnchangedTiles && !midMeshFastPath && buildConfig.lodEnabled) {
-            const float marginToBoundary = std::min(
-                std::abs(tileCamDist - 2200.0f), std::abs(tileCamDist - 5000.0f));
-            midMeshFullScanMinMargin = std::min(midMeshFullScanMinMargin, marginToBoundary);
-        }
         // Unified rule: cap the merged QUAD'S WORLD SIZE by distance — that is the
         // actual visual criterion ("no giant cubes"). Coarse rings (32-64u cells)
         // therefore stop merging until far out (kills the far-waterline slab walls
@@ -7633,34 +7574,15 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         }
     }
 
-    // On a FULL scan, capture the reference state the fast path checks against next build:
-    // the residency generation, camera position, and the min bucket margin just measured.
-    // (A fast-path build leaves these untouched, so the camera-move accumulates against the
-    // last full scan's camera until it exceeds the margin and forces a fresh full scan.)
-    if (buildConfig.skipUnchangedTiles && !midMeshFastPath) {
-        m_midMeshLastFullScanResidencyGen = m_midMeshResidencyGen;
-        m_midMeshLastFullScanCameraX = buildConfig.cameraX;
-        m_midMeshLastFullScanCameraZ = buildConfig.cameraZ;
-        m_midMeshMinBucketMargin = buildConfig.lodEnabled
-            ? midMeshFullScanMinMargin
-            : std::numeric_limits<float>::max();
-        m_midMeshHasFullScanState = true;
-    }
-
     if (buildConfig.emitDirtyPayload) {
         // Derive this build's emitted coords from the per-tile draw batches; removed =
         // previously-emitted minus now-emitted (evicted / re-centered tiles). dirty =
         // accumulated dirty set intersected with still-emitted tiles. The faces pointers
         // in drawBatches let StageDirtyPayloadSnapshot upload only these.
         std::unordered_set<BrickCoord, BrickCoordHash> emittedThisBuild;
-        emittedThisBuild.reserve(outSnapshot.drawBatches.size() + midMeshSkippedCoords.size());
+        emittedThisBuild.reserve(outSnapshot.drawBatches.size());
         for (const SparseSurfaceDrawBatch& batch : outSnapshot.drawBatches) {
             emittedThisBuild.insert(batch.coord);
-        }
-        // Fast-path-skipped tiles are still resident (their GPU range persists) - count them
-        // as emitted so they are NOT derived as removed (which would free the range -> hole).
-        for (const BrickCoord& skipped : midMeshSkippedCoords) {
-            emittedThisBuild.insert(skipped);
         }
         outSnapshot.removedBricks.clear();
         for (const BrickCoord& prev : m_midMeshEmittedCoords) {
@@ -7690,14 +7612,10 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         m_lastMidMeshMaxStaleAge = maxStaleAge;
         m_lastMidMeshPendingCount = static_cast<uint32_t>(m_midMeshTileDeferredSince.size());
     }
-    // Total wanted tiles this build (emitted + skipped) for the no-hole coverage gate.
-    m_lastMidMeshExpectedTiles = emittedTiles;
-    if (rebuiltThisBuild > 0u || m_lastMidMeshSkippedTiles > 0u ||
-        missNew + missRecenter + missLod + missContent + missChild + missBuildVer > 0u) {
+    if (rebuiltThisBuild > 0u || missNew + missRecenter + missLod + missContent + missChild + missBuildVer > 0u) {
         spdlog::info(
-            "MIDMESH_MISS_CAUSE emitted={} reExtract={} extractMs={:.2f} assemblyMs={:.2f} skipAssembly={} fastPath={} skipped={} camMove={:.0f} margin={:.0f} pending={} maxStaleAge={} miss=new/recenter/lod/content/child/buildver:{}/{}/{}/{}/{}/{}",
+            "MIDMESH_MISS_CAUSE emitted={} reExtract={} extractMs={:.2f} assemblyMs={:.2f} skipAssembly={} pending={} maxStaleAge={} miss=new/recenter/lod/content/child/buildver:{}/{}/{}/{}/{}/{}",
             emittedTiles, rebuiltThisBuild, extractMsAccum, assemblyMsAccum, skipFullAssembly ? 1 : 0,
-            midMeshFastPath ? 1 : 0, m_lastMidMeshSkippedTiles, midMeshCameraMove, m_midMeshMinBucketMargin,
             m_lastMidMeshPendingCount, m_lastMidMeshMaxStaleAge,
             missNew, missRecenter, missLod, missContent, missChild, missBuildVer);
     }
