@@ -16713,6 +16713,13 @@ int RunSandbox(int argc, char* argv[]) {
                             : "off");
                 }
                 (void)midMeshDirtyUpload;
+                // Incremental no-op: the build succeeded but nothing was dirty/removed, so
+                // there was nothing to upload and the resident floor is unchanged + correct.
+                // This is NOT a failure - tripping the fail-backoff here would wrongly
+                // suppress later legit builds (and could stall the floor).
+                const bool midMeshNoOp =
+                    sparseMidMeshIncrementalUpload && midMeshBuilt && !midMeshEmitted &&
+                    midMeshSnapshot.dirtyBricks.empty() && midMeshSnapshot.removedBricks.empty();
                 if (midMeshEmitted) {
                     sparseMidMeshUploadedHeightSerial = sparseClipmapTileCache.HeightDirtySerial();
                     sparseMidMeshFaceCountLastUpload = midMeshTicket.faceCount;
@@ -16735,6 +16742,11 @@ int RunSandbox(int argc, char* argv[]) {
                         cameraPos.x,
                         cameraPos.y,
                         cameraPos.z);
+                } else if (midMeshNoOp) {
+                    // Clean no-op: nothing to upload, floor unchanged. Treat as success so
+                    // the fail-backoff doesn't suppress the next real build.
+                    sparseMidMeshLastAttemptFailed = false;
+                    sparseMidMeshConsecutiveFailures = 0;
                 } else {
                     ++sparseMidMeshUploadRetriesLastFrame;
                     sparseMidMeshFaceCountLastUpload = 0u;
