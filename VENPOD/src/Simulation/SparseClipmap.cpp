@@ -7441,6 +7441,15 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         // MOVE (not copy) - tileFaces is not needed after this; downstream reads the
         // persistent meshCacheFaces via emittedFaces.
         if (faceBudgetOk) {
+            // Compute the direction mask + face AABB ONCE here (faces just changed), so the
+            // per-build emission below can reuse them instead of rescanning every tile's
+            // faces every build.
+            tile.meshCacheDirectionMask = BuildSparseSurfaceDirectionMask(tileFaces);
+            ComputeSparseSurfaceFaceBounds(
+                tileFaces.data(),
+                static_cast<uint32_t>(tileFaces.size()),
+                &tile.meshCacheMinX, &tile.meshCacheMinY, &tile.meshCacheMinZ,
+                &tile.meshCacheMaxX, &tile.meshCacheMaxY, &tile.meshCacheMaxZ);
             tile.meshCacheFaces = std::move(tileFaces);
             tile.meshCacheContentVersion = tile.meshContentVersion;
             tile.meshCacheMergeCells = mergeCells;
@@ -7481,7 +7490,9 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             assemblyMsAccum +=
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - assemblyStart).count();
         }
-        const uint32_t directionMask = BuildSparseSurfaceDirectionMask(emittedFaces);
+        // Reuse the mask + AABB cached when these faces were last extracted (above, or a
+        // prior build). emittedFaces is unchanged since then, so they are still exact.
+        const uint32_t directionMask = tile.meshCacheDirectionMask;
 
         SparseSurfaceBrickRange range;
         range.coord = coord;
@@ -7496,15 +7507,12 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         record.faceCount = faceCount;
         record.flags = range.flags;
         record.generation = m_heightDirtySerial;
-        ComputeSparseSurfaceFaceBounds(
-            emittedFaces.data(),
-            faceCount,
-            &record.minX,
-            &record.minY,
-            &record.minZ,
-            &record.maxX,
-            &record.maxY,
-            &record.maxZ);
+        record.minX = tile.meshCacheMinX;
+        record.minY = tile.meshCacheMinY;
+        record.minZ = tile.meshCacheMinZ;
+        record.maxX = tile.meshCacheMaxX;
+        record.maxY = tile.meshCacheMaxY;
+        record.maxZ = tile.meshCacheMaxZ;
         outSnapshot.surfaceRecords.push_back(record);
 
         SparseSurfaceDrawArgs args;

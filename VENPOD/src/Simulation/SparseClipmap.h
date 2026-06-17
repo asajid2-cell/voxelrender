@@ -854,6 +854,17 @@ private:
         int32_t meshCacheRangeMinY = 0;
         int32_t meshCacheRangeMaxY = 0;
         uint64_t meshCacheRangeVersion = UINT64_MAX;
+        // Cached direction mask + face AABB. Both are O(faceCount) scans of the tile's
+        // emitted faces and depend ONLY on those faces, yet ran for EVERY tile EVERY build
+        // (251 tiles x ~4600 faces = ~1.1M face-iterations/build x2). Computed once when the
+        // faces are (re)extracted, reused for the life of meshCacheFaces.
+        uint32_t meshCacheDirectionMask = 0;
+        int32_t meshCacheMinX = 0;
+        int32_t meshCacheMinY = 0;
+        int32_t meshCacheMinZ = 0;
+        int32_t meshCacheMaxX = 0;
+        int32_t meshCacheMaxY = 0;
+        int32_t meshCacheMaxZ = 0;
     };
 
     struct VoxelColumnSample {
