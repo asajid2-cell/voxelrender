@@ -248,6 +248,10 @@ struct SparseMidHeightSurfaceBuildConfig {
     // from re-extracting many expensive fine/near tiles in one frame; deferred tiles with
     // a reusable cache keep drawing stale faces (no hole), re-fired until caught up.
     float maxRebuildMs = 0.0f;
+    // Dirty-worklist fast path: when the camera buckets + residency are provably stable
+    // since the last build, skip per-tile work for unchanged tiles (their GPU ranges
+    // persist). Requires emitDirtyPayload. See m_midMeshResidencyGen / m_midMeshMinBucketMargin.
+    bool skipUnchangedTiles = false;
     uint32_t terraceStep = 1;
     uint32_t lodBaseMerge = 1;
     uint32_t lodMaxMerge = 4;
@@ -639,6 +643,11 @@ public:
     // Changed tiles that were deferred (over maxRebuildTiles) in the last build. >0 means
     // the mid-mesh is mid-catch-up; the caller should re-fire the build next frame.
     uint32_t LastMidMeshDeferredTiles() const { return m_lastMidMeshDeferredTiles; }
+    // Total tiles the last build WANTED drawn (emitted + fast-path-skipped). The no-hole
+    // coverage gate must compare resident GPU ranges against THIS, not drawBatches.size()
+    // (which on a fast-path build is only the dirty subset -> a false 0).
+    uint32_t LastMidMeshExpectedTiles() const { return m_lastMidMeshExpectedTiles; }
+    uint32_t LastMidMeshSkippedTiles() const { return m_lastMidMeshSkippedTiles; }
     // P1.5: clear exactly the tiles the GPU committed this frame (the upload is
     // per-frame BUDGETED, so a mass recenter drains over several frames). Retry-safe:
     // a failed/deferred tile stays dirty. Call only after EmitCopy succeeds.
@@ -1106,6 +1115,21 @@ private:
     uint64_t m_midMeshBuildCounter = 0;
     uint32_t m_lastMidMeshMaxStaleAge = 0;
     uint32_t m_lastMidMeshPendingCount = 0;
+    // Dirty-worklist fast path (VENPOD_MIDMESH_DIRTY_WORKLIST): skip the per-tile work
+    // (childResident lookups + emission) for tiles that are PROVABLY unchanged since the
+    // last build. m_midMeshResidencyGen bumps on every m_slotByCoord add/evict (which always
+    // co-occur with a heightDirtySerial bump); if it is unchanged AND the camera moved less
+    // than m_midMeshMinBucketMargin (the smallest distance any tile sits from a LOD-bucket
+    // boundary), then no tile's childMask or mergeCells can have changed, so only
+    // content-changed tiles need processing. The full scan stays the correct fallback and
+    // recomputes the margin. Last-build state is captured after each full scan.
+    uint64_t m_midMeshResidencyGen = 0;
+    uint64_t m_midMeshLastFullScanResidencyGen = UINT64_MAX;
+    float m_midMeshLastFullScanCameraX = 0.0f;
+    float m_midMeshLastFullScanCameraZ = 0.0f;
+    float m_midMeshMinBucketMargin = 0.0f;
+    bool m_midMeshHasFullScanState = false;
+    uint32_t m_lastMidMeshSkippedTiles = 0;
     uint32_t m_lastInterestUpdateFrame = 0;
     uint32_t m_lastStatsFrame = 0;
     // RefreshStats' heavy aggregation (iterating up to 16384 resident voxel bricks +
@@ -1115,6 +1139,7 @@ private:
     uint32_t m_lastFullStatsFrame = 0xFFFFFFFFu;
     bool m_statsHeavyRefreshOncePerFrame = false;
     uint32_t m_lastMidMeshDeferredTiles = 0;
+    uint32_t m_lastMidMeshExpectedTiles = 0;
     float m_lastCameraYForStats = 0.0f;
     uint32_t m_interestReusedLastFrame = 0;
     uint32_t m_pumpBudgetHitLastFrame = 0;
