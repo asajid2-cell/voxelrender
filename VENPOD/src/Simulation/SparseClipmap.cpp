@@ -7090,8 +7090,13 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             tile.meshCacheOriginX == tile.record.originX &&
             tile.meshCacheOriginZ == tile.record.originZ &&
             tile.meshCacheRing == tile.record.coord.ring;
+        // Over budget when this build has spent its re-extraction tile OR time budget.
+        // Time-based bounds the actual cost (a fine near tile costs ~3-5ms, a coarse far
+        // tile ~0.1ms, so a tile count is a poor cost proxy).
         const bool overRebuildBudget =
-            maxRebuildTiles != 0u && rebuiltThisBuild >= maxRebuildTiles;
+            (maxRebuildTiles != 0u && rebuiltThisBuild >= maxRebuildTiles) ||
+            (buildConfig.maxRebuildMs > 0.0f &&
+             extractMsAccum >= static_cast<double>(buildConfig.maxRebuildMs));
         if (!meshCacheHit) {
             // Categorize the miss by FIRST-priority cause (so we know what drives churn).
             if (!tile.meshCacheValid) {
@@ -7109,18 +7114,22 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             }
         }
         if (meshCacheHit) {
-            tileFaces = tile.meshCacheFaces;
+            // Reuse the persistent cached faces directly (emittedFaces below references
+            // tile.meshCacheFaces) - do NOT copy them into a local vector. The dirty path
+            // never assembles a global face vector, so copying ~4600 faces here per cached
+            // tile, every build, was pure waste (the residual build spike).
         } else if (overRebuildBudget && cacheSameLocation) {
-            // Over the per-build rebuild budget: reuse this tile's stale (same-location)
-            // faces and defer the expensive re-emit to a later build.
-            tileFaces = tile.meshCacheFaces;
+            // NO-HOLE deferral: over the per-build budget AND this tile has a same-location
+            // cached version -> keep drawing its stale faces (emittedFaces references them)
+            // and defer the expensive re-emit to a later build. The floor never disappears;
+            // it is at most one edit/LOD step behind for a few frames. Re-fired via
+            // LastMidMeshDeferredTiles until caught up.
             ++m_lastMidMeshDeferredTiles;
-        } else if (overRebuildBudget) {
-            // Re-centered/new tile with no reusable cache: defer entirely (brief mesh
-            // gap here, filled within a few frames as the budget drains).
-            ++m_lastMidMeshDeferredTiles;
-            continue;
         } else {
+            // Either under budget, OR a NEW tile with no reusable cache. A new tile must
+            // NOT be deferred (skipping it would punch a hole - there is no old patch to
+            // hold), so extract it immediately even if over budget. Only tiles that already
+            // have a drawable version are budget-deferred (the branch above).
         ++rebuiltThisBuild;
         tileReEmitted = true;
         const auto extractStart = std::chrono::steady_clock::now();
@@ -7404,8 +7413,10 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
 
         // Store this tile's freshly emitted faces in its cache, keyed by what they
         // depend on, so subsequent frames reuse them until the tile actually changes.
+        // MOVE (not copy) - tileFaces is not needed after this; downstream reads the
+        // persistent meshCacheFaces via emittedFaces.
         if (faceBudgetOk) {
-            tile.meshCacheFaces = tileFaces;
+            tile.meshCacheFaces = std::move(tileFaces);
             tile.meshCacheContentVersion = tile.meshContentVersion;
             tile.meshCacheMergeCells = mergeCells;
             tile.meshCacheChildMask = childMask;
@@ -7422,7 +7433,11 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         if (!faceBudgetOk) {
             return false;
         }
-        if (tileFaces.empty()) {
+        // emittedFaces references the tile's PERSISTENT cached faces (valid in every
+        // non-continue branch above: cache-hit/deferred leave it as-is, re-emit moved the
+        // fresh faces in). No per-tile copy. drawBatch.faces points at the same storage.
+        const std::vector<SparseSurfaceFace>& emittedFaces = tile.meshCacheFaces;
+        if (emittedFaces.empty()) {
             continue;
         }
 
@@ -7432,16 +7447,16 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             tile.record.coord.z
         };
         const uint32_t firstFace = static_cast<uint32_t>(outSnapshot.faces.size());
-        const uint32_t faceCount = static_cast<uint32_t>(tileFaces.size());
+        const uint32_t faceCount = static_cast<uint32_t>(emittedFaces.size());
         if (!skipFullAssembly) {
             // Full path: concatenate every tile's faces for StageSnapshot. Skipped on
             // primed dirty builds (drawBatch.faces points at the persistent cache instead).
             const auto assemblyStart = std::chrono::steady_clock::now();
-            outSnapshot.faces.insert(outSnapshot.faces.end(), tileFaces.begin(), tileFaces.end());
+            outSnapshot.faces.insert(outSnapshot.faces.end(), emittedFaces.begin(), emittedFaces.end());
             assemblyMsAccum +=
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - assemblyStart).count();
         }
-        const uint32_t directionMask = BuildSparseSurfaceDirectionMask(tileFaces);
+        const uint32_t directionMask = BuildSparseSurfaceDirectionMask(emittedFaces);
 
         SparseSurfaceBrickRange range;
         range.coord = coord;
@@ -7457,7 +7472,7 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         record.flags = range.flags;
         record.generation = m_heightDirtySerial;
         ComputeSparseSurfaceFaceBounds(
-            tileFaces.data(),
+            emittedFaces.data(),
             faceCount,
             &record.minX,
             &record.minY,

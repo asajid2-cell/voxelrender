@@ -244,6 +244,10 @@ struct SparseMidHeightSurfaceBuildConfig {
     // the ~150-290ms full-frontier rebuild into bounded per-frame chunks. The deferred
     // count is reported via LastMidMeshDeferredTiles() so the caller can re-fire.
     uint32_t maxRebuildTiles = 0;
+    // Per-build re-extraction TIME budget (ms). 0 = unlimited. Bounds the build spike
+    // from re-extracting many expensive fine/near tiles in one frame; deferred tiles with
+    // a reusable cache keep drawing stale faces (no hole), re-fired until caught up.
+    float maxRebuildMs = 0.0f;
     uint32_t terraceStep = 1;
     uint32_t lodBaseMerge = 1;
     uint32_t lodMaxMerge = 4;

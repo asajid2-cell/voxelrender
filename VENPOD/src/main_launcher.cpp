@@ -3348,15 +3348,20 @@ int RunSandbox(int argc, char* argv[]) {
             midMeshConfig.compactStableDrawCommands = sparseMidMeshIncrementalUpload;
             midMeshConfig.useGpuCull = false;
             if (sparseMidMeshIncrementalUpload) {
-                // Per-frame upload budget: a camera recenter dirties ~all tiles at once;
-                // without a budget StageDirtyPayloadSnapshot uploads the whole ~1M-face
-                // mesh in one frame (the spike). Cap faces/regions per frame so the
-                // recenter drains over a few cheap frames instead (re-fired via
-                // HasMidMeshDirtyPayload). Tunable; default ~256k faces / 192 tiles.
+                // NO per-frame upload budget by default. The self-time split proved the
+                // upload (stage+emit) is ~1.4ms even for the full ~1.1M-face buffer - it was
+                // NEVER the spike (the assembly was, now killed by skipFullAssembly). A budget
+                // here only DEFERS dirty tiles -> transient visibleMissing>0 (floor holes) on a
+                // recenter, with no perf benefit. Upload all dirty tiles each frame (no-hole).
+                // Default = full buffer capacity (never defer a dirty tile) so every dirty
+                // tile uploads the frame it's extracted -> visibleMissing stays 0 (no-hole).
+                // Env override exists for experiments only; 0 = full capacity (the default).
+                const uint32_t midUploadFaceBudget = ReadUIntEnv("VENPOD_MIDMESH_UPLOAD_FACE_BUDGET", 0u);
+                const uint32_t midUploadRegionBudget = ReadUIntEnv("VENPOD_MIDMESH_UPLOAD_REGION_BUDGET", 0u);
                 midMeshConfig.maxPayloadCopyFacesPerFrame =
-                    ReadUIntEnv("VENPOD_MIDMESH_UPLOAD_FACE_BUDGET", 256u * 1024u);
+                    (midUploadFaceBudget != 0u) ? midUploadFaceBudget : midMeshConfig.maxFaces;
                 midMeshConfig.maxPayloadCopyRegionsPerFrame =
-                    ReadUIntEnv("VENPOD_MIDMESH_UPLOAD_REGION_BUDGET", 192u);
+                    (midUploadRegionBudget != 0u) ? midUploadRegionBudget : midMeshConfig.maxDrawCommands;
             }
             auto midMeshGpuResult = sparseMidMeshGpuResources.Initialize(
                 device->GetDevice(),
@@ -16615,13 +16620,17 @@ int RunSandbox(int argc, char* argv[]) {
                 Simulation::SparseMidHeightSurfaceBuildConfig midMeshBuildConfig;
                 midMeshBuildConfig.maxFaces = sparseMidMeshMaxFaces;
                 midMeshBuildConfig.maxTiles = sparseMidMeshMaxTiles;
-                // Re-extraction budget stays opt-in (env): budgeting per-build re-emit
-                // would defer re-centered tiles and briefly drop them (transient floor
-                // holes during a recenter). The incremental path already skips the full
-                // faces re-assembly + budgets the UPLOAD, which is hole-free. Set
-                // VENPOD_SPARSE_MID_MESH_MAX_REBUILD_TILES>0 to also spread re-extraction
-                // (accepts brief holes for a lower peak).
                 midMeshBuildConfig.maxRebuildTiles = sparseMidMeshMaxRebuildTiles;
+                // No-hole re-extraction TIME budget: bound the per-build cost of re-meshing
+                // expensive fine/near tiles (the residual ~50-155ms spikes = a few tiles at
+                // 3-5ms each). Deferred tiles with a reusable cache keep drawing stale faces
+                // (no hole); new tiles still extract immediately. Re-fired until caught up.
+                // Incremental path only (the full path re-uploads everything anyway).
+                // 0 = unlimited. Env override: VENPOD_MIDMESH_REBUILD_MS.
+                midMeshBuildConfig.maxRebuildMs =
+                    sparseMidMeshIncrementalUpload
+                        ? static_cast<float>(ReadUIntEnv("VENPOD_MIDMESH_REBUILD_MS", 12u))
+                        : 0.0f;
                 midMeshBuildConfig.terraceStep = sparseMidMeshTerraceStep;
                 midMeshBuildConfig.lodEnabled = sparseMidMeshLodEnabled;
                 midMeshBuildConfig.lodBaseMerge = sparseMidMeshLodBaseMerge;
@@ -16700,14 +16709,25 @@ int RunSandbox(int argc, char* argv[]) {
                 const float midMeshStageEmitMs =
                     ticksToMs(SDL_GetPerformanceCounter() - midMeshStageEmitStart);
                 if (midMeshBuilt && enableRuntimeLog) {
+                    // No-hole coverage gate: every tile the build wants drawn (drawBatches)
+                    // must have a resident GPU range. visibleMissing>0 == a wanted tile has
+                    // no geometry == a floor hole. The invariant is visibleMissing==0.
+                    const auto& midMeshCovStats = sparseMidMeshGpuResources.GetStats();
+                    const uint32_t midMeshExpectedTiles =
+                        static_cast<uint32_t>(midMeshSnapshot.drawBatches.size());
+                    const uint32_t midMeshResidentTiles = midMeshCovStats.allocatedFaceRanges;
+                    const uint32_t midMeshVisibleMissing =
+                        midMeshExpectedTiles > midMeshResidentTiles
+                            ? midMeshExpectedTiles - midMeshResidentTiles
+                            : 0u;
                     spdlog::info(
-                        "MIDMESH_SELFTIME frame={} buildMs={:.2f} stageEmitMs={:.2f} upload={} faces={} dirtyTiles={} removedTiles={} drawBatches={} dirtyReject={}",
+                        "MIDMESH_SELFTIME frame={} buildMs={:.2f} stageEmitMs={:.2f} upload={} faces={} dirtyTiles={} removedTiles={} drawBatches={} resident={} visibleMissing={} dirtyReject={}",
                         frameCount, midMeshBuildMs, midMeshStageEmitMs,
                         midMeshEmitted ? (midMeshDirtyUpload ? "dirty" : "full") : "none",
                         static_cast<uint32_t>(midMeshSnapshot.faces.size()),
                         static_cast<uint32_t>(midMeshSnapshot.dirtyBricks.size()),
                         static_cast<uint32_t>(midMeshSnapshot.removedBricks.size()),
-                        static_cast<uint32_t>(midMeshSnapshot.drawBatches.size()),
+                        midMeshExpectedTiles, midMeshResidentTiles, midMeshVisibleMissing,
                         sparseMidMeshIncrementalUpload
                             ? sparseMidMeshGpuResources.LastDirtyStageRejectReason()
                             : "off");
