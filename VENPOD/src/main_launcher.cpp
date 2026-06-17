@@ -16654,8 +16654,14 @@ int RunSandbox(int argc, char* argv[]) {
                 midMeshBuildConfig.emitDirtyPayload = sparseMidMeshIncrementalUpload;
                 // Split the chain so a failure names the stage that rejected it and the
                 // snapshot's counts-vs-caps -> the replay log pins the exact overflow cap.
+                // Throttle-robust timing split: BUILD self-time is pure CPU; STAGE+EMIT
+                // absorbs upload-ring/fence waits that the headless present-throttle
+                // inflates. If build is small on a "spike" frame, the spike is wait, not CPU.
+                const uint64_t midMeshBuildStart = SDL_GetPerformanceCounter();
                 const bool midMeshBuilt =
                     sparseClipmapTileCache.BuildMidHeightSurfaceSnapshot(midMeshSnapshot, midMeshBuildConfig);
+                const float midMeshBuildMs = ticksToMs(SDL_GetPerformanceCounter() - midMeshBuildStart);
+                const uint64_t midMeshStageEmitStart = SDL_GetPerformanceCounter();
                 // P1.5: prefer the incremental dirty-payload upload (only re-extracted
                 // tiles); fall back to the full StageSnapshot when it can't apply (first
                 // upload before the GPU mirrors are primed, or nothing dirty resolves a
@@ -16690,6 +16696,17 @@ int RunSandbox(int argc, char* argv[]) {
                         // The full upload re-seeded the whole GPU buffer; all dirty covered.
                         sparseClipmapTileCache.AckMidMeshDirtyUploadAll();
                     }
+                }
+                const float midMeshStageEmitMs =
+                    ticksToMs(SDL_GetPerformanceCounter() - midMeshStageEmitStart);
+                if (midMeshBuilt && enableRuntimeLog) {
+                    spdlog::info(
+                        "MIDMESH_SELFTIME frame={} buildMs={:.2f} stageEmitMs={:.2f} upload={} faces={} dirtyTiles={} drawBatches={}",
+                        frameCount, midMeshBuildMs, midMeshStageEmitMs,
+                        midMeshEmitted ? (midMeshDirtyUpload ? "dirty" : "full") : "none",
+                        static_cast<uint32_t>(midMeshSnapshot.faces.size()),
+                        static_cast<uint32_t>(midMeshSnapshot.dirtyBricks.size()),
+                        static_cast<uint32_t>(midMeshSnapshot.drawBatches.size()));
                 }
                 (void)midMeshDirtyUpload;
                 if (midMeshEmitted) {
