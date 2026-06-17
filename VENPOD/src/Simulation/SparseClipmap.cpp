@@ -6744,6 +6744,11 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     // RECENTER (slot's world origin/ring changed), LOD (mergeCells flip at same world
     // location), CONTENT (edit/stream regen), CHILD (finer-ring residency), BUILDVER.
     uint32_t missNew = 0, missRecenter = 0, missLod = 0, missContent = 0, missChild = 0, missBuildVer = 0;
+    // Granular build self-time split (the 48ms build's composition): per-tile re-emission
+    // (extract) vs the full-snapshot faces concat (assembly). Pinpoints whether
+    // skipFullAssembly (removing the concat) or extraction is the dominant build cost.
+    double extractMsAccum = 0.0;
+    double assemblyMsAccum = 0.0;
 
     struct SurfaceBlock {
         bool present = false;
@@ -7118,6 +7123,7 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         } else {
         ++rebuiltThisBuild;
         tileReEmitted = true;
+        const auto extractStart = std::chrono::steady_clock::now();
         const uint32_t blockCountPerAxis = (cellCount + mergeCells - 1u) / mergeCells;
         tileFaces.reserve(static_cast<size_t>(blockCountPerAxis) * static_cast<size_t>(blockCountPerAxis) * 3u);
 
@@ -7409,6 +7415,8 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             tile.meshCacheRing = tile.record.coord.ring;
             tile.meshCacheValid = true;
         }
+        extractMsAccum +=
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - extractStart).count();
         } // end cache-miss emission (meshCacheHit ? reuse : emit)
 
         if (!faceBudgetOk) {
@@ -7428,7 +7436,10 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         if (!skipFullAssembly) {
             // Full path: concatenate every tile's faces for StageSnapshot. Skipped on
             // primed dirty builds (drawBatch.faces points at the persistent cache instead).
+            const auto assemblyStart = std::chrono::steady_clock::now();
             outSnapshot.faces.insert(outSnapshot.faces.end(), tileFaces.begin(), tileFaces.end());
+            assemblyMsAccum +=
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - assemblyStart).count();
         }
         const uint32_t directionMask = BuildSparseSurfaceDirectionMask(tileFaces);
 
@@ -7542,8 +7553,8 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     }
     if (rebuiltThisBuild > 0u || missNew + missRecenter + missLod + missContent + missChild + missBuildVer > 0u) {
         spdlog::info(
-            "MIDMESH_MISS_CAUSE emitted={} reExtract={} miss=new/recenter/lod/content/child/buildver:{}/{}/{}/{}/{}/{}",
-            emittedTiles, rebuiltThisBuild,
+            "MIDMESH_MISS_CAUSE emitted={} reExtract={} extractMs={:.2f} assemblyMs={:.2f} skipAssembly={} miss=new/recenter/lod/content/child/buildver:{}/{}/{}/{}/{}/{}",
+            emittedTiles, rebuiltThisBuild, extractMsAccum, assemblyMsAccum, skipFullAssembly ? 1 : 0,
             missNew, missRecenter, missLod, missContent, missChild, missBuildVer);
     }
     return true;
