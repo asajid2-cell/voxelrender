@@ -1006,20 +1006,26 @@ bool SparseSurfaceGpuResources::StageDirtyPayloadSnapshot(
     if (outTicket) {
         *outTicket = {};
     }
-    if (!m_stats.initialized ||
-        !m_config.useRangeAllocator ||
-        m_activeUploadSlot >= m_config.uploadRingSlots ||
-        (snapshot.dirtyBricks.empty() && snapshot.removedBricks.empty()) ||
-        m_rangeMirror.empty() ||
-        m_drawArgsMirror.empty() ||
-        m_surfaceRecordMirror.empty() ||
-        m_surfaceClusterMirror.empty() ||
-        !m_config.useFixedRangeTable ||
-        !m_config.useStableDrawSlots ||
-        !m_config.compactStableDrawCommands ||
-        snapshot.serial == 0u) {
+    // Record exactly which precondition rejects a dirty stage so callers (mid-mesh)
+    // can log it instead of guessing why they fall back to a full StageSnapshot.
+    const char* rejectReason = nullptr;
+    if (!m_stats.initialized) rejectReason = "not-initialized";
+    else if (!m_config.useRangeAllocator) rejectReason = "no-range-allocator";
+    else if (m_activeUploadSlot >= m_config.uploadRingSlots) rejectReason = "no-upload-slot";
+    else if (snapshot.dirtyBricks.empty() && snapshot.removedBricks.empty()) rejectReason = "nothing-dirty";
+    else if (m_rangeMirror.empty()) rejectReason = "range-mirror-empty(unprimed)";
+    else if (m_drawArgsMirror.empty()) rejectReason = "drawargs-mirror-empty(unprimed)";
+    else if (m_surfaceRecordMirror.empty()) rejectReason = "record-mirror-empty(unprimed)";
+    else if (m_surfaceClusterMirror.empty()) rejectReason = "cluster-mirror-empty(unprimed)";
+    else if (!m_config.useFixedRangeTable) rejectReason = "no-fixed-range-table";
+    else if (!m_config.useStableDrawSlots) rejectReason = "no-stable-draw-slots";
+    else if (!m_config.compactStableDrawCommands) rejectReason = "no-compact-draw";
+    else if (snapshot.serial == 0u) rejectReason = "serial-zero";
+    if (rejectReason != nullptr) {
+        m_lastDirtyStageRejectReason = rejectReason;
         return false;
     }
+    m_lastDirtyStageRejectReason = "accepted";
 
     UploadBuffer& upload = m_uploadRing[m_activeUploadSlot];
     uint8_t* mapped = static_cast<uint8_t*>(upload.GetMappedData());

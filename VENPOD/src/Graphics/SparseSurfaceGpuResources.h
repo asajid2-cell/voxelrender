@@ -470,6 +470,9 @@ public:
 
     bool IsInitialized() const { return m_stats.initialized; }
     const SparseSurfaceGpuStats& GetStats() const { return m_stats; }
+    // Why the last StageDirtyPayloadSnapshot rejected (or "accepted"). Lets the mid-mesh
+    // caller log exactly which precondition forced a full-StageSnapshot fallback.
+    const char* LastDirtyStageRejectReason() const { return m_lastDirtyStageRejectReason; }
     const DescriptorHandle& FaceBufferSRV() const { return m_faceBuffer.GetShaderVisibleSRV(); }
     const DescriptorHandle& RangeBufferSRV() const { return m_rangeBuffer.GetShaderVisibleSRV(); }
     const DescriptorHandle& SurfaceRecordSRV() const { return m_surfaceRecordBuffer.GetShaderVisibleSRV(); }
@@ -509,6 +512,7 @@ private:
 
     SparseSurfaceGpuConfig m_config;
     SparseSurfaceGpuStats m_stats;
+    const char* m_lastDirtyStageRejectReason = "none";
     GPUBuffer m_faceBuffer;
     GPUBuffer m_rangeBuffer;
     GPUBuffer m_drawArgsBuffer;

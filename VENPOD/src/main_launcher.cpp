@@ -16701,12 +16701,16 @@ int RunSandbox(int argc, char* argv[]) {
                     ticksToMs(SDL_GetPerformanceCounter() - midMeshStageEmitStart);
                 if (midMeshBuilt && enableRuntimeLog) {
                     spdlog::info(
-                        "MIDMESH_SELFTIME frame={} buildMs={:.2f} stageEmitMs={:.2f} upload={} faces={} dirtyTiles={} drawBatches={}",
+                        "MIDMESH_SELFTIME frame={} buildMs={:.2f} stageEmitMs={:.2f} upload={} faces={} dirtyTiles={} removedTiles={} drawBatches={} dirtyReject={}",
                         frameCount, midMeshBuildMs, midMeshStageEmitMs,
                         midMeshEmitted ? (midMeshDirtyUpload ? "dirty" : "full") : "none",
                         static_cast<uint32_t>(midMeshSnapshot.faces.size()),
                         static_cast<uint32_t>(midMeshSnapshot.dirtyBricks.size()),
-                        static_cast<uint32_t>(midMeshSnapshot.drawBatches.size()));
+                        static_cast<uint32_t>(midMeshSnapshot.removedBricks.size()),
+                        static_cast<uint32_t>(midMeshSnapshot.drawBatches.size()),
+                        sparseMidMeshIncrementalUpload
+                            ? sparseMidMeshGpuResources.LastDirtyStageRejectReason()
+                            : "off");
                 }
                 (void)midMeshDirtyUpload;
                 if (midMeshEmitted) {
