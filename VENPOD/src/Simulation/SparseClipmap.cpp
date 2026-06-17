@@ -6740,6 +6740,10 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     // assembles so the full StageSnapshot can prime the GPU mirrors.
     const bool skipFullAssembly =
         buildConfig.emitDirtyPayload && !m_midMeshEmittedCoords.empty();
+    // Cache-miss cause counters (instrument the re-extraction churn source): NEW tile,
+    // RECENTER (slot's world origin/ring changed), LOD (mergeCells flip at same world
+    // location), CONTENT (edit/stream regen), CHILD (finer-ring residency), BUILDVER.
+    uint32_t missNew = 0, missRecenter = 0, missLod = 0, missContent = 0, missChild = 0, missBuildVer = 0;
 
     struct SurfaceBlock {
         bool present = false;
@@ -7083,6 +7087,22 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             tile.meshCacheRing == tile.record.coord.ring;
         const bool overRebuildBudget =
             maxRebuildTiles != 0u && rebuiltThisBuild >= maxRebuildTiles;
+        if (!meshCacheHit) {
+            // Categorize the miss by FIRST-priority cause (so we know what drives churn).
+            if (!tile.meshCacheValid) {
+                ++missNew;
+            } else if (!cacheSameLocation) {
+                ++missRecenter;
+            } else if (tile.meshCacheContentVersion != tile.meshContentVersion) {
+                ++missContent;
+            } else if (tile.meshCacheMergeCells != mergeCells) {
+                ++missLod;
+            } else if (tile.meshCacheChildMask != childMask) {
+                ++missChild;
+            } else {
+                ++missBuildVer;
+            }
+        }
         if (meshCacheHit) {
             tileFaces = tile.meshCacheFaces;
         } else if (overRebuildBudget && cacheSameLocation) {
@@ -7519,6 +7539,12 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             }
         }
         m_midMeshEmittedCoords = std::move(emittedThisBuild);
+    }
+    if (rebuiltThisBuild > 0u || missNew + missRecenter + missLod + missContent + missChild + missBuildVer > 0u) {
+        spdlog::info(
+            "MIDMESH_MISS_CAUSE emitted={} reExtract={} miss=new/recenter/lod/content/child/buildver:{}/{}/{}/{}/{}/{}",
+            emittedTiles, rebuiltThisBuild,
+            missNew, missRecenter, missLod, missContent, missChild, missBuildVer);
     }
     return true;
 }
