@@ -76,3 +76,38 @@ BrickCoord for the existing per-brick snapshot/range machinery).
     throttle and run per-frame.
   - clipInterest ~19ms/frame during EDITING is now the editing bottleneck (the
     mid-VOXEL clipmap interest scan) — separate system from the mesh.
+
+## P1.5 — incremental UPLOAD (precise, fully scoped 2026-06-17)
+Measured: 429/454 build-path frames <1ms (P1 cache working), but 17 frames >20ms (up to
+~325ms headless) = the full BuildMidHeightSurfaceSnapshot re-assembly + StageSnapshot (FULL
+upload) firing on edit / camera-recenter / stream. These are the remaining p99/max spikes.
+
+Mechanism gap: mid-mesh uses StageSnapshot (full); near-surface uses StageDirtyPayloadSnapshot
+(incremental). Both take the SAME SparseSurfaceGpuSnapshot. The snapshot struct ALREADY has the
+incremental fields (ranges, drawArgs, drawBatches, surfaceRecords, brickFaceCounts, dirtyBricks,
+removedBricks, serial). RenderSparseSurfaceFaces ALREADY supports the range/indirect draw (near
+passes range SRVs; mid passes nullptr -> linear). So the machinery exists; mid-mesh is just not
+wired to it. The blocker: mid-mesh GPU resource is initialized with the range allocator DISABLED
+(main_launcher.cpp:3336-3340) and the build emits only a flat faces vector.
+
+Cross-cutting change (all flip together behind VENPOD_MIDMESH_INCREMENTAL_UPLOAD, default OFF so the
+shipped full path is untouched until visual parity is proven):
+1. CONFIG (main_launcher.cpp:3336-3340): when toggle on, set midMeshConfig.useRangeAllocator /
+   useFixedRangeTable / useStableDrawSlots / compactStableDrawCommands = true (maxBrickRanges must be
+   power-of-two per the IsSparseSurfaceGpuPowerOfTwo assert).
+2. BUILD EMISSION (BuildMidHeightSurfaceSnapshot, SparseClipmap.cpp): per emitted tile, emit a
+   SparseSurfaceBrickRange + drawArg/drawBatch + brickFaceCount keyed by a SYNTHETIC BrickCoord
+   (disjoint from real bricks via ring bits, per the existing risk note) + a dirtyBricks entry
+   {coord, serial} for tiles that RE-EXTRACTED this build (the per-tile cache already knows
+   dirty-vs-cached) + removedBricks for evicted tiles + a monotonic outSnapshot.serial. Mirror the
+   near-surface builder at SparseSurfaceCache.cpp:1087-1100. The per-tile face cache must hold a
+   STABLE synthetic coord per tile slot so ranges persist across builds.
+3. UPLOAD (main_launcher.cpp:16629): toggle on -> StageDirtyPayloadSnapshot (fallback to
+   StageSnapshot if it returns false, e.g. first build / full rebuild).
+4. DRAW (main_launcher.cpp:21329): toggle on -> pass sparseMidMeshGpuResources.RangeBufferSRV() +
+   uploadedRanges + uploadedRangeTableCapacity to RenderSparseSurfaceFaces (the indirect path),
+   instead of nullptr/0.
+VALIDATE: headless = tests 28 + toggle-off byte-identical + toggle-on uploadedFaces/per-tile face
+counts match the full path (geometry parity) + midMeshUpload spikes gone + no crash. FINAL = GPU
+visual eyeball of the terrain floor at ground + altitude (the mesh is minDistance-0 floor; needs a
+real view, can't be fully self-served headless).
