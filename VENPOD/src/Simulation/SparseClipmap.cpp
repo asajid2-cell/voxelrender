@@ -6943,221 +6943,25 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         (buildConfig.lodEnabled ? (1u << 28) : 0u) |
         (buildConfig.emitWater ? (1u << 29) : 0u);
 
-    for (uint32_t tileSlot = 0; tileSlot < static_cast<uint32_t>(m_tiles.size()); ++tileSlot) {
-        if (emittedTiles >= effectiveMaxTiles) {
-            break;
-        }
-        TilePayload& tile = m_tiles[tileSlot];
-        if (tile.record.slot == UINT32_MAX ||
-            tile.packedSamples.size() < sampleCount ||
-            tile.record.cellSize <= 0.0f) {
-            continue;
-        }
-
-        const uint32_t cellSize = static_cast<uint32_t>(std::max(
-            1,
-            RoundToInt32Clamped(tile.record.cellSize)));
-        const uint32_t tileWorldSize = cellSize * cellCount;
-        // L7 GIANT-CUBE FIX part 1 — DISTANCE-based LOD merge (was ring-based): a
-        // coarse-ring tile near the camera used to get merge 2-4 on 32-64u cells ->
-        // 64-128u monolith quads right in the player's view (user-confirmed). Merge by
-        // the tile's actual camera distance instead: full detail close, coarser only
-        // where quads are small on screen. (Global merge-1 measured 1.4M faces / ~26fps
-        // -> distance-scoped keeps the budget.)
-        const float tileCenterX = static_cast<float>(tile.record.originX) + static_cast<float>(tileWorldSize) * 0.5f;
-        const float tileCenterZ = static_cast<float>(tile.record.originZ) + static_cast<float>(tileWorldSize) * 0.5f;
-        const float tileCamDx = tileCenterX - buildConfig.cameraX;
-        const float tileCamDz = tileCenterZ - buildConfig.cameraZ;
-        const float tileCamDist = std::sqrt(tileCamDx * tileCamDx + tileCamDz * tileCamDz) -
-            static_cast<float>(tileWorldSize) * 0.70711f;
-        // Unified rule: cap the merged QUAD'S WORLD SIZE by distance — that is the
-        // actual visual criterion ("no giant cubes"). Coarse rings (32-64u cells)
-        // therefore stop merging until far out (kills the far-waterline slab walls
-        // the judge flagged at 3-7km), while fine rings merge MORE at distance
-        // (4-8u cells -> up to 32-64u quads there), which pays the face bill back.
-        uint32_t mergeCells = 1u;
-        if (buildConfig.lodEnabled) {
-            const float maxQuadWorld =
-                tileCamDist <= 2200.0f ? static_cast<float>(cellSize)
-                : (tileCamDist <= 5000.0f ? 32.0f : 64.0f);
-            mergeCells = static_cast<uint32_t>(std::max(
-                1.0f, maxQuadWorld / static_cast<float>(cellSize)));
-            // SLOPE-AWARE refinement (judge-flagged): the footprint cap bounds quad
-            // WIDTH, but on a steep waterline cliff the terrace RISERS of merged
-            // columns stack into one giant flat wall (64u x 200u slabs at 5-9km).
-            // Tiles with a large height range get finer merge so far cliffs step
-            // like voxel terraces; flat tiles keep the cheap coarse quads.
-            if (mergeCells > 1u) {
-                // The height range is a function of the tile's samples only, so cache it
-                // keyed by content version - this scan ran on every LOD-merged tile every
-                // build (a chunk of the per-tile-loop cost) though the result rarely changes.
-                if (tile.meshCacheRangeVersion != tile.meshContentVersion) {
-                    int32_t scanMinY = std::numeric_limits<int32_t>::max();
-                    int32_t scanMaxY = std::numeric_limits<int32_t>::min();
-                    for (uint32_t s = 0; s < sampleCount; s += 7u) {
-                        const uint32_t sample = tile.packedSamples[s];
-                        if (UnpackMidHeightSurfaceSampleMaterial(sample) == Utils::Material::Air) {
-                            continue;
-                        }
-                        const int32_t sy = UnpackMidHeightSurfaceSampleY(sample);
-                        scanMinY = std::min(scanMinY, sy);
-                        scanMaxY = std::max(scanMaxY, sy);
-                    }
-                    tile.meshCacheRangeMinY = scanMinY;
-                    tile.meshCacheRangeMaxY = scanMaxY;
-                    tile.meshCacheRangeVersion = tile.meshContentVersion;
-                }
-                const int32_t tileMinY = tile.meshCacheRangeMinY;
-                const int32_t tileMaxY = tile.meshCacheRangeMaxY;
-                if (tileMinY <= tileMaxY) {
-                    const int32_t tileRange = tileMaxY - tileMinY;
-                    if (tileRange > 192) {
-                        mergeCells = 1u;
-                    } else if (tileRange > 96) {
-                        mergeCells = std::max(1u, mergeCells / 2u);
-                    }
-                }
-            }
-        }
-        mergeCells = std::clamp(mergeCells, 1u, cellCount);
-        if (blockCullBounds(
-                tile.record.originX,
-                tile.record.originZ,
-                tileWorldSize,
-                tileWorldSize)) {
-            continue;
-        }
-        // L7 GIANT-CUBE FIX part 2 — RESIDENT-AWARE FINER-COVERAGE SUPPRESSION: the
-        // build iterates ALL resident tiles of ALL rings with one global distance cull,
-        // so a stale coarse-ring tile legally drew its giant quantized quads (and
-        // sea-level skirts / water fills) INSIDE the band a finer ring owns — until an
-        // edit invalidated it ("turns to real voxels when we edit", the user's clue).
-        // Rule (hole-free by construction): suppress a block only where the FINER ring's
-        // child tile is RESIDENT with samples — that child renders the same footprint
-        // itself. Child coord math: ringGrowthFactor=2 + tileWorldSize=cell*(side-1)
-        // means ring r tile (x,z) covers exactly children (2x+dx, 2z+dz) at ring r-1
-        // (the voxel-brick analog HasCompleteFinerVoxelCoverage uses the same 2:1 map).
-        bool childResident[4] = { false, false, false, false };
-        bool anyChildResident = false;
-        // The 2:1 child map is only valid when rings double (the default). With a
-        // non-2 growth factor, skip suppression (correct but allows overlap again)
-        // rather than suppress the wrong area (which would make holes).
-        const bool finerSuppressionValid =
-            std::abs(m_config.ringGrowthFactor - 2.0f) < 0.01f;
-        if (finerSuppressionValid && tile.record.coord.ring > 0) {
-            for (int32_t dz = 0; dz <= 1; ++dz) {
-                for (int32_t dx = 0; dx <= 1; ++dx) {
-                    const SparseClipmapTileCoord childCoord{
-                        tile.record.coord.ring - 1,
-                        SaturatingAddInt32(tile.record.coord.x, tile.record.coord.x) + dx,
-                        SaturatingAddInt32(tile.record.coord.z, tile.record.coord.z) + dz
-                    };
-                    const auto childIt = m_slotByCoord.find(childCoord);
-                    if (childIt != m_slotByCoord.end() &&
-                        childIt->second < m_tiles.size()) {
-                        const TilePayload& childTile = m_tiles[childIt->second];
-                        // Defensive slot validation: only trust the coord->slot mapping
-                        // when the slot still holds THIS coord. (Audit showed eviction
-                        // erases mappings promptly, so this is hardening, not a fix —
-                        // the round-3 band bug was the altitude annulus in the min
-                        // distance, handled above.)
-                        if (childTile.record.slot != UINT32_MAX &&
-                            childTile.record.coord == childCoord &&
-                            childTile.packedSamples.size() >= sampleCount) {
-                            childResident[dz * 2 + dx] = true;
-                            anyChildResident = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        // ===== INCREMENTAL MID-MESH: per-tile face cache =====
-        // Reuse this tile's previously emitted faces unless something that affects
-        // them changed: content (edit/stream/regen bump meshContentVersion), the
-        // camera-distance LOD (mergeCells), finer-ring child residency (childMask),
-        // the build config, or the tile slot being re-centered to a new coord. A hit
-        // skips the expensive per-cell emission below - so only changed tiles cost
-        // anything, instead of rebuilding the whole ~1.5M-face monolith every frame.
+    // ===== PER-TILE EXTRACTION (factored for parallelism) =====
+    // Re-extract one tile's mid-mesh faces into its persistent meshCacheFaces. Reads
+    // only `tile.packedSamples` + shared read-only build config; writes only this
+    // tile's meshCache* fields. Returns the face-budget OK flag (false => the global
+    // face cap was hit mid-tile, an abort signal). This is the dominant residual cost
+    // (~3.75ms for a fine/near tile), so the primed-dirty pre-pass runs it across
+    // worker threads (distinct tiles => no shared writes). The per-tile LOD lambdas
+    // (sampleAt/cellWorldX/cellWorldZ/aggregateSamples) live INSIDE so each invocation
+    // is self-contained and thread-safe. The extract TIMER + dirty/defer bookkeeping
+    // stay in the CALLER (they touch per-build accumulators, not per-tile state).
+    auto extractTileMesh = [&](
+        TilePayload& tile,
+        uint32_t mergeCells,
+        uint32_t childMask,
+        bool anyChildResident,
+        const bool* childResident,
+        uint32_t cellSize) -> bool
+    {
         std::vector<SparseSurfaceFace> tileFaces;
-        bool faceBudgetOk = true;
-        bool tileReEmitted = false;  // P1.5: this tile re-extracted (faces changed) this build
-        const uint32_t childMask =
-            (childResident[0] ? 1u : 0u) | (childResident[1] ? 2u : 0u) |
-            (childResident[2] ? 4u : 0u) | (childResident[3] ? 8u : 0u);
-        const bool meshCacheHit =
-            tile.meshCacheValid &&
-            tile.meshCacheContentVersion == tile.meshContentVersion &&
-            tile.meshCacheMergeCells == mergeCells &&
-            tile.meshCacheChildMask == childMask &&
-            tile.meshCacheBuildVersion == midMeshBuildVersion &&
-            tile.meshCacheOriginX == tile.record.originX &&
-            tile.meshCacheOriginZ == tile.record.originZ &&
-            tile.meshCacheRing == tile.record.coord.ring;
-        // A tile whose cached faces are for the SAME world location (origin/ring) but a
-        // stale content/LOD key can safely reuse those faces for one more frame — the
-        // mesh is just briefly behind. A re-centered/new tile cannot (its cache is for a
-        // different location), so it must rebuild or be skipped (brief frontier hole).
-        const bool cacheSameLocation =
-            tile.meshCacheValid &&
-            tile.meshCacheOriginX == tile.record.originX &&
-            tile.meshCacheOriginZ == tile.record.originZ &&
-            tile.meshCacheRing == tile.record.coord.ring;
-        // Over budget when this build has spent its re-extraction tile OR time budget.
-        // Time-based bounds the actual cost (a fine near tile costs ~3-5ms, a coarse far
-        // tile ~0.1ms, so a tile count is a poor cost proxy).
-        const bool overRebuildBudget =
-            (maxRebuildTiles != 0u && rebuiltThisBuild >= maxRebuildTiles) ||
-            (buildConfig.maxRebuildMs > 0.0f &&
-             extractMsAccum >= static_cast<double>(buildConfig.maxRebuildMs));
-        if (!meshCacheHit) {
-            // Categorize the miss by FIRST-priority cause (so we know what drives churn).
-            if (!tile.meshCacheValid) {
-                ++missNew;
-            } else if (!cacheSameLocation) {
-                ++missRecenter;
-            } else if (tile.meshCacheContentVersion != tile.meshContentVersion) {
-                ++missContent;
-            } else if (tile.meshCacheMergeCells != mergeCells) {
-                ++missLod;
-            } else if (tile.meshCacheChildMask != childMask) {
-                ++missChild;
-            } else {
-                ++missBuildVer;
-            }
-        }
-        if (meshCacheHit) {
-            // Reuse the persistent cached faces directly (emittedFaces below references
-            // tile.meshCacheFaces) - do NOT copy them into a local vector. The dirty path
-            // never assembles a global face vector, so copying ~4600 faces here per cached
-            // tile, every build, was pure waste (the residual build spike).
-        } else if (overRebuildBudget && cacheSameLocation) {
-            // NO-HOLE deferral: over the per-build budget AND this tile has a same-location
-            // cached version -> keep drawing its stale faces (emittedFaces references them)
-            // and defer the expensive re-emit to a later build. The floor never disappears;
-            // it is at most one edit/LOD step behind for a few frames. Re-fired via
-            // LastMidMeshDeferredTiles until caught up.
-            ++m_lastMidMeshDeferredTiles;
-            // Track how long this tile has been drawing stale faces (stale age / edit lag).
-            {
-                const BrickCoord deferCoord{
-                    tile.record.coord.x, tile.record.coord.ring, tile.record.coord.z};
-                m_midMeshTileDeferredSince.emplace(deferCoord, m_midMeshBuildCounter);
-            }
-        } else {
-            // Either under budget, OR a NEW tile with no reusable cache. A new tile must
-            // NOT be deferred (skipping it would punch a hole - there is no old patch to
-            // hold), so extract it immediately even if over budget. Only tiles that already
-            // have a drawable version are budget-deferred (the branch above).
-        ++rebuiltThisBuild;
-        tileReEmitted = true;
-        // This tile is re-extracting now: it is no longer pending/stale.
-        {
-            const BrickCoord reExtractCoord{
-                tile.record.coord.x, tile.record.coord.ring, tile.record.coord.z};
-            m_midMeshTileDeferredSince.erase(reExtractCoord);
-        }
-        const auto extractStart = std::chrono::steady_clock::now();
         const uint32_t blockCountPerAxis = (cellCount + mergeCells - 1u) / mergeCells;
         tileFaces.reserve(static_cast<size_t>(blockCountPerAxis) * static_cast<size_t>(blockCountPerAxis) * 3u);
 
@@ -7244,7 +7048,7 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             return block;
         };
 
-        faceBudgetOk = true;
+        bool faceBudgetOk = true;
         for (uint32_t z = 0; z < cellCount && faceBudgetOk; z += mergeCells) {
             const uint32_t zEnd = std::min(cellCount, z + mergeCells);
             for (uint32_t x = 0; x < cellCount && faceBudgetOk; x += mergeCells) {
@@ -7460,6 +7264,227 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             tile.meshCacheRing = tile.record.coord.ring;
             tile.meshCacheValid = true;
         }
+        return faceBudgetOk;
+    };
+
+    for (uint32_t tileSlot = 0; tileSlot < static_cast<uint32_t>(m_tiles.size()); ++tileSlot) {
+        if (emittedTiles >= effectiveMaxTiles) {
+            break;
+        }
+        TilePayload& tile = m_tiles[tileSlot];
+        if (tile.record.slot == UINT32_MAX ||
+            tile.packedSamples.size() < sampleCount ||
+            tile.record.cellSize <= 0.0f) {
+            continue;
+        }
+
+        const uint32_t cellSize = static_cast<uint32_t>(std::max(
+            1,
+            RoundToInt32Clamped(tile.record.cellSize)));
+        const uint32_t tileWorldSize = cellSize * cellCount;
+        // L7 GIANT-CUBE FIX part 1 — DISTANCE-based LOD merge (was ring-based): a
+        // coarse-ring tile near the camera used to get merge 2-4 on 32-64u cells ->
+        // 64-128u monolith quads right in the player's view (user-confirmed). Merge by
+        // the tile's actual camera distance instead: full detail close, coarser only
+        // where quads are small on screen. (Global merge-1 measured 1.4M faces / ~26fps
+        // -> distance-scoped keeps the budget.)
+        const float tileCenterX = static_cast<float>(tile.record.originX) + static_cast<float>(tileWorldSize) * 0.5f;
+        const float tileCenterZ = static_cast<float>(tile.record.originZ) + static_cast<float>(tileWorldSize) * 0.5f;
+        const float tileCamDx = tileCenterX - buildConfig.cameraX;
+        const float tileCamDz = tileCenterZ - buildConfig.cameraZ;
+        const float tileCamDist = std::sqrt(tileCamDx * tileCamDx + tileCamDz * tileCamDz) -
+            static_cast<float>(tileWorldSize) * 0.70711f;
+        // Unified rule: cap the merged QUAD'S WORLD SIZE by distance — that is the
+        // actual visual criterion ("no giant cubes"). Coarse rings (32-64u cells)
+        // therefore stop merging until far out (kills the far-waterline slab walls
+        // the judge flagged at 3-7km), while fine rings merge MORE at distance
+        // (4-8u cells -> up to 32-64u quads there), which pays the face bill back.
+        uint32_t mergeCells = 1u;
+        if (buildConfig.lodEnabled) {
+            const float maxQuadWorld =
+                tileCamDist <= 2200.0f ? static_cast<float>(cellSize)
+                : (tileCamDist <= 5000.0f ? 32.0f : 64.0f);
+            mergeCells = static_cast<uint32_t>(std::max(
+                1.0f, maxQuadWorld / static_cast<float>(cellSize)));
+            // SLOPE-AWARE refinement (judge-flagged): the footprint cap bounds quad
+            // WIDTH, but on a steep waterline cliff the terrace RISERS of merged
+            // columns stack into one giant flat wall (64u x 200u slabs at 5-9km).
+            // Tiles with a large height range get finer merge so far cliffs step
+            // like voxel terraces; flat tiles keep the cheap coarse quads.
+            if (mergeCells > 1u) {
+                // The height range is a function of the tile's samples only, so cache it
+                // keyed by content version - this scan ran on every LOD-merged tile every
+                // build (a chunk of the per-tile-loop cost) though the result rarely changes.
+                if (tile.meshCacheRangeVersion != tile.meshContentVersion) {
+                    int32_t scanMinY = std::numeric_limits<int32_t>::max();
+                    int32_t scanMaxY = std::numeric_limits<int32_t>::min();
+                    for (uint32_t s = 0; s < sampleCount; s += 7u) {
+                        const uint32_t sample = tile.packedSamples[s];
+                        if (UnpackMidHeightSurfaceSampleMaterial(sample) == Utils::Material::Air) {
+                            continue;
+                        }
+                        const int32_t sy = UnpackMidHeightSurfaceSampleY(sample);
+                        scanMinY = std::min(scanMinY, sy);
+                        scanMaxY = std::max(scanMaxY, sy);
+                    }
+                    tile.meshCacheRangeMinY = scanMinY;
+                    tile.meshCacheRangeMaxY = scanMaxY;
+                    tile.meshCacheRangeVersion = tile.meshContentVersion;
+                }
+                const int32_t tileMinY = tile.meshCacheRangeMinY;
+                const int32_t tileMaxY = tile.meshCacheRangeMaxY;
+                if (tileMinY <= tileMaxY) {
+                    const int32_t tileRange = tileMaxY - tileMinY;
+                    if (tileRange > 192) {
+                        mergeCells = 1u;
+                    } else if (tileRange > 96) {
+                        mergeCells = std::max(1u, mergeCells / 2u);
+                    }
+                }
+            }
+        }
+        mergeCells = std::clamp(mergeCells, 1u, cellCount);
+        if (blockCullBounds(
+                tile.record.originX,
+                tile.record.originZ,
+                tileWorldSize,
+                tileWorldSize)) {
+            continue;
+        }
+        // L7 GIANT-CUBE FIX part 2 — RESIDENT-AWARE FINER-COVERAGE SUPPRESSION: the
+        // build iterates ALL resident tiles of ALL rings with one global distance cull,
+        // so a stale coarse-ring tile legally drew its giant quantized quads (and
+        // sea-level skirts / water fills) INSIDE the band a finer ring owns — until an
+        // edit invalidated it ("turns to real voxels when we edit", the user's clue).
+        // Rule (hole-free by construction): suppress a block only where the FINER ring's
+        // child tile is RESIDENT with samples — that child renders the same footprint
+        // itself. Child coord math: ringGrowthFactor=2 + tileWorldSize=cell*(side-1)
+        // means ring r tile (x,z) covers exactly children (2x+dx, 2z+dz) at ring r-1
+        // (the voxel-brick analog HasCompleteFinerVoxelCoverage uses the same 2:1 map).
+        bool childResident[4] = { false, false, false, false };
+        bool anyChildResident = false;
+        // The 2:1 child map is only valid when rings double (the default). With a
+        // non-2 growth factor, skip suppression (correct but allows overlap again)
+        // rather than suppress the wrong area (which would make holes).
+        const bool finerSuppressionValid =
+            std::abs(m_config.ringGrowthFactor - 2.0f) < 0.01f;
+        if (finerSuppressionValid && tile.record.coord.ring > 0) {
+            for (int32_t dz = 0; dz <= 1; ++dz) {
+                for (int32_t dx = 0; dx <= 1; ++dx) {
+                    const SparseClipmapTileCoord childCoord{
+                        tile.record.coord.ring - 1,
+                        SaturatingAddInt32(tile.record.coord.x, tile.record.coord.x) + dx,
+                        SaturatingAddInt32(tile.record.coord.z, tile.record.coord.z) + dz
+                    };
+                    const auto childIt = m_slotByCoord.find(childCoord);
+                    if (childIt != m_slotByCoord.end() &&
+                        childIt->second < m_tiles.size()) {
+                        const TilePayload& childTile = m_tiles[childIt->second];
+                        // Defensive slot validation: only trust the coord->slot mapping
+                        // when the slot still holds THIS coord. (Audit showed eviction
+                        // erases mappings promptly, so this is hardening, not a fix —
+                        // the round-3 band bug was the altitude annulus in the min
+                        // distance, handled above.)
+                        if (childTile.record.slot != UINT32_MAX &&
+                            childTile.record.coord == childCoord &&
+                            childTile.packedSamples.size() >= sampleCount) {
+                            childResident[dz * 2 + dx] = true;
+                            anyChildResident = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ===== INCREMENTAL MID-MESH: per-tile face cache =====
+        // Reuse this tile's previously emitted faces unless something that affects
+        // them changed: content (edit/stream/regen bump meshContentVersion), the
+        // camera-distance LOD (mergeCells), finer-ring child residency (childMask),
+        // the build config, or the tile slot being re-centered to a new coord. A hit
+        // skips the expensive per-cell emission below - so only changed tiles cost
+        // anything, instead of rebuilding the whole ~1.5M-face monolith every frame.
+        // (The per-tile face vector now lives inside extractTileMesh; this scope only
+        // carries the budget flag + the re-emit marker the caller bookkeeping reads.)
+        bool faceBudgetOk = true;
+        bool tileReEmitted = false;  // P1.5: this tile re-extracted (faces changed) this build
+        const uint32_t childMask =
+            (childResident[0] ? 1u : 0u) | (childResident[1] ? 2u : 0u) |
+            (childResident[2] ? 4u : 0u) | (childResident[3] ? 8u : 0u);
+        const bool meshCacheHit =
+            tile.meshCacheValid &&
+            tile.meshCacheContentVersion == tile.meshContentVersion &&
+            tile.meshCacheMergeCells == mergeCells &&
+            tile.meshCacheChildMask == childMask &&
+            tile.meshCacheBuildVersion == midMeshBuildVersion &&
+            tile.meshCacheOriginX == tile.record.originX &&
+            tile.meshCacheOriginZ == tile.record.originZ &&
+            tile.meshCacheRing == tile.record.coord.ring;
+        // A tile whose cached faces are for the SAME world location (origin/ring) but a
+        // stale content/LOD key can safely reuse those faces for one more frame — the
+        // mesh is just briefly behind. A re-centered/new tile cannot (its cache is for a
+        // different location), so it must rebuild or be skipped (brief frontier hole).
+        const bool cacheSameLocation =
+            tile.meshCacheValid &&
+            tile.meshCacheOriginX == tile.record.originX &&
+            tile.meshCacheOriginZ == tile.record.originZ &&
+            tile.meshCacheRing == tile.record.coord.ring;
+        // Over budget when this build has spent its re-extraction tile OR time budget.
+        // Time-based bounds the actual cost (a fine near tile costs ~3-5ms, a coarse far
+        // tile ~0.1ms, so a tile count is a poor cost proxy).
+        const bool overRebuildBudget =
+            (maxRebuildTiles != 0u && rebuiltThisBuild >= maxRebuildTiles) ||
+            (buildConfig.maxRebuildMs > 0.0f &&
+             extractMsAccum >= static_cast<double>(buildConfig.maxRebuildMs));
+        if (!meshCacheHit) {
+            // Categorize the miss by FIRST-priority cause (so we know what drives churn).
+            if (!tile.meshCacheValid) {
+                ++missNew;
+            } else if (!cacheSameLocation) {
+                ++missRecenter;
+            } else if (tile.meshCacheContentVersion != tile.meshContentVersion) {
+                ++missContent;
+            } else if (tile.meshCacheMergeCells != mergeCells) {
+                ++missLod;
+            } else if (tile.meshCacheChildMask != childMask) {
+                ++missChild;
+            } else {
+                ++missBuildVer;
+            }
+        }
+        if (meshCacheHit) {
+            // Reuse the persistent cached faces directly (emittedFaces below references
+            // tile.meshCacheFaces) - do NOT copy them into a local vector. The dirty path
+            // never assembles a global face vector, so copying ~4600 faces here per cached
+            // tile, every build, was pure waste (the residual build spike).
+        } else if (overRebuildBudget && cacheSameLocation) {
+            // NO-HOLE deferral: over the per-build budget AND this tile has a same-location
+            // cached version -> keep drawing its stale faces (emittedFaces references them)
+            // and defer the expensive re-emit to a later build. The floor never disappears;
+            // it is at most one edit/LOD step behind for a few frames. Re-fired via
+            // LastMidMeshDeferredTiles until caught up.
+            ++m_lastMidMeshDeferredTiles;
+            // Track how long this tile has been drawing stale faces (stale age / edit lag).
+            {
+                const BrickCoord deferCoord{
+                    tile.record.coord.x, tile.record.coord.ring, tile.record.coord.z};
+                m_midMeshTileDeferredSince.emplace(deferCoord, m_midMeshBuildCounter);
+            }
+        } else {
+            // Either under budget, OR a NEW tile with no reusable cache. A new tile must
+            // NOT be deferred (skipping it would punch a hole - there is no old patch to
+            // hold), so extract it immediately even if over budget. Only tiles that already
+            // have a drawable version are budget-deferred (the branch above).
+        ++rebuiltThisBuild;
+        tileReEmitted = true;
+        // This tile is re-extracting now: it is no longer pending/stale.
+        {
+            const BrickCoord reExtractCoord{
+                tile.record.coord.x, tile.record.coord.ring, tile.record.coord.z};
+            m_midMeshTileDeferredSince.erase(reExtractCoord);
+        }
+        const auto extractStart = std::chrono::steady_clock::now();
+        faceBudgetOk = extractTileMesh(
+            tile, mergeCells, childMask, anyChildResident, childResident, cellSize);
         extractMsAccum +=
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - extractStart).count();
         } // end cache-miss emission (meshCacheHit ? reuse : emit)
