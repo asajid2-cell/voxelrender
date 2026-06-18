@@ -16767,6 +16767,17 @@ int RunSandbox(int argc, char* argv[]) {
                     // the fail-backoff doesn't suppress the next real build.
                     sparseMidMeshLastAttemptFailed = false;
                     sparseMidMeshConsecutiveFailures = 0;
+                    // Nothing dirty/removed means the floor is already current at this height
+                    // serial + cull camera, so ADVANCE the rebuild-trigger reference. Without
+                    // this, midMeshContentChangeDue/midMeshCullMoved stay latched against a
+                    // stale reference and re-fire a (cheap) no-op build every single frame -
+                    // harmless at the serial cadence but a CPU sink once builds get cheap.
+                    // Any tiles deferred under budget are re-fired independently by the
+                    // LastMidMeshDeferredTiles catch-up trigger, so this never strands work.
+                    sparseMidMeshUploadedHeightSerial = sparseClipmapTileCache.HeightDirtySerial();
+                    sparseMidMeshUploadedCullValid = true;
+                    sparseMidMeshUploadedCullCamera = cameraPos;
+                    sparseMidMeshUploadedCullForward = normalizedMidMeshCullForward;
                 } else {
                     ++sparseMidMeshUploadRetriesLastFrame;
                     sparseMidMeshFaceCountLastUpload = 0u;
