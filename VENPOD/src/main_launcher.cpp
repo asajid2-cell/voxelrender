@@ -11,6 +11,7 @@
 #include "Graphics/FarVoxelOctree.h"
 #include "Graphics/SparseSurfaceGpuResources.h"
 #include "Graphics/SparseVoxelGpuResources.h"
+#include "Graphics/MidMeshGpuExtractResources.h"  // Phase B1.1: GPU mesh extraction INPUT side (shadow)
 #include "Graphics/MidVoxelGpuGenPoc.h"  // DEV-ONLY: Phase-0 GPU mid-voxel gen parity POC
 #include "Graphics/MidVoxelGpuGenerator.h"  // Phase-1 GPU mid-voxel sample generator
 #include "Graphics/VoxelRenderBackend.h"
@@ -1153,6 +1154,9 @@ int RunSandbox(int argc, char* argv[]) {
     SparseVoxelGpuResources sparseGpuResources;
     SparseSurfaceGpuResources sparseSurfaceGpuResources;
     SparseSurfaceGpuResources sparseMidMeshGpuResources;
+    // Phase B1.1: persistent per-tile GPU sample + metadata buffers for the SHADOW
+    // GPU mesh-extraction input path. Only active when VENPOD_MIDMESH_GPU_EXTRACT=1.
+    MidMeshGpuExtractResources midMeshGpuExtractResources;
     Simulation::SparseVoxelWorld sparseVoxelWorld;
     bool sparseVoxelWorldReady = false;
     enum class SurfaceFillWaterProofResult : uint8_t {
@@ -2957,6 +2961,14 @@ int RunSandbox(int argc, char* argv[]) {
     // full-StageSnapshot path.
     const bool sparseMidMeshIncrementalUpload =
         ReadUIntEnv("VENPOD_MIDMESH_INCREMENTAL_UPLOAD", 1u) != 0u;
+    // Phase B1.1 (GPU mesh extraction, SHADOW input side). Default 0 = zero behavior
+    // change, ideally zero cost. When 1 (AND incremental upload on), each frame uploads
+    // ONLY the dirty tiles' height samples + per-tile metadata into persistent GPU
+    // buffers for a LATER compute shader. No dispatch, no face output, no readback - the
+    // CPU mid-mesh path still produces ALL visible geometry unchanged. Logs GPU_EXTRACT.
+    const bool sparseMidMeshGpuExtract =
+        sparseMidMeshIncrementalUpload &&
+        ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT", 0u) != 0u;
     // PARALLEL pre-extraction of cache-miss tiles (only meaningful on the primed-dirty
     // incremental path). DEFAULT ON: the build re-extracts every cache-miss tile across
     // worker threads BEFORE the main loop (the dominant per-build cost is the ~3.75ms/tile
@@ -3405,6 +3417,29 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseMidMeshMaxDistance,
                     sparseMidMeshMaxTiles,
                     midMeshStats.iaStreamCapacityFaces);
+            }
+            // Phase B1.1 (SHADOW): persistent per-tile GPU sample + metadata buffers.
+            // Only initialized when the GPU-extract toggle is set; otherwise zero cost.
+            if (sparseMidMeshGpuExtract) {
+                MidMeshGpuExtractConfig extractConfig;
+                extractConfig.maxTiles = std::max(1u, sparseClipmapConfig.maxTiles);
+                extractConfig.tileSampleSide = std::max(2u, sparseClipmapConfig.tileSampleSide);
+                auto extractResult = midMeshGpuExtractResources.Initialize(
+                    device->GetDevice(),
+                    renderer->GetHeapManager(),
+                    extractConfig);
+                if (!extractResult) {
+                    spdlog::error("Mid-mesh GPU extract (B1.1) init failed: {}", extractResult.error());
+                } else {
+                    const auto& extractStats = midMeshGpuExtractResources.GetStats();
+                    spdlog::info(
+                        "Mid-mesh GPU extract (B1.1) ready: maxTiles={} sampleSide={} samplesPerTile={} "
+                        "sampleBufMB={:.2f} metaBufKB={:.1f} uploadSlotMB={:.2f} (SHADOW - no shader/faces/readback)",
+                        extractStats.maxTiles, extractStats.sampleSide, extractStats.samplesPerTile,
+                        static_cast<double>(extractStats.sampleBufferBytes) / (1024.0 * 1024.0),
+                        static_cast<double>(extractStats.metadataBufferBytes) / 1024.0,
+                        static_cast<double>(extractStats.uploadRingSlotBytes) / (1024.0 * 1024.0));
+                }
             }
         } else if (sparseBackendRequested) {
             spdlog::info("Sparse mid mesh path: {}", enableSparseMidMesh ? "upload disabled" : "disabled");
@@ -14931,6 +14966,12 @@ int RunSandbox(int argc, char* argv[]) {
                     commandQueue->GetLastCompletedFenceValue(),
                     commandQueue->GetNextFenceValue());
             }
+            if (midMeshGpuExtractResources.IsInitialized()) {
+                midMeshGpuExtractResources.BeginFrame(
+                    frameIndex,
+                    commandQueue->GetLastCompletedFenceValue(),
+                    commandQueue->GetNextFenceValue());
+            }
             perfSparseBeginFrameMs = ticksToMs(SDL_GetPerformanceCounter() - perfSparseStepStart);
             perfSparseStepStart = SDL_GetPerformanceCounter();
             sparseSurfaceRasterFacesLastFrame = 0;
@@ -16747,6 +16788,57 @@ int RunSandbox(int argc, char* argv[]) {
                         sparseMidMeshIncrementalUpload
                             ? sparseMidMeshGpuResources.LastDirtyStageRejectReason()
                             : "off");
+                }
+                // ===== Phase B1.1: GPU mesh-extraction INPUT side (SHADOW) =====
+                // Upload ONLY the dirty tiles' height samples + per-tile metadata into
+                // the persistent GPU buffers a later compute shader will read. No
+                // dispatch, no face output, no readback - the CPU path above already
+                // produced ALL visible geometry. Reads midMeshSnapshot.dirtyBricks (the
+                // same dirty set the CPU upload tracks); per-frame cost scales with the
+                // DIRTY count, not the resident tile count.
+                if (sparseMidMeshGpuExtract &&
+                    midMeshGpuExtractResources.IsInitialized() &&
+                    midMeshBuilt) {
+                    const uint64_t gpuExtractStart = SDL_GetPerformanceCounter();
+                    std::vector<Simulation::BrickCoord> gpuExtractDirtyCoords;
+                    gpuExtractDirtyCoords.reserve(midMeshSnapshot.dirtyBricks.size());
+                    for (const auto& d : midMeshSnapshot.dirtyBricks) {
+                        gpuExtractDirtyCoords.push_back(d.coord);
+                    }
+                    std::vector<Simulation::MidMeshGpuExtractDirtyTile> gpuExtractTiles;
+                    sparseClipmapTileCache.CollectMidMeshGpuExtractDirtyTiles(
+                        gpuExtractDirtyCoords, gpuExtractTiles);
+                    MidMeshGpuExtractTicket gpuExtractTicket;
+                    bool gpuExtractStaged = false;
+                    if (midMeshGpuExtractResources.StageDirtyTiles(gpuExtractTiles, &gpuExtractTicket)) {
+                        gpuExtractStaged =
+                            midMeshGpuExtractResources.EmitCopy(commandList.Get(), gpuExtractTicket);
+                    }
+                    const float gpuExtractCpuMs =
+                        ticksToMs(SDL_GetPerformanceCounter() - gpuExtractStart);
+                    const auto& gpuExtractStats = midMeshGpuExtractResources.GetStats();
+                    const uint32_t gpuExtractTracked =
+                        sparseClipmapTileCache.MidMeshTrackedTileCount();
+                    const uint32_t gpuExtractDirty =
+                        static_cast<uint32_t>(midMeshSnapshot.dirtyBricks.size());
+                    const uint32_t gpuExtractSkippedClean =
+                        gpuExtractTracked > gpuExtractDirty
+                            ? gpuExtractTracked - gpuExtractDirty
+                            : 0u;
+                    spdlog::info(
+                        "GPU_EXTRACT frame={} staged={} gpuExtract.sampleUploadBytes={} "
+                        "gpuExtract.sampleUploadTiles={} gpuExtract.sampleUploadCpuMs={:.3f} "
+                        "gpuExtract.totalTrackedTiles={} gpuExtract.dirtyTiles={} "
+                        "gpuExtract.skippedCleanTiles={} skippedNoSlot={} deferredRingFull={}",
+                        frameCount, gpuExtractStaged ? 1 : 0,
+                        gpuExtractStats.sampleUploadBytes,
+                        gpuExtractStats.sampleUploadTiles,
+                        gpuExtractCpuMs,
+                        gpuExtractTracked,
+                        gpuExtractDirty,
+                        gpuExtractSkippedClean,
+                        gpuExtractStats.skippedNoSlotTiles,
+                        gpuExtractStats.deferredRingFullTiles);
                 }
                 (void)midMeshDirtyUpload;
                 // Incremental no-op: the build succeeded but nothing was dirty/removed, so
@@ -24950,6 +25042,7 @@ int RunSandbox(int argc, char* argv[]) {
     chunkManager->Shutdown();
     voxelWorld->Shutdown();
     farVoxelOctree.Shutdown();
+    midMeshGpuExtractResources.Shutdown();
     sparseMidMeshGpuResources.Shutdown();
     sparseSurfaceGpuResources.Shutdown();
     sparseGpuResources.Shutdown();

@@ -517,6 +517,29 @@ struct SparseClipmapFarSvoFallbackMetadata {
     float pageCoverageRatio = 0.0f;
 };
 
+// Phase B1.1 (GPU mesh extraction, INPUT side only). One dirty tile's CPU->GPU
+// extraction input: the stable per-tile slot, a pointer to the tile's persistent
+// packedSamples grid, and the per-tile metadata a future compute shader needs to
+// reproduce extractTileMesh on the GPU. Pointers are valid only until the next
+// BuildMidHeightSurfaceSnapshot / tile mutation (same lifetime as the CPU draw
+// batch's faces pointer). This carries NO faces and triggers NO extraction; it is
+// purely the read-side projection of a dirty tile for the GPU upload path.
+struct MidMeshGpuExtractDirtyTile {
+    BrickCoord coord;                  // synthetic {x, ring, z} (matches dirtyBricks)
+    uint32_t slot = UINT32_MAX;        // stable tile slot (m_slotByCoord)
+    const uint32_t* samples = nullptr; // tile.packedSamples.data() (side*side uint32)
+    uint32_t sampleCount = 0;          // side*side
+    int32_t originX = 0;
+    int32_t originZ = 0;
+    float cellSize = 0.0f;
+    uint32_t mergeCells = 0;           // LOD merge-cell size for THIS build
+    uint32_t childMask = 0;            // finer-ring child residency (4 bits)
+    uint64_t meshContentVersion = 0;   // per-tile content serial
+    uint32_t faceCount = 0;            // CPU per-tile emitted face count (capacity bound)
+    int32_t minY = 0;                  // cached per-tile height range / face AABB
+    int32_t maxY = 0;
+};
+
 class SparseClipmapTileCache {
 public:
     ~SparseClipmapTileCache();
@@ -669,6 +692,20 @@ public:
         m_midMeshEmittedCoords.clear();
         m_midMeshDirtyCoords.clear();
     }
+    // Phase B1.1: project the dirty tiles of the last BuildMidHeightSurfaceSnapshot
+    // into per-tile GPU extraction INPUT records (slot + persistent sample pointer +
+    // metadata). `dirtyCoords` is the snapshot's dirtyBricks coords (already
+    // intersected with still-emitted tiles), so cost is O(dirty), not O(all tiles).
+    // No extraction, no faces, no mutation - this is the read side of the GPU upload
+    // path. Returns the number of records appended to `out` (a dirty coord with no
+    // resident slot / empty samples is skipped). The mergeCells/childMask/faceCount
+    // reflect the values cached by the build that just ran.
+    uint32_t CollectMidMeshGpuExtractDirtyTiles(
+        const std::vector<BrickCoord>& dirtyCoords,
+        std::vector<MidMeshGpuExtractDirtyTile>& out) const;
+    // Total resident mid-mesh tiles currently tracked (occupied tile slots). Used by
+    // the GPU-extract instrumentation to prove dirty-scaling (uploadTiles << this).
+    uint32_t MidMeshTrackedTileCount() const;
     void SetEditStore(const SparseEditStore* edits);
     void SetFarSvoFallbackMetadata(const SparseClipmapFarSvoFallbackMetadata& metadata);
     // sinceRevision: only overlays touched after this global edit revision are

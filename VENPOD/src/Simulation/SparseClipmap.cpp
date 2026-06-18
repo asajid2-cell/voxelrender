@@ -7810,6 +7810,67 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     return true;
 }
 
+uint32_t SparseClipmapTileCache::MidMeshTrackedTileCount() const {
+    // Resident mid-mesh tiles = occupied tile slots (slot != UINT32_MAX). The slot
+    // map is keyed by the live tile coord, so its size is exactly the resident count.
+    return static_cast<uint32_t>(m_slotByCoord.size());
+}
+
+uint32_t SparseClipmapTileCache::CollectMidMeshGpuExtractDirtyTiles(
+    const std::vector<BrickCoord>& dirtyCoords,
+    std::vector<MidMeshGpuExtractDirtyTile>& out) const
+{
+    // Phase B1.1: read-only projection. For each dirty synthetic coord {x, ring, z},
+    // resolve its stable tile slot via m_slotByCoord (keyed by {ring, x, z}) and emit
+    // the tile's persistent sample pointer + the metadata cached by the build that
+    // just ran. O(dirty) lookups (no O(all tiles) scan), no extraction, no mutation.
+    const uint32_t side = m_config.tileSampleSide;
+    const uint32_t sampleCount = side >= 2u ? side * side : 0u;
+    if (sampleCount == 0u) {
+        return 0u;
+    }
+    uint32_t appended = 0u;
+    out.reserve(out.size() + dirtyCoords.size());
+    for (const BrickCoord& coord : dirtyCoords) {
+        // Synthetic coord packs the tile coord as x->x, ring->y, z->z.
+        const SparseClipmapTileCoord tileCoord{coord.y, coord.x, coord.z};
+        const auto slotIt = m_slotByCoord.find(tileCoord);
+        if (slotIt == m_slotByCoord.end()) {
+            continue;  // tile no longer resident (evicted / re-centered)
+        }
+        const uint32_t slot = slotIt->second;
+        if (slot >= m_tiles.size()) {
+            continue;
+        }
+        const TilePayload& tile = m_tiles[slot];
+        if (tile.record.slot == UINT32_MAX ||
+            tile.packedSamples.size() < sampleCount ||
+            tile.record.cellSize <= 0.0f) {
+            continue;
+        }
+        MidMeshGpuExtractDirtyTile entry;
+        entry.coord = coord;
+        entry.slot = slot;
+        entry.samples = tile.packedSamples.data();
+        entry.sampleCount = sampleCount;
+        entry.originX = tile.record.originX;
+        entry.originZ = tile.record.originZ;
+        entry.cellSize = tile.record.cellSize;
+        // mergeCells / childMask were cached by the build that just extracted this
+        // tile (computeTileLod -> extractTileMesh). meshCacheFaces.size() is the exact
+        // CPU per-tile face count, the capacity bound the GPU range reservation uses.
+        entry.mergeCells = tile.meshCacheMergeCells;
+        entry.childMask = tile.meshCacheChildMask;
+        entry.meshContentVersion = tile.meshContentVersion;
+        entry.faceCount = static_cast<uint32_t>(tile.meshCacheFaces.size());
+        entry.minY = tile.meshCacheMinY;
+        entry.maxY = tile.meshCacheMaxY;
+        out.push_back(entry);
+        ++appended;
+    }
+    return appended;
+}
+
 void SparseClipmapTileCache::ClearHeightDirtyRange() {
     m_dirtyHeightStartSlot = UINT32_MAX;
     m_dirtyHeightEndSlot = 0;
