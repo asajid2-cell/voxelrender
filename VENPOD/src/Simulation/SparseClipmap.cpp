@@ -7267,18 +7267,24 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         return faceBudgetOk;
     };
 
-    for (uint32_t tileSlot = 0; tileSlot < static_cast<uint32_t>(m_tiles.size()); ++tileSlot) {
-        if (emittedTiles >= effectiveMaxTiles) {
-            break;
-        }
-        TilePayload& tile = m_tiles[tileSlot];
-        if (tile.record.slot == UINT32_MAX ||
-            tile.packedSamples.size() < sampleCount ||
-            tile.record.cellSize <= 0.0f) {
-            continue;
-        }
-
-        const uint32_t cellSize = static_cast<uint32_t>(std::max(
+    // ===== PER-TILE LOD/CHILD DECISION (factored so the parallel pre-pass and the main
+    // loop agree by construction on cellSize/mergeCells/childMask) =====
+    // Computes the camera-distance LOD merge (incl. the cached slope scan that WRITES the
+    // tile's meshCacheRange* fields) and the finer-ring child residency mask. Pure decision
+    // -> writes only the tile's slope-scan cache; reads m_slotByCoord/m_tiles (other tiles)
+    // read-only. Called SERIALLY from both the pre-pass and the main loop, so the slope-scan
+    // write is never concurrent. (Non-const `tile` because the cached slope scan writes the
+    // range cache; everything else is read-only.) Does NOT do the cull `continue` — that is
+    // loop control and stays at each call site.
+    auto computeTileLod = [&](
+        TilePayload& tile,
+        uint32_t& cellSize,
+        uint32_t& mergeCells,
+        uint32_t& childMask,
+        bool& anyChildResident,
+        bool childResident[4])
+    {
+        cellSize = static_cast<uint32_t>(std::max(
             1,
             RoundToInt32Clamped(tile.record.cellSize)));
         const uint32_t tileWorldSize = cellSize * cellCount;
@@ -7299,7 +7305,7 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         // therefore stop merging until far out (kills the far-waterline slab walls
         // the judge flagged at 3-7km), while fine rings merge MORE at distance
         // (4-8u cells -> up to 32-64u quads there), which pays the face bill back.
-        uint32_t mergeCells = 1u;
+        mergeCells = 1u;
         if (buildConfig.lodEnabled) {
             const float maxQuadWorld =
                 tileCamDist <= 2200.0f ? static_cast<float>(cellSize)
@@ -7344,13 +7350,6 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             }
         }
         mergeCells = std::clamp(mergeCells, 1u, cellCount);
-        if (blockCullBounds(
-                tile.record.originX,
-                tile.record.originZ,
-                tileWorldSize,
-                tileWorldSize)) {
-            continue;
-        }
         // L7 GIANT-CUBE FIX part 2 — RESIDENT-AWARE FINER-COVERAGE SUPPRESSION: the
         // build iterates ALL resident tiles of ALL rings with one global distance cull,
         // so a stale coarse-ring tile legally drew its giant quantized quads (and
@@ -7361,8 +7360,8 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         // itself. Child coord math: ringGrowthFactor=2 + tileWorldSize=cell*(side-1)
         // means ring r tile (x,z) covers exactly children (2x+dx, 2z+dz) at ring r-1
         // (the voxel-brick analog HasCompleteFinerVoxelCoverage uses the same 2:1 map).
-        bool childResident[4] = { false, false, false, false };
-        bool anyChildResident = false;
+        childResident[0] = childResident[1] = childResident[2] = childResident[3] = false;
+        anyChildResident = false;
         // The 2:1 child map is only valid when rings double (the default). With a
         // non-2 growth factor, skip suppression (correct but allows overlap again)
         // rather than suppress the wrong area (which would make holes).
@@ -7395,6 +7394,178 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
                 }
             }
         }
+        childMask =
+            (childResident[0] ? 1u : 0u) | (childResident[1] ? 2u : 0u) |
+            (childResident[2] ? 4u : 0u) | (childResident[3] ? 8u : 0u);
+    };
+
+    // ===== MESH-CACHE-HIT PREDICATE (factored so the pre-pass collects exactly the same
+    // cache-MISS tiles the main loop would re-extract) =====
+    auto computeMeshCacheHit = [&](
+        const TilePayload& tile,
+        uint32_t mergeCells,
+        uint32_t childMask) -> bool
+    {
+        return
+            tile.meshCacheValid &&
+            tile.meshCacheContentVersion == tile.meshContentVersion &&
+            tile.meshCacheMergeCells == mergeCells &&
+            tile.meshCacheChildMask == childMask &&
+            tile.meshCacheBuildVersion == midMeshBuildVersion &&
+            tile.meshCacheOriginX == tile.record.originX &&
+            tile.meshCacheOriginZ == tile.record.originZ &&
+            tile.meshCacheRing == tile.record.coord.ring;
+    };
+
+    // ===== PARALLEL PRE-EXTRACTION PRE-PASS =====
+    // On the primed-dirty incremental path, the dominant residual build cost is re-extracting
+    // a handful of independent fine/near tiles SERIALLY (~3.75ms each, 4-17 per editing build).
+    // Pre-extract every cache-MISS tile across worker threads BEFORE the main loop, so the loop
+    // sees them as cache HITS and emits via the cheap hit path. Distinct tiles => no shared
+    // writes between workers (extractTileMesh writes only its own tile). The LOD decision +
+    // meshCacheHit predicate match the main loop EXACTLY (same lambdas), so the pre-pass and the
+    // loop agree on which tiles are misses by construction.
+    if (buildConfig.parallelExtract && buildConfig.emitDirtyPayload && !m_midMeshEmittedCoords.empty()) {
+        struct PreExtractTile {
+            uint32_t slot;
+            uint32_t cellSize;
+            uint32_t mergeCells;
+            uint32_t childMask;
+            bool anyChildResident;
+            bool childResident[4];
+        };
+        std::vector<PreExtractTile> preExtract;
+        preExtract.reserve(m_tiles.size());
+        for (uint32_t tileSlot = 0; tileSlot < static_cast<uint32_t>(m_tiles.size()); ++tileSlot) {
+            TilePayload& tile = m_tiles[tileSlot];
+            // Same residency guard as the main loop (skip empty/uninitialized slots).
+            if (tile.record.slot == UINT32_MAX ||
+                tile.packedSamples.size() < sampleCount ||
+                tile.record.cellSize <= 0.0f) {
+                continue;
+            }
+            uint32_t cellSize = 0u;
+            uint32_t mergeCells = 0u;
+            uint32_t childMask = 0u;
+            bool anyChildResident = false;
+            bool childResident[4] = { false, false, false, false };
+            computeTileLod(tile, cellSize, mergeCells, childMask, anyChildResident, childResident);
+            // Same cull as the main loop: a culled tile is never emitted/extracted there, so
+            // it must NOT be pre-extracted here (would mark it dirty with no emission -> a
+            // dangling dirty coord). tileWorldSize = cellSize * cellCount (matches the loop).
+            const uint32_t tileWorldSize = cellSize * cellCount;
+            if (blockCullBounds(
+                    tile.record.originX,
+                    tile.record.originZ,
+                    tileWorldSize,
+                    tileWorldSize)) {
+                continue;
+            }
+            if (computeMeshCacheHit(tile, mergeCells, childMask)) {
+                continue;  // already cached -> the loop reuses it; nothing to pre-extract
+            }
+            PreExtractTile entry;
+            entry.slot = tileSlot;
+            entry.cellSize = cellSize;
+            entry.mergeCells = mergeCells;
+            entry.childMask = childMask;
+            entry.anyChildResident = anyChildResident;
+            entry.childResident[0] = childResident[0];
+            entry.childResident[1] = childResident[1];
+            entry.childResident[2] = childResident[2];
+            entry.childResident[3] = childResident[3];
+            preExtract.push_back(entry);
+        }
+        if (!preExtract.empty()) {
+            // Extract every miss across workers. No per-build budget: parallelism bounds the
+            // cost, so the floor is always fresh (no deferral on the parallel path). Each
+            // worker touches distinct tiles -> only that tile's meshCache* is written. The
+            // shared outSnapshot vectors are NOT touched here (extractTileMesh appends only to
+            // its own local tileFaces, then moves into tile.meshCacheFaces).
+            const uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
+            const uint32_t workerCount = std::min(hw, static_cast<uint32_t>(preExtract.size()));
+            if (workerCount <= 1u) {
+                for (const PreExtractTile& e : preExtract) {
+                    TilePayload& tile = m_tiles[e.slot];
+                    extractTileMesh(tile, e.mergeCells, e.childMask, e.anyChildResident,
+                                    e.childResident, e.cellSize);
+                }
+            } else {
+                std::vector<std::thread> extractWorkers;
+                extractWorkers.reserve(workerCount);
+                for (uint32_t worker = 0u; worker < workerCount; ++worker) {
+                    extractWorkers.emplace_back([this, &preExtract, &extractTileMesh, worker, workerCount]() {
+                        const size_t begin =
+                            (preExtract.size() * static_cast<size_t>(worker)) /
+                            static_cast<size_t>(workerCount);
+                        const size_t end =
+                            (preExtract.size() * static_cast<size_t>(worker + 1u)) /
+                            static_cast<size_t>(workerCount);
+                        for (size_t index = begin; index < end; ++index) {
+                            const PreExtractTile& e = preExtract[index];
+                            TilePayload& tile = m_tiles[e.slot];
+                            extractTileMesh(tile, e.mergeCells, e.childMask, e.anyChildResident,
+                                            e.childResident, e.cellSize);
+                        }
+                    });
+                }
+                for (std::thread& w : extractWorkers) {
+                    w.join();
+                }
+            }
+            // CRITICAL no-hole step: a tile this pre-pass extracted now matches its cache, so
+            // the main loop sees it as meshCacheHit and will NOT take its tileReEmitted path —
+            // i.e. it would NOT mark the tile dirty, and its NEW faces would never upload
+            // (stale GPU faces = HOLE). Explicitly mark each pre-extracted tile dirty (same
+            // synthetic BrickCoord the loop's dirtyBricks uses) and clear any deferral, so the
+            // loop's hit-path emission still pushes these tiles into outSnapshot.dirtyBricks.
+            //
+            // ONLY mark a tile whose extraction produced FACES. The main loop skips a tile with
+            // empty meshCacheFaces (`if (emittedFaces.empty()) continue;`) BEFORE it reaches
+            // drawBatches, so an empty-faces tile is never in emittedThisBuild — its dirty coord
+            // would never intersect into dirtyBricks, never upload, never get acked, and would
+            // sit in m_midMeshDirtyCoords forever. That keeps HasMidMeshDirtyPayload() true,
+            // which re-fires a (now no-op) build EVERY frame (build-count explosion). An empty
+            // tile has no geometry to show, so not marking it is also hole-free. This mirrors
+            // the main loop's emission gate exactly.
+            for (const PreExtractTile& e : preExtract) {
+                const TilePayload& tile = m_tiles[e.slot];
+                if (tile.meshCacheFaces.empty()) {
+                    continue;
+                }
+                const BrickCoord coord{
+                    tile.record.coord.x, tile.record.coord.ring, tile.record.coord.z};
+                m_midMeshDirtyCoords.insert(coord);
+                m_midMeshTileDeferredSince.erase(coord);
+            }
+        }
+    }
+
+    for (uint32_t tileSlot = 0; tileSlot < static_cast<uint32_t>(m_tiles.size()); ++tileSlot) {
+        if (emittedTiles >= effectiveMaxTiles) {
+            break;
+        }
+        TilePayload& tile = m_tiles[tileSlot];
+        if (tile.record.slot == UINT32_MAX ||
+            tile.packedSamples.size() < sampleCount ||
+            tile.record.cellSize <= 0.0f) {
+            continue;
+        }
+
+        uint32_t cellSize = 0u;
+        uint32_t mergeCells = 0u;
+        uint32_t childMask = 0u;
+        bool anyChildResident = false;
+        bool childResident[4] = { false, false, false, false };
+        computeTileLod(tile, cellSize, mergeCells, childMask, anyChildResident, childResident);
+        const uint32_t tileWorldSize = cellSize * cellCount;
+        if (blockCullBounds(
+                tile.record.originX,
+                tile.record.originZ,
+                tileWorldSize,
+                tileWorldSize)) {
+            continue;
+        }
 
         // ===== INCREMENTAL MID-MESH: per-tile face cache =====
         // Reuse this tile's previously emitted faces unless something that affects
@@ -7407,18 +7578,10 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         // carries the budget flag + the re-emit marker the caller bookkeeping reads.)
         bool faceBudgetOk = true;
         bool tileReEmitted = false;  // P1.5: this tile re-extracted (faces changed) this build
-        const uint32_t childMask =
-            (childResident[0] ? 1u : 0u) | (childResident[1] ? 2u : 0u) |
-            (childResident[2] ? 4u : 0u) | (childResident[3] ? 8u : 0u);
-        const bool meshCacheHit =
-            tile.meshCacheValid &&
-            tile.meshCacheContentVersion == tile.meshContentVersion &&
-            tile.meshCacheMergeCells == mergeCells &&
-            tile.meshCacheChildMask == childMask &&
-            tile.meshCacheBuildVersion == midMeshBuildVersion &&
-            tile.meshCacheOriginX == tile.record.originX &&
-            tile.meshCacheOriginZ == tile.record.originZ &&
-            tile.meshCacheRing == tile.record.coord.ring;
+        // childMask + the cache-hit predicate now come from computeTileLod/computeMeshCacheHit
+        // (the SAME lambdas the parallel pre-pass uses), so the pre-pass and this loop agree on
+        // every tile's miss/hit status by construction.
+        const bool meshCacheHit = computeMeshCacheHit(tile, mergeCells, childMask);
         // A tile whose cached faces are for the SAME world location (origin/ring) but a
         // stale content/LOD key can safely reuse those faces for one more frame — the
         // mesh is just briefly behind. A re-centered/new tile cannot (its cache is for a

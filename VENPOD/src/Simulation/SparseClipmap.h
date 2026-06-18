@@ -256,6 +256,13 @@ struct SparseMidHeightSurfaceBuildConfig {
     // coords + sets drawBatch.faces pointers so the caller can StageDirtyPayloadSnapshot
     // (upload only re-extracted tiles) instead of StageSnapshot (full re-upload).
     bool emitDirtyPayload = false;
+    // PARALLEL PRE-EXTRACTION (only meaningful on the primed-dirty incremental path, i.e.
+    // emitDirtyPayload && a previous build primed the GPU). When true, a serial pre-pass
+    // identifies every cache-MISS tile (using the SAME LOD/childMask + meshCacheHit rules
+    // as the main loop) and re-extracts them across worker threads BEFORE the main loop
+    // runs. The main loop then sees those tiles as cache HITS and emits via the hit path.
+    // OFF => byte-identical to the serial path (this flag gates everything).
+    bool parallelExtract = false;
     bool emitWater = true;
     bool distanceCull = true;
     bool frustumCull = false;

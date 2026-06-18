@@ -2951,6 +2951,14 @@ int RunSandbox(int argc, char* argv[]) {
     // the terrain floor is confirmed; the full path is unchanged when off.
     const bool sparseMidMeshIncrementalUpload =
         ReadUIntEnv("VENPOD_MIDMESH_INCREMENTAL_UPLOAD", 0u) != 0u;
+    // PARALLEL pre-extraction of cache-miss tiles (only meaningful on the primed-dirty
+    // incremental path). Default OFF. When on, the build re-extracts every cache-miss
+    // tile across worker threads BEFORE the main loop (the dominant per-build cost is
+    // the ~3.75ms/tile extract, and an editing build re-extracts 4-17 independent tiles
+    // serially). Gated on sparseMidMeshIncrementalUpload (no-op without the dirty path).
+    const bool sparseMidMeshParallelExtract =
+        sparseMidMeshIncrementalUpload &&
+        ReadUIntEnv("VENPOD_MIDMESH_PARALLEL", 0u) != 0u;
     const uint32_t sparseMidMeshLodBaseMerge =
         std::max(1u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_LOD_BASE_MERGE", 1u));
     // Default merge cap 2 (was 4): both visual judges ranked the finer distant
@@ -16661,6 +16669,7 @@ int RunSandbox(int argc, char* argv[]) {
                 midMeshBuildConfig.maxDistance = sparseMidMeshMaxDistance;
                 midMeshBuildConfig.cullPadding = sparseMidMeshCullPadding;
                 midMeshBuildConfig.emitDirtyPayload = sparseMidMeshIncrementalUpload;
+                midMeshBuildConfig.parallelExtract = sparseMidMeshParallelExtract;
                 // Split the chain so a failure names the stage that rejected it and the
                 // snapshot's counts-vs-caps -> the replay log pins the exact overflow cap.
                 // Throttle-robust timing split: BUILD self-time is pure CPU; STAGE+EMIT
