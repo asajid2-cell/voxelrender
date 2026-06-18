@@ -59,6 +59,35 @@ inline uint32_t SparseSurfacePayloadVoxel(uint32_t payload) {
     return payload & kSparseSurfaceVoxelPayloadMask;
 }
 
+// ===== SparseSurfaceFace HARD ABI (CPU <-> GPU) =====
+// The 16-byte face is the exact contract the draw shader (VS_SparseSurface.hlsl) and the
+// upcoming GPU extraction compute shader both consume. The payload bit layout MUST stay
+// byte-identical across C++ and HLSL - a one-bit drift reads as "random geometry bugs".
+// These asserts pin the layout at compile time; the HLSL side mirrors the same shifts/masks
+// (FaceDirection >>29 &0x7, FaceWidth ((>>24)&0x1F)+1, FaceHeight ((>>19)&0x1F)+1,
+// FaceVoxel &0x0007FFFF). Keep all three (this header, the VS, the extraction CS) in sync.
+static_assert(sizeof(SparseSurfaceFace) == 16, "face ABI is 3x int32 + 1x uint32");
+static_assert(kSparseSurfaceDirectionShift == 29u && kSparseSurfaceDirectionMask == 0x7u,
+    "direction = bits 29..31");
+static_assert(kSparseSurfaceQuadWidthShift == 24u && kSparseSurfaceQuadHeightShift == 19u &&
+    kSparseSurfaceQuadExtentMask == 0x1Fu, "width = bits 24..28, height = bits 19..23 (5 each)");
+static_assert(kSparseSurfaceVoxelPayloadMask == 0x0007FFFFu, "voxel = bits 0..18 (19 bits)");
+// Fields are mutually exclusive and tile the full 32-bit payload (no overlap, no gap).
+static_assert(
+    ((kSparseSurfaceDirectionMask << kSparseSurfaceDirectionShift) |
+     (kSparseSurfaceQuadExtentMask << kSparseSurfaceQuadWidthShift) |
+     (kSparseSurfaceQuadExtentMask << kSparseSurfaceQuadHeightShift) |
+     kSparseSurfaceVoxelPayloadMask) == 0xFFFFFFFFu,
+    "face payload fields must tile all 32 bits exactly");
+static_assert(
+    ((kSparseSurfaceDirectionMask << kSparseSurfaceDirectionShift) &
+     (kSparseSurfaceQuadExtentMask << kSparseSurfaceQuadWidthShift)) == 0u &&
+    ((kSparseSurfaceQuadExtentMask << kSparseSurfaceQuadWidthShift) &
+     (kSparseSurfaceQuadExtentMask << kSparseSurfaceQuadHeightShift)) == 0u &&
+    ((kSparseSurfaceQuadExtentMask << kSparseSurfaceQuadHeightShift) &
+     kSparseSurfaceVoxelPayloadMask) == 0u,
+    "face payload fields must not overlap");
+
 struct SparseSurfaceStats {
     uint32_t solidVoxels = 0;
     uint32_t exposedFaces = 0;

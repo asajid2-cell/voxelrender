@@ -133,3 +133,74 @@ Open questions to answer only after the render-only pipeline is proven:
 2. GPU culling / indirect draw integration (B2).
 3. Extend visual extraction toward near-surface `surfExtract` (B4).
 4. Only then revisit GPU `genPrep` / terrain-generation authority (separate pass).
+
+---
+
+## Phase B1 — refined spec (approved) + sub-step sequence
+
+Approved shape: GPU mid/far visual extraction; input height samples; output `SparseSurfaceFace`
+into the existing GPU face buffer; no readback; CPU fallback retained. **Reuse SparseSurfaceFace +
+the existing indirect/cull path — NOT a compact draw payload** (a payload change is a later
+optimization; it would move too many variables at once).
+
+### Allocation strategy (locked for B1)
+**Per-tile reserved pending range** — NOT a global atomic append, NOT a GPU prefix allocator:
+1. CPU reserves a pending face range for the tile (bounded by the CPU path's known per-tile face
+   count + margin).
+2. GPU extracts only inside that tile's reserved range; writes actual `faceCount` + `status`.
+3. Overflow -> set failure flag, keep the old resident patch (no partial draw).
+4. After GPU completion (fence) AND serial still matches, atomically commit/swap pending->resident;
+   release the old range only when safe.
+Inside the shader: prefer group-reserves-a-block-from-the-tile-counter over one global atomic/face,
+but correctness first (start with a per-tile counter, optimize atomics after A/B works). Avoid a
+global append counter (breaks removal/ownership/cull/fallback) until buffer pressure proves a
+two-pass count/prefix is needed.
+
+### No-hole publication (same invariant as the CPU path)
+old resident keeps drawing -> GPU builds into pending -> fence proves done -> serial/version still
+matches -> swap pending->resident -> release old. If a tile goes dirty again while a GPU job is in
+flight: never overwrite the resident range in place; let the old job finish (discard if stale) or
+allocate a new pending range for the newer serial. Invariants: never remove first; never draw a
+partially-written range; never let a stale GPU result overwrite a newer tile.
+
+### Input payload (must carry EVERY seam dependency the CPU extractor uses)
+tile world/synthetic coord; LOD / merge-cell size; sample dims + stride; height quantization /
+scale / offset; **border/halo samples needed for risers, tile-border skirts, child stitching, LOD
+transitions** (do NOT upload interior-only); child mask / child-resident state; edit footprint /
+overlay influence; `meshContentVersion` / serial; max output face capacity; pending output base
+range. Sample buffers are **persistent + dirty-updated** (like the face path) — do NOT re-upload
+every tile every frame, or we just trade "upload faces" for "upload samples" at O(all tiles).
+
+### Face ABI (DONE - foundation)
+SparseSurfaceFace 16B pinned by compile-time static_asserts (SparseSurfaceExtractor.h): direction
+bits 29..31, width 24..28, height 19..23 (each +1), voxel 0..18; fields tile all 32 bits, no overlap.
+The extraction CS must use the identical pack; mirror VS_SparseSurface.hlsl's decode exactly.
+
+### Debug validation (delayed/offline readback only - never required per-frame)
+GPU emission order may differ from CPU -> use an ORDER-INSENSITIVE face hash (or sort/canonicalize
+offline). Collect: face count, order-insensitive hash, vertex/face AABB, tile-bounds sanity,
+overflow count, stale-discard count, GPU-extracted tile count, CPU-fallback tile count, visibleMissing.
+
+### Timing instrumentation (REQUIRED from the first prototype)
+sample-upload CPU time + bytes; compute-dispatch GPU time; UAV/barrier time; draw/cull GPU time;
+CPU submission time; GPU p95/p99/max; CPU body p95/p99/max. Log as `GPU_EXTRACT`.
+**Win condition:** CPU body drops AND GPU p95/p99 does not rise by more than the CPU saving AND no
+sync readback AND no holes/seams/misplaced tiles AND fallback works.
+
+### Sub-step sequence (incremental, validate each)
+- B1.0 Face ABI lock (DONE). 
+- B1.1 Persistent per-tile GPU sample buffer + dirty-update (reuse the dirty worklist as the
+  dispatch list); CPU uploads only changed tiles' samples (+ halo). Validate: bytes uploaded scales
+  with dirty count, not total tiles.
+- B1.2 GpuExtractTileInput cbuffer/struct (the input payload above) + the per-tile reserved-range
+  reservation + status/overflow buffers.
+- B1.3 Compute shader, built up for correctness FIRST: top faces -> + risers -> + tile-border
+  skirts -> + child-quadrant suppression -> + edit-footprint skip. A/B each increment vs CPU via
+  the offline hash on a small fixed tile set.
+- B1.4 No-hole pending->resident swap with fence + serial validation; CPU fallback on overflow/stale.
+- B1.5 Instrumentation (`GPU_EXTRACT` timing) + debug compare, then A/B profile vs CPU path.
+- B2 fold GPU cull / indirect once B1 draws correctly.
+
+NOTE: B1 is a multi-step GPU build, not a single-pass change. B1.0 (ABI) is done; B1.1+ (sample
+buffer, compute shader meshing port, no-hole swap, instrumentation) are the bulk and need a
+non-exhausted GPU for the A/B validation.
