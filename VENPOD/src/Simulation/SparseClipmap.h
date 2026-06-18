@@ -659,6 +659,16 @@ public:
     // True while dirty tiles remain un-uploaded -> the caller should re-fire the build
     // next frame to drain the budgeted upload backlog (no full-frame spike).
     bool HasMidMeshDirtyPayload() const { return !m_midMeshDirtyCoords.empty(); }
+    // Recovery hatch: if an incremental dirty upload fails (e.g. the dirty-stage hits an
+    // edge condition under a massive recenter), clearing the emitted set makes the NEXT
+    // build un-primed -> it full-assembles outSnapshot.faces and the caller's full
+    // StageSnapshot fallback re-seeds the entire GPU buffer from scratch (the simple path
+    // that always works at startup). Costs one full-assembly frame; recovers visibleMissing
+    // to 0 instead of letting resident freeze while the dirty path keeps failing.
+    void ForceMidMeshFullReseed() {
+        m_midMeshEmittedCoords.clear();
+        m_midMeshDirtyCoords.clear();
+    }
     void SetEditStore(const SparseEditStore* edits);
     void SetFarSvoFallbackMetadata(const SparseClipmapFarSvoFallbackMetadata& metadata);
     // sinceRevision: only overlays touched after this global edit revision are

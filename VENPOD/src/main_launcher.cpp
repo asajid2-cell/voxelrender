@@ -2925,10 +2925,14 @@ int RunSandbox(int argc, char* argv[]) {
     uint32_t sparseMidClipmapUploadedVoxelSerial = 0;
     uint32_t sparseMidClipmapUploadRetriesLastFrame = 0;
     const uint32_t sparseMidMeshMaxFaces =
-        // 1.5M (was 1M): the canonical scene already builds ~1.02M faces (LOD cap 2 +
-        // water + skirts + air-fill); at 1M the budget could trip mid-build and stale
-        // the whole mesh. Faces are ~tens of MB GPU at most; the engine is CPU-bound.
-        std::max(1024u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_MAX_FACES", 1572864u));
+        // 3M (was 1.5M): a high-altitude look-down view builds ~1.56M faces - 99% of the
+        // old 1.5M cap. At that fill the incremental face-range allocator FRAGMENTS under
+        // recenter churn and can't place new tiles, so StageDirty/StageSnapshot fail, the
+        // upload stalls, and resident freezes (visibleMissing climbs - a far-covered but
+        // real coverage gap, caught by the production-gate altitude stress). 3M gives the
+        // allocator ~2x headroom so it never fragments out. Faces are ~tens of MB GPU; the
+        // engine is CPU-bound, so the extra buffer is cheap insurance.
+        std::max(1024u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_MAX_FACES", 3145728u));
     const uint32_t sparseMidMeshMaxTiles =
         ReadUIntEnv("VENPOD_SPARSE_MID_MESH_MAX_TILES", 0u);
     // Per-build cap on expensive mid-mesh tile re-emissions: bounds the ~150-290ms
@@ -16810,6 +16814,15 @@ int RunSandbox(int argc, char* argv[]) {
                             midMeshSnapshot.surfaceRecords.size(),
                             midMeshStats.uploadOverflowLastFrame ? 1 : 0,
                             cameraPos.x, cameraPos.y, cameraPos.z);
+                    }
+                    // RECOVERY: the incremental dirty upload failed (an edge condition under a
+                    // heavy recenter), and retrying the same dirty path just refreezes resident
+                    // while visibleMissing grows. Force the NEXT build to re-prime via the full
+                    // StageSnapshot path (always-works at startup), which re-seeds the whole
+                    // buffer and restores visibleMissing=0. One full-assembly frame, only on the
+                    // rare upload failure.
+                    if (sparseMidMeshIncrementalUpload) {
+                        sparseClipmapTileCache.ForceMidMeshFullReseed();
                     }
                 }
                 }
