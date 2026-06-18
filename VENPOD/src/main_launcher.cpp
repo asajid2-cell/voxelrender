@@ -2951,18 +2951,21 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_SPARSE_MID_MESH_LOD", 1u) != 0u;
     // P1.5: incremental mid-mesh UPLOAD. When on, the mid-mesh GPU resource uses the
     // range allocator and the build emits a dirty payload so only re-extracted tiles
-    // re-upload (vs the full StageSnapshot spike). Default OFF until visual parity of
-    // the terrain floor is confirmed; the full path is unchanged when off.
+    // re-upload (vs the full StageSnapshot spike). DEFAULT ON (final CPU baseline): the
+    // production gate validated geometry parity + visibleMissing=0 across edit/ground/
+    // altitude stress; set VENPOD_MIDMESH_INCREMENTAL_UPLOAD=0 to fall back to the old
+    // full-StageSnapshot path.
     const bool sparseMidMeshIncrementalUpload =
-        ReadUIntEnv("VENPOD_MIDMESH_INCREMENTAL_UPLOAD", 0u) != 0u;
+        ReadUIntEnv("VENPOD_MIDMESH_INCREMENTAL_UPLOAD", 1u) != 0u;
     // PARALLEL pre-extraction of cache-miss tiles (only meaningful on the primed-dirty
-    // incremental path). Default OFF. When on, the build re-extracts every cache-miss
-    // tile across worker threads BEFORE the main loop (the dominant per-build cost is
-    // the ~3.75ms/tile extract, and an editing build re-extracts 4-17 independent tiles
-    // serially). Gated on sparseMidMeshIncrementalUpload (no-op without the dirty path).
+    // incremental path). DEFAULT ON: the build re-extracts every cache-miss tile across
+    // worker threads BEFORE the main loop (the dominant per-build cost is the ~3.75ms/tile
+    // extract, and an editing build re-extracts 4-17 independent tiles serially). Validated
+    // identical-to-serial coverage + ~40% lower editing-build time. Set VENPOD_MIDMESH_PARALLEL=0
+    // to fall back to serial extraction.
     const bool sparseMidMeshParallelExtract =
         sparseMidMeshIncrementalUpload &&
-        ReadUIntEnv("VENPOD_MIDMESH_PARALLEL", 0u) != 0u;
+        ReadUIntEnv("VENPOD_MIDMESH_PARALLEL", 1u) != 0u;
     const uint32_t sparseMidMeshLodBaseMerge =
         std::max(1u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_LOD_BASE_MERGE", 1u));
     // Default merge cap 2 (was 4): both visual judges ranked the finer distant
