@@ -2,6 +2,7 @@
 
 #include "MidMeshFaceAbCompare.h"
 #include "RHI/DX12CommandQueue.h"
+#include "Simulation/TerrainConstants.h"  // SEA_LEVEL_Y (mirrored into the GPU skirt rule)
 
 #include <windows.h>
 
@@ -11,6 +12,7 @@
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <set>
 
 namespace VENPOD::Graphics {
 
@@ -640,6 +642,142 @@ void MidMeshGpuExtractResources::ComputeSmokeFacesCpu(
     }
 }
 
+void MidMeshGpuExtractResources::ComputeB13cSkirtFacesCpu(
+    const SmokeControlledTile& tile,
+    uint32_t terraceStep,
+    int32_t seaLevelY,
+    std::vector<Simulation::SparseSurfaceFace>& outSkirtFaces)
+{
+    outSkirtFaces.clear();
+    if (!tile.valid || tile.sampleSide < 2u) {
+        return;
+    }
+    const uint32_t side = tile.sampleSide;
+    const uint32_t stride = side;
+    const uint32_t cellsPerRow = side - 1u;
+    if (cellsPerRow == 0u || tile.samples.size() < static_cast<size_t>(side) * side) {
+        return;
+    }
+    const int32_t cellSizeInt = std::max(1, tile.cellSizeInt);
+    const int32_t step = std::max(1, static_cast<int32_t>(terraceStep));
+    const uint32_t splitLimit = 32u; // kSparseExtentMask + 1 (must match the shader addFace)
+
+    // Exact mirrors of the shared HLSLI helpers (a one-bit drift would miscount skirts).
+    auto decodeMaterial = [](uint32_t s) -> uint32_t { return (s >> 16u) & 0xFFu; };
+    auto decodeY = [](uint32_t s) -> int32_t {
+        return static_cast<int32_t>(s & 0xFFFFu) -
+            static_cast<int32_t>(MidMeshSampleHeightBias);
+    };
+    auto isSolid = [](uint32_t m) -> bool { return m != 0u /*Air*/ && m != 2u /*Water*/; };
+    auto floorDiv = [](int32_t a, int32_t b) -> int32_t {
+        int32_t q = a / b;
+        int32_t r = a - q * b;
+        if (r != 0 && ((r < 0) != (b < 0))) { q -= 1; }
+        return q;
+    };
+    auto quantY = [&](int32_t y) -> int32_t { return floorDiv(y, step) * step; };
+    // FNV-1a over (x,y,z,0x9E3779B9); low byte = variant. Mirrors MidMeshPackVoxel.
+    auto packVoxel = [](uint32_t material, int32_t x, int32_t y, int32_t z) -> uint32_t {
+        uint32_t h = 2166136261u;
+        h = (h ^ static_cast<uint32_t>(x)) * 16777619u;
+        h = (h ^ static_cast<uint32_t>(y)) * 16777619u;
+        h = (h ^ static_cast<uint32_t>(z)) * 16777619u;
+        h = (h ^ 0x9E3779B9u) * 16777619u;
+        const uint32_t variant = h & 0xFFu;
+        return (material & 0xFFu) | (variant << 8u) | (0x10u << 24u);
+    };
+
+    // addFace split-chunked emission (mirrors MidMeshAddFace / the CPU addFace) for ONE
+    // riser-direction quad. direction is NegX/PosX/NegZ/PosZ here (skirts are never PosY).
+    auto addFace = [&](uint32_t direction, int32_t baseX, int32_t baseY, int32_t baseZ,
+                       uint32_t width, uint32_t height, uint32_t voxel) {
+        if (width == 0u || height == 0u) { return; }
+        for (uint32_t hOff = 0u; hOff < height; hOff += splitLimit) {
+            const uint32_t hChunk = std::min(splitLimit, height - hOff);
+            for (uint32_t wOff = 0u; wOff < width; wOff += splitLimit) {
+                const uint32_t wChunk = std::min(splitLimit, width - wOff);
+                Simulation::SparseSurfaceFace face;
+                face.worldX = baseX;
+                face.worldY = baseY;
+                face.worldZ = baseZ;
+                const auto NegX = static_cast<uint32_t>(Simulation::SparseFaceDirection::NegX);
+                const auto PosX = static_cast<uint32_t>(Simulation::SparseFaceDirection::PosX);
+                const auto NegZ = static_cast<uint32_t>(Simulation::SparseFaceDirection::NegZ);
+                if (direction == NegX || direction == PosX) {
+                    face.worldY = baseY + static_cast<int32_t>(hOff);
+                    face.worldZ = baseZ + static_cast<int32_t>(wOff);
+                } else { // NegZ / PosZ (skirts are never PosY here)
+                    (void)NegZ;
+                    face.worldX = baseX + static_cast<int32_t>(wOff);
+                    face.worldY = baseY + static_cast<int32_t>(hOff);
+                }
+                face.payload =
+                    Simulation::PackSparseSurfacePayload(direction, voxel, wChunk, hChunk);
+                outSkirtFaces.push_back(face);
+            }
+        }
+    };
+    // addRiser -1 inward shift for PosX/PosZ (mirrors MidMeshAddRiser / the CPU addRiser).
+    auto addRiser = [&](uint32_t direction, int32_t boundaryX, int32_t boundaryZ,
+                        int32_t lowTopY, uint32_t span, uint32_t height, uint32_t voxel) {
+        if (height == 0u) { return; }
+        const auto PosX = static_cast<uint32_t>(Simulation::SparseFaceDirection::PosX);
+        const auto PosZ = static_cast<uint32_t>(Simulation::SparseFaceDirection::PosZ);
+        int32_t faceX = boundaryX;
+        int32_t faceZ = boundaryZ;
+        if (direction == PosX) { faceX = boundaryX - 1; }
+        else if (direction == PosZ) { faceZ = boundaryZ - 1; }
+        addFace(direction, faceX, lowTopY, faceZ, span, height, voxel);
+    };
+
+    const auto NegX = static_cast<uint32_t>(Simulation::SparseFaceDirection::NegX);
+    const auto PosX = static_cast<uint32_t>(Simulation::SparseFaceDirection::PosX);
+    const auto NegZ = static_cast<uint32_t>(Simulation::SparseFaceDirection::NegZ);
+    const auto PosZ = static_cast<uint32_t>(Simulation::SparseFaceDirection::PosZ);
+
+    for (uint32_t cz = 0; cz < cellsPerRow; ++cz) {
+        const bool atNegZ = (cz == 0u);
+        const bool atPosZ = (cz + 1u >= cellsPerRow);
+        for (uint32_t cx = 0; cx < cellsPerRow; ++cx) {
+            const bool atNegX = (cx == 0u);
+            const bool atPosX = (cx + 1u >= cellsPerRow);
+            if (!atNegX && !atPosX && !atNegZ && !atPosZ) {
+                continue; // interior: no skirt
+            }
+            const uint32_t s = tile.samples[cz * stride + cx];
+            const uint32_t material = decodeMaterial(s);
+            if (!isSolid(material)) {
+                continue; // SOLID-only (mirrors !block.water on the GPU's solid-only path)
+            }
+            const int32_t height = quantY(decodeY(s));
+            const int32_t worldX = tile.originX + static_cast<int32_t>(cx) * cellSizeInt;
+            const int32_t worldZ = tile.originZ + static_cast<int32_t>(cz) * cellSizeInt;
+            const uint32_t width = static_cast<uint32_t>(cellSizeInt);
+            const uint32_t depth = static_cast<uint32_t>(cellSizeInt);
+            const uint32_t voxel = packVoxel(material, worldX, height, worldZ);
+
+            const uint32_t skirtDepth = std::max(8u, terraceStep * 6u);
+            int32_t skirtLowTopY = height + 1 - static_cast<int32_t>(skirtDepth);
+            if (height > seaLevelY && skirtLowTopY > seaLevelY - 2) {
+                skirtLowTopY = seaLevelY - 2;
+            }
+            const uint32_t skirtHeight =
+                static_cast<uint32_t>(std::max(1, height + 1 - skirtLowTopY));
+
+            if (atNegX) { addRiser(NegX, worldX, worldZ, skirtLowTopY, depth, skirtHeight, voxel); }
+            if (atPosX) {
+                addRiser(PosX, worldX + static_cast<int32_t>(width), worldZ,
+                         skirtLowTopY, depth, skirtHeight, voxel);
+            }
+            if (atNegZ) { addRiser(NegZ, worldX, worldZ, skirtLowTopY, width, skirtHeight, voxel); }
+            if (atPosZ) {
+                addRiser(PosZ, worldX, worldZ + static_cast<int32_t>(depth),
+                         skirtLowTopY, width, skirtHeight, voxel);
+            }
+        }
+    }
+}
+
 bool MidMeshGpuExtractResources::RunSmokeDispatch(
     ID3D12Device* device,
     DX12CommandQueue& commandQueue,
@@ -1021,8 +1159,11 @@ Result<void> MidMeshGpuExtractResources::InitializeB13aTopFace(
     }
 
     // Top-face PSO. Root layout MUST match CS_MidMeshExtractTopFaces.hlsl:
-    //   b0: 5x 32-bit constants {tileSlot, debugBaseFace, faceCapacityPerTile,
-    //       terraceStep, emitRisers}  (emitRisers: 0 = B1.3a top only, 1 = B1.3b + risers)
+    //   b0: 7x 32-bit constants {tileSlot, debugBaseFace, faceCapacityPerTile,
+    //       terraceStep, emitRisers, emitSkirts, seaLevelY}
+    //       (emitRisers: 0 = B1.3a top only, 1 = B1.3b + risers;
+    //        emitSkirts: 0 = no border skirts, 1 = B1.3c + tile-border skirts;
+    //        seaLevelY: SEA_LEVEL_Y, passed so the GPU never hardcodes it)
     //   t0: samples (root SRV)   u0: debug faces (root UAV)   u1: metadata (root UAV)
     const std::filesystem::path csPath =
         shaderPath / "Compute" / "CS_MidMeshExtractTopFaces.hlsl";
@@ -1034,7 +1175,7 @@ Result<void> MidMeshGpuExtractResources::InitializeB13aTopFace(
     ComputePipelineDesc desc;
     desc.computeShader = compileResult.value();
     desc.debugName = "CS_MidMeshExtractTopFaces";
-    desc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 5 }); // b0
+    desc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 7 }); // b0
     desc.rootParams.push_back({ RootParamType::ShaderResource, 0, 0, 1 }); // t0 samples
     desc.rootParams.push_back({ RootParamType::UnorderedAccess, 0, 0, 1 }); // u0 faces
     desc.rootParams.push_back({ RootParamType::UnorderedAccess, 1, 0, 1 }); // u1 metadata
@@ -1155,13 +1296,72 @@ uint32_t MidMeshGpuExtractResources::SelectB13bFixture(
     return UINT32_MAX;
 }
 
+uint32_t MidMeshGpuExtractResources::SelectB13cFixture(
+    const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
+    const std::function<bool(uint32_t)>& hasEditFootprint,
+    uint32_t sampleSide,
+    uint32_t terraceStep)
+{
+    if (sampleSide < 2u) {
+        return UINT32_MAX;
+    }
+    const uint32_t side = sampleSide;
+    (void)terraceStep; // not needed: a border SOLID cell emits a skirt regardless of height.
+
+    // Mirror the shared HLSLI material decode + solid predicate exactly.
+    auto decodeMaterial = [](uint32_t sample) -> uint32_t {
+        return (sample >> 16u) & 0xFFu;
+    };
+    auto isSolid = [](uint32_t material) -> bool {
+        return material != 0u /*Air*/ && material != 2u /*Water*/;
+    };
+
+    const uint32_t cellsPerRow = side - 1u;
+    for (uint32_t i = 0; i < dirtyTiles.size(); ++i) {
+        const auto& t = dirtyTiles[i];
+        if (t.slot == UINT32_MAX || t.samples == nullptr || t.sampleCount == 0u) {
+            continue;
+        }
+        if (t.mergeCells != 1u || t.childMask != 0u) {
+            continue;
+        }
+        if (hasEditFootprint && hasEditFootprint(t.slot)) {
+            continue;
+        }
+        if (t.sampleCount < static_cast<uint32_t>(side) * side) {
+            continue; // need the full grid to scan border cells
+        }
+        // BORDER-SOLID check: the CPU emits a skirt on every SOLID footprint whose cell sits
+        // on a tile edge (cx==0 || cx==cellsPerRow-1 || cz==0 || cz==cellsPerRow-1). Scan
+        // the perimeter; if ANY border cell is solid, the GPU skirt path will emit (> 0).
+        bool borderSolid = false;
+        for (uint32_t cz = 0; cz < cellsPerRow && !borderSolid; ++cz) {
+            const bool zEdge = (cz == 0u) || (cz + 1u >= cellsPerRow);
+            for (uint32_t cx = 0; cx < cellsPerRow && !borderSolid; ++cx) {
+                const bool xEdge = (cx == 0u) || (cx + 1u >= cellsPerRow);
+                if (!xEdge && !zEdge) {
+                    continue; // interior cell: no skirt
+                }
+                if (isSolid(decodeMaterial(t.samples[cz * side + cx]))) {
+                    borderSolid = true;
+                }
+            }
+        }
+        if (borderSolid) {
+            return i;
+        }
+    }
+    return UINT32_MAX;
+}
+
 bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     ID3D12Device* device,
     const Simulation::MidMeshGpuExtractDirtyTile& fixture,
     const std::vector<Simulation::SparseSurfaceFace>& cpuReferenceFaces,
     uint32_t terraceStep,
     uint64_t currentTileVersionForSlot,
-    bool emitRisers)
+    bool emitRisers,
+    bool emitSkirts)
 {
     if (!m_b13aReady || !device) {
         return false;
@@ -1182,6 +1382,7 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     ctl.valid = true;
     ctl.b13aTopFace = true;
     ctl.emitRisers = emitRisers; // B1.3b: poll labels b13b + the riser path was active
+    ctl.emitSkirts = emitSkirts; // B1.3c: poll labels b13c + the skirt path was active
     ctl.slot = 0u;       // the dedicated smoke buffers always use slot 0 / baseFace 0
     ctl.baseFace = 0u;
     ctl.version = fixture.meshContentVersion;
@@ -1260,11 +1461,19 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     m_smokeFaceBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     m_topFacePipeline.Bind(list);
-    const uint32_t consts[5] = {
+    // b0: {tileSlot, debugBaseFace, faceCapacityPerTile, terraceStep, emitRisers,
+    //      emitSkirts, seaLevelY}. seaLevelY mirrors the CPU compile-time SEA_LEVEL_Y so
+    //      the GPU skirt rule never hardcodes it. Bit-cast the signed int into the uint slot.
+    uint32_t seaLevelBits;
+    const int32_t seaLevelY = Simulation::SEA_LEVEL_Y;
+    std::memcpy(&seaLevelBits, &seaLevelY, sizeof(uint32_t));
+    const uint32_t consts[7] = {
         ctl.slot, ctl.baseFace, m_topFaceCapacityPerTile, m_b13aBuildTerraceStep,
-        emitRisers ? 1u : 0u
+        emitRisers ? 1u : 0u,
+        emitSkirts ? 1u : 0u,
+        seaLevelBits
     };
-    m_topFacePipeline.SetRoot32BitConstants(list, 0, 5, consts);
+    m_topFacePipeline.SetRoot32BitConstants(list, 0, 7, consts);
     list->SetComputeRootShaderResourceView(1, m_smokeSampleBuffer.GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(2, m_smokeFaceBuffer.GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(3, m_smokeMetaBuffer.GetGPUVirtualAddress());
@@ -1354,6 +1563,7 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     m_b13aStats = {};
     m_b13aStats.dispatched = true;
     m_b13aStats.emitRisers = emitRisers;
+    m_b13aStats.emitSkirts = emitSkirts;
     m_b13aStats.tileSlot = fixture.slot;        // report the REAL cache slot (fixture)
     m_b13aStats.fixtureMergeCells = fixture.mergeCells;
     m_b13aStats.fixtureChildMask = fixture.childMask;
@@ -1367,11 +1577,13 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     m_b13aStats.verified = keepVerified;
     m_b13aStats.verifyCount = keepVerifyCount;
 
+    // Label: b13c if skirts are on (the superset increment), else b13b if risers, else b13a.
+    const char* const modeLabel = emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a");
     spdlog::info(
         "GPU_EXTRACT_B13A mode={} fixtureSlot={} mergeCells={} childMask={} cpuRefFaces={} "
         "dispatchGpuUs={:.2f} barrierGpuUs={:.2f} cpuSubmitUs={:.2f} commitGate={} "
         "dispatchedVersion={} currentVersion={}",
-        emitRisers ? "b13b" : "b13a",
+        modeLabel,
         fixture.slot, fixture.mergeCells, fixture.childMask,
         m_b13aStats.cpuRefFaceCount, dispatchUs, barrierUs, cpuSubmitUs,
         stale ? "DISCARD_STALE" : "PASS",
@@ -1423,11 +1635,38 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     // B1.3b: a GPU RISER is any emitted face whose packed direction is not PosY (the top).
     // Count them so the gate can require riser faces > 0 (the increment really added risers).
     const bool emitRisers = slot.tile.emitRisers;
+    const bool emitSkirts = slot.tile.emitSkirts;
     uint32_t gpuRiserFaces = 0u;
     for (const auto& f : gpuFaces) {
         if (Simulation::SparseSurfacePayloadDirection(f.payload) !=
             static_cast<uint32_t>(Simulation::SparseFaceDirection::PosY)) {
             ++gpuRiserFaces;
+        }
+    }
+
+    // B1.3c: COUNT the GPU faces that are TILE-BORDER SKIRTS, drift-free. Recompute the exact
+    // skirt face set CPU-side (same FNV voxel hash / quantize / addRiser split as the shader),
+    // build a multiset, and count how many GPU faces appear in it. This is the "skirt faces > 0"
+    // gate signal - it isolates the new B1.3c contribution from the B1.3b interior risers (both
+    // share riser DIRECTIONS, so direction alone cannot tell them apart). 0 when skirts are off.
+    uint32_t gpuSkirtFaces = 0u;
+    if (emitSkirts) {
+        std::vector<Simulation::SparseSurfaceFace> skirtFaces;
+        ComputeB13cSkirtFacesCpu(slot.tile, m_b13aBuildTerraceStep, Simulation::SEA_LEVEL_Y,
+                                 skirtFaces);
+        // Multiset key = the raw 16-byte face (memcmp), matching the AB harness canonical form.
+        auto faceLess = [](const Simulation::SparseSurfaceFace& a,
+                           const Simulation::SparseSurfaceFace& b) {
+            return std::memcmp(&a, &b, sizeof(Simulation::SparseSurfaceFace)) < 0;
+        };
+        std::multiset<Simulation::SparseSurfaceFace, decltype(faceLess)> skirtSet(faceLess);
+        for (const auto& f : skirtFaces) { skirtSet.insert(f); }
+        for (const auto& f : gpuFaces) {
+            auto it = skirtSet.find(f);
+            if (it != skirtSet.end()) {
+                ++gpuSkirtFaces;
+                skirtSet.erase(it); // each GPU skirt consumes one CPU skirt slot (multiset)
+            }
         }
     }
 
@@ -1439,7 +1678,9 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     const std::vector<Simulation::SparseSurfaceFace>& cpuFaces = slot.tile.cpuReferenceFaces;
     const MidMeshFaceAbResult ab = CompareMidMeshFacesMultiset(
         gpuFaces, cpuFaces, MidMeshFaceAbMode::Containment, gpuStatus, 8u);
-    LogMidMeshFaceAbResult(emitRisers ? "b13b" : "b13a", ab);
+    // Label: b13c if skirts were on (the superset increment), else b13b/b13a.
+    const char* const modeLabel = emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a");
+    LogMidMeshFaceAbResult(modeLabel, ab);
 
     slot.pending = false;
     slot.tile = {};
@@ -1447,6 +1688,8 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
 
     ++m_b13aAbVerifyCount;
     m_b13aStats.emitRisers = emitRisers;
+    m_b13aStats.emitSkirts = emitSkirts;
+    m_b13aStats.gpuSkirtFaces = gpuSkirtFaces;
     m_b13aStats.gpuFaceCount = gpuFaceCount;
     m_b13aStats.gpuStatusOverflow = gpuStatus;
     m_b13aStats.verified = true;
@@ -1465,12 +1708,12 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     // gpuRiserFaces > 0 is part of the B1.3b gate (the increment really added risers).
     spdlog::info(
         "B13A_VERIFY mode={} abVerifyCount={} match={} containSubset={} gpuFaces={} "
-        "gpuRiserFaces={} cpuMeshFaces={} extraGpuFaces={} missingCpuFaces={} "
+        "gpuRiserFaces={} gpuSkirtFaces={} cpuMeshFaces={} extraGpuFaces={} missingCpuFaces={} "
         "multiplicityMismatches={} gpuStatus={}",
-        emitRisers ? "b13b" : "b13a",
+        modeLabel,
         m_b13aAbVerifyCount, ab.match ? 1 : 0,
         (ab.extraGpuFaces == 0u && gpuStatus == 0u) ? 1 : 0,
-        gpuFaceCount, gpuRiserFaces, ab.cpuFaceCount,
+        gpuFaceCount, gpuRiserFaces, gpuSkirtFaces, ab.cpuFaceCount,
         ab.extraGpuFaces, ab.missingCpuFaces, ab.multiplicityMismatches, gpuStatus);
     return true;
 }

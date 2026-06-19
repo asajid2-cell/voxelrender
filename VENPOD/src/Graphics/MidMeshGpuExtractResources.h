@@ -185,8 +185,10 @@ struct MidMeshGpuExtractSmokeStats {
 // CONTAINMENT A/B against the CPU tile's meshCacheFaces (the ground-truth mesh).
 // -----------------------------------------------------------------------------
 struct MidMeshGpuExtractB13aStats {
-    bool dispatched = false;        // a B1.3a/b top-face dispatch ran this frame
+    bool dispatched = false;        // a B1.3a/b/c top-face dispatch ran this frame
     bool emitRisers = false;        // B1.3b: this dispatch also emitted neighbor risers
+    bool emitSkirts = false;        // B1.3c: this dispatch also emitted tile-border skirts
+    uint32_t gpuSkirtFaces = 0;     // B1.3c: GPU faces that are border-skirt side quads
     uint32_t tileSlot = UINT32_MAX; // controlled (flat/simple) fixture slot
     uint32_t fixtureMergeCells = 0; // the fixture's mergeCells (must be 1)
     uint32_t fixtureChildMask = 0;  // the fixture's childMask (must be 0)
@@ -355,6 +357,19 @@ public:
         uint32_t sampleSide,
         uint32_t terraceStep);
 
+    // B1.3c fixture: the SAME flat/simple constraints as SelectB13aFixture (mergeCells==1,
+    // childMask==0, no edit footprint) PLUS at least one BORDER cell (cx/cz on the tile edge)
+    // that is SOLID - the exact condition under which the CPU's tile-border SKIRT emits, so
+    // the "skirt faces > 0" gate can be met. (The CPU emits a skirt on every border SOLID
+    // footprint, independent of any height step, so a stepped interior is NOT required - a
+    // solid edge cell is sufficient.) `sampleSide`/`terraceStep` mirror the build so the
+    // solid/quantize scan matches the GPU. Returns the picked tile's index, or UINT32_MAX.
+    static uint32_t SelectB13cFixture(
+        const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
+        const std::function<bool(uint32_t /*slot*/)>& hasEditFootprint,
+        uint32_t sampleSide,
+        uint32_t terraceStep);
+
     // Run ONE top-face extraction for the picked fixture tile. Uploads the tile's
     // samples+metadata (faceCount zeroed) into the dedicated smoke buffers, dispatches
     // CS_MidMeshExtractTopFaces over the tile's cell grid (each eligible solid cell
@@ -364,17 +379,20 @@ public:
     // against it. Runs on the isolated smoke queue + fence (production untouched).
     // Returns true if a dispatch was issued.
     // `emitRisers` (B1.3b): when true the dispatch also emits the CPU's right/forward
-    // neighbor RISER side faces (tile-interior addressing; border skirts deferred to
-    // B1.3c). The containment A/B then proves GPU(top+risers) is still a multiset-subset
-    // of the CPU mesh; only the AB_VERIFY label changes (b13a -> b13b). false = B1.3a
-    // top-faces only (unchanged behaviour).
+    // neighbor RISER side faces (tile-interior addressing). `emitSkirts` (B1.3c): when
+    // true the dispatch ALSO emits the CPU's tile-border SKIRT faces (the self-contained
+    // outward border quads that seal tile seams - no halo needed; mirrors the CPU's
+    // x==0/xEnd>=cellCount/z==0/zEnd>=cellCount skirt rule using SEA_LEVEL_Y + terraceStep).
+    // The containment A/B then proves GPU(top+risers+skirts) is still a multiset-subset of
+    // the CPU mesh; the AB_VERIFY label becomes b13c. Both false = B1.3a top-faces only.
     bool RunB13aTopFaceDispatch(
         ID3D12Device* device,
         const Simulation::MidMeshGpuExtractDirtyTile& fixture,
         const std::vector<Simulation::SparseSurfaceFace>& cpuReferenceFaces,
         uint32_t terraceStep,
         uint64_t currentTileVersionForSlot,
-        bool emitRisers = false);
+        bool emitRisers = false,
+        bool emitSkirts = false);
 
     // Delayed, DEBUG-ONLY containment A/B via the fence-tracked ring (same FIFO/ring as
     // the smoke poll, non-blocking by default). Reads the GPU top faces + status for the
@@ -406,6 +424,7 @@ private:
         // smoke pattern. When set, the poll uses cpuReferenceFaces + Containment.
         bool b13aTopFace = false;
         bool emitRisers = false; // B1.3b: this dispatch also emitted neighbor risers
+        bool emitSkirts = false; // B1.3c: this dispatch also emitted tile-border skirts
         std::vector<Simulation::SparseSurfaceFace> cpuReferenceFaces; // tile meshCacheFaces
     };
 
@@ -414,6 +433,18 @@ private:
     static void ComputeSmokeFacesCpu(
         const SmokeControlledTile& tile,
         std::vector<Simulation::SparseSurfaceFace>& outFaces);
+
+    // B1.3c: recompute ONLY the tile-border SKIRT faces CPU-side for the captured fixture
+    // (mirror of the HLSL MidMeshEmitBorderSkirts + the CPU extractTileMesh skirt rule). Used
+    // by PollB13aReadback to COUNT how many of the GPU's emitted faces are border skirts (the
+    // "skirt faces > 0" gate), drift-free: identical FNV voxel hash / quantize / addRiser split
+    // as the shader, so a skirt face matches the GPU's exactly. `terraceStep`/`seaLevelY` mirror
+    // the build. Does NOT include tops or interior risers - only the border skirts.
+    static void ComputeB13cSkirtFacesCpu(
+        const SmokeControlledTile& tile,
+        uint32_t terraceStep,
+        int32_t seaLevelY,
+        std::vector<Simulation::SparseSurfaceFace>& outSkirtFaces);
 
     // B1.3.0: one slot of the fence-tracked readback RING. Each slot owns a face +
     // metadata readback buffer that is Map()'d ONCE at init and kept persistently

@@ -45,13 +45,15 @@
 
 #include "MidMeshExtractCommon.hlsli"
 
-// Root constants (b0): the B1.3a/b controls.
+// Root constants (b0): the B1.3a/b/c controls.
 cbuffer TopFaceConstants : register(b0) {
     uint gTileSlot;             // controlled tile slot (index into the metadata buffer)
     uint gDebugBaseFace;        // base of this tile's range in the DEBUG face buffer
     uint gFaceCapacityPerTile;  // per-tile debug-buffer capacity (overflow bound)
     uint gTerraceStep;          // terraceStep (build config) for height quantization
     uint gEmitRisers;           // B1.3b: 0 = top faces only (B1.3a); 1 = + risers
+    uint gEmitSkirts;           // B1.3c: 0 = no border skirts; 1 = + tile-border skirts
+    int  gSeaLevelY;            // B1.3c: SEA_LEVEL_Y (-48); mirrors the CPU compile-time const
 }
 
 StructuredBuffer<uint>                Samples    : register(t0); // per-tile sample grid
@@ -141,6 +143,73 @@ bool MidMeshAddRiser(uint slot, uint direction,
     }
     // addFace(direction, faceX, lowTopY, faceZ, span=width, height, voxel).
     return MidMeshAddFace(slot, direction, faceX, lowTopY, faceZ, span, height, voxel);
+}
+
+// =============================================================================
+// TILE-BORDER SKIRTS (CPU extractTileMesh, SparseClipmap.cpp ~7120-7170). B1.3c.
+// SELF-CONTAINED - reads NO neighbor-tile samples; this is the deliberate SUBSTITUTE
+// for a halo. aggregateSamples CLAMPS to the tile, so a border footprint sees itself
+// as its own neighbor (equal heights -> no riser ever crosses a tile boundary). The
+// CPU seals those seams with fixed-depth OUTWARD skirts on border SOLID footprints,
+// using ONLY this block's own height/material/voxel + terraceStep + SEA_LEVEL_Y. We
+// MIRROR it byte-for-byte (so haloWidth stays 0):
+//   * SOLID blocks only (!block.water): water tops sit at the uniform sea level so
+//     water-water borders cannot crack, and a water skirt is a visible dark wall.
+//   * skirtDepth = max(8, terraceStep*6); skirtLowTopY = height + 1 - skirtDepth,
+//     extended DOWN to SEA_LEVEL_Y - 2 whenever the block sits above sea level (so a
+//     border ledge always meets the water instead of leaving a black cut).
+//   * skirtHeight = max(1, height + 1 - skirtLowTopY).
+//   * one addRiser per border edge (NegX@x==0, PosX@xEnd>=cellCount, NegZ@z==0,
+//     PosZ@zEnd>=cellCount), span = depth (X edges) / width (Z edges), the SAME voxel
+//     as the top face (NOT re-hashed per segment - this is a plain addRiser, not the
+//     cliff-sliced emitRiser). The PosX/PosZ boundary coords are worldX+width /
+//     worldZ+depth (addRiser applies the -1 inward shift), NegX/NegZ keep worldX/worldZ.
+// `width`/`depth` are this block's footprint extent; `atNegX/atPosX/atNegZ/atPosZ` are
+// the border-edge predicates the caller computes from the cell index vs cellCount.
+// =============================================================================
+bool MidMeshEmitBorderSkirts(uint slot,
+                             int worldX, int worldZ, int height,
+                             uint width, uint depth, uint voxel,
+                             uint terraceStep, int seaLevelY,
+                             bool atNegX, bool atPosX, bool atNegZ, bool atPosZ) {
+    // skirtDepth = max(8u, terraceStep * 6u).
+    const uint skirtDepth = max(8u, terraceStep * 6u);
+    int skirtLowTopY = height + 1 - (int)skirtDepth;
+    // height > SEA_LEVEL_Y && skirtLowTopY > SEA_LEVEL_Y - 2  ->  clamp to SEA_LEVEL_Y - 2.
+    if (height > seaLevelY && skirtLowTopY > seaLevelY - 2) {
+        skirtLowTopY = seaLevelY - 2;
+    }
+    const uint skirtHeight = (uint)max(1, height + 1 - skirtLowTopY);
+
+    if (atNegX) {
+        // addRiser(NegX, worldX, worldZ, skirtLowTopY, span=depth, skirtHeight, voxel)
+        if (!MidMeshAddRiser(slot, kSparseDirNegX, worldX, worldZ, skirtLowTopY,
+                             depth, skirtHeight, voxel)) {
+            return false;
+        }
+    }
+    if (atPosX) {
+        // boundary X = worldX + width (addRiser applies the -1 inward shift for PosX).
+        if (!MidMeshAddRiser(slot, kSparseDirPosX, worldX + (int)width, worldZ, skirtLowTopY,
+                             depth, skirtHeight, voxel)) {
+            return false;
+        }
+    }
+    if (atNegZ) {
+        // addRiser(NegZ, worldX, worldZ, skirtLowTopY, span=width, skirtHeight, voxel)
+        if (!MidMeshAddRiser(slot, kSparseDirNegZ, worldX, worldZ, skirtLowTopY,
+                             width, skirtHeight, voxel)) {
+            return false;
+        }
+    }
+    if (atPosZ) {
+        // boundary Z = worldZ + depth (addRiser applies the -1 inward shift for PosZ).
+        if (!MidMeshAddRiser(slot, kSparseDirPosZ, worldX, worldZ + (int)depth, skirtLowTopY,
+                             width, skirtHeight, voxel)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // =============================================================================
@@ -259,6 +328,28 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     // addFace SPLIT-LIMIT chunking parity: a top quad wider/deeper than 32u is emitted as
     // MULTIPLE sub-faces. For PosY: worldX += wOff, worldZ += hOff. cellSize<=32 -> 1 face.
     MidMeshAddFace(slot, kSparseDirPosY, worldX, height, worldZ, width, depth, voxel);
+
+    // ---- TILE-BORDER SKIRTS (B1.3c) ----
+    // CPU order: top face -> border skirts -> risers. The skirt is SOLID-only; this path
+    // already early-returned for non-solid cells (MidMeshSolidCellBlock above), so block
+    // is always solid here -> the CPU's `!block.water` guard is satisfied implicitly.
+    // Border-edge predicates mirror the CPU mergeCells==1 case: x==0 (cx==0), xEnd>=cellCount
+    // (cx==cellsPerRow-1), z==0 (cz==0), zEnd>=cellCount (cz==cellsPerRow-1). cellsPerRow is
+    // the CPU's cellCount (== side-1). Skirts use the SAME voxel as the top face.
+    if (gEmitSkirts != 0u) {
+        const bool atNegX = (cx == 0u);
+        const bool atPosX = (cx + 1u >= cellsPerRow);
+        const bool atNegZ = (cz == 0u);
+        const bool atPosZ = (cz + 1u >= cellsPerRow);
+        if (atNegX || atPosX || atNegZ || atPosZ) {
+            if (!MidMeshEmitBorderSkirts(slot, worldX, worldZ, height,
+                                         width, depth, voxel,
+                                         terraceStep, gSeaLevelY,
+                                         atNegX, atPosX, atNegZ, atPosZ)) {
+                return; // overflow -> status set; stop emitting for this thread.
+            }
+        }
+    }
 
     // ---- RISERS (B1.3b) ----
     // Only when enabled. INTERIOR addressing: the right (cx+1,cz) / forward (cx,cz+1)

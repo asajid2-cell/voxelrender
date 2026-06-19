@@ -2995,11 +2995,22 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseMidMeshGpuExtractB13b =
         sparseMidMeshGpuExtract &&
         ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_B13B", 0u) != 0u;
-    // The B1.3a/b top-face path reuses the smoke compute side (queue/fence/readback ring),
-    // so the smoke compute objects must be stood up whenever ANY path is enabled. B1.3b
-    // shares the B1.3a top-face PSO, so it also needs the B1.3a init to run.
+    // Phase B1.3c: the THIRD meshing increment - GPU TOP-FACE + RISER + tile-border SKIRT
+    // extraction for a controlled border-relevant tile (mergeCells==1, childMask==0, no edit
+    // footprint, at least one SOLID border cell so a skirt actually emits). Still A/B'd in
+    // CONTAINMENT mode (GPU top+risers+skirts must be a multiset-subset of the CPU mesh;
+    // extraGpuFaces==0). The CPU skirt rule is SELF-CONTAINED (no neighbor-tile samples), so
+    // NO halo is uploaded (haloWidth stays 0). Reuses the B1.3a/b top-face PSO with the new
+    // gEmitSkirts root constant set; implies risers on too (the superset increment). Default 0.
+    const bool sparseMidMeshGpuExtractB13c =
+        sparseMidMeshGpuExtract &&
+        ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_B13C", 0u) != 0u;
+    // The B1.3a/b/c top-face path reuses the smoke compute side (queue/fence/readback ring),
+    // so the smoke compute objects must be stood up whenever ANY path is enabled. B1.3b/c
+    // share the B1.3a top-face PSO, so they also need the B1.3a init to run.
     const bool sparseMidMeshGpuExtractTopFacePath =
-        sparseMidMeshGpuExtractB13a || sparseMidMeshGpuExtractB13b;
+        sparseMidMeshGpuExtractB13a || sparseMidMeshGpuExtractB13b ||
+        sparseMidMeshGpuExtractB13c;
     const bool sparseMidMeshGpuExtractComputeSide =
         sparseMidMeshGpuExtractSmoke || sparseMidMeshGpuExtractTopFacePath;
     // Phase B1.3.0 GATED explicit readback WAIT. Default 0 = the readback ring polls
@@ -16935,31 +16946,40 @@ int RunSandbox(int argc, char* argv[]) {
                             commandQueue->GetLastCompletedFenceValue());
                     }
 
-                    // ===== Phase B1.3a / B1.3b: REAL top-face (+ riser) extraction =====
+                    // ===== Phase B1.3a / B1.3b / B1.3c: REAL top-face (+ riser + skirt) extract =====
                     // B1.3a: pick a FLAT/SIMPLE fixture (mergeCells==1, childMask==0, no edit
                     // footprint) and emit GPU TOP faces only. B1.3b: pick a STEPPED-but-simple
                     // fixture (same constraints + real height variation) and emit TOP + RISER
-                    // faces (interior neighbor risers; border skirts deferred to B1.3c). In
-                    // both cases capture the tile's FULL CPU meshCacheFaces (read-only) as the
-                    // ground truth and (delayed) A/B in CONTAINMENT mode: the GPU set MUST be a
-                    // multiset-subset of the CPU mesh (extraGpuFaces==0). ISOLATED debug output;
-                    // the CPU path is untouched and still owns all visible geometry. When B1.3b
-                    // is enabled it takes precedence (it is the superset increment); otherwise
-                    // B1.3a runs. Both reuse the same top-face PSO (gEmitRisers root constant).
+                    // faces (interior neighbor risers). B1.3c: pick a BORDER-relevant fixture
+                    // (same constraints + a SOLID border cell) and emit TOP + RISER + tile-border
+                    // SKIRT faces. The CPU skirt rule is SELF-CONTAINED (no neighbor-tile samples
+                    // -> NO halo upload). In all cases capture the tile's FULL CPU meshCacheFaces
+                    // (read-only) as the ground truth and (delayed) A/B in CONTAINMENT mode: the
+                    // GPU set MUST be a multiset-subset of the CPU mesh (extraGpuFaces==0).
+                    // ISOLATED debug output; the CPU path is untouched and still owns all visible
+                    // geometry. Precedence B1.3c > B1.3b > B1.3a (each a superset of the prior).
+                    // All reuse the same top-face PSO (gEmitRisers / gEmitSkirts root constants).
                     if (sparseMidMeshGpuExtractTopFacePath &&
                         midMeshGpuExtractResources.B13aReady() &&
                         !gpuExtractTiles.empty()) {
-                        const bool emitRisers = sparseMidMeshGpuExtractB13b;
+                        // B1.3c is the superset increment (top + risers + skirts) and takes
+                        // precedence; else B1.3b (top + risers); else B1.3a (top only).
+                        const bool emitSkirts = sparseMidMeshGpuExtractB13c;
+                        const bool emitRisers = sparseMidMeshGpuExtractB13b || emitSkirts;
                         const auto editFootprintFn = [&](uint32_t slot) {
                             return sparseClipmapTileCache
                                 .MidMeshTileHasEditFootprintBySlot(slot);
                         };
-                        const uint32_t fixtureIdx = emitRisers
-                            ? MidMeshGpuExtractResources::SelectB13bFixture(
+                        const uint32_t fixtureIdx = emitSkirts
+                            ? MidMeshGpuExtractResources::SelectB13cFixture(
                                   gpuExtractTiles, editFootprintFn,
                                   sparseClipmapConfig.tileSampleSide, sparseMidMeshTerraceStep)
-                            : MidMeshGpuExtractResources::SelectB13aFixture(
-                                  gpuExtractTiles, editFootprintFn);
+                            : (emitRisers
+                                ? MidMeshGpuExtractResources::SelectB13bFixture(
+                                      gpuExtractTiles, editFootprintFn,
+                                      sparseClipmapConfig.tileSampleSide, sparseMidMeshTerraceStep)
+                                : MidMeshGpuExtractResources::SelectB13aFixture(
+                                      gpuExtractTiles, editFootprintFn));
                         if (fixtureIdx != UINT32_MAX) {
                             const auto& fixture = gpuExtractTiles[fixtureIdx];
                             // READ-ONLY: the tile's persistent CPU reference mesh (the exact
@@ -16979,7 +16999,7 @@ int RunSandbox(int argc, char* argv[]) {
                                 midMeshGpuExtractResources.RunB13aTopFaceDispatch(
                                     device->GetDevice(), fixture, cpuRefFaces,
                                     sparseMidMeshTerraceStep, fixture.meshContentVersion,
-                                    emitRisers);
+                                    emitRisers, emitSkirts);
                                 midMeshGpuExtractResources.PollB13aReadback();
                             }
                         }
