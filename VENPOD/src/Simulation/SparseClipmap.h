@@ -690,6 +690,11 @@ public:
     // Changed tiles that were deferred (over maxRebuildTiles) in the last build. >0 means
     // the mid-mesh is mid-catch-up; the caller should re-fire the build next frame.
     uint32_t LastMidMeshDeferredTiles() const { return m_lastMidMeshDeferredTiles; }
+    // Phase B1.3f-d read-only CPU-displaced telemetry: the last build's total CPU
+    // extractTileMesh time + the number of tiles it (re)extracted. The GPU-extract corpus
+    // harness pairs this with the per-tile GPU dispatch time to weigh CPU saved vs GPU added.
+    double LastMidMeshExtractMs() const { return m_lastMidMeshExtractMs; }
+    uint32_t LastMidMeshReExtractTiles() const { return m_lastMidMeshReExtractTiles; }
     // P1.5: clear exactly the tiles the GPU committed this frame (the upload is
     // per-frame BUDGETED, so a mass recenter drains over several frames). Retry-safe:
     // a failed/deferred tile stays dirty. Call only after EmitCopy succeeds.
@@ -1254,6 +1259,11 @@ private:
     uint64_t m_midMeshBuildCounter = 0;
     uint32_t m_lastMidMeshMaxStaleAge = 0;
     uint32_t m_lastMidMeshPendingCount = 0;
+    // Phase B1.3f-d (read-only telemetry): the last build's CPU extract attribution, so the
+    // GPU-extract corpus harness can report the CPU extractTileMesh cost DISPLACED (CPU saved vs
+    // GPU added) without touching the production extractor. Pure bookkeeping set at build end.
+    double m_lastMidMeshExtractMs = 0.0;
+    uint32_t m_lastMidMeshReExtractTiles = 0;
     uint32_t m_lastInterestUpdateFrame = 0;
     uint32_t m_lastStatsFrame = 0;
     // RefreshStats' heavy aggregation (iterating up to 16384 resident voxel bricks +

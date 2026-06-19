@@ -60,9 +60,12 @@
 #include <chrono>
 #include <deque>
 #include <limits>
+#include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 using namespace VENPOD;
@@ -3073,14 +3076,30 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseMidMeshGpuExtractB13fc =
         sparseMidMeshGpuExtract &&
         ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_B13FC", 0u) != 0u;
-    // The B1.3a..f-c top-face path reuses the smoke compute side (queue/fence/readback ring),
-    // so the smoke compute objects must be stood up whenever ANY path is enabled. B1.3b-f-c
+    // Phase B1.3f-d: the FINAL increment - EVERYTHING-ON full multiset EQUALITY across a real-
+    // tile CORPUS. Every prior increment was equality-proven in ISOLATION (with the others'
+    // isolation flags forced off); B1.3f-d turns them ALL on together with NO isolation - the
+    // GPU emits the COMPLETE mesh exactly the way the production CPU does (risers + skirts +
+    // child-suppression + edit-skip + LOD merge + water/all-air fill + camera-distance cull, all
+    // simultaneously). It does NOT run one fixture - it sweeps a BROAD corpus of resident +
+    // dirty tiles each frame, dispatches the full-feature extract over each, A/Bs in EQUALITY
+    // mode, tallies a category coverage matrix + the equality verdict + the GPU/CPU timing
+    // distribution, and reports a promotion-pass summary at process end. Production STAYS on the
+    // CPU path (NO promotion - prove equality + measure). This is the REAL configuration, so it
+    // runs WITH water + distance cull on (the production defaults); FRUSTUM cull must stay off
+    // (the GPU mask replicates distance cull only). Default 0. Requires VENPOD_MIDMESH_GPU_EXTRACT=1.
+    const bool sparseMidMeshGpuExtractFull =
+        sparseMidMeshGpuExtract &&
+        ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_FULL", 0u) != 0u;
+    // The B1.3a..f-d top-face path reuses the smoke compute side (queue/fence/readback ring),
+    // so the smoke compute objects must be stood up whenever ANY path is enabled. B1.3b-f-d
     // share the B1.3a top-face PSO, so they also need the B1.3a init to run.
     const bool sparseMidMeshGpuExtractTopFacePath =
         sparseMidMeshGpuExtractB13a || sparseMidMeshGpuExtractB13b ||
         sparseMidMeshGpuExtractB13c || sparseMidMeshGpuExtractB13d ||
         sparseMidMeshGpuExtractB13e || sparseMidMeshGpuExtractB13fa ||
-        sparseMidMeshGpuExtractB13fb || sparseMidMeshGpuExtractB13fc;
+        sparseMidMeshGpuExtractB13fb || sparseMidMeshGpuExtractB13fc ||
+        sparseMidMeshGpuExtractFull;
     const bool sparseMidMeshGpuExtractComputeSide =
         sparseMidMeshGpuExtractSmoke || sparseMidMeshGpuExtractTopFacePath;
     // Phase B1.3.0 GATED explicit readback WAIT. Default 0 = the readback ring polls
@@ -4623,6 +4642,79 @@ int RunSandbox(int argc, char* argv[]) {
 
     // Player position represents feet/collision point
     // Camera rendering position is offset upward by playerHeight for natural eye-level view
+
+    // ===== Phase B1.3f-d: EVERYTHING-ON corpus accumulator =====
+    // Lives across the whole replay. The per-frame FULL corpus loop dispatches the
+    // full-feature GPU extract over a broad set of resident + dirty tiles, A/Bs each in
+    // EQUALITY mode, and feeds the verdict + category + per-tile timing here. The
+    // process-end summary reports the coverage matrix, the multiset-equality result, the
+    // promotion-pass health counters, and the GPU/CPU timing distribution. Pure validation -
+    // it never routes GPU output to the draw (production stays on the CPU path).
+    struct MidMeshFullCorpusAccumulator {
+        // Coverage matrix: distinct (slot, contentVersion) tiles equality-checked per category.
+        // A tile re-checked across frames counts once per category (the (slot,version) key).
+        std::map<std::string, std::set<std::pair<uint32_t, uint64_t>>> categoryTiles;
+        // Every distinct corpus tile checked at least once (the denominator).
+        std::set<std::pair<uint32_t, uint64_t>> allTiles;
+        // Equality tally.
+        uint64_t checks = 0;          // total A/B comparisons (one per dispatch+poll)
+        uint64_t equal = 0;           // comparisons that passed full equality
+        uint64_t mismatched = 0;      // comparisons that failed (any missing/extra/mult/overflow)
+        uint64_t staleDiscards = 0;   // dispatches whose serial drifted in-flight (not compared)
+        uint64_t overflowHits = 0;    // GPU status/overflow != 0
+        uint64_t pollsRan = 0;        // PollB13aReadback() returned true (a comparison happened)
+        // First-few mismatch records (slot + category + the harness already logged the diffs).
+        struct Mismatch {
+            uint32_t slot = 0;
+            uint64_t version = 0;
+            std::string category;
+            uint32_t gpuFaceCount = 0;
+            uint32_t cpuFaceCount = 0;
+            uint32_t missing = 0;
+            uint32_t extra = 0;
+            uint32_t multiplicity = 0;
+            uint32_t overflow = 0;
+            uint32_t mergeCells = 0;
+            uint32_t childMask = 0;
+        };
+        std::vector<Mismatch> firstMismatches;
+        // Timing distributions (microseconds), GPU dispatch + barrier + CPU submit.
+        std::vector<double> dispatchUs;
+        std::vector<double> barrierUs;
+        std::vector<double> submitUs;
+        std::vector<uint32_t> gpuFaceCounts; // per dispatch (for "high face-count" coverage)
+        // CPU extraction displaced (from the build's MIDMESH_MISS_CAUSE attribution):
+        double cpuExtractMsTotal = 0.0;  // sum of per-build extractMs while FULL ran
+        uint64_t cpuExtractTiles = 0;    // sum of per-build reExtract counts
+        // Health pass-throughs the summary cross-checks.
+        uint64_t deviceRemovals = 0;     // device-removed events seen (should be 0)
+        uint32_t maxVisibleMissing = 0;  // worst visibleMissing on the production path (must be 0)
+
+        void note(const char* category, uint32_t slot, uint64_t version) {
+            categoryTiles[category].insert({slot, version});
+        }
+        static double percentile(std::vector<double> v, double p) {
+            if (v.empty()) { return 0.0; }
+            std::sort(v.begin(), v.end());
+            const double idx = p * static_cast<double>(v.size() - 1);
+            const size_t lo = static_cast<size_t>(idx);
+            const size_t hi = std::min(lo + 1, v.size() - 1);
+            const double frac = idx - static_cast<double>(lo);
+            return v[lo] + (v[hi] - v[lo]) * frac;
+        }
+        static double mean(const std::vector<double>& v) {
+            if (v.empty()) { return 0.0; }
+            double s = 0.0;
+            for (double x : v) { s += x; }
+            return s / static_cast<double>(v.size());
+        }
+        static double maxOf(const std::vector<double>& v) {
+            double m = 0.0;
+            for (double x : v) { m = std::max(m, x); }
+            return m;
+        }
+    };
+    MidMeshFullCorpusAccumulator midMeshFullCorpus;
 
     // Main loop
     bool running = true;
@@ -17078,6 +17170,288 @@ int RunSandbox(int argc, char* argv[]) {
                                 .MidMeshTileHasEditFootprintBySlot(slot);
                         };
 
+                        if (sparseMidMeshGpuExtractFull) {
+                            // ===== Phase B1.3f-d: EVERYTHING-ON corpus sweep =====
+                            // The REAL configuration: ALL features on (risers + skirts +
+                            // child-suppression + edit-skip + LOD merge + water/all-air fill +
+                            // camera-distance cull) with NO isolation, A/B in EQUALITY mode. Sweep
+                            // a BROAD corpus of resident tiles (the stable population: flat/steep,
+                            // all directions, borders, child combos, all LODs, near/far, water,
+                            // high-face-count) PLUS the build's dirty set (edited + just-streamed
+                            // tiles), and dispatch the full-feature extract over each, tallying the
+                            // category coverage + equality verdict + timing. Bounded per-frame so
+                            // the dedicated compute queue is not flooded (the ring is 3 slots and
+                            // each dispatch serializes on the prior fence anyway).
+                            const uint32_t corpusBudgetPerFrame =
+                                std::max(1u, ReadUIntEnv(
+                                    "VENPOD_MIDMESH_GPU_EXTRACT_FULL_BUDGET", 8u));
+                            const uint32_t side = sparseClipmapConfig.tileSampleSide;
+                            const uint32_t neededSamples = side * side;
+                            // Build the candidate pool: dirty tiles FIRST (edited / just-built),
+                            // then ALL resident tiles (the stable population), de-duplicated by slot.
+                            std::vector<Simulation::MidMeshGpuExtractDirtyTile> residentPool;
+                            sparseClipmapTileCache.CollectAllResidentMidMeshGpuExtractTiles(
+                                residentPool);
+                            std::vector<const Simulation::MidMeshGpuExtractDirtyTile*> candidates;
+                            std::unordered_set<uint32_t> seenSlots;
+                            auto addPool =
+                                [&](const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& pool) {
+                                for (const auto& t : pool) {
+                                    if (t.slot == UINT32_MAX || t.samples == nullptr ||
+                                        t.sampleCount < neededSamples) {
+                                        continue;
+                                    }
+                                    if (seenSlots.insert(t.slot).second) {
+                                        candidates.push_back(&t);
+                                    }
+                                }
+                            };
+                            addPool(gpuExtractTiles);  // dirty set (edited + streamed)
+                            addPool(residentPool);     // stable resident population
+                            // Round-robin a window across frames so a long replay covers the WHOLE
+                            // corpus (not just the first N tiles every frame). The cursor persists
+                            // in a function-static; it only advances on FULL runs.
+                            static uint32_t corpusCursor = 0u;
+                            const uint32_t candCount =
+                                static_cast<uint32_t>(candidates.size());
+                            uint32_t dispatchedThisFrame = 0u;
+                            for (uint32_t step = 0u;
+                                 step < candCount && dispatchedThisFrame < corpusBudgetPerFrame;
+                                 ++step) {
+                                const uint32_t ci = (corpusCursor + step) % candCount;
+                                const auto& tile = *candidates[ci];
+                                // READ-ONLY cache reference + the cull mask + the edit boxes for
+                                // THIS tile (each tile carries its own feature inputs).
+                                std::vector<Simulation::SparseSurfaceFace> cpuRefFaces;
+                                uint32_t refMergeCells = 0u, refChildMask = 0u;
+                                uint64_t refContentVersion = 0u;
+                                if (!sparseClipmapTileCache.GetMidMeshTileCacheFacesBySlot(
+                                        tile.slot, cpuRefFaces, &refMergeCells, &refChildMask,
+                                        &refContentVersion)) {
+                                    continue;
+                                }
+                                // Skip a tile whose cached serial drifted vs the pool snapshot
+                                // (an in-flight rebuild): comparing against a stale CPU mesh would
+                                // be a false mismatch. The corpus re-covers it on a later frame.
+                                if (refContentVersion != tile.meshContentVersion) {
+                                    continue;
+                                }
+                                // Per-tile feature inputs (all features ON):
+                                //   * cull mask = the CPU's bit-exact per-block distance-cull verdict
+                                //   * edit boxes = the tile's overlapping brush-edit boxes (capped)
+                                std::vector<uint8_t> tileCullMask;
+                                uint32_t tileBlocksPerAxis = 0u;
+                                const uint32_t tileCulled =
+                                    sparseClipmapTileCache.MidMeshTileCullBlockMaskBySlot(
+                                        tile.slot, tileCullMask, &tileBlocksPerAxis);
+                                const uint32_t cullBoxCap =
+                                    MidMeshGpuExtractConfig{}.editBoxCapacityPerTile;
+                                std::vector<Simulation::MidMeshEditXzBox> tileEditBoxes;
+                                const uint32_t tileEditTotal =
+                                    sparseClipmapTileCache.MidMeshTileEditBoxesBySlot(
+                                        tile.slot, tileEditBoxes, cullBoxCap);
+                                if (tileEditTotal > cullBoxCap) {
+                                    // A truncated footprint would under-suppress -> a false extra.
+                                    // Skip + report (a cap overflow, not a silent wrong result).
+                                    spdlog::warn(
+                                        "[GPU_EXTRACT_FULL] tile slot {} has {} edit boxes > cap {};"
+                                        " skipping (raise editBoxCapacityPerTile)",
+                                        tile.slot, tileEditTotal, cullBoxCap);
+                                    continue;
+                                }
+                                // Categorize the tile (read-only) for the coverage matrix BEFORE
+                                // the dispatch (so a tile counts even if its A/B lands later).
+                                const std::pair<uint32_t, uint64_t> key{
+                                    tile.slot, refContentVersion};
+                                midMeshFullCorpus.allTiles.insert(key);
+                                {
+                                    auto& acc = midMeshFullCorpus;
+                                    const uint32_t merge = std::max(1u, refMergeCells);
+                                    acc.note(merge == 1u ? "merge1"
+                                             : merge == 2u ? "merge2"
+                                             : merge == 4u ? "merge4"
+                                             : "mergeOther",
+                                             tile.slot, refContentVersion);
+                                    if (editFootprintFn(tile.slot)) {
+                                        acc.note("edited", tile.slot, refContentVersion);
+                                    } else {
+                                        acc.note("unedited", tile.slot, refContentVersion);
+                                    }
+                                    acc.note(refChildMask == 0u ? "childMaskZero"
+                                             : "childMaskNonZero",
+                                             tile.slot, refContentVersion);
+                                    if (tileCulled > 0u && tileCulled < tileCullMask.size()) {
+                                        acc.note("cullStraddle", tile.slot, refContentVersion);
+                                    } else if (!tileCullMask.empty() &&
+                                               tileCulled == tileCullMask.size()) {
+                                        acc.note("cullFullyCulled", tile.slot, refContentVersion);
+                                    } else {
+                                        acc.note("cullClean", tile.slot, refContentVersion);
+                                    }
+                                    // Steep vs flat: scan the tile's quantized sample heights.
+                                    // Border (skirt) tile: any SOLID cell on the tile edge. Water /
+                                    // air sample presence. Per-direction presence: derive from the
+                                    // CPU reference faces (the ground-truth mesh's face directions).
+                                    int32_t minH = INT32_MAX, maxH = INT32_MIN;
+                                    bool borderSolid = false, hasWater = false, hasAir = false;
+                                    for (uint32_t s = 0u; s < neededSamples; ++s) {
+                                        const uint32_t smp = tile.samples[s];
+                                        const uint32_t mat = (smp >> 16u) & 0xFFu;
+                                        if (mat == 2u) { hasWater = true; }
+                                        else if (mat == 0u) { hasAir = true; }
+                                        const int32_t h = static_cast<int32_t>(smp & 0xFFFFu);
+                                        const bool solid = (mat != 0u && mat != 2u);
+                                        if (solid) {
+                                            minH = std::min(minH, h);
+                                            maxH = std::max(maxH, h);
+                                            const uint32_t sx = s % side;
+                                            const uint32_t sz = s / side;
+                                            if (sx == 0u || sx == side - 1u ||
+                                                sz == 0u || sz == side - 1u) {
+                                                borderSolid = true;
+                                            }
+                                        }
+                                    }
+                                    if (maxH > minH && (maxH - minH) > 4) {
+                                        acc.note("steep", tile.slot, refContentVersion);
+                                    } else if (maxH >= minH && minH != INT32_MAX) {
+                                        acc.note("flat", tile.slot, refContentVersion);
+                                    }
+                                    if (borderSolid) {
+                                        acc.note("skirtBorder", tile.slot, refContentVersion);
+                                    }
+                                    if (hasWater) { acc.note("water", tile.slot, refContentVersion); }
+                                    if (hasAir) { acc.note("air", tile.slot, refContentVersion); }
+                                    if (cpuRefFaces.size() > 3000u) {
+                                        acc.note("highFaceCount", tile.slot, refContentVersion);
+                                    }
+                                    // Camera distance: near vs far by the tile's mergeCells (LOD is
+                                    // the camera-distance proxy the CPU itself uses) + AABB Y span.
+                                    if (merge >= 2u) {
+                                        acc.note("far", tile.slot, refContentVersion);
+                                    } else {
+                                        acc.note("near", tile.slot, refContentVersion);
+                                    }
+                                    // Per-direction presence from the CPU reference faces.
+                                    bool dir[6] = {false, false, false, false, false, false};
+                                    for (const auto& f : cpuRefFaces) {
+                                        const uint32_t d =
+                                            Simulation::SparseSurfacePayloadDirection(f.payload);
+                                        if (d < 6u) { dir[d] = true; }
+                                    }
+                                    static const char* kDirName[6] = {
+                                        "dirNegX", "dirPosX", "dirNegY",
+                                        "dirPosY", "dirNegZ", "dirPosZ"};
+                                    for (uint32_t d = 0u; d < 6u; ++d) {
+                                        if (dir[d]) {
+                                            acc.note(kDirName[d], tile.slot, refContentVersion);
+                                        }
+                                    }
+                                }
+                                // Dispatch the FULL-feature extract for this tile. ALL features on;
+                                // EQUALITY mode; water + distance-cull on (the production config).
+                                const bool ran =
+                                    midMeshGpuExtractResources.RunB13aTopFaceDispatch(
+                                        device->GetDevice(), tile, cpuRefFaces,
+                                        sparseMidMeshTerraceStep, refContentVersion,
+                                        /*emitRisers=*/true, /*emitSkirts=*/true,
+                                        /*applyChildSuppression=*/true, /*equalityMode=*/true,
+                                        /*applyEditSkip=*/true, tileEditBoxes,
+                                        /*emitWater=*/true, /*applyDistanceCull=*/true,
+                                        tileCullMask);
+                                if (ran) {
+                                    ++dispatchedThisFrame;
+                                    if (midMeshGpuExtractResources.GetB13aStats().commitGateStale) {
+                                        ++midMeshFullCorpus.staleDiscards;
+                                    }
+                                    // Drain the oldest completed dispatch's A/B (FIFO ring). With
+                                    // READBACK_WAIT=1 this blocks on the fence -> same-cycle verdict.
+                                    if (midMeshGpuExtractResources.PollB13aReadback()) {
+                                        ++midMeshFullCorpus.pollsRan;
+                                        const auto& st =
+                                            midMeshGpuExtractResources.GetB13aStats();
+                                        ++midMeshFullCorpus.checks;
+                                        const bool eq =
+                                            (st.abMissingCpuFaces == 0u) &&
+                                            (st.abExtraGpuFaces == 0u) &&
+                                            (st.abMultiplicityMismatches == 0u) &&
+                                            (st.gpuStatusOverflow == 0u);
+                                        if (eq) {
+                                            ++midMeshFullCorpus.equal;
+                                        } else {
+                                            ++midMeshFullCorpus.mismatched;
+                                            if (midMeshFullCorpus.firstMismatches.size() < 16u) {
+                                                MidMeshFullCorpusAccumulator::Mismatch mm;
+                                                mm.slot = st.tileSlot;
+                                                mm.version = st.dispatchedVersion;
+                                                mm.gpuFaceCount = st.gpuFaceCount;
+                                                mm.cpuFaceCount = st.cpuRefFaceCount;
+                                                mm.missing = st.abMissingCpuFaces;
+                                                mm.extra = st.abExtraGpuFaces;
+                                                mm.multiplicity = st.abMultiplicityMismatches;
+                                                mm.overflow = st.gpuStatusOverflow;
+                                                mm.mergeCells = st.fixtureMergeCells;
+                                                mm.childMask = st.fixtureChildMask;
+                                                midMeshFullCorpus.firstMismatches.push_back(mm);
+                                            }
+                                        }
+                                        if (st.gpuStatusOverflow != 0u) {
+                                            ++midMeshFullCorpus.overflowHits;
+                                        }
+                                        midMeshFullCorpus.dispatchUs.push_back(st.dispatchGpuUs);
+                                        midMeshFullCorpus.barrierUs.push_back(st.barrierGpuUs);
+                                        midMeshFullCorpus.submitUs.push_back(st.cpuSubmitUs);
+                                        midMeshFullCorpus.gpuFaceCounts.push_back(st.gpuFaceCount);
+                                    }
+                                }
+                            }
+                            // Advance the round-robin cursor so the next frame covers new tiles.
+                            if (candCount > 0u) {
+                                corpusCursor = (corpusCursor + dispatchedThisFrame) % candCount;
+                            }
+                            // Drain any remaining pending ring slots (non-blocking when
+                            // READBACK_WAIT=0; this catches verdicts a frame or two behind).
+                            while (midMeshGpuExtractResources.PollB13aReadback()) {
+                                ++midMeshFullCorpus.pollsRan;
+                                const auto& st = midMeshGpuExtractResources.GetB13aStats();
+                                ++midMeshFullCorpus.checks;
+                                const bool eq =
+                                    (st.abMissingCpuFaces == 0u) &&
+                                    (st.abExtraGpuFaces == 0u) &&
+                                    (st.abMultiplicityMismatches == 0u) &&
+                                    (st.gpuStatusOverflow == 0u);
+                                if (eq) { ++midMeshFullCorpus.equal; }
+                                else { ++midMeshFullCorpus.mismatched; }
+                                if (st.gpuStatusOverflow != 0u) {
+                                    ++midMeshFullCorpus.overflowHits;
+                                }
+                                midMeshFullCorpus.dispatchUs.push_back(st.dispatchGpuUs);
+                                midMeshFullCorpus.barrierUs.push_back(st.barrierGpuUs);
+                                midMeshFullCorpus.submitUs.push_back(st.cpuSubmitUs);
+                                midMeshFullCorpus.gpuFaceCounts.push_back(st.gpuFaceCount);
+                            }
+                            // Promotion-pass measurement: the CPU extractTileMesh time this build
+                            // DISPLACED (per-build attribution; read-only) + the production
+                            // visibleMissing (must stay 0 - the GPU output is never drawn).
+                            if (dispatchedThisFrame > 0u) {
+                                midMeshFullCorpus.cpuExtractMsTotal +=
+                                    sparseClipmapTileCache.LastMidMeshExtractMs();
+                                midMeshFullCorpus.cpuExtractTiles +=
+                                    sparseClipmapTileCache.LastMidMeshReExtractTiles();
+                            }
+                            {
+                                const auto& covStats =
+                                    sparseMidMeshGpuResources.GetStats();
+                                const uint32_t expected =
+                                    static_cast<uint32_t>(midMeshSnapshot.drawBatches.size());
+                                const uint32_t resident = covStats.allocatedFaceRanges;
+                                const uint32_t vm =
+                                    expected > resident ? expected - resident : 0u;
+                                midMeshFullCorpus.maxVisibleMissing =
+                                    std::max(midMeshFullCorpus.maxVisibleMissing, vm);
+                            }
+                        } else {
+
                         // B1.3f-a DIAGNOSTIC: log the mergeCells distribution of the WHOLE
                         // dirty set this build, so the run shows whether LOD-merged tiles
                         // (mergeCells>1) ever reach the extractor's dirty list at all (the
@@ -17449,6 +17823,7 @@ int RunSandbox(int argc, char* argv[]) {
                                 midMeshGpuExtractResources.PollB13aReadback();
                             }
                         }
+                        } // end else (single-fixture path; the FULL corpus sweep handled above)
                     }
                 }
                 (void)midMeshDirtyUpload;
@@ -25604,6 +25979,109 @@ int RunSandbox(int argc, char* argv[]) {
         // if (frameCount % 100 == 0) {
         //     spdlog::debug("Frame {}", frameCount);
         // }
+    }
+
+    // ===== Phase B1.3f-d: EVERYTHING-ON corpus PROMOTION-PASS report =====
+    // Emitted once at process end when the FULL corpus sweep ran. Reports the coverage matrix
+    // (distinct tiles per category equality-checked), the multiset-equality result (checked /
+    // equal / mismatched + the first-few diffs), the health counters (overflow / stale / device
+    // removals / production visibleMissing - all must be 0), and the GPU/CPU timing distribution
+    // (GPU compute-dispatch + barrier + CPU submit, mean/p95/p99/max), plus the CPU
+    // extractTileMesh cost displaced for the same tiles. Production stayed on the CPU path.
+    if (sparseMidMeshGpuExtractFull) {
+        // Device-removed health: GetDeviceRemovedReason() is S_OK on a healthy device, else the
+        // removal HRESULT. A removed device is a hard stop condition for this stage.
+        if (auto* d3dDevice = device->GetDevice()) {
+            if (FAILED(d3dDevice->GetDeviceRemovedReason())) {
+                ++midMeshFullCorpus.deviceRemovals;
+            }
+        }
+        const auto& fc = midMeshFullCorpus;
+        spdlog::info(
+            "GPU_EXTRACT_FULL_SUMMARY mode=everything-on equalityMode=1 "
+            "corpusTilesChecked={} abChecks={} abEqual={} abMismatched={} "
+            "staleDiscards={} overflowHits={} deviceRemovals={} maxVisibleMissing={} pollsRan={}",
+            static_cast<uint64_t>(fc.allTiles.size()),
+            fc.checks, fc.equal, fc.mismatched,
+            fc.staleDiscards, fc.overflowHits, fc.deviceRemovals,
+            fc.maxVisibleMissing, fc.pollsRan);
+
+        // Coverage matrix - one line per category (distinct tiles equality-checked). Ordered
+        // (std::map) so the report is deterministic across runs.
+        for (const auto& [cat, tiles] : fc.categoryTiles) {
+            spdlog::info("GPU_EXTRACT_FULL_COVERAGE category={} tilesChecked={}",
+                cat, static_cast<uint64_t>(tiles.size()));
+        }
+        // Explicitly name any required category that was NOT populated (a coverage gap the
+        // stage must report honestly, e.g. all-air never reached on this replay path).
+        static const char* kRequiredCategories[] = {
+            "flat", "steep", "skirtBorder", "edited", "unedited",
+            "childMaskZero", "childMaskNonZero", "merge1", "merge2", "merge4",
+            "near", "far", "cullStraddle", "cullClean", "highFaceCount",
+            "water", "air",
+            "dirNegX", "dirPosX", "dirNegY", "dirPosY", "dirNegZ", "dirPosZ"};
+        for (const char* cat : kRequiredCategories) {
+            auto it = fc.categoryTiles.find(cat);
+            if (it == fc.categoryTiles.end() || it->second.empty()) {
+                spdlog::warn(
+                    "GPU_EXTRACT_FULL_COVERAGE_GAP category={} tilesChecked=0 "
+                    "(not reached on this replay/camera path)", cat);
+            }
+        }
+
+        // Timing distribution (microseconds): GPU compute-dispatch, barrier/transition, CPU
+        // submit - mean / p95 / p99 / max. Captured from the existing per-dispatch timestamps.
+        auto logTiming = [&](const char* what, const std::vector<double>& v) {
+            spdlog::info(
+                "GPU_EXTRACT_FULL_TIMING what={} samples={} meanUs={:.2f} p95Us={:.2f} "
+                "p99Us={:.2f} maxUs={:.2f}",
+                what, static_cast<uint64_t>(v.size()),
+                MidMeshFullCorpusAccumulator::mean(v),
+                MidMeshFullCorpusAccumulator::percentile(v, 0.95),
+                MidMeshFullCorpusAccumulator::percentile(v, 0.99),
+                MidMeshFullCorpusAccumulator::maxOf(v));
+        };
+        logTiming("computeDispatchGpu", fc.dispatchUs);
+        logTiming("barrierTransitionGpu", fc.barrierUs);
+        logTiming("cpuSubmit", fc.submitUs);
+
+        // CPU extraction DISPLACED: the CPU extractTileMesh time for the tiles re-extracted
+        // during the FULL run + the per-tile mean, weighed against the GPU per-tile dispatch
+        // mean (so CPU saved vs GPU added can be compared later). Read-only attribution.
+        const double cpuPerTileMs =
+            fc.cpuExtractTiles > 0u
+                ? fc.cpuExtractMsTotal / static_cast<double>(fc.cpuExtractTiles)
+                : 0.0;
+        spdlog::info(
+            "GPU_EXTRACT_FULL_CPU_DISPLACED cpuExtractMsTotal={:.2f} cpuExtractTiles={} "
+            "cpuExtractMsPerTile={:.3f} gpuDispatchMeanUs={:.2f} gpuDispatchP95Us={:.2f} "
+            "gpuDispatchP99Us={:.2f}",
+            fc.cpuExtractMsTotal, fc.cpuExtractTiles, cpuPerTileMs,
+            MidMeshFullCorpusAccumulator::mean(fc.dispatchUs),
+            MidMeshFullCorpusAccumulator::percentile(fc.dispatchUs, 0.95),
+            MidMeshFullCorpusAccumulator::percentile(fc.dispatchUs, 0.99));
+
+        // The first-few EQUALITY mismatches (the harness already logged the decoded diffs at the
+        // frame they occurred; this is the consolidated end-of-run roll-up + category context).
+        for (const auto& mm : fc.firstMismatches) {
+            spdlog::warn(
+                "GPU_EXTRACT_FULL_MISMATCH slot={} version={} mergeCells={} childMask={} "
+                "gpuFaceCount={} cpuFaceCount={} missing={} extra={} multiplicity={} overflow={}",
+                mm.slot, mm.version, mm.mergeCells, mm.childMask,
+                mm.gpuFaceCount, mm.cpuFaceCount, mm.missing, mm.extra,
+                mm.multiplicity, mm.overflow);
+        }
+
+        // The single verdict line a harness can grep: PASS iff every corpus tile was equal AND
+        // no overflow / stale-after-compare / device removal / production-floor regression.
+        const bool fullPass =
+            fc.checks > 0u && fc.mismatched == 0u && fc.overflowHits == 0u &&
+            fc.deviceRemovals == 0u && fc.maxVisibleMissing == 0u;
+        spdlog::info(
+            "GPU_EXTRACT_FULL_VERDICT pass={} (abChecks={} abMismatched={} overflowHits={} "
+            "deviceRemovals={} maxVisibleMissing={})",
+            fullPass ? 1 : 0, fc.checks, fc.mismatched, fc.overflowHits,
+            fc.deviceRemovals, fc.maxVisibleMissing);
     }
 
     if (runRecorder.IsRecord()) {

@@ -7817,6 +7817,11 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         m_lastMidMeshMaxStaleAge = maxStaleAge;
         m_lastMidMeshPendingCount = static_cast<uint32_t>(m_midMeshTileDeferredSince.size());
     }
+    // Phase B1.3f-d (read-only): record this build's CPU extract attribution for the GPU-extract
+    // corpus harness's CPU-displaced report. Set unconditionally (even when the miss-cause log
+    // below is silent), so a steady frame that re-extracts nothing reports 0 ms / 0 tiles.
+    m_lastMidMeshExtractMs = extractMsAccum;
+    m_lastMidMeshReExtractTiles = rebuiltThisBuild;
     if (rebuiltThisBuild > 0u || missNew + missRecenter + missLod + missContent + missChild + missBuildVer > 0u) {
         spdlog::info(
             "MIDMESH_MISS_CAUSE emitted={} reExtract={} extractMs={:.2f} assemblyMs={:.2f} skipAssembly={} pending={} maxStaleAge={} miss=new/recenter/lod/content/child/buildver:{}/{}/{}/{}/{}/{}",
