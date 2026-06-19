@@ -2978,6 +2978,12 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseMidMeshGpuExtractSmoke =
         sparseMidMeshGpuExtract &&
         ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_SMOKE", 0u) != 0u;
+    // Phase B1.3.0 GATED explicit readback WAIT. Default 0 = the readback ring polls
+    // NON-BLOCKING (a frame or two behind the dispatch). Set to 1 ONLY for the isolated
+    // correctness path (forces a same-cycle blocking compare); NEVER on for timing runs.
+    const bool sparseMidMeshGpuExtractReadbackWait =
+        sparseMidMeshGpuExtractSmoke &&
+        ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_READBACK_WAIT", 0u) != 0u;
     // PARALLEL pre-extraction of cache-miss tiles (only meaningful on the primed-dirty
     // incremental path). DEFAULT ON: the build re-extracts every cache-miss tile across
     // worker threads BEFORE the main loop (the dominant per-build cost is the ~3.75ms/tile
@@ -3454,7 +3460,8 @@ int RunSandbox(int argc, char* argv[]) {
                         auto smokeInit = midMeshGpuExtractResources.InitializeSmoke(
                             device->GetDevice(),
                             renderer->GetShaderCompiler(),
-                            shaderPath);
+                            shaderPath,
+                            sparseMidMeshGpuExtractReadbackWait);
                         if (!smokeInit) {
                             spdlog::error("Mid-mesh GPU extract SMOKE (B1.2) init failed: {}",
                                 smokeInit.error());

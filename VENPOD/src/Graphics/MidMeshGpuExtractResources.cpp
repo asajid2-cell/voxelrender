@@ -1,5 +1,6 @@
 #include "MidMeshGpuExtractResources.h"
 
+#include "MidMeshFaceAbCompare.h"
 #include "RHI/DX12CommandQueue.h"
 
 #include <windows.h>
@@ -146,8 +147,25 @@ void MidMeshGpuExtractResources::Shutdown() {
     m_smokeSampleBuffer.Shutdown();
     m_smokeMetaBuffer.Shutdown();
     m_smokeFaceBuffer.Shutdown();
-    m_smokeFaceReadback.Shutdown();
-    m_smokeMetaReadback.Shutdown();
+    // B1.3.0 readback ring: unmap the persistent maps, then release the buffers.
+    for (auto& slot : m_smokeReadbackRing) {
+        if (slot.facePtr) {
+            slot.faceReadback.Unmap();
+            slot.facePtr = nullptr;
+        }
+        if (slot.metaPtr) {
+            slot.metaReadback.Unmap();
+            slot.metaPtr = nullptr;
+        }
+        slot.faceReadback.Shutdown();
+        slot.metaReadback.Shutdown();
+        slot.fenceValue = 0;
+        slot.pending = false;
+        slot.tile = {};
+    }
+    m_smokeReadbackWriteSlot = 0;
+    m_smokeReadbackReadSlot = 0;
+    m_smokeReadbackForceWait = false;
     m_smokeQueryReadback.Shutdown();
     m_smokeQueryHeap.Reset();
     m_smokeCmdList.Reset();
@@ -159,7 +177,8 @@ void MidMeshGpuExtractResources::Shutdown() {
     m_smokeFence.Reset();
     m_smokeQueue.Reset();
     m_smokeFenceValue = 0;
-    m_smokeVerifyDone = false;
+    m_smokeSelfTestDone = false;
+    m_smokeAbVerifyCount = 0;
     m_smokeReady = false;
     m_smokeTimestampFrequency = 0;
     m_smokeFaceCapacityPerTile = 0;
@@ -369,8 +388,10 @@ bool MidMeshGpuExtractResources::EmitCopy(
 Result<void> MidMeshGpuExtractResources::InitializeSmoke(
     ID3D12Device* device,
     ShaderCompiler& shaderCompiler,
-    const std::filesystem::path& shaderPath)
+    const std::filesystem::path& shaderPath,
+    bool readbackForceWait)
 {
+    m_smokeReadbackForceWait = readbackForceWait;
     if (!m_stats.initialized) {
         return Error("InitializeSmoke - B1.1 resources not initialized");
     }
@@ -415,20 +436,44 @@ Result<void> MidMeshGpuExtractResources::InitializeSmoke(
         return Error("InitializeSmoke - debug face buffer: {}", r.error());
     }
 
-    // Readback buffers (debug-only verify path): one controlled tile's worth.
-    if (auto r = m_smokeFaceReadback.Initialize(
-            device,
-            static_cast<uint64_t>(m_smokeFaceCapacityPerTile) * sizeof(Simulation::SparseSurfaceFace),
-            BufferUsage::Readback, sizeof(Simulation::SparseSurfaceFace),
-            "MidMeshGpuExtractSmokeFaceReadback"); !r) {
-        return Error("InitializeSmoke - face readback: {}", r.error());
+    // B1.3.0 readback RING (debug-only verify path): kSmokeReadbackSlots slots, each
+    // a face + metadata readback buffer Map()'d ONCE here and kept persistently mapped
+    // (the CPU pointer is held for the process lifetime; never per-frame Map/Unmap).
+    // A per-slot fence value (recorded at dispatch) tracks GPU-copy completion, so a
+    // slot is read only after its fence is satisfied. This makes the verify REPEATABLE
+    // across frames, not once per process.
+    const uint64_t faceReadbackBytes =
+        static_cast<uint64_t>(m_smokeFaceCapacityPerTile) * sizeof(Simulation::SparseSurfaceFace);
+    for (uint32_t i = 0; i < kSmokeReadbackSlots; ++i) {
+        char faceName[64];
+        char metaName[64];
+        std::snprintf(faceName, sizeof(faceName), "MidMeshGpuExtractSmokeFaceReadback%u", i);
+        std::snprintf(metaName, sizeof(metaName), "MidMeshGpuExtractSmokeMetaReadback%u", i);
+        SmokeReadbackSlot& slot = m_smokeReadbackRing[i];
+        if (auto r = slot.faceReadback.Initialize(
+                device, faceReadbackBytes,
+                BufferUsage::Readback, sizeof(Simulation::SparseSurfaceFace), faceName); !r) {
+            return Error("InitializeSmoke - face readback ring[{}]: {}", i, r.error());
+        }
+        if (auto r = slot.metaReadback.Initialize(
+                device, sizeof(MidMeshGpuExtractTileMeta),
+                BufferUsage::Readback, sizeof(MidMeshGpuExtractTileMeta), metaName); !r) {
+            return Error("InitializeSmoke - meta readback ring[{}]: {}", i, r.error());
+        }
+        // Persistent map: Map() once, hold the pointer. A readback heap is system
+        // memory; the runtime makes a completed GPU copy visible to this pointer after
+        // the slot's fence is satisfied, so we never re-Map per frame.
+        slot.facePtr = slot.faceReadback.Map();
+        slot.metaPtr = slot.metaReadback.Map();
+        if (!slot.facePtr || !slot.metaPtr) {
+            return Error("InitializeSmoke - readback ring[{}] persistent map failed", i);
+        }
+        slot.fenceValue = 0;
+        slot.pending = false;
+        slot.tile = {};
     }
-    if (auto r = m_smokeMetaReadback.Initialize(
-            device, sizeof(MidMeshGpuExtractTileMeta),
-            BufferUsage::Readback, sizeof(MidMeshGpuExtractTileMeta),
-            "MidMeshGpuExtractSmokeMetaReadback"); !r) {
-        return Error("InitializeSmoke - meta readback: {}", r.error());
-    }
+    m_smokeReadbackWriteSlot = 0;
+    m_smokeReadbackReadSlot = 0;
 
     // Self-contained input stage: one controlled tile's samples + metadata, so the
     // smoke dispatch never depends on the frame command list's B1.1 EmitCopy ordering.
@@ -524,9 +569,23 @@ Result<void> MidMeshGpuExtractResources::InitializeSmoke(
     m_smokeReady = true;
     spdlog::info(
         "[GPU_EXTRACT_SMOKE] compute side ready: debugFaceBufMB={:.2f} faceCapacityPerTile={} "
-        "maxCells={} (ISOLATED - production face buffer + draw path untouched)",
+        "maxCells={} readbackRingSlots={} readbackForceWait={} "
+        "(ISOLATED - production face buffer + draw path untouched)",
         static_cast<double>(m_smokeFaceBufferBytes) / (1024.0 * 1024.0),
-        m_smokeFaceCapacityPerTile, m_config.smokeMaxCells);
+        m_smokeFaceCapacityPerTile, m_config.smokeMaxCells,
+        kSmokeReadbackSlots, m_smokeReadbackForceWait ? 1 : 0);
+
+    // AB_SELFTEST: prove the multiset/multiplicity/containment harness actually bites
+    // (catches duplicates + missing faces) BEFORE any real GPU comparison relies on it.
+    // Runs once, here, independent of the GPU - a unit-style check of the harness.
+    m_smokeStats.abSelfTestPassed = RunMidMeshFaceAbSelfTest();
+    m_smokeStats.abSelfTestRun = true;
+    m_smokeSelfTestDone = true;
+    if (!m_smokeStats.abSelfTestPassed) {
+        spdlog::error(
+            "[GPU_EXTRACT_SMOKE] AB_SELFTEST FAILED - the multiset compare does not "
+            "detect duplicates/missing; AB_VERIFY results are NOT trustworthy");
+    }
     return {};
 }
 
@@ -602,11 +661,20 @@ bool MidMeshGpuExtractResources::RunSmokeDispatch(
     ctl.expectedCount = std::min(m_config.smokeMaxCells, cellCount);
     ctl.samples.assign(picked->samples, picked->samples + picked->sampleCount);
 
-    // Reuse the persistent command allocator + list (created once in InitializeSmoke);
-    // the previous dispatch's fence was already waited, so it is safe to reset.
+    // Reuse the persistent command allocator + list (created once in InitializeSmoke).
+    // Resetting the allocator requires the PREVIOUS dispatch (which recorded into it) to
+    // be GPU-complete. Wait that prior fence value - by the next frame it is essentially
+    // always already signaled, so this is non-blocking in steady state and is NOT a wait
+    // on the CURRENT dispatch's result (the ring + delayed poll handle that). This keeps
+    // the readback REPEATABLE without a per-frame blocking wait on fresh GPU output.
     if (!m_smokeCmdAllocator || !m_smokeCmdList) {
         spdlog::error("[GPU_EXTRACT_SMOKE] command objects missing");
         return false;
+    }
+    const uint64_t prevFence = m_smokeFenceValue;
+    if (prevFence != 0u && m_smokeFence->GetCompletedValue() < prevFence) {
+        m_smokeFence->SetEventOnCompletion(prevFence, m_smokeFenceEvent);
+        WaitForSingleObject(m_smokeFenceEvent, INFINITE);
     }
     if (FAILED(m_smokeCmdAllocator->Reset()) ||
         FAILED(m_smokeCmdList->Reset(m_smokeCmdAllocator.Get(), nullptr))) {
@@ -616,13 +684,11 @@ bool MidMeshGpuExtractResources::RunSmokeDispatch(
     ID3D12GraphicsCommandList* const list = m_smokeCmdList.Get();
 
     const bool haveTimestamps = (m_smokeQueryHeap != nullptr);
-    // Debug-only verify readback: this RHI reliably maps a readback resource only ONCE
-    // per process, so we capture the GPU->CPU verify on the FIRST dispatch only (one
-    // authoritative SMOKE_VERIFY proving the GPU wrote the expected faces). After that
-    // the dispatch + commit gate + GPU timestamps still run every frame; only the
-    // (optional, debug-only) readback copy + map is skipped. The pipeline never depends
-    // on the readback, so this is purely a validation-budget decision.
-    const bool recordReadback = !m_smokeVerifyDone;
+    // B1.3.0: the readback copy is recorded EVERY dispatch into the next ring slot
+    // (persistently mapped, fence-tracked), so the verify is repeatable - not once.
+    const uint32_t writeSlot = m_smokeReadbackWriteSlot;
+    SmokeReadbackSlot& ringSlot = m_smokeReadbackRing[writeSlot];
+    const bool recordReadback = true;
 
     // The dedicated smoke input buffers always use slot 0 / baseFace 0.
     ctl.baseFace = 0u;
@@ -712,20 +778,20 @@ bool MidMeshGpuExtractResources::RunSmokeDispatch(
         list->EndQuery(m_smokeQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2); // barrier end
     }
 
-    // Copy the controlled tile's debug faces + metadata into the readback buffers as
-    // part of THIS submission, so the (delayed, debug-only) verify only needs to map.
-    // Recorded ONLY until the first authoritative SMOKE_VERIFY is captured (this RHI
-    // reliably maps a readback resource once per process); after that the dispatch +
-    // commit gate + timestamps still run every frame. The pipeline never needs this.
+    // B1.3.0: copy this dispatch's debug faces + metadata into the CURRENT RING SLOT's
+    // persistently-mapped readback buffers as part of THIS submission. Recorded EVERY
+    // dispatch (not once per process), so a later PollSmokeReadback reads a fresh result
+    // each time the ring cycles - proving repeatable readback. The slot's fence value
+    // (recorded below) tells the poll when this copy is GPU-complete.
     if (recordReadback) {
         m_smokeFaceBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COPY_SOURCE);
         m_smokeMetaBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COPY_SOURCE);
         list->CopyBufferRegion(
-            m_smokeFaceReadback.GetResource(), 0,
+            ringSlot.faceReadback.GetResource(), 0,
             m_smokeFaceBuffer.GetResource(), 0,
             static_cast<uint64_t>(m_smokeFaceCapacityPerTile) * sizeof(Simulation::SparseSurfaceFace));
         list->CopyBufferRegion(
-            m_smokeMetaReadback.GetResource(), 0,
+            ringSlot.metaReadback.GetResource(), 0,
             m_smokeMetaBuffer.GetResource(), 0,
             sizeof(MidMeshGpuExtractTileMeta));
     }
@@ -752,21 +818,31 @@ bool MidMeshGpuExtractResources::RunSmokeDispatch(
     m_smokeQueue->Signal(m_smokeFence.Get(), fence);
     const auto cpuSubmitStop = std::chrono::steady_clock::now();
 
-    // ---- commit gate (validate; nothing is drawn) ----
-    // (a) GPU work completed -> wait this dispatch's fence (the per-slot fence guard).
-    if (m_smokeFence->GetCompletedValue() < fence) {
-        m_smokeFence->SetEventOnCompletion(fence, m_smokeFenceEvent);
-        WaitForSingleObject(m_smokeFenceEvent, INFINITE);
-    }
     ctl.fenceValue = fence;
     (void)commandQueue; // main render queue intentionally untouched by the smoke path
 
-    // (b) serial still matches what we dispatched -> usable; else discard-stale.
+    // ---- record this dispatch into the ring slot (NO blocking wait on its fence) ----
+    // The slot's fence value tells PollSmokeReadback when the copy is GPU-complete; the
+    // poll reads it a frame or two later, by which point the fence is naturally done.
+    // This is the change that makes the readback REPEATABLE without a per-frame stall.
+    ringSlot.fenceValue = fence;
+    ringSlot.pending = true;
+    ringSlot.tile = ctl;
+    m_smokeReadbackWriteSlot = (writeSlot + 1u) % kSmokeReadbackSlots;
+
+    // ---- commit gate (validate; nothing is drawn) ----
+    // serial still matches what we dispatched -> usable; else discard-stale. (The GPU
+    // completion half of the gate is proven by the slot fence at poll time, not a wait.)
     const bool stale = (currentTileVersionForSlot != ctl.version);
 
-    // Resolve timestamps now that the fence is complete (every frame).
+    // Resolve timestamps NON-BLOCKINGLY: read the per-query readback only if a prior
+    // dispatch's fence is already complete (the prevFence wait above guarantees the
+    // previous resolve is visible). We never block on THIS dispatch for timing.
     double dispatchUs = 0.0, barrierUs = 0.0;
-    if (haveTimestamps && m_smokeTimestampFrequency != 0u) {
+    const bool timingReady =
+        (m_smokeFence->GetCompletedValue() >= fence) ||
+        (prevFence != 0u && m_smokeFence->GetCompletedValue() >= prevFence);
+    if (haveTimestamps && m_smokeTimestampFrequency != 0u && timingReady) {
         if (const auto* ts = static_cast<const uint64_t*>(m_smokeQueryReadback.Map())) {
             const double toUs = 1.0e6 / static_cast<double>(m_smokeTimestampFrequency);
             dispatchUs = (ts[1] >= ts[0]) ? static_cast<double>(ts[1] - ts[0]) * toUs : 0.0;
@@ -777,7 +853,13 @@ bool MidMeshGpuExtractResources::RunSmokeDispatch(
     const double cpuSubmitUs =
         std::chrono::duration<double, std::micro>(cpuSubmitStop - cpuSubmitStart).count();
 
-    // Record stats.
+    // Record stats. Preserve the CUMULATIVE / persistent verify fields (the ring poll
+    // owns them) across this per-dispatch refresh, so AB_VERIFY repeatability + the
+    // self-test result are not wiped every frame.
+    const uint32_t keepVerifyCount = m_smokeStats.verifyCount;
+    const bool keepVerified = m_smokeStats.verified;
+    const bool keepSelfTestRun = m_smokeStats.abSelfTestRun;
+    const bool keepSelfTestPassed = m_smokeStats.abSelfTestPassed;
     m_smokeStats = {};
     m_smokeStats.dispatched = true;
     m_smokeStats.tileSlot = ctl.slot;
@@ -786,16 +868,19 @@ bool MidMeshGpuExtractResources::RunSmokeDispatch(
     m_smokeStats.gpuFaceCount = UINT32_MAX;   // unread until PollSmokeReadback
     m_smokeStats.gpuStatusOverflow = 0u;
     m_smokeStats.dispatchedVersion = ctl.version;
-    m_smokeStats.commitGatePassed = !stale;   // fence already waited (done) + serial check
+    m_smokeStats.commitGatePassed = !stale;   // serial check (fence proven at poll time)
     m_smokeStats.commitGateStale = stale;
     m_smokeStats.dispatchGpuUs = dispatchUs;
     m_smokeStats.barrierGpuUs = barrierUs;
     m_smokeStats.cpuSubmitUs = cpuSubmitUs;
-    m_smokeStats.verified = false;
+    m_smokeStats.verified = keepVerified;
     m_smokeStats.verifyMatched = 0;
     m_smokeStats.verifyMismatch = 0;
+    m_smokeStats.verifyCount = keepVerifyCount;
+    m_smokeStats.abSelfTestRun = keepSelfTestRun;
+    m_smokeStats.abSelfTestPassed = keepSelfTestPassed;
 
-    m_smokeControlled = std::move(ctl);
+    m_smokeControlled = ctl;
 
     spdlog::info(
         "GPU_EXTRACT_SMOKE slot={} controlledTiles={} expectedFaces={} dispatchGpuUs={:.2f} "
@@ -808,70 +893,89 @@ bool MidMeshGpuExtractResources::RunSmokeDispatch(
 }
 
 bool MidMeshGpuExtractResources::PollSmokeReadback(uint64_t completedFenceValue) {
-    (void)completedFenceValue; // smoke uses its own dedicated fence (waited in dispatch)
-    // One authoritative verify: the readback copy is only RECORDED on the first dispatch
-    // (recordReadback == !m_smokeVerifyDone), so only poll while that holds. The smoke
-    // dispatch already waited its dedicated fence, so the readback data is ready.
-    if (!m_smokeReady || !m_smokeControlled.valid || m_smokeVerifyDone) {
+    (void)completedFenceValue; // smoke uses its own dedicated fence (the ring tracks it)
+    if (!m_smokeReady) {
         return false;
     }
 
-    // Read the GPU-written metadata faceCount/status for the controlled tile (the smoke
-    // dispatch fence is complete, so this first-map of the readback resource is coherent).
+    // B1.3.0: consume the OLDEST pending ring slot whose copy fence has completed (FIFO).
+    // The poll runs a couple frames behind the dispatch, so the slot's fence is normally
+    // already satisfied with NO wait. The gated explicit wait (m_smokeReadbackForceWait,
+    // OFF for timing) is the only blocking path; it forces a same-cycle compare in the
+    // isolated correctness path. This is what makes the verify REPEATABLE - one compare
+    // per cycled slot, not once per process.
+    SmokeReadbackSlot& slot = m_smokeReadbackRing[m_smokeReadbackReadSlot];
+    if (!slot.pending || !slot.tile.valid) {
+        return false;
+    }
+    const uint64_t completed = m_smokeFence->GetCompletedValue();
+    if (completed < slot.fenceValue) {
+        if (!m_smokeReadbackForceWait) {
+            return false; // not done yet; try again next poll (non-blocking)
+        }
+        // GATED correctness path ONLY (never on for timing): block until the slot's
+        // fence completes so the persistent readback pointer holds this dispatch's data.
+        if (m_smokeFenceEvent) {
+            m_smokeFence->SetEventOnCompletion(slot.fenceValue, m_smokeFenceEvent);
+            WaitForSingleObject(m_smokeFenceEvent, INFINITE);
+        }
+    }
+
+    // Fence satisfied: the persistently-mapped pointers now hold this dispatch's copy.
     uint32_t gpuFaceCount = 0;
     uint32_t gpuStatus = 0;
-    if (const auto* meta =
-            static_cast<const MidMeshGpuExtractTileMeta*>(m_smokeMetaReadback.Map())) {
+    if (slot.metaPtr) {
+        const auto* meta = static_cast<const MidMeshGpuExtractTileMeta*>(slot.metaPtr);
         gpuFaceCount = meta->faceCount;
         gpuStatus = meta->statusOverflow;
-        m_smokeMetaReadback.Unmap();
     }
 
-    // Recompute the deterministic expected faces CPU-side from the SAME samples.
-    std::vector<Simulation::SparseSurfaceFace> expected;
-    ComputeSmokeFacesCpu(m_smokeControlled, expected);
-    const uint32_t expectedCount = static_cast<uint32_t>(expected.size());
+    // Recompute the deterministic CPU reference for THIS slot's dispatch (its captured
+    // tile snapshot - the same `ComputeSmokeFacesCpu` mirror), then gather the GPU faces
+    // the shader actually wrote (the first gpuFaceCount, clamped to capacity).
+    std::vector<Simulation::SparseSurfaceFace> cpuFaces;
+    ComputeSmokeFacesCpu(slot.tile, cpuFaces);
 
-    // Compare the GPU faces (deterministic cell-index order) against CPU.
-    uint32_t matched = 0;
-    uint32_t mismatch = 0;
-    if (const auto* gpuFaces =
-            static_cast<const Simulation::SparseSurfaceFace*>(m_smokeFaceReadback.Map())) {
-        const uint32_t cmpCount = std::min(expectedCount, m_smokeFaceCapacityPerTile);
-        for (uint32_t i = 0; i < cmpCount; ++i) {
-            const auto& g = gpuFaces[i];
-            const auto& e = expected[i];
-            if (g.worldX == e.worldX && g.worldY == e.worldY &&
-                g.worldZ == e.worldZ && g.payload == e.payload) {
-                ++matched;
-            } else {
-                ++mismatch;
-                if (mismatch <= 4u) {
-                    spdlog::warn(
-                        "[SMOKE_VERIFY] face[{}] MISMATCH gpu=({},{},{},0x{:08X}) "
-                        "cpu=({},{},{},0x{:08X})",
-                        i, g.worldX, g.worldY, g.worldZ, g.payload,
-                        e.worldX, e.worldY, e.worldZ, e.payload);
-                }
-            }
-        }
-        m_smokeFaceReadback.Unmap();
+    std::vector<Simulation::SparseSurfaceFace> gpuFaces;
+    if (slot.facePtr) {
+        const auto* faces = static_cast<const Simulation::SparseSurfaceFace*>(slot.facePtr);
+        const uint32_t emitted =
+            (gpuStatus == 0u) ? std::min(gpuFaceCount, m_smokeFaceCapacityPerTile) : 0u;
+        gpuFaces.assign(faces, faces + emitted);
     }
 
+    // Multiset A/B: the smoke is deterministic and complete, so use full EQUALITY
+    // (later subset-convergence increments will pass Containment instead). The harness
+    // canonicalizes by sorting raw 16-byte payloads, keeps duplicates, and reports the
+    // multiset diff - so a duplicated GPU face would FAIL even though counts "look" ok.
+    const MidMeshFaceAbResult ab = CompareMidMeshFacesMultiset(
+        gpuFaces, cpuFaces, MidMeshFaceAbMode::Equal, gpuStatus, 4u);
+    LogMidMeshFaceAbResult("smoke", ab);
+
+    // Mark the slot consumed and advance the FIFO read cursor.
+    slot.pending = false;
+    slot.tile = {};
+    m_smokeReadbackReadSlot = (m_smokeReadbackReadSlot + 1u) % kSmokeReadbackSlots;
+
+    ++m_smokeAbVerifyCount;
     m_smokeStats.gpuFaceCount = gpuFaceCount;
     m_smokeStats.gpuStatusOverflow = gpuStatus;
     m_smokeStats.verified = true;
-    m_smokeStats.verifyMatched = matched;
-    m_smokeStats.verifyMismatch = mismatch;
-    // One authoritative verify captured; stop recording further readback copies (this
-    // RHI reliably maps a readback resource once, and the proof is now established).
-    m_smokeVerifyDone = true;
+    m_smokeStats.verifyMatched = ab.match ? 1u : 0u;
+    m_smokeStats.verifyMismatch = ab.match ? 0u : 1u;
+    m_smokeStats.verifyCount = m_smokeAbVerifyCount;
+    m_smokeStats.abGpuFaceCount = ab.gpuFaceCount;
+    m_smokeStats.abGpuUniqueFaceCount = ab.gpuUniqueFaceCount;
+    m_smokeStats.abMissingCpuFaces = ab.missingCpuFaces;
+    m_smokeStats.abExtraGpuFaces = ab.extraGpuFaces;
+    m_smokeStats.abMultiplicityMismatches = ab.multiplicityMismatches;
+    m_smokeStats.abOverflow = ab.overflow;
 
-    const bool countOk = (gpuFaceCount == expectedCount);
+    // Keep the legacy SMOKE_VERIFY line too (count/expected) for continuity with B1.2.
     spdlog::info(
-        "SMOKE_VERIFY ok={} mismatch={} count={} expected={} gpuStatus={} countMatch={}",
-        matched, mismatch, gpuFaceCount, expectedCount, gpuStatus,
-        countOk ? 1 : 0);
+        "SMOKE_VERIFY abVerifyCount={} match={} gpuCount={} cpuCount={} gpuStatus={}",
+        m_smokeAbVerifyCount, ab.match ? 1 : 0, gpuFaceCount,
+        static_cast<uint32_t>(cpuFaces.size()), gpuStatus);
     return true;
 }
 

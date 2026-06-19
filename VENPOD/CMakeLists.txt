@@ -59,6 +59,7 @@ set(VENPOD_SOURCES
     # Graphics
     src/Graphics/FarVoxelOctree.cpp
     src/Graphics/BackbufferCapture.cpp
+    src/Graphics/MidMeshFaceAbCompare.cpp
     src/Graphics/MidMeshGpuExtractResources.cpp
     src/Graphics/MidVoxelGpuGenPoc.cpp
     src/Graphics/MidVoxelGpuGenerator.cpp

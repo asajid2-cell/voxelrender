@@ -155,10 +155,21 @@ struct MidMeshGpuExtractSmokeStats {
     double dispatchGpuUs = 0.0;
     double barrierGpuUs = 0.0;
     double cpuSubmitUs = 0.0;
-    // Verify (filled by the delayed readback):
-    bool verified = false;
-    uint32_t verifyMatched = 0;     // faces that matched the CPU recompute
-    uint32_t verifyMismatch = 0;
+    // Verify (filled by the delayed readback ring + multiset A/B harness):
+    bool verified = false;          // at least one AB_VERIFY has run this process
+    uint32_t verifyMatched = 0;     // 1 if the last multiset compare passed, else 0
+    uint32_t verifyMismatch = 0;    // 1 if the last multiset compare failed, else 0
+    uint32_t verifyCount = 0;       // TOTAL AB_VERIFY comparisons across the run
+                                    // (proves the readback RING works repeatedly).
+    // Last multiset A/B result (B1.3.0):
+    uint32_t abGpuFaceCount = 0;
+    uint32_t abGpuUniqueFaceCount = 0;
+    uint32_t abMissingCpuFaces = 0;
+    uint32_t abExtraGpuFaces = 0;
+    uint32_t abMultiplicityMismatches = 0;
+    uint32_t abOverflow = 0;
+    bool abSelfTestRun = false;     // AB_SELFTEST was executed
+    bool abSelfTestPassed = false;  // AB_SELFTEST asserted the multiset logic bites
 };
 
 // Per-frame upload ticket: the staged copy regions for this frame's dirty tiles.
@@ -225,10 +236,14 @@ public:
     // Stands up the compute side: an ISOLATED debug-output SparseSurfaceFace UAV
     // buffer + the smoke compute PSO. NEVER touches the production mid-mesh face
     // buffer or the draw path. Must be called after Initialize().
+    // `readbackForceWait` (default false) gates the explicit CPU fence WAIT in the
+    // readback poll: when true, the ISOLATED correctness path blocks until each slot's
+    // fence completes (same-cycle compare). MUST be false for any timing run.
     Result<void> InitializeSmoke(
         ID3D12Device* device,
         ShaderCompiler& shaderCompiler,
-        const std::filesystem::path& shaderPath);
+        const std::filesystem::path& shaderPath,
+        bool readbackForceWait = false);
     bool SmokeReady() const { return m_smokeReady; }
 
     // Run ONE smoke dispatch for the FIRST controlled (resident-slot) dirty tile in
@@ -246,11 +261,15 @@ public:
         const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
         uint64_t currentTileVersionForSlot);
 
-    // Delayed, DEBUG-ONLY readback of the last dispatch's controlled tile: copies the
-    // debug face buffer's reserved range + the metadata faceCount/status back, then
-    // recomputes the SAME deterministic pattern CPU-side and compares. Non-blocking:
-    // only runs once the dispatch fence has completed. Returns true once a verify ran.
-    // The pipeline FUNCTIONS without ever calling this - it is pure validation.
+    // Delayed, DEBUG-ONLY readback via the fence-tracked RING. Consumes the OLDEST
+    // pending ring slot whose copy fence has completed: reads that slot's persistently
+    // mapped face + metadata pointers, recomputes the CPU reference for THAT dispatch,
+    // and runs the multiset A/B harness -> AB_VERIFY. Works REPEATEDLY across frames
+    // (one comparison per dispatch, a couple frames behind), NOT once per process.
+    // Non-blocking by default (skips a slot whose fence is not yet done); the gated
+    // explicit wait (set in InitializeSmoke) is the only blocking path and is OFF for
+    // timing runs. The pipeline FUNCTIONS without ever calling this - pure validation.
+    // Returns true if a comparison ran this call.
     bool PollSmokeReadback(uint64_t completedFenceValue);
 
     const MidMeshGpuExtractSmokeStats& GetSmokeStats() const { return m_smokeStats; }
@@ -277,6 +296,21 @@ private:
     static void ComputeSmokeFacesCpu(
         const SmokeControlledTile& tile,
         std::vector<Simulation::SparseSurfaceFace>& outFaces);
+
+    // B1.3.0: one slot of the fence-tracked readback RING. Each slot owns a face +
+    // metadata readback buffer that is Map()'d ONCE at init and kept persistently
+    // mapped (never per-frame Map/Unmap); the recorded fence value tells the poll
+    // when the GPU copy into this slot has completed, and the captured controlled
+    // tile lets the poll recompute the CPU reference for THAT dispatch (delayed).
+    struct SmokeReadbackSlot {
+        GPUBuffer faceReadback;     // CPU-visible copy of the dispatch's debug faces
+        GPUBuffer metaReadback;     // CPU-visible copy of the dispatch's metadata
+        void* facePtr = nullptr;    // persistent mapped pointer into faceReadback
+        void* metaPtr = nullptr;    // persistent mapped pointer into metaReadback
+        uint64_t fenceValue = 0;    // smoke-fence value the copy into this slot signals
+        bool pending = false;       // copy recorded, awaiting fence + a poll
+        SmokeControlledTile tile;   // controlled tile snapshot for this dispatch
+    };
 
     MidMeshGpuExtractConfig m_config;
     MidMeshGpuExtractStats m_stats;
@@ -305,8 +339,19 @@ private:
     GPUBuffer m_smokeSampleBuffer;   // one tile's samples (StructuredBuffer, SRV-read)
     GPUBuffer m_smokeMetaBuffer;     // one slot's metadata (RWStructuredBuffer, UAV)
     GPUBuffer m_smokeFaceBuffer;     // ISOLATED RWStructuredBuffer<SparseSurfaceFace> (UAV)
-    GPUBuffer m_smokeFaceReadback;   // CPU-visible copy of the controlled tile's range
-    GPUBuffer m_smokeMetaReadback;   // CPU-visible copy of the controlled tile's metadata
+    // B1.3.0: fence-tracked, persistently-mapped readback RING (replaces B1.2's
+    // single once-per-process readback). 3 slots so a dispatch's copy can be read
+    // a frame or two later, after its fence is naturally satisfied - no per-frame
+    // blocking wait on the normal path.
+    static constexpr uint32_t kSmokeReadbackSlots = 3u;
+    std::array<SmokeReadbackSlot, kSmokeReadbackSlots> m_smokeReadbackRing;
+    uint32_t m_smokeReadbackWriteSlot = 0; // next slot a dispatch writes into
+    uint32_t m_smokeReadbackReadSlot = 0;  // next slot the poll consumes (FIFO)
+    // Gated explicit CPU fence WAIT: OFF by default. When ON (env
+    // VENPOD_MIDMESH_GPU_EXTRACT_READBACK_WAIT=1) the poll blocks until the slot's
+    // fence completes, guaranteeing a same-cycle compare in the ISOLATED correctness
+    // path. NEVER on for timing runs and never on the production runtime path.
+    bool m_smokeReadbackForceWait = false;
     ComPtr<ID3D12QueryHeap> m_smokeQueryHeap;   // 3 timestamps: dispatch begin/end + barrier end
     GPUBuffer m_smokeQueryReadback;             // CPU-visible timestamp resolve target
     ComPtr<ID3D12CommandAllocator> m_smokeCmdAllocator; // reused per dispatch (created once)
@@ -319,7 +364,8 @@ private:
     ComPtr<ID3D12Fence> m_smokeFence;
     void* m_smokeFenceEvent = nullptr;
     uint64_t m_smokeFenceValue = 0;
-    bool m_smokeVerifyDone = false; // one authoritative SMOKE_VERIFY has been captured
+    bool m_smokeSelfTestDone = false; // AB_SELFTEST has been run once this process
+    uint32_t m_smokeAbVerifyCount = 0; // total AB_VERIFY comparisons (ring repeatability)
     uint64_t m_smokeTimestampFrequency = 0;
     uint32_t m_smokeFaceCapacityPerTile = 0;
     uint64_t m_smokeFaceBufferBytes = 0;
