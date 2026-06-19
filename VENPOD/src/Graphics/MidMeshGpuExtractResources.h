@@ -32,6 +32,7 @@
 #include <array>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <vector>
 
 namespace VENPOD::Graphics {
@@ -118,6 +119,11 @@ struct MidMeshGpuExtractConfig {
     // CS writes only the first smokeMaxCells top quads (<= this capacity).
     uint32_t smokeFaceCapacityPerTile = 256u;
     uint32_t smokeMaxCells = 16u;   // K: top quads the smoke shader writes per tile
+    // B1.3a TOP-FACE: per-tile reserved capacity for the REAL top-face extraction. A
+    // tile emits up to cellCount^2 solid top faces ((side-1)^2 ~= 1024 for side=33),
+    // each possibly split into a few sub-faces for cellSize > 32. 4096 covers the
+    // worst flat tile with headroom; overflow sets the status flag (a rejected result).
+    uint32_t topFaceCapacityPerTile = 4096u;
 };
 
 struct MidMeshGpuExtractStats {
@@ -170,6 +176,38 @@ struct MidMeshGpuExtractSmokeStats {
     uint32_t abOverflow = 0;
     bool abSelfTestRun = false;     // AB_SELFTEST was executed
     bool abSelfTestPassed = false;  // AB_SELFTEST asserted the multiset logic bites
+};
+
+// -----------------------------------------------------------------------------
+// B1.3a TOP-FACE: per-dispatch result of the REAL top-face extraction + its
+// CONTAINMENT A/B against the CPU tile's meshCacheFaces (the ground-truth mesh).
+// -----------------------------------------------------------------------------
+struct MidMeshGpuExtractB13aStats {
+    bool dispatched = false;        // a B1.3a top-face dispatch ran this frame
+    uint32_t tileSlot = UINT32_MAX; // controlled (flat/simple) fixture slot
+    uint32_t fixtureMergeCells = 0; // the fixture's mergeCells (must be 1)
+    uint32_t fixtureChildMask = 0;  // the fixture's childMask (must be 0)
+    uint32_t cpuRefFaceCount = 0;   // CPU meshCacheFaces size (full mesh: tops+risers+skirts)
+    uint32_t gpuFaceCount = 0;      // GPU-written top-face count (read back; UINT32_MAX=unread)
+    uint32_t gpuStatusOverflow = 0; // GPU status (0 ok / 1 reserved-range overflow)
+    uint64_t dispatchedVersion = 0; // meshContentVersion at dispatch
+    bool commitGateStale = false;   // dispatched serial != current serial -> discard
+    // Timing (microseconds):
+    double dispatchGpuUs = 0.0;
+    double barrierGpuUs = 0.0;
+    double cpuSubmitUs = 0.0;
+    // CONTAINMENT A/B (filled by the delayed readback ring + multiset harness):
+    bool verified = false;          // at least one AB_VERIFY(contain) has run
+    uint32_t verifyCount = 0;       // TOTAL containment comparisons (ring repeatability)
+    uint32_t verifyMatched = 0;     // 1 if the last containment compare passed
+    uint32_t verifyMismatch = 0;    // 1 if the last containment compare failed
+    // Last containment result (the proof: extraGpuFaces==0 => GPU-top subset of CPU):
+    uint32_t abGpuFaceCount = 0;
+    uint32_t abGpuUniqueFaceCount = 0;
+    uint32_t abMissingCpuFaces = 0;     // CPU faces the GPU did not emit (ALLOWED in contain)
+    uint32_t abExtraGpuFaces = 0;       // GPU faces not in CPU (MUST be 0)
+    uint32_t abMultiplicityMismatches = 0;
+    uint32_t abOverflow = 0;
 };
 
 // Per-frame upload ticket: the staged copy regions for this frame's dirty tiles.
@@ -239,11 +277,15 @@ public:
     // `readbackForceWait` (default false) gates the explicit CPU fence WAIT in the
     // readback poll: when true, the ISOLATED correctness path blocks until each slot's
     // fence completes (same-cycle compare). MUST be false for any timing run.
+    // `b13aEnabled` sizes the ISOLATED debug face buffer + readback ring to also hold a
+    // full B1.3a top-face tile (topFaceCapacityPerTile, larger than the smoke K), so the
+    // B1.3a path can reuse this same isolated infrastructure.
     Result<void> InitializeSmoke(
         ID3D12Device* device,
         ShaderCompiler& shaderCompiler,
         const std::filesystem::path& shaderPath,
-        bool readbackForceWait = false);
+        bool readbackForceWait = false,
+        bool b13aEnabled = false);
     bool SmokeReady() const { return m_smokeReady; }
 
     // Run ONE smoke dispatch for the FIRST controlled (resident-slot) dirty tile in
@@ -274,6 +316,54 @@ public:
 
     const MidMeshGpuExtractSmokeStats& GetSmokeStats() const { return m_smokeStats; }
 
+    // =========================================================================
+    // B1.3a TOP-FACE - the FIRST real meshing increment (gated by
+    // VENPOD_MIDMESH_GPU_EXTRACT_B13A; requires the smoke compute side ready).
+    // =========================================================================
+    // Compile the top-face PSO (CS_MidMeshExtractTopFaces.hlsl). Reuses the smoke
+    // path's isolated dedicated queue/fence, readback ring, timestamps, command list,
+    // and debug face/sample/meta buffers; only the PSO + root layout differ. Call AFTER
+    // InitializeSmoke(). No-op (returns ok) if B1.3a is not enabled.
+    Result<void> InitializeB13aTopFace(
+        ID3D12Device* device,
+        ShaderCompiler& shaderCompiler,
+        const std::filesystem::path& shaderPath);
+    bool B13aReady() const { return m_b13aReady; }
+
+    // Pick the FIRST flat/simple B1.3a fixture from `dirtyTiles`: a resident-slot dirty
+    // tile with mergeCells==1 AND childMask==0 (no resident finer children -> no
+    // suppression). `hasEditFootprint` is queried by the caller per-candidate slot (a
+    // fixture must have NO edit footprint, since the CPU suppresses edited cells). Returns
+    // the picked tile's index in `dirtyTiles`, or UINT32_MAX if none qualifies.
+    static uint32_t SelectB13aFixture(
+        const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
+        const std::function<bool(uint32_t /*slot*/)>& hasEditFootprint);
+
+    // Run ONE top-face extraction for the picked fixture tile. Uploads the tile's
+    // samples+metadata (faceCount zeroed) into the dedicated smoke buffers, dispatches
+    // CS_MidMeshExtractTopFaces over the tile's cell grid (each eligible solid cell
+    // appends a PosY top quad via the per-tile counter), copies the result into the
+    // readback ring, and captures `cpuReferenceFaces` (the tile's FULL meshCacheFaces,
+    // passed in by the caller via the read-only accessor) so PollB13aReadback can A/B
+    // against it. Runs on the isolated smoke queue + fence (production untouched).
+    // Returns true if a dispatch was issued.
+    bool RunB13aTopFaceDispatch(
+        ID3D12Device* device,
+        const Simulation::MidMeshGpuExtractDirtyTile& fixture,
+        const std::vector<Simulation::SparseSurfaceFace>& cpuReferenceFaces,
+        uint32_t terraceStep,
+        uint64_t currentTileVersionForSlot);
+
+    // Delayed, DEBUG-ONLY containment A/B via the fence-tracked ring (same FIFO/ring as
+    // the smoke poll, non-blocking by default). Reads the GPU top faces + status for the
+    // oldest completed dispatch and compares them against that dispatch's captured CPU
+    // reference mesh in CONTAINMENT mode -> AB_VERIFY label=b13a mode=contain. Proves
+    // GPU-top is a multiset-subset of the CPU mesh (extraGpuFaces==0). Returns true if a
+    // comparison ran this call.
+    bool PollB13aReadback();
+
+    const MidMeshGpuExtractB13aStats& GetB13aStats() const { return m_b13aStats; }
+
 private:
     // B1.2: CPU snapshot of the controlled tile, captured at dispatch, so the readback
     // can recompute the exact deterministic faces the shader was asked to produce.
@@ -289,6 +379,11 @@ private:
         int32_t cellSizeInt = 0;
         uint32_t sampleSide = 0;
         std::vector<uint32_t> samples;  // copy of the tile's packed samples
+        // B1.3a: this dispatch is a real top-face extraction A/B'd in CONTAINMENT mode
+        // against the CPU's FULL meshCacheFaces (captured below), not the deterministic
+        // smoke pattern. When set, the poll uses cpuReferenceFaces + Containment.
+        bool b13aTopFace = false;
+        std::vector<Simulation::SparseSurfaceFace> cpuReferenceFaces; // tile meshCacheFaces
     };
 
     // Recompute the deterministic smoke faces CPU-side (mirror of the HLSL). Static so
@@ -368,9 +463,24 @@ private:
     uint32_t m_smokeAbVerifyCount = 0; // total AB_VERIFY comparisons (ring repeatability)
     uint64_t m_smokeTimestampFrequency = 0;
     uint32_t m_smokeFaceCapacityPerTile = 0;
+    // The ISOLATED debug face buffer + readback ring are sized to this (= max of the
+    // smoke K capacity and, when B1.3a is enabled, the top-face capacity) so BOTH the
+    // smoke and B1.3a dispatches fit in the shared isolated buffers.
+    uint32_t m_debugFaceCapacityPerTile = 0;
     uint64_t m_smokeFaceBufferBytes = 0;
     SmokeControlledTile m_smokeControlled;       // last dispatch's controlled tile
     MidMeshGpuExtractSmokeStats m_smokeStats;
+
+    // ---- B1.3a TOP-FACE (real meshing increment) ----
+    // Reuses the smoke path's isolated queue/fence/readback-ring/timestamps/command list
+    // and the dedicated debug sample/meta/face buffers; only the PSO + root layout + the
+    // CPU-reference + containment comparison differ.
+    bool m_b13aReady = false;
+    DX12ComputePipeline m_topFacePipeline;
+    uint32_t m_topFaceCapacityPerTile = 0;
+    uint32_t m_b13aAbVerifyCount = 0;    // total containment comparisons (ring repeatability)
+    uint32_t m_b13aBuildTerraceStep = 1; // terraceStep the CPU build used (height quantize)
+    MidMeshGpuExtractB13aStats m_b13aStats;
 };
 
 } // namespace VENPOD::Graphics

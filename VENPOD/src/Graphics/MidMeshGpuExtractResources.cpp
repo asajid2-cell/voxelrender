@@ -182,9 +182,17 @@ void MidMeshGpuExtractResources::Shutdown() {
     m_smokeReady = false;
     m_smokeTimestampFrequency = 0;
     m_smokeFaceCapacityPerTile = 0;
+    m_debugFaceCapacityPerTile = 0;
     m_smokeFaceBufferBytes = 0;
     m_smokeControlled = {};
     m_smokeStats = {};
+    // B1.3a top-face path (reuses the smoke isolated objects, so only its own state here).
+    m_topFacePipeline.Shutdown();
+    m_b13aReady = false;
+    m_topFaceCapacityPerTile = 0;
+    m_b13aAbVerifyCount = 0;
+    m_b13aBuildTerraceStep = 1;
+    m_b13aStats = {};
 
     for (auto& ring : m_uploadRing) {
         ring.Shutdown();
@@ -389,7 +397,8 @@ Result<void> MidMeshGpuExtractResources::InitializeSmoke(
     ID3D12Device* device,
     ShaderCompiler& shaderCompiler,
     const std::filesystem::path& shaderPath,
-    bool readbackForceWait)
+    bool readbackForceWait,
+    bool b13aEnabled)
 {
     m_smokeReadbackForceWait = readbackForceWait;
     if (!m_stats.initialized) {
@@ -400,6 +409,13 @@ Result<void> MidMeshGpuExtractResources::InitializeSmoke(
     }
 
     m_smokeFaceCapacityPerTile = std::max(1u, m_config.smokeFaceCapacityPerTile);
+    m_topFaceCapacityPerTile = std::max(1u, m_config.topFaceCapacityPerTile);
+    // The ISOLATED debug face buffer + readback ring must hold the LARGER of the smoke
+    // K-quad reservation and (when B1.3a is enabled) the full top-face tile reservation,
+    // so both dispatch kinds reuse the same isolated buffers without overflow.
+    m_debugFaceCapacityPerTile =
+        b13aEnabled ? std::max(m_smokeFaceCapacityPerTile, m_topFaceCapacityPerTile)
+                    : m_smokeFaceCapacityPerTile;
     // The smoke shader writes at most smokeMaxCells faces; the per-tile reserved range
     // must be able to hold them (otherwise we always overflow).
     if (m_config.smokeMaxCells > m_smokeFaceCapacityPerTile) {
@@ -425,9 +441,10 @@ Result<void> MidMeshGpuExtractResources::InitializeSmoke(
     }
 
     // ISOLATED debug-output face buffer. One controlled tile's reserved range
-    // (baseFace=0). This is NOT the production mid-mesh face buffer.
+    // (baseFace=0). This is NOT the production mid-mesh face buffer. Sized to the
+    // larger of the smoke / B1.3a per-tile capacity so both reuse it.
     m_smokeFaceBufferBytes =
-        static_cast<uint64_t>(m_smokeFaceCapacityPerTile) * sizeof(Simulation::SparseSurfaceFace);
+        static_cast<uint64_t>(m_debugFaceCapacityPerTile) * sizeof(Simulation::SparseSurfaceFace);
     if (auto r = m_smokeFaceBuffer.Initialize(
             device, m_smokeFaceBufferBytes,
             BufferUsage::Default | BufferUsage::StructuredBuffer | BufferUsage::UnorderedAccess,
@@ -443,7 +460,7 @@ Result<void> MidMeshGpuExtractResources::InitializeSmoke(
     // slot is read only after its fence is satisfied. This makes the verify REPEATABLE
     // across frames, not once per process.
     const uint64_t faceReadbackBytes =
-        static_cast<uint64_t>(m_smokeFaceCapacityPerTile) * sizeof(Simulation::SparseSurfaceFace);
+        static_cast<uint64_t>(m_debugFaceCapacityPerTile) * sizeof(Simulation::SparseSurfaceFace);
     for (uint32_t i = 0; i < kSmokeReadbackSlots; ++i) {
         char faceName[64];
         char metaName[64];
@@ -976,6 +993,386 @@ bool MidMeshGpuExtractResources::PollSmokeReadback(uint64_t completedFenceValue)
         "SMOKE_VERIFY abVerifyCount={} match={} gpuCount={} cpuCount={} gpuStatus={}",
         m_smokeAbVerifyCount, ab.match ? 1 : 0, gpuFaceCount,
         static_cast<uint32_t>(cpuFaces.size()), gpuStatus);
+    return true;
+}
+
+// =============================================================================
+// B1.3a TOP-FACE - the first real meshing increment (containment-proven).
+// =============================================================================
+
+Result<void> MidMeshGpuExtractResources::InitializeB13aTopFace(
+    ID3D12Device* device,
+    ShaderCompiler& shaderCompiler,
+    const std::filesystem::path& shaderPath)
+{
+    if (!m_smokeReady) {
+        return Error("InitializeB13aTopFace - smoke compute side not ready");
+    }
+    if (!device) {
+        return Error("InitializeB13aTopFace - device is null");
+    }
+    // The isolated debug face buffer + readback ring must have been sized for the
+    // top-face capacity (InitializeSmoke called with b13aEnabled=true).
+    if (m_debugFaceCapacityPerTile < m_topFaceCapacityPerTile) {
+        return Error(
+            "InitializeB13aTopFace - debug face buffer capacity {} < topFaceCapacityPerTile {} "
+            "(InitializeSmoke must be called with b13aEnabled=true)",
+            m_debugFaceCapacityPerTile, m_topFaceCapacityPerTile);
+    }
+
+    // Top-face PSO. Root layout MUST match CS_MidMeshExtractTopFaces.hlsl:
+    //   b0: 4x 32-bit constants {tileSlot, debugBaseFace, faceCapacityPerTile, terraceStep}
+    //   t0: samples (root SRV)   u0: debug faces (root UAV)   u1: metadata (root UAV)
+    const std::filesystem::path csPath =
+        shaderPath / "Compute" / "CS_MidMeshExtractTopFaces.hlsl";
+    auto compileResult = shaderCompiler.CompileComputeShader(csPath, L"main", false);
+    if (!compileResult || !compileResult.value().IsValid()) {
+        return Error("InitializeB13aTopFace - CS compile failed: {}",
+            compileResult ? compileResult.value().errors : compileResult.error());
+    }
+    ComputePipelineDesc desc;
+    desc.computeShader = compileResult.value();
+    desc.debugName = "CS_MidMeshExtractTopFaces";
+    desc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 4 }); // b0
+    desc.rootParams.push_back({ RootParamType::ShaderResource, 0, 0, 1 }); // t0 samples
+    desc.rootParams.push_back({ RootParamType::UnorderedAccess, 0, 0, 1 }); // u0 faces
+    desc.rootParams.push_back({ RootParamType::UnorderedAccess, 1, 0, 1 }); // u1 metadata
+    if (auto r = m_topFacePipeline.Initialize(device, desc); !r) {
+        return Error("InitializeB13aTopFace - PSO init: {}", r.error());
+    }
+
+    m_b13aReady = true;
+    spdlog::info(
+        "[GPU_EXTRACT_B13A] top-face compute ready: topFaceCapacityPerTile={} "
+        "debugFaceCapacityPerTile={} (ISOLATED - production face buffer + draw path untouched, "
+        "containment A/B vs CPU meshCacheFaces)",
+        m_topFaceCapacityPerTile, m_debugFaceCapacityPerTile);
+    return {};
+}
+
+uint32_t MidMeshGpuExtractResources::SelectB13aFixture(
+    const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
+    const std::function<bool(uint32_t)>& hasEditFootprint)
+{
+    // A clean containment fixture is FLAT/SIMPLE: a resident-slot dirty tile with
+    //   * mergeCells == 1   (single-cell footprints; the only path the B1.3a CS handles)
+    //   * childMask  == 0   (no resident finer children -> no L7 quadrant suppression)
+    //   * NO edit footprint (the CPU suppresses edited cells; the GPU would over-emit)
+    // For such a tile the CPU mesh is { top faces } (+ border skirts/risers), so GPU-top
+    // is a strict multiset-subset.
+    for (uint32_t i = 0; i < dirtyTiles.size(); ++i) {
+        const auto& t = dirtyTiles[i];
+        if (t.slot == UINT32_MAX || t.samples == nullptr || t.sampleCount == 0u) {
+            continue;
+        }
+        if (t.mergeCells != 1u || t.childMask != 0u) {
+            continue;
+        }
+        if (hasEditFootprint && hasEditFootprint(t.slot)) {
+            continue;
+        }
+        return i;
+    }
+    return UINT32_MAX;
+}
+
+bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
+    ID3D12Device* device,
+    const Simulation::MidMeshGpuExtractDirtyTile& fixture,
+    const std::vector<Simulation::SparseSurfaceFace>& cpuReferenceFaces,
+    uint32_t terraceStep,
+    uint64_t currentTileVersionForSlot)
+{
+    if (!m_b13aReady || !device) {
+        return false;
+    }
+    if (fixture.slot >= m_config.maxTiles || fixture.samples == nullptr ||
+        fixture.sampleCount == 0u) {
+        return false;
+    }
+    if (!m_smokeCmdAllocator || !m_smokeCmdList) {
+        spdlog::error("[GPU_EXTRACT_B13A] command objects missing");
+        return false;
+    }
+    m_b13aBuildTerraceStep = std::max(1u, terraceStep);
+
+    // Capture the controlled fixture + its FULL CPU reference mesh so the delayed poll
+    // can A/B in CONTAINMENT mode.
+    SmokeControlledTile ctl;
+    ctl.valid = true;
+    ctl.b13aTopFace = true;
+    ctl.slot = 0u;       // the dedicated smoke buffers always use slot 0 / baseFace 0
+    ctl.baseFace = 0u;
+    ctl.version = fixture.meshContentVersion;
+    ctl.originX = fixture.originX;
+    ctl.originZ = fixture.originZ;
+    ctl.cellSizeInt = std::max(1, static_cast<int32_t>(fixture.cellSize));
+    ctl.sampleSide = m_config.tileSampleSide;
+    ctl.expectedCount = 0u; // variable (counter-driven); filled by the GPU faceCount
+    ctl.samples.assign(fixture.samples, fixture.samples + fixture.sampleCount);
+    ctl.cpuReferenceFaces = cpuReferenceFaces;
+
+    // Reuse the persistent allocator/list. Wait the PREVIOUS dispatch's fence so the
+    // allocator can be reset (non-blocking in steady state; NOT a wait on this dispatch).
+    const uint64_t prevFence = m_smokeFenceValue;
+    if (prevFence != 0u && m_smokeFence->GetCompletedValue() < prevFence) {
+        m_smokeFence->SetEventOnCompletion(prevFence, m_smokeFenceEvent);
+        WaitForSingleObject(m_smokeFenceEvent, INFINITE);
+    }
+    if (FAILED(m_smokeCmdAllocator->Reset()) ||
+        FAILED(m_smokeCmdList->Reset(m_smokeCmdAllocator.Get(), nullptr))) {
+        spdlog::error("[GPU_EXTRACT_B13A] command list reset failed");
+        return false;
+    }
+    ID3D12GraphicsCommandList* const list = m_smokeCmdList.Get();
+    const bool haveTimestamps = (m_smokeQueryHeap != nullptr);
+
+    const uint32_t writeSlot = m_smokeReadbackWriteSlot;
+    SmokeReadbackSlot& ringSlot = m_smokeReadbackRing[writeSlot];
+
+    // ---- self-contained input upload into the DEDICATED smoke buffers ----
+    if (auto* mapped = static_cast<uint8_t*>(m_smokeInputUpload.GetMappedData())) {
+        const uint64_t tileSampleBytes =
+            static_cast<uint64_t>(fixture.sampleCount) * sizeof(uint32_t);
+        std::memcpy(mapped, fixture.samples, static_cast<size_t>(tileSampleBytes));
+
+        MidMeshGpuExtractTileMeta meta;
+        meta.coordX = fixture.coord.x;
+        meta.coordRing = fixture.coord.y;
+        meta.coordZ = fixture.coord.z;
+        meta.originX = fixture.originX;
+        meta.originZ = fixture.originZ;
+        std::memcpy(&meta.cellSizeBits, &fixture.cellSize, sizeof(uint32_t));
+        meta.mergeCells = fixture.mergeCells;   // == 1 for a B1.3a fixture
+        meta.childMask = fixture.childMask;     // == 0 for a B1.3a fixture
+        meta.meshContentVersionLo =
+            static_cast<uint32_t>(fixture.meshContentVersion & 0xFFFFFFFFull);
+        meta.meshContentVersionHi =
+            static_cast<uint32_t>(fixture.meshContentVersion >> 32u);
+        meta.sampleSide = m_config.tileSampleSide;
+        meta.sampleStride = m_config.tileSampleSide;
+        meta.haloWidth = 0u;
+        meta.heightPackDesc = PackMidMeshHeightDesc();
+        meta.heightBias = MidMeshSampleHeightBias;
+        meta.editFootprintCount = 0u;
+        meta.faceCapacity = m_topFaceCapacityPerTile;
+        meta.baseFace = 0u;
+        // faceCount is the per-tile append COUNTER: start at 0 so InterlockedAdd hands out
+        // dense slots [0..count). statusOverflow starts clean.
+        meta.faceCount = 0u;
+        meta.statusOverflow = 0u;
+        std::memcpy(mapped + tileSampleBytes, &meta, sizeof(meta));
+
+        ID3D12Resource* uploadRes = m_smokeInputUpload.GetResource();
+        m_smokeSampleBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COPY_DEST);
+        m_smokeMetaBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COPY_DEST);
+        list->CopyBufferRegion(
+            m_smokeSampleBuffer.GetResource(), 0, uploadRes, 0, tileSampleBytes);
+        list->CopyBufferRegion(
+            m_smokeMetaBuffer.GetResource(), 0,
+            uploadRes, tileSampleBytes, sizeof(MidMeshGpuExtractTileMeta));
+        m_smokeSampleBuffer.TransitionTo(
+            list, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        m_smokeMetaBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    m_smokeFaceBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    m_topFacePipeline.Bind(list);
+    const uint32_t consts[4] = {
+        ctl.slot, ctl.baseFace, m_topFaceCapacityPerTile, m_b13aBuildTerraceStep
+    };
+    m_topFacePipeline.SetRoot32BitConstants(list, 0, 4, consts);
+    list->SetComputeRootShaderResourceView(1, m_smokeSampleBuffer.GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(2, m_smokeFaceBuffer.GetGPUVirtualAddress());
+    list->SetComputeRootUnorderedAccessView(3, m_smokeMetaBuffer.GetGPUVirtualAddress());
+
+    if (haveTimestamps) {
+        list->EndQuery(m_smokeQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
+    }
+    // One thread per cell: cellCount^2 cells, 64 threads/group.
+    const uint32_t side = m_config.tileSampleSide;
+    const uint32_t cellsPerRow = (side > 1u) ? (side - 1u) : 0u;
+    const uint32_t cellCount = cellsPerRow * cellsPerRow;
+    const uint32_t groups = (cellCount + 63u) / 64u;
+    m_topFacePipeline.Dispatch(list, std::max(1u, groups), 1, 1);
+    if (haveTimestamps) {
+        list->EndQuery(m_smokeQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
+    }
+
+    D3D12_RESOURCE_BARRIER uavBarriers[2] = {};
+    uavBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uavBarriers[0].UAV.pResource = m_smokeFaceBuffer.GetResource();
+    uavBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uavBarriers[1].UAV.pResource = m_smokeMetaBuffer.GetResource();
+    list->ResourceBarrier(2, uavBarriers);
+    if (haveTimestamps) {
+        list->EndQuery(m_smokeQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
+    }
+
+    // Copy this dispatch's faces + metadata into the current ring slot (persistently
+    // mapped, fence-tracked) so a later poll reads it back. Copy the FULL top-face
+    // capacity (the poll clamps to the GPU-written faceCount).
+    m_smokeFaceBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    m_smokeMetaBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    list->CopyBufferRegion(
+        ringSlot.faceReadback.GetResource(), 0,
+        m_smokeFaceBuffer.GetResource(), 0,
+        static_cast<uint64_t>(m_topFaceCapacityPerTile) * sizeof(Simulation::SparseSurfaceFace));
+    list->CopyBufferRegion(
+        ringSlot.metaReadback.GetResource(), 0,
+        m_smokeMetaBuffer.GetResource(), 0,
+        sizeof(MidMeshGpuExtractTileMeta));
+    if (haveTimestamps && m_smokeQueryReadback.GetResource()) {
+        list->ResolveQueryData(
+            m_smokeQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 3,
+            m_smokeQueryReadback.GetResource(), 0);
+    }
+
+    m_smokeFaceBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COMMON);
+    m_smokeMetaBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COMMON);
+    m_smokeSampleBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COMMON);
+
+    const auto cpuSubmitStart = std::chrono::steady_clock::now();
+    list->Close();
+    ID3D12CommandList* lists[] = { list };
+    m_smokeQueue->ExecuteCommandLists(1, lists);
+    const uint64_t fence = ++m_smokeFenceValue;
+    m_smokeQueue->Signal(m_smokeFence.Get(), fence);
+    const auto cpuSubmitStop = std::chrono::steady_clock::now();
+
+    ctl.fenceValue = fence;
+
+    // Record into the ring (no blocking wait on its fence; the poll reads it later).
+    ringSlot.fenceValue = fence;
+    ringSlot.pending = true;
+    ringSlot.tile = ctl;
+    m_smokeReadbackWriteSlot = (writeSlot + 1u) % kSmokeReadbackSlots;
+
+    const bool stale = (currentTileVersionForSlot != ctl.version);
+
+    double dispatchUs = 0.0, barrierUs = 0.0;
+    const bool timingReady =
+        (m_smokeFence->GetCompletedValue() >= fence) ||
+        (prevFence != 0u && m_smokeFence->GetCompletedValue() >= prevFence);
+    if (haveTimestamps && m_smokeTimestampFrequency != 0u && timingReady) {
+        if (const auto* ts = static_cast<const uint64_t*>(m_smokeQueryReadback.Map())) {
+            const double toUs = 1.0e6 / static_cast<double>(m_smokeTimestampFrequency);
+            dispatchUs = (ts[1] >= ts[0]) ? static_cast<double>(ts[1] - ts[0]) * toUs : 0.0;
+            barrierUs = (ts[2] >= ts[1]) ? static_cast<double>(ts[2] - ts[1]) * toUs : 0.0;
+            m_smokeQueryReadback.Unmap();
+        }
+    }
+    const double cpuSubmitUs =
+        std::chrono::duration<double, std::micro>(cpuSubmitStop - cpuSubmitStart).count();
+
+    // Preserve cumulative verify fields across the per-dispatch stats refresh.
+    const uint32_t keepVerifyCount = m_b13aStats.verifyCount;
+    const bool keepVerified = m_b13aStats.verified;
+    m_b13aStats = {};
+    m_b13aStats.dispatched = true;
+    m_b13aStats.tileSlot = fixture.slot;        // report the REAL cache slot (fixture)
+    m_b13aStats.fixtureMergeCells = fixture.mergeCells;
+    m_b13aStats.fixtureChildMask = fixture.childMask;
+    m_b13aStats.cpuRefFaceCount = static_cast<uint32_t>(cpuReferenceFaces.size());
+    m_b13aStats.gpuFaceCount = UINT32_MAX;        // unread until PollB13aReadback
+    m_b13aStats.dispatchedVersion = ctl.version;
+    m_b13aStats.commitGateStale = stale;
+    m_b13aStats.dispatchGpuUs = dispatchUs;
+    m_b13aStats.barrierGpuUs = barrierUs;
+    m_b13aStats.cpuSubmitUs = cpuSubmitUs;
+    m_b13aStats.verified = keepVerified;
+    m_b13aStats.verifyCount = keepVerifyCount;
+
+    spdlog::info(
+        "GPU_EXTRACT_B13A fixtureSlot={} mergeCells={} childMask={} cpuRefFaces={} "
+        "dispatchGpuUs={:.2f} barrierGpuUs={:.2f} cpuSubmitUs={:.2f} commitGate={} "
+        "dispatchedVersion={} currentVersion={}",
+        fixture.slot, fixture.mergeCells, fixture.childMask,
+        m_b13aStats.cpuRefFaceCount, dispatchUs, barrierUs, cpuSubmitUs,
+        stale ? "DISCARD_STALE" : "PASS",
+        ctl.version, currentTileVersionForSlot);
+    return true;
+}
+
+bool MidMeshGpuExtractResources::PollB13aReadback() {
+    if (!m_b13aReady) {
+        return false;
+    }
+    // FIFO-consume the oldest pending ring slot whose copy fence has completed. Only act
+    // on B1.3a dispatches here (the smoke poll owns equality dispatches); a non-B1.3a slot
+    // at the read cursor is left for PollSmokeReadback. (In a B1.3a run only B1.3a
+    // dispatches are recorded, so this is the only consumer.)
+    SmokeReadbackSlot& slot = m_smokeReadbackRing[m_smokeReadbackReadSlot];
+    if (!slot.pending || !slot.tile.valid || !slot.tile.b13aTopFace) {
+        return false;
+    }
+    const uint64_t completed = m_smokeFence->GetCompletedValue();
+    if (completed < slot.fenceValue) {
+        if (!m_smokeReadbackForceWait) {
+            return false; // not done yet (non-blocking)
+        }
+        if (m_smokeFenceEvent) {
+            m_smokeFence->SetEventOnCompletion(slot.fenceValue, m_smokeFenceEvent);
+            WaitForSingleObject(m_smokeFenceEvent, INFINITE);
+        }
+    }
+
+    uint32_t gpuFaceCount = 0;
+    uint32_t gpuStatus = 0;
+    if (slot.metaPtr) {
+        const auto* meta = static_cast<const MidMeshGpuExtractTileMeta*>(slot.metaPtr);
+        gpuFaceCount = meta->faceCount;       // the per-tile append counter's final value
+        gpuStatus = meta->statusOverflow;
+    }
+
+    // Gather the GPU top faces the shader actually wrote (clamped to capacity; on overflow
+    // the result is rejected by the harness so we read nothing meaningful).
+    std::vector<Simulation::SparseSurfaceFace> gpuFaces;
+    if (slot.facePtr) {
+        const auto* faces = static_cast<const Simulation::SparseSurfaceFace*>(slot.facePtr);
+        const uint32_t emitted =
+            (gpuStatus == 0u) ? std::min(gpuFaceCount, m_topFaceCapacityPerTile) : 0u;
+        gpuFaces.assign(faces, faces + emitted);
+    }
+
+    // The CPU reference = this dispatch's captured FULL meshCacheFaces (tops + risers +
+    // skirts). CONTAINMENT: every GPU top face must appear in the CPU mesh with >= its
+    // multiplicity, and extraGpuFaces MUST be 0 (a GPU face absent from the CPU mesh is a
+    // bug). missingCpuFaces is EXPECTED (the CPU has risers/skirts the GPU does not emit).
+    const std::vector<Simulation::SparseSurfaceFace>& cpuFaces = slot.tile.cpuReferenceFaces;
+    const MidMeshFaceAbResult ab = CompareMidMeshFacesMultiset(
+        gpuFaces, cpuFaces, MidMeshFaceAbMode::Containment, gpuStatus, 8u);
+    LogMidMeshFaceAbResult("b13a", ab);
+
+    slot.pending = false;
+    slot.tile = {};
+    m_smokeReadbackReadSlot = (m_smokeReadbackReadSlot + 1u) % kSmokeReadbackSlots;
+
+    ++m_b13aAbVerifyCount;
+    m_b13aStats.gpuFaceCount = gpuFaceCount;
+    m_b13aStats.gpuStatusOverflow = gpuStatus;
+    m_b13aStats.verified = true;
+    m_b13aStats.verifyCount = m_b13aAbVerifyCount;
+    m_b13aStats.verifyMatched = ab.match ? 1u : 0u;
+    m_b13aStats.verifyMismatch = ab.match ? 0u : 1u;
+    m_b13aStats.abGpuFaceCount = ab.gpuFaceCount;
+    m_b13aStats.abGpuUniqueFaceCount = ab.gpuUniqueFaceCount;
+    m_b13aStats.abMissingCpuFaces = ab.missingCpuFaces;
+    m_b13aStats.abExtraGpuFaces = ab.extraGpuFaces;
+    m_b13aStats.abMultiplicityMismatches = ab.multiplicityMismatches;
+    m_b13aStats.abOverflow = ab.overflow;
+
+    // Use ab.cpuFaceCount (a captured value), NOT cpuFaces.size() - cpuFaces aliases
+    // slot.tile.cpuReferenceFaces which was just cleared by `slot.tile = {}` above.
+    spdlog::info(
+        "B13A_VERIFY abVerifyCount={} match={} containSubset={} gpuTopFaces={} "
+        "cpuMeshFaces={} extraGpuFaces={} missingCpuFaces={} multiplicityMismatches={} "
+        "gpuStatus={}",
+        m_b13aAbVerifyCount, ab.match ? 1 : 0,
+        (ab.extraGpuFaces == 0u && gpuStatus == 0u) ? 1 : 0,
+        gpuFaceCount, ab.cpuFaceCount,
+        ab.extraGpuFaces, ab.missingCpuFaces, ab.multiplicityMismatches, gpuStatus);
     return true;
 }
 

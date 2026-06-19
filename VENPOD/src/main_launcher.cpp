@@ -2978,11 +2978,23 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseMidMeshGpuExtractSmoke =
         sparseMidMeshGpuExtract &&
         ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_SMOKE", 0u) != 0u;
+    // Phase B1.3a: the FIRST real meshing increment - GPU TOP-FACE extraction for a
+    // controlled FLAT/SIMPLE tile (mergeCells==1, childMask==0, no edit footprint),
+    // A/B'd in CONTAINMENT mode against the CPU tile's meshCacheFaces (GPU-top must be a
+    // multiset-subset). Default 0 = zero cost. Requires VENPOD_MIDMESH_GPU_EXTRACT=1.
+    // Reuses the smoke compute side's ISOLATED queue/buffers (production untouched).
+    const bool sparseMidMeshGpuExtractB13a =
+        sparseMidMeshGpuExtract &&
+        ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_B13A", 0u) != 0u;
+    // The B1.3a top-face path reuses the smoke compute side (queue/fence/readback ring),
+    // so the smoke compute objects must be stood up whenever EITHER path is enabled.
+    const bool sparseMidMeshGpuExtractComputeSide =
+        sparseMidMeshGpuExtractSmoke || sparseMidMeshGpuExtractB13a;
     // Phase B1.3.0 GATED explicit readback WAIT. Default 0 = the readback ring polls
     // NON-BLOCKING (a frame or two behind the dispatch). Set to 1 ONLY for the isolated
     // correctness path (forces a same-cycle blocking compare); NEVER on for timing runs.
     const bool sparseMidMeshGpuExtractReadbackWait =
-        sparseMidMeshGpuExtractSmoke &&
+        sparseMidMeshGpuExtractComputeSide &&
         ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_READBACK_WAIT", 0u) != 0u;
     // PARALLEL pre-extraction of cache-miss tiles (only meaningful on the primed-dirty
     // incremental path). DEFAULT ON: the build re-extracts every cache-miss tile across
@@ -3454,17 +3466,30 @@ int RunSandbox(int argc, char* argv[]) {
                         static_cast<double>(extractStats.sampleBufferBytes) / (1024.0 * 1024.0),
                         static_cast<double>(extractStats.metadataBufferBytes) / 1024.0,
                         static_cast<double>(extractStats.uploadRingSlotBytes) / (1024.0 * 1024.0));
-                    // Phase B1.2 SMOKE: stand up the compute side (isolated debug face
-                    // buffer + smoke PSO). Only when the SMOKE sub-toggle is set.
-                    if (sparseMidMeshGpuExtractSmoke && extractResult) {
+                    // Phase B1.2 SMOKE / B1.3a TOP-FACE: stand up the compute side (isolated
+                    // debug face buffer + readback ring + smoke PSO). The same isolated
+                    // infrastructure backs both paths, so initialize it when EITHER is set;
+                    // pass b13aEnabled so the debug face buffer + ring are sized for a full
+                    // top-face tile. B1.3a then compiles its own top-face PSO on top.
+                    if (sparseMidMeshGpuExtractComputeSide && extractResult) {
                         auto smokeInit = midMeshGpuExtractResources.InitializeSmoke(
                             device->GetDevice(),
                             renderer->GetShaderCompiler(),
                             shaderPath,
-                            sparseMidMeshGpuExtractReadbackWait);
+                            sparseMidMeshGpuExtractReadbackWait,
+                            sparseMidMeshGpuExtractB13a);
                         if (!smokeInit) {
-                            spdlog::error("Mid-mesh GPU extract SMOKE (B1.2) init failed: {}",
+                            spdlog::error("Mid-mesh GPU extract compute side init failed: {}",
                                 smokeInit.error());
+                        } else if (sparseMidMeshGpuExtractB13a) {
+                            auto b13aInit = midMeshGpuExtractResources.InitializeB13aTopFace(
+                                device->GetDevice(),
+                                renderer->GetShaderCompiler(),
+                                shaderPath);
+                            if (!b13aInit) {
+                                spdlog::error("Mid-mesh GPU extract B1.3a top-face init failed: {}",
+                                    b13aInit.error());
+                            }
                         }
                     }
                 }
@@ -16895,6 +16920,47 @@ int RunSandbox(int argc, char* argv[]) {
                         // this compiled out - it is pure validation.
                         midMeshGpuExtractResources.PollSmokeReadback(
                             commandQueue->GetLastCompletedFenceValue());
+                    }
+
+                    // ===== Phase B1.3a: REAL top-face extraction (containment-proven) =====
+                    // Pick a FLAT/SIMPLE fixture (mergeCells==1, childMask==0, no edit
+                    // footprint), dispatch the GPU top-face CS for it, capture the tile's
+                    // FULL CPU meshCacheFaces (read-only accessor) as the ground truth, and
+                    // (delayed) A/B in CONTAINMENT mode: GPU-top MUST be a multiset-subset of
+                    // the CPU mesh (extraGpuFaces==0). ISOLATED debug output; the CPU path is
+                    // untouched and still owns all visible geometry.
+                    if (sparseMidMeshGpuExtractB13a &&
+                        midMeshGpuExtractResources.B13aReady() &&
+                        !gpuExtractTiles.empty()) {
+                        const uint32_t fixtureIdx =
+                            MidMeshGpuExtractResources::SelectB13aFixture(
+                                gpuExtractTiles,
+                                [&](uint32_t slot) {
+                                    return sparseClipmapTileCache
+                                        .MidMeshTileHasEditFootprintBySlot(slot);
+                                });
+                        if (fixtureIdx != UINT32_MAX) {
+                            const auto& fixture = gpuExtractTiles[fixtureIdx];
+                            // READ-ONLY: the tile's persistent CPU reference mesh (the exact
+                            // faces extractTileMesh left). Never re-extracts, never mutates.
+                            std::vector<Simulation::SparseSurfaceFace> cpuRefFaces;
+                            uint32_t refMergeCells = 0u, refChildMask = 0u;
+                            uint64_t refContentVersion = 0u;
+                            const bool haveRef =
+                                sparseClipmapTileCache.GetMidMeshTileCacheFacesBySlot(
+                                    fixture.slot, cpuRefFaces, &refMergeCells, &refChildMask,
+                                    &refContentVersion);
+                            // Only proceed if the cache reflects the SAME flat/simple state
+                            // the fixture selection assumed (mergeCells==1, childMask==0) and
+                            // the same content serial (no in-flight change).
+                            if (haveRef && refMergeCells == 1u && refChildMask == 0u &&
+                                refContentVersion == fixture.meshContentVersion) {
+                                midMeshGpuExtractResources.RunB13aTopFaceDispatch(
+                                    device->GetDevice(), fixture, cpuRefFaces,
+                                    sparseMidMeshTerraceStep, fixture.meshContentVersion);
+                                midMeshGpuExtractResources.PollB13aReadback();
+                            }
+                        }
                     }
                 }
                 (void)midMeshDirtyUpload;

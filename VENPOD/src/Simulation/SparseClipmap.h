@@ -706,6 +706,25 @@ public:
     // Total resident mid-mesh tiles currently tracked (occupied tile slots). Used by
     // the GPU-extract instrumentation to prove dirty-scaling (uploadTiles << this).
     uint32_t MidMeshTrackedTileCount() const;
+    // Phase B1.3a A/B (DEBUG / READ-ONLY): copy the persistent CPU reference mesh for
+    // ONE resident tile slot - exactly the faces `extractTileMesh` left in
+    // `meshCacheFaces`. The GPU top-face extraction A/Bs against this as the ground
+    // truth (containment: GPU top faces must be a multiset-subset of these). This is a
+    // pure read of cached output - it NEVER re-extracts and NEVER mutates the CPU path
+    // (the production algorithm is untouched). Also reports the LOD/child state the
+    // tile was cached under so the caller can pick flat/simple fixtures
+    // (mergeCells==1, childMask==0). Returns false if the slot is not resident.
+    bool GetMidMeshTileCacheFacesBySlot(
+        uint32_t slot,
+        std::vector<SparseSurfaceFace>& outFaces,
+        uint32_t* outMergeCells = nullptr,
+        uint32_t* outChildMask = nullptr,
+        uint64_t* outContentVersion = nullptr) const;
+    // Phase B1.3a fixture check (DEBUG / READ-ONLY): true iff any brush edit footprint
+    // overlaps this tile's XZ extent. A B1.3a fixture must have NO edit footprint, since
+    // the CPU `extractTileMesh` suppresses edited cells (the GPU would then emit a top
+    // face the CPU dropped -> a false containment extra). Pure read of edit overlays.
+    bool MidMeshTileHasEditFootprintBySlot(uint32_t slot) const;
     void SetEditStore(const SparseEditStore* edits);
     void SetFarSvoFallbackMetadata(const SparseClipmapFarSvoFallbackMetadata& metadata);
     // sinceRevision: only overlays touched after this global edit revision are

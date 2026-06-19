@@ -7871,6 +7871,85 @@ uint32_t SparseClipmapTileCache::CollectMidMeshGpuExtractDirtyTiles(
     return appended;
 }
 
+bool SparseClipmapTileCache::GetMidMeshTileCacheFacesBySlot(
+    uint32_t slot,
+    std::vector<SparseSurfaceFace>& outFaces,
+    uint32_t* outMergeCells,
+    uint32_t* outChildMask,
+    uint64_t* outContentVersion) const
+{
+    // Phase B1.3a A/B reference: a pure READ of the tile's persistent meshCacheFaces -
+    // the exact output extractTileMesh left for this tile. No re-extraction, no mutation.
+    outFaces.clear();
+    if (slot >= m_tiles.size()) {
+        return false;
+    }
+    const TilePayload& tile = m_tiles[slot];
+    if (tile.record.slot == UINT32_MAX || !tile.meshCacheValid) {
+        return false;
+    }
+    outFaces = tile.meshCacheFaces;  // copy (read-only snapshot for the comparison)
+    if (outMergeCells) {
+        *outMergeCells = tile.meshCacheMergeCells;
+    }
+    if (outChildMask) {
+        *outChildMask = tile.meshCacheChildMask;
+    }
+    if (outContentVersion) {
+        *outContentVersion = tile.meshCacheContentVersion;
+    }
+    return true;
+}
+
+bool SparseClipmapTileCache::MidMeshTileHasEditFootprintBySlot(uint32_t slot) const {
+    // Phase B1.3a fixture check: does any edited brick's XZ footprint overlap this tile?
+    // Pure read of the edit overlays (mirrors the build's editXzBoxes intersection rule).
+    if (slot >= m_tiles.size() || m_edits == nullptr || m_edits->EditedBrickCount() == 0u) {
+        return false;
+    }
+    const TilePayload& tile = m_tiles[slot];
+    if (tile.record.slot == UINT32_MAX || tile.record.cellSize <= 0.0f) {
+        return false;
+    }
+    const uint32_t side = m_config.tileSampleSide;
+    const uint32_t cellCount = side >= 2u ? side - 1u : 0u;
+    const int32_t cell = std::max(1, RoundToInt32Clamped(tile.record.cellSize));
+    const int64_t tileSpan = static_cast<int64_t>(cell) * static_cast<int64_t>(cellCount);
+    const int32_t tileMinX = tile.record.originX;
+    const int32_t tileMinZ = tile.record.originZ;
+    const int32_t tileMaxX =
+        SaturatingAddInt32(tile.record.originX, static_cast<int32_t>(tileSpan));
+    const int32_t tileMaxZ =
+        SaturatingAddInt32(tile.record.originZ, static_cast<int32_t>(tileSpan));
+    bool overlaps = false;
+    m_edits->ForEachOverlay([&](const BrickEditOverlay& overlay) {
+        if (overlaps || overlay.voxels.empty()) {
+            return;
+        }
+        uint8_t minLocalX = SPARSE_BRICK_SIZE - 1u, minLocalZ = SPARSE_BRICK_SIZE - 1u;
+        uint8_t maxLocalX = 0u, maxLocalZ = 0u;
+        for (const auto& [localIndex, packedVoxel] : overlay.voxels) {
+            (void)packedVoxel;
+            const LocalVoxelCoord local = LocalVoxelFromIndex(localIndex);
+            minLocalX = std::min(minLocalX, local.x);
+            maxLocalX = std::max(maxLocalX, local.x);
+            minLocalZ = std::min(minLocalZ, local.z);
+            maxLocalZ = std::max(maxLocalZ, local.z);
+        }
+        int32_t bMinX = 0, bMinZ = 0, bMaxX = 0, bMaxZ = 0;
+        if (TryWorldVoxelFromBrickLocal(overlay.coord.x, minLocalX, &bMinX) &&
+            TryWorldVoxelFromBrickLocal(overlay.coord.z, minLocalZ, &bMinZ) &&
+            TryWorldVoxelFromBrickLocal(overlay.coord.x, maxLocalX, &bMaxX) &&
+            TryWorldVoxelFromBrickLocal(overlay.coord.z, maxLocalZ, &bMaxZ)) {
+            if (bMinX <= tileMaxX && bMaxX >= tileMinX &&
+                bMinZ <= tileMaxZ && bMaxZ >= tileMinZ) {
+                overlaps = true;
+            }
+        }
+    });
+    return overlaps;
+}
+
 void SparseClipmapTileCache::ClearHeightDirtyRange() {
     m_dirtyHeightStartSlot = UINT32_MAX;
     m_dirtyHeightEndSlot = 0;
