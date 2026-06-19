@@ -140,7 +140,12 @@ static const uint kSparseExtentMask   = 0x1Fu;
 static const uint kSparseVoxelMask    = 0x0007FFFFu;
 
 // Direction values mirror SparseFaceDirection (NegX=0..PosZ=5). PosY (top) = 3.
+static const uint kSparseDirNegX = 0u;
+static const uint kSparseDirPosX = 1u;
+static const uint kSparseDirNegY = 2u;
 static const uint kSparseDirPosY = 3u;
+static const uint kSparseDirNegZ = 4u;
+static const uint kSparseDirPosZ = 5u;
 
 uint MidMeshPackPayload(uint direction, uint voxel, uint width, uint height) {
     uint packedWidth  = ((width  > 0u) ? (width  - 1u) : 0u) & kSparseExtentMask;

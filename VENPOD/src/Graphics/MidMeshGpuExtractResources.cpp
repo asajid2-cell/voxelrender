@@ -1021,7 +1021,8 @@ Result<void> MidMeshGpuExtractResources::InitializeB13aTopFace(
     }
 
     // Top-face PSO. Root layout MUST match CS_MidMeshExtractTopFaces.hlsl:
-    //   b0: 4x 32-bit constants {tileSlot, debugBaseFace, faceCapacityPerTile, terraceStep}
+    //   b0: 5x 32-bit constants {tileSlot, debugBaseFace, faceCapacityPerTile,
+    //       terraceStep, emitRisers}  (emitRisers: 0 = B1.3a top only, 1 = B1.3b + risers)
     //   t0: samples (root SRV)   u0: debug faces (root UAV)   u1: metadata (root UAV)
     const std::filesystem::path csPath =
         shaderPath / "Compute" / "CS_MidMeshExtractTopFaces.hlsl";
@@ -1033,7 +1034,7 @@ Result<void> MidMeshGpuExtractResources::InitializeB13aTopFace(
     ComputePipelineDesc desc;
     desc.computeShader = compileResult.value();
     desc.debugName = "CS_MidMeshExtractTopFaces";
-    desc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 4 }); // b0
+    desc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 5 }); // b0
     desc.rootParams.push_back({ RootParamType::ShaderResource, 0, 0, 1 }); // t0 samples
     desc.rootParams.push_back({ RootParamType::UnorderedAccess, 0, 0, 1 }); // u0 faces
     desc.rootParams.push_back({ RootParamType::UnorderedAccess, 1, 0, 1 }); // u1 metadata
@@ -1076,12 +1077,91 @@ uint32_t MidMeshGpuExtractResources::SelectB13aFixture(
     return UINT32_MAX;
 }
 
+uint32_t MidMeshGpuExtractResources::SelectB13bFixture(
+    const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
+    const std::function<bool(uint32_t)>& hasEditFootprint,
+    uint32_t sampleSide,
+    uint32_t terraceStep)
+{
+    if (sampleSide < 2u) {
+        return UINT32_MAX;
+    }
+    const uint32_t side = sampleSide;
+    const int32_t step = std::max(1, static_cast<int32_t>(terraceStep));
+
+    // Mirror the shared HLSLI decode/quantize exactly so the scan agrees with the GPU.
+    auto decodeMaterial = [](uint32_t sample) -> uint32_t {
+        return (sample >> 16u) & 0xFFu;
+    };
+    auto isSolid = [](uint32_t material) -> bool {
+        return material != 0u /*Air*/ && material != 2u /*Water*/;
+    };
+    auto floorDiv = [](int32_t a, int32_t b) -> int32_t {
+        int32_t q = a / b;
+        int32_t r = a - q * b;
+        if (r != 0 && ((r < 0) != (b < 0))) {
+            q -= 1;
+        }
+        return q;
+    };
+    auto quantY = [&](uint32_t sample) -> int32_t {
+        const int32_t y = static_cast<int32_t>(sample & 0xFFFFu) -
+            static_cast<int32_t>(MidMeshSampleHeightBias);
+        return floorDiv(y, step) * step;
+    };
+
+    for (uint32_t i = 0; i < dirtyTiles.size(); ++i) {
+        const auto& t = dirtyTiles[i];
+        if (t.slot == UINT32_MAX || t.samples == nullptr || t.sampleCount == 0u) {
+            continue;
+        }
+        if (t.mergeCells != 1u || t.childMask != 0u) {
+            continue;
+        }
+        if (hasEditFootprint && hasEditFootprint(t.slot)) {
+            continue;
+        }
+        if (t.sampleCount < static_cast<uint32_t>(side) * side) {
+            continue; // need the full grid for the neighbor scan
+        }
+        // STEPPED check: scan for two right/forward-adjacent solid cells with different
+        // quantized heights (the exact condition that makes the riser path emit). The cell
+        // grid is [0, side-1)^2; neighbor (cx+1,cz)/(cx,cz+1) is in-tile (cx+1 <= side-1).
+        const uint32_t cellsPerRow = side - 1u;
+        bool stepped = false;
+        for (uint32_t cz = 0; cz < cellsPerRow && !stepped; ++cz) {
+            for (uint32_t cx = 0; cx < cellsPerRow && !stepped; ++cx) {
+                const uint32_t s = t.samples[cz * side + cx];
+                if (!isSolid(decodeMaterial(s))) {
+                    continue;
+                }
+                const int32_t h = quantY(s);
+                const uint32_t sr = t.samples[cz * side + (cx + 1u)];
+                if (isSolid(decodeMaterial(sr)) && quantY(sr) != h) {
+                    stepped = true;
+                    break;
+                }
+                const uint32_t sf = t.samples[(cz + 1u) * side + cx];
+                if (isSolid(decodeMaterial(sf)) && quantY(sf) != h) {
+                    stepped = true;
+                    break;
+                }
+            }
+        }
+        if (stepped) {
+            return i;
+        }
+    }
+    return UINT32_MAX;
+}
+
 bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     ID3D12Device* device,
     const Simulation::MidMeshGpuExtractDirtyTile& fixture,
     const std::vector<Simulation::SparseSurfaceFace>& cpuReferenceFaces,
     uint32_t terraceStep,
-    uint64_t currentTileVersionForSlot)
+    uint64_t currentTileVersionForSlot,
+    bool emitRisers)
 {
     if (!m_b13aReady || !device) {
         return false;
@@ -1101,6 +1181,7 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     SmokeControlledTile ctl;
     ctl.valid = true;
     ctl.b13aTopFace = true;
+    ctl.emitRisers = emitRisers; // B1.3b: poll labels b13b + the riser path was active
     ctl.slot = 0u;       // the dedicated smoke buffers always use slot 0 / baseFace 0
     ctl.baseFace = 0u;
     ctl.version = fixture.meshContentVersion;
@@ -1179,10 +1260,11 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     m_smokeFaceBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     m_topFacePipeline.Bind(list);
-    const uint32_t consts[4] = {
-        ctl.slot, ctl.baseFace, m_topFaceCapacityPerTile, m_b13aBuildTerraceStep
+    const uint32_t consts[5] = {
+        ctl.slot, ctl.baseFace, m_topFaceCapacityPerTile, m_b13aBuildTerraceStep,
+        emitRisers ? 1u : 0u
     };
-    m_topFacePipeline.SetRoot32BitConstants(list, 0, 4, consts);
+    m_topFacePipeline.SetRoot32BitConstants(list, 0, 5, consts);
     list->SetComputeRootShaderResourceView(1, m_smokeSampleBuffer.GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(2, m_smokeFaceBuffer.GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(3, m_smokeMetaBuffer.GetGPUVirtualAddress());
@@ -1271,6 +1353,7 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     const bool keepVerified = m_b13aStats.verified;
     m_b13aStats = {};
     m_b13aStats.dispatched = true;
+    m_b13aStats.emitRisers = emitRisers;
     m_b13aStats.tileSlot = fixture.slot;        // report the REAL cache slot (fixture)
     m_b13aStats.fixtureMergeCells = fixture.mergeCells;
     m_b13aStats.fixtureChildMask = fixture.childMask;
@@ -1285,9 +1368,10 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     m_b13aStats.verifyCount = keepVerifyCount;
 
     spdlog::info(
-        "GPU_EXTRACT_B13A fixtureSlot={} mergeCells={} childMask={} cpuRefFaces={} "
+        "GPU_EXTRACT_B13A mode={} fixtureSlot={} mergeCells={} childMask={} cpuRefFaces={} "
         "dispatchGpuUs={:.2f} barrierGpuUs={:.2f} cpuSubmitUs={:.2f} commitGate={} "
         "dispatchedVersion={} currentVersion={}",
+        emitRisers ? "b13b" : "b13a",
         fixture.slot, fixture.mergeCells, fixture.childMask,
         m_b13aStats.cpuRefFaceCount, dispatchUs, barrierUs, cpuSubmitUs,
         stale ? "DISCARD_STALE" : "PASS",
@@ -1336,20 +1420,33 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
         gpuFaces.assign(faces, faces + emitted);
     }
 
+    // B1.3b: a GPU RISER is any emitted face whose packed direction is not PosY (the top).
+    // Count them so the gate can require riser faces > 0 (the increment really added risers).
+    const bool emitRisers = slot.tile.emitRisers;
+    uint32_t gpuRiserFaces = 0u;
+    for (const auto& f : gpuFaces) {
+        if (Simulation::SparseSurfacePayloadDirection(f.payload) !=
+            static_cast<uint32_t>(Simulation::SparseFaceDirection::PosY)) {
+            ++gpuRiserFaces;
+        }
+    }
+
     // The CPU reference = this dispatch's captured FULL meshCacheFaces (tops + risers +
-    // skirts). CONTAINMENT: every GPU top face must appear in the CPU mesh with >= its
-    // multiplicity, and extraGpuFaces MUST be 0 (a GPU face absent from the CPU mesh is a
-    // bug). missingCpuFaces is EXPECTED (the CPU has risers/skirts the GPU does not emit).
+    // skirts). CONTAINMENT: every GPU face (top + B1.3b risers) must appear in the CPU mesh
+    // with >= its multiplicity, and extraGpuFaces MUST be 0 (a GPU face absent from the CPU
+    // mesh is a bug). missingCpuFaces is EXPECTED (the CPU still has border skirts / water /
+    // LOD the GPU does not emit) but is SMALLER than B1.3a once risers are covered.
     const std::vector<Simulation::SparseSurfaceFace>& cpuFaces = slot.tile.cpuReferenceFaces;
     const MidMeshFaceAbResult ab = CompareMidMeshFacesMultiset(
         gpuFaces, cpuFaces, MidMeshFaceAbMode::Containment, gpuStatus, 8u);
-    LogMidMeshFaceAbResult("b13a", ab);
+    LogMidMeshFaceAbResult(emitRisers ? "b13b" : "b13a", ab);
 
     slot.pending = false;
     slot.tile = {};
     m_smokeReadbackReadSlot = (m_smokeReadbackReadSlot + 1u) % kSmokeReadbackSlots;
 
     ++m_b13aAbVerifyCount;
+    m_b13aStats.emitRisers = emitRisers;
     m_b13aStats.gpuFaceCount = gpuFaceCount;
     m_b13aStats.gpuStatusOverflow = gpuStatus;
     m_b13aStats.verified = true;
@@ -1365,13 +1462,15 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
 
     // Use ab.cpuFaceCount (a captured value), NOT cpuFaces.size() - cpuFaces aliases
     // slot.tile.cpuReferenceFaces which was just cleared by `slot.tile = {}` above.
+    // gpuRiserFaces > 0 is part of the B1.3b gate (the increment really added risers).
     spdlog::info(
-        "B13A_VERIFY abVerifyCount={} match={} containSubset={} gpuTopFaces={} "
-        "cpuMeshFaces={} extraGpuFaces={} missingCpuFaces={} multiplicityMismatches={} "
-        "gpuStatus={}",
+        "B13A_VERIFY mode={} abVerifyCount={} match={} containSubset={} gpuFaces={} "
+        "gpuRiserFaces={} cpuMeshFaces={} extraGpuFaces={} missingCpuFaces={} "
+        "multiplicityMismatches={} gpuStatus={}",
+        emitRisers ? "b13b" : "b13a",
         m_b13aAbVerifyCount, ab.match ? 1 : 0,
         (ab.extraGpuFaces == 0u && gpuStatus == 0u) ? 1 : 0,
-        gpuFaceCount, ab.cpuFaceCount,
+        gpuFaceCount, gpuRiserFaces, ab.cpuFaceCount,
         ab.extraGpuFaces, ab.missingCpuFaces, ab.multiplicityMismatches, gpuStatus);
     return true;
 }

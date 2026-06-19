@@ -1,13 +1,23 @@
 // =============================================================================
-// VENPOD GPU mid-mesh extraction - Phase B1.3a: TOP FACES (containment-proven).
+// VENPOD GPU mid-mesh extraction - Phase B1.3a TOP FACES + B1.3b RISERS
+//                                  (containment-proven).
 // =============================================================================
-// The FIRST real meshing increment. For a controlled FLAT/SIMPLE tile
-// (mergeCells==1, childMask==0, no edit footprint) this emits the CPU's TOP faces
-// (direction = PosY) and NOTHING else (no risers, no skirts) - so the GPU output is
-// a multiset-SUBSET of the CPU tile's meshCacheFaces. Proven by MidMeshFaceAbCompare
-// in CONTAINMENT mode: every GPU top face must appear in the CPU mesh; extraGpuFaces
-// must be 0. This is ISOLATED debug output - production geometry + the draw path are
-// untouched.
+// B1.3a (gEmitRisers==0): for a controlled FLAT/SIMPLE tile (mergeCells==1,
+// childMask==0, no edit footprint) this emits the CPU's TOP faces (direction = PosY)
+// and NOTHING else - so the GPU output is a multiset-SUBSET of the CPU tile's
+// meshCacheFaces.
+//
+// B1.3b (gEmitRisers==1): EXTENDS the same path to ALSO emit the CPU's RISER side
+// faces - the vertical quads filling the height gap between a cell and its right/
+// forward neighbor (TILE-INTERIOR addressing only; halo/border skirts are B1.3c).
+// Ported byte-for-byte from extractTileMesh's right/forward-neighbor riser blocks +
+// emitRiser (24u segment slicing for tall risers) + addRiser (the -1 boundary shift)
+// + addFace (the 32-unit split chunking). The GPU set is still proven a multiset-
+// SUBSET of the CPU mesh by MidMeshFaceAbCompare in CONTAINMENT mode (extraGpuFaces
+// MUST be 0); the CPU keeps MORE (border skirts, child-suppression, water, LOD) so
+// missingCpuFaces stays > 0 but SMALLER than B1.3a (risers are now covered).
+//
+// This is ISOLATED debug output - production geometry + the draw path are untouched.
 //
 // PARITY with the CPU extractTileMesh (mergeCells==1 path), all from the shared
 // MidMeshExtractCommon.hlsli machinery:
@@ -15,32 +25,173 @@
 //   * aggregateSamples(x,z,x+1,z+1) for mergeCells==1 is the SINGLE sample (cx,cz).
 //   * SOLID cell -> top quad: world (cellWorldX, quantize(decodeY), cellWorldZ),
 //     width = height = cellSize, direction = PosY, voxel = PackVoxel(material, ...).
+//   * RIGHT/FORWARD neighbor (cx+1,cz)/(cx,cz+1) is a real IN-TILE sample for every
+//     interior cell in the mergeCells==1 path (cx+1,cz+1 in [1,cellCount]=side-1), so
+//     NO halo is needed; the height gap to a present neighbor emits a riser.
 //   * WATER / all-AIR footprints are NOT emitted here (their emission depends on the
-//     emitWater + sea-level fill path); deferring them keeps GPU-top a strict subset.
+//     emitWater + sea-level fill path); deferring them keeps the GPU set a strict subset.
+//     The riser neighbor-presence test mirrors this: only SOLID neighbors are "present"
+//     here, so a riser against a water/air neighbor is deferred too (a smaller subset).
 //   * per-block distance/frustum cull is camera-dependent and NOT replicated; the
 //     fixture is chosen near-camera + the A/B is containment, so a culled CPU cell only
 //     ever makes the GPU a smaller subset (never an extra). If a culled cell DID make
 //     the GPU emit an extra, the containment compare surfaces it (it is not hidden).
 //
 // Append model: a per-tile InterlockedAdd counter (TileMeta[slot].faceCount) hands
-// each eligible cell a dense write slot inside the reserved range. Overflow past
+// each emitted sub-face a dense write slot inside the reserved range. Overflow past
 // gFaceCapacityPerTile sets statusOverflow and the face is not written (the A/B
 // harness fails a non-zero overflow, so a truncated result is never trusted).
 // =============================================================================
 
 #include "MidMeshExtractCommon.hlsli"
 
-// Root constants (b0): the B1.3a controls.
+// Root constants (b0): the B1.3a/b controls.
 cbuffer TopFaceConstants : register(b0) {
     uint gTileSlot;             // controlled tile slot (index into the metadata buffer)
     uint gDebugBaseFace;        // base of this tile's range in the DEBUG face buffer
     uint gFaceCapacityPerTile;  // per-tile debug-buffer capacity (overflow bound)
     uint gTerraceStep;          // terraceStep (build config) for height quantization
+    uint gEmitRisers;           // B1.3b: 0 = top faces only (B1.3a); 1 = + risers
 }
 
 StructuredBuffer<uint>                Samples    : register(t0); // per-tile sample grid
 RWStructuredBuffer<SparseSurfaceFace> DebugFaces : register(u0); // ISOLATED debug output
 RWStructuredBuffer<MidMeshTileMeta>   TileMeta   : register(u1); // metadata (faceCount UAV)
+
+// =============================================================================
+// APPEND ONE FACE - claims a dense slot from the per-tile counter, bounds-checks
+// against the reserved range, writes into the ISOLATED debug buffer. Overflow sets
+// the status flag and writes nothing (stay strictly inside the reserved range).
+// Returns true on success (or benign skip), false on overflow (caller may stop).
+// =============================================================================
+bool MidMeshAppendFace(uint slot, SparseSurfaceFace face) {
+    uint writeIndex;
+    InterlockedAdd(TileMeta[slot].faceCount, 1u, writeIndex);
+    if (writeIndex >= gFaceCapacityPerTile) {
+        TileMeta[slot].statusOverflow = 1u;
+        return false;
+    }
+    DebugFaces[gDebugBaseFace + writeIndex] = face;
+    return true;
+}
+
+// =============================================================================
+// addFace SPLIT-LIMIT chunking (CPU addFace, SparseClipmap.cpp). A quad wider/taller
+// than the 32-unit packed-extent limit is emitted as MULTIPLE sub-faces at offset
+// positions. The per-direction offset assignment MUST match the CPU switch exactly:
+//   NegX/PosX : worldY += hOff, worldZ += wOff   (X-facing risers)
+//   NegY/PosY : worldX += wOff, worldZ += hOff   (top/bottom quads)
+//   NegZ/PosZ : worldX += wOff, worldY += hOff   (Z-facing risers)
+// (worldX/worldY/worldZ here are the CPU addFace's base coords; for X-dirs worldX is
+// constant across chunks, for Z-dirs worldZ is constant - mirrors the CPU switch.)
+// =============================================================================
+bool MidMeshAddFace(uint slot, uint direction,
+                    int baseX, int baseY, int baseZ,
+                    uint width, uint height, uint voxel) {
+    if (width == 0u || height == 0u) {
+        return true;
+    }
+    const uint splitLimit = kSparseExtentMask + 1u; // 32
+    for (uint hOff = 0u; hOff < height; hOff += splitLimit) {
+        const uint hChunk = min(splitLimit, height - hOff);
+        for (uint wOff = 0u; wOff < width; wOff += splitLimit) {
+            const uint wChunk = min(splitLimit, width - wOff);
+
+            SparseSurfaceFace face;
+            face.worldX = baseX;
+            face.worldY = baseY;
+            face.worldZ = baseZ;
+            if (direction == kSparseDirNegX || direction == kSparseDirPosX) {
+                face.worldY = baseY + (int)hOff;
+                face.worldZ = baseZ + (int)wOff;
+            } else if (direction == kSparseDirNegY || direction == kSparseDirPosY) {
+                face.worldX = baseX + (int)wOff;
+                face.worldZ = baseZ + (int)hOff;
+            } else { // NegZ / PosZ
+                face.worldX = baseX + (int)wOff;
+                face.worldY = baseY + (int)hOff;
+            }
+            face.payload = MidMeshPackPayload(direction, voxel, wChunk, hChunk);
+            if (!MidMeshAppendFace(slot, face)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// =============================================================================
+// addRiser (CPU SparseClipmap.cpp): a PosX riser's face X is boundaryX-1; a PosZ
+// riser's face Z is boundaryZ-1 (the side quad sits one unit inside the high cell).
+// NegX/NegZ keep the boundary coord. Then it is a normal split-chunked addFace.
+// height==0 emits nothing (the CPU early-outs identically).
+// =============================================================================
+bool MidMeshAddRiser(uint slot, uint direction,
+                     int boundaryX, int boundaryZ, int lowTopY,
+                     uint span, uint height, uint voxel) {
+    if (height == 0u) {
+        return true;
+    }
+    int faceX = boundaryX;
+    int faceZ = boundaryZ;
+    if (direction == kSparseDirPosX) {
+        faceX = boundaryX - 1;
+    } else if (direction == kSparseDirPosZ) {
+        faceZ = boundaryZ - 1;
+    }
+    // addFace(direction, faceX, lowTopY, faceZ, span=width, height, voxel).
+    return MidMeshAddFace(slot, direction, faceX, lowTopY, faceZ, span, height, voxel);
+}
+
+// =============================================================================
+// emitRiser (CPU SparseClipmap.cpp CLIFF-RISER SLICING): short risers (<=32) emit a
+// single riser whose voxel is hashed at lowTopY+riserHeight. Tall risers slice into
+// 24u vertical segments, each hashed at its own segment top (segLowTopY+segHeight) so
+// the cliff reads as stratified rock. riserX/riserZ are the BOUNDARY coords (the
+// voxel hash uses them, NOT the addRiser -1 face coord - mirrors the CPU exactly).
+// =============================================================================
+bool MidMeshEmitRiser(uint slot, uint direction,
+                      int riserX, int riserZ, int lowTopY,
+                      uint span, uint riserHeight, uint riserMaterial) {
+    if (riserHeight <= 32u) {
+        const uint riserVoxel = MidMeshPackVoxel(
+            riserMaterial, riserX, lowTopY + (int)riserHeight, riserZ);
+        return MidMeshAddRiser(slot, direction, riserX, riserZ, lowTopY, span, riserHeight, riserVoxel);
+    }
+    uint emitted = 0u;
+    while (emitted < riserHeight) {
+        const uint segHeight = min(24u, riserHeight - emitted);
+        const int segLowTopY = lowTopY + (int)emitted;
+        const uint segVoxel = MidMeshPackVoxel(
+            riserMaterial, riserX, segLowTopY + (int)segHeight, riserZ);
+        if (!MidMeshAddRiser(slot, direction, riserX, riserZ, segLowTopY, span, segHeight, segVoxel)) {
+            return false;
+        }
+        emitted += segHeight;
+    }
+    return true;
+}
+
+// Decode one IN-TILE sample-cell into a present/solid SurfaceBlock for the
+// mergeCells==1 path: aggregateSamples(cx,cz,cx+1,cz+1) is the single sample (cx,cz).
+// Returns whether the cell is a SOLID block (the only "present" kind the GPU subset
+// emits here - water/air are deferred, matching the top-face eligibility) and fills
+// the quantized height + material.
+bool MidMeshSolidCellBlock(uint slot, uint stride, uint side, uint cx, uint cz,
+                           uint heightBias, uint terraceStep,
+                           out int outHeight, out uint outMaterial) {
+    outHeight = 0;
+    outMaterial = 0u;
+    const uint sampleIndex = MidMeshSampleIndex(slot, stride, side, cx, cz);
+    const uint sample = Samples[sampleIndex];
+    const uint material = MidMeshDecodeSampleMaterial(sample);
+    if (!MidMeshIsSolidMaterial(material)) {
+        return false;
+    }
+    outMaterial = material;
+    outHeight = MidMeshQuantizeY(MidMeshDecodeSampleY(sample, heightBias), terraceStep);
+    return true;
+}
 
 [numthreads(64, 1, 1)]
 void main(uint3 dispatchId : SV_DispatchThreadID) {
@@ -79,58 +230,90 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
 
     const uint cx = cell % cellsPerRow;
     const uint cz = cell / cellsPerRow;
-    const uint sampleIndex = MidMeshSampleIndex(slot, stride, side, cx, cz);
-    const uint sample = Samples[sampleIndex];
 
-    const uint material = MidMeshDecodeSampleMaterial(sample);
-    // B1.3a emits SOLID top faces only (subset-safe). Water / all-air emission is a
-    // later increment (it depends on emitWater + the sea-level fill rule).
-    if (!MidMeshIsSolidMaterial(material)) {
+    const int cellSizeInt = MidMeshCellSizeInt(meta.cellSizeBits);
+    const uint heightBias = meta.heightBias;
+    const uint terraceStep = gTerraceStep;
+
+    // ---- this cell's block (aggregateSamples(cx,cz,cx+1,cz+1) == sample (cx,cz)) ----
+    int height;
+    uint material;
+    if (!MidMeshSolidCellBlock(slot, stride, side, cx, cz, heightBias, terraceStep,
+                               height, material)) {
+        // B1.3a/b emit SOLID footprints only (subset-safe). Water / all-air emission is a
+        // later increment (it depends on emitWater + the sea-level fill rule). A non-solid
+        // cell also emits no risers toward its neighbors (matching the CPU subset deferral).
         return;
     }
 
-    const int cellSizeInt = MidMeshCellSizeInt(meta.cellSizeBits);
-    const int rawY = MidMeshDecodeSampleY(sample, meta.heightBias);
-    const int height = MidMeshQuantizeY(rawY, gTerraceStep);
     const int worldX = MidMeshCellWorldX(meta.originX, cx, cellSizeInt);
     const int worldZ = MidMeshCellWorldZ(meta.originZ, cz, cellSizeInt);
-
-    // voxel = PackMidHeightSurfaceVoxel(material, worldX, height, worldZ), then masked
-    // into the 19-bit payload field by MidMeshPackPayload (matches PackSparseSurfacePayload).
-    const uint voxel = MidMeshPackVoxel(material, worldX, height, worldZ);
     // width = depth = cellSize for a single-cell footprint (xEnd-x == 1 -> *cellSize).
     const uint width = (uint)cellSizeInt;
     const uint depth = (uint)cellSizeInt;
 
-    // addFace SPLIT-LIMIT chunking parity (CPU addFace, SparseClipmap.cpp): a top quad
-    // wider/deeper than the 32-unit packed-extent limit is emitted as MULTIPLE sub-faces
-    // at offset positions, NOT one big face. Replicate exactly so the GPU face(s) match the
-    // CPU's chunked faces 1:1. For PosY: worldX += wOff, worldZ += hOff; wChunk/hChunk are
-    // the per-sub-quad packed extents. For cellSize <= 32 this is a single face (no split).
-    const uint splitLimit = kSparseExtentMask + 1u; // 32
-    for (uint hOff = 0u; hOff < depth; hOff += splitLimit) {
-        const uint hChunk = min(splitLimit, depth - hOff);
-        for (uint wOff = 0u; wOff < width; wOff += splitLimit) {
-            const uint wChunk = min(splitLimit, width - wOff);
+    // ---- TOP FACE (B1.3a) ----
+    // voxel = PackMidHeightSurfaceVoxel(material, worldX, height, worldZ), then masked
+    // into the 19-bit payload field by MidMeshPackPayload (matches PackSparseSurfacePayload).
+    const uint voxel = MidMeshPackVoxel(material, worldX, height, worldZ);
+    // addFace SPLIT-LIMIT chunking parity: a top quad wider/deeper than 32u is emitted as
+    // MULTIPLE sub-faces. For PosY: worldX += wOff, worldZ += hOff. cellSize<=32 -> 1 face.
+    MidMeshAddFace(slot, kSparseDirPosY, worldX, height, worldZ, width, depth, voxel);
 
-            // Claim a dense slot in the reserved range via the per-tile counter.
-            uint writeIndex;
-            InterlockedAdd(TileMeta[slot].faceCount, 1u, writeIndex);
-            if (writeIndex >= gFaceCapacityPerTile) {
-                // Overflow: stay strictly inside the reserved per-tile range. Flag it and
-                // write nothing (the A/B harness fails on a non-zero status, so a truncated
-                // result is never trusted).
-                TileMeta[slot].statusOverflow = 1u;
-                continue;
-            }
+    // ---- RISERS (B1.3b) ----
+    // Only when enabled. INTERIOR addressing: the right (cx+1,cz) / forward (cx,cz+1)
+    // neighbor sample is in-tile for every interior cell of the mergeCells==1 path. The
+    // CPU's border SKIRTS (x==0 / xEnd>=cellCount etc.) are a SEPARATE path (B1.3c) and
+    // are NOT emitted here, so the GPU set stays a strict subset (skirts remain missing).
+    if (gEmitRisers == 0u) {
+        return;
+    }
 
-            SparseSurfaceFace face;
-            // PosY: the chunk offsets advance worldX (by wOff) and worldZ (by hOff).
-            face.worldX = worldX + (int)wOff;
-            face.worldY = height;
-            face.worldZ = worldZ + (int)hOff;
-            face.payload = MidMeshPackPayload(kSparseDirPosY, voxel, wChunk, hChunk);
-            DebugFaces[gDebugBaseFace + writeIndex] = face;
+    // RIGHT NEIGHBOR (cx+1, cz): rightBlock = aggregateSamples(xEnd,z,xEnd+1,zEnd) for
+    // mergeCells==1 == sample (cx+1,cz). Present-and-different-height -> riser between them.
+    if (cx + 1u < side) { // cx in [0,cellCount)=[0,side-1) so this is always true; guard anyway
+        int rHeight;
+        uint rMaterial;
+        if (MidMeshSolidCellBlock(slot, stride, side, cx + 1u, cz, heightBias, terraceStep,
+                                  rHeight, rMaterial) &&
+            height != rHeight) {
+            const int lowTopY = min(height, rHeight) + 1;
+            const uint riserHeight = (uint)abs(height - rHeight);
+            const bool currentHigher = (height > rHeight);
+            // boundary = (worldX + width, worldZ); span = depth; dir PosX if current higher.
+            MidMeshEmitRiser(
+                slot,
+                currentHigher ? kSparseDirPosX : kSparseDirNegX,
+                worldX + (int)width,
+                worldZ,
+                lowTopY,
+                depth,
+                riserHeight,
+                currentHigher ? material : rMaterial);
+        }
+    }
+
+    // FORWARD NEIGHBOR (cx, cz+1): forwardBlock = aggregateSamples(x,zEnd,xEnd,zEnd+1) for
+    // mergeCells==1 == sample (cx,cz+1). Present-and-different-height -> riser between them.
+    if (cz + 1u < side) {
+        int fHeight;
+        uint fMaterial;
+        if (MidMeshSolidCellBlock(slot, stride, side, cx, cz + 1u, heightBias, terraceStep,
+                                  fHeight, fMaterial) &&
+            height != fHeight) {
+            const int lowTopY = min(height, fHeight) + 1;
+            const uint riserHeight = (uint)abs(height - fHeight);
+            const bool currentHigher = (height > fHeight);
+            // boundary = (worldX, worldZ + depth); span = width; dir PosZ if current higher.
+            MidMeshEmitRiser(
+                slot,
+                currentHigher ? kSparseDirPosZ : kSparseDirNegZ,
+                worldX,
+                worldZ + (int)depth,
+                lowTopY,
+                width,
+                riserHeight,
+                currentHigher ? material : fMaterial);
         }
     }
 }

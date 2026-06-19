@@ -2986,10 +2986,22 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseMidMeshGpuExtractB13a =
         sparseMidMeshGpuExtract &&
         ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_B13A", 0u) != 0u;
-    // The B1.3a top-face path reuses the smoke compute side (queue/fence/readback ring),
-    // so the smoke compute objects must be stood up whenever EITHER path is enabled.
+    // Phase B1.3b: the SECOND meshing increment - GPU TOP-FACE + RISER extraction for a
+    // controlled STEPPED-but-simple tile (mergeCells==1, childMask==0, no edit footprint,
+    // real height variation so risers actually emit), still A/B'd in CONTAINMENT mode
+    // (GPU top+risers must be a multiset-subset of the CPU mesh; extraGpuFaces==0). Reuses
+    // the B1.3a top-face PSO with the gEmitRisers root constant set. Default 0. Implies the
+    // B1.3a compute/PSO path is stood up (it reuses the same top-face pipeline).
+    const bool sparseMidMeshGpuExtractB13b =
+        sparseMidMeshGpuExtract &&
+        ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_B13B", 0u) != 0u;
+    // The B1.3a/b top-face path reuses the smoke compute side (queue/fence/readback ring),
+    // so the smoke compute objects must be stood up whenever ANY path is enabled. B1.3b
+    // shares the B1.3a top-face PSO, so it also needs the B1.3a init to run.
+    const bool sparseMidMeshGpuExtractTopFacePath =
+        sparseMidMeshGpuExtractB13a || sparseMidMeshGpuExtractB13b;
     const bool sparseMidMeshGpuExtractComputeSide =
-        sparseMidMeshGpuExtractSmoke || sparseMidMeshGpuExtractB13a;
+        sparseMidMeshGpuExtractSmoke || sparseMidMeshGpuExtractTopFacePath;
     // Phase B1.3.0 GATED explicit readback WAIT. Default 0 = the readback ring polls
     // NON-BLOCKING (a frame or two behind the dispatch). Set to 1 ONLY for the isolated
     // correctness path (forces a same-cycle blocking compare); NEVER on for timing runs.
@@ -3477,17 +3489,18 @@ int RunSandbox(int argc, char* argv[]) {
                             renderer->GetShaderCompiler(),
                             shaderPath,
                             sparseMidMeshGpuExtractReadbackWait,
-                            sparseMidMeshGpuExtractB13a);
+                            sparseMidMeshGpuExtractTopFacePath);
                         if (!smokeInit) {
                             spdlog::error("Mid-mesh GPU extract compute side init failed: {}",
                                 smokeInit.error());
-                        } else if (sparseMidMeshGpuExtractB13a) {
+                        } else if (sparseMidMeshGpuExtractTopFacePath) {
+                            // B1.3a top-face + B1.3b riser share ONE PSO (gEmitRisers root const).
                             auto b13aInit = midMeshGpuExtractResources.InitializeB13aTopFace(
                                 device->GetDevice(),
                                 renderer->GetShaderCompiler(),
                                 shaderPath);
                             if (!b13aInit) {
-                                spdlog::error("Mid-mesh GPU extract B1.3a top-face init failed: {}",
+                                spdlog::error("Mid-mesh GPU extract B1.3a/b top-face init failed: {}",
                                     b13aInit.error());
                             }
                         }
@@ -16922,23 +16935,31 @@ int RunSandbox(int argc, char* argv[]) {
                             commandQueue->GetLastCompletedFenceValue());
                     }
 
-                    // ===== Phase B1.3a: REAL top-face extraction (containment-proven) =====
-                    // Pick a FLAT/SIMPLE fixture (mergeCells==1, childMask==0, no edit
-                    // footprint), dispatch the GPU top-face CS for it, capture the tile's
-                    // FULL CPU meshCacheFaces (read-only accessor) as the ground truth, and
-                    // (delayed) A/B in CONTAINMENT mode: GPU-top MUST be a multiset-subset of
-                    // the CPU mesh (extraGpuFaces==0). ISOLATED debug output; the CPU path is
-                    // untouched and still owns all visible geometry.
-                    if (sparseMidMeshGpuExtractB13a &&
+                    // ===== Phase B1.3a / B1.3b: REAL top-face (+ riser) extraction =====
+                    // B1.3a: pick a FLAT/SIMPLE fixture (mergeCells==1, childMask==0, no edit
+                    // footprint) and emit GPU TOP faces only. B1.3b: pick a STEPPED-but-simple
+                    // fixture (same constraints + real height variation) and emit TOP + RISER
+                    // faces (interior neighbor risers; border skirts deferred to B1.3c). In
+                    // both cases capture the tile's FULL CPU meshCacheFaces (read-only) as the
+                    // ground truth and (delayed) A/B in CONTAINMENT mode: the GPU set MUST be a
+                    // multiset-subset of the CPU mesh (extraGpuFaces==0). ISOLATED debug output;
+                    // the CPU path is untouched and still owns all visible geometry. When B1.3b
+                    // is enabled it takes precedence (it is the superset increment); otherwise
+                    // B1.3a runs. Both reuse the same top-face PSO (gEmitRisers root constant).
+                    if (sparseMidMeshGpuExtractTopFacePath &&
                         midMeshGpuExtractResources.B13aReady() &&
                         !gpuExtractTiles.empty()) {
-                        const uint32_t fixtureIdx =
-                            MidMeshGpuExtractResources::SelectB13aFixture(
-                                gpuExtractTiles,
-                                [&](uint32_t slot) {
-                                    return sparseClipmapTileCache
-                                        .MidMeshTileHasEditFootprintBySlot(slot);
-                                });
+                        const bool emitRisers = sparseMidMeshGpuExtractB13b;
+                        const auto editFootprintFn = [&](uint32_t slot) {
+                            return sparseClipmapTileCache
+                                .MidMeshTileHasEditFootprintBySlot(slot);
+                        };
+                        const uint32_t fixtureIdx = emitRisers
+                            ? MidMeshGpuExtractResources::SelectB13bFixture(
+                                  gpuExtractTiles, editFootprintFn,
+                                  sparseClipmapConfig.tileSampleSide, sparseMidMeshTerraceStep)
+                            : MidMeshGpuExtractResources::SelectB13aFixture(
+                                  gpuExtractTiles, editFootprintFn);
                         if (fixtureIdx != UINT32_MAX) {
                             const auto& fixture = gpuExtractTiles[fixtureIdx];
                             // READ-ONLY: the tile's persistent CPU reference mesh (the exact
@@ -16957,7 +16978,8 @@ int RunSandbox(int argc, char* argv[]) {
                                 refContentVersion == fixture.meshContentVersion) {
                                 midMeshGpuExtractResources.RunB13aTopFaceDispatch(
                                     device->GetDevice(), fixture, cpuRefFaces,
-                                    sparseMidMeshTerraceStep, fixture.meshContentVersion);
+                                    sparseMidMeshTerraceStep, fixture.meshContentVersion,
+                                    emitRisers);
                                 midMeshGpuExtractResources.PollB13aReadback();
                             }
                         }

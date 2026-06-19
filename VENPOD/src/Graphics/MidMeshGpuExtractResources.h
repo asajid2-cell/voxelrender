@@ -119,11 +119,13 @@ struct MidMeshGpuExtractConfig {
     // CS writes only the first smokeMaxCells top quads (<= this capacity).
     uint32_t smokeFaceCapacityPerTile = 256u;
     uint32_t smokeMaxCells = 16u;   // K: top quads the smoke shader writes per tile
-    // B1.3a TOP-FACE: per-tile reserved capacity for the REAL top-face extraction. A
-    // tile emits up to cellCount^2 solid top faces ((side-1)^2 ~= 1024 for side=33),
-    // each possibly split into a few sub-faces for cellSize > 32. 4096 covers the
-    // worst flat tile with headroom; overflow sets the status flag (a rejected result).
-    uint32_t topFaceCapacityPerTile = 4096u;
+    // B1.3a/b TOP-FACE (+ RISER): per-tile reserved capacity for the REAL extraction. A
+    // tile emits up to cellCount^2 solid top faces ((side-1)^2 ~= 1024 for side=33), each
+    // possibly split for cellSize > 32, PLUS (B1.3b) up to ~2 risers per cell, each sliced
+    // into 24u vertical segments + 32u chunks on a tall cliff. A stepped tile was measured
+    // at ~4628+ faces (overflowing the old 4096), so size for the worst stepped tile with
+    // headroom; overflow still sets the status flag (a rejected result, never an OOB write).
+    uint32_t topFaceCapacityPerTile = 16384u;
 };
 
 struct MidMeshGpuExtractStats {
@@ -183,7 +185,8 @@ struct MidMeshGpuExtractSmokeStats {
 // CONTAINMENT A/B against the CPU tile's meshCacheFaces (the ground-truth mesh).
 // -----------------------------------------------------------------------------
 struct MidMeshGpuExtractB13aStats {
-    bool dispatched = false;        // a B1.3a top-face dispatch ran this frame
+    bool dispatched = false;        // a B1.3a/b top-face dispatch ran this frame
+    bool emitRisers = false;        // B1.3b: this dispatch also emitted neighbor risers
     uint32_t tileSlot = UINT32_MAX; // controlled (flat/simple) fixture slot
     uint32_t fixtureMergeCells = 0; // the fixture's mergeCells (must be 1)
     uint32_t fixtureChildMask = 0;  // the fixture's childMask (must be 0)
@@ -339,6 +342,19 @@ public:
         const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
         const std::function<bool(uint32_t /*slot*/)>& hasEditFootprint);
 
+    // B1.3b fixture: the SAME flat/simple constraints as SelectB13aFixture (mergeCells==1,
+    // childMask==0, no edit footprint) PLUS real STEPPED height variation - at least two
+    // adjacent in-tile sample-cells that are both SOLID with DIFFERENT quantized heights, so
+    // the riser path actually emits (otherwise a perfectly flat tile yields zero risers and
+    // the "riser faces > 0" gate could never be met on it). `sampleSide` / `terraceStep`
+    // mirror the build so the height-variation scan matches the GPU's quantization. Returns
+    // the picked tile's index in `dirtyTiles`, or UINT32_MAX if none qualifies.
+    static uint32_t SelectB13bFixture(
+        const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
+        const std::function<bool(uint32_t /*slot*/)>& hasEditFootprint,
+        uint32_t sampleSide,
+        uint32_t terraceStep);
+
     // Run ONE top-face extraction for the picked fixture tile. Uploads the tile's
     // samples+metadata (faceCount zeroed) into the dedicated smoke buffers, dispatches
     // CS_MidMeshExtractTopFaces over the tile's cell grid (each eligible solid cell
@@ -347,12 +363,18 @@ public:
     // passed in by the caller via the read-only accessor) so PollB13aReadback can A/B
     // against it. Runs on the isolated smoke queue + fence (production untouched).
     // Returns true if a dispatch was issued.
+    // `emitRisers` (B1.3b): when true the dispatch also emits the CPU's right/forward
+    // neighbor RISER side faces (tile-interior addressing; border skirts deferred to
+    // B1.3c). The containment A/B then proves GPU(top+risers) is still a multiset-subset
+    // of the CPU mesh; only the AB_VERIFY label changes (b13a -> b13b). false = B1.3a
+    // top-faces only (unchanged behaviour).
     bool RunB13aTopFaceDispatch(
         ID3D12Device* device,
         const Simulation::MidMeshGpuExtractDirtyTile& fixture,
         const std::vector<Simulation::SparseSurfaceFace>& cpuReferenceFaces,
         uint32_t terraceStep,
-        uint64_t currentTileVersionForSlot);
+        uint64_t currentTileVersionForSlot,
+        bool emitRisers = false);
 
     // Delayed, DEBUG-ONLY containment A/B via the fence-tracked ring (same FIFO/ring as
     // the smoke poll, non-blocking by default). Reads the GPU top faces + status for the
@@ -383,6 +405,7 @@ private:
         // against the CPU's FULL meshCacheFaces (captured below), not the deterministic
         // smoke pattern. When set, the poll uses cpuReferenceFaces + Containment.
         bool b13aTopFace = false;
+        bool emitRisers = false; // B1.3b: this dispatch also emitted neighbor risers
         std::vector<Simulation::SparseSurfaceFace> cpuReferenceFaces; // tile meshCacheFaces
     };
 
