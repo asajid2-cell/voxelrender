@@ -182,4 +182,42 @@ uint MidMeshSampleIndex(uint slot, uint stride, uint side, uint cx, uint cz) {
     return slot * (stride * side) + (cz * stride + cx);
 }
 
+// =============================================================================
+// EDIT-FOOTPRINT BOX (B1.3e) - mirrors extractTileMesh's internal `EditXzBox`
+// (SparseClipmap.cpp). WORLD-VOXEL coordinates; 4x int32 = 16B, byte-identical to
+// the C++ MidMeshEditXzBox the cache uploads.
+// =============================================================================
+struct MidMeshEditBox {
+    int minX;
+    int minZ;
+    int maxX;
+    int maxZ;
+};
+
+// =============================================================================
+// cellInEditFootprint (B1.3e) - mirrors SparseClipmap.cpp byte-for-byte:
+//   for (const EditXzBox& b : editXzBoxes)
+//       if (b.minX <= x1 && b.maxX >= x0 && b.minZ <= z1 && b.maxZ >= z0) return true;
+// The cell's world box is (x0,z0)=(cellWorldX(x),cellWorldZ(z)) and
+// (x1,z1)=(cellWorldX(xEnd),cellWorldZ(zEnd)). For mergeCells==1, xEnd=x+1 so the
+// cell box is [worldX, worldX+cellSize] x [worldZ, worldZ+cellSize] (INCLUSIVE of
+// the next cell's start corner - the same width=cellSize the CPU passes). The
+// overlap test uses INCLUSIVE bounds on BOTH sides (a standard AABB overlap). A
+// cell that overlaps ANY edit box is skipped WHOLE (no top, no riser, no skirt) so
+// the live voxel raymarch owns that area, identical to the CPU `continue`.
+// =============================================================================
+bool MidMeshCellInEditFootprint(
+    StructuredBuffer<MidMeshEditBox> editBoxes,
+    uint editBoxBase, uint editBoxCount,
+    int x0, int z0, int x1, int z1)
+{
+    for (uint i = 0u; i < editBoxCount; ++i) {
+        MidMeshEditBox b = editBoxes[editBoxBase + i];
+        if (b.minX <= x1 && b.maxX >= x0 && b.minZ <= z1 && b.maxZ >= z0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 #endif // VENPOD_MIDMESH_EXTRACT_COMMON_HLSLI

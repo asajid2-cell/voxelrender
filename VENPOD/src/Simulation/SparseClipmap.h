@@ -540,6 +540,19 @@ struct MidMeshGpuExtractDirtyTile {
     int32_t maxY = 0;
 };
 
+// Phase B1.3e (GPU edit-footprint suppression, READ-ONLY projection). One edited-cell
+// XZ box in WORLD-VOXEL coordinates - byte-identical to the CPU build's internal
+// `EditXzBox` (SparseClipmap.cpp extractTileMesh). The GPU mirrors the CPU's
+// `cellInEditFootprint` overlap test (inclusive bounds) against these to SKIP an
+// edited cell, so the live voxel raymarch owns it. Pure read of the edit overlays;
+// the CPU edit path is NEVER mutated.
+struct MidMeshEditXzBox {
+    int32_t minX = 0;
+    int32_t minZ = 0;
+    int32_t maxX = 0;
+    int32_t maxZ = 0;
+};
+
 class SparseClipmapTileCache {
 public:
     ~SparseClipmapTileCache();
@@ -725,6 +738,17 @@ public:
     // the CPU `extractTileMesh` suppresses edited cells (the GPU would then emit a top
     // face the CPU dropped -> a false containment extra). Pure read of edit overlays.
     bool MidMeshTileHasEditFootprintBySlot(uint32_t slot) const;
+    // Phase B1.3e edit-footprint upload (DEBUG / READ-ONLY): collect the WORLD-VOXEL edit
+    // boxes whose XZ footprint overlaps this tile - the exact `editXzBoxes` the CPU build
+    // tests in `cellInEditFootprint` (same coordinate space, same inclusive overlap bounds).
+    // Appends at most `maxBoxes` boxes to `outBoxes` (capped to keep the per-tile GPU upload
+    // bounded); the RETURN value is the TOTAL overlapping box count (so the caller can detect
+    // a cap overflow when return > outBoxes.size()-startSize). Pure read of edit overlays - it
+    // NEVER mutates the CPU path. Returns 0 if the slot is not resident / no edits.
+    uint32_t MidMeshTileEditBoxesBySlot(
+        uint32_t slot,
+        std::vector<MidMeshEditXzBox>& outBoxes,
+        uint32_t maxBoxes) const;
     void SetEditStore(const SparseEditStore* edits);
     void SetFarSvoFallbackMetadata(const SparseClipmapFarSvoFallbackMetadata& metadata);
     // sinceRevision: only overlays touched after this global edit revision are

@@ -3018,12 +3018,26 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseMidMeshGpuExtractB13d =
         sparseMidMeshGpuExtract &&
         ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_B13D", 0u) != 0u;
-    // The B1.3a/b/c/d top-face path reuses the smoke compute side (queue/fence/readback ring),
-    // so the smoke compute objects must be stood up whenever ANY path is enabled. B1.3b/c/d
+    // Phase B1.3e: the FIFTH meshing increment - GPU TOP + RISER + SKIRT extraction WITH the
+    // CPU's EDIT-FOOTPRINT suppression (a cell whose world box overlaps a brush-edit box emits
+    // NOTHING, mirroring extractTileMesh's `cellInEditFootprint` skip; the live voxel raymarch
+    // owns the edited area). The fixture REQUIRES an EDITED tile (the edit footprint overlapped
+    // it); A/B is FULL EQUALITY against the CPU mesh (missingCpuFaces==0 AND extraGpuFaces==0).
+    // Like B1.3d, EQUALITY against the real CPU mesh is only sound with water + cull OFF, so this
+    // run REQUIRES VENPOD_SPARSE_MID_MESH_WATER=0 and VENPOD_SPARSE_MID_MESH_DISTANCE_CULL=0 (the
+    // only remaining difference is the edit skip). Reuses the B1.3a-d top-face PSO with the new
+    // gApplyEditSkip + gEditBoxBase/Count root consts + a per-tile edit-box buffer (t1). The
+    // edit-box upload is DIRTY-SCALED (only an edited fixture uploads boxes). Default 0.
+    const bool sparseMidMeshGpuExtractB13e =
+        sparseMidMeshGpuExtract &&
+        ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_B13E", 0u) != 0u;
+    // The B1.3a/b/c/d/e top-face path reuses the smoke compute side (queue/fence/readback ring),
+    // so the smoke compute objects must be stood up whenever ANY path is enabled. B1.3b/c/d/e
     // share the B1.3a top-face PSO, so they also need the B1.3a init to run.
     const bool sparseMidMeshGpuExtractTopFacePath =
         sparseMidMeshGpuExtractB13a || sparseMidMeshGpuExtractB13b ||
-        sparseMidMeshGpuExtractB13c || sparseMidMeshGpuExtractB13d;
+        sparseMidMeshGpuExtractB13c || sparseMidMeshGpuExtractB13d ||
+        sparseMidMeshGpuExtractB13e;
     const bool sparseMidMeshGpuExtractComputeSide =
         sparseMidMeshGpuExtractSmoke || sparseMidMeshGpuExtractTopFacePath;
     // Phase B1.3.0 GATED explicit readback WAIT. Default 0 = the readback ring polls
@@ -16975,30 +16989,68 @@ int RunSandbox(int argc, char* argv[]) {
                     if (sparseMidMeshGpuExtractTopFacePath &&
                         midMeshGpuExtractResources.B13aReady() &&
                         !gpuExtractTiles.empty()) {
-                        // B1.3d is the FIRST face-REMOVING increment (top+riser+skirt MINUS the
-                        // child-suppressed quadrants) and takes precedence; it implies risers +
-                        // skirts on (the b13c superset) plus the suppression. Else B1.3c (top +
-                        // risers + skirts); else B1.3b (top + risers); else B1.3a (top only).
+                        // B1.3e is the latest face-REMOVING increment (top+riser+skirt MINUS the
+                        // EDIT-FOOTPRINT cells) and takes precedence; it implies risers + skirts on
+                        // (the b13c superset) plus the edit skip. B1.3d is the prior face-REMOVING
+                        // increment (child-quadrant suppression). Else B1.3c/b/a.
+                        const bool wantEditSkip = sparseMidMeshGpuExtractB13e;
                         const bool wantSuppression = sparseMidMeshGpuExtractB13d;
-                        const bool emitSkirts = sparseMidMeshGpuExtractB13c || wantSuppression;
+                        const bool emitSkirts =
+                            sparseMidMeshGpuExtractB13c || wantSuppression || wantEditSkip;
                         const bool emitRisers = sparseMidMeshGpuExtractB13b || emitSkirts;
                         const auto editFootprintFn = [&](uint32_t slot) {
                             return sparseClipmapTileCache
                                 .MidMeshTileHasEditFootprintBySlot(slot);
                         };
 
-                        // B1.3d fixture selection:
-                        //   * PRIMARY = a childMask != 0 tile (SelectB13dFixture) -> suppression
-                        //     fires, A/B in EQUALITY mode (the suppression proof).
-                        //   * If none is dirty this build, FALL BACK to a childMask == 0 border
-                        //     tile (SelectB13cFixture) and run EQUALITY with the suppression code
-                        //     present-but-inactive -> proves the childMask==0 path is unchanged.
+                        // B1.3d/e fixture selection:
+                        //   * B1.3e PRIMARY = an EDITED tile (SelectB13eFixture) -> the edit skip
+                        //     fires, A/B in EQUALITY mode (the edit-suppression proof). FALL BACK to
+                        //     a non-edited childMask==0 tile (SelectB13cFixture) + EMPTY edit boxes ->
+                        //     EQUALITY proves the non-edited path stays equal (edit code inert).
+                        //   * B1.3d PRIMARY = a childMask != 0 tile (SelectB13dFixture) -> suppression
+                        //     fires, A/B in EQUALITY mode. FALL BACK to a childMask == 0 border tile.
                         // B1.3a/b/c keep their original childMask==0 fixtures + containment.
                         uint32_t fixtureIdx = UINT32_MAX;
                         bool applyChildSuppression = false; // active only on a childMask!=0 fixture
-                        bool equalityMode = false;          // B1.3d A/Bs in EQUALITY mode
+                        bool applyEditSkip = false;         // B1.3e: active on an edited fixture
+                        bool equalityMode = false;          // B1.3d/e A/Bs in EQUALITY mode
                         bool expectChildMaskNonZero = false; // gate: which childMask the cache must show
-                        if (wantSuppression) {
+                        std::vector<Simulation::MidMeshEditXzBox> editBoxes; // B1.3e fixture's boxes
+                        if (wantEditSkip) {
+                            equalityMode = true;
+                            applyEditSkip = true; // the edit-skip code path is ALWAYS on for B1.3e
+                            fixtureIdx = MidMeshGpuExtractResources::SelectB13eFixture(
+                                gpuExtractTiles, editFootprintFn,
+                                sparseClipmapConfig.tileSampleSide);
+                            if (fixtureIdx != UINT32_MAX) {
+                                // PRIMARY: an edited tile. Fetch its WORLD-VOXEL edit boxes (capped)
+                                // via the read-only accessor; the skip fires on those cells. The cap
+                                // matches the resources' editBoxCapacityPerTile (config default; not
+                                // env-overridden), so the accessor never over-fetches the GPU buffer.
+                                const uint32_t cap =
+                                    MidMeshGpuExtractConfig{}.editBoxCapacityPerTile;
+                                editBoxes.clear();
+                                const uint32_t totalBoxes =
+                                    sparseClipmapTileCache.MidMeshTileEditBoxesBySlot(
+                                        gpuExtractTiles[fixtureIdx].slot, editBoxes, cap);
+                                if (totalBoxes > cap) {
+                                    spdlog::warn(
+                                        "[GPU_EXTRACT_B13E] edited tile slot {} has {} edit boxes "
+                                        "> cap {}; SKIPPING this fixture (raise cap)",
+                                        gpuExtractTiles[fixtureIdx].slot, totalBoxes, cap);
+                                    fixtureIdx = UINT32_MAX; // do not run a truncated footprint
+                                }
+                            }
+                            if (fixtureIdx == UINT32_MAX) {
+                                // FALL BACK: non-edited childMask==0 tile, EMPTY edit boxes -> the
+                                // edit-skip code is present-but-inert, EQUALITY must still hold.
+                                editBoxes.clear();
+                                fixtureIdx = MidMeshGpuExtractResources::SelectB13cFixture(
+                                    gpuExtractTiles, editFootprintFn,
+                                    sparseClipmapConfig.tileSampleSide, sparseMidMeshTerraceStep);
+                            }
+                        } else if (wantSuppression) {
                             equalityMode = true;
                             fixtureIdx = MidMeshGpuExtractResources::SelectB13dFixture(
                                 gpuExtractTiles, editFootprintFn,
@@ -17050,7 +17102,8 @@ int RunSandbox(int argc, char* argv[]) {
                                 midMeshGpuExtractResources.RunB13aTopFaceDispatch(
                                     device->GetDevice(), fixture, cpuRefFaces,
                                     sparseMidMeshTerraceStep, fixture.meshContentVersion,
-                                    emitRisers, emitSkirts, applyChildSuppression, equalityMode);
+                                    emitRisers, emitSkirts, applyChildSuppression, equalityMode,
+                                    applyEditSkip, editBoxes);
                                 midMeshGpuExtractResources.PollB13aReadback();
                             }
                         }

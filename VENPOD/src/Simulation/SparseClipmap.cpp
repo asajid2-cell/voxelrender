@@ -7950,6 +7950,70 @@ bool SparseClipmapTileCache::MidMeshTileHasEditFootprintBySlot(uint32_t slot) co
     return overlaps;
 }
 
+uint32_t SparseClipmapTileCache::MidMeshTileEditBoxesBySlot(
+    uint32_t slot,
+    std::vector<MidMeshEditXzBox>& outBoxes,
+    uint32_t maxBoxes) const
+{
+    // Phase B1.3e: collect the WORLD-VOXEL edit boxes overlapping this tile - byte-identical
+    // to the `editXzBoxes` the build's `cellInEditFootprint` tests. Each box is the TIGHT XZ
+    // footprint of the ACTUAL edited voxels (min/max local), exactly as the build computes it
+    // (NOT the whole 16^3 brick), so the GPU's overlap test matches the CPU's. The boxes are
+    // NOT clipped to the tile (the CPU keeps full world coords too); we only UPLOAD the boxes
+    // that overlap this tile, so the per-tile list stays small + bounded. Pure read of the
+    // edit overlays - the CPU edit path is never mutated.
+    if (slot >= m_tiles.size() || m_edits == nullptr || m_edits->EditedBrickCount() == 0u) {
+        return 0u;
+    }
+    const TilePayload& tile = m_tiles[slot];
+    if (tile.record.slot == UINT32_MAX || tile.record.cellSize <= 0.0f) {
+        return 0u;
+    }
+    const uint32_t side = m_config.tileSampleSide;
+    const uint32_t cellCount = side >= 2u ? side - 1u : 0u;
+    const int32_t cell = std::max(1, RoundToInt32Clamped(tile.record.cellSize));
+    const int64_t tileSpan = static_cast<int64_t>(cell) * static_cast<int64_t>(cellCount);
+    const int32_t tileMinX = tile.record.originX;
+    const int32_t tileMinZ = tile.record.originZ;
+    const int32_t tileMaxX =
+        SaturatingAddInt32(tile.record.originX, static_cast<int32_t>(tileSpan));
+    const int32_t tileMaxZ =
+        SaturatingAddInt32(tile.record.originZ, static_cast<int32_t>(tileSpan));
+    uint32_t totalOverlapping = 0u;
+    m_edits->ForEachOverlay([&](const BrickEditOverlay& overlay) {
+        if (overlay.voxels.empty()) {
+            return;
+        }
+        // TIGHT footprint of the edited voxels (mirror of extractTileMesh's editXzBoxes).
+        uint8_t minLocalX = SPARSE_BRICK_SIZE - 1u, minLocalZ = SPARSE_BRICK_SIZE - 1u;
+        uint8_t maxLocalX = 0u, maxLocalZ = 0u;
+        for (const auto& [localIndex, packedVoxel] : overlay.voxels) {
+            (void)packedVoxel;
+            const LocalVoxelCoord local = LocalVoxelFromIndex(localIndex);
+            minLocalX = std::min(minLocalX, local.x);
+            maxLocalX = std::max(maxLocalX, local.x);
+            minLocalZ = std::min(minLocalZ, local.z);
+            maxLocalZ = std::max(maxLocalZ, local.z);
+        }
+        MidMeshEditXzBox box{};
+        if (TryWorldVoxelFromBrickLocal(overlay.coord.x, minLocalX, &box.minX) &&
+            TryWorldVoxelFromBrickLocal(overlay.coord.z, minLocalZ, &box.minZ) &&
+            TryWorldVoxelFromBrickLocal(overlay.coord.x, maxLocalX, &box.maxX) &&
+            TryWorldVoxelFromBrickLocal(overlay.coord.z, maxLocalZ, &box.maxZ)) {
+            // Only UPLOAD boxes that overlap this tile (inclusive bounds, same rule as
+            // cellInEditFootprint) - the per-tile list stays bounded.
+            if (box.minX <= tileMaxX && box.maxX >= tileMinX &&
+                box.minZ <= tileMaxZ && box.maxZ >= tileMinZ) {
+                ++totalOverlapping;
+                if (static_cast<uint32_t>(outBoxes.size()) < maxBoxes) {
+                    outBoxes.push_back(box);
+                }
+            }
+        }
+    });
+    return totalOverlapping;
+}
+
 void SparseClipmapTileCache::ClearHeightDirtyRange() {
     m_dirtyHeightStartSlot = UINT32_MAX;
     m_dirtyHeightEndSlot = 0;

@@ -16,6 +16,12 @@
 
 namespace VENPOD::Graphics {
 
+// B1.3e: the GPU edit-box (HLSL MidMeshEditBox) is 4x int32; the CPU MidMeshEditXzBox must
+// match byte-for-byte so the upload is a straight memcpy and the shader's overlap test reads
+// the same coords the CPU `cellInEditFootprint` would.
+static_assert(sizeof(Simulation::MidMeshEditXzBox) == 16u,
+    "MidMeshEditXzBox must be 4x int32 (16B) to match the HLSL MidMeshEditBox ABI");
+
 namespace {
 
 constexpr uint32_t kMaxUploadRingSlots = 3u;
@@ -149,6 +155,9 @@ void MidMeshGpuExtractResources::Shutdown() {
     m_smokeSampleBuffer.Shutdown();
     m_smokeMetaBuffer.Shutdown();
     m_smokeFaceBuffer.Shutdown();
+    m_editBoxBuffer.Shutdown();
+    m_editBoxUpload.Shutdown();
+    m_editBoxCapacityPerTile = 0;
     // B1.3.0 readback ring: unmap the persistent maps, then release the buffers.
     for (auto& slot : m_smokeReadbackRing) {
         if (slot.facePtr) {
@@ -453,6 +462,24 @@ Result<void> MidMeshGpuExtractResources::InitializeSmoke(
             sizeof(Simulation::SparseSurfaceFace),
             "MidMeshGpuExtractSmokeFaces"); !r) {
         return Error("InitializeSmoke - debug face buffer: {}", r.error());
+    }
+
+    // B1.3e EDIT-FOOTPRINT: dedicated per-tile edit-box buffer (SRV-read at t1) + its small
+    // upload stage. One tile's boxes at a time (slot 0), sized to editBoxCapacityPerTile.
+    // DIRTY-SCALED: only written when an EDITED fixture is dispatched (not every frame/tile).
+    m_editBoxCapacityPerTile = std::max(1u, m_config.editBoxCapacityPerTile);
+    const uint64_t editBoxBufferBytes =
+        static_cast<uint64_t>(m_editBoxCapacityPerTile) * sizeof(Simulation::MidMeshEditXzBox);
+    if (auto r = m_editBoxBuffer.Initialize(
+            device, editBoxBufferBytes,
+            BufferUsage::Default | BufferUsage::StructuredBuffer,
+            sizeof(Simulation::MidMeshEditXzBox), "MidMeshGpuExtractEditBoxes"); !r) {
+        return Error("InitializeSmoke - edit-box buffer: {}", r.error());
+    }
+    if (auto r = m_editBoxUpload.Initialize(
+            device, std::max<uint64_t>(editBoxBufferBytes, 256u),
+            "MidMeshGpuExtractEditBoxUpload"); !r) {
+        return Error("InitializeSmoke - edit-box upload: {}", r.error());
     }
 
     // B1.3.0 readback RING (debug-only verify path): kSmokeReadbackSlots slots, each
@@ -1159,14 +1186,18 @@ Result<void> MidMeshGpuExtractResources::InitializeB13aTopFace(
     }
 
     // Top-face PSO. Root layout MUST match CS_MidMeshExtractTopFaces.hlsl:
-    //   b0: 8x 32-bit constants {tileSlot, debugBaseFace, faceCapacityPerTile,
-    //       terraceStep, emitRisers, emitSkirts, seaLevelY, applyChildSuppression}
+    //   b0: 11x 32-bit constants {tileSlot, debugBaseFace, faceCapacityPerTile,
+    //       terraceStep, emitRisers, emitSkirts, seaLevelY, applyChildSuppression,
+    //       applyEditSkip, editBoxBase, editBoxCount}
     //       (emitRisers: 0 = B1.3a top only, 1 = B1.3b + risers;
     //        emitSkirts: 0 = no border skirts, 1 = B1.3c + tile-border skirts;
     //        seaLevelY: SEA_LEVEL_Y, passed so the GPU never hardcodes it;
     //        applyChildSuppression: 0 = B1.3a-c (no suppression), 1 = B1.3d child-quadrant
-    //        suppression - a cell whose quadrant has a resident finer child emits nothing)
+    //        suppression - a cell whose quadrant has a resident finer child emits nothing;
+    //        applyEditSkip: 0 = B1.3a-d, 1 = B1.3e edit-footprint skip - a cell inside the
+    //        tile's edit footprint emits nothing; editBoxBase/Count index this tile's boxes)
     //   t0: samples (root SRV)   u0: debug faces (root UAV)   u1: metadata (root UAV)
+    //   t1: edit boxes (root SRV; B1.3e)
     const std::filesystem::path csPath =
         shaderPath / "Compute" / "CS_MidMeshExtractTopFaces.hlsl";
     auto compileResult = shaderCompiler.CompileComputeShader(csPath, L"main", false);
@@ -1177,10 +1208,11 @@ Result<void> MidMeshGpuExtractResources::InitializeB13aTopFace(
     ComputePipelineDesc desc;
     desc.computeShader = compileResult.value();
     desc.debugName = "CS_MidMeshExtractTopFaces";
-    desc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 8 }); // b0
+    desc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 11 }); // b0
     desc.rootParams.push_back({ RootParamType::ShaderResource, 0, 0, 1 }); // t0 samples
     desc.rootParams.push_back({ RootParamType::UnorderedAccess, 0, 0, 1 }); // u0 faces
     desc.rootParams.push_back({ RootParamType::UnorderedAccess, 1, 0, 1 }); // u1 metadata
+    desc.rootParams.push_back({ RootParamType::ShaderResource, 1, 0, 1 }); // t1 edit boxes
     if (auto r = m_topFacePipeline.Initialize(device, desc); !r) {
         return Error("InitializeB13aTopFace - PSO init: {}", r.error());
     }
@@ -1390,6 +1422,43 @@ uint32_t MidMeshGpuExtractResources::SelectB13dFixture(
     return UINT32_MAX;
 }
 
+uint32_t MidMeshGpuExtractResources::SelectB13eFixture(
+    const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
+    const std::function<bool(uint32_t)>& hasEditFootprint,
+    uint32_t sampleSide)
+{
+    if (sampleSide < 2u) {
+        return UINT32_MAX;
+    }
+    const uint32_t side = sampleSide;
+    // B1.3e REQUIRES an EDITED tile (hasEditFootprint(slot) == TRUE) - the inverse of the
+    // earlier increments. To isolate the edit skip as the ONLY removed-face source, prefer
+    // mergeCells==1 (the only path the CS handles) AND childMask==0 (no child suppression in
+    // play, so the only difference vs the full CPU mesh is the edited cells). A full sample
+    // grid is needed for the cell scan/parity. No height scan is required - whether a cell is
+    // edited depends only on the edit boxes, not the heights.
+    if (!hasEditFootprint) {
+        return UINT32_MAX; // no way to know which tiles are edited
+    }
+    for (uint32_t i = 0; i < dirtyTiles.size(); ++i) {
+        const auto& t = dirtyTiles[i];
+        if (t.slot == UINT32_MAX || t.samples == nullptr || t.sampleCount == 0u) {
+            continue;
+        }
+        if (t.mergeCells != 1u || t.childMask != 0u) {
+            continue; // isolate the edit skip (no merge-block, no child suppression)
+        }
+        if (t.sampleCount < static_cast<uint32_t>(side) * side) {
+            continue;
+        }
+        if (!hasEditFootprint(t.slot)) {
+            continue; // REQUIRE an edit footprint (an edit overlapped this tile)
+        }
+        return i;
+    }
+    return UINT32_MAX;
+}
+
 bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     ID3D12Device* device,
     const Simulation::MidMeshGpuExtractDirtyTile& fixture,
@@ -1399,13 +1468,30 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     bool emitRisers,
     bool emitSkirts,
     bool applyChildSuppression,
-    bool equalityMode)
+    bool equalityMode,
+    bool applyEditSkip,
+    const std::vector<Simulation::MidMeshEditXzBox>& editBoxes)
 {
     if (!m_b13aReady || !device) {
         return false;
     }
     if (fixture.slot >= m_config.maxTiles || fixture.samples == nullptr ||
         fixture.sampleCount == 0u) {
+        return false;
+    }
+    // B1.3e: the edit-box list is capped at editBoxCapacityPerTile (the caller already caps
+    // its fetch). If somehow more arrived, REJECT the dispatch (report it) rather than upload
+    // a truncated footprint that would under-suppress and surface as a false extra. An empty
+    // list with applyEditSkip true is benign (no cell is inside an empty footprint).
+    const uint32_t editBoxCount = static_cast<uint32_t>(editBoxes.size());
+    const bool editBoxOverflow = (editBoxCount > m_editBoxCapacityPerTile);
+    if (applyEditSkip && editBoxOverflow) {
+        spdlog::warn(
+            "[GPU_EXTRACT_B13E] tile slot {} has {} edit boxes > capacity {}; dispatch SKIPPED "
+            "(raise editBoxCapacityPerTile)",
+            fixture.slot, editBoxCount, m_editBoxCapacityPerTile);
+        m_b13aStats.editBoxOverflow = 1u;
+        m_b13aStats.editBoxCount = editBoxCount;
         return false;
     }
     if (!m_smokeCmdAllocator || !m_smokeCmdList) {
@@ -1422,8 +1508,10 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     ctl.emitRisers = emitRisers; // B1.3b: poll labels b13b + the riser path was active
     ctl.emitSkirts = emitSkirts; // B1.3c: poll labels b13c + the skirt path was active
     ctl.applyChildSuppression = applyChildSuppression; // B1.3d: suppression was active
+    ctl.applyEditSkip = applyEditSkip; // B1.3e: edit-footprint suppression was active
     ctl.equalityMode = equalityMode; // B1.3d: poll A/Bs in EQUALITY mode
     ctl.childMask = fixture.childMask; // B1.3d: for the suppressed-cell count
+    ctl.editBoxes = editBoxes; // B1.3e: for the edit-skipped-cell count (poll mirror)
     ctl.slot = 0u;       // the dedicated smoke buffers always use slot 0 / baseFace 0
     ctl.baseFace = 0u;
     ctl.version = fixture.meshContentVersion;
@@ -1477,7 +1565,10 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
         meta.haloWidth = 0u;
         meta.heightPackDesc = PackMidMeshHeightDesc();
         meta.heightBias = MidMeshSampleHeightBias;
-        meta.editFootprintCount = 0u;
+        // B1.3e: record the per-tile edit-box count in the reserved metadata field (0 when
+        // not edit-skipping). Carried for diagnostics; the shader uses the gEditBoxCount
+        // root constant for the loop bound.
+        meta.editFootprintCount = applyEditSkip ? editBoxCount : 0u;
         meta.faceCapacity = m_topFaceCapacityPerTile;
         meta.baseFace = 0u;
         // faceCount is the per-tile append COUNTER: start at 0 so InterlockedAdd hands out
@@ -1499,6 +1590,24 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
         m_smokeMetaBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
 
+    // B1.3e: DIRTY-SCALED edit-box upload. ONLY when this is an edit-skip dispatch with at
+    // least one box (a non-edited dispatch leaves m_editBoxBuffer untouched -> zero extra
+    // upload, and the shader sees gEditBoxCount=0 so it never reads it). One tile's boxes.
+    uint64_t editBoxBytesUploaded = 0u;
+    if (applyEditSkip && editBoxCount > 0u) {
+        if (auto* mappedBoxes = static_cast<uint8_t*>(m_editBoxUpload.GetMappedData())) {
+            const uint64_t boxBytes =
+                static_cast<uint64_t>(editBoxCount) * sizeof(Simulation::MidMeshEditXzBox);
+            std::memcpy(mappedBoxes, editBoxes.data(), static_cast<size_t>(boxBytes));
+            m_editBoxBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyBufferRegion(
+                m_editBoxBuffer.GetResource(), 0, m_editBoxUpload.GetResource(), 0, boxBytes);
+            m_editBoxBuffer.TransitionTo(
+                list, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            editBoxBytesUploaded = boxBytes;
+        }
+    }
+
     m_smokeFaceBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     m_topFacePipeline.Bind(list);
@@ -1509,17 +1618,25 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     uint32_t seaLevelBits;
     const int32_t seaLevelY = Simulation::SEA_LEVEL_Y;
     std::memcpy(&seaLevelBits, &seaLevelY, sizeof(uint32_t));
-    const uint32_t consts[8] = {
+    // B1.3e: gEditBoxBase=0 (the dedicated edit-box buffer holds this ONE tile's boxes at
+    // base 0); gEditBoxCount=0 when not edit-skipping so the shader's edit loop never runs.
+    const uint32_t consts[11] = {
         ctl.slot, ctl.baseFace, m_topFaceCapacityPerTile, m_b13aBuildTerraceStep,
         emitRisers ? 1u : 0u,
         emitSkirts ? 1u : 0u,
         seaLevelBits,
-        applyChildSuppression ? 1u : 0u
+        applyChildSuppression ? 1u : 0u,
+        applyEditSkip ? 1u : 0u,
+        0u,                                       // gEditBoxBase
+        applyEditSkip ? editBoxCount : 0u         // gEditBoxCount
     };
-    m_topFacePipeline.SetRoot32BitConstants(list, 0, 8, consts);
+    m_topFacePipeline.SetRoot32BitConstants(list, 0, 11, consts);
     list->SetComputeRootShaderResourceView(1, m_smokeSampleBuffer.GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(2, m_smokeFaceBuffer.GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(3, m_smokeMetaBuffer.GetGPUVirtualAddress());
+    // B1.3e: t1 edit boxes (root index 4). Always bind a valid SRV address (even when
+    // gEditBoxCount==0 the binding must be valid); the buffer holds this tile's boxes.
+    list->SetComputeRootShaderResourceView(4, m_editBoxBuffer.GetGPUVirtualAddress());
 
     if (haveTimestamps) {
         list->EndQuery(m_smokeQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
@@ -1566,6 +1683,11 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     m_smokeFaceBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COMMON);
     m_smokeMetaBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COMMON);
     m_smokeSampleBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COMMON);
+    // B1.3e: restore the edit-box buffer to COMMON for the next dispatch (only if it was
+    // transitioned this dispatch).
+    if (editBoxBytesUploaded > 0u) {
+        m_editBoxBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COMMON);
+    }
 
     const auto cpuSubmitStart = std::chrono::steady_clock::now();
     list->Close();
@@ -1608,6 +1730,10 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     m_b13aStats.emitRisers = emitRisers;
     m_b13aStats.emitSkirts = emitSkirts;
     m_b13aStats.applyChildSuppression = applyChildSuppression;
+    m_b13aStats.applyEditSkip = applyEditSkip;
+    m_b13aStats.editBoxCount = applyEditSkip ? editBoxCount : 0u;
+    m_b13aStats.editBoxOverflow = 0u; // overflow already early-returned above
+    m_b13aStats.editBoxBytes = editBoxBytesUploaded;
     m_b13aStats.equalityMode = equalityMode;
     m_b13aStats.tileSlot = fixture.slot;        // report the REAL cache slot (fixture)
     m_b13aStats.fixtureMergeCells = fixture.mergeCells;
@@ -1622,19 +1748,22 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     m_b13aStats.verified = keepVerified;
     m_b13aStats.verifyCount = keepVerifyCount;
 
-    // Label: b13d if child suppression is on (the face-REMOVING increment), else b13c if
-    // skirts, else b13b if risers, else b13a (each a superset of the prior, except b13d
-    // which is the first to REMOVE faces vs the b13c superset).
-    const char* const modeLabel = applyChildSuppression
-        ? "b13d"
-        : (emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a"));
+    // Label: b13e if edit skip is on (this increment's face-REMOVING source), else b13d if
+    // child suppression, else b13c if skirts, else b13b if risers, else b13a (each a superset
+    // of the prior, except b13d/e which REMOVE faces vs the b13c superset).
+    const char* const modeLabel = applyEditSkip
+        ? "b13e"
+        : (applyChildSuppression
+               ? "b13d"
+               : (emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a")));
     spdlog::info(
         "GPU_EXTRACT_B13A mode={} abMode={} fixtureSlot={} mergeCells={} childMask={} cpuRefFaces={} "
-        "dispatchGpuUs={:.2f} barrierGpuUs={:.2f} cpuSubmitUs={:.2f} commitGate={} "
-        "dispatchedVersion={} currentVersion={}",
+        "editBoxes={} editBoxBytes={} dispatchGpuUs={:.2f} barrierGpuUs={:.2f} cpuSubmitUs={:.2f} "
+        "commitGate={} dispatchedVersion={} currentVersion={}",
         modeLabel, equalityMode ? "equal" : "contain",
         fixture.slot, fixture.mergeCells, fixture.childMask,
-        m_b13aStats.cpuRefFaceCount, dispatchUs, barrierUs, cpuSubmitUs,
+        m_b13aStats.cpuRefFaceCount, m_b13aStats.editBoxCount, m_b13aStats.editBoxBytes,
+        dispatchUs, barrierUs, cpuSubmitUs,
         stale ? "DISCARD_STALE" : "PASS",
         ctl.version, currentTileVersionForSlot);
     return true;
@@ -1686,6 +1815,7 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     const bool emitRisers = slot.tile.emitRisers;
     const bool emitSkirts = slot.tile.emitSkirts;
     const bool applyChildSuppression = slot.tile.applyChildSuppression;
+    const bool applyEditSkip = slot.tile.applyEditSkip;
     const bool equalityMode = slot.tile.equalityMode;
     uint32_t gpuRiserFaces = 0u;
     for (const auto& f : gpuFaces) {
@@ -1740,6 +1870,33 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
         }
     }
 
+    // B1.3e: COUNT the cells the GPU EDIT-SKIPPED (whole-cell skip) because their world box
+    // overlaps an edit box. Mirrors the shader's MidMeshCellInEditFootprint exactly (same
+    // world-box corners cellWorldX/Z(cx..cx+1), same inclusive AABB overlap). > 0 confirms the
+    // new B1.3e edit-skip path actually fired on this fixture. 0 when the edit skip is off or
+    // no box is uploaded.
+    uint32_t gpuEditSkippedCells = 0u;
+    const uint32_t editBoxCountForStats =
+        static_cast<uint32_t>(slot.tile.editBoxes.size()); // capture before slot.tile is cleared
+    if (applyEditSkip && !slot.tile.editBoxes.empty() && slot.tile.sampleSide > 1u) {
+        const uint32_t cellsPerRow = slot.tile.sampleSide - 1u;
+        const int32_t cellSizeInt = std::max(1, slot.tile.cellSizeInt);
+        for (uint32_t cz = 0u; cz < cellsPerRow; ++cz) {
+            const int32_t z0 = slot.tile.originZ + static_cast<int32_t>(cz) * cellSizeInt;
+            const int32_t z1 = slot.tile.originZ + static_cast<int32_t>(cz + 1u) * cellSizeInt;
+            for (uint32_t cx = 0u; cx < cellsPerRow; ++cx) {
+                const int32_t x0 = slot.tile.originX + static_cast<int32_t>(cx) * cellSizeInt;
+                const int32_t x1 = slot.tile.originX + static_cast<int32_t>(cx + 1u) * cellSizeInt;
+                for (const auto& b : slot.tile.editBoxes) {
+                    if (b.minX <= x1 && b.maxX >= x0 && b.minZ <= z1 && b.maxZ >= z0) {
+                        ++gpuEditSkippedCells;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     // The CPU reference = this dispatch's captured FULL meshCacheFaces. For B1.3a-c
     // (Containment): every GPU face must appear in the CPU mesh, extraGpuFaces==0;
     // missingCpuFaces is EXPECTED (CPU has water/LOD the GPU defers). For B1.3d
@@ -1752,10 +1909,13 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
         equalityMode ? MidMeshFaceAbMode::Equal : MidMeshFaceAbMode::Containment;
     const MidMeshFaceAbResult ab = CompareMidMeshFacesMultiset(
         gpuFaces, cpuFaces, abMode, gpuStatus, 8u);
-    // Label: b13d if child suppression was on (the face-REMOVING increment), else b13c/b/a.
-    const char* const modeLabel = applyChildSuppression
-        ? "b13d"
-        : (emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a"));
+    // Label: b13e if edit skip was on (this increment's face-REMOVING source), else b13d if
+    // child suppression, else b13c/b/a.
+    const char* const modeLabel = applyEditSkip
+        ? "b13e"
+        : (applyChildSuppression
+               ? "b13d"
+               : (emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a")));
     LogMidMeshFaceAbResult(modeLabel, ab);
 
     slot.pending = false;
@@ -1766,9 +1926,12 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     m_b13aStats.emitRisers = emitRisers;
     m_b13aStats.emitSkirts = emitSkirts;
     m_b13aStats.applyChildSuppression = applyChildSuppression;
+    m_b13aStats.applyEditSkip = applyEditSkip;
     m_b13aStats.equalityMode = equalityMode;
     m_b13aStats.gpuSkirtFaces = gpuSkirtFaces;
     m_b13aStats.gpuSuppressedCells = gpuSuppressedCells;
+    m_b13aStats.gpuEditSkippedCells = gpuEditSkippedCells;
+    m_b13aStats.editBoxCount = editBoxCountForStats;
     m_b13aStats.gpuFaceCount = gpuFaceCount;
     m_b13aStats.gpuStatusOverflow = gpuStatus;
     m_b13aStats.verified = true;
@@ -1789,14 +1952,16 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     // For EQUALITY mode the gate is missing==0 AND extra==0 (gpuFaces==cpuMeshFaces).
     spdlog::info(
         "B13A_VERIFY mode={} abMode={} abVerifyCount={} match={} equalityHeld={} containSubset={} "
-        "gpuFaces={} gpuRiserFaces={} gpuSkirtFaces={} gpuSuppressedCells={} cpuMeshFaces={} "
-        "extraGpuFaces={} missingCpuFaces={} multiplicityMismatches={} gpuStatus={}",
+        "gpuFaces={} gpuRiserFaces={} gpuSkirtFaces={} gpuSuppressedCells={} gpuEditSkippedCells={} "
+        "editBoxes={} cpuMeshFaces={} extraGpuFaces={} missingCpuFaces={} multiplicityMismatches={} "
+        "gpuStatus={}",
         modeLabel, equalityMode ? "equal" : "contain",
         m_b13aAbVerifyCount, ab.match ? 1 : 0,
         (equalityMode && ab.missingCpuFaces == 0u && ab.extraGpuFaces == 0u &&
          ab.multiplicityMismatches == 0u && gpuStatus == 0u) ? 1 : 0,
         (ab.extraGpuFaces == 0u && gpuStatus == 0u) ? 1 : 0,
-        gpuFaceCount, gpuRiserFaces, gpuSkirtFaces, gpuSuppressedCells, ab.cpuFaceCount,
+        gpuFaceCount, gpuRiserFaces, gpuSkirtFaces, gpuSuppressedCells, gpuEditSkippedCells,
+        editBoxCountForStats, ab.cpuFaceCount,
         ab.extraGpuFaces, ab.missingCpuFaces, ab.multiplicityMismatches, gpuStatus);
     return true;
 }

@@ -126,6 +126,11 @@ struct MidMeshGpuExtractConfig {
     // at ~4628+ faces (overflowing the old 4096), so size for the worst stepped tile with
     // headroom; overflow still sets the status flag (a rejected result, never an OOB write).
     uint32_t topFaceCapacityPerTile = 16384u;
+    // B1.3e EDIT-FOOTPRINT: per-tile cap on the number of edited-cell XZ boxes uploaded to
+    // the GPU. An edited tile in practice overlaps a handful of brush strokes; 256 is ample
+    // headroom. If a tile exceeds it the dispatch is SKIPPED + reported (never a partial/OOB
+    // upload), so a too-small cap surfaces as a logged overflow, not silent wrong geometry.
+    uint32_t editBoxCapacityPerTile = 256u;
 };
 
 struct MidMeshGpuExtractStats {
@@ -189,9 +194,14 @@ struct MidMeshGpuExtractB13aStats {
     bool emitRisers = false;        // B1.3b: this dispatch also emitted neighbor risers
     bool emitSkirts = false;        // B1.3c: this dispatch also emitted tile-border skirts
     bool applyChildSuppression = false; // B1.3d: child-quadrant suppression was active
+    bool applyEditSkip = false;     // B1.3e: edit-footprint suppression was active
     bool equalityMode = false;      // B1.3d: A/B ran in EQUALITY mode (not containment)
     uint32_t gpuSkirtFaces = 0;     // B1.3c: GPU faces that are border-skirt side quads
     uint32_t gpuSuppressedCells = 0;// B1.3d: cells the GPU skipped due to child suppression
+    uint32_t gpuEditSkippedCells = 0;// B1.3e: cells the GPU skipped due to the edit footprint
+    uint32_t editBoxCount = 0;      // B1.3e: edit boxes uploaded for this fixture
+    uint32_t editBoxOverflow = 0;   // B1.3e: 1 if the tile exceeded editBoxCapacityPerTile
+    uint64_t editBoxBytes = 0;      // B1.3e: edit-box bytes uploaded this dispatch
     uint32_t tileSlot = UINT32_MAX; // controlled (flat/simple) fixture slot
     uint32_t fixtureMergeCells = 0; // the fixture's mergeCells (must be 1)
     uint32_t fixtureChildMask = 0;  // the fixture's childMask (0 for B1.3a-c; !=0 for B1.3d)
@@ -387,6 +397,19 @@ public:
         const std::function<bool(uint32_t /*slot*/)>& hasEditFootprint,
         uint32_t sampleSide);
 
+    // B1.3e fixture: an EDITED tile - one the edit footprint overlapped (the predicate
+    // `hasEditFootprint(slot)` is TRUE). This INVERTS the earlier increments, which all
+    // REQUIRED no edit footprint. To isolate the edit skip as the only removed-face source,
+    // it prefers mergeCells==1 AND childMask==0 (so neither merge-blocking nor child
+    // suppression is in play - only the edit skip removes cells). Still a full sample grid.
+    // The CPU mesh for such a tile is { tops + risers + skirts } MINUS the edited cells, so
+    // GPU(top+riser+skirt+editSkip) can A/B EQUAL to it. Returns the picked tile's index, or
+    // UINT32_MAX. `hasEditFootprint` is the read-only edit-overlap predicate.
+    static uint32_t SelectB13eFixture(
+        const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
+        const std::function<bool(uint32_t /*slot*/)>& hasEditFootprint,
+        uint32_t sampleSide);
+
     // Run ONE top-face extraction for the picked fixture tile. Uploads the tile's
     // samples+metadata (faceCount zeroed) into the dedicated smoke buffers, dispatches
     // CS_MidMeshExtractTopFaces over the tile's cell grid (each eligible solid cell
@@ -409,6 +432,12 @@ public:
     // suppression increment proves FULL equality, since with suppression the GPU emits the
     // exact same set the CPU does (run with water+cull off so the only variable is the
     // suppression). Defaults false keep the B1.3a-c containment behavior unchanged.
+    // `applyEditSkip` (B1.3e): when true the shader skips cells inside the tile's edit
+    // footprint (whole-cell, mirroring the CPU `cellInEditFootprint`), and `editBoxes` carries
+    // the tile's WORLD-VOXEL edit boxes (from MidMeshTileEditBoxesBySlot) to upload + bind. An
+    // empty `editBoxes` with applyEditSkip true is inert (no cell is in an empty footprint).
+    // The poll then A/Bs in EQUALITY mode (run with water+cull off): the GPU emits the exact
+    // CPU set minus the edited cells, so missing==0 AND extra==0.
     bool RunB13aTopFaceDispatch(
         ID3D12Device* device,
         const Simulation::MidMeshGpuExtractDirtyTile& fixture,
@@ -418,7 +447,9 @@ public:
         bool emitRisers = false,
         bool emitSkirts = false,
         bool applyChildSuppression = false,
-        bool equalityMode = false);
+        bool equalityMode = false,
+        bool applyEditSkip = false,
+        const std::vector<Simulation::MidMeshEditXzBox>& editBoxes = {});
 
     // Delayed, DEBUG-ONLY containment A/B via the fence-tracked ring (same FIFO/ring as
     // the smoke poll, non-blocking by default). Reads the GPU top faces + status for the
@@ -452,8 +483,10 @@ private:
         bool emitRisers = false; // B1.3b: this dispatch also emitted neighbor risers
         bool emitSkirts = false; // B1.3c: this dispatch also emitted tile-border skirts
         bool applyChildSuppression = false; // B1.3d: child-quadrant suppression was active
+        bool applyEditSkip = false; // B1.3e: edit-footprint suppression was active
         bool equalityMode = false; // B1.3d: poll A/Bs in EQUALITY mode (not containment)
         uint32_t childMask = 0u; // B1.3d: the fixture's childMask (for suppressed-cell count)
+        std::vector<Simulation::MidMeshEditXzBox> editBoxes; // B1.3e: uploaded edit boxes (poll mirror)
         std::vector<Simulation::SparseSurfaceFace> cpuReferenceFaces; // tile meshCacheFaces
     };
 
@@ -517,6 +550,13 @@ private:
     GPUBuffer m_smokeSampleBuffer;   // one tile's samples (StructuredBuffer, SRV-read)
     GPUBuffer m_smokeMetaBuffer;     // one slot's metadata (RWStructuredBuffer, UAV)
     GPUBuffer m_smokeFaceBuffer;     // ISOLATED RWStructuredBuffer<SparseSurfaceFace> (UAV)
+    // B1.3e EDIT-FOOTPRINT: dedicated per-tile edit-box buffer (StructuredBuffer<MidMeshEditBox>,
+    // SRV-read at t1) + its own small upload stage. DIRTY-SCALED: written ONLY when an edited
+    // fixture is dispatched (not every tile / every frame); a non-edited dispatch leaves it
+    // untouched (gEditBoxCount=0 -> the shader never reads it). Sized to editBoxCapacityPerTile.
+    GPUBuffer m_editBoxBuffer;       // one tile's edit boxes (SRV-read at t1)
+    UploadBuffer m_editBoxUpload;    // one tile's edit-box stage
+    uint32_t m_editBoxCapacityPerTile = 0;
     // B1.3.0: fence-tracked, persistently-mapped readback RING (replaces B1.2's
     // single once-per-process readback). 3 slots so a dispatch's copy can be read
     // a frame or two later, after its fence is naturally satisfied - no per-frame

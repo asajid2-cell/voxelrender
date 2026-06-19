@@ -56,6 +56,10 @@ cbuffer TopFaceConstants : register(b0) {
     int  gSeaLevelY;            // B1.3c: SEA_LEVEL_Y (-48); mirrors the CPU compile-time const
     uint gApplyChildSuppression;// B1.3d: 0 = no child suppression (B1.3a-c); 1 = suppress
                                 //        cells whose quadrant has a resident finer child.
+    uint gApplyEditSkip;        // B1.3e: 0 = no edit skip (B1.3a-d); 1 = skip cells inside
+                                //        the tile's edit footprint (whole-cell, like the CPU).
+    uint gEditBoxBase;          // B1.3e: base index of this tile's edit boxes in EditBoxes.
+    uint gEditBoxCount;         // B1.3e: number of edit boxes for this tile (0 = none).
 }
 
 // =============================================================================
@@ -87,6 +91,7 @@ bool MidMeshCellSuppressedByChild(uint childMask, uint cellsPerRow, uint cx, uin
 }
 
 StructuredBuffer<uint>                Samples    : register(t0); // per-tile sample grid
+StructuredBuffer<MidMeshEditBox>      EditBoxes  : register(t1); // B1.3e: per-tile edit boxes
 RWStructuredBuffer<SparseSurfaceFace> DebugFaces : register(u0); // ISOLATED debug output
 RWStructuredBuffer<MidMeshTileMeta>   TileMeta   : register(u1); // metadata (faceCount UAV)
 
@@ -330,6 +335,29 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     const uint cx = cell % cellsPerRow;
     const uint cz = cell / cellsPerRow;
 
+    const int cellSizeIntEarly = MidMeshCellSizeInt(meta.cellSizeBits);
+
+    // ---- B1.3e EDIT-FOOTPRINT SUPPRESSION ----
+    // Mirrors the CPU's `cellInEditFootprint` `continue` at the VERY TOP of the
+    // footprint loop body - BEFORE aggregateSamples, the all-air fill, distance cull,
+    // child suppression, top, skirts, AND risers. A cell whose world box overlaps any
+    // edit box emits NOTHING, so the live voxel raymarch owns the carved/painted area
+    // (the legacy clean-edit invariant). The cell's world box is
+    // (cellWorldX(cx),cellWorldZ(cz)) .. (cellWorldX(cx+1),cellWorldZ(cz+1)) - for
+    // mergeCells==1, xEnd=cx+1 / zEnd=cz+1, so width=cellSize (INCLUSIVE of the next
+    // cell's start corner, matching the CPU box). When gApplyEditSkip==0 (B1.3a-d) this
+    // is inert; with no edit boxes (gEditBoxCount==0) it is a no-op too.
+    if (gApplyEditSkip != 0u && gEditBoxCount != 0u) {
+        const int editX0 = MidMeshCellWorldX(meta.originX, cx, cellSizeIntEarly);
+        const int editZ0 = MidMeshCellWorldZ(meta.originZ, cz, cellSizeIntEarly);
+        const int editX1 = MidMeshCellWorldX(meta.originX, cx + 1u, cellSizeIntEarly);
+        const int editZ1 = MidMeshCellWorldZ(meta.originZ, cz + 1u, cellSizeIntEarly);
+        if (MidMeshCellInEditFootprint(EditBoxes, gEditBoxBase, gEditBoxCount,
+                                       editX0, editZ0, editX1, editZ1)) {
+            return; // whole-cell skip (matches the CPU `continue`)
+        }
+    }
+
     // ---- B1.3d CHILD-QUADRANT SUPPRESSION ----
     // Mirrors the CPU's L7 finer-coverage suppression `continue` at the TOP of the
     // footprint loop: if this cell's quadrant has a resident finer child, the child
@@ -344,7 +372,7 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
         }
     }
 
-    const int cellSizeInt = MidMeshCellSizeInt(meta.cellSizeBits);
+    const int cellSizeInt = cellSizeIntEarly;
     const uint heightBias = meta.heightBias;
     const uint terraceStep = gTerraceStep;
 
