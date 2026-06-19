@@ -158,6 +158,9 @@ void MidMeshGpuExtractResources::Shutdown() {
     m_editBoxBuffer.Shutdown();
     m_editBoxUpload.Shutdown();
     m_editBoxCapacityPerTile = 0;
+    m_cullBlockBuffer.Shutdown();
+    m_cullBlockUpload.Shutdown();
+    m_cullBlockCapacityPerTile = 0;
     // B1.3.0 readback ring: unmap the persistent maps, then release the buffers.
     for (auto& slot : m_smokeReadbackRing) {
         if (slot.facePtr) {
@@ -480,6 +483,27 @@ Result<void> MidMeshGpuExtractResources::InitializeSmoke(
             device, std::max<uint64_t>(editBoxBufferBytes, 256u),
             "MidMeshGpuExtractEditBoxUpload"); !r) {
         return Error("InitializeSmoke - edit-box upload: {}", r.error());
+    }
+
+    // B1.3f-c CAMERA-DISTANCE CULL: dedicated per-tile per-BLOCK cull-flag buffer (SRV-read at
+    // t2) + its small upload stage. One tile's blocks at a time (slot 0). Worst case = one block
+    // per cell at mergeCells==1 -> (tileSampleSide-1)^2 blocks. One uint per block (1 = CPU
+    // culled). DIRTY-SCALED: only written when a distance-cull dispatch runs.
+    const uint32_t cellsPerAxis =
+        (m_config.tileSampleSide > 1u) ? (m_config.tileSampleSide - 1u) : 1u;
+    m_cullBlockCapacityPerTile = std::max(1u, cellsPerAxis * cellsPerAxis);
+    const uint64_t cullBlockBufferBytes =
+        static_cast<uint64_t>(m_cullBlockCapacityPerTile) * sizeof(uint32_t);
+    if (auto r = m_cullBlockBuffer.Initialize(
+            device, cullBlockBufferBytes,
+            BufferUsage::Default | BufferUsage::StructuredBuffer,
+            sizeof(uint32_t), "MidMeshGpuExtractCullBlocks"); !r) {
+        return Error("InitializeSmoke - cull-block buffer: {}", r.error());
+    }
+    if (auto r = m_cullBlockUpload.Initialize(
+            device, std::max<uint64_t>(cullBlockBufferBytes, 256u),
+            "MidMeshGpuExtractCullBlockUpload"); !r) {
+        return Error("InitializeSmoke - cull-block upload: {}", r.error());
     }
 
     // B1.3.0 readback RING (debug-only verify path): kSmokeReadbackSlots slots, each
@@ -1264,11 +1288,12 @@ Result<void> MidMeshGpuExtractResources::InitializeB13aTopFace(
     ComputePipelineDesc desc;
     desc.computeShader = compileResult.value();
     desc.debugName = "CS_MidMeshExtractTopFaces";
-    desc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 12 }); // b0 (B1.3f-b: +gEmitWater)
+    desc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 14 }); // b0 (B1.3f-c: +gApplyDistanceCull,+gCullBlockBase)
     desc.rootParams.push_back({ RootParamType::ShaderResource, 0, 0, 1 }); // t0 samples
     desc.rootParams.push_back({ RootParamType::UnorderedAccess, 0, 0, 1 }); // u0 faces
     desc.rootParams.push_back({ RootParamType::UnorderedAccess, 1, 0, 1 }); // u1 metadata
     desc.rootParams.push_back({ RootParamType::ShaderResource, 1, 0, 1 }); // t1 edit boxes
+    desc.rootParams.push_back({ RootParamType::ShaderResource, 2, 0, 1 }); // t2 cull-block mask (B1.3f-c)
     if (auto r = m_topFacePipeline.Initialize(device, desc); !r) {
         return Error("InitializeB13aTopFace - PSO init: {}", r.error());
     }
@@ -1614,7 +1639,9 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     bool equalityMode,
     bool applyEditSkip,
     const std::vector<Simulation::MidMeshEditXzBox>& editBoxes,
-    bool emitWater)
+    bool emitWater,
+    bool applyDistanceCull,
+    const std::vector<uint8_t>& cullBlockMask)
 {
     if (!m_b13aReady || !device) {
         return false;
@@ -1638,6 +1665,18 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
         m_b13aStats.editBoxCount = editBoxCount;
         return false;
     }
+    // B1.3f-c: the per-block cull mask is bounded by m_cullBlockCapacityPerTile (worst-case one
+    // block per cell). If a larger mask arrives (should never - the host sizes it to the same
+    // bound), REJECT the dispatch rather than upload a truncated mask that would under-cull and
+    // surface as a false extra. An empty mask with applyDistanceCull true is benign (no block
+    // flagged). A non-cull dispatch leaves the cull buffer untouched (gApplyDistanceCull=0).
+    const uint32_t cullBlockCount = static_cast<uint32_t>(cullBlockMask.size());
+    if (applyDistanceCull && cullBlockCount > m_cullBlockCapacityPerTile) {
+        spdlog::warn(
+            "[GPU_EXTRACT_B13FC] tile slot {} cull mask {} blocks > capacity {}; dispatch SKIPPED",
+            fixture.slot, cullBlockCount, m_cullBlockCapacityPerTile);
+        return false;
+    }
     if (!m_smokeCmdAllocator || !m_smokeCmdList) {
         spdlog::error("[GPU_EXTRACT_B13A] command objects missing");
         return false;
@@ -1654,6 +1693,14 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     ctl.applyChildSuppression = applyChildSuppression; // B1.3d: suppression was active
     ctl.applyEditSkip = applyEditSkip; // B1.3e: edit-footprint suppression was active
     ctl.emitWater = emitWater; // B1.3f-b: water-aware aggregation + all-air fill was active
+    ctl.applyDistanceCull = applyDistanceCull; // B1.3f-c: camera-distance cull (CPU mask) was active
+    // B1.3f-c: count the blocks the CPU mask flagged as culled (for the log + the "cull removed
+    // blocks" gate). 0 when the cull is off or no block was beyond the threshold.
+    {
+        uint32_t culled = 0u;
+        for (const uint8_t f : cullBlockMask) { culled += (f != 0u) ? 1u : 0u; }
+        ctl.culledBlocks = culled;
+    }
     ctl.equalityMode = equalityMode; // B1.3d: poll A/Bs in EQUALITY mode
     ctl.mergeCells = std::max(1u, fixture.mergeCells); // B1.3f-a: block span for the poll mirrors
     ctl.childMask = fixture.childMask; // B1.3d: for the suppressed-cell count
@@ -1754,6 +1801,27 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
         }
     }
 
+    // B1.3f-c: DIRTY-SCALED per-block cull-mask upload. ONLY when this is a distance-cull
+    // dispatch with >=1 block flag (a non-cull dispatch leaves m_cullBlockBuffer untouched ->
+    // zero extra upload, and the shader sees gApplyDistanceCull=0 so it never reads it). The
+    // host already packed the CPU's per-block verdict (1 = culled) into cullBlockMask, indexed by
+    // blockId = bz*blockCountPerAxis + bx. We widen each uint8 flag to uint32 for the StructuredBuffer.
+    uint64_t cullBlockBytesUploaded = 0u;
+    if (applyDistanceCull && cullBlockCount > 0u) {
+        if (auto* mappedCull = static_cast<uint32_t*>(m_cullBlockUpload.GetMappedData())) {
+            for (uint32_t i = 0u; i < cullBlockCount; ++i) {
+                mappedCull[i] = (cullBlockMask[i] != 0u) ? 1u : 0u;
+            }
+            const uint64_t cullBytes = static_cast<uint64_t>(cullBlockCount) * sizeof(uint32_t);
+            m_cullBlockBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COPY_DEST);
+            list->CopyBufferRegion(
+                m_cullBlockBuffer.GetResource(), 0, m_cullBlockUpload.GetResource(), 0, cullBytes);
+            m_cullBlockBuffer.TransitionTo(
+                list, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            cullBlockBytesUploaded = cullBytes;
+        }
+    }
+
     m_smokeFaceBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     m_topFacePipeline.Bind(list);
@@ -1767,7 +1835,10 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     // B1.3e: gEditBoxBase=0 (the dedicated edit-box buffer holds this ONE tile's boxes at
     // base 0); gEditBoxCount=0 when not edit-skipping so the shader's edit loop never runs.
     // B1.3f-b: gEmitWater gates the water-aware aggregation + all-air sea-level fill.
-    const uint32_t consts[12] = {
+    // B1.3f-c: gApplyDistanceCull gates the per-block cull skip; gCullBlockBase=0 (the dedicated
+    // cull buffer holds this ONE tile's per-block flags at base 0). gApplyDistanceCull=0 when not
+    // culling so the shader never reads CullBlockMask.
+    const uint32_t consts[14] = {
         ctl.slot, ctl.baseFace, m_topFaceCapacityPerTile, m_b13aBuildTerraceStep,
         emitRisers ? 1u : 0u,
         emitSkirts ? 1u : 0u,
@@ -1776,15 +1847,20 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
         applyEditSkip ? 1u : 0u,
         0u,                                       // gEditBoxBase
         applyEditSkip ? editBoxCount : 0u,        // gEditBoxCount
-        emitWater ? 1u : 0u                       // gEmitWater (B1.3f-b)
+        emitWater ? 1u : 0u,                      // gEmitWater (B1.3f-b)
+        applyDistanceCull ? 1u : 0u,              // gApplyDistanceCull (B1.3f-c)
+        0u                                        // gCullBlockBase (B1.3f-c)
     };
-    m_topFacePipeline.SetRoot32BitConstants(list, 0, 12, consts);
+    m_topFacePipeline.SetRoot32BitConstants(list, 0, 14, consts);
     list->SetComputeRootShaderResourceView(1, m_smokeSampleBuffer.GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(2, m_smokeFaceBuffer.GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(3, m_smokeMetaBuffer.GetGPUVirtualAddress());
     // B1.3e: t1 edit boxes (root index 4). Always bind a valid SRV address (even when
     // gEditBoxCount==0 the binding must be valid); the buffer holds this tile's boxes.
     list->SetComputeRootShaderResourceView(4, m_editBoxBuffer.GetGPUVirtualAddress());
+    // B1.3f-c: t2 cull-block mask (root index 5). Always bind a valid SRV address (even when
+    // gApplyDistanceCull==0 the binding must be valid); the buffer holds this tile's flags.
+    list->SetComputeRootShaderResourceView(5, m_cullBlockBuffer.GetGPUVirtualAddress());
 
     if (haveTimestamps) {
         list->EndQuery(m_smokeQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
@@ -1835,6 +1911,10 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     // transitioned this dispatch).
     if (editBoxBytesUploaded > 0u) {
         m_editBoxBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COMMON);
+    }
+    // B1.3f-c: same for the cull-block buffer.
+    if (cullBlockBytesUploaded > 0u) {
+        m_cullBlockBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COMMON);
     }
 
     const auto cpuSubmitStart = std::chrono::steady_clock::now();
@@ -1969,6 +2049,8 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     const bool applyChildSuppression = slot.tile.applyChildSuppression;
     const bool applyEditSkip = slot.tile.applyEditSkip;
     const bool emitWater = slot.tile.emitWater;
+    const bool applyDistanceCull = slot.tile.applyDistanceCull;
+    const uint32_t culledBlocks = slot.tile.culledBlocks; // B1.3f-c: blocks the CPU mask flagged
     const bool equalityMode = slot.tile.equalityMode;
     uint32_t gpuRiserFaces = 0u;
     // B1.3f-b: count GPU faces with the Water material (low byte of the packed voxel ==
@@ -2152,16 +2234,18 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
         equalityMode ? MidMeshFaceAbMode::Equal : MidMeshFaceAbMode::Containment;
     const MidMeshFaceAbResult ab = CompareMidMeshFacesMultiset(
         gpuFaces, cpuFaces, abMode, gpuStatus, 8u);
-    // Label: b13fb if the WATER + all-air-fill path was on (its own corpus label - the prior
-    // code logged this equality verify under b13c). Else b13e if edit skip, else b13d if child
-    // suppression, else b13c/b/a.
-    const char* const modeLabel = emitWater
-        ? "b13fb"
-        : (applyEditSkip
-               ? "b13e"
-               : (applyChildSuppression
-                      ? "b13d"
-                      : (emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a"))));
+    // Label: b13fc if the camera-distance CULL was on (its own corpus label - the new increment).
+    // Else b13fb if WATER + all-air-fill, else b13e if edit skip, else b13d if child suppression,
+    // else b13c/b/a. (Cull takes the top label since it can stack on water + everything below.)
+    const char* const modeLabel = applyDistanceCull
+        ? "b13fc"
+        : (emitWater
+               ? "b13fb"
+               : (applyEditSkip
+                      ? "b13e"
+                      : (applyChildSuppression
+                             ? "b13d"
+                             : (emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a")))));
     LogMidMeshFaceAbResult(modeLabel, ab);
 
     slot.pending = false;
@@ -2174,6 +2258,8 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     m_b13aStats.applyChildSuppression = applyChildSuppression;
     m_b13aStats.applyEditSkip = applyEditSkip;
     m_b13aStats.emitWater = emitWater;
+    m_b13aStats.applyDistanceCull = applyDistanceCull;
+    m_b13aStats.gpuCulledBlocks = culledBlocks;
     m_b13aStats.equalityMode = equalityMode;
     m_b13aStats.gpuSkirtFaces = gpuSkirtFaces;
     m_b13aStats.gpuSuppressedCells = gpuSuppressedCells;
@@ -2201,7 +2287,7 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     // For EQUALITY mode the gate is missing==0 AND extra==0 (gpuFaces==cpuMeshFaces).
     spdlog::info(
         "B13A_VERIFY mode={} abMode={} abVerifyCount={} match={} equalityHeld={} containSubset={} "
-        "mergeCells={} emitWater={} gpuFaces={} gpuRiserFaces={} gpuSkirtFaces={} "
+        "mergeCells={} emitWater={} applyDistanceCull={} culledBlocks={} gpuFaces={} gpuRiserFaces={} gpuSkirtFaces={} "
         "gpuWaterFaces={} gpuAirFillFaces={} maxTopQuadW={} maxTopQuadH={} "
         "gpuSuppressedCells={} gpuEditSkippedCells={} "
         "editBoxes={} cpuMeshFaces={} extraGpuFaces={} missingCpuFaces={} multiplicityMismatches={} "
@@ -2211,7 +2297,8 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
         (equalityMode && ab.missingCpuFaces == 0u && ab.extraGpuFaces == 0u &&
          ab.multiplicityMismatches == 0u && gpuStatus == 0u) ? 1 : 0,
         (ab.extraGpuFaces == 0u && gpuStatus == 0u) ? 1 : 0,
-        mergeCellsForStats, emitWater ? 1 : 0, gpuFaceCount, gpuRiserFaces, gpuSkirtFaces,
+        mergeCellsForStats, emitWater ? 1 : 0, applyDistanceCull ? 1 : 0, culledBlocks,
+        gpuFaceCount, gpuRiserFaces, gpuSkirtFaces,
         gpuWaterFaces, gpuAirFillFaces, gpuMaxTopQuadW, gpuMaxTopQuadH,
         gpuSuppressedCells, gpuEditSkippedCells,
         editBoxCountForStats, ab.cpuFaceCount,

@@ -196,7 +196,9 @@ struct MidMeshGpuExtractB13aStats {
     bool applyChildSuppression = false; // B1.3d: child-quadrant suppression was active
     bool applyEditSkip = false;     // B1.3e: edit-footprint suppression was active
     bool emitWater = false;         // B1.3f-b: water-aware aggregation + all-air fill active
+    bool applyDistanceCull = false; // B1.3f-c: camera-distance cull (CPU-decision mask) was active
     bool equalityMode = false;      // B1.3d: A/B ran in EQUALITY mode (not containment)
+    uint32_t gpuCulledBlocks = 0;   // B1.3f-c: blocks the CPU mask flagged as culled (the GPU skipped)
     uint32_t gpuSkirtFaces = 0;     // B1.3c: GPU faces that are border-skirt side quads
     uint32_t gpuSuppressedCells = 0;// B1.3d: cells the GPU skipped due to child suppression
     uint32_t gpuEditSkippedCells = 0;// B1.3e: cells the GPU skipped due to the edit footprint
@@ -484,6 +486,15 @@ public:
     // mode with water ON (run with cull off so water + air-fill is the only new variable):
     // the GPU emits the exact CPU set, missing==0 AND extra==0. Default false keeps the
     // B1.3a-f-a solid-only behavior byte-identical (water/air samples skipped, no fill).
+    // `applyDistanceCull` (B1.3f-c): when true the shader skips every block the CPU CULLED,
+    // consuming the per-block decision in `cullBlockMask` (the host-replayed CPU blockCullBounds
+    // verdict, one uint per block, 1 = culled). The mask is laid out by blockId = bz*blockCountPerAxis
+    // + bx (z-outer, x-inner), matching the shader. Because the GPU consumes the CPU's exact
+    // float decision (never recomputes it), the cull is BIT-IDENTICAL at any distance threshold -
+    // the boundary divergence risk is eliminated. The poll then A/Bs in EQUALITY mode WITH cull ON
+    // (run via VENPOD_SPARSE_MID_MESH_DISTANCE_CULL=1): the GPU emits the exact CPU set, the cull
+    // removed blocks on both sides identically, so missing==0 AND extra==0. An empty mask with
+    // applyDistanceCull true is inert (no block flagged). Default false keeps B1.3a-f-b behavior.
     bool RunB13aTopFaceDispatch(
         ID3D12Device* device,
         const Simulation::MidMeshGpuExtractDirtyTile& fixture,
@@ -496,7 +507,9 @@ public:
         bool equalityMode = false,
         bool applyEditSkip = false,
         const std::vector<Simulation::MidMeshEditXzBox>& editBoxes = {},
-        bool emitWater = false);
+        bool emitWater = false,
+        bool applyDistanceCull = false,
+        const std::vector<uint8_t>& cullBlockMask = {});
 
     // Delayed, DEBUG-ONLY containment A/B via the fence-tracked ring (same FIFO/ring as
     // the smoke poll, non-blocking by default). Reads the GPU top faces + status for the
@@ -532,9 +545,11 @@ private:
         bool applyChildSuppression = false; // B1.3d: child-quadrant suppression was active
         bool applyEditSkip = false; // B1.3e: edit-footprint suppression was active
         bool emitWater = false; // B1.3f-b: water-aware aggregation + all-air fill was active
+        bool applyDistanceCull = false; // B1.3f-c: camera-distance cull (CPU-decision mask) active
         bool equalityMode = false; // B1.3d: poll A/Bs in EQUALITY mode (not containment)
         uint32_t mergeCells = 1u; // B1.3f-a: the fixture's LOD merge-cell size (block span)
         uint32_t childMask = 0u; // B1.3d: the fixture's childMask (for suppressed-cell count)
+        uint32_t culledBlocks = 0u; // B1.3f-c: count of blocks the CPU cull mask flagged (for the log)
         std::vector<Simulation::MidMeshEditXzBox> editBoxes; // B1.3e: uploaded edit boxes (poll mirror)
         std::vector<Simulation::SparseSurfaceFace> cpuReferenceFaces; // tile meshCacheFaces
     };
@@ -606,6 +621,14 @@ private:
     GPUBuffer m_editBoxBuffer;       // one tile's edit boxes (SRV-read at t1)
     UploadBuffer m_editBoxUpload;    // one tile's edit-box stage
     uint32_t m_editBoxCapacityPerTile = 0;
+    // B1.3f-c CAMERA-DISTANCE CULL: dedicated per-tile per-BLOCK cull-flag buffer
+    // (StructuredBuffer<uint>, SRV-read at t2) + its own small upload stage. The host fills it
+    // with the CPU's bit-exact per-block cull DECISION (one uint per block, 1 = CPU culled it),
+    // so the GPU consumes the CPU's verdict instead of recomputing a float predicate (no
+    // boundary divergence). DIRTY-SCALED: written ONLY when a distance-cull dispatch runs.
+    GPUBuffer m_cullBlockBuffer;     // one tile's per-block cull flags (SRV-read at t2)
+    UploadBuffer m_cullBlockUpload;  // one tile's cull-flag stage
+    uint32_t m_cullBlockCapacityPerTile = 0; // max blocks/tile == (tileSampleSide-1)^2
     // B1.3.0: fence-tracked, persistently-mapped readback RING (replaces B1.2's
     // single once-per-process readback). 3 slots so a dispatch's copy can be read
     // a frame or two later, after its fence is naturally satisfied - no per-frame

@@ -769,6 +769,22 @@ public:
         uint32_t slot,
         std::vector<MidMeshEditXzBox>& outBoxes,
         uint32_t maxBoxes) const;
+    // Phase B1.3f-c camera-distance cull parity (DEBUG / READ-ONLY): re-run the EXACT CPU
+    // per-block `blockCullBounds`/`distanceCullBounds` float predicate that `extractTileMesh`
+    // applied when it produced this tile's meshCacheFaces, and return the per-block cull
+    // decision as a flat bit array indexed by the SHADER's blockId = bz*blockCountPerAxis+bx
+    // (z-outer, x-inner; block cell-span x=bx*mergeCells, xEnd=min(cellCount,x+mergeCells)).
+    // Bit set => the CPU CULLED that block (emitted nothing for it). The GPU consumes this
+    // mask so its cull decision is BIT-IDENTICAL to the CPU's at any distance threshold (no
+    // float-compare divergence). Uses the cull params PINNED at extraction (meshCacheCull*),
+    // not the current camera, so the mask matches the cache regardless of camera motion.
+    // `outMask` is sized to blockCountPerAxis^2 (one bit per uint8). Returns the number of
+    // CULLED blocks (popcount); 0 if cull was off / slot not resident. Pure read - the CPU
+    // cull algorithm is NEVER touched, only its recorded inputs are replayed.
+    uint32_t MidMeshTileCullBlockMaskBySlot(
+        uint32_t slot,
+        std::vector<uint8_t>& outMask,
+        uint32_t* outBlockCountPerAxis = nullptr) const;
     void SetEditStore(const SparseEditStore* edits);
     void SetFarSvoFallbackMetadata(const SparseClipmapFarSvoFallbackMetadata& metadata);
     // sinceRevision: only overlays touched after this global edit revision are
@@ -982,6 +998,21 @@ private:
         int32_t meshCacheMaxX = 0;
         int32_t meshCacheMaxY = 0;
         int32_t meshCacheMaxZ = 0;
+        // Phase B1.3f-c (GPU camera-distance cull parity, READ-ONLY annotation): record the
+        // EXACT distance-cull parameters the build used when it extracted meshCacheFaces, so a
+        // gated read-only accessor (MidMeshTileCullBlockMaskBySlot) can re-run the IDENTICAL
+        // CPU blockCullBounds/distanceCullBounds float predicate per block and hand the GPU the
+        // CPU's bit-exact cull decision (the cache is NOT camera-keyed, so the CURRENT camera
+        // could differ - these pin the decision to the build that produced these faces). Pure
+        // bookkeeping: these record values the build already computed; they NEVER change the
+        // cull decision, the geometry, or extractTileMesh's algorithm (parallel to the other
+        // meshCache* fields). Default = cull off (no faces removed) until a build records them.
+        bool meshCacheCullDistanceEnabled = false;
+        float meshCacheCullCameraX = 0.0f;
+        float meshCacheCullCameraZ = 0.0f;
+        float meshCacheCullMinDistance = 0.0f;
+        float meshCacheCullMaxDistance = 0.0f;
+        float meshCacheCullPadding = 0.0f;
     };
 
     struct VoxelColumnSample {

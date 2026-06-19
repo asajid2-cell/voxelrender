@@ -64,6 +64,16 @@ cbuffer TopFaceConstants : register(b0) {
                                 //        samples skipped, no all-air fill); 1 = WATER-AWARE
                                 //        aggregation + water-surface tops + all-air sea-level
                                 //        fill, matching the CPU emitWater path byte-for-byte.
+    uint gApplyDistanceCull;    // B1.3f-c: 0 = no camera-distance cull (B1.3a-f-b; the GPU did
+                                //        NOT replicate it, so those runs forced DISTANCE_CULL=0);
+                                //        1 = consume the CPU's per-block cull DECISION from
+                                //        CullBlockMask (NOT a re-computed float predicate). The
+                                //        host fills CullBlockMask by replaying the EXACT CPU
+                                //        blockCullBounds float math, so the GPU's cull decision is
+                                //        BIT-IDENTICAL to the CPU's at any threshold (no float
+                                //        divergence at the cull boundary - the flagged risk).
+    uint gCullBlockBase;        // B1.3f-c: base index of this tile's per-block cull flags in
+                                //        CullBlockMask (one uint per block, 1 = CPU culled it).
 }
 
 // =============================================================================
@@ -96,10 +106,11 @@ bool MidMeshCellSuppressedByChild(uint childMask, uint cellsPerRow, uint cx, uin
     return (childMask & (1u << quadrantBit)) != 0u;
 }
 
-StructuredBuffer<uint>                Samples    : register(t0); // per-tile sample grid
-StructuredBuffer<MidMeshEditBox>      EditBoxes  : register(t1); // B1.3e: per-tile edit boxes
-RWStructuredBuffer<SparseSurfaceFace> DebugFaces : register(u0); // ISOLATED debug output
-RWStructuredBuffer<MidMeshTileMeta>   TileMeta   : register(u1); // metadata (faceCount UAV)
+StructuredBuffer<uint>                Samples       : register(t0); // per-tile sample grid
+StructuredBuffer<MidMeshEditBox>      EditBoxes     : register(t1); // B1.3e: per-tile edit boxes
+StructuredBuffer<uint>                CullBlockMask : register(t2); // B1.3f-c: per-block CPU cull flag
+RWStructuredBuffer<SparseSurfaceFace> DebugFaces    : register(u0); // ISOLATED debug output
+RWStructuredBuffer<MidMeshTileMeta>   TileMeta      : register(u1); // metadata (faceCount UAV)
 
 // =============================================================================
 // APPEND ONE FACE - claims a dense slot from the per-tile counter, bounds-checks
@@ -405,6 +416,22 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     const uint z = bz * mergeCells;
     const uint xEnd = min(cellsPerAxis, x + mergeCells);
     const uint zEnd = min(cellsPerAxis, z + mergeCells);
+
+    // ---- B1.3f-c CAMERA-DISTANCE CULL (block space) ----
+    // Mirrors extractTileMesh's per-block `blockCullBounds` `continue` (SparseClipmap.cpp ~7088),
+    // which sits AFTER aggregateSamples + the all-air fill but BEFORE child suppression + emission.
+    // A culled block emits NOTHING regardless of where the skip sits (each gate independently
+    // emits nothing), so applying it here is equivalent. CRITICAL DETERMINISM: we do NOT recompute
+    // the float distance predicate on the GPU (CPU sqrt is correctly-rounded, HLSL sqrt is only
+    // 1-ULP and dxc may contract a*b+c into an FMA -> a block at the exact threshold could cull on
+    // one side and not the other). Instead the host replayed the EXACT CPU blockCullBounds float
+    // math and handed us the DECISION in CullBlockMask, so the GPU consumes the CPU's bit-identical
+    // verdict. blockId == bz*blockCountPerAxis + bx, matching the host mask layout exactly.
+    if (gApplyDistanceCull != 0u) {
+        if (CullBlockMask[gCullBlockBase + blockId] != 0u) {
+            return; // whole-block skip (matches the CPU `continue`)
+        }
+    }
 
     const int cellSizeIntEarly = MidMeshCellSizeInt(meta.cellSizeBits);
 

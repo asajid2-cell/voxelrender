@@ -7263,6 +7263,15 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             tile.meshCacheOriginZ = tile.record.originZ;
             tile.meshCacheRing = tile.record.coord.ring;
             tile.meshCacheValid = true;
+            // B1.3f-c: pin the cull parameters this extraction used (read-only annotation; the
+            // VALUES already drove the per-block blockCullBounds skip above - this only RECORDS
+            // them so the GPU-parity accessor reproduces the EXACT same float decision later).
+            tile.meshCacheCullDistanceEnabled = buildConfig.distanceCull;
+            tile.meshCacheCullCameraX = buildConfig.cameraX;
+            tile.meshCacheCullCameraZ = buildConfig.cameraZ;
+            tile.meshCacheCullMinDistance = minDistance; // the ALTITUDE-CORRECTED min (line ~6727)
+            tile.meshCacheCullMaxDistance = maxDistance;
+            tile.meshCacheCullPadding = cullPadding;
         }
         return faceBudgetOk;
     };
@@ -8064,6 +8073,106 @@ uint32_t SparseClipmapTileCache::MidMeshTileEditBoxesBySlot(
         }
     });
     return totalOverlapping;
+}
+
+uint32_t SparseClipmapTileCache::MidMeshTileCullBlockMaskBySlot(
+    uint32_t slot,
+    std::vector<uint8_t>& outMask,
+    uint32_t* outBlockCountPerAxis) const
+{
+    // Phase B1.3f-c: replay the EXACT CPU per-block camera-distance cull that produced this
+    // tile's meshCacheFaces, so the GPU consumes the CPU's bit-identical decision. We mirror
+    // extractTileMesh's block loop geometry + blockCullBounds/distanceCullBounds float math
+    // byte-for-byte, using the cull params PINNED at extraction (meshCacheCull*), NOT the
+    // current camera (the cache is not camera-keyed). Pure read; the CPU path is untouched.
+    outMask.clear();
+    if (outBlockCountPerAxis) {
+        *outBlockCountPerAxis = 0u;
+    }
+    if (slot >= m_tiles.size()) {
+        return 0u;
+    }
+    const TilePayload& tile = m_tiles[slot];
+    if (tile.record.slot == UINT32_MAX || !tile.meshCacheValid) {
+        return 0u;
+    }
+    const uint32_t side = m_config.tileSampleSide;
+    const uint32_t cellCount = side >= 2u ? side - 1u : 0u;
+    if (cellCount == 0u) {
+        return 0u;
+    }
+    // The LOD merge the cache was built at (block span). Same source as the GPU metadata's
+    // mergeCells (CollectAllResidentMidMeshGpuExtractTiles uses meshCacheMergeCells too).
+    const uint32_t mergeCells = std::max(1u, tile.meshCacheMergeCells);
+    const uint32_t blockCountPerAxis = (cellCount + mergeCells - 1u) / mergeCells;
+    if (outBlockCountPerAxis) {
+        *outBlockCountPerAxis = blockCountPerAxis;
+    }
+    outMask.assign(static_cast<size_t>(blockCountPerAxis) * blockCountPerAxis, 0u);
+    if (!tile.meshCacheCullDistanceEnabled) {
+        // Cull was OFF when these faces were built -> no block was removed. (Matches the CPU
+        // distanceCullBounds early-out `if (!distanceCull) return false`.)
+        return 0u;
+    }
+    // Mirror extractTileMesh's INTEGER cell size: max(1, RoundToInt32Clamped(record.cellSize))
+    // (the same value computeTileLod derived + the block loop used for cellWorldX/width).
+    const uint32_t cellSize =
+        static_cast<uint32_t>(std::max(1, RoundToInt32Clamped(tile.record.cellSize)));
+    // Pinned cull params (the EXACT values the build's lambdas closed over).
+    const float cameraX = tile.meshCacheCullCameraX;
+    const float cameraZ = tile.meshCacheCullCameraZ;
+    const float minDistance = tile.meshCacheCullMinDistance;
+    const float maxDistance = tile.meshCacheCullMaxDistance;
+    const float cullPadding = tile.meshCacheCullPadding;
+    // Byte-for-byte mirror of distanceCullBounds (SparseClipmap.cpp ~6764) + blockCullBounds
+    // (~6797). Frustum cull is intentionally NOT replicated here; the B1.3f-c run requires
+    // VENPOD_SPARSE_MID_MESH_FRUSTUM_CULL=0, so blockCullBounds reduces to distanceCullBounds.
+    auto distanceCulled = [&](float centerX, float centerZ, float radius) -> bool {
+        const float dx = centerX - cameraX;
+        const float dz = centerZ - cameraZ;
+        const float distance = std::sqrt(dx * dx + dz * dz);
+        return distance - radius > maxDistance || distance + radius < minDistance;
+    };
+    // cellWorldX/Z (the SaturatingAdd version extractTileMesh used).
+    auto cellWorldX = [&](uint32_t x) -> int32_t {
+        return SaturatingAddInt32(
+            tile.record.originX,
+            static_cast<int32_t>(static_cast<int64_t>(x) * static_cast<int64_t>(cellSize)));
+    };
+    auto cellWorldZ = [&](uint32_t z) -> int32_t {
+        return SaturatingAddInt32(
+            tile.record.originZ,
+            static_cast<int32_t>(static_cast<int64_t>(z) * static_cast<int64_t>(cellSize)));
+    };
+    uint32_t culledBlocks = 0u;
+    // z OUTER, x INNER + the same block span as the loop (x=bx*mergeCells, xEnd=min(...)).
+    // The GPU shader's blockId = bz*blockCountPerAxis + bx, so index the mask the same way.
+    for (uint32_t bz = 0u; bz < blockCountPerAxis; ++bz) {
+        const uint32_t z = bz * mergeCells;
+        const uint32_t zEnd = std::min(cellCount, z + mergeCells);
+        for (uint32_t bx = 0u; bx < blockCountPerAxis; ++bx) {
+            const uint32_t x = bx * mergeCells;
+            const uint32_t xEnd = std::min(cellCount, x + mergeCells);
+            const int32_t worldX = cellWorldX(x);
+            const int32_t worldZ = cellWorldZ(z);
+            const uint32_t width = (xEnd - x) * cellSize;
+            const uint32_t depth = (zEnd - z) * cellSize;
+            // blockCullBounds center/radius (the EXACT float expression).
+            const float centerX =
+                static_cast<float>(worldX) + static_cast<float>(width) * 0.5f;
+            const float centerZ =
+                static_cast<float>(worldZ) + static_cast<float>(depth) * 0.5f;
+            const float radius =
+                std::sqrt(static_cast<float>(width) * static_cast<float>(width) +
+                          static_cast<float>(depth) * static_cast<float>(depth)) * 0.5f +
+                cullPadding;
+            if (distanceCulled(centerX, centerZ, radius)) {
+                outMask[static_cast<size_t>(bz) * blockCountPerAxis + bx] = 1u;
+                ++culledBlocks;
+            }
+        }
+    }
+    return culledBlocks;
 }
 
 void SparseClipmapTileCache::ClearHeightDirtyRange() {

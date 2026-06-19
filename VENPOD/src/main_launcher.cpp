@@ -3056,14 +3056,31 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseMidMeshGpuExtractB13fb =
         sparseMidMeshGpuExtract &&
         ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_B13FB", 0u) != 0u;
-    // The B1.3a..f-b top-face path reuses the smoke compute side (queue/fence/readback ring),
-    // so the smoke compute objects must be stood up whenever ANY path is enabled. B1.3b-f-b
+    // Phase B1.3f-c: the CAMERA-DISTANCE CULL increment - the GPU applies the SAME per-block
+    // camera-distance cull the CPU does, so EQUALITY holds with cull ON (the prior increments
+    // forced VENPOD_SPARSE_MID_MESH_DISTANCE_CULL=0 because the GPU did not replicate it). The #1
+    // RISK is float-threshold divergence: CPU sqrt is correctly-rounded while HLSL sqrt is only
+    // 1-ULP + dxc may contract a*b+c into an FMA, so a naive GPU float port could cull a block at
+    // the exact threshold that the CPU keeps (or vice-versa). To make the decision DETERMINISTIC
+    // we do NOT recompute the predicate on the GPU - the host replays the EXACT CPU blockCullBounds
+    // float math (MidMeshTileCullBlockMaskBySlot, a gated read-only accessor; the CPU production
+    // algorithm is UNTOUCHED) and feeds the GPU the per-block DECISION as a mask, so the GPU
+    // consumes the CPU's bit-identical verdict. The fixture is a tile STRADDLING the cull boundary
+    // (some blocks culled, some kept). A/B is FULL EQUALITY against the CPU mesh WITH cull ON
+    // (missing==0 AND extra==0). This run REQUIRES VENPOD_SPARSE_MID_MESH_DISTANCE_CULL=1 and
+    // VENPOD_SPARSE_MID_MESH_FRUSTUM_CULL=0 (the mask replicates distance cull only). Water is on
+    // by default (the water-aware aggregation already matches at any LOD). Default 0.
+    const bool sparseMidMeshGpuExtractB13fc =
+        sparseMidMeshGpuExtract &&
+        ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_B13FC", 0u) != 0u;
+    // The B1.3a..f-c top-face path reuses the smoke compute side (queue/fence/readback ring),
+    // so the smoke compute objects must be stood up whenever ANY path is enabled. B1.3b-f-c
     // share the B1.3a top-face PSO, so they also need the B1.3a init to run.
     const bool sparseMidMeshGpuExtractTopFacePath =
         sparseMidMeshGpuExtractB13a || sparseMidMeshGpuExtractB13b ||
         sparseMidMeshGpuExtractB13c || sparseMidMeshGpuExtractB13d ||
         sparseMidMeshGpuExtractB13e || sparseMidMeshGpuExtractB13fa ||
-        sparseMidMeshGpuExtractB13fb;
+        sparseMidMeshGpuExtractB13fb || sparseMidMeshGpuExtractB13fc;
     const bool sparseMidMeshGpuExtractComputeSide =
         sparseMidMeshGpuExtractSmoke || sparseMidMeshGpuExtractTopFacePath;
     // Phase B1.3.0 GATED explicit readback WAIT. Default 0 = the readback ring polls
@@ -17043,13 +17060,18 @@ int RunSandbox(int argc, char* argv[]) {
                         // aware) + gEmitWater and A/Bs in EQUALITY mode against the CPU's full
                         // water-on mesh. B1.3f-a is the prior LOD-MERGE increment; B1.3e the
                         // edit footprint; B1.3d child suppression. Else B1.3c/b/a.
-                        const bool wantWater = sparseMidMeshGpuExtractB13fb;
+                        // B1.3f-c is the LATEST increment (CAMERA-DISTANCE CULL) and takes top
+                        // precedence; it is the FULL water-aware mesh (risers + skirts + water on)
+                        // PLUS the per-block cull, A/B in EQUALITY mode against the CPU's full
+                        // cull-ON mesh.
+                        const bool wantDistanceCull = sparseMidMeshGpuExtractB13fc;
+                        const bool wantWater = sparseMidMeshGpuExtractB13fb || wantDistanceCull;
                         const bool wantLodMerge = sparseMidMeshGpuExtractB13fa;
                         const bool wantEditSkip = sparseMidMeshGpuExtractB13e;
                         const bool wantSuppression = sparseMidMeshGpuExtractB13d;
                         const bool emitSkirts =
                             sparseMidMeshGpuExtractB13c || wantSuppression || wantEditSkip ||
-                            wantLodMerge || wantWater;
+                            wantLodMerge || wantWater || wantDistanceCull;
                         const bool emitRisers = sparseMidMeshGpuExtractB13b || emitSkirts;
                         const auto editFootprintFn = [&](uint32_t slot) {
                             return sparseClipmapTileCache
@@ -17143,6 +17165,8 @@ int RunSandbox(int argc, char* argv[]) {
                         bool applyChildSuppression = false; // active only on a childMask!=0 fixture
                         bool applyEditSkip = false;         // B1.3e: active on an edited fixture
                         bool emitWater = false;             // B1.3f-b: water-aware aggregation + fill
+                        bool applyDistanceCull = false;     // B1.3f-c: per-block camera-distance cull
+                        std::vector<uint8_t> cullBlockMask; // B1.3f-c: CPU per-block cull decision
                         bool equalityMode = false;          // B1.3d/e/f-a/f-b A/Bs in EQUALITY mode
                         bool expectChildMaskNonZero = false; // gate: which childMask the cache must show
                         bool expectMergeGreaterThanOne = false; // B1.3f-a: cache must show mergeCells>1
@@ -17157,7 +17181,88 @@ int RunSandbox(int argc, char* argv[]) {
                         std::vector<Simulation::MidMeshGpuExtractDirtyTile> b13faResidentPool;
                         const std::vector<Simulation::MidMeshGpuExtractDirtyTile>* fixturePool =
                             &gpuExtractTiles;
-                        if (wantWater) {
+                        if (wantDistanceCull) {
+                            // B1.3f-c PRIMARY = a tile STRADDLING the cull boundary: the CPU mask
+                            // flags SOME blocks culled and KEEPS others (0 < culledBlocks < total),
+                            // so the fixture exercises blocks below/at/above the distance threshold
+                            // in ONE A/B and proves the GPU and CPU decide IDENTICALLY at the
+                            // boundary. The cull params are PINNED at extraction (the accessor uses
+                            // meshCacheCull*, not the current camera), so the mask matches the cache.
+                            // A/B in EQUALITY mode WITH cull ON. Prefer childMask==0 + no edit
+                            // footprint so the cull is the only new variable; mergeCells unconstrained
+                            // (the host-decision mask is exact at any LOD). FALL BACK: a fully-CULLED
+                            // or fully-KEPT tile (cull still consumed) so equality holds either way.
+                            equalityMode = true;
+                            emitWater = true;        // the full water-aware mesh + the cull on top
+                            applyDistanceCull = true;
+                            allowAnyMerge = true;    // CPU-decision mask is exact at any LOD
+                            sparseClipmapTileCache.CollectAllResidentMidMeshGpuExtractTiles(
+                                b13faResidentPool);
+                            fixturePool = &b13faResidentPool;
+                            // Scan the resident pool: compute each candidate's CPU cull mask
+                            // (the gated read-only accessor) and rank by how well it exercises the
+                            // boundary. straddle (some culled + some kept) > any-culled > clean.
+                            uint32_t bestStraddle = UINT32_MAX;
+                            uint32_t bestCulled = UINT32_MAX;
+                            uint32_t bestClean = UINT32_MAX;
+                            std::vector<uint8_t> bestStraddleMask, bestCulledMask, bestCleanMask;
+                            for (uint32_t i = 0u; i < b13faResidentPool.size(); ++i) {
+                                const auto& t = b13faResidentPool[i];
+                                if (t.slot == UINT32_MAX || t.samples == nullptr ||
+                                    t.sampleCount == 0u || t.childMask != 0u) {
+                                    continue;
+                                }
+                                if (editFootprintFn(t.slot)) {
+                                    continue;
+                                }
+                                std::vector<uint8_t> mask;
+                                uint32_t blocksPerAxis = 0u;
+                                const uint32_t culled =
+                                    sparseClipmapTileCache.MidMeshTileCullBlockMaskBySlot(
+                                        t.slot, mask, &blocksPerAxis);
+                                const uint32_t total = static_cast<uint32_t>(mask.size());
+                                if (total == 0u) {
+                                    continue;
+                                }
+                                if (culled > 0u && culled < total) {
+                                    if (bestStraddle == UINT32_MAX) {
+                                        bestStraddle = i;
+                                        bestStraddleMask = mask;
+                                    }
+                                } else if (culled == total) {
+                                    if (bestCulled == UINT32_MAX) {
+                                        bestCulled = i;
+                                        bestCulledMask = mask;
+                                    }
+                                } else { // culled == 0 (fully kept)
+                                    if (bestClean == UINT32_MAX) {
+                                        bestClean = i;
+                                        bestCleanMask = mask;
+                                    }
+                                }
+                            }
+                            if (bestStraddle != UINT32_MAX) {
+                                fixtureIdx = bestStraddle;
+                                cullBlockMask = std::move(bestStraddleMask);
+                            } else if (bestCulled != UINT32_MAX) {
+                                fixtureIdx = bestCulled;
+                                cullBlockMask = std::move(bestCulledMask);
+                            } else if (bestClean != UINT32_MAX) {
+                                fixtureIdx = bestClean;
+                                cullBlockMask = std::move(bestCleanMask);
+                            }
+                            uint32_t maskCulled = 0u;
+                            for (uint8_t f : cullBlockMask) { maskCulled += (f != 0u) ? 1u : 0u; }
+                            spdlog::info(
+                                "GPU_EXTRACT_B13FC_DIRTY residentTotal={} pickedIdx={} pickKind={} "
+                                "maskBlocks={} maskCulled={}",
+                                static_cast<uint32_t>(b13faResidentPool.size()),
+                                fixtureIdx,
+                                (bestStraddle != UINT32_MAX) ? "straddle"
+                                    : (bestCulled != UINT32_MAX) ? "fullyCulled"
+                                    : (bestClean != UINT32_MAX) ? "clean" : "none",
+                                static_cast<uint32_t>(cullBlockMask.size()), maskCulled);
+                        } else if (wantWater) {
                             // B1.3f-b PRIMARY = a tile bearing WATER and/or AIR samples (so a
                             // water-surface top and/or the all-air sea-level fill actually emit).
                             // A/B in EQUALITY mode WITH WATER ON (the water + air-fill proof).
@@ -17339,7 +17444,8 @@ int RunSandbox(int argc, char* argv[]) {
                                     device->GetDevice(), fixture, cpuRefFaces,
                                     sparseMidMeshTerraceStep, fixture.meshContentVersion,
                                     emitRisers, emitSkirts, applyChildSuppression, equalityMode,
-                                    applyEditSkip, editBoxes, emitWater);
+                                    applyEditSkip, editBoxes, emitWater,
+                                    applyDistanceCull, cullBlockMask);
                                 midMeshGpuExtractResources.PollB13aReadback();
                             }
                         }
