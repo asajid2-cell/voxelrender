@@ -45,7 +45,7 @@
 
 #include "MidMeshExtractCommon.hlsli"
 
-// Root constants (b0): the B1.3a/b/c controls.
+// Root constants (b0): the B1.3a/b/c/d controls.
 cbuffer TopFaceConstants : register(b0) {
     uint gTileSlot;             // controlled tile slot (index into the metadata buffer)
     uint gDebugBaseFace;        // base of this tile's range in the DEBUG face buffer
@@ -54,6 +54,36 @@ cbuffer TopFaceConstants : register(b0) {
     uint gEmitRisers;           // B1.3b: 0 = top faces only (B1.3a); 1 = + risers
     uint gEmitSkirts;           // B1.3c: 0 = no border skirts; 1 = + tile-border skirts
     int  gSeaLevelY;            // B1.3c: SEA_LEVEL_Y (-48); mirrors the CPU compile-time const
+    uint gApplyChildSuppression;// B1.3d: 0 = no child suppression (B1.3a-c); 1 = suppress
+                                //        cells whose quadrant has a resident finer child.
+}
+
+// =============================================================================
+// B1.3d CHILD-QUADRANT SUPPRESSION - mirrors extractTileMesh's L7 finer-coverage
+// suppression (SparseClipmap.cpp ~7091-7103), the no-monolith rule:
+//
+//   if (anyChildResident) {
+//       const uint midCell  = x + (xEnd - x) / 2;   // mergeCells==1 -> == cx
+//       const uint midCellZ = z + (zEnd - z) / 2;   // mergeCells==1 -> == cz
+//       const uint qx = (midCell  * 2 >= cellCount) ? 1 : 0;   // cellCount = PER-AXIS count
+//       const uint qz = (midCellZ * 2 >= cellCount) ? 1 : 0;
+//       if (childResident[qz * 2 + qx]) continue;   // SKIP THE WHOLE CELL
+//   }
+//
+// The CPU `continue` sits at the TOP of the footprint loop body, BEFORE the top
+// face, the border skirts, AND the risers - so a suppressed cell emits NOTHING.
+// Mirror that: this returns true (skip everything) when the cell's quadrant has a
+// resident child. The childResident[i] bit is bit i of childMask (i = qz*2 + qx);
+// childMask bit mapping: 0=(qx0,qz0) 1=(qx1,qz0) 2=(qx0,qz1) 3=(qx1,qz1), matching
+// the CPU computeTileLod pack. `cellsPerRow` here is the CPU's PER-AXIS `cellCount`
+// (== side - 1). For mergeCells==1, midCell==cx / midCellZ==cz exactly.
+// =============================================================================
+bool MidMeshCellSuppressedByChild(uint childMask, uint cellsPerRow, uint cx, uint cz) {
+    // midCell = cx + (1)/2 = cx for mergeCells==1 (integer divide). Same for cz.
+    const uint qx = (cx * 2u >= cellsPerRow) ? 1u : 0u;
+    const uint qz = (cz * 2u >= cellsPerRow) ? 1u : 0u;
+    const uint quadrantBit = qz * 2u + qx;
+    return (childMask & (1u << quadrantBit)) != 0u;
 }
 
 StructuredBuffer<uint>                Samples    : register(t0); // per-tile sample grid
@@ -299,6 +329,20 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
 
     const uint cx = cell % cellsPerRow;
     const uint cz = cell / cellsPerRow;
+
+    // ---- B1.3d CHILD-QUADRANT SUPPRESSION ----
+    // Mirrors the CPU's L7 finer-coverage suppression `continue` at the TOP of the
+    // footprint loop: if this cell's quadrant has a resident finer child, the child
+    // renders the area at higher detail, so the coarse cell emits NOTHING (top, skirts,
+    // AND risers all skipped). The CPU only applies it when anyChildResident; childMask
+    // != 0 is exactly that condition, so the bit test alone is sufficient. When
+    // gApplyChildSuppression==0 (B1.3a-c) this is inert and the childMask==0 path is
+    // byte-identical to before.
+    if (gApplyChildSuppression != 0u && meta.childMask != 0u) {
+        if (MidMeshCellSuppressedByChild(meta.childMask, cellsPerRow, cx, cz)) {
+            return; // whole-cell skip (matches the CPU continue)
+        }
+    }
 
     const int cellSizeInt = MidMeshCellSizeInt(meta.cellSizeBits);
     const uint heightBias = meta.heightBias;

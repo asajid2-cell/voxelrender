@@ -185,13 +185,16 @@ struct MidMeshGpuExtractSmokeStats {
 // CONTAINMENT A/B against the CPU tile's meshCacheFaces (the ground-truth mesh).
 // -----------------------------------------------------------------------------
 struct MidMeshGpuExtractB13aStats {
-    bool dispatched = false;        // a B1.3a/b/c top-face dispatch ran this frame
+    bool dispatched = false;        // a B1.3a/b/c/d top-face dispatch ran this frame
     bool emitRisers = false;        // B1.3b: this dispatch also emitted neighbor risers
     bool emitSkirts = false;        // B1.3c: this dispatch also emitted tile-border skirts
+    bool applyChildSuppression = false; // B1.3d: child-quadrant suppression was active
+    bool equalityMode = false;      // B1.3d: A/B ran in EQUALITY mode (not containment)
     uint32_t gpuSkirtFaces = 0;     // B1.3c: GPU faces that are border-skirt side quads
+    uint32_t gpuSuppressedCells = 0;// B1.3d: cells the GPU skipped due to child suppression
     uint32_t tileSlot = UINT32_MAX; // controlled (flat/simple) fixture slot
     uint32_t fixtureMergeCells = 0; // the fixture's mergeCells (must be 1)
-    uint32_t fixtureChildMask = 0;  // the fixture's childMask (must be 0)
+    uint32_t fixtureChildMask = 0;  // the fixture's childMask (0 for B1.3a-c; !=0 for B1.3d)
     uint32_t cpuRefFaceCount = 0;   // CPU meshCacheFaces size (full mesh: tops+risers+skirts)
     uint32_t gpuFaceCount = 0;      // GPU-written top-face count (read back; UINT32_MAX=unread)
     uint32_t gpuStatusOverflow = 0; // GPU status (0 ok / 1 reserved-range overflow)
@@ -370,6 +373,20 @@ public:
         uint32_t sampleSide,
         uint32_t terraceStep);
 
+    // B1.3d fixture: the FIRST face-REMOVING increment. Constraints INVERT the childMask
+    // requirement of the earlier increments - it REQUIRES childMask != 0 (at least one
+    // resident finer child quadrant) so the suppression rule actually FIRES, while still
+    // mergeCells==1, no edit footprint, full sample grid. (The earlier increments required
+    // childMask==0 to avoid suppression; B1.3d needs it present.) `sampleSide` is used to
+    // validate the grid; `terraceStep` is unused here (a quadrant either has a resident
+    // child or it does not, independent of height). Returns the picked tile's index, or
+    // UINT32_MAX. The CPU mesh for such a tile is { tops + risers + skirts } MINUS the
+    // suppressed child quadrants, so GPU(top+riser+skirt+suppression) can A/B EQUAL to it.
+    static uint32_t SelectB13dFixture(
+        const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
+        const std::function<bool(uint32_t /*slot*/)>& hasEditFootprint,
+        uint32_t sampleSide);
+
     // Run ONE top-face extraction for the picked fixture tile. Uploads the tile's
     // samples+metadata (faceCount zeroed) into the dedicated smoke buffers, dispatches
     // CS_MidMeshExtractTopFaces over the tile's cell grid (each eligible solid cell
@@ -385,6 +402,13 @@ public:
     // x==0/xEnd>=cellCount/z==0/zEnd>=cellCount skirt rule using SEA_LEVEL_Y + terraceStep).
     // The containment A/B then proves GPU(top+risers+skirts) is still a multiset-subset of
     // the CPU mesh; the AB_VERIFY label becomes b13c. Both false = B1.3a top-faces only.
+    // `applyChildSuppression` (B1.3d): when true, the shader applies the CPU's
+    // child-quadrant suppression (a cell whose quadrant has a resident finer child emits
+    // NOTHING). `equalityMode` (B1.3d): when true, the delayed poll A/Bs in EQUALITY mode
+    // (gpuFaceCount==cpuFaceCount, missing==0 AND extra==0) instead of containment - the
+    // suppression increment proves FULL equality, since with suppression the GPU emits the
+    // exact same set the CPU does (run with water+cull off so the only variable is the
+    // suppression). Defaults false keep the B1.3a-c containment behavior unchanged.
     bool RunB13aTopFaceDispatch(
         ID3D12Device* device,
         const Simulation::MidMeshGpuExtractDirtyTile& fixture,
@@ -392,7 +416,9 @@ public:
         uint32_t terraceStep,
         uint64_t currentTileVersionForSlot,
         bool emitRisers = false,
-        bool emitSkirts = false);
+        bool emitSkirts = false,
+        bool applyChildSuppression = false,
+        bool equalityMode = false);
 
     // Delayed, DEBUG-ONLY containment A/B via the fence-tracked ring (same FIFO/ring as
     // the smoke poll, non-blocking by default). Reads the GPU top faces + status for the
@@ -425,6 +451,9 @@ private:
         bool b13aTopFace = false;
         bool emitRisers = false; // B1.3b: this dispatch also emitted neighbor risers
         bool emitSkirts = false; // B1.3c: this dispatch also emitted tile-border skirts
+        bool applyChildSuppression = false; // B1.3d: child-quadrant suppression was active
+        bool equalityMode = false; // B1.3d: poll A/Bs in EQUALITY mode (not containment)
+        uint32_t childMask = 0u; // B1.3d: the fixture's childMask (for suppressed-cell count)
         std::vector<Simulation::SparseSurfaceFace> cpuReferenceFaces; // tile meshCacheFaces
     };
 

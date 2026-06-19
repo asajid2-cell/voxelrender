@@ -3005,12 +3005,25 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseMidMeshGpuExtractB13c =
         sparseMidMeshGpuExtract &&
         ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_B13C", 0u) != 0u;
-    // The B1.3a/b/c top-face path reuses the smoke compute side (queue/fence/readback ring),
-    // so the smoke compute objects must be stood up whenever ANY path is enabled. B1.3b/c
+    // Phase B1.3d: the FOURTH (and FIRST face-REMOVING) meshing increment - GPU TOP + RISER
+    // + SKIRT extraction WITH the CPU's child-quadrant suppression (a cell whose quadrant has
+    // a resident finer child emits NOTHING, mirroring extractTileMesh's L7 no-monolith rule).
+    // The fixture REQUIRES childMask != 0 (so suppression fires); A/B is FULL EQUALITY against
+    // the CPU mesh (missingCpuFaces==0 AND extraGpuFaces==0). Because the GPU still defers
+    // water + does not replicate distance/frustum cull, EQUALITY against the real CPU mesh is
+    // only sound with water + cull OFF, so this run REQUIRES VENPOD_SPARSE_MID_MESH_WATER=0
+    // and VENPOD_SPARSE_MID_MESH_DISTANCE_CULL=0 (the only remaining difference is suppression).
+    // Reuses the B1.3a/b/c top-face PSO with the new gApplyChildSuppression root const; implies
+    // risers + skirts on (the b13c superset, minus the suppressed quadrants). Default 0.
+    const bool sparseMidMeshGpuExtractB13d =
+        sparseMidMeshGpuExtract &&
+        ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_B13D", 0u) != 0u;
+    // The B1.3a/b/c/d top-face path reuses the smoke compute side (queue/fence/readback ring),
+    // so the smoke compute objects must be stood up whenever ANY path is enabled. B1.3b/c/d
     // share the B1.3a top-face PSO, so they also need the B1.3a init to run.
     const bool sparseMidMeshGpuExtractTopFacePath =
         sparseMidMeshGpuExtractB13a || sparseMidMeshGpuExtractB13b ||
-        sparseMidMeshGpuExtractB13c;
+        sparseMidMeshGpuExtractB13c || sparseMidMeshGpuExtractB13d;
     const bool sparseMidMeshGpuExtractComputeSide =
         sparseMidMeshGpuExtractSmoke || sparseMidMeshGpuExtractTopFacePath;
     // Phase B1.3.0 GATED explicit readback WAIT. Default 0 = the readback ring polls
@@ -16962,24 +16975,58 @@ int RunSandbox(int argc, char* argv[]) {
                     if (sparseMidMeshGpuExtractTopFacePath &&
                         midMeshGpuExtractResources.B13aReady() &&
                         !gpuExtractTiles.empty()) {
-                        // B1.3c is the superset increment (top + risers + skirts) and takes
-                        // precedence; else B1.3b (top + risers); else B1.3a (top only).
-                        const bool emitSkirts = sparseMidMeshGpuExtractB13c;
+                        // B1.3d is the FIRST face-REMOVING increment (top+riser+skirt MINUS the
+                        // child-suppressed quadrants) and takes precedence; it implies risers +
+                        // skirts on (the b13c superset) plus the suppression. Else B1.3c (top +
+                        // risers + skirts); else B1.3b (top + risers); else B1.3a (top only).
+                        const bool wantSuppression = sparseMidMeshGpuExtractB13d;
+                        const bool emitSkirts = sparseMidMeshGpuExtractB13c || wantSuppression;
                         const bool emitRisers = sparseMidMeshGpuExtractB13b || emitSkirts;
                         const auto editFootprintFn = [&](uint32_t slot) {
                             return sparseClipmapTileCache
                                 .MidMeshTileHasEditFootprintBySlot(slot);
                         };
-                        const uint32_t fixtureIdx = emitSkirts
-                            ? MidMeshGpuExtractResources::SelectB13cFixture(
-                                  gpuExtractTiles, editFootprintFn,
-                                  sparseClipmapConfig.tileSampleSide, sparseMidMeshTerraceStep)
-                            : (emitRisers
-                                ? MidMeshGpuExtractResources::SelectB13bFixture(
-                                      gpuExtractTiles, editFootprintFn,
-                                      sparseClipmapConfig.tileSampleSide, sparseMidMeshTerraceStep)
-                                : MidMeshGpuExtractResources::SelectB13aFixture(
-                                      gpuExtractTiles, editFootprintFn));
+
+                        // B1.3d fixture selection:
+                        //   * PRIMARY = a childMask != 0 tile (SelectB13dFixture) -> suppression
+                        //     fires, A/B in EQUALITY mode (the suppression proof).
+                        //   * If none is dirty this build, FALL BACK to a childMask == 0 border
+                        //     tile (SelectB13cFixture) and run EQUALITY with the suppression code
+                        //     present-but-inactive -> proves the childMask==0 path is unchanged.
+                        // B1.3a/b/c keep their original childMask==0 fixtures + containment.
+                        uint32_t fixtureIdx = UINT32_MAX;
+                        bool applyChildSuppression = false; // active only on a childMask!=0 fixture
+                        bool equalityMode = false;          // B1.3d A/Bs in EQUALITY mode
+                        bool expectChildMaskNonZero = false; // gate: which childMask the cache must show
+                        if (wantSuppression) {
+                            equalityMode = true;
+                            fixtureIdx = MidMeshGpuExtractResources::SelectB13dFixture(
+                                gpuExtractTiles, editFootprintFn,
+                                sparseClipmapConfig.tileSampleSide);
+                            if (fixtureIdx != UINT32_MAX) {
+                                applyChildSuppression = true;   // childMask!=0 -> suppression fires
+                                expectChildMaskNonZero = true;
+                            } else {
+                                // childMask==0 re-confirmation (suppression inactive, equal still).
+                                fixtureIdx = MidMeshGpuExtractResources::SelectB13cFixture(
+                                    gpuExtractTiles, editFootprintFn,
+                                    sparseClipmapConfig.tileSampleSide, sparseMidMeshTerraceStep);
+                                applyChildSuppression = false;
+                                expectChildMaskNonZero = false;
+                            }
+                        } else if (emitSkirts) {
+                            fixtureIdx = MidMeshGpuExtractResources::SelectB13cFixture(
+                                gpuExtractTiles, editFootprintFn,
+                                sparseClipmapConfig.tileSampleSide, sparseMidMeshTerraceStep);
+                        } else if (emitRisers) {
+                            fixtureIdx = MidMeshGpuExtractResources::SelectB13bFixture(
+                                gpuExtractTiles, editFootprintFn,
+                                sparseClipmapConfig.tileSampleSide, sparseMidMeshTerraceStep);
+                        } else {
+                            fixtureIdx = MidMeshGpuExtractResources::SelectB13aFixture(
+                                gpuExtractTiles, editFootprintFn);
+                        }
+
                         if (fixtureIdx != UINT32_MAX) {
                             const auto& fixture = gpuExtractTiles[fixtureIdx];
                             // READ-ONLY: the tile's persistent CPU reference mesh (the exact
@@ -16991,15 +17038,19 @@ int RunSandbox(int argc, char* argv[]) {
                                 sparseClipmapTileCache.GetMidMeshTileCacheFacesBySlot(
                                     fixture.slot, cpuRefFaces, &refMergeCells, &refChildMask,
                                     &refContentVersion);
-                            // Only proceed if the cache reflects the SAME flat/simple state
-                            // the fixture selection assumed (mergeCells==1, childMask==0) and
-                            // the same content serial (no in-flight change).
-                            if (haveRef && refMergeCells == 1u && refChildMask == 0u &&
+                            // Only proceed if the cache reflects the SAME state the fixture
+                            // selection assumed: always mergeCells==1, the expected childMask
+                            // (==0 for B1.3a-c + the B1.3d fallback; !=0 for the B1.3d primary),
+                            // and the same content serial (no in-flight change).
+                            const bool childMaskOk = expectChildMaskNonZero
+                                ? (refChildMask != 0u)
+                                : (refChildMask == 0u);
+                            if (haveRef && refMergeCells == 1u && childMaskOk &&
                                 refContentVersion == fixture.meshContentVersion) {
                                 midMeshGpuExtractResources.RunB13aTopFaceDispatch(
                                     device->GetDevice(), fixture, cpuRefFaces,
                                     sparseMidMeshTerraceStep, fixture.meshContentVersion,
-                                    emitRisers, emitSkirts);
+                                    emitRisers, emitSkirts, applyChildSuppression, equalityMode);
                                 midMeshGpuExtractResources.PollB13aReadback();
                             }
                         }

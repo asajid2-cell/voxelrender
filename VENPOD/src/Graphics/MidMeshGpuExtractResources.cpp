@@ -1159,11 +1159,13 @@ Result<void> MidMeshGpuExtractResources::InitializeB13aTopFace(
     }
 
     // Top-face PSO. Root layout MUST match CS_MidMeshExtractTopFaces.hlsl:
-    //   b0: 7x 32-bit constants {tileSlot, debugBaseFace, faceCapacityPerTile,
-    //       terraceStep, emitRisers, emitSkirts, seaLevelY}
+    //   b0: 8x 32-bit constants {tileSlot, debugBaseFace, faceCapacityPerTile,
+    //       terraceStep, emitRisers, emitSkirts, seaLevelY, applyChildSuppression}
     //       (emitRisers: 0 = B1.3a top only, 1 = B1.3b + risers;
     //        emitSkirts: 0 = no border skirts, 1 = B1.3c + tile-border skirts;
-    //        seaLevelY: SEA_LEVEL_Y, passed so the GPU never hardcodes it)
+    //        seaLevelY: SEA_LEVEL_Y, passed so the GPU never hardcodes it;
+    //        applyChildSuppression: 0 = B1.3a-c (no suppression), 1 = B1.3d child-quadrant
+    //        suppression - a cell whose quadrant has a resident finer child emits nothing)
     //   t0: samples (root SRV)   u0: debug faces (root UAV)   u1: metadata (root UAV)
     const std::filesystem::path csPath =
         shaderPath / "Compute" / "CS_MidMeshExtractTopFaces.hlsl";
@@ -1175,7 +1177,7 @@ Result<void> MidMeshGpuExtractResources::InitializeB13aTopFace(
     ComputePipelineDesc desc;
     desc.computeShader = compileResult.value();
     desc.debugName = "CS_MidMeshExtractTopFaces";
-    desc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 7 }); // b0
+    desc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 8 }); // b0
     desc.rootParams.push_back({ RootParamType::ShaderResource, 0, 0, 1 }); // t0 samples
     desc.rootParams.push_back({ RootParamType::UnorderedAccess, 0, 0, 1 }); // u0 faces
     desc.rootParams.push_back({ RootParamType::UnorderedAccess, 1, 0, 1 }); // u1 metadata
@@ -1354,6 +1356,40 @@ uint32_t MidMeshGpuExtractResources::SelectB13cFixture(
     return UINT32_MAX;
 }
 
+uint32_t MidMeshGpuExtractResources::SelectB13dFixture(
+    const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
+    const std::function<bool(uint32_t)>& hasEditFootprint,
+    uint32_t sampleSide)
+{
+    if (sampleSide < 2u) {
+        return UINT32_MAX;
+    }
+    const uint32_t side = sampleSide;
+    // B1.3d INVERTS the childMask constraint: it REQUIRES childMask != 0 so the
+    // child-quadrant suppression rule actually fires (otherwise the increment removes
+    // nothing and the "suppression removed faces" gate could never be met). Still
+    // mergeCells==1 (the only path the CS handles), no edit footprint (the CPU suppresses
+    // edited cells), and a full sample grid. No height/solid scan is needed - suppression
+    // depends only on which quadrant has a resident child, not on the heights.
+    for (uint32_t i = 0; i < dirtyTiles.size(); ++i) {
+        const auto& t = dirtyTiles[i];
+        if (t.slot == UINT32_MAX || t.samples == nullptr || t.sampleCount == 0u) {
+            continue;
+        }
+        if (t.mergeCells != 1u || t.childMask == 0u) {
+            continue; // REQUIRE a resident child quadrant (childMask != 0)
+        }
+        if (hasEditFootprint && hasEditFootprint(t.slot)) {
+            continue;
+        }
+        if (t.sampleCount < static_cast<uint32_t>(side) * side) {
+            continue;
+        }
+        return i;
+    }
+    return UINT32_MAX;
+}
+
 bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     ID3D12Device* device,
     const Simulation::MidMeshGpuExtractDirtyTile& fixture,
@@ -1361,7 +1397,9 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     uint32_t terraceStep,
     uint64_t currentTileVersionForSlot,
     bool emitRisers,
-    bool emitSkirts)
+    bool emitSkirts,
+    bool applyChildSuppression,
+    bool equalityMode)
 {
     if (!m_b13aReady || !device) {
         return false;
@@ -1383,6 +1421,9 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     ctl.b13aTopFace = true;
     ctl.emitRisers = emitRisers; // B1.3b: poll labels b13b + the riser path was active
     ctl.emitSkirts = emitSkirts; // B1.3c: poll labels b13c + the skirt path was active
+    ctl.applyChildSuppression = applyChildSuppression; // B1.3d: suppression was active
+    ctl.equalityMode = equalityMode; // B1.3d: poll A/Bs in EQUALITY mode
+    ctl.childMask = fixture.childMask; // B1.3d: for the suppressed-cell count
     ctl.slot = 0u;       // the dedicated smoke buffers always use slot 0 / baseFace 0
     ctl.baseFace = 0u;
     ctl.version = fixture.meshContentVersion;
@@ -1462,18 +1503,20 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
 
     m_topFacePipeline.Bind(list);
     // b0: {tileSlot, debugBaseFace, faceCapacityPerTile, terraceStep, emitRisers,
-    //      emitSkirts, seaLevelY}. seaLevelY mirrors the CPU compile-time SEA_LEVEL_Y so
-    //      the GPU skirt rule never hardcodes it. Bit-cast the signed int into the uint slot.
+    //      emitSkirts, seaLevelY, applyChildSuppression}. seaLevelY mirrors the CPU
+    //      compile-time SEA_LEVEL_Y so the GPU skirt rule never hardcodes it; bit-cast the
+    //      signed int into the uint slot. applyChildSuppression gates the B1.3d cell skip.
     uint32_t seaLevelBits;
     const int32_t seaLevelY = Simulation::SEA_LEVEL_Y;
     std::memcpy(&seaLevelBits, &seaLevelY, sizeof(uint32_t));
-    const uint32_t consts[7] = {
+    const uint32_t consts[8] = {
         ctl.slot, ctl.baseFace, m_topFaceCapacityPerTile, m_b13aBuildTerraceStep,
         emitRisers ? 1u : 0u,
         emitSkirts ? 1u : 0u,
-        seaLevelBits
+        seaLevelBits,
+        applyChildSuppression ? 1u : 0u
     };
-    m_topFacePipeline.SetRoot32BitConstants(list, 0, 7, consts);
+    m_topFacePipeline.SetRoot32BitConstants(list, 0, 8, consts);
     list->SetComputeRootShaderResourceView(1, m_smokeSampleBuffer.GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(2, m_smokeFaceBuffer.GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(3, m_smokeMetaBuffer.GetGPUVirtualAddress());
@@ -1564,6 +1607,8 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     m_b13aStats.dispatched = true;
     m_b13aStats.emitRisers = emitRisers;
     m_b13aStats.emitSkirts = emitSkirts;
+    m_b13aStats.applyChildSuppression = applyChildSuppression;
+    m_b13aStats.equalityMode = equalityMode;
     m_b13aStats.tileSlot = fixture.slot;        // report the REAL cache slot (fixture)
     m_b13aStats.fixtureMergeCells = fixture.mergeCells;
     m_b13aStats.fixtureChildMask = fixture.childMask;
@@ -1577,13 +1622,17 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     m_b13aStats.verified = keepVerified;
     m_b13aStats.verifyCount = keepVerifyCount;
 
-    // Label: b13c if skirts are on (the superset increment), else b13b if risers, else b13a.
-    const char* const modeLabel = emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a");
+    // Label: b13d if child suppression is on (the face-REMOVING increment), else b13c if
+    // skirts, else b13b if risers, else b13a (each a superset of the prior, except b13d
+    // which is the first to REMOVE faces vs the b13c superset).
+    const char* const modeLabel = applyChildSuppression
+        ? "b13d"
+        : (emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a"));
     spdlog::info(
-        "GPU_EXTRACT_B13A mode={} fixtureSlot={} mergeCells={} childMask={} cpuRefFaces={} "
+        "GPU_EXTRACT_B13A mode={} abMode={} fixtureSlot={} mergeCells={} childMask={} cpuRefFaces={} "
         "dispatchGpuUs={:.2f} barrierGpuUs={:.2f} cpuSubmitUs={:.2f} commitGate={} "
         "dispatchedVersion={} currentVersion={}",
-        modeLabel,
+        modeLabel, equalityMode ? "equal" : "contain",
         fixture.slot, fixture.mergeCells, fixture.childMask,
         m_b13aStats.cpuRefFaceCount, dispatchUs, barrierUs, cpuSubmitUs,
         stale ? "DISCARD_STALE" : "PASS",
@@ -1636,6 +1685,8 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     // Count them so the gate can require riser faces > 0 (the increment really added risers).
     const bool emitRisers = slot.tile.emitRisers;
     const bool emitSkirts = slot.tile.emitSkirts;
+    const bool applyChildSuppression = slot.tile.applyChildSuppression;
+    const bool equalityMode = slot.tile.equalityMode;
     uint32_t gpuRiserFaces = 0u;
     for (const auto& f : gpuFaces) {
         if (Simulation::SparseSurfacePayloadDirection(f.payload) !=
@@ -1670,16 +1721,41 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
         }
     }
 
-    // The CPU reference = this dispatch's captured FULL meshCacheFaces (tops + risers +
-    // skirts). CONTAINMENT: every GPU face (top + B1.3b risers) must appear in the CPU mesh
-    // with >= its multiplicity, and extraGpuFaces MUST be 0 (a GPU face absent from the CPU
-    // mesh is a bug). missingCpuFaces is EXPECTED (the CPU still has border skirts / water /
-    // LOD the GPU does not emit) but is SMALLER than B1.3a once risers are covered.
+    // B1.3d: COUNT the cells the GPU SUPPRESSED (whole-cell skip) because their quadrant has
+    // a resident finer child. This mirrors the shader's MidMeshCellSuppressedByChild exactly
+    // (mergeCells==1 -> midCell==cx / midCellZ==cz; qx/qz from cellsPerRow; childMask bit
+    // qz*2+qx). It is the "suppression removed faces" signal: > 0 confirms the new B1.3d code
+    // path actually fired on this fixture. 0 when suppression is off.
+    uint32_t gpuSuppressedCells = 0u;
+    if (applyChildSuppression && slot.tile.childMask != 0u && slot.tile.sampleSide > 1u) {
+        const uint32_t cellsPerRow = slot.tile.sampleSide - 1u;
+        for (uint32_t cz = 0u; cz < cellsPerRow; ++cz) {
+            const uint32_t qz = (cz * 2u >= cellsPerRow) ? 1u : 0u;
+            for (uint32_t cx = 0u; cx < cellsPerRow; ++cx) {
+                const uint32_t qx = (cx * 2u >= cellsPerRow) ? 1u : 0u;
+                if ((slot.tile.childMask & (1u << (qz * 2u + qx))) != 0u) {
+                    ++gpuSuppressedCells;
+                }
+            }
+        }
+    }
+
+    // The CPU reference = this dispatch's captured FULL meshCacheFaces. For B1.3a-c
+    // (Containment): every GPU face must appear in the CPU mesh, extraGpuFaces==0;
+    // missingCpuFaces is EXPECTED (CPU has water/LOD the GPU defers). For B1.3d
+    // (Equality, run with water+cull off so the only variable is suppression): the GPU now
+    // emits the EXACT same set the CPU does - tops+risers+skirts MINUS the child-suppressed
+    // quadrants - so missingCpuFaces MUST be 0 AND extraGpuFaces MUST be 0. A suppression
+    // that removes too much -> missingCpuFaces>0; too little -> extraGpuFaces>0.
     const std::vector<Simulation::SparseSurfaceFace>& cpuFaces = slot.tile.cpuReferenceFaces;
+    const MidMeshFaceAbMode abMode =
+        equalityMode ? MidMeshFaceAbMode::Equal : MidMeshFaceAbMode::Containment;
     const MidMeshFaceAbResult ab = CompareMidMeshFacesMultiset(
-        gpuFaces, cpuFaces, MidMeshFaceAbMode::Containment, gpuStatus, 8u);
-    // Label: b13c if skirts were on (the superset increment), else b13b/b13a.
-    const char* const modeLabel = emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a");
+        gpuFaces, cpuFaces, abMode, gpuStatus, 8u);
+    // Label: b13d if child suppression was on (the face-REMOVING increment), else b13c/b/a.
+    const char* const modeLabel = applyChildSuppression
+        ? "b13d"
+        : (emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a"));
     LogMidMeshFaceAbResult(modeLabel, ab);
 
     slot.pending = false;
@@ -1689,7 +1765,10 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     ++m_b13aAbVerifyCount;
     m_b13aStats.emitRisers = emitRisers;
     m_b13aStats.emitSkirts = emitSkirts;
+    m_b13aStats.applyChildSuppression = applyChildSuppression;
+    m_b13aStats.equalityMode = equalityMode;
     m_b13aStats.gpuSkirtFaces = gpuSkirtFaces;
+    m_b13aStats.gpuSuppressedCells = gpuSuppressedCells;
     m_b13aStats.gpuFaceCount = gpuFaceCount;
     m_b13aStats.gpuStatusOverflow = gpuStatus;
     m_b13aStats.verified = true;
@@ -1705,15 +1784,19 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
 
     // Use ab.cpuFaceCount (a captured value), NOT cpuFaces.size() - cpuFaces aliases
     // slot.tile.cpuReferenceFaces which was just cleared by `slot.tile = {}` above.
-    // gpuRiserFaces > 0 is part of the B1.3b gate (the increment really added risers).
+    // gpuRiserFaces > 0 is part of the B1.3b gate (the increment really added risers);
+    // gpuSuppressedCells > 0 is the B1.3d gate (suppression actually removed faces).
+    // For EQUALITY mode the gate is missing==0 AND extra==0 (gpuFaces==cpuMeshFaces).
     spdlog::info(
-        "B13A_VERIFY mode={} abVerifyCount={} match={} containSubset={} gpuFaces={} "
-        "gpuRiserFaces={} gpuSkirtFaces={} cpuMeshFaces={} extraGpuFaces={} missingCpuFaces={} "
-        "multiplicityMismatches={} gpuStatus={}",
-        modeLabel,
+        "B13A_VERIFY mode={} abMode={} abVerifyCount={} match={} equalityHeld={} containSubset={} "
+        "gpuFaces={} gpuRiserFaces={} gpuSkirtFaces={} gpuSuppressedCells={} cpuMeshFaces={} "
+        "extraGpuFaces={} missingCpuFaces={} multiplicityMismatches={} gpuStatus={}",
+        modeLabel, equalityMode ? "equal" : "contain",
         m_b13aAbVerifyCount, ab.match ? 1 : 0,
+        (equalityMode && ab.missingCpuFaces == 0u && ab.extraGpuFaces == 0u &&
+         ab.multiplicityMismatches == 0u && gpuStatus == 0u) ? 1 : 0,
         (ab.extraGpuFaces == 0u && gpuStatus == 0u) ? 1 : 0,
-        gpuFaceCount, gpuRiserFaces, gpuSkirtFaces, ab.cpuFaceCount,
+        gpuFaceCount, gpuRiserFaces, gpuSkirtFaces, gpuSuppressedCells, ab.cpuFaceCount,
         ab.extraGpuFaces, ab.missingCpuFaces, ab.multiplicityMismatches, gpuStatus);
     return true;
 }
