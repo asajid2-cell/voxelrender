@@ -3043,13 +3043,27 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseMidMeshGpuExtractB13fa =
         sparseMidMeshGpuExtract &&
         ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_B13FA", 0u) != 0u;
-    // The B1.3a/b/c/d/e/f-a top-face path reuses the smoke compute side (queue/fence/readback
-    // ring), so the smoke compute objects must be stood up whenever ANY path is enabled.
-    // B1.3b-f-a share the B1.3a top-face PSO, so they also need the B1.3a init to run.
+    // Phase B1.3f-b: the WATER + ALL-AIR-FILL increment - the GPU extraction generalizes from
+    // SOLID-only to the FULL WATER-AWARE aggregation (water samples participate, the shoal
+    // min-height override, a water-only block) AND emits the all-air sea-level FILL, a faithful
+    // port of extractTileMesh's emitWater path. The fixture REQUIRES a tile bearing WATER and/or
+    // AIR samples (so a water top and/or the fill actually emit); A/B is FULL EQUALITY against
+    // the CPU mesh (missingCpuFaces==0 AND extraGpuFaces==0) with water ON. Because the GPU still
+    // does not replicate distance/frustum cull, EQUALITY is only sound with cull OFF, so this run
+    // REQUIRES VENPOD_SPARSE_MID_MESH_WATER=1 (the production default - water is the new variable)
+    // and VENPOD_SPARSE_MID_MESH_DISTANCE_CULL=0. Reuses the B1.3a-f-a top-face PSO with the new
+    // gEmitWater root const; implies risers + skirts on (the b13c superset, water-aware). Default 0.
+    const bool sparseMidMeshGpuExtractB13fb =
+        sparseMidMeshGpuExtract &&
+        ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_B13FB", 0u) != 0u;
+    // The B1.3a..f-b top-face path reuses the smoke compute side (queue/fence/readback ring),
+    // so the smoke compute objects must be stood up whenever ANY path is enabled. B1.3b-f-b
+    // share the B1.3a top-face PSO, so they also need the B1.3a init to run.
     const bool sparseMidMeshGpuExtractTopFacePath =
         sparseMidMeshGpuExtractB13a || sparseMidMeshGpuExtractB13b ||
         sparseMidMeshGpuExtractB13c || sparseMidMeshGpuExtractB13d ||
-        sparseMidMeshGpuExtractB13e || sparseMidMeshGpuExtractB13fa;
+        sparseMidMeshGpuExtractB13e || sparseMidMeshGpuExtractB13fa ||
+        sparseMidMeshGpuExtractB13fb;
     const bool sparseMidMeshGpuExtractComputeSide =
         sparseMidMeshGpuExtractSmoke || sparseMidMeshGpuExtractTopFacePath;
     // Phase B1.3.0 GATED explicit readback WAIT. Default 0 = the readback ring polls
@@ -5916,15 +5930,27 @@ int RunSandbox(int argc, char* argv[]) {
         constexpr int32_t kOrbitSamples = 16;
         const float anchorOrbitRadius = std::clamp(sparseStressCameraRadius, 32.0f, 320.0f);
         const bool compactWaterlineOrbit = anchorOrbitRadius <= 80.0f;
-        const int32_t kSearchRadius = compactWaterlineOrbit ? 1536 : 4096;
+        // Test-only override: the production terrain pushes basins past the ~10k render
+        // horizon, so the default 1536/4096 search never reaches water from a spawn-landmass
+        // spawn. VENPOD_SPARSE_STRESS_CAMERA_WATER_SEARCH_RADIUS widens it so a water/air-fill
+        // fixture run (B1.3f-b) can actually anchor over water. Default 0 keeps production
+        // behavior byte-identical. Does NOT touch the CPU extractor or any visible geometry.
+        const int32_t kDefaultSearchRadius = compactWaterlineOrbit ? 1536 : 4096;
+        const int32_t kSearchRadiusOverride = static_cast<int32_t>(
+            ReadUIntEnv("VENPOD_SPARSE_STRESS_CAMERA_WATER_SEARCH_RADIUS", 0u));
+        const int32_t kSearchRadius =
+            (kSearchRadiusOverride > 0) ? kSearchRadiusOverride : kDefaultSearchRadius;
         const float compactMinWaterDepth = 36.0f;
         const float compactIdealWaterDepth = 58.0f;
         const float transitionMinWaterDepth = 40.0f;
         const float transitionIdealWaterDepth = 68.0f;
         const float requiredWaterDepth = compactWaterlineOrbit ? compactMinWaterDepth : transitionMinWaterDepth;
+        float probeMinHeight = std::numeric_limits<float>::infinity();
+        int32_t probeMinX = centerX, probeMinZ = centerZ;
         for (int32_t z = centerZ - kSearchRadius; z <= centerZ + kSearchRadius; z += kSampleStep) {
             for (int32_t x = centerX - kSearchRadius; x <= centerX + kSearchRadius; x += kSampleStep) {
                 const float height = terrain.HeightAt(x, z);
+                if (height < probeMinHeight) { probeMinHeight = height; probeMinX = x; probeMinZ = z; }
                 if (height > static_cast<float>(Simulation::SEA_LEVEL_Y) - requiredWaterDepth) {
                     continue;
                 }
@@ -6021,9 +6047,15 @@ int RunSandbox(int argc, char* argv[]) {
                 bestScore);
         } else {
             spdlog::warn(
-                "Sparse stress water anchor requested but no basin found near ({}, {})",
+                "Sparse stress water anchor requested but no basin found near ({}, {}); "
+                "probeMinHeight={:.1f} at ({}, {}) seaLevel={} (terrain min within {}u of spawn)",
                 centerX,
-                centerZ);
+                centerZ,
+                probeMinHeight,
+                probeMinX,
+                probeMinZ,
+                static_cast<int32_t>(Simulation::SEA_LEVEL_Y),
+                kSearchRadius);
         }
     }
 
@@ -17006,17 +17038,18 @@ int RunSandbox(int argc, char* argv[]) {
                     if (sparseMidMeshGpuExtractTopFacePath &&
                         midMeshGpuExtractResources.B13aReady() &&
                         !gpuExtractTiles.empty()) {
-                        // B1.3f-a is the latest increment (LOD MERGE, mergeCells>1) and takes
-                        // precedence; it implies risers + skirts on (the b13c superset) and A/Bs
-                        // in EQUALITY mode against the CPU's merged mesh. B1.3e is the prior
-                        // face-REMOVING increment (edit footprint); B1.3d (child suppression).
-                        // Else B1.3c/b/a.
+                        // B1.3f-b is the latest increment (WATER + ALL-AIR FILL) and takes top
+                        // precedence; it implies risers + skirts on (the b13c superset, water-
+                        // aware) + gEmitWater and A/Bs in EQUALITY mode against the CPU's full
+                        // water-on mesh. B1.3f-a is the prior LOD-MERGE increment; B1.3e the
+                        // edit footprint; B1.3d child suppression. Else B1.3c/b/a.
+                        const bool wantWater = sparseMidMeshGpuExtractB13fb;
                         const bool wantLodMerge = sparseMidMeshGpuExtractB13fa;
                         const bool wantEditSkip = sparseMidMeshGpuExtractB13e;
                         const bool wantSuppression = sparseMidMeshGpuExtractB13d;
                         const bool emitSkirts =
                             sparseMidMeshGpuExtractB13c || wantSuppression || wantEditSkip ||
-                            wantLodMerge;
+                            wantLodMerge || wantWater;
                         const bool emitRisers = sparseMidMeshGpuExtractB13b || emitSkirts;
                         const auto editFootprintFn = [&](uint32_t slot) {
                             return sparseClipmapTileCache
@@ -17059,6 +17092,45 @@ int RunSandbox(int argc, char* argv[]) {
                                 rMerged, rClean, rMax);
                         }
 
+                        // B1.3f-b DIAGNOSTIC: count tiles bearing WATER and/or AIR samples (the
+                        // water/air-fill fixture needs one) across the dirty + resident pools, plus
+                        // how many bear WATER specifically (so the report shows whether a water-
+                        // surface tile is reachable at all in this scene/camera path). One line/build.
+                        if (wantWater) {
+                            const uint32_t side = sparseClipmapConfig.tileSampleSide;
+                            const uint32_t needed = side * side;
+                            auto countWaterAir =
+                                [&](const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& pool,
+                                    uint32_t& water, uint32_t& air, uint32_t& clean) {
+                                water = 0u; air = 0u; clean = 0u;
+                                for (const auto& dt : pool) {
+                                    if (dt.samples == nullptr || dt.sampleCount < needed) { continue; }
+                                    bool hasW = false, hasA = false;
+                                    for (uint32_t s = 0u; s < needed; ++s) {
+                                        const uint32_t m = (dt.samples[s] >> 16u) & 0xFFu;
+                                        if (m == 2u) { hasW = true; }
+                                        else if (m == 0u) { hasA = true; }
+                                    }
+                                    if (hasW) { ++water; }
+                                    if (hasA) { ++air; }
+                                    if ((hasW || hasA) && dt.childMask == 0u &&
+                                        !editFootprintFn(dt.slot)) { ++clean; }
+                                }
+                            };
+                            uint32_t dW = 0u, dA = 0u, dC = 0u;
+                            countWaterAir(gpuExtractTiles, dW, dA, dC);
+                            std::vector<Simulation::MidMeshGpuExtractDirtyTile> probePool;
+                            sparseClipmapTileCache.CollectAllResidentMidMeshGpuExtractTiles(probePool);
+                            uint32_t rW = 0u, rA = 0u, rC = 0u;
+                            countWaterAir(probePool, rW, rA, rC);
+                            spdlog::info(
+                                "GPU_EXTRACT_B13FB_DIRTY dirtyTotal={} dirtyWater={} dirtyAir={} "
+                                "dirtyWaterAirClean={} residentTotal={} residentWater={} residentAir={} "
+                                "residentWaterAirClean={}",
+                                static_cast<uint32_t>(gpuExtractTiles.size()), dW, dA, dC,
+                                static_cast<uint32_t>(probePool.size()), rW, rA, rC);
+                        }
+
                         // B1.3d/e fixture selection:
                         //   * B1.3e PRIMARY = an EDITED tile (SelectB13eFixture) -> the edit skip
                         //     fires, A/B in EQUALITY mode (the edit-suppression proof). FALL BACK to
@@ -17070,18 +17142,81 @@ int RunSandbox(int argc, char* argv[]) {
                         uint32_t fixtureIdx = UINT32_MAX;
                         bool applyChildSuppression = false; // active only on a childMask!=0 fixture
                         bool applyEditSkip = false;         // B1.3e: active on an edited fixture
-                        bool equalityMode = false;          // B1.3d/e/f-a A/Bs in EQUALITY mode
+                        bool emitWater = false;             // B1.3f-b: water-aware aggregation + fill
+                        bool equalityMode = false;          // B1.3d/e/f-a/f-b A/Bs in EQUALITY mode
                         bool expectChildMaskNonZero = false; // gate: which childMask the cache must show
                         bool expectMergeGreaterThanOne = false; // B1.3f-a: cache must show mergeCells>1
+                        bool allowAnyMerge = false; // B1.3f-b: equality holds at ANY mergeCells (water-
+                                                    // aware aggregation matches the CPU for any LOD), so
+                                                    // a water fixture is accepted regardless of mergeCells.
                         std::vector<Simulation::MidMeshEditXzBox> editBoxes; // B1.3e fixture's boxes
                         // The fixture index normally addresses gpuExtractTiles (the build's dirty
-                        // set). B1.3f-a may instead pull from ALL resident tiles (a stable far
-                        // merged tile is rarely in the per-build dirty set), so route the final
-                        // dispatch through this pool pointer.
+                        // set). B1.3f-a/f-b may instead pull from ALL resident tiles (a stable far
+                        // merged / water tile is rarely in the per-build dirty set), so route the
+                        // final dispatch through this pool pointer.
                         std::vector<Simulation::MidMeshGpuExtractDirtyTile> b13faResidentPool;
                         const std::vector<Simulation::MidMeshGpuExtractDirtyTile>* fixturePool =
                             &gpuExtractTiles;
-                        if (wantLodMerge) {
+                        if (wantWater) {
+                            // B1.3f-b PRIMARY = a tile bearing WATER and/or AIR samples (so a
+                            // water-surface top and/or the all-air sea-level fill actually emit).
+                            // A/B in EQUALITY mode WITH WATER ON (the water + air-fill proof).
+                            // Search the build's dirty set FIRST; a water tile near the shoreline
+                            // is usually re-extracted as the camera moves, but if none is dirty,
+                            // search ALL RESIDENT tiles (read-only). FALL BACK to a non-water
+                            // border tile (SelectB13c) -> EQUALITY re-confirms the water code is
+                            // inert on a pure-land tile (no water/air faces, still equal). Prefer
+                            // childMask==0 + no edit footprint so water/air-fill is the only
+                            // variable. mergeCells unconstrained (a water tile at any LOD is
+                            // valid); the merged-water sub-fixture (requireMerged) is tried first
+                            // so the report exercises water at mergeCells>1 when one exists.
+                            equalityMode = true;
+                            emitWater = true;
+                            allowAnyMerge = true; // equality holds at any LOD with water-aware aggregation
+                            sparseClipmapTileCache.CollectAllResidentMidMeshGpuExtractTiles(
+                                b13faResidentPool);
+                            // Priority ladder - prefer a tile that actually emits a WATER surface,
+                            // then a merged-water tile, then ANY water/air-fill tile, then pure land.
+                            // Each rung tries the build's dirty set first, then ALL resident tiles.
+                            // helper packs (pool, requireMerged, requireWater) and routes fixturePool.
+                            auto trySelect = [&](bool requireMerged, bool requireWater) -> bool {
+                                uint32_t idx = MidMeshGpuExtractResources::SelectB13fbFixture(
+                                    gpuExtractTiles, editFootprintFn,
+                                    sparseClipmapConfig.tileSampleSide, requireMerged, requireWater);
+                                if (idx != UINT32_MAX) {
+                                    fixturePool = &gpuExtractTiles;
+                                    fixtureIdx = idx;
+                                    expectMergeGreaterThanOne = requireMerged;
+                                    return true;
+                                }
+                                idx = MidMeshGpuExtractResources::SelectB13fbFixture(
+                                    b13faResidentPool, editFootprintFn,
+                                    sparseClipmapConfig.tileSampleSide, requireMerged, requireWater);
+                                if (idx != UINT32_MAX) {
+                                    fixturePool = &b13faResidentPool;
+                                    fixtureIdx = idx;
+                                    expectMergeGreaterThanOne = requireMerged;
+                                    return true;
+                                }
+                                return false;
+                            };
+                            // (a) merged WATER tile, (b) any WATER tile, (c) merged water/air tile,
+                            // (d) any water/air tile.
+                            const bool picked =
+                                trySelect(/*merged=*/true,  /*water=*/true)  ||
+                                trySelect(/*merged=*/false, /*water=*/true)  ||
+                                trySelect(/*merged=*/true,  /*water=*/false) ||
+                                trySelect(/*merged=*/false, /*water=*/false);
+                            if (!picked) {
+                                // FALL BACK: non-water border tile, water code inert -> EQUALITY
+                                // re-confirms a pure-land tile stays equal (no water/air faces).
+                                fixturePool = &gpuExtractTiles;
+                                fixtureIdx = MidMeshGpuExtractResources::SelectB13cFixture(
+                                    gpuExtractTiles, editFootprintFn,
+                                    sparseClipmapConfig.tileSampleSide, sparseMidMeshTerraceStep);
+                                expectMergeGreaterThanOne = false;
+                            }
+                        } else if (wantLodMerge) {
                             // B1.3f-a PRIMARY = a far/LOD-merged tile (mergeCells>1) -> the per-BLOCK
                             // path aggregates mergeCells x mergeCells cells, A/B in EQUALITY mode (the
                             // LOD-merge proof). Search the build's dirty set FIRST; if no merged tile
@@ -17197,14 +17332,14 @@ int RunSandbox(int argc, char* argv[]) {
                                 : (refChildMask == 0u);
                             const bool mergeCellsOk = expectMergeGreaterThanOne
                                 ? (refMergeCells > 1u)
-                                : (refMergeCells == 1u);
+                                : (allowAnyMerge ? true : (refMergeCells == 1u));
                             if (haveRef && mergeCellsOk && childMaskOk &&
                                 refContentVersion == fixture.meshContentVersion) {
                                 midMeshGpuExtractResources.RunB13aTopFaceDispatch(
                                     device->GetDevice(), fixture, cpuRefFaces,
                                     sparseMidMeshTerraceStep, fixture.meshContentVersion,
                                     emitRisers, emitSkirts, applyChildSuppression, equalityMode,
-                                    applyEditSkip, editBoxes);
+                                    applyEditSkip, editBoxes, emitWater);
                                 midMeshGpuExtractResources.PollB13aReadback();
                             }
                         }

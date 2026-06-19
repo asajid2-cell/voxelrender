@@ -703,9 +703,14 @@ void MidMeshGpuExtractResources::ComputeB13cSkirtFacesCpu(
         return q;
     };
     auto quantY = [&](int32_t y) -> int32_t { return floorDiv(y, step) * step; };
-    // B1.3f-a: block aggregation mirror of the shader MidMeshAggregateSolidBlock (WATER-OFF):
-    // MAX quantized solid height over [x0,x1)x[z0,z1) clamped to the tile, z-outer/x-inner so
-    // the tie-break material (>= update) matches. present == has >=1 solid sample.
+    auto isWater = [](uint32_t m) -> bool { return m == 2u; };
+    const bool emitWater = tile.emitWater;
+    // B1.3f-a/b: SKIRT-ONLY block aggregation mirror of the shader MidMeshAggregateBlock.
+    // Skirts emit on SOLID blocks only (`!block.water`), so this returns `present` ONLY for a
+    // block whose aggregated result is SOLID (a water-only / all-air block emits no skirt and
+    // is reported !present here). It must therefore match the SOLID-block height/material the
+    // shader would use, INCLUDING the shoal min-height override when water is on (a mixed
+    // water+solid block is solid but its top sits at the LOWEST solid sample, not the MAX).
     auto aggregateBlock = [&](uint32_t x0, uint32_t z0, uint32_t x1, uint32_t z1,
                               bool& present, int32_t& outHeight, uint32_t& outMaterial) {
         present = false; outHeight = 0; outMaterial = 0u;
@@ -713,17 +718,38 @@ void MidMeshGpuExtractResources::ComputeB13cSkirtFacesCpu(
         z0 = std::min(z0, side - 1u);
         x1 = std::max(x0 + 1u, std::min(x1, side));
         z1 = std::max(z0 + 1u, std::min(z1, side));
+        bool solid = false;
+        uint32_t waterCount = 0u;
+        int32_t minSolidHeight = 0; uint32_t minSolidMaterial = 0u; bool haveMinSolid = false;
         for (uint32_t zz = z0; zz < z1; ++zz) {
             for (uint32_t xx = x0; xx < x1; ++xx) {
                 const uint32_t ss = tile.samples[zz * stride + xx];
                 const uint32_t mm = decodeMaterial(ss);
-                if (!isSolid(mm)) { continue; }
+                if (!emitWater && isWater(mm)) { continue; }
+                const bool sSolid = isSolid(mm);
+                const bool sWater = isWater(mm);
+                if (!sSolid && !sWater) { continue; }
                 const int32_t hh = quantY(decodeY(ss));
-                if (!present || hh >= outHeight) {
-                    present = true; outHeight = hh; outMaterial = mm;
+                if (sSolid) {
+                    if (!haveMinSolid || hh < minSolidHeight) {
+                        minSolidHeight = hh; minSolidMaterial = mm; haveMinSolid = true;
+                    }
+                    if (!present || !solid || hh >= outHeight) {
+                        present = true; solid = true; outHeight = hh; outMaterial = mm;
+                    }
+                } else {
+                    ++waterCount;
+                    if (!present) { present = true; /* water block; solid stays false */
+                        outHeight = hh; outMaterial = mm; }
                 }
             }
         }
+        // Shoal override (mixed water+solid -> hug the lowest solid).
+        if (present && solid && waterCount > 0u && haveMinSolid) {
+            outHeight = minSolidHeight; outMaterial = minSolidMaterial;
+        }
+        // Skirts are SOLID-only: report !present for a water-only block so no skirt is counted.
+        if (present && !solid) { present = false; outHeight = 0; outMaterial = 0u; }
     };
     // FNV-1a over (x,y,z,0x9E3779B9); low byte = variant. Mirrors MidMeshPackVoxel.
     auto packVoxel = [](uint32_t material, int32_t x, int32_t y, int32_t z) -> uint32_t {
@@ -1238,7 +1264,7 @@ Result<void> MidMeshGpuExtractResources::InitializeB13aTopFace(
     ComputePipelineDesc desc;
     desc.computeShader = compileResult.value();
     desc.debugName = "CS_MidMeshExtractTopFaces";
-    desc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 11 }); // b0
+    desc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 12 }); // b0 (B1.3f-b: +gEmitWater)
     desc.rootParams.push_back({ RootParamType::ShaderResource, 0, 0, 1 }); // t0 samples
     desc.rootParams.push_back({ RootParamType::UnorderedAccess, 0, 0, 1 }); // u0 faces
     desc.rootParams.push_back({ RootParamType::UnorderedAccess, 1, 0, 1 }); // u1 metadata
@@ -1524,6 +1550,58 @@ uint32_t MidMeshGpuExtractResources::SelectB13faFixture(
     return UINT32_MAX;
 }
 
+uint32_t MidMeshGpuExtractResources::SelectB13fbFixture(
+    const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
+    const std::function<bool(uint32_t)>& hasEditFootprint,
+    uint32_t sampleSide,
+    bool requireMerged,
+    bool requireWater)
+{
+    if (sampleSide < 2u) {
+        return UINT32_MAX;
+    }
+    const uint32_t side = sampleSide;
+    const uint32_t needed = side * side;
+    // B1.3f-b REQUIRES a tile that bears WATER and/or AIR samples (so a water top and/or the
+    // all-air sea-level fill actually emit). Scan the tile's samples for any Water (material
+    // 2) or Air (material 0). To isolate water/air-fill as the only new variable, prefer
+    // childMask==0 + no edit footprint. `requireMerged` demands a LOD-merged tile (mergeCells>1)
+    // for the merged-water sub-fixture; otherwise mergeCells is unconstrained.
+    for (uint32_t i = 0; i < dirtyTiles.size(); ++i) {
+        const auto& t = dirtyTiles[i];
+        if (t.slot == UINT32_MAX || t.samples == nullptr || t.sampleCount == 0u) {
+            continue;
+        }
+        if (t.childMask != 0u) {
+            continue; // isolate from child suppression
+        }
+        if (requireMerged ? (t.mergeCells <= 1u) : false) {
+            continue; // merged-water sub-fixture demands a LOD-merged tile
+        }
+        if (hasEditFootprint && hasEditFootprint(t.slot)) {
+            continue; // no edit footprint (isolate the edit skip out)
+        }
+        if (t.sampleCount < needed) {
+            continue;
+        }
+        // Scan for at least one WATER (and, when not requireWater, AIR) sample (material
+        // decode mirrors UnpackMidHeightSurfaceSampleMaterial: (sample >> 16) & 0xFF).
+        bool bearsWater = false;
+        bool bearsAir = false;
+        for (uint32_t s = 0u; s < needed; ++s) {
+            const uint32_t material = (t.samples[s] >> 16u) & 0xFFu;
+            if (material == 2u /*Water*/) { bearsWater = true; if (requireWater) { break; } }
+            else if (material == 0u /*Air*/) { bearsAir = true; }
+        }
+        const bool qualifies = requireWater ? bearsWater : (bearsWater || bearsAir);
+        if (!qualifies) {
+            continue;
+        }
+        return i;
+    }
+    return UINT32_MAX;
+}
+
 bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     ID3D12Device* device,
     const Simulation::MidMeshGpuExtractDirtyTile& fixture,
@@ -1535,7 +1613,8 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     bool applyChildSuppression,
     bool equalityMode,
     bool applyEditSkip,
-    const std::vector<Simulation::MidMeshEditXzBox>& editBoxes)
+    const std::vector<Simulation::MidMeshEditXzBox>& editBoxes,
+    bool emitWater)
 {
     if (!m_b13aReady || !device) {
         return false;
@@ -1574,6 +1653,7 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     ctl.emitSkirts = emitSkirts; // B1.3c: poll labels b13c + the skirt path was active
     ctl.applyChildSuppression = applyChildSuppression; // B1.3d: suppression was active
     ctl.applyEditSkip = applyEditSkip; // B1.3e: edit-footprint suppression was active
+    ctl.emitWater = emitWater; // B1.3f-b: water-aware aggregation + all-air fill was active
     ctl.equalityMode = equalityMode; // B1.3d: poll A/Bs in EQUALITY mode
     ctl.mergeCells = std::max(1u, fixture.mergeCells); // B1.3f-a: block span for the poll mirrors
     ctl.childMask = fixture.childMask; // B1.3d: for the suppressed-cell count
@@ -1686,7 +1766,8 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     std::memcpy(&seaLevelBits, &seaLevelY, sizeof(uint32_t));
     // B1.3e: gEditBoxBase=0 (the dedicated edit-box buffer holds this ONE tile's boxes at
     // base 0); gEditBoxCount=0 when not edit-skipping so the shader's edit loop never runs.
-    const uint32_t consts[11] = {
+    // B1.3f-b: gEmitWater gates the water-aware aggregation + all-air sea-level fill.
+    const uint32_t consts[12] = {
         ctl.slot, ctl.baseFace, m_topFaceCapacityPerTile, m_b13aBuildTerraceStep,
         emitRisers ? 1u : 0u,
         emitSkirts ? 1u : 0u,
@@ -1694,9 +1775,10 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
         applyChildSuppression ? 1u : 0u,
         applyEditSkip ? 1u : 0u,
         0u,                                       // gEditBoxBase
-        applyEditSkip ? editBoxCount : 0u         // gEditBoxCount
+        applyEditSkip ? editBoxCount : 0u,        // gEditBoxCount
+        emitWater ? 1u : 0u                       // gEmitWater (B1.3f-b)
     };
-    m_topFacePipeline.SetRoot32BitConstants(list, 0, 11, consts);
+    m_topFacePipeline.SetRoot32BitConstants(list, 0, 12, consts);
     list->SetComputeRootShaderResourceView(1, m_smokeSampleBuffer.GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(2, m_smokeFaceBuffer.GetGPUVirtualAddress());
     list->SetComputeRootUnorderedAccessView(3, m_smokeMetaBuffer.GetGPUVirtualAddress());
@@ -1800,6 +1882,7 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     m_b13aStats.editBoxCount = applyEditSkip ? editBoxCount : 0u;
     m_b13aStats.editBoxOverflow = 0u; // overflow already early-returned above
     m_b13aStats.editBoxBytes = editBoxBytesUploaded;
+    m_b13aStats.emitWater = emitWater;
     m_b13aStats.equalityMode = equalityMode;
     m_b13aStats.tileSlot = fixture.slot;        // report the REAL cache slot (fixture)
     m_b13aStats.fixtureMergeCells = fixture.mergeCells;
@@ -1814,14 +1897,17 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     m_b13aStats.verified = keepVerified;
     m_b13aStats.verifyCount = keepVerifyCount;
 
-    // Label: b13e if edit skip is on (this increment's face-REMOVING source), else b13d if
-    // child suppression, else b13c if skirts, else b13b if risers, else b13a (each a superset
-    // of the prior, except b13d/e which REMOVE faces vs the b13c superset).
-    const char* const modeLabel = applyEditSkip
-        ? "b13e"
-        : (applyChildSuppression
-               ? "b13d"
-               : (emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a")));
+    // Label: b13fb if the WATER + all-air-fill path is on (this increment owns its own corpus
+    // label so the stage can tell increments apart - the prior code logged it under b13c).
+    // Else b13e if edit skip is on (a face-REMOVING source), else b13d if child suppression,
+    // else b13c if skirts, else b13b if risers, else b13a (each a superset of the prior).
+    const char* const modeLabel = emitWater
+        ? "b13fb"
+        : (applyEditSkip
+               ? "b13e"
+               : (applyChildSuppression
+                      ? "b13d"
+                      : (emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a"))));
     spdlog::info(
         "GPU_EXTRACT_B13A mode={} abMode={} fixtureSlot={} mergeCells={} childMask={} cpuRefFaces={} "
         "editBoxes={} editBoxBytes={} dispatchGpuUs={:.2f} barrierGpuUs={:.2f} cpuSubmitUs={:.2f} "
@@ -1882,8 +1968,14 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     const bool emitSkirts = slot.tile.emitSkirts;
     const bool applyChildSuppression = slot.tile.applyChildSuppression;
     const bool applyEditSkip = slot.tile.applyEditSkip;
+    const bool emitWater = slot.tile.emitWater;
     const bool equalityMode = slot.tile.equalityMode;
     uint32_t gpuRiserFaces = 0u;
+    // B1.3f-b: count GPU faces with the Water material (low byte of the packed voxel ==
+    // Material::Water == 2). This is the "water faces emitted" gate signal: it covers BOTH
+    // water-surface tops AND the all-air sea-level fill tops/risers (all carry the Water
+    // material). 0 when water is off (the solid-only path never emits a Water face).
+    uint32_t gpuWaterFaces = 0u;
     // B1.3f-a: track the MAX top-face quad world span so the LOD-merge run can show that
     // merged quads are physically LARGER than a single cell (a 1x1 cell quad spans cellSize;
     // a merged kxk block spans up to k*cellSize, capped per sub-face by the 32u split limit).
@@ -1896,6 +1988,62 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
         } else {
             gpuMaxTopQuadW = std::max(gpuMaxTopQuadW, Simulation::SparseSurfacePayloadWidth(f.payload));
             gpuMaxTopQuadH = std::max(gpuMaxTopQuadH, Simulation::SparseSurfacePayloadHeight(f.payload));
+        }
+        // B1.3f-b: Water material is the low byte of the packed voxel field (== 2).
+        if ((Simulation::SparseSurfacePayloadVoxel(f.payload) & 0xFFu) == 2u /*Water*/) {
+            ++gpuWaterFaces;
+        }
+    }
+
+    // B1.3f-b: COUNT the BLOCKS the GPU all-air-FILLED (a block whose samples are ALL Air,
+    // filled with a sea-level water top - SparseClipmap.cpp ~7065-7083). Recompute the
+    // water-aware block aggregation CPU-side (drift-free mirror of MidMeshAggregateBlock) and
+    // count blocks that are !present (all-air -> filled). > 0 confirms the new all-air-fill
+    // path actually fired on this fixture. 0 when water is off (no fill) or no all-air block.
+    uint32_t gpuAirFillFaces = 0u;
+    if (emitWater && slot.tile.sampleSide > 1u &&
+        slot.tile.samples.size() >=
+            static_cast<size_t>(slot.tile.sampleSide) * slot.tile.sampleSide) {
+        const uint32_t side = slot.tile.sampleSide;
+        const uint32_t stride = side;
+        const uint32_t cellsPerAxis = side - 1u;
+        const int32_t step = std::max(1, static_cast<int32_t>(m_b13aBuildTerraceStep));
+        const uint32_t mergeCells = std::max(1u, slot.tile.mergeCells);
+        const uint32_t blockCountPerAxis = (cellsPerAxis + mergeCells - 1u) / mergeCells;
+        auto decodeMaterial = [](uint32_t s) -> uint32_t { return (s >> 16u) & 0xFFu; };
+        auto isSolid = [](uint32_t m) -> bool { return m != 0u && m != 2u; };
+        auto isWater = [](uint32_t m) -> bool { return m == 2u; };
+        for (uint32_t bz = 0u; bz < blockCountPerAxis; ++bz) {
+            const uint32_t z = bz * mergeCells;
+            const uint32_t zEnd = std::min(cellsPerAxis, z + mergeCells);
+            for (uint32_t bx = 0u; bx < blockCountPerAxis; ++bx) {
+                const uint32_t x = bx * mergeCells;
+                const uint32_t xEnd = std::min(cellsPerAxis, x + mergeCells);
+                // Clamp identical to the shader/CPU aggregate.
+                uint32_t x0 = std::min(x, side - 1u);
+                uint32_t z0 = std::min(z, side - 1u);
+                uint32_t x1 = std::max(x0 + 1u, std::min(xEnd, side));
+                uint32_t z1 = std::max(z0 + 1u, std::min(zEnd, side));
+                bool present = false;
+                for (uint32_t zz = z0; zz < z1 && !present; ++zz) {
+                    for (uint32_t xx = x0; xx < x1; ++xx) {
+                        const uint32_t m = decodeMaterial(slot.tile.samples[zz * stride + xx]);
+                        if (isSolid(m) || isWater(m)) { present = true; break; }
+                    }
+                }
+                if (!present) {
+                    // This block is all-air -> the GPU fills it with ONE sea-level water top
+                    // quad, split into 32u chunks for a merged block (same as the shader's
+                    // MidMeshAddFace). Count the sub-faces the fill emits.
+                    const int32_t cellSizeInt = std::max(1, slot.tile.cellSizeInt);
+                    const uint32_t width = (xEnd - x) * static_cast<uint32_t>(cellSizeInt);
+                    const uint32_t depth = (zEnd - z) * static_cast<uint32_t>(cellSizeInt);
+                    const uint32_t wChunks = (width + 31u) / 32u;
+                    const uint32_t hChunks = (depth + 31u) / 32u;
+                    gpuAirFillFaces += std::max(1u, wChunks) * std::max(1u, hChunks);
+                }
+                (void)step;
+            }
         }
     }
 
@@ -2004,13 +2152,16 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
         equalityMode ? MidMeshFaceAbMode::Equal : MidMeshFaceAbMode::Containment;
     const MidMeshFaceAbResult ab = CompareMidMeshFacesMultiset(
         gpuFaces, cpuFaces, abMode, gpuStatus, 8u);
-    // Label: b13e if edit skip was on (this increment's face-REMOVING source), else b13d if
-    // child suppression, else b13c/b/a.
-    const char* const modeLabel = applyEditSkip
-        ? "b13e"
-        : (applyChildSuppression
-               ? "b13d"
-               : (emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a")));
+    // Label: b13fb if the WATER + all-air-fill path was on (its own corpus label - the prior
+    // code logged this equality verify under b13c). Else b13e if edit skip, else b13d if child
+    // suppression, else b13c/b/a.
+    const char* const modeLabel = emitWater
+        ? "b13fb"
+        : (applyEditSkip
+               ? "b13e"
+               : (applyChildSuppression
+                      ? "b13d"
+                      : (emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a"))));
     LogMidMeshFaceAbResult(modeLabel, ab);
 
     slot.pending = false;
@@ -2022,10 +2173,13 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     m_b13aStats.emitSkirts = emitSkirts;
     m_b13aStats.applyChildSuppression = applyChildSuppression;
     m_b13aStats.applyEditSkip = applyEditSkip;
+    m_b13aStats.emitWater = emitWater;
     m_b13aStats.equalityMode = equalityMode;
     m_b13aStats.gpuSkirtFaces = gpuSkirtFaces;
     m_b13aStats.gpuSuppressedCells = gpuSuppressedCells;
     m_b13aStats.gpuEditSkippedCells = gpuEditSkippedCells;
+    m_b13aStats.gpuWaterTopFaces = gpuWaterFaces;
+    m_b13aStats.gpuAirFillFaces = gpuAirFillFaces;
     m_b13aStats.editBoxCount = editBoxCountForStats;
     m_b13aStats.gpuFaceCount = gpuFaceCount;
     m_b13aStats.gpuStatusOverflow = gpuStatus;
@@ -2047,7 +2201,8 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     // For EQUALITY mode the gate is missing==0 AND extra==0 (gpuFaces==cpuMeshFaces).
     spdlog::info(
         "B13A_VERIFY mode={} abMode={} abVerifyCount={} match={} equalityHeld={} containSubset={} "
-        "mergeCells={} gpuFaces={} gpuRiserFaces={} gpuSkirtFaces={} maxTopQuadW={} maxTopQuadH={} "
+        "mergeCells={} emitWater={} gpuFaces={} gpuRiserFaces={} gpuSkirtFaces={} "
+        "gpuWaterFaces={} gpuAirFillFaces={} maxTopQuadW={} maxTopQuadH={} "
         "gpuSuppressedCells={} gpuEditSkippedCells={} "
         "editBoxes={} cpuMeshFaces={} extraGpuFaces={} missingCpuFaces={} multiplicityMismatches={} "
         "gpuStatus={}",
@@ -2056,8 +2211,9 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
         (equalityMode && ab.missingCpuFaces == 0u && ab.extraGpuFaces == 0u &&
          ab.multiplicityMismatches == 0u && gpuStatus == 0u) ? 1 : 0,
         (ab.extraGpuFaces == 0u && gpuStatus == 0u) ? 1 : 0,
-        mergeCellsForStats, gpuFaceCount, gpuRiserFaces, gpuSkirtFaces,
-        gpuMaxTopQuadW, gpuMaxTopQuadH, gpuSuppressedCells, gpuEditSkippedCells,
+        mergeCellsForStats, emitWater ? 1 : 0, gpuFaceCount, gpuRiserFaces, gpuSkirtFaces,
+        gpuWaterFaces, gpuAirFillFaces, gpuMaxTopQuadW, gpuMaxTopQuadH,
+        gpuSuppressedCells, gpuEditSkippedCells,
         editBoxCountForStats, ab.cpuFaceCount,
         ab.extraGpuFaces, ab.missingCpuFaces, ab.multiplicityMismatches, gpuStatus);
     return true;

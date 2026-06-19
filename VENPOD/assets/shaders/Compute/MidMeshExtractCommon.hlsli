@@ -220,4 +220,116 @@ bool MidMeshCellInEditFootprint(
     return false;
 }
 
+// =============================================================================
+// SURFACE BLOCK (B1.3f-b) - mirrors the CPU `SurfaceBlock` (SparseClipmap.cpp):
+//   bool present; bool solid; bool water; int height; uint material; (Air default).
+// Carries the full WATER-AWARE aggregation result so the GPU can reproduce the
+// CPU's water-mixed block decision (a water-only block, a shoal min-height
+// override, the all-air water fill) exactly. The B1.3f-a SOLID-only aggregate was
+// a degenerate case of this (emitWater==0 -> water samples skipped -> block.solid).
+// =============================================================================
+struct MidMeshSurfaceBlock {
+    bool present;
+    bool solid;
+    bool water;
+    int  height;
+    uint material;
+};
+
+// =============================================================================
+// B1.3f-b WATER-AWARE AGGREGATE - faithful port of extractTileMesh's
+// `aggregateSamples` lambda (SparseClipmap.cpp ~6982-7048), the FULL water path.
+// Byte-for-byte parity (the #1 risk of this increment):
+//   * clamp the block span to the tile (same as the solid-only path).
+//   * iterate z OUTER, x INNER (the CPU order) so the >= tie-break material matches.
+//   * emitWater==0 -> skip every Water sample (CPU `!emitWater && Water -> continue`),
+//     then skip air (`!solid && !water -> continue`) - reduces to the solid-only
+//     B1.3f-a result EXACTLY (water counters stay 0, the shoal override never fires).
+//   * emitWater==1 -> Water samples participate:
+//       SOLID sample: ++solidCount; track minSolidHeight/minSolidMaterial; update the
+//         block to SOLID on (!present || !solid || h >= height) (>= keeps the last
+//         max-height solid's material; flips a water-present block to solid via !solid).
+//       WATER sample: ++waterCount; set the block to WATER ONLY when !present (the very
+//         first sample being water seeds a water block; a later solid then takes over).
+//         A water sample NEVER overrides an already-present block (matches the CPU).
+//   * SHOAL MIN-HEIGHT OVERRIDE: if (present && solid && waterCount>0 && minSolidHeight
+//     valid) -> height = minSolidHeight, material = minSolidMaterial (a mixed water+solid
+//     footprint hugs the water instead of floating at the solid MAX). Inert when
+//     waterCount==0 (pure land keeps MAX) - so it never fires with water off.
+// The CPU's `waterHeight`/`waterMaterial`/`solidCount` locals are write-only (never read
+// after the loop), so they are intentionally not modeled; only waterCount + the minSolid*
+// pair drive the result.
+// =============================================================================
+MidMeshSurfaceBlock MidMeshAggregateBlock(
+    StructuredBuffer<uint> samples,
+    uint slot, uint stride, uint side,
+    uint x0, uint z0, uint x1, uint z1,
+    uint heightBias, uint terraceStep, bool emitWater)
+{
+    MidMeshSurfaceBlock block;
+    block.present = false;
+    block.solid = false;
+    block.water = false;
+    block.height = 0;
+    block.material = kMidMeshMaterialAir;
+
+    // Clamp exactly like the CPU aggregateSamples.
+    x0 = min(x0, side - 1u);
+    z0 = min(z0, side - 1u);
+    x1 = max(x0 + 1u, min(x1, side));
+    z1 = max(z0 + 1u, min(z1, side));
+
+    uint waterCount = 0u;
+    int  minSolidHeight = 0x7FFFFFFF; // std::numeric_limits<int32_t>::max()
+    uint minSolidMaterial = 0u;
+    bool haveMinSolid = false;
+
+    for (uint z = z0; z < z1; ++z) {
+        for (uint x = x0; x < x1; ++x) {
+            const uint sampleIndex = MidMeshSampleIndex(slot, stride, side, x, z);
+            const uint sample = samples[sampleIndex];
+            const uint material = MidMeshDecodeSampleMaterial(sample);
+            // emitWater==0: skip Water (CPU `!emitWater && Water -> continue`).
+            if (!emitWater && MidMeshIsWaterMaterial(material)) {
+                continue;
+            }
+            const bool solid = MidMeshIsSolidMaterial(material);
+            const bool water = MidMeshIsWaterMaterial(material);
+            // Air (neither solid nor water) is skipped (CPU `!solid && !water -> continue`).
+            if (!solid && !water) {
+                continue;
+            }
+            const int h = MidMeshQuantizeY(MidMeshDecodeSampleY(sample, heightBias), terraceStep);
+            if (solid) {
+                if (!haveMinSolid || h < minSolidHeight) {
+                    minSolidHeight = h;
+                    minSolidMaterial = material;
+                    haveMinSolid = true;
+                }
+                if (!block.present || !block.solid || h >= block.height) {
+                    block.present = true;
+                    block.solid = true;
+                    block.water = false;
+                    block.height = h;
+                    block.material = material;
+                }
+            } else {
+                ++waterCount;
+                if (!block.present) {
+                    block.present = true;
+                    block.water = true;
+                    block.height = h;
+                    block.material = material;
+                }
+            }
+        }
+    }
+    // SHOAL-HEIGHT FIX: mixed (water+solid) footprints hug the lowest solid sample.
+    if (block.present && block.solid && waterCount > 0u && haveMinSolid) {
+        block.height = minSolidHeight;
+        block.material = minSolidMaterial;
+    }
+    return block;
+}
+
 #endif // VENPOD_MIDMESH_EXTRACT_COMMON_HLSLI

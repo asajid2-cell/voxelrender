@@ -60,6 +60,10 @@ cbuffer TopFaceConstants : register(b0) {
                                 //        the tile's edit footprint (whole-cell, like the CPU).
     uint gEditBoxBase;          // B1.3e: base index of this tile's edit boxes in EditBoxes.
     uint gEditBoxCount;         // B1.3e: number of edit boxes for this tile (0 = none).
+    uint gEmitWater;            // B1.3f-b: 0 = SOLID-only aggregation (B1.3a-f-a; water/air
+                                //        samples skipped, no all-air fill); 1 = WATER-AWARE
+                                //        aggregation + water-surface tops + all-air sea-level
+                                //        fill, matching the CPU emitWater path byte-for-byte.
 }
 
 // =============================================================================
@@ -446,15 +450,31 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
 
     // ---- this block's aggregated surface (aggregateSamples(x,z,xEnd,zEnd)) ----
     // For mergeCells==1 this is the single sample (x,z), byte-identical to B1.3a-e.
-    int height;
-    uint material;
-    if (!MidMeshAggregateSolidBlock(slot, stride, side, x, z, xEnd, zEnd,
-                                    heightBias, terraceStep, height, material)) {
-        // WATER-OFF: a block with no solid sample is !present -> the CPU `continue`s here
-        // (no all-air water fill since emitWater is off). It emits NO top, and neighbors
-        // emit no riser toward it (the rightBlock/forwardBlock present test below).
-        return;
+    // B1.3f-b WATER-AWARE: gEmitWater==0 reduces to the B1.3f-a solid-only result
+    // EXACTLY (water/air samples skipped, block.solid). gEmitWater==1 lets water
+    // samples participate (water-only blocks present + the shoal min-height override).
+    const bool emitWater = (gEmitWater != 0u);
+    MidMeshSurfaceBlock block = MidMeshAggregateBlock(
+        Samples, slot, stride, side, x, z, xEnd, zEnd,
+        heightBias, terraceStep, emitWater);
+    if (!block.present) {
+        // ALL-AIR FOOTPRINT FILL (mirrors extractTileMesh ~7065-7083): a block whose
+        // samples are all Air emits NOTHING under water-off (the CPU `continue`). With
+        // water ON, fill it with a sea-level WATER top so the hole seals AND the block
+        // becomes `present`, so adjacent land seals risers against it. (The fill is
+        // applied ONLY to the CURRENT block, never to the neighbor probes below - exactly
+        // like the CPU, where the fill sits in the loop body, not inside aggregateSamples.)
+        if (!emitWater) {
+            return; // WATER-OFF: no top, neighbors emit no riser toward this block.
+        }
+        block.present = true;
+        block.solid = false;
+        block.water = true;
+        block.height = MidMeshQuantizeY(gSeaLevelY, terraceStep);
+        block.material = kMidMeshMaterialWater;
     }
+    const int height = block.height;
+    const uint material = block.material;
 
     const int worldX = MidMeshCellWorldX(meta.originX, x, cellSizeInt);
     const int worldZ = MidMeshCellWorldZ(meta.originZ, z, cellSizeInt);
@@ -473,12 +493,13 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     MidMeshAddFace(slot, kSparseDirPosY, worldX, height, worldZ, width, depth, voxel);
 
     // ---- TILE-BORDER SKIRTS (B1.3c) ----
-    // CPU order: top face -> border skirts -> risers. The skirt is SOLID-only; this path
-    // already early-returned for !present (no-solid) blocks, so block is always solid here
-    // -> the CPU's `!block.water` guard is satisfied implicitly. Border-edge predicates
-    // mirror the CPU's BLOCK rule: x==0, xEnd>=cellCount, z==0, zEnd>=cellCount (cellCount
-    // == cellsPerAxis). Skirts use the SAME voxel as the top face + the BLOCK's width/depth.
-    if (gEmitSkirts != 0u) {
+    // CPU order: top face -> border skirts -> risers. The skirt is SOLID-only: the CPU
+    // guards it with `if (!block.water)` (SparseClipmap.cpp ~7128). Under water-off every
+    // present block is solid so the guard is implicit; under water-on a water block (incl.
+    // the all-air sea-level fill) emits NO skirt, so we must mirror the explicit guard.
+    // Border-edge predicates mirror the CPU's BLOCK rule: x==0, xEnd>=cellCount, z==0,
+    // zEnd>=cellCount (cellCount == cellsPerAxis). Skirts use the top face's voxel + span.
+    if (gEmitSkirts != 0u && !block.water) {
         const bool atNegX = (x == 0u);
         const bool atPosX = (xEnd >= cellsPerAxis);
         const bool atNegZ = (z == 0u);
@@ -506,17 +527,23 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
         return;
     }
 
+    // B1.3f-b: the neighbor probes are WATER-AWARE too (gEmitWater carried), but the CPU
+    // does NOT apply the all-air fill to the neighbor (the fill is in the loop body, not in
+    // aggregateSamples). So an all-air neighbor probe returns !present and emits no riser
+    // toward it here; that area's riser comes from the all-air-filled block's own iteration.
+    // The CPU riser test is `neighbor.present && height != neighbor.height` (present, not
+    // solid) - water blocks (present) now participate, identical to the CPU.
+
     // RIGHT NEIGHBOR BLOCK: aggregateSamples(xEnd, z, xEnd+mergeCells, zEnd).
     {
-        int rHeight;
-        uint rMaterial;
-        if (MidMeshAggregateSolidBlock(slot, stride, side,
-                                       xEnd, z, xEnd + mergeCells, zEnd,
-                                       heightBias, terraceStep, rHeight, rMaterial) &&
-            height != rHeight) {
-            const int lowTopY = min(height, rHeight) + 1;
-            const uint riserHeight = (uint)abs(height - rHeight);
-            const bool currentHigher = (height > rHeight);
+        MidMeshSurfaceBlock rightBlock = MidMeshAggregateBlock(
+            Samples, slot, stride, side,
+            xEnd, z, xEnd + mergeCells, zEnd,
+            heightBias, terraceStep, emitWater);
+        if (rightBlock.present && height != rightBlock.height) {
+            const int lowTopY = min(height, rightBlock.height) + 1;
+            const uint riserHeight = (uint)abs(height - rightBlock.height);
+            const bool currentHigher = (height > rightBlock.height);
             // boundary = (worldX + width, worldZ); span = depth (the block's Z span);
             // dir PosX if current higher.
             MidMeshEmitRiser(
@@ -527,21 +554,20 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
                 lowTopY,
                 depth,
                 riserHeight,
-                currentHigher ? material : rMaterial);
+                currentHigher ? material : rightBlock.material);
         }
     }
 
     // FORWARD NEIGHBOR BLOCK: aggregateSamples(x, zEnd, xEnd, zEnd+mergeCells).
     {
-        int fHeight;
-        uint fMaterial;
-        if (MidMeshAggregateSolidBlock(slot, stride, side,
-                                       x, zEnd, xEnd, zEnd + mergeCells,
-                                       heightBias, terraceStep, fHeight, fMaterial) &&
-            height != fHeight) {
-            const int lowTopY = min(height, fHeight) + 1;
-            const uint riserHeight = (uint)abs(height - fHeight);
-            const bool currentHigher = (height > fHeight);
+        MidMeshSurfaceBlock forwardBlock = MidMeshAggregateBlock(
+            Samples, slot, stride, side,
+            x, zEnd, xEnd, zEnd + mergeCells,
+            heightBias, terraceStep, emitWater);
+        if (forwardBlock.present && height != forwardBlock.height) {
+            const int lowTopY = min(height, forwardBlock.height) + 1;
+            const uint riserHeight = (uint)abs(height - forwardBlock.height);
+            const bool currentHigher = (height > forwardBlock.height);
             // boundary = (worldX, worldZ + depth); span = width (the block's X span);
             // dir PosZ if current higher.
             MidMeshEmitRiser(
@@ -552,7 +578,7 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
                 lowTopY,
                 width,
                 riserHeight,
-                currentHigher ? material : fMaterial);
+                currentHigher ? material : forwardBlock.material);
         }
     }
 }

@@ -195,10 +195,13 @@ struct MidMeshGpuExtractB13aStats {
     bool emitSkirts = false;        // B1.3c: this dispatch also emitted tile-border skirts
     bool applyChildSuppression = false; // B1.3d: child-quadrant suppression was active
     bool applyEditSkip = false;     // B1.3e: edit-footprint suppression was active
+    bool emitWater = false;         // B1.3f-b: water-aware aggregation + all-air fill active
     bool equalityMode = false;      // B1.3d: A/B ran in EQUALITY mode (not containment)
     uint32_t gpuSkirtFaces = 0;     // B1.3c: GPU faces that are border-skirt side quads
     uint32_t gpuSuppressedCells = 0;// B1.3d: cells the GPU skipped due to child suppression
     uint32_t gpuEditSkippedCells = 0;// B1.3e: cells the GPU skipped due to the edit footprint
+    uint32_t gpuWaterTopFaces = 0;  // B1.3f-b: GPU PosY top faces with the Water material
+    uint32_t gpuAirFillFaces = 0;   // B1.3f-b: GPU faces from all-air sea-level fill blocks
     uint32_t editBoxCount = 0;      // B1.3e: edit boxes uploaded for this fixture
     uint32_t editBoxOverflow = 0;   // B1.3e: 1 if the tile exceeded editBoxCapacityPerTile
     uint64_t editBoxBytes = 0;      // B1.3e: edit-box bytes uploaded this dispatch
@@ -424,6 +427,29 @@ public:
         const std::function<bool(uint32_t /*slot*/)>& hasEditFootprint,
         uint32_t sampleSide);
 
+    // B1.3f-b fixture: the WATER + ALL-AIR-FILL increment. It REQUIRES a tile that bears
+    // WATER and/or AIR samples (so the water-surface tops and/or the all-air sea-level fill
+    // actually emit - otherwise a pure-land tile exercises neither new path and the "water
+    // faces > 0" / "air-fill faces > 0" gate could never be met). To isolate water/air-fill
+    // as the only new variable it prefers childMask==0 AND no edit footprint. mergeCells is
+    // NOT constrained (a water tile at any LOD is valid; the caller may demand mergeCells>1
+    // for the merged-water sub-fixture via `requireMerged`). A full sample grid is required.
+    // The CPU mesh for such a tile is the water-aware tops/risers + skirts (solid-only) + the
+    // all-air fill, so GPU(water-aware extraction) A/Bs to FULL EQUALITY against it (water ON,
+    // cull off). Returns the picked tile's index in `dirtyTiles`, or UINT32_MAX. `sampleSide`
+    // validates the grid + bounds the water/air sample scan; `requireMerged` demands
+    // mergeCells>1 (the merged-water sub-fixture) when true.
+    // `requireWater` (default false): when true, ONLY a tile bearing >=1 WATER sample qualifies
+    // (so a water-surface top is guaranteed to emit); when false, a tile bearing WATER OR AIR
+    // qualifies (the all-air sea-level fill also exercises the new path). The caller tries
+    // requireWater=true first so the report exercises an actual water surface when one exists.
+    static uint32_t SelectB13fbFixture(
+        const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
+        const std::function<bool(uint32_t /*slot*/)>& hasEditFootprint,
+        uint32_t sampleSide,
+        bool requireMerged,
+        bool requireWater = false);
+
     // Run ONE top-face extraction for the picked fixture tile. Uploads the tile's
     // samples+metadata (faceCount zeroed) into the dedicated smoke buffers, dispatches
     // CS_MidMeshExtractTopFaces over the tile's cell grid (each eligible solid cell
@@ -452,6 +478,12 @@ public:
     // empty `editBoxes` with applyEditSkip true is inert (no cell is in an empty footprint).
     // The poll then A/Bs in EQUALITY mode (run with water+cull off): the GPU emits the exact
     // CPU set minus the edited cells, so missing==0 AND extra==0.
+    // `emitWater` (B1.3f-b): when true the shader runs the WATER-AWARE aggregation (water
+    // samples participate, the shoal min-height override, a water-only block) AND emits the
+    // all-air sea-level fill, matching the CPU emitWater path. The poll then A/Bs in EQUALITY
+    // mode with water ON (run with cull off so water + air-fill is the only new variable):
+    // the GPU emits the exact CPU set, missing==0 AND extra==0. Default false keeps the
+    // B1.3a-f-a solid-only behavior byte-identical (water/air samples skipped, no fill).
     bool RunB13aTopFaceDispatch(
         ID3D12Device* device,
         const Simulation::MidMeshGpuExtractDirtyTile& fixture,
@@ -463,7 +495,8 @@ public:
         bool applyChildSuppression = false,
         bool equalityMode = false,
         bool applyEditSkip = false,
-        const std::vector<Simulation::MidMeshEditXzBox>& editBoxes = {});
+        const std::vector<Simulation::MidMeshEditXzBox>& editBoxes = {},
+        bool emitWater = false);
 
     // Delayed, DEBUG-ONLY containment A/B via the fence-tracked ring (same FIFO/ring as
     // the smoke poll, non-blocking by default). Reads the GPU top faces + status for the
@@ -498,6 +531,7 @@ private:
         bool emitSkirts = false; // B1.3c: this dispatch also emitted tile-border skirts
         bool applyChildSuppression = false; // B1.3d: child-quadrant suppression was active
         bool applyEditSkip = false; // B1.3e: edit-footprint suppression was active
+        bool emitWater = false; // B1.3f-b: water-aware aggregation + all-air fill was active
         bool equalityMode = false; // B1.3d: poll A/Bs in EQUALITY mode (not containment)
         uint32_t mergeCells = 1u; // B1.3f-a: the fixture's LOD merge-cell size (block span)
         uint32_t childMask = 0u; // B1.3d: the fixture's childMask (for suppressed-cell count)
