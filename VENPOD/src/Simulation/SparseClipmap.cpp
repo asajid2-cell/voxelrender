@@ -7350,6 +7350,14 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             }
         }
         mergeCells = std::clamp(mergeCells, 1u, cellCount);
+        // TEST-ONLY (B1.3f-a A/B harness, default OFF): force the LOD merge to a fixed value,
+        // overriding the camera-distance rule, so the per-BLOCK GPU extraction can be A/B'd in
+        // scenes where the distance rule never fires. buildConfig.forceMergeCells==0 leaves the
+        // production behavior byte-identical. extractTileMesh is UNTOUCHED - it runs its normal
+        // merged path at this mergeCells, so the CPU merged mesh is the real A/B reference.
+        if (buildConfig.forceMergeCells > 1u) {
+            mergeCells = std::clamp(buildConfig.forceMergeCells, 1u, cellCount);
+        }
         // L7 GIANT-CUBE FIX part 2 — RESIDENT-AWARE FINER-COVERAGE SUPPRESSION: the
         // build iterates ALL resident tiles of ALL rings with one global distance cull,
         // so a stale coarse-ring tile legally drew its giant quantized quads (and
@@ -7859,6 +7867,50 @@ uint32_t SparseClipmapTileCache::CollectMidMeshGpuExtractDirtyTiles(
         // mergeCells / childMask were cached by the build that just extracted this
         // tile (computeTileLod -> extractTileMesh). meshCacheFaces.size() is the exact
         // CPU per-tile face count, the capacity bound the GPU range reservation uses.
+        entry.mergeCells = tile.meshCacheMergeCells;
+        entry.childMask = tile.meshCacheChildMask;
+        entry.meshContentVersion = tile.meshContentVersion;
+        entry.faceCount = static_cast<uint32_t>(tile.meshCacheFaces.size());
+        entry.minY = tile.meshCacheMinY;
+        entry.maxY = tile.meshCacheMaxY;
+        out.push_back(entry);
+        ++appended;
+    }
+    return appended;
+}
+
+uint32_t SparseClipmapTileCache::CollectAllResidentMidMeshGpuExtractTiles(
+    std::vector<MidMeshGpuExtractDirtyTile>& out) const
+{
+    // Phase B1.3f-a: enumerate EVERY resident tile with a valid mesh cache (NOT just the
+    // build's dirty set), so the LOD-merge fixture selector can find a far merged tile
+    // (mergeCells>1). Same per-entry projection as the dirty collector; pure read of the
+    // cached output (no re-extraction, no mutation). Cache fields reflect the build that
+    // last extracted each tile (meshCacheMergeCells/ChildMask/Faces).
+    const uint32_t side = m_config.tileSampleSide;
+    const uint32_t sampleCount = side >= 2u ? side * side : 0u;
+    if (sampleCount == 0u) {
+        return 0u;
+    }
+    uint32_t appended = 0u;
+    out.reserve(out.size() + m_tiles.size());
+    for (uint32_t slot = 0u; slot < m_tiles.size(); ++slot) {
+        const TilePayload& tile = m_tiles[slot];
+        if (tile.record.slot == UINT32_MAX ||
+            !tile.meshCacheValid ||
+            tile.packedSamples.size() < sampleCount ||
+            tile.record.cellSize <= 0.0f) {
+            continue;
+        }
+        MidMeshGpuExtractDirtyTile entry;
+        // Synthetic coord {x, ring, z} (matches dirtyBricks / the dirty collector).
+        entry.coord = BrickCoord{tile.record.coord.x, tile.record.coord.ring, tile.record.coord.z};
+        entry.slot = slot;
+        entry.samples = tile.packedSamples.data();
+        entry.sampleCount = sampleCount;
+        entry.originX = tile.record.originX;
+        entry.originZ = tile.record.originZ;
+        entry.cellSize = tile.record.cellSize;
         entry.mergeCells = tile.meshCacheMergeCells;
         entry.childMask = tile.meshCacheChildMask;
         entry.meshContentVersion = tile.meshContentVersion;

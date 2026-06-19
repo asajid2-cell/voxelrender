@@ -252,6 +252,14 @@ struct SparseMidHeightSurfaceBuildConfig {
     uint32_t lodBaseMerge = 1;
     uint32_t lodMaxMerge = 4;
     bool lodEnabled = true;
+    // TEST-ONLY (B1.3f-a A/B harness): force EVERY tile's LOD merge to this value,
+    // overriding the camera-distance rule, so the per-BLOCK GPU extraction can be A/B'd
+    // against the CPU's merged mesh in scenes where the distance rule never fires (a
+    // recentering clipmap keeps fine tiles near, so mergeCells naturally stays 1). 0 =
+    // OFF = the production distance-based LOD is byte-identical. >1 clamps to cellCount.
+    // The CPU extractTileMesh is UNTOUCHED - it runs its normal merged path at this
+    // mergeCells, producing the real CPU merged mesh the GPU must match (an honest A/B).
+    uint32_t forceMergeCells = 0;
     // P1.5 incremental upload: when true, the build also tracks per-tile dirty/removed
     // coords + sets drawBatch.faces pointers so the caller can StageDirtyPayloadSnapshot
     // (upload only re-extracted tiles) instead of StageSnapshot (full re-upload).
@@ -715,6 +723,18 @@ public:
     // reflect the values cached by the build that just ran.
     uint32_t CollectMidMeshGpuExtractDirtyTiles(
         const std::vector<BrickCoord>& dirtyCoords,
+        std::vector<MidMeshGpuExtractDirtyTile>& out) const;
+    // Phase B1.3f-a fixture pool (DEBUG / READ-ONLY): the SAME projection as
+    // CollectMidMeshGpuExtractDirtyTiles, but over EVERY resident tile with a valid mesh
+    // cache (NOT just the build's dirty set). The LOD-merge increment needs a far tile with
+    // mergeCells>1, and a stable far tile is not re-dirtied every build, so the per-build
+    // dirty set rarely contains one. This pure read of the cached output lets the B13fa
+    // fixture selector find a merged tile among ALL resident tiles. It NEVER re-extracts and
+    // NEVER mutates the CPU path (same category as the dirty collector). The per-entry
+    // mergeCells/childMask/sample pointer reflect the build that last extracted that tile.
+    // Returns the number of records appended. O(resident tiles) - debug-only, gated by the
+    // B13fa toggle in the caller.
+    uint32_t CollectAllResidentMidMeshGpuExtractTiles(
         std::vector<MidMeshGpuExtractDirtyTile>& out) const;
     // Total resident mid-mesh tiles currently tracked (occupied tile slots). Used by
     // the GPU-extract instrumentation to prove dirty-scaling (uploadTiles << this).

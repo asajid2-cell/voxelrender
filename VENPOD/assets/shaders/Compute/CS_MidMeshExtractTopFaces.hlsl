@@ -80,10 +80,12 @@ cbuffer TopFaceConstants : register(b0) {
 // resident child. The childResident[i] bit is bit i of childMask (i = qz*2 + qx);
 // childMask bit mapping: 0=(qx0,qz0) 1=(qx1,qz0) 2=(qx0,qz1) 3=(qx1,qz1), matching
 // the CPU computeTileLod pack. `cellsPerRow` here is the CPU's PER-AXIS `cellCount`
-// (== side - 1). For mergeCells==1, midCell==cx / midCellZ==cz exactly.
+// (== side - 1). For mergeCells==1, midCell==cx / midCellZ==cz exactly; for mergeCells>1
+// (B1.3f-a) the caller passes the BLOCK-CENTER cell (midCell/midCellZ) so this computes
+// the CPU's quadrant from the block center, generalizing the B1.3d rule unchanged.
 // =============================================================================
 bool MidMeshCellSuppressedByChild(uint childMask, uint cellsPerRow, uint cx, uint cz) {
-    // midCell = cx + (1)/2 = cx for mergeCells==1 (integer divide). Same for cz.
+    // cx/cz are the BLOCK-CENTER cell (== cx for mergeCells==1). qx/qz = the CPU quadrant.
     const uint qx = (cx * 2u >= cellsPerRow) ? 1u : 0u;
     const uint qz = (cz * 2u >= cellsPerRow) ? 1u : 0u;
     const uint quadrantBit = qz * 2u + qx;
@@ -276,24 +278,75 @@ bool MidMeshEmitRiser(uint slot, uint direction,
     return true;
 }
 
-// Decode one IN-TILE sample-cell into a present/solid SurfaceBlock for the
-// mergeCells==1 path: aggregateSamples(cx,cz,cx+1,cz+1) is the single sample (cx,cz).
-// Returns whether the cell is a SOLID block (the only "present" kind the GPU subset
-// emits here - water/air are deferred, matching the top-face eligibility) and fills
-// the quantized height + material.
-bool MidMeshSolidCellBlock(uint slot, uint stride, uint side, uint cx, uint cz,
-                           uint heightBias, uint terraceStep,
-                           out int outHeight, out uint outMaterial) {
+// =============================================================================
+// B1.3f-a AGGREGATE SAMPLES (LOD MERGE) - faithful port of extractTileMesh's
+// `aggregateSamples` lambda (SparseClipmap.cpp), WATER-OFF path. The B1.3f-a run
+// forces VENPOD_SPARSE_MID_MESH_WATER=0, so the CPU `aggregateSamples` skips every
+// water sample (`if (!buildConfig.emitWater && material==Water) continue;`) and
+// also never runs the all-air fill (`if (!buildConfig.emitWater) continue;`). With
+// water OFF the CPU's water counters stay 0, the shoal-height fix (which only fires
+// when waterCount>0) never triggers, and `block.present` becomes exactly
+// `block.solid`. So the GPU's solid-only aggregation reproduces the CPU block EXACTLY
+// for this run, mergeCells>=1, while staying a clean subset under any future water-on
+// path (water tops are deferred, never an extra).
+//
+// The aggregation rule the GPU MUST match byte-for-byte (the #1 risk of this
+// increment):
+//   * clamp the block span to the tile: x0 in [0,side-1], x1 in [x0+1, side] (same z).
+//   * iterate samples in the CPU's order (z OUTER, x INNER) so the tie-break material
+//     matches: the LAST solid sample at the running max height wins (the CPU updates on
+//     `h >= block.height`, i.e. >= not >, so a later equal-height sample overwrites the
+//     material).
+//   * height = the MAXIMUM quantized height over the block's SOLID samples (any-solid-
+//     wins-MAX; the shoal MIN-height override is a water-mixed rule, inert when water is
+//     off). material = that winning sample's material.
+//   * present == solid: the block is present iff it has >=1 solid sample (water/air
+//     samples are skipped). A block with no solid sample returns present=false (the CPU
+//     `!block.present` -> `continue` under water-off, emitting nothing).
+// For mergeCells==1 a 1x1 block is the single sample (x0..x0+1) x (z0..z0+1), so this
+// reduces EXACTLY to the old single-sample decode (byte-identical to B1.3e).
+// =============================================================================
+bool MidMeshAggregateSolidBlock(
+    uint slot, uint stride, uint side,
+    uint x0, uint z0, uint x1, uint z1,
+    uint heightBias, uint terraceStep,
+    out int outHeight, out uint outMaterial)
+{
     outHeight = 0;
     outMaterial = 0u;
-    const uint sampleIndex = MidMeshSampleIndex(slot, stride, side, cx, cz);
-    const uint sample = Samples[sampleIndex];
-    const uint material = MidMeshDecodeSampleMaterial(sample);
-    if (!MidMeshIsSolidMaterial(material)) {
+    // Clamp exactly like the CPU aggregateSamples.
+    x0 = min(x0, side - 1u);
+    z0 = min(z0, side - 1u);
+    x1 = max(x0 + 1u, min(x1, side));
+    z1 = max(z0 + 1u, min(z1, side));
+    bool present = false;
+    int blockHeight = 0;
+    uint blockMaterial = 0u;
+    for (uint z = z0; z < z1; ++z) {
+        for (uint x = x0; x < x1; ++x) {
+            const uint sampleIndex = MidMeshSampleIndex(slot, stride, side, x, z);
+            const uint sample = Samples[sampleIndex];
+            const uint material = MidMeshDecodeSampleMaterial(sample);
+            // WATER-OFF: skip water (and air) samples - mirrors the CPU's
+            // `!emitWater && Water -> continue` plus `!solid && !water -> continue`.
+            if (!MidMeshIsSolidMaterial(material)) {
+                continue;
+            }
+            const int h = MidMeshQuantizeY(MidMeshDecodeSampleY(sample, heightBias), terraceStep);
+            // any-solid-wins MAX: update on `!present || h >= blockHeight` (>= so the
+            // last sample at the max height owns the material - matches the CPU `>=`).
+            if (!present || h >= blockHeight) {
+                present = true;
+                blockHeight = h;
+                blockMaterial = material;
+            }
+        }
+    }
+    if (!present) {
         return false;
     }
-    outMaterial = material;
-    outHeight = MidMeshQuantizeY(MidMeshDecodeSampleY(sample, heightBias), terraceStep);
+    outHeight = blockHeight;
+    outMaterial = blockMaterial;
     return true;
 }
 
@@ -304,8 +357,20 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
 
     const uint side = meta.sampleSide;
     const uint stride = (meta.sampleStride > 0u) ? meta.sampleStride : side;
-    const uint cellsPerRow = (side > 1u) ? (side - 1u) : 0u;
-    const uint cellCount = cellsPerRow * cellsPerRow;
+    // cellsPerAxis == the CPU extractTileMesh's `cellCount` (PER-AXIS cell count = side-1).
+    // Earlier increments named this `cellsPerRow`; we keep that meaning but rename to
+    // disambiguate from the CPU's `cellCount` (which is per-axis, NOT total). The B1.3d
+    // child-suppression helper expects this PER-AXIS count too.
+    const uint cellsPerAxis = (side > 1u) ? (side - 1u) : 0u;
+
+    // ---- B1.3f-a LOD MERGE: per-BLOCK loop geometry (mirrors extractTileMesh) ----
+    // mergeCells==1 -> blockCountPerAxis==cellsPerAxis -> one block per cell (the exact
+    // B1.3a-e mapping, byte-identical). mergeCells>1 -> coarse blocks, each spanning up to
+    // mergeCells x mergeCells cells, clamped at the tile's far/upper edge by `min`.
+    const uint mergeCells = max(1u, meta.mergeCells);
+    const uint blockCountPerAxis =
+        (cellsPerAxis > 0u) ? ((cellsPerAxis + mergeCells - 1u) / mergeCells) : 0u;
+    const uint blockCount = blockCountPerAxis * blockCountPerAxis;
 
     // Thread 0 initializes the per-tile face counter + ok status for this dispatch.
     // (The host zeroes the counter pre-dispatch too, but make the shader self-consistent.)
@@ -316,59 +381,62 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     // A device-scope barrier so every thread sees the zeroed counter before appending.
     AllMemoryBarrierWithGroupSync();
 
-    if (cellsPerRow == 0u) {
+    if (cellsPerAxis == 0u || blockCountPerAxis == 0u) {
         return; // degenerate tile - nothing to emit.
     }
 
-    const uint cell = dispatchId.x;
-    if (cell >= cellCount) {
-        return; // padding thread.
+    // ONE THREAD PER BLOCK (B1.3f-a). For mergeCells==1 this is one thread per cell, so the
+    // host's cellCount^2 dispatch still covers all blocks (blockCount <= cellsPerAxis^2).
+    const uint blockId = dispatchId.x;
+    if (blockId >= blockCount) {
+        return; // padding thread (or a coarse tile where blockCount < dispatched cellCount^2).
     }
 
-    // B1.3a is the mergeCells==1 fixture path only. A non-1 merge tile would aggregate
-    // a block; that is a later increment. Guard so a misrouted tile emits NOTHING (a
-    // smaller subset) instead of wrong geometry.
-    if (meta.mergeCells != 1u) {
-        return;
-    }
-
-    const uint cx = cell % cellsPerRow;
-    const uint cz = cell / cellsPerRow;
+    // Block grid index (bx, bz) in [0, blockCountPerAxis)^2. The block's CELL span is
+    // [x, xEnd) x [z, zEnd), x = bx*mergeCells, xEnd = min(cellsPerAxis, x+mergeCells) -
+    // exactly the CPU's `for (x=0; x<cellCount; x+=mergeCells) xEnd=min(cellCount,x+mergeCells)`.
+    const uint bx = blockId % blockCountPerAxis;
+    const uint bz = blockId / blockCountPerAxis;
+    const uint x = bx * mergeCells;
+    const uint z = bz * mergeCells;
+    const uint xEnd = min(cellsPerAxis, x + mergeCells);
+    const uint zEnd = min(cellsPerAxis, z + mergeCells);
 
     const int cellSizeIntEarly = MidMeshCellSizeInt(meta.cellSizeBits);
 
-    // ---- B1.3e EDIT-FOOTPRINT SUPPRESSION ----
-    // Mirrors the CPU's `cellInEditFootprint` `continue` at the VERY TOP of the
-    // footprint loop body - BEFORE aggregateSamples, the all-air fill, distance cull,
-    // child suppression, top, skirts, AND risers. A cell whose world box overlaps any
-    // edit box emits NOTHING, so the live voxel raymarch owns the carved/painted area
-    // (the legacy clean-edit invariant). The cell's world box is
-    // (cellWorldX(cx),cellWorldZ(cz)) .. (cellWorldX(cx+1),cellWorldZ(cz+1)) - for
-    // mergeCells==1, xEnd=cx+1 / zEnd=cz+1, so width=cellSize (INCLUSIVE of the next
-    // cell's start corner, matching the CPU box). When gApplyEditSkip==0 (B1.3a-d) this
-    // is inert; with no edit boxes (gEditBoxCount==0) it is a no-op too.
+    // ---- B1.3e EDIT-FOOTPRINT SUPPRESSION (block space) ----
+    // Mirrors the CPU's `cellInEditFootprint` `continue` at the VERY TOP of the BLOCK loop
+    // body - BEFORE aggregateSamples, the all-air fill, distance cull, child suppression,
+    // top, skirts, AND risers. The CPU box is the BLOCK's world box:
+    // (cellWorldX(x),cellWorldZ(z)) .. (cellWorldX(xEnd),cellWorldZ(zEnd)). For mergeCells==1
+    // x..xEnd is one cell (cx..cx+1), identical to B1.3e. A block overlapping any edit box
+    // emits NOTHING. When gApplyEditSkip==0 (B1.3a-d) this is inert; gEditBoxCount==0 no-op.
     if (gApplyEditSkip != 0u && gEditBoxCount != 0u) {
-        const int editX0 = MidMeshCellWorldX(meta.originX, cx, cellSizeIntEarly);
-        const int editZ0 = MidMeshCellWorldZ(meta.originZ, cz, cellSizeIntEarly);
-        const int editX1 = MidMeshCellWorldX(meta.originX, cx + 1u, cellSizeIntEarly);
-        const int editZ1 = MidMeshCellWorldZ(meta.originZ, cz + 1u, cellSizeIntEarly);
+        const int editX0 = MidMeshCellWorldX(meta.originX, x, cellSizeIntEarly);
+        const int editZ0 = MidMeshCellWorldZ(meta.originZ, z, cellSizeIntEarly);
+        const int editX1 = MidMeshCellWorldX(meta.originX, xEnd, cellSizeIntEarly);
+        const int editZ1 = MidMeshCellWorldZ(meta.originZ, zEnd, cellSizeIntEarly);
         if (MidMeshCellInEditFootprint(EditBoxes, gEditBoxBase, gEditBoxCount,
                                        editX0, editZ0, editX1, editZ1)) {
-            return; // whole-cell skip (matches the CPU `continue`)
+            return; // whole-block skip (matches the CPU `continue`)
         }
     }
 
-    // ---- B1.3d CHILD-QUADRANT SUPPRESSION ----
-    // Mirrors the CPU's L7 finer-coverage suppression `continue` at the TOP of the
-    // footprint loop: if this cell's quadrant has a resident finer child, the child
-    // renders the area at higher detail, so the coarse cell emits NOTHING (top, skirts,
-    // AND risers all skipped). The CPU only applies it when anyChildResident; childMask
-    // != 0 is exactly that condition, so the bit test alone is sufficient. When
-    // gApplyChildSuppression==0 (B1.3a-c) this is inert and the childMask==0 path is
-    // byte-identical to before.
+    // ---- B1.3d CHILD-QUADRANT SUPPRESSION (block center) ----
+    // Mirrors the CPU's L7 finer-coverage suppression `continue`. For mergeCells>1 the CPU
+    // uses the BLOCK CENTER cell, not a single cell: midCell = x + (xEnd-x)/2,
+    // midCellZ = z + (zEnd-z)/2, qx = (midCell*2 >= cellCount)?1:0 (cellCount == cellsPerAxis).
+    // MidMeshCellSuppressedByChild takes a (cell, cellsPerAxis) pair and computes the same
+    // qx/qz from `cell*2 >= cellsPerAxis`, so passing the block-center cell reproduces it
+    // exactly (for mergeCells==1, midCell==cx, byte-identical to B1.3d). The CPU only applies
+    // it when anyChildResident; childMask != 0 is that condition.
     if (gApplyChildSuppression != 0u && meta.childMask != 0u) {
-        if (MidMeshCellSuppressedByChild(meta.childMask, cellsPerRow, cx, cz)) {
-            return; // whole-cell skip (matches the CPU continue)
+        const uint midCell = x + (xEnd - x) / 2u;
+        const uint midCellZ = z + (zEnd - z) / 2u;
+        // MidMeshCellSuppressedByChild(childMask, cellsPerAxis, midCell, midCellZ) -> the
+        // CPU qx=(midCell*2>=cellCount), qz=(midCellZ*2>=cellCount), bit qz*2+qx.
+        if (MidMeshCellSuppressedByChild(meta.childMask, cellsPerAxis, midCell, midCellZ)) {
+            return; // whole-block skip (matches the CPU continue)
         }
     }
 
@@ -376,43 +444,45 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     const uint heightBias = meta.heightBias;
     const uint terraceStep = gTerraceStep;
 
-    // ---- this cell's block (aggregateSamples(cx,cz,cx+1,cz+1) == sample (cx,cz)) ----
+    // ---- this block's aggregated surface (aggregateSamples(x,z,xEnd,zEnd)) ----
+    // For mergeCells==1 this is the single sample (x,z), byte-identical to B1.3a-e.
     int height;
     uint material;
-    if (!MidMeshSolidCellBlock(slot, stride, side, cx, cz, heightBias, terraceStep,
-                               height, material)) {
-        // B1.3a/b emit SOLID footprints only (subset-safe). Water / all-air emission is a
-        // later increment (it depends on emitWater + the sea-level fill rule). A non-solid
-        // cell also emits no risers toward its neighbors (matching the CPU subset deferral).
+    if (!MidMeshAggregateSolidBlock(slot, stride, side, x, z, xEnd, zEnd,
+                                    heightBias, terraceStep, height, material)) {
+        // WATER-OFF: a block with no solid sample is !present -> the CPU `continue`s here
+        // (no all-air water fill since emitWater is off). It emits NO top, and neighbors
+        // emit no riser toward it (the rightBlock/forwardBlock present test below).
         return;
     }
 
-    const int worldX = MidMeshCellWorldX(meta.originX, cx, cellSizeInt);
-    const int worldZ = MidMeshCellWorldZ(meta.originZ, cz, cellSizeInt);
-    // width = depth = cellSize for a single-cell footprint (xEnd-x == 1 -> *cellSize).
-    const uint width = (uint)cellSizeInt;
-    const uint depth = (uint)cellSizeInt;
+    const int worldX = MidMeshCellWorldX(meta.originX, x, cellSizeInt);
+    const int worldZ = MidMeshCellWorldZ(meta.originZ, z, cellSizeInt);
+    // width/depth = the BLOCK's world span = (xEnd-x)*cellSize / (zEnd-z)*cellSize. For
+    // mergeCells==1 (xEnd-x==1) this is cellSize, identical to B1.3a-e. A merged block is
+    // LARGER (up to mergeCells*cellSize), so a top quad > 32u splits into addFace chunks.
+    const uint width = (xEnd - x) * (uint)cellSizeInt;
+    const uint depth = (zEnd - z) * (uint)cellSizeInt;
 
     // ---- TOP FACE (B1.3a) ----
     // voxel = PackMidHeightSurfaceVoxel(material, worldX, height, worldZ), then masked
     // into the 19-bit payload field by MidMeshPackPayload (matches PackSparseSurfacePayload).
     const uint voxel = MidMeshPackVoxel(material, worldX, height, worldZ);
     // addFace SPLIT-LIMIT chunking parity: a top quad wider/deeper than 32u is emitted as
-    // MULTIPLE sub-faces. For PosY: worldX += wOff, worldZ += hOff. cellSize<=32 -> 1 face.
+    // MULTIPLE sub-faces. For PosY: worldX += wOff, worldZ += hOff.
     MidMeshAddFace(slot, kSparseDirPosY, worldX, height, worldZ, width, depth, voxel);
 
     // ---- TILE-BORDER SKIRTS (B1.3c) ----
     // CPU order: top face -> border skirts -> risers. The skirt is SOLID-only; this path
-    // already early-returned for non-solid cells (MidMeshSolidCellBlock above), so block
-    // is always solid here -> the CPU's `!block.water` guard is satisfied implicitly.
-    // Border-edge predicates mirror the CPU mergeCells==1 case: x==0 (cx==0), xEnd>=cellCount
-    // (cx==cellsPerRow-1), z==0 (cz==0), zEnd>=cellCount (cz==cellsPerRow-1). cellsPerRow is
-    // the CPU's cellCount (== side-1). Skirts use the SAME voxel as the top face.
+    // already early-returned for !present (no-solid) blocks, so block is always solid here
+    // -> the CPU's `!block.water` guard is satisfied implicitly. Border-edge predicates
+    // mirror the CPU's BLOCK rule: x==0, xEnd>=cellCount, z==0, zEnd>=cellCount (cellCount
+    // == cellsPerAxis). Skirts use the SAME voxel as the top face + the BLOCK's width/depth.
     if (gEmitSkirts != 0u) {
-        const bool atNegX = (cx == 0u);
-        const bool atPosX = (cx + 1u >= cellsPerRow);
-        const bool atNegZ = (cz == 0u);
-        const bool atPosZ = (cz + 1u >= cellsPerRow);
+        const bool atNegX = (x == 0u);
+        const bool atPosX = (xEnd >= cellsPerAxis);
+        const bool atNegZ = (z == 0u);
+        const bool atPosZ = (zEnd >= cellsPerAxis);
         if (atNegX || atPosX || atNegZ || atPosZ) {
             if (!MidMeshEmitBorderSkirts(slot, worldX, worldZ, height,
                                          width, depth, voxel,
@@ -424,26 +494,31 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     }
 
     // ---- RISERS (B1.3b) ----
-    // Only when enabled. INTERIOR addressing: the right (cx+1,cz) / forward (cx,cz+1)
-    // neighbor sample is in-tile for every interior cell of the mergeCells==1 path. The
-    // CPU's border SKIRTS (x==0 / xEnd>=cellCount etc.) are a SEPARATE path (B1.3c) and
-    // are NOT emitted here, so the GPU set stays a strict subset (skirts remain missing).
+    // Only when enabled. NEIGHBOR = the ADJACENT BLOCK (not the next cell): the CPU reads
+    // rightBlock = aggregateSamples(xEnd, z, xEnd+mergeCells, zEnd), forwardBlock =
+    // aggregateSamples(x, zEnd, xEnd, zEnd+mergeCells). aggregateSamples CLAMPS to the tile,
+    // so a border block sees itself as its own neighbor (equal heights -> no riser crosses a
+    // tile boundary; the skirts seal those). For mergeCells==1 xEnd==cx+1 etc., identical to
+    // B1.3b. The CPU rises on `present && height != neighborHeight` (present == solid under
+    // water-off), using the higher block's material when current is higher, else the
+    // neighbor's material.
     if (gEmitRisers == 0u) {
         return;
     }
 
-    // RIGHT NEIGHBOR (cx+1, cz): rightBlock = aggregateSamples(xEnd,z,xEnd+1,zEnd) for
-    // mergeCells==1 == sample (cx+1,cz). Present-and-different-height -> riser between them.
-    if (cx + 1u < side) { // cx in [0,cellCount)=[0,side-1) so this is always true; guard anyway
+    // RIGHT NEIGHBOR BLOCK: aggregateSamples(xEnd, z, xEnd+mergeCells, zEnd).
+    {
         int rHeight;
         uint rMaterial;
-        if (MidMeshSolidCellBlock(slot, stride, side, cx + 1u, cz, heightBias, terraceStep,
-                                  rHeight, rMaterial) &&
+        if (MidMeshAggregateSolidBlock(slot, stride, side,
+                                       xEnd, z, xEnd + mergeCells, zEnd,
+                                       heightBias, terraceStep, rHeight, rMaterial) &&
             height != rHeight) {
             const int lowTopY = min(height, rHeight) + 1;
             const uint riserHeight = (uint)abs(height - rHeight);
             const bool currentHigher = (height > rHeight);
-            // boundary = (worldX + width, worldZ); span = depth; dir PosX if current higher.
+            // boundary = (worldX + width, worldZ); span = depth (the block's Z span);
+            // dir PosX if current higher.
             MidMeshEmitRiser(
                 slot,
                 currentHigher ? kSparseDirPosX : kSparseDirNegX,
@@ -456,18 +531,19 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
         }
     }
 
-    // FORWARD NEIGHBOR (cx, cz+1): forwardBlock = aggregateSamples(x,zEnd,xEnd,zEnd+1) for
-    // mergeCells==1 == sample (cx,cz+1). Present-and-different-height -> riser between them.
-    if (cz + 1u < side) {
+    // FORWARD NEIGHBOR BLOCK: aggregateSamples(x, zEnd, xEnd, zEnd+mergeCells).
+    {
         int fHeight;
         uint fMaterial;
-        if (MidMeshSolidCellBlock(slot, stride, side, cx, cz + 1u, heightBias, terraceStep,
-                                  fHeight, fMaterial) &&
+        if (MidMeshAggregateSolidBlock(slot, stride, side,
+                                       x, zEnd, xEnd, zEnd + mergeCells,
+                                       heightBias, terraceStep, fHeight, fMaterial) &&
             height != fHeight) {
             const int lowTopY = min(height, fHeight) + 1;
             const uint riserHeight = (uint)abs(height - fHeight);
             const bool currentHigher = (height > fHeight);
-            // boundary = (worldX, worldZ + depth); span = width; dir PosZ if current higher.
+            // boundary = (worldX, worldZ + depth); span = width (the block's X span);
+            // dir PosZ if current higher.
             MidMeshEmitRiser(
                 slot,
                 currentHigher ? kSparseDirPosZ : kSparseDirNegZ,

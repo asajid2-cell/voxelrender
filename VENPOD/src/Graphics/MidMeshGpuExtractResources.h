@@ -410,6 +410,20 @@ public:
         const std::function<bool(uint32_t /*slot*/)>& hasEditFootprint,
         uint32_t sampleSide);
 
+    // B1.3f-a fixture: the LOD-MERGE increment. INVERTS the mergeCells==1 constraint of every
+    // prior increment - it REQUIRES mergeCells > 1 (a far/LOD-merged tile, where the CPU
+    // aggregates mergeCells x mergeCells sample cells into one coarse BLOCK). To isolate LOD
+    // as the only new variable, it prefers childMask==0 AND no edit footprint (so neither
+    // child suppression nor the edit skip removes faces - the only difference vs the full CPU
+    // mesh is the block merge itself). A full sample grid is required. The CPU mesh for such a
+    // tile is the merged (coarse) tops+risers+skirts, so GPU(per-BLOCK extraction) A/Bs to
+    // FULL EQUALITY against it (run with water+cull off). Returns the picked tile's index, or
+    // UINT32_MAX. `sampleSide` validates the grid (height/material come from aggregation).
+    static uint32_t SelectB13faFixture(
+        const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
+        const std::function<bool(uint32_t /*slot*/)>& hasEditFootprint,
+        uint32_t sampleSide);
+
     // Run ONE top-face extraction for the picked fixture tile. Uploads the tile's
     // samples+metadata (faceCount zeroed) into the dedicated smoke buffers, dispatches
     // CS_MidMeshExtractTopFaces over the tile's cell grid (each eligible solid cell
@@ -485,6 +499,7 @@ private:
         bool applyChildSuppression = false; // B1.3d: child-quadrant suppression was active
         bool applyEditSkip = false; // B1.3e: edit-footprint suppression was active
         bool equalityMode = false; // B1.3d: poll A/Bs in EQUALITY mode (not containment)
+        uint32_t mergeCells = 1u; // B1.3f-a: the fixture's LOD merge-cell size (block span)
         uint32_t childMask = 0u; // B1.3d: the fixture's childMask (for suppressed-cell count)
         std::vector<Simulation::MidMeshEditXzBox> editBoxes; // B1.3e: uploaded edit boxes (poll mirror)
         std::vector<Simulation::SparseSurfaceFace> cpuReferenceFaces; // tile meshCacheFaces

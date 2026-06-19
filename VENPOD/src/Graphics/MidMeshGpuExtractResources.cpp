@@ -703,6 +703,28 @@ void MidMeshGpuExtractResources::ComputeB13cSkirtFacesCpu(
         return q;
     };
     auto quantY = [&](int32_t y) -> int32_t { return floorDiv(y, step) * step; };
+    // B1.3f-a: block aggregation mirror of the shader MidMeshAggregateSolidBlock (WATER-OFF):
+    // MAX quantized solid height over [x0,x1)x[z0,z1) clamped to the tile, z-outer/x-inner so
+    // the tie-break material (>= update) matches. present == has >=1 solid sample.
+    auto aggregateBlock = [&](uint32_t x0, uint32_t z0, uint32_t x1, uint32_t z1,
+                              bool& present, int32_t& outHeight, uint32_t& outMaterial) {
+        present = false; outHeight = 0; outMaterial = 0u;
+        x0 = std::min(x0, side - 1u);
+        z0 = std::min(z0, side - 1u);
+        x1 = std::max(x0 + 1u, std::min(x1, side));
+        z1 = std::max(z0 + 1u, std::min(z1, side));
+        for (uint32_t zz = z0; zz < z1; ++zz) {
+            for (uint32_t xx = x0; xx < x1; ++xx) {
+                const uint32_t ss = tile.samples[zz * stride + xx];
+                const uint32_t mm = decodeMaterial(ss);
+                if (!isSolid(mm)) { continue; }
+                const int32_t hh = quantY(decodeY(ss));
+                if (!present || hh >= outHeight) {
+                    present = true; outHeight = hh; outMaterial = mm;
+                }
+            }
+        }
+    };
     // FNV-1a over (x,y,z,0x9E3779B9); low byte = variant. Mirrors MidMeshPackVoxel.
     auto packVoxel = [](uint32_t material, int32_t x, int32_t y, int32_t z) -> uint32_t {
         uint32_t h = 2166136261u;
@@ -762,25 +784,33 @@ void MidMeshGpuExtractResources::ComputeB13cSkirtFacesCpu(
     const auto NegZ = static_cast<uint32_t>(Simulation::SparseFaceDirection::NegZ);
     const auto PosZ = static_cast<uint32_t>(Simulation::SparseFaceDirection::PosZ);
 
-    for (uint32_t cz = 0; cz < cellsPerRow; ++cz) {
-        const bool atNegZ = (cz == 0u);
-        const bool atPosZ = (cz + 1u >= cellsPerRow);
-        for (uint32_t cx = 0; cx < cellsPerRow; ++cx) {
-            const bool atNegX = (cx == 0u);
-            const bool atPosX = (cx + 1u >= cellsPerRow);
+    // B1.3f-a: iterate BLOCKS (mergeCells>=1), exactly like the shader. mergeCells==1 -> one
+    // block per cell (byte-identical to the prior B1.3c skirt mirror). cellsPerRow here is the
+    // CPU's PER-AXIS cellCount (== side-1). Border predicates use the BLOCK edge.
+    const uint32_t mergeCells = std::max(1u, tile.mergeCells);
+    const uint32_t blockCountPerAxis = (cellsPerRow + mergeCells - 1u) / mergeCells;
+    for (uint32_t bz = 0; bz < blockCountPerAxis; ++bz) {
+        const uint32_t z = bz * mergeCells;
+        const uint32_t zEnd = std::min(cellsPerRow, z + mergeCells);
+        const bool atNegZ = (z == 0u);
+        const bool atPosZ = (zEnd >= cellsPerRow);
+        for (uint32_t bx = 0; bx < blockCountPerAxis; ++bx) {
+            const uint32_t x = bx * mergeCells;
+            const uint32_t xEnd = std::min(cellsPerRow, x + mergeCells);
+            const bool atNegX = (x == 0u);
+            const bool atPosX = (xEnd >= cellsPerRow);
             if (!atNegX && !atPosX && !atNegZ && !atPosZ) {
-                continue; // interior: no skirt
+                continue; // interior block: no skirt
             }
-            const uint32_t s = tile.samples[cz * stride + cx];
-            const uint32_t material = decodeMaterial(s);
-            if (!isSolid(material)) {
+            bool present = false; int32_t height = 0; uint32_t material = 0u;
+            aggregateBlock(x, z, xEnd, zEnd, present, height, material);
+            if (!present) {
                 continue; // SOLID-only (mirrors !block.water on the GPU's solid-only path)
             }
-            const int32_t height = quantY(decodeY(s));
-            const int32_t worldX = tile.originX + static_cast<int32_t>(cx) * cellSizeInt;
-            const int32_t worldZ = tile.originZ + static_cast<int32_t>(cz) * cellSizeInt;
-            const uint32_t width = static_cast<uint32_t>(cellSizeInt);
-            const uint32_t depth = static_cast<uint32_t>(cellSizeInt);
+            const int32_t worldX = tile.originX + static_cast<int32_t>(x) * cellSizeInt;
+            const int32_t worldZ = tile.originZ + static_cast<int32_t>(z) * cellSizeInt;
+            const uint32_t width = (xEnd - x) * static_cast<uint32_t>(cellSizeInt);
+            const uint32_t depth = (zEnd - z) * static_cast<uint32_t>(cellSizeInt);
             const uint32_t voxel = packVoxel(material, worldX, height, worldZ);
 
             const uint32_t skirtDepth = std::max(8u, terraceStep * 6u);
@@ -1459,6 +1489,41 @@ uint32_t MidMeshGpuExtractResources::SelectB13eFixture(
     return UINT32_MAX;
 }
 
+uint32_t MidMeshGpuExtractResources::SelectB13faFixture(
+    const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
+    const std::function<bool(uint32_t)>& hasEditFootprint,
+    uint32_t sampleSide)
+{
+    if (sampleSide < 2u) {
+        return UINT32_MAX;
+    }
+    const uint32_t side = sampleSide;
+    // B1.3f-a REQUIRES mergeCells > 1 (a far/LOD-merged tile) - the inverse of every earlier
+    // increment (all required mergeCells==1). To isolate LOD as the only new variable, prefer
+    // childMask==0 (no child suppression in play) AND no edit footprint (the CPU suppresses
+    // edited cells). A full sample grid is needed for the per-block aggregation. No height
+    // scan is required - the merge always changes the block geometry, so a clean merged tile
+    // is sufficient to prove the per-BLOCK path; the merged-quad gate (gpuFaceCount much lower
+    // than an unmerged tile) is checked by the caller from the A/B metrics.
+    for (uint32_t i = 0; i < dirtyTiles.size(); ++i) {
+        const auto& t = dirtyTiles[i];
+        if (t.slot == UINT32_MAX || t.samples == nullptr || t.sampleCount == 0u) {
+            continue;
+        }
+        if (t.mergeCells <= 1u || t.childMask != 0u) {
+            continue; // REQUIRE a LOD-merged block (mergeCells>1), isolate from child suppression
+        }
+        if (hasEditFootprint && hasEditFootprint(t.slot)) {
+            continue; // no edit footprint (isolate the edit skip out)
+        }
+        if (t.sampleCount < static_cast<uint32_t>(side) * side) {
+            continue;
+        }
+        return i;
+    }
+    return UINT32_MAX;
+}
+
 bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     ID3D12Device* device,
     const Simulation::MidMeshGpuExtractDirtyTile& fixture,
@@ -1510,6 +1575,7 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatch(
     ctl.applyChildSuppression = applyChildSuppression; // B1.3d: suppression was active
     ctl.applyEditSkip = applyEditSkip; // B1.3e: edit-footprint suppression was active
     ctl.equalityMode = equalityMode; // B1.3d: poll A/Bs in EQUALITY mode
+    ctl.mergeCells = std::max(1u, fixture.mergeCells); // B1.3f-a: block span for the poll mirrors
     ctl.childMask = fixture.childMask; // B1.3d: for the suppressed-cell count
     ctl.editBoxes = editBoxes; // B1.3e: for the edit-skipped-cell count (poll mirror)
     ctl.slot = 0u;       // the dedicated smoke buffers always use slot 0 / baseFace 0
@@ -1818,10 +1884,18 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     const bool applyEditSkip = slot.tile.applyEditSkip;
     const bool equalityMode = slot.tile.equalityMode;
     uint32_t gpuRiserFaces = 0u;
+    // B1.3f-a: track the MAX top-face quad world span so the LOD-merge run can show that
+    // merged quads are physically LARGER than a single cell (a 1x1 cell quad spans cellSize;
+    // a merged kxk block spans up to k*cellSize, capped per sub-face by the 32u split limit).
+    // PayloadWidth/Height are the +1-decoded packed extents (PosY: width=X span, height=Z span).
+    uint32_t gpuMaxTopQuadW = 0u, gpuMaxTopQuadH = 0u;
     for (const auto& f : gpuFaces) {
         if (Simulation::SparseSurfacePayloadDirection(f.payload) !=
             static_cast<uint32_t>(Simulation::SparseFaceDirection::PosY)) {
             ++gpuRiserFaces;
+        } else {
+            gpuMaxTopQuadW = std::max(gpuMaxTopQuadW, Simulation::SparseSurfacePayloadWidth(f.payload));
+            gpuMaxTopQuadH = std::max(gpuMaxTopQuadH, Simulation::SparseSurfacePayloadHeight(f.payload));
         }
     }
 
@@ -1856,13 +1930,24 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     // (mergeCells==1 -> midCell==cx / midCellZ==cz; qx/qz from cellsPerRow; childMask bit
     // qz*2+qx). It is the "suppression removed faces" signal: > 0 confirms the new B1.3d code
     // path actually fired on this fixture. 0 when suppression is off.
+    // B1.3f-a: count is over BLOCKS now (mergeCells>=1) using the BLOCK-CENTER quadrant rule
+    // (midCell = x + (xEnd-x)/2), mirroring the shader exactly. mergeCells==1 -> one block
+    // per cell -> byte-identical to the prior B1.3d count.
     uint32_t gpuSuppressedCells = 0u;
     if (applyChildSuppression && slot.tile.childMask != 0u && slot.tile.sampleSide > 1u) {
-        const uint32_t cellsPerRow = slot.tile.sampleSide - 1u;
-        for (uint32_t cz = 0u; cz < cellsPerRow; ++cz) {
-            const uint32_t qz = (cz * 2u >= cellsPerRow) ? 1u : 0u;
-            for (uint32_t cx = 0u; cx < cellsPerRow; ++cx) {
-                const uint32_t qx = (cx * 2u >= cellsPerRow) ? 1u : 0u;
+        const uint32_t cellsPerAxis = slot.tile.sampleSide - 1u;
+        const uint32_t mergeCells = std::max(1u, slot.tile.mergeCells);
+        const uint32_t blockCountPerAxis = (cellsPerAxis + mergeCells - 1u) / mergeCells;
+        for (uint32_t bz = 0u; bz < blockCountPerAxis; ++bz) {
+            const uint32_t z = bz * mergeCells;
+            const uint32_t zEnd = std::min(cellsPerAxis, z + mergeCells);
+            const uint32_t midCellZ = z + (zEnd - z) / 2u;
+            const uint32_t qz = (midCellZ * 2u >= cellsPerAxis) ? 1u : 0u;
+            for (uint32_t bx = 0u; bx < blockCountPerAxis; ++bx) {
+                const uint32_t x = bx * mergeCells;
+                const uint32_t xEnd = std::min(cellsPerAxis, x + mergeCells);
+                const uint32_t midCell = x + (xEnd - x) / 2u;
+                const uint32_t qx = (midCell * 2u >= cellsPerAxis) ? 1u : 0u;
                 if ((slot.tile.childMask & (1u << (qz * 2u + qx))) != 0u) {
                     ++gpuSuppressedCells;
                 }
@@ -1875,18 +1960,28 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     // world-box corners cellWorldX/Z(cx..cx+1), same inclusive AABB overlap). > 0 confirms the
     // new B1.3e edit-skip path actually fired on this fixture. 0 when the edit skip is off or
     // no box is uploaded.
+    // B1.3f-a: count is over BLOCKS now (mergeCells>=1) using the BLOCK world box
+    // (cellWorldX/Z(x..xEnd)), mirroring the shader exactly. mergeCells==1 -> one block per
+    // cell -> byte-identical to the prior B1.3e count.
     uint32_t gpuEditSkippedCells = 0u;
     const uint32_t editBoxCountForStats =
         static_cast<uint32_t>(slot.tile.editBoxes.size()); // capture before slot.tile is cleared
+    const uint32_t mergeCellsForStats = slot.tile.mergeCells; // B1.3f-a: capture before clear
     if (applyEditSkip && !slot.tile.editBoxes.empty() && slot.tile.sampleSide > 1u) {
-        const uint32_t cellsPerRow = slot.tile.sampleSide - 1u;
+        const uint32_t cellsPerAxis = slot.tile.sampleSide - 1u;
         const int32_t cellSizeInt = std::max(1, slot.tile.cellSizeInt);
-        for (uint32_t cz = 0u; cz < cellsPerRow; ++cz) {
-            const int32_t z0 = slot.tile.originZ + static_cast<int32_t>(cz) * cellSizeInt;
-            const int32_t z1 = slot.tile.originZ + static_cast<int32_t>(cz + 1u) * cellSizeInt;
-            for (uint32_t cx = 0u; cx < cellsPerRow; ++cx) {
-                const int32_t x0 = slot.tile.originX + static_cast<int32_t>(cx) * cellSizeInt;
-                const int32_t x1 = slot.tile.originX + static_cast<int32_t>(cx + 1u) * cellSizeInt;
+        const uint32_t mergeCells = std::max(1u, slot.tile.mergeCells);
+        const uint32_t blockCountPerAxis = (cellsPerAxis + mergeCells - 1u) / mergeCells;
+        for (uint32_t bz = 0u; bz < blockCountPerAxis; ++bz) {
+            const uint32_t z = bz * mergeCells;
+            const uint32_t zEnd = std::min(cellsPerAxis, z + mergeCells);
+            const int32_t z0 = slot.tile.originZ + static_cast<int32_t>(z) * cellSizeInt;
+            const int32_t z1 = slot.tile.originZ + static_cast<int32_t>(zEnd) * cellSizeInt;
+            for (uint32_t bx = 0u; bx < blockCountPerAxis; ++bx) {
+                const uint32_t x = bx * mergeCells;
+                const uint32_t xEnd = std::min(cellsPerAxis, x + mergeCells);
+                const int32_t x0 = slot.tile.originX + static_cast<int32_t>(x) * cellSizeInt;
+                const int32_t x1 = slot.tile.originX + static_cast<int32_t>(xEnd) * cellSizeInt;
                 for (const auto& b : slot.tile.editBoxes) {
                     if (b.minX <= x1 && b.maxX >= x0 && b.minZ <= z1 && b.maxZ >= z0) {
                         ++gpuEditSkippedCells;
@@ -1952,7 +2047,8 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     // For EQUALITY mode the gate is missing==0 AND extra==0 (gpuFaces==cpuMeshFaces).
     spdlog::info(
         "B13A_VERIFY mode={} abMode={} abVerifyCount={} match={} equalityHeld={} containSubset={} "
-        "gpuFaces={} gpuRiserFaces={} gpuSkirtFaces={} gpuSuppressedCells={} gpuEditSkippedCells={} "
+        "mergeCells={} gpuFaces={} gpuRiserFaces={} gpuSkirtFaces={} maxTopQuadW={} maxTopQuadH={} "
+        "gpuSuppressedCells={} gpuEditSkippedCells={} "
         "editBoxes={} cpuMeshFaces={} extraGpuFaces={} missingCpuFaces={} multiplicityMismatches={} "
         "gpuStatus={}",
         modeLabel, equalityMode ? "equal" : "contain",
@@ -1960,7 +2056,8 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
         (equalityMode && ab.missingCpuFaces == 0u && ab.extraGpuFaces == 0u &&
          ab.multiplicityMismatches == 0u && gpuStatus == 0u) ? 1 : 0,
         (ab.extraGpuFaces == 0u && gpuStatus == 0u) ? 1 : 0,
-        gpuFaceCount, gpuRiserFaces, gpuSkirtFaces, gpuSuppressedCells, gpuEditSkippedCells,
+        mergeCellsForStats, gpuFaceCount, gpuRiserFaces, gpuSkirtFaces,
+        gpuMaxTopQuadW, gpuMaxTopQuadH, gpuSuppressedCells, gpuEditSkippedCells,
         editBoxCountForStats, ab.cpuFaceCount,
         ab.extraGpuFaces, ab.missingCpuFaces, ab.multiplicityMismatches, gpuStatus);
     return true;

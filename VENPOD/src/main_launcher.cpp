@@ -3031,13 +3031,25 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseMidMeshGpuExtractB13e =
         sparseMidMeshGpuExtract &&
         ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_B13E", 0u) != 0u;
-    // The B1.3a/b/c/d/e top-face path reuses the smoke compute side (queue/fence/readback ring),
-    // so the smoke compute objects must be stood up whenever ANY path is enabled. B1.3b/c/d/e
-    // share the B1.3a top-face PSO, so they also need the B1.3a init to run.
+    // Phase B1.3f-a: the LOD-MERGE increment (mergeCells>1) - the GPU extraction generalizes
+    // from per-CELL to per-BLOCK, aggregating mergeCells x mergeCells sample cells into one
+    // coarse footprint (a faithful port of extractTileMesh's aggregateSamples), so it matches
+    // the CPU for any mergeCells. The fixture REQUIRES a far/LOD-merged tile (mergeCells>1);
+    // A/B is FULL EQUALITY against the CPU mesh (missingCpuFaces==0 AND extraGpuFaces==0). Like
+    // B1.3d/e, EQUALITY is only sound with water + cull OFF (so LOD is the only new variable),
+    // so this run REQUIRES VENPOD_SPARSE_MID_MESH_WATER=0 and VENPOD_SPARSE_MID_MESH_DISTANCE_CULL=0.
+    // Reuses the B1.3a-e top-face PSO with the per-BLOCK shader loop (driven by the metadata's
+    // mergeCells). mergeCells==1 stays byte-identical (a 1x1 block == a cell). Default 0.
+    const bool sparseMidMeshGpuExtractB13fa =
+        sparseMidMeshGpuExtract &&
+        ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_B13FA", 0u) != 0u;
+    // The B1.3a/b/c/d/e/f-a top-face path reuses the smoke compute side (queue/fence/readback
+    // ring), so the smoke compute objects must be stood up whenever ANY path is enabled.
+    // B1.3b-f-a share the B1.3a top-face PSO, so they also need the B1.3a init to run.
     const bool sparseMidMeshGpuExtractTopFacePath =
         sparseMidMeshGpuExtractB13a || sparseMidMeshGpuExtractB13b ||
         sparseMidMeshGpuExtractB13c || sparseMidMeshGpuExtractB13d ||
-        sparseMidMeshGpuExtractB13e;
+        sparseMidMeshGpuExtractB13e || sparseMidMeshGpuExtractB13fa;
     const bool sparseMidMeshGpuExtractComputeSide =
         sparseMidMeshGpuExtractSmoke || sparseMidMeshGpuExtractTopFacePath;
     // Phase B1.3.0 GATED explicit readback WAIT. Default 0 = the readback ring polls
@@ -16795,6 +16807,11 @@ int RunSandbox(int argc, char* argv[]) {
                 midMeshBuildConfig.lodEnabled = sparseMidMeshLodEnabled;
                 midMeshBuildConfig.lodBaseMerge = sparseMidMeshLodBaseMerge;
                 midMeshBuildConfig.lodMaxMerge = sparseMidMeshLodMaxMerge;
+                // TEST-ONLY (B1.3f-a A/B): force a fixed LOD merge so the per-BLOCK GPU
+                // extraction can be A/B'd vs the CPU's merged mesh in scenes where the
+                // distance rule never fires. Default 0 = OFF = production behavior unchanged.
+                midMeshBuildConfig.forceMergeCells =
+                    ReadUIntEnv("VENPOD_SPARSE_MID_MESH_FORCE_MERGE", 0u);
                 midMeshBuildConfig.emitWater = sparseMidMeshEmitWater;
                 midMeshBuildConfig.distanceCull = sparseMidMeshDistanceCull;
                 midMeshBuildConfig.frustumCull = sparseMidMeshFrustumCull;
@@ -16989,19 +17006,58 @@ int RunSandbox(int argc, char* argv[]) {
                     if (sparseMidMeshGpuExtractTopFacePath &&
                         midMeshGpuExtractResources.B13aReady() &&
                         !gpuExtractTiles.empty()) {
-                        // B1.3e is the latest face-REMOVING increment (top+riser+skirt MINUS the
-                        // EDIT-FOOTPRINT cells) and takes precedence; it implies risers + skirts on
-                        // (the b13c superset) plus the edit skip. B1.3d is the prior face-REMOVING
-                        // increment (child-quadrant suppression). Else B1.3c/b/a.
+                        // B1.3f-a is the latest increment (LOD MERGE, mergeCells>1) and takes
+                        // precedence; it implies risers + skirts on (the b13c superset) and A/Bs
+                        // in EQUALITY mode against the CPU's merged mesh. B1.3e is the prior
+                        // face-REMOVING increment (edit footprint); B1.3d (child suppression).
+                        // Else B1.3c/b/a.
+                        const bool wantLodMerge = sparseMidMeshGpuExtractB13fa;
                         const bool wantEditSkip = sparseMidMeshGpuExtractB13e;
                         const bool wantSuppression = sparseMidMeshGpuExtractB13d;
                         const bool emitSkirts =
-                            sparseMidMeshGpuExtractB13c || wantSuppression || wantEditSkip;
+                            sparseMidMeshGpuExtractB13c || wantSuppression || wantEditSkip ||
+                            wantLodMerge;
                         const bool emitRisers = sparseMidMeshGpuExtractB13b || emitSkirts;
                         const auto editFootprintFn = [&](uint32_t slot) {
                             return sparseClipmapTileCache
                                 .MidMeshTileHasEditFootprintBySlot(slot);
                         };
+
+                        // B1.3f-a DIAGNOSTIC: log the mergeCells distribution of the WHOLE
+                        // dirty set this build, so the run shows whether LOD-merged tiles
+                        // (mergeCells>1) ever reach the extractor's dirty list at all (the
+                        // B13fa primary fixture needs one). One line per build; cheap.
+                        if (wantLodMerge) {
+                            auto countPool =
+                                [&](const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& pool,
+                                    uint32_t& merged, uint32_t& mergedClean, uint32_t& maxMerge) {
+                                merged = 0u; mergedClean = 0u; maxMerge = 0u;
+                                for (const auto& dt : pool) {
+                                    if (dt.mergeCells <= 1u) { continue; }
+                                    ++merged;
+                                    maxMerge = std::max(maxMerge, dt.mergeCells);
+                                    if (dt.childMask == 0u && !editFootprintFn(dt.slot)) {
+                                        ++mergedClean;
+                                    }
+                                }
+                            };
+                            uint32_t dMerged = 0u, dClean = 0u, dMax = 0u;
+                            countPool(gpuExtractTiles, dMerged, dClean, dMax);
+                            // Also probe the resident pool (read-only) for the report - this is
+                            // where a stable far merged tile lives when the dirty set has none.
+                            std::vector<Simulation::MidMeshGpuExtractDirtyTile> probePool;
+                            sparseClipmapTileCache.CollectAllResidentMidMeshGpuExtractTiles(probePool);
+                            uint32_t rMerged = 0u, rClean = 0u, rMax = 0u;
+                            countPool(probePool, rMerged, rClean, rMax);
+                            spdlog::info(
+                                "GPU_EXTRACT_B13FA_DIRTY dirtyTotal={} dirtyMerged={} "
+                                "dirtyMergedClean={} dirtyMaxMerge={} residentTotal={} "
+                                "residentMerged={} residentMergedClean={} residentMaxMerge={}",
+                                static_cast<uint32_t>(gpuExtractTiles.size()),
+                                dMerged, dClean, dMax,
+                                static_cast<uint32_t>(probePool.size()),
+                                rMerged, rClean, rMax);
+                        }
 
                         // B1.3d/e fixture selection:
                         //   * B1.3e PRIMARY = an EDITED tile (SelectB13eFixture) -> the edit skip
@@ -17014,10 +17070,51 @@ int RunSandbox(int argc, char* argv[]) {
                         uint32_t fixtureIdx = UINT32_MAX;
                         bool applyChildSuppression = false; // active only on a childMask!=0 fixture
                         bool applyEditSkip = false;         // B1.3e: active on an edited fixture
-                        bool equalityMode = false;          // B1.3d/e A/Bs in EQUALITY mode
+                        bool equalityMode = false;          // B1.3d/e/f-a A/Bs in EQUALITY mode
                         bool expectChildMaskNonZero = false; // gate: which childMask the cache must show
+                        bool expectMergeGreaterThanOne = false; // B1.3f-a: cache must show mergeCells>1
                         std::vector<Simulation::MidMeshEditXzBox> editBoxes; // B1.3e fixture's boxes
-                        if (wantEditSkip) {
+                        // The fixture index normally addresses gpuExtractTiles (the build's dirty
+                        // set). B1.3f-a may instead pull from ALL resident tiles (a stable far
+                        // merged tile is rarely in the per-build dirty set), so route the final
+                        // dispatch through this pool pointer.
+                        std::vector<Simulation::MidMeshGpuExtractDirtyTile> b13faResidentPool;
+                        const std::vector<Simulation::MidMeshGpuExtractDirtyTile>* fixturePool =
+                            &gpuExtractTiles;
+                        if (wantLodMerge) {
+                            // B1.3f-a PRIMARY = a far/LOD-merged tile (mergeCells>1) -> the per-BLOCK
+                            // path aggregates mergeCells x mergeCells cells, A/B in EQUALITY mode (the
+                            // LOD-merge proof). Search the build's dirty set FIRST; if no merged tile
+                            // is dirty (the common case - far tiles settle + stop being re-extracted),
+                            // search ALL RESIDENT cached tiles (read-only). FALL BACK to a mergeCells==1
+                            // border tile (SelectB13c) -> EQUALITY re-confirms a 1x1 block reproduces
+                            // the cell exactly (mergeCells==1 byte-identical to B1.3e). All childMask==0
+                            // + no edit footprint, so LOD is the only variable.
+                            equalityMode = true;
+                            fixtureIdx = MidMeshGpuExtractResources::SelectB13faFixture(
+                                gpuExtractTiles, editFootprintFn,
+                                sparseClipmapConfig.tileSampleSide);
+                            if (fixtureIdx != UINT32_MAX) {
+                                expectMergeGreaterThanOne = true; // cache must still show mergeCells>1
+                            } else {
+                                // No merged tile in the dirty set -> search ALL resident tiles.
+                                sparseClipmapTileCache.CollectAllResidentMidMeshGpuExtractTiles(
+                                    b13faResidentPool);
+                                fixtureIdx = MidMeshGpuExtractResources::SelectB13faFixture(
+                                    b13faResidentPool, editFootprintFn,
+                                    sparseClipmapConfig.tileSampleSide);
+                                if (fixtureIdx != UINT32_MAX) {
+                                    fixturePool = &b13faResidentPool; // index now addresses this pool
+                                    expectMergeGreaterThanOne = true;
+                                } else {
+                                    // FALL BACK: mergeCells==1 re-confirm (a 1x1 block == a cell).
+                                    fixtureIdx = MidMeshGpuExtractResources::SelectB13cFixture(
+                                        gpuExtractTiles, editFootprintFn,
+                                        sparseClipmapConfig.tileSampleSide, sparseMidMeshTerraceStep);
+                                    expectMergeGreaterThanOne = false;
+                                }
+                            }
+                        } else if (wantEditSkip) {
                             equalityMode = true;
                             applyEditSkip = true; // the edit-skip code path is ALWAYS on for B1.3e
                             fixtureIdx = MidMeshGpuExtractResources::SelectB13eFixture(
@@ -17080,7 +17177,7 @@ int RunSandbox(int argc, char* argv[]) {
                         }
 
                         if (fixtureIdx != UINT32_MAX) {
-                            const auto& fixture = gpuExtractTiles[fixtureIdx];
+                            const auto& fixture = (*fixturePool)[fixtureIdx];
                             // READ-ONLY: the tile's persistent CPU reference mesh (the exact
                             // faces extractTileMesh left). Never re-extracts, never mutates.
                             std::vector<Simulation::SparseSurfaceFace> cpuRefFaces;
@@ -17091,13 +17188,17 @@ int RunSandbox(int argc, char* argv[]) {
                                     fixture.slot, cpuRefFaces, &refMergeCells, &refChildMask,
                                     &refContentVersion);
                             // Only proceed if the cache reflects the SAME state the fixture
-                            // selection assumed: always mergeCells==1, the expected childMask
-                            // (==0 for B1.3a-c + the B1.3d fallback; !=0 for the B1.3d primary),
+                            // selection assumed: the expected mergeCells (==1 for B1.3a-e + the
+                            // B1.3f-a fallback; >1 for the B1.3f-a primary), the expected childMask
+                            // (==0 for B1.3a-c + the B1.3d/f-a fallbacks; !=0 for the B1.3d primary),
                             // and the same content serial (no in-flight change).
                             const bool childMaskOk = expectChildMaskNonZero
                                 ? (refChildMask != 0u)
                                 : (refChildMask == 0u);
-                            if (haveRef && refMergeCells == 1u && childMaskOk &&
+                            const bool mergeCellsOk = expectMergeGreaterThanOne
+                                ? (refMergeCells > 1u)
+                                : (refMergeCells == 1u);
+                            if (haveRef && mergeCellsOk && childMaskOk &&
                                 refContentVersion == fixture.meshContentVersion) {
                                 midMeshGpuExtractResources.RunB13aTopFaceDispatch(
                                     device->GetDevice(), fixture, cpuRefFaces,
