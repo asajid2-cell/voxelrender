@@ -2969,6 +2969,15 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseMidMeshGpuExtract =
         sparseMidMeshIncrementalUpload &&
         ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT", 0u) != 0u;
+    // Phase B1.2 SMOKE: minimal compute proof (one controlled tile). Default 0 = zero
+    // cost. Requires VENPOD_MIDMESH_GPU_EXTRACT=1 too. When 1, after the B1.1 sample
+    // upload each frame, dispatch CS_MidMeshExtractSmoke for ONE controlled dirty tile,
+    // writing deterministic top quads into an ISOLATED debug face buffer, validating the
+    // commit gate + (delayed, debug-only) a SMOKE_VERIFY readback. Never touches the
+    // production face buffer or draw path.
+    const bool sparseMidMeshGpuExtractSmoke =
+        sparseMidMeshGpuExtract &&
+        ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_SMOKE", 0u) != 0u;
     // PARALLEL pre-extraction of cache-miss tiles (only meaningful on the primed-dirty
     // incremental path). DEFAULT ON: the build re-extracts every cache-miss tile across
     // worker threads BEFORE the main loop (the dominant per-build cost is the ~3.75ms/tile
@@ -3439,6 +3448,18 @@ int RunSandbox(int argc, char* argv[]) {
                         static_cast<double>(extractStats.sampleBufferBytes) / (1024.0 * 1024.0),
                         static_cast<double>(extractStats.metadataBufferBytes) / 1024.0,
                         static_cast<double>(extractStats.uploadRingSlotBytes) / (1024.0 * 1024.0));
+                    // Phase B1.2 SMOKE: stand up the compute side (isolated debug face
+                    // buffer + smoke PSO). Only when the SMOKE sub-toggle is set.
+                    if (sparseMidMeshGpuExtractSmoke && extractResult) {
+                        auto smokeInit = midMeshGpuExtractResources.InitializeSmoke(
+                            device->GetDevice(),
+                            renderer->GetShaderCompiler(),
+                            shaderPath);
+                        if (!smokeInit) {
+                            spdlog::error("Mid-mesh GPU extract SMOKE (B1.2) init failed: {}",
+                                smokeInit.error());
+                        }
+                    }
                 }
             }
         } else if (sparseBackendRequested) {
@@ -16839,6 +16860,35 @@ int RunSandbox(int argc, char* argv[]) {
                         gpuExtractSkippedClean,
                         gpuExtractStats.skippedNoSlotTiles,
                         gpuExtractStats.deferredRingFullTiles);
+
+                    // ===== Phase B1.2 SMOKE: minimal compute proof =====
+                    // Self-contained: RunSmokeDispatch uploads the controlled tile's
+                    // samples+metadata, dispatches the smoke CS, and validates the commit
+                    // gate on its OWN command list + fence (the MidVoxelGpuGenPoc pattern),
+                    // fully isolated from this frame's command list. It writes an ISOLATED
+                    // debug face buffer only - production geometry + draw path untouched.
+                    if (sparseMidMeshGpuExtractSmoke &&
+                        midMeshGpuExtractResources.SmokeReady() &&
+                        !gpuExtractTiles.empty()) {
+                        // Current version for the tile the dispatch will pick (the first
+                        // eligible dirty tile) - same-frame, so the commit gate PASSes.
+                        uint64_t controlledCurrentVersion = 0;
+                        for (const auto& t : gpuExtractTiles) {
+                            if (t.slot != UINT32_MAX && t.samples != nullptr && t.sampleCount > 0u) {
+                                controlledCurrentVersion = t.meshContentVersion;
+                                break;
+                            }
+                        }
+                        midMeshGpuExtractResources.RunSmokeDispatch(
+                            device->GetDevice(), *commandQueue, gpuExtractTiles,
+                            controlledCurrentVersion);
+                        // Delayed/debug-only verify: the dispatch fence is already complete
+                        // (RunSmokeDispatch waited it), so a poll here reads the written
+                        // faces back and emits SMOKE_VERIFY. The pipeline functions with
+                        // this compiled out - it is pure validation.
+                        midMeshGpuExtractResources.PollSmokeReadback(
+                            commandQueue->GetLastCompletedFenceValue());
+                    }
                 }
                 (void)midMeshDirtyUpload;
                 // Incremental no-op: the build succeeded but nothing was dirty/removed, so

@@ -22,15 +22,21 @@
 // =============================================================================
 
 #include "RHI/DescriptorHeap.h"
+#include "RHI/DX12ComputePipeline.h"
 #include "RHI/GPUBuffer.h"
+#include "RHI/ShaderCompiler.h"
 #include "Simulation/SparseClipmap.h"
+#include "Simulation/SparseSurfaceExtractor.h"
 #include "Utils/Result.h"
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <vector>
 
 namespace VENPOD::Graphics {
+
+class DX12CommandQueue;
 
 // -----------------------------------------------------------------------------
 // Per-tile GPU extraction metadata - HARD ABI (CPU <-> future HLSL compute).
@@ -106,6 +112,12 @@ struct MidMeshGpuExtractConfig {
     uint32_t tileSampleSide = 33;   // side; per-tile region = side*side uint32
     uint32_t uploadRingSlots = 3;   // per-frame upload-ring depth (matches the present ring)
     uint32_t faceCapacityMargin = 64; // extra faces reserved past the CPU count (B1.1: bookkeeping only)
+    // B1.2 SMOKE: a fixed per-slot reserved face range for the ISOLATED debug-output
+    // face buffer (NOT the production mid-mesh face buffer). Uniform per-slot so
+    // baseFace = slot * smokeFaceCapacityPerTile is non-overlapping + stable. The smoke
+    // CS writes only the first smokeMaxCells top quads (<= this capacity).
+    uint32_t smokeFaceCapacityPerTile = 256u;
+    uint32_t smokeMaxCells = 16u;   // K: top quads the smoke shader writes per tile
 };
 
 struct MidMeshGpuExtractStats {
@@ -122,6 +134,31 @@ struct MidMeshGpuExtractStats {
     uint32_t skippedNoSlotTiles = 0;    // dirty coords with no resident slot (evicted)
     uint32_t deferredRingFullTiles = 0; // dirty tiles deferred because the ring slot was full
     bool uploadRingWaitSkipped = false; // active ring slot still in flight -> upload skipped
+};
+
+// -----------------------------------------------------------------------------
+// B1.2 SMOKE: per-dispatch result + a captured snapshot of the ONE controlled tile
+// so the CPU can recompute the deterministic face pattern the shader should produce.
+// -----------------------------------------------------------------------------
+struct MidMeshGpuExtractSmokeStats {
+    bool dispatched = false;        // a smoke dispatch was recorded this run
+    uint32_t tileSlot = UINT32_MAX; // controlled tile's slot
+    uint32_t controlledTiles = 0;   // controlled tile count (1 for B1.2)
+    uint32_t expectedFaceCount = 0; // CPU-predicted face count for the controlled tile
+    uint32_t gpuFaceCount = 0;      // GPU-written faceCount (read back; UINT32_MAX = unread)
+    uint32_t gpuStatusOverflow = 0; // GPU-written status (0 ok / 1 overflow)
+    // Commit gate (no-hole publication logic; nothing is actually drawn):
+    bool commitGatePassed = false;  // fence done AND meshContentVersion still matches
+    bool commitGateStale = false;   // dispatched serial != current tile serial -> discard
+    uint64_t dispatchedVersion = 0; // meshContentVersion captured at dispatch
+    // Timing (microseconds):
+    double dispatchGpuUs = 0.0;
+    double barrierGpuUs = 0.0;
+    double cpuSubmitUs = 0.0;
+    // Verify (filled by the delayed readback):
+    bool verified = false;
+    uint32_t verifyMatched = 0;     // faces that matched the CPU recompute
+    uint32_t verifyMismatch = 0;
 };
 
 // Per-frame upload ticket: the staged copy regions for this frame's dirty tiles.
@@ -182,7 +219,65 @@ public:
     const DescriptorHandle& SampleBufferSRV() const { return m_sampleBuffer.GetShaderVisibleSRV(); }
     const DescriptorHandle& MetadataBufferSRV() const { return m_metadataBuffer.GetShaderVisibleSRV(); }
 
+    // =========================================================================
+    // B1.2 SMOKE - minimal compute proof (gated by VENPOD_MIDMESH_GPU_EXTRACT_SMOKE)
+    // =========================================================================
+    // Stands up the compute side: an ISOLATED debug-output SparseSurfaceFace UAV
+    // buffer + the smoke compute PSO. NEVER touches the production mid-mesh face
+    // buffer or the draw path. Must be called after Initialize().
+    Result<void> InitializeSmoke(
+        ID3D12Device* device,
+        ShaderCompiler& shaderCompiler,
+        const std::filesystem::path& shaderPath);
+    bool SmokeReady() const { return m_smokeReady; }
+
+    // Run ONE smoke dispatch for the FIRST controlled (resident-slot) dirty tile in
+    // `dirtyTiles`: the smoke CS reads that tile's metadata + samples from the
+    // persistent buffers (already uploaded by EmitCopy on `commandQueue`'s timeline)
+    // and writes K deterministic top quads into the isolated debug face buffer's
+    // reserved range. Runs on its own command list + fence (the per-slot fence
+    // pattern), times the dispatch+barrier with GPU timestamps, and validates the
+    // commit gate (fence done AND serial unchanged). Records into m_smokeStats and
+    // captures the controlled tile so a later PollSmokeReadback() can verify it.
+    // Returns true if a dispatch was issued.
+    bool RunSmokeDispatch(
+        ID3D12Device* device,
+        DX12CommandQueue& commandQueue,
+        const std::vector<Simulation::MidMeshGpuExtractDirtyTile>& dirtyTiles,
+        uint64_t currentTileVersionForSlot);
+
+    // Delayed, DEBUG-ONLY readback of the last dispatch's controlled tile: copies the
+    // debug face buffer's reserved range + the metadata faceCount/status back, then
+    // recomputes the SAME deterministic pattern CPU-side and compares. Non-blocking:
+    // only runs once the dispatch fence has completed. Returns true once a verify ran.
+    // The pipeline FUNCTIONS without ever calling this - it is pure validation.
+    bool PollSmokeReadback(uint64_t completedFenceValue);
+
+    const MidMeshGpuExtractSmokeStats& GetSmokeStats() const { return m_smokeStats; }
+
 private:
+    // B1.2: CPU snapshot of the controlled tile, captured at dispatch, so the readback
+    // can recompute the exact deterministic faces the shader was asked to produce.
+    struct SmokeControlledTile {
+        bool valid = false;
+        uint32_t slot = UINT32_MAX;
+        uint32_t baseFace = 0;          // reserved range base in the debug face buffer
+        uint32_t expectedCount = 0;     // K (clamped to capacity)
+        uint64_t version = 0;           // meshContentVersion at dispatch
+        uint64_t fenceValue = 0;        // fence this dispatch signaled
+        int32_t originX = 0;
+        int32_t originZ = 0;
+        int32_t cellSizeInt = 0;
+        uint32_t sampleSide = 0;
+        std::vector<uint32_t> samples;  // copy of the tile's packed samples
+    };
+
+    // Recompute the deterministic smoke faces CPU-side (mirror of the HLSL). Static so
+    // the test/verify path and the doc stay in lockstep with the shader.
+    static void ComputeSmokeFacesCpu(
+        const SmokeControlledTile& tile,
+        std::vector<Simulation::SparseSurfaceFace>& outFaces);
+
     MidMeshGpuExtractConfig m_config;
     MidMeshGpuExtractStats m_stats;
 
@@ -198,6 +293,38 @@ private:
     uint64_t m_currentFrameFenceValue = 0;
     bool m_sampleBufferInCopyDest = false;
     bool m_metadataBufferInCopyDest = false;
+
+    // ---- B1.2 SMOKE (compute side) ----
+    bool m_smokeReady = false;
+    DX12ComputePipeline m_smokePipeline;
+    UploadBuffer m_smokeInputUpload; // one controlled tile's samples + metadata stage
+    // DEDICATED, smoke-OWNED input buffers (one tile / one slot). Kept separate from the
+    // B1.1 persistent sample/metadata buffers so the smoke's own command list never
+    // shares DX12 state tracking with the frame command list's B1.1 EmitCopy (that
+    // cross-list coupling silently corrupted reads on frames after the first).
+    GPUBuffer m_smokeSampleBuffer;   // one tile's samples (StructuredBuffer, SRV-read)
+    GPUBuffer m_smokeMetaBuffer;     // one slot's metadata (RWStructuredBuffer, UAV)
+    GPUBuffer m_smokeFaceBuffer;     // ISOLATED RWStructuredBuffer<SparseSurfaceFace> (UAV)
+    GPUBuffer m_smokeFaceReadback;   // CPU-visible copy of the controlled tile's range
+    GPUBuffer m_smokeMetaReadback;   // CPU-visible copy of the controlled tile's metadata
+    ComPtr<ID3D12QueryHeap> m_smokeQueryHeap;   // 3 timestamps: dispatch begin/end + barrier end
+    GPUBuffer m_smokeQueryReadback;             // CPU-visible timestamp resolve target
+    ComPtr<ID3D12CommandAllocator> m_smokeCmdAllocator; // reused per dispatch (created once)
+    ComPtr<ID3D12GraphicsCommandList> m_smokeCmdList;   // reused per dispatch (created once)
+    // DEDICATED queue + fence for the smoke submit. The smoke path runs every frame, so
+    // it must NOT share the main render queue's fence/value counter (that desynchronized
+    // the main per-frame fence ring and caused a device removal). This queue is touched
+    // ONLY by the smoke dispatch, fully isolating its Signal/Wait.
+    ComPtr<ID3D12CommandQueue> m_smokeQueue;
+    ComPtr<ID3D12Fence> m_smokeFence;
+    void* m_smokeFenceEvent = nullptr;
+    uint64_t m_smokeFenceValue = 0;
+    bool m_smokeVerifyDone = false; // one authoritative SMOKE_VERIFY has been captured
+    uint64_t m_smokeTimestampFrequency = 0;
+    uint32_t m_smokeFaceCapacityPerTile = 0;
+    uint64_t m_smokeFaceBufferBytes = 0;
+    SmokeControlledTile m_smokeControlled;       // last dispatch's controlled tile
+    MidMeshGpuExtractSmokeStats m_smokeStats;
 };
 
 } // namespace VENPOD::Graphics
