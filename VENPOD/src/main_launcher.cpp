@@ -3140,6 +3140,12 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseMidMeshGpuExtractFull =
         sparseMidMeshGpuExtract &&
         ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_FULL", 0u) != 0u;
+    // Step 1 promotion gate: validation-only production-format face output. When enabled,
+    // dispatch the everything-on extractor for the per-frame dirty tile set and A/B the
+    // production per-slot range against CPU meshCacheFaces. Draw/CPU extraction remain unchanged.
+    const bool sparseMidMeshGpuExtractProduction =
+        sparseMidMeshGpuExtract &&
+        ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_PRODUCTION", 0u) != 0u;
     // The B1.3a..f-d top-face path reuses the smoke compute side (queue/fence/readback ring),
     // so the smoke compute objects must be stood up whenever ANY path is enabled. B1.3b-f-d
     // share the B1.3a top-face PSO, so they also need the B1.3a init to run.
@@ -3148,7 +3154,7 @@ int RunSandbox(int argc, char* argv[]) {
         sparseMidMeshGpuExtractB13c || sparseMidMeshGpuExtractB13d ||
         sparseMidMeshGpuExtractB13e || sparseMidMeshGpuExtractB13fa ||
         sparseMidMeshGpuExtractB13fb || sparseMidMeshGpuExtractB13fc ||
-        sparseMidMeshGpuExtractFull;
+        sparseMidMeshGpuExtractFull || sparseMidMeshGpuExtractProduction;
     const bool sparseMidMeshGpuExtractComputeSide =
         sparseMidMeshGpuExtractSmoke || sparseMidMeshGpuExtractTopFacePath;
     // Phase B1.3.0 GATED explicit readback WAIT. Default 0 = the readback ring polls
@@ -17318,6 +17324,119 @@ int RunSandbox(int argc, char* argv[]) {
                                 .MidMeshTileHasEditFootprintBySlot(slot);
                         };
 
+                        if (sparseMidMeshGpuExtractProduction) {
+                            // STEP 1 PRODUCTION OUTPUT: write the full-feature extraction into
+                            // fixed per-slot production-format ranges for ONLY this frame's dirty
+                            // tiles, then A/B that production range against CPU meshCacheFaces.
+                            // Draw/CPU extraction remain unchanged; this is validation-only.
+                            const uint32_t side = sparseClipmapConfig.tileSampleSide;
+                            const uint32_t neededSamples = side * side;
+                            uint32_t prodDispatched = 0u;
+                            uint32_t prodCompared = 0u;
+                            uint32_t prodEqual = 0u;
+                            uint32_t prodMismatch = 0u;
+                            uint32_t prodOverflow = 0u;
+                            uint32_t prodMaxGpuFaces = 0u;
+                            uint32_t prodSkipped = 0u;
+                            auto drainProductionPolls = [&]() {
+                                while (midMeshGpuExtractResources.PollB13aReadback()) {
+                                    const auto& st = midMeshGpuExtractResources.GetB13aStats();
+                                    if (!st.productionOutput) {
+                                        continue;
+                                    }
+                                    ++prodCompared;
+                                    prodMaxGpuFaces = std::max(prodMaxGpuFaces, st.gpuFaceCount);
+                                    const bool eq =
+                                        (st.abMissingCpuFaces == 0u) &&
+                                        (st.abExtraGpuFaces == 0u) &&
+                                        (st.abMultiplicityMismatches == 0u) &&
+                                        (st.gpuStatusOverflow == 0u);
+                                    if (eq) { ++prodEqual; }
+                                    else { ++prodMismatch; }
+                                    if (st.gpuStatusOverflow != 0u) {
+                                        ++prodOverflow;
+                                    }
+                                    spdlog::info(
+                                        "GPU_EXTRACT_PROD frame={} tile={} gpuFaces={} cpuFaces={} "
+                                        "extra={} missing={} multiplicity={} overflow={} match={}",
+                                        frameCount, st.tileSlot, st.gpuFaceCount, st.cpuRefFaceCount,
+                                        st.abExtraGpuFaces, st.abMissingCpuFaces,
+                                        st.abMultiplicityMismatches, st.gpuStatusOverflow,
+                                        eq ? 1 : 0);
+                                }
+                            };
+
+                            drainProductionPolls();
+                            for (const auto& tile : gpuExtractTiles) {
+                                if (tile.slot == UINT32_MAX || tile.samples == nullptr ||
+                                    tile.sampleCount < neededSamples) {
+                                    ++prodSkipped;
+                                    continue;
+                                }
+
+                                std::vector<Simulation::SparseSurfaceFace> cpuRefFaces;
+                                uint32_t refMergeCells = 0u, refChildMask = 0u;
+                                uint64_t refContentVersion = 0u;
+                                if (!sparseClipmapTileCache.GetMidMeshTileCacheFacesBySlot(
+                                        tile.slot, cpuRefFaces, &refMergeCells, &refChildMask,
+                                        &refContentVersion) ||
+                                    refContentVersion != tile.meshContentVersion) {
+                                    ++prodSkipped;
+                                    continue;
+                                }
+
+                                std::vector<uint8_t> tileCullMask;
+                                uint32_t tileBlocksPerAxis = 0u;
+                                sparseClipmapTileCache.MidMeshTileCullBlockMaskBySlot(
+                                    tile.slot, tileCullMask, &tileBlocksPerAxis);
+
+                                std::vector<Simulation::MidMeshEditXzBox> tileEditBoxes;
+                                const uint32_t editBoxCap =
+                                    MidMeshGpuExtractConfig{}.editBoxCapacityPerTile;
+                                const uint32_t tileEditTotal =
+                                    sparseClipmapTileCache.MidMeshTileEditBoxesBySlot(
+                                        tile.slot, tileEditBoxes, editBoxCap);
+                                if (tileEditTotal > editBoxCap) {
+                                    ++prodSkipped;
+                                    spdlog::warn(
+                                        "[GPU_EXTRACT_PROD] tile slot {} has {} edit boxes "
+                                        "> cap {}; skipping (raise editBoxCapacityPerTile)",
+                                        tile.slot, tileEditTotal, editBoxCap);
+                                    continue;
+                                }
+
+                                const bool dispatched =
+                                    midMeshGpuExtractResources.RunB13aTopFaceDispatchProduction(
+                                        device->GetDevice(), tile, cpuRefFaces,
+                                        sparseMidMeshTerraceStep, tile.meshContentVersion,
+                                        /*emitRisers=*/true,
+                                        /*emitSkirts=*/true,
+                                        /*applyChildSuppression=*/true,
+                                        /*equalityMode=*/true,
+                                        /*applyEditSkip=*/true,
+                                        tileEditBoxes,
+                                        /*emitWater=*/true,
+                                        /*applyDistanceCull=*/true,
+                                        tileCullMask);
+                                if (dispatched) {
+                                    ++prodDispatched;
+                                    drainProductionPolls();
+                                } else {
+                                    ++prodSkipped;
+                                }
+                            }
+                            drainProductionPolls();
+                            spdlog::info(
+                                "GPU_EXTRACT_PROD_SUMMARY frame={} dirtyTiles={} dispatched={} "
+                                "compared={} equal={} mismatched={} overflow={} skipped={} "
+                                "maxGpuFaces={} faceCapacityPerTile={}",
+                                frameCount,
+                                static_cast<uint32_t>(gpuExtractTiles.size()),
+                                prodDispatched, prodCompared, prodEqual, prodMismatch,
+                                prodOverflow, prodSkipped, prodMaxGpuFaces,
+                                midMeshGpuExtractResources.GetStats().productionFaceCapacityPerTile);
+                        }
+
                         if (sparseMidMeshGpuExtractFull) {
                             // ===== Phase B1.3f-d: EVERYTHING-ON corpus sweep =====
                             // The REAL configuration: ALL features on (risers + skirts +
@@ -17598,7 +17717,7 @@ int RunSandbox(int argc, char* argv[]) {
                                 midMeshFullCorpus.maxVisibleMissing =
                                     std::max(midMeshFullCorpus.maxVisibleMissing, vm);
                             }
-                        } else {
+                        } else if (!sparseMidMeshGpuExtractProduction) {
 
                         // B1.3f-a DIAGNOSTIC: log the mergeCells distribution of the WHOLE
                         // dirty set this build, so the run shows whether LOD-merged tiles

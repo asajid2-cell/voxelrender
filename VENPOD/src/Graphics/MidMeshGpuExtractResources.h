@@ -126,6 +126,15 @@ struct MidMeshGpuExtractConfig {
     // at ~4628+ faces (overflowing the old 4096), so size for the worst stepped tile with
     // headroom; overflow still sets the status flag (a rejected result, never an OOB write).
     uint32_t topFaceCapacityPerTile = 16384u;
+    // STEP 1 PRODUCTION OUTPUT: fixed per-slot face arena. This intentionally does NOT
+    // borrow the CPU tile.faceCount. For side=33, the worst block count is merge=1:
+    // 32*32 = 1024 top blocks, with at most 2*32*31 interior neighbor probes plus 4*32
+    // border skirt edges before 32-unit extent / vertical riser splitting. The production
+    // mtns_edit replay currently peaks at 13,540 faces, so 16k is the validated bound for
+    // current terrain/config with explicit overflow reporting if a future tile exceeds it.
+    // Overflow sets status and the A/B rejects the result instead of truncating or drawing
+    // partial geometry.
+    uint32_t productionFaceCapacityPerTile = 16384u;
     // B1.3e EDIT-FOOTPRINT: per-tile cap on the number of edited-cell XZ boxes uploaded to
     // the GPU. An edited tile in practice overlaps a handful of brush strokes; 256 is ample
     // headroom. If a tile exceeds it the dispatch is SKIPPED + reported (never a partial/OOB
@@ -141,6 +150,10 @@ struct MidMeshGpuExtractStats {
     uint64_t sampleBufferBytes = 0;
     uint64_t metadataBufferBytes = 0;
     uint64_t uploadRingSlotBytes = 0;
+    uint32_t productionFaceCapacityPerTile = 0;
+    uint64_t productionFaceBufferBytes = 0;
+    uint64_t productionFaceCountBufferBytes = 0;
+    uint64_t productionFaceStatusBufferBytes = 0;
     // Per-frame (last upload):
     uint32_t sampleUploadTiles = 0;     // tiles whose samples+metadata were copied
     uint64_t sampleUploadBytes = 0;     // samples + metadata bytes copied this frame
@@ -198,6 +211,7 @@ struct MidMeshGpuExtractB13aStats {
     bool emitWater = false;         // B1.3f-b: water-aware aggregation + all-air fill active
     bool applyDistanceCull = false; // B1.3f-c: camera-distance cull (CPU-decision mask) was active
     bool equalityMode = false;      // B1.3d: A/B ran in EQUALITY mode (not containment)
+    bool productionOutput = false;  // STEP 1: faces were written to the production-format buffer
     uint32_t gpuCulledBlocks = 0;   // B1.3f-c: blocks the CPU mask flagged as culled (the GPU skipped)
     uint32_t gpuSkirtFaces = 0;     // B1.3c: GPU faces that are border-skirt side quads
     uint32_t gpuSuppressedCells = 0;// B1.3d: cells the GPU skipped due to child suppression
@@ -510,6 +524,21 @@ public:
         bool emitWater = false,
         bool applyDistanceCull = false,
         const std::vector<uint8_t>& cullBlockMask = {});
+    bool RunB13aTopFaceDispatchProduction(
+        ID3D12Device* device,
+        const Simulation::MidMeshGpuExtractDirtyTile& fixture,
+        const std::vector<Simulation::SparseSurfaceFace>& cpuReferenceFaces,
+        uint32_t terraceStep,
+        uint64_t currentTileVersionForSlot,
+        bool emitRisers,
+        bool emitSkirts,
+        bool applyChildSuppression,
+        bool equalityMode,
+        bool applyEditSkip,
+        const std::vector<Simulation::MidMeshEditXzBox>& editBoxes,
+        bool emitWater,
+        bool applyDistanceCull,
+        const std::vector<uint8_t>& cullBlockMask);
 
     // Delayed, DEBUG-ONLY containment A/B via the fence-tracked ring (same FIFO/ring as
     // the smoke poll, non-blocking by default). Reads the GPU top faces + status for the
@@ -522,6 +551,23 @@ public:
     const MidMeshGpuExtractB13aStats& GetB13aStats() const { return m_b13aStats; }
 
 private:
+    bool RunB13aTopFaceDispatchInternal(
+        ID3D12Device* device,
+        const Simulation::MidMeshGpuExtractDirtyTile& fixture,
+        const std::vector<Simulation::SparseSurfaceFace>& cpuReferenceFaces,
+        uint32_t terraceStep,
+        uint64_t currentTileVersionForSlot,
+        bool emitRisers,
+        bool emitSkirts,
+        bool applyChildSuppression,
+        bool equalityMode,
+        bool applyEditSkip,
+        const std::vector<Simulation::MidMeshEditXzBox>& editBoxes,
+        bool emitWater,
+        bool applyDistanceCull,
+        const std::vector<uint8_t>& cullBlockMask,
+        bool productionOutput);
+
     // B1.2: CPU snapshot of the controlled tile, captured at dispatch, so the readback
     // can recompute the exact deterministic faces the shader was asked to produce.
     struct SmokeControlledTile {
@@ -547,6 +593,8 @@ private:
         bool emitWater = false; // B1.3f-b: water-aware aggregation + all-air fill was active
         bool applyDistanceCull = false; // B1.3f-c: camera-distance cull (CPU-decision mask) active
         bool equalityMode = false; // B1.3d: poll A/Bs in EQUALITY mode (not containment)
+        bool productionOutput = false; // STEP 1: readback comes from production-format range
+        uint32_t outputSlot = 0; // per-slot production range index (real tile slot when production)
         uint32_t mergeCells = 1u; // B1.3f-a: the fixture's LOD merge-cell size (block span)
         uint32_t childMask = 0u; // B1.3d: the fixture's childMask (for suppressed-cell count)
         uint32_t culledBlocks = 0u; // B1.3f-c: count of blocks the CPU cull mask flagged (for the log)
@@ -580,8 +628,12 @@ private:
     struct SmokeReadbackSlot {
         GPUBuffer faceReadback;     // CPU-visible copy of the dispatch's debug faces
         GPUBuffer metaReadback;     // CPU-visible copy of the dispatch's metadata
+        GPUBuffer countReadback;    // CPU-visible copy of the production count slot
+        GPUBuffer statusReadback;   // CPU-visible copy of the production status slot
         void* facePtr = nullptr;    // persistent mapped pointer into faceReadback
         void* metaPtr = nullptr;    // persistent mapped pointer into metaReadback
+        void* countPtr = nullptr;   // persistent mapped pointer into countReadback
+        void* statusPtr = nullptr;  // persistent mapped pointer into statusReadback
         uint64_t fenceValue = 0;    // smoke-fence value the copy into this slot signals
         bool pending = false;       // copy recorded, awaiting fence + a poll
         SmokeControlledTile tile;   // controlled tile snapshot for this dispatch
@@ -629,6 +681,17 @@ private:
     GPUBuffer m_cullBlockBuffer;     // one tile's per-block cull flags (SRV-read at t2)
     UploadBuffer m_cullBlockUpload;  // one tile's cull-flag stage
     uint32_t m_cullBlockCapacityPerTile = 0; // max blocks/tile == (tileSampleSide-1)^2
+    // STEP 1 PRODUCTION OUTPUT: fixed per-real-slot face arena + count UAV. The draw path
+    // does not consume this yet; A/B readback proves this production-format range matches
+    // CPU meshCacheFaces before later promotion steps bind it for rendering.
+    GPUBuffer m_productionFaceBuffer;
+    GPUBuffer m_productionFaceCountBuffer;
+    GPUBuffer m_productionFaceStatusBuffer;
+    UploadBuffer m_productionCountClearUpload;
+    uint32_t m_productionFaceCapacityPerTile = 0;
+    uint64_t m_productionFaceBufferBytes = 0;
+    uint64_t m_productionFaceCountBufferBytes = 0;
+    uint64_t m_productionFaceStatusBufferBytes = 0;
     // B1.3.0: fence-tracked, persistently-mapped readback RING (replaces B1.2's
     // single once-per-process readback). 3 slots so a dispatch's copy can be read
     // a frame or two later, after its fence is naturally satisfied - no per-frame

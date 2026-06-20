@@ -37,8 +37,8 @@
 //     ever makes the GPU a smaller subset (never an extra). If a culled cell DID make
 //     the GPU emit an extra, the containment compare surfaces it (it is not hidden).
 //
-// Append model: a per-tile InterlockedAdd counter (TileMeta[slot].faceCount) hands
-// each emitted sub-face a dense write slot inside the reserved range. Overflow past
+// Append model: a per-output-slot InterlockedAdd counter (FaceCounts[gOutputSlot])
+// hands each emitted sub-face a dense write slot inside the reserved range. Overflow past
 // gFaceCapacityPerTile sets statusOverflow and the face is not written (the A/B
 // harness fails a non-zero overflow, so a truncated result is never trusted).
 // =============================================================================
@@ -74,6 +74,7 @@ cbuffer TopFaceConstants : register(b0) {
                                 //        divergence at the cull boundary - the flagged risk).
     uint gCullBlockBase;        // B1.3f-c: base index of this tile's per-block cull flags in
                                 //        CullBlockMask (one uint per block, 1 = CPU culled it).
+    uint gOutputSlot;           // STEP 1 production output slot for FaceCounts.
 }
 
 // =============================================================================
@@ -111,6 +112,8 @@ StructuredBuffer<MidMeshEditBox>      EditBoxes     : register(t1); // B1.3e: pe
 StructuredBuffer<uint>                CullBlockMask : register(t2); // B1.3f-c: per-block CPU cull flag
 RWStructuredBuffer<SparseSurfaceFace> DebugFaces    : register(u0); // ISOLATED debug output
 RWStructuredBuffer<MidMeshTileMeta>   TileMeta      : register(u1); // metadata (faceCount UAV)
+RWStructuredBuffer<uint>              FaceCounts    : register(u2); // STEP 1 production counts
+RWStructuredBuffer<uint>              FaceStatuses  : register(u3); // STEP 1 production overflow/status
 
 // =============================================================================
 // APPEND ONE FACE - claims a dense slot from the per-tile counter, bounds-checks
@@ -120,9 +123,10 @@ RWStructuredBuffer<MidMeshTileMeta>   TileMeta      : register(u1); // metadata 
 // =============================================================================
 bool MidMeshAppendFace(uint slot, SparseSurfaceFace face) {
     uint writeIndex;
-    InterlockedAdd(TileMeta[slot].faceCount, 1u, writeIndex);
+    InterlockedAdd(FaceCounts[gOutputSlot], 1u, writeIndex);
     if (writeIndex >= gFaceCapacityPerTile) {
         TileMeta[slot].statusOverflow = 1u;
+        FaceStatuses[gOutputSlot] = 1u;
         return false;
     }
     DebugFaces[gDebugBaseFace + writeIndex] = face;
@@ -386,15 +390,6 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     const uint blockCountPerAxis =
         (cellsPerAxis > 0u) ? ((cellsPerAxis + mergeCells - 1u) / mergeCells) : 0u;
     const uint blockCount = blockCountPerAxis * blockCountPerAxis;
-
-    // Thread 0 initializes the per-tile face counter + ok status for this dispatch.
-    // (The host zeroes the counter pre-dispatch too, but make the shader self-consistent.)
-    if (dispatchId.x == 0u) {
-        TileMeta[slot].faceCount = 0u;
-        TileMeta[slot].statusOverflow = 0u;
-    }
-    // A device-scope barrier so every thread sees the zeroed counter before appending.
-    AllMemoryBarrierWithGroupSync();
 
     if (cellsPerAxis == 0u || blockCountPerAxis == 0u) {
         return; // degenerate tile - nothing to emit.
