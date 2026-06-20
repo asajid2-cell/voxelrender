@@ -176,71 +176,87 @@ float SparseTerrainGenerator::HeightAt(int32_t worldX, int32_t worldZ) const {
     if (publicBasinBand > 0.0f) {
         height = Lerp(height, std::min(height, publicBasinFloor), publicBasinBand * 0.80f);
     }
-    const float backdropNoise = ValueNoise2D(x * 0.0018f + 19.0f, z * 0.0018f - 31.0f, m_seed + 211u);
-    const float backdropRidgeSource =
-        ValueNoise2D(x * 0.0032f - 71.0f, z * 0.0032f + 43.0f, m_seed + 227u);
-    const float backdropRidge = 1.0f - std::abs(backdropRidgeSource);
-    const float backdropBreakup =
-        ValueNoise2D(x * 0.0075f + 203.0f, z * 0.0075f - 167.0f, m_seed + 271u);
-    const float backdropNotch =
-        Smooth01(std::clamp((backdropBreakup - 0.08f) / 0.58f, 0.0f, 1.0f));
-    const float silhouetteRidge =
-        std::clamp(backdropRidge * backdropRidge * 1.22f + backdropNoise * 0.18f, 0.0f, 1.0f);
+    // PERF (near-terrain early-out, byte-identical): the backdrop relief Lerp factor is
+    // backdropInfluence*0.70, and backdropInfluence is proportional to backdropBand, which is
+    // exactly 0 for originDistance < 1360. So for every near-camera query (collision, surface,
+    // interest) the Lerp below is a provable no-op while it still pays for 3 ValueNoise2D evals.
+    // Hoist the noise-free backdropBand and skip the whole block when it can't contribute.
+    // Result is bit-identical to the original; mirror in TerrainHeight.hlsli TH_HeightAt.
     const float backdropBand =
         Smooth01(std::clamp((originDistance - 1360.0f) / 700.0f, 0.0f, 1.0f)) *
         (1.0f - Smooth01(std::clamp((originDistance - 5200.0f) / 1200.0f, 0.0f, 1.0f)));
-    const float northBackdrop =
-        Smooth01(std::clamp((z - 1180.0f) / 900.0f, 0.0f, 1.0f));
-    const float sideBackdrop =
-        Smooth01(std::clamp((std::abs(x - 192.0f) - 820.0f) / 980.0f, 0.0f, 1.0f));
-    const float backdropFacing =
-        std::clamp(northBackdrop + sideBackdrop * 0.58f, 0.0f, 1.0f);
-    const float silhouetteContinuity =
-        std::clamp(silhouetteRidge + backdropBand * backdropFacing * 0.32f, 0.0f, 1.0f);
-    const float backdropInfluence =
-        backdropBand *
-        backdropFacing *
-        Smooth01(silhouetteContinuity) *
-        (0.46f + backdropNotch * 0.54f);
-    const float backdropHeight =
-        248.0f +
-        backdropBand * 160.0f +
-        silhouetteContinuity * 186.0f +
-        backdropNoise * 26.0f;
-    height = Lerp(height, std::max(height, backdropHeight), backdropInfluence * 0.70f);
+    if (backdropBand > 0.0f) {
+        const float backdropNoise = ValueNoise2D(x * 0.0018f + 19.0f, z * 0.0018f - 31.0f, m_seed + 211u);
+        const float backdropRidgeSource =
+            ValueNoise2D(x * 0.0032f - 71.0f, z * 0.0032f + 43.0f, m_seed + 227u);
+        const float backdropRidge = 1.0f - std::abs(backdropRidgeSource);
+        const float backdropBreakup =
+            ValueNoise2D(x * 0.0075f + 203.0f, z * 0.0075f - 167.0f, m_seed + 271u);
+        const float backdropNotch =
+            Smooth01(std::clamp((backdropBreakup - 0.08f) / 0.58f, 0.0f, 1.0f));
+        const float silhouetteRidge =
+            std::clamp(backdropRidge * backdropRidge * 1.22f + backdropNoise * 0.18f, 0.0f, 1.0f);
+        const float northBackdrop =
+            Smooth01(std::clamp((z - 1180.0f) / 900.0f, 0.0f, 1.0f));
+        const float sideBackdrop =
+            Smooth01(std::clamp((std::abs(x - 192.0f) - 820.0f) / 980.0f, 0.0f, 1.0f));
+        const float backdropFacing =
+            std::clamp(northBackdrop + sideBackdrop * 0.58f, 0.0f, 1.0f);
+        const float silhouetteContinuity =
+            std::clamp(silhouetteRidge + backdropBand * backdropFacing * 0.32f, 0.0f, 1.0f);
+        const float backdropInfluence =
+            backdropBand *
+            backdropFacing *
+            Smooth01(silhouetteContinuity) *
+            (0.46f + backdropNotch * 0.54f);
+        const float backdropHeight =
+            248.0f +
+            backdropBand * 160.0f +
+            silhouetteContinuity * 186.0f +
+            backdropNoise * 26.0f;
+        height = Lerp(height, std::max(height, backdropHeight), backdropInfluence * 0.70f);
+    }
 
-    const float westCorridor = Smooth01(std::clamp((192.0f - x - 520.0f) / 820.0f, 0.0f, 1.0f));
-    const float eastCorridor = Smooth01(std::clamp((x - 192.0f - 520.0f) / 820.0f, 0.0f, 1.0f));
-    const float southBlend = Smooth01(std::clamp((360.0f - z) / 1200.0f, 0.0f, 1.0f));
-    const float westNorthBlend = Smooth01(std::clamp((z - 360.0f) / 920.0f, 0.0f, 1.0f));
+    // PERF (near-terrain early-out, byte-identical): the route relief Lerp factor is
+    // routeCorridor*routeRidge*routeNotch*0.68, and routeCorridor is proportional to
+    // routeDistanceBand, which is exactly 0 for originDistance < 780. So the Lerp is a provable
+    // no-op for near queries while still paying for 3 ValueNoise2D evals. Hoist the noise-free
+    // routeDistanceBand and skip the block when it can't contribute. Bit-identical to the
+    // original; mirror in TerrainHeight.hlsli TH_HeightAt.
     const float routeDistanceBand =
         Smooth01(std::clamp((originDistance - 780.0f) / 420.0f, 0.0f, 1.0f)) *
         (1.0f - Smooth01(std::clamp((originDistance - 4300.0f) / 1200.0f, 0.0f, 1.0f)));
-    const float routeCorridor = routeDistanceBand * std::clamp(
-        westCorridor * (0.50f + southBlend * 0.42f + westNorthBlend * 0.30f) +
-        eastCorridor * southBlend,
-        0.0f,
-        1.0f);
-    const float routeRidgeNoiseA =
-        ValueNoise2D(x * 0.0024f + 113.0f, z * 0.0024f - 89.0f, m_seed + 251u);
-    const float routeRidgeNoiseB =
-        ValueNoise2D(x * 0.0068f - 37.0f, z * 0.0068f + 151.0f, m_seed + 263u);
-    const float routeBreakup =
-        ValueNoise2D(x * 0.0110f - 211.0f, z * 0.0110f + 73.0f, m_seed + 281u);
-    const float routeNotch =
-        Smooth01(std::clamp((routeBreakup - 0.02f) / 0.60f, 0.0f, 1.0f));
-    const float routeRidge =
-        std::clamp(
-            0.26f +
-            (1.0f - std::abs(routeRidgeNoiseA)) * 0.58f +
-            routeRidgeNoiseB * 0.16f,
+    if (routeDistanceBand > 0.0f) {
+        const float westCorridor = Smooth01(std::clamp((192.0f - x - 520.0f) / 820.0f, 0.0f, 1.0f));
+        const float eastCorridor = Smooth01(std::clamp((x - 192.0f - 520.0f) / 820.0f, 0.0f, 1.0f));
+        const float southBlend = Smooth01(std::clamp((360.0f - z) / 1200.0f, 0.0f, 1.0f));
+        const float westNorthBlend = Smooth01(std::clamp((z - 360.0f) / 920.0f, 0.0f, 1.0f));
+        const float routeCorridor = routeDistanceBand * std::clamp(
+            westCorridor * (0.50f + southBlend * 0.42f + westNorthBlend * 0.30f) +
+            eastCorridor * southBlend,
             0.0f,
             1.0f);
-    const float routeBackdropHeight =
-        272.0f +
-        routeDistanceBand * 104.0f +
-        routeRidge * 218.0f;
-    height = Lerp(height, std::max(height, routeBackdropHeight), routeCorridor * routeRidge * routeNotch * 0.68f);
+        const float routeRidgeNoiseA =
+            ValueNoise2D(x * 0.0024f + 113.0f, z * 0.0024f - 89.0f, m_seed + 251u);
+        const float routeRidgeNoiseB =
+            ValueNoise2D(x * 0.0068f - 37.0f, z * 0.0068f + 151.0f, m_seed + 263u);
+        const float routeBreakup =
+            ValueNoise2D(x * 0.0110f - 211.0f, z * 0.0110f + 73.0f, m_seed + 281u);
+        const float routeNotch =
+            Smooth01(std::clamp((routeBreakup - 0.02f) / 0.60f, 0.0f, 1.0f));
+        const float routeRidge =
+            std::clamp(
+                0.26f +
+                (1.0f - std::abs(routeRidgeNoiseA)) * 0.58f +
+                routeRidgeNoiseB * 0.16f,
+                0.0f,
+                1.0f);
+        const float routeBackdropHeight =
+            272.0f +
+            routeDistanceBand * 104.0f +
+            routeRidge * 218.0f;
+        height = Lerp(height, std::max(height, routeBackdropHeight), routeCorridor * routeRidge * routeNotch * 0.68f);
+    }
 
     // Spawn landmass: lift low/submerged near-origin terrain onto a gently
     // rolling land floor comfortably above sea level. TANDEM widen 9300 -> 35000
