@@ -181,12 +181,39 @@ bool SparseSurfaceExtractor::IsSolid(uint32_t voxel) {
         material != VENPOD::Utils::Material::Water;
 }
 
+bool IsSolidMaterial(uint8_t material) {
+    return material != VENPOD::Utils::Material::Air &&
+        material != VENPOD::Utils::Material::Water;
+}
+
 bool IsWater(uint32_t voxel) {
     return VENPOD::Utils::UnpackMaterial(voxel) == VENPOD::Utils::Material::Water;
 }
 
 bool IsAir(uint32_t voxel) {
     return VENPOD::Utils::UnpackMaterial(voxel) == VENPOD::Utils::Material::Air;
+}
+
+bool IsRenderableSurfaceFaceMaterials(
+    uint8_t material,
+    uint8_t neighborMaterial,
+    SparseFaceDirection direction)
+{
+    if (IsSolidMaterial(material)) {
+        if (neighborMaterial == VENPOD::Utils::Material::Air) {
+            return true;
+        }
+        return neighborMaterial == VENPOD::Utils::Material::Water &&
+            direction != SparseFaceDirection::PosY;
+    }
+
+    if (material == VENPOD::Utils::Material::Water) {
+        return (direction == SparseFaceDirection::PosY ||
+                direction == SparseFaceDirection::NegY) &&
+            neighborMaterial == VENPOD::Utils::Material::Air;
+    }
+
+    return false;
 }
 
 bool IsRenderableSurfaceFace(
@@ -262,7 +289,7 @@ SparseSurfaceExtractionResult SparseSurfaceExtractor::ExtractRegion(
         for (int32_t z = minZ; z <= maxZ; ++z) {
             for (int32_t y = minY; y <= maxY; ++y) {
                 for (int32_t x = minX; x <= maxX; ++x) {
-                    if (IsSolid(LocalVoxelAt(brick, x, y, z))) {
+                    if (IsSolidMaterial(VENPOD::Utils::UnpackMaterial(LocalVoxelAt(brick, x, y, z)))) {
                         ++result.stats.solidVoxels;
                     }
                 }
@@ -334,8 +361,10 @@ SparseSurfaceExtractionResult SparseSurfaceExtractor::ExtractRegion(
                     int32_t z = 0;
                     LocalFromFacePlane(dir.direction, fixed, u, v, x, y, z);
                     const uint32_t voxel = LocalVoxelAt(brick, x, y, z);
-                    if (!IsSolid(voxel) &&
-                        !(IsWater(voxel) && dir.direction == SparseFaceDirection::PosY)) {
+                    const uint8_t material = VENPOD::Utils::UnpackMaterial(voxel);
+                    if (!IsSolidMaterial(material) &&
+                        !(material == VENPOD::Utils::Material::Water &&
+                          dir.direction == SparseFaceDirection::PosY)) {
                         continue;
                     }
 
@@ -352,7 +381,8 @@ SparseSurfaceExtractionResult SparseSurfaceExtractor::ExtractRegion(
                         worldZ,
                         dir,
                         neighborSampler);
-                    if (!IsRenderableSurfaceFace(voxel, neighborVoxel, dir.direction)) {
+                    const uint8_t neighborMaterial = VENPOD::Utils::UnpackMaterial(neighborVoxel);
+                    if (!IsRenderableSurfaceFaceMaterials(material, neighborMaterial, dir.direction)) {
                         continue;
                     }
 
