@@ -62,3 +62,20 @@ Slowly, one verified loop at a time. Never ship a hole. Never claim an unmeasure
   Helper cross-check attempted via `node tandem/bin/peer.mjs ask ...` but timed out. Loop 3 pick:
   re-profile and decide between Lever A (finish gating heavy `RefreshStats`, still 2.5-3.6%) and
   Lever C (`SparseSurfaceExtractor::ExtractRegion`, 2.4-4.0% and prominent in edit hitches).
+- **Loop 3 (Codex, code 99f5fe5):** Lever C, reduce CPU work in
+  `SparseSurfaceExtractor::ExtractRegion` by unpacking the current voxel material once and the
+  neighbor material once, then using a material-equivalent face visibility test. This leaves face
+  payloads, merge behavior, unit-face stats, and draw paths unchanged. Fresh clean-head profile
+  picked this over Lever A because `mtns_edit.rec` showed `ExtractRegion` 4.8% vs `RefreshStats`
+  2.9%; `mtns.rec` had them close at 2.2% vs 2.4%. After the change: `mtns_edit.rec`
+  `ExtractRegion` 4.8% (56/1171 samples) -> 3.4% (52/1541), `PROF_HITCH` 90->81.
+  `mtns.rec` baseline was an outlier (3123 samples, 353 hitches), so treat it as supportive only:
+  raw `ExtractRegion` samples 68->17 and hitches 353->18, but percent deltas are not stable.
+  GATES: clean worktree build OK; `VENPODTests.exe` still has broad pre-existing sparse failures
+  and was not used as a loop gate; no `terrain-parity-fail`; visibleMissing nonzero count 0 on
+  both replays; frame-598 baseline vs after BMP SHA256 identical
+  (`CC66B19C9CEB5B39F15E5884F33F9A8D1567411BB14BCFDCA9DCE2B6E2C541D8`). Terrain checksum not
+  applicable (no terrain math touched). Loop 4 pick: fresh profile first, but current after-edit
+  profile points back to terrain HeightAt/memo tuning as the largest CPU lever; if we want the
+  lower-risk telemetry lane, split `SparseClipmapTileCache::RefreshStats` into coverage-critical
+  counters vs telemetry-only fallback/ring diagnostics.
