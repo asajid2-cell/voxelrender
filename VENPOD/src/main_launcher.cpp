@@ -4837,6 +4837,13 @@ int RunSandbox(int argc, char* argv[]) {
     // everything needed to diagnose what the scripted smoke cannot see.
     const bool editTelemetryEnabled =
         ReadUIntEnv("VENPOD_EDIT_TELEMETRY", 0u) != 0u;
+    const bool perfVerboseTelemetry =
+        ReadUIntEnv("VENPOD_PERF_VERBOSE", 0u) != 0u ||
+        ReadUIntEnv("VENPOD_EDIT_TELEMETRY_VERBOSE", 0u) != 0u;
+    const uint32_t editTelemetryLogInterval =
+        std::max(1u, ReadUIntEnv("VENPOD_EDIT_TELEMETRY_LOG_INTERVAL", 60u));
+    const uint32_t editTelemetrySlowLogInterval =
+        std::max(1u, ReadUIntEnv("VENPOD_EDIT_TELEMETRY_SLOW_LOG_INTERVAL", 30u));
     const uint32_t editTelemetryCaptureInterval =
         std::max(1u, ReadUIntEnv("VENPOD_EDIT_TELEMETRY_CAPTURE_INTERVAL", 60u));
     // Framebuffer capture is now OPT-IN (VENPOD_EDIT_TELEMETRY_CAPTURE=1) and
@@ -26252,10 +26259,24 @@ int RunSandbox(int argc, char* argv[]) {
                 editTelem.painting || editTelem.erasing ||
                 editTelem.deltaCount != 0u || editTelem.bakeRan ||
                 editTelem.propRegenUploads != 0u || editTelem.propInvalidatedBricks != 0u;
-            // Also log SLOW frames (>30ms) so the spiky frames are always captured,
-            // editing or not.
+            // Default telemetry is sparse because the string formatting itself shows
+            // up in PROF_TOP and makes dips worse. VENPOD_PERF_VERBOSE=1 preserves
+            // the old every-edit/every-slow-frame stream for targeted diagnosis.
             const bool slowFrameThisFrame = perfFrameBodyMsLastFrame > 30.0f;
-            if (editingThisFrame || slowFrameThisFrame || (frameCount % 15u) == 0u) {
+            static uint64_t lastEditTelemetryLogFrame = UINT64_MAX;
+            const bool firstTelemetryFrame = lastEditTelemetryLogFrame == UINT64_MAX;
+            const bool legacyTelemetryDue =
+                editingThisFrame || slowFrameThisFrame || (frameCount % 15u) == 0u;
+            const bool intervalTelemetryDue =
+                firstTelemetryFrame ||
+                frameCount >= lastEditTelemetryLogFrame + editTelemetryLogInterval;
+            const bool slowTelemetryDue =
+                slowFrameThisFrame &&
+                (firstTelemetryFrame ||
+                 frameCount >= lastEditTelemetryLogFrame + editTelemetrySlowLogInterval);
+            const bool sparseTelemetryDue = intervalTelemetryDue || slowTelemetryDue;
+            if (perfVerboseTelemetry ? legacyTelemetryDue : sparseTelemetryDue) {
+                lastEditTelemetryLogFrame = frameCount;
                 const auto& gs = sparseGpuResources.GetStats();
                 const auto& edits = sparseVoxelWorld.GetEdits();
                 spdlog::info(
