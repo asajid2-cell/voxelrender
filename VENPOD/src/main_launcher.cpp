@@ -5182,6 +5182,7 @@ int RunSandbox(int argc, char* argv[]) {
     uint32_t perfSparseTerrainCriticalPrePublishSurfaceExtracted = 0;
     uint32_t perfSparseTerrainCriticalSurfaceGateDefers = 0;
     float perfPrePhysicsGapMs = 0.0f;
+    float perfPrePhysGroundScanMs = 0.0f;  // DIAG: FindCollisionSupportBelow time (prePhys gap)
     float perfPreRenderGapMs = 0.0f;
     float perfPostRenderGapMs = 0.0f;
     // UNTRACKED-DIVE instrumentation: fine-grained scoped timers around the
@@ -19918,7 +19919,9 @@ int RunSandbox(int argc, char* argv[]) {
                 feetWorld.y + 0.35f,
                 feetWorld.z + playerRadius
             };
+            const uint64_t ppGroundT0 = SDL_GetPerformanceCounter();  // DIAG prePhys-gap ground scan
             const auto sparseGround = sparseVoxelWorld.FindCollisionSupportBelow(footProbe, 512.0f);
+            perfPrePhysGroundScanMs = ticksToMs(SDL_GetPerformanceCounter() - ppGroundT0);
             if (sparseGround.found) {
                 groundRaycastResult.posX = static_cast<float>(sparseGround.supportX) + 0.5f;
                 groundRaycastResult.posY = static_cast<float>(sparseGround.supportY) + 1.0f;
