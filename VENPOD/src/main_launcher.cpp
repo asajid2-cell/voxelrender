@@ -25909,6 +25909,14 @@ int RunSandbox(int argc, char* argv[]) {
         inputManager.EndFrame();
         perfInputEndMsLastFrame = ticksToMs(SDL_GetPerformanceCounter() - perfPhaseStart);
         perfFrameBodyMsLastFrame = ticksToMs(SDL_GetPerformanceCounter() - currentFrameCounter);
+        // CLEAN PER-FRAME DIP MEASUREMENT (VENPOD_FRAMETIME_LOG=1): one tiny line/frame with the
+        // same-frame body time (the real frame work; excludes the after-body logging) + the
+        // frame-to-frame raw delta. Lets dips be measured at PRODUCTION log interval without the
+        // heavy per-frame PERF logging (and its logging-gated readiness scans) inflating the body.
+        static const bool frametimeLog = (std::getenv("VENPOD_FRAMETIME_LOG") != nullptr);
+        if (frametimeLog) {
+            spdlog::info("FT {} body={:.3f} raw={:.3f}", frameCount, perfFrameBodyMsLastFrame, lastRawFrameMs);
+        }
         // ===== UNTRACKED-DIVE: full body partition at END of loop, where EVERY
         // timer holds this frame's value (no current/previous mixing). bodyResidual
         // is the time inside the body NOT covered by any named phase OR gap timer.
