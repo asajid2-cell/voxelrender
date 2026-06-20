@@ -9,6 +9,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cstring>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -546,6 +547,7 @@ bool SparseClipmapTileCache::Initialize(const SparseClipmapConfig& config) {
     m_tiles.resize(m_config.maxTiles);
     m_freeSlots.clear();
     m_slotByCoord.clear();
+    ++m_midMeshResidencyEpoch;  // residency changed -> invalidate per-tile LOD cache
     m_generationQueue.clear();
     m_queuedSet.clear();
     m_interestSet.clear();
@@ -1986,6 +1988,14 @@ void SparseClipmapTileCache::UpdateInterest(
     velocityZ = FiniteOr(velocityZ, 0.0f);
     predictionSeconds = std::max(0.0f, FiniteOr(predictionSeconds, 0.0f));
 
+    // CLIPINTEREST PROFILE (env-gated, VENPOD_CLIPINTEREST_PROFILE=1): split UpdateInterest into
+    // direct per-phase timers so the actual O(N) operation is MEASURED, not inferred from the
+    // aggregate `clip` timer. Logs one line/frame: reuse reason, fullRebuild, set sizes, phase ms.
+    static const bool ciProfile = (std::getenv("VENPOD_CLIPINTEREST_PROFILE") != nullptr);
+    const auto ciEntryT = std::chrono::steady_clock::now();
+    const size_t ciSetSizeBefore = m_interestSet.size();
+    const size_t ciVoxelSizeBefore = m_voxelInterestSet.size();
+    const auto ciSigT0 = std::chrono::steady_clock::now();
     const InterestSignature signature = BuildInterestSignature(
         cameraX,
         cameraY,
@@ -1998,18 +2008,37 @@ void SparseClipmapTileCache::UpdateInterest(
         velocityY,
         velocityZ,
         predictionSeconds);
+    const double ciSigMs =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ciSigT0).count();
     const bool intervalReuse =
         m_lastInterestSignatureValid &&
         policy.Config().interestUpdateIntervalFrames > 1u &&
         frameIndex - m_lastInterestUpdateFrame < policy.Config().interestUpdateIntervalFrames;
     if (m_lastInterestSignatureValid && (signature == m_lastInterestSignature || intervalReuse)) {
         m_interestReusedLastFrame = 1;
+        const bool ciSigMatch = (signature == m_lastInterestSignature);
+        const auto ciRefreshT0 = std::chrono::steady_clock::now();
         RefreshInterestTouchFrames(frameIndex);
+        const double ciRefreshMs =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ciRefreshT0).count();
+        const auto ciStatsT0 = std::chrono::steady_clock::now();
         RefreshStats();
+        const double ciStatsMs =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ciStatsT0).count();
+        if (ciProfile) {
+            spdlog::info(
+                "CLIPINTEREST frame={} reuse={} fullRebuild=0 interval={} lastUpd={} setSize={} voxelSize={} "
+                "sigMs={:.3f} refreshMs={:.3f} statsMs={:.3f} totalMs={:.3f}",
+                frameIndex, ciSigMatch ? "sig" : "interval",
+                policy.Config().interestUpdateIntervalFrames, m_lastInterestUpdateFrame,
+                ciSetSizeBefore, ciVoxelSizeBefore, ciSigMs, ciRefreshMs, ciStatsMs,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ciEntryT).count());
+        }
         return;
     }
 
     m_interestReusedLastFrame = 0;
+    const auto ciRebuildBodyT0 = std::chrono::steady_clock::now();
     std::unordered_set<SparseClipmapTileCoord, SparseClipmapTileCoordHash> previousInterestSet;
     if (policy.Config().drainReuseDiagnostics) {
         previousInterestSet = m_interestSet;
@@ -2218,8 +2247,14 @@ void SparseClipmapTileCache::UpdateInterest(
             static_cast<size_t>(std::numeric_limits<uint32_t>::max() - m_noLongerInterestedTilesLastFrame)));
     }
 
+    const double ciHeightMs =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ciRebuildBodyT0).count();
+    const auto ciStatsRbT0 = std::chrono::steady_clock::now();
     RefreshStats();
+    const double ciStatsRbMs =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ciStatsRbT0).count();
     m_stats.heightInterestAnchors = heightAnchorCount;
+    const auto ciVoxelT0 = std::chrono::steady_clock::now();
     UpdateVoxelInterest(
         cameraX,
         cameraY,
@@ -2233,9 +2268,21 @@ void SparseClipmapTileCache::UpdateInterest(
         velocityY,
         velocityZ,
         predictionSeconds);
+    const double ciVoxelMs =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ciVoxelT0).count();
     m_lastInterestSignature = signature;
     m_lastInterestSignatureValid = true;
     m_lastInterestUpdateFrame = frameIndex;
+    if (ciProfile) {
+        spdlog::info(
+            "CLIPINTEREST frame={} reuse=none fullRebuild=1 interval={} setSize={}->{} voxelSize={}->{} "
+            "sigMs={:.3f} heightMs={:.3f} statsMs={:.3f} voxelMs={:.3f} rebuildMs={:.3f} totalMs={:.3f}",
+            frameIndex, policy.Config().interestUpdateIntervalFrames,
+            ciSetSizeBefore, m_interestSet.size(), ciVoxelSizeBefore, m_voxelInterestSet.size(), ciSigMs,
+            ciHeightMs, ciStatsRbMs, ciVoxelMs,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ciRebuildBodyT0).count(),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ciEntryT).count());
+    }
 }
 
 uint32_t SparseClipmapTileCache::AllocateSlot(
@@ -2268,6 +2315,7 @@ uint32_t SparseClipmapTileCache::AllocateSlot(
 
     const SparseClipmapTileCoord oldCoord = m_tiles[bestSlot].record.coord;
     m_slotByCoord.erase(oldCoord);
+    ++m_midMeshResidencyEpoch;  // residency changed -> invalidate per-tile LOD cache
     m_tiles[bestSlot].packedSamples.clear();
     m_tiles[bestSlot].record = {};
     m_tiles[bestSlot].record.slot = bestSlot;
@@ -2420,6 +2468,7 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
             // Single-threaded commit: publish slots + dirty marks in queue order.
             for (const PendingHeightGeneration& item : pendingHeight) {
                 m_slotByCoord[item.coord] = item.slot;
+                ++m_midMeshResidencyEpoch;  // residency changed -> invalidate per-tile LOD cache
                 ++m_dirtySerial;
                 ++m_heightDirtySerial;
                 MarkHeightSlotDirty(item.slot);
@@ -2452,6 +2501,7 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
             m_tiles[slot].record.lastTouchedFrame = frameIndex;
             GenerateTile(slot, policy);
             m_slotByCoord[coord] = slot;
+            ++m_midMeshResidencyEpoch;  // residency changed -> invalidate per-tile LOD cache
             ++generated;
             ++m_dirtySerial;
             ++m_heightDirtySerial;
@@ -6733,6 +6783,18 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     const float maxDistance = std::max(minDistance + 1.0f, buildConfig.maxDistance);
     const float cullPadding = std::max(0.0f, buildConfig.cullPadding);
     const float tanHalfFov = std::tan(std::clamp(buildConfig.fovYRadians, 0.1f, 3.0f) * 0.5f);
+    // EFFECTIVE distance-cull params the cull lambdas read. Default to the current build's values;
+    // the dirty-region splice transiently overrides them to a tile's FROZEN (cached) cull params
+    // so an in-rect re-extract shares the same cull basis as the kept out-of-rect cache faces
+    // (see drrKeysOk note). Mutated only in the single-threaded main loop (pre-pass already
+    // joined), always restored immediately after the region/validator extract -> never seen by
+    // the parallel pre-pass workers, which only ever observe the build defaults.
+    bool effCullDistanceEnabled = buildConfig.distanceCull;
+    float effCullCameraX = buildConfig.cameraX;
+    float effCullCameraZ = buildConfig.cameraZ;
+    float effCullMinDistance = minDistance;
+    float effCullMaxDistance = maxDistance;
+    float effCullPadding = cullPadding;
     uint32_t emittedTiles = 0;
     const uint32_t maxRebuildTiles = buildConfig.maxRebuildTiles;
     uint32_t rebuiltThisBuild = 0;
@@ -6752,6 +6814,25 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     // skipFullAssembly (removing the concat) or extraction is the dominant build cost.
     double extractMsAccum = 0.0;
     double assemblyMsAccum = 0.0;
+    // Loop 1 (FPS tail) attribution: direct time spent in computeTileLod across BOTH the
+    // pre-pass and the main loop (~2x m_tiles.size() calls). Confirms/refutes whether the LOD +
+    // childResident scan is the dominant buildMs cost (vs inferring it from extract/assembly~0).
+    double lodScanMsAccum = 0.0;
+    uint32_t lodScanCalls = 0;
+    // Pre-pass parallel-extraction wall time (spawn + extract misses + join). This is the only
+    // heavy build operation NOT covered by extractMs (main-loop) / assemblyMs / lodScanMs, so on
+    // slow builds (buildMs 76ms with all those ~0) the cost must be here. Measure it directly.
+    double preExtractMsAccum = 0.0;
+    uint32_t preExtractTileCount = 0;
+    // Loop A: region-routing reason histogram (only counted for tiles that DO re-extract).
+    // 0 used / 1 keyMismatch / 2 noEditBox / 3 noIntersect / 4 touchesBoundary / 5 tooLarge.
+    uint32_t drrUsed = 0, drrKeyMismatch = 0, drrNoEditBox = 0, drrNoIntersect = 0,
+             drrBoundary = 0, drrTooLarge = 0, drrCullMiss = 0;
+    double drrUsedMs = 0.0, drrFullMs = 0.0;
+    // Same-process region-vs-full timing (validate runs): time the region splice extract and the
+    // validator's full-ref extract of the SAME tiles separately, so their ratio is a drift-immune
+    // measure of the extractMs reduction region delivers (the editing-tail cost). Sum per build.
+    double drrRegionTimeMs = 0.0, drrFullRefTimeMs = 0.0;
 
     struct SurfaceBlock {
         bool present = false;
@@ -6762,13 +6843,13 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     };
 
     auto distanceCullBounds = [&](float centerX, float centerZ, float radius) -> bool {
-        if (!buildConfig.distanceCull) {
+        if (!effCullDistanceEnabled) {
             return false;
         }
-        const float dx = centerX - buildConfig.cameraX;
-        const float dz = centerZ - buildConfig.cameraZ;
+        const float dx = centerX - effCullCameraX;
+        const float dz = centerZ - effCullCameraZ;
         const float distance = std::sqrt(dx * dx + dz * dz);
-        return distance - radius > maxDistance || distance + radius < minDistance;
+        return distance - radius > effCullMaxDistance || distance + radius < effCullMinDistance;
     };
 
     auto frustumCullBounds = [&](float centerX, float centerZ, float radius) -> bool {
@@ -6795,7 +6876,7 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     };
 
     auto blockCullBounds = [&](int32_t x0, int32_t z0, uint32_t width, uint32_t depth) -> bool {
-        if (!buildConfig.distanceCull && !buildConfig.frustumCull) {
+        if (!effCullDistanceEnabled && !buildConfig.frustumCull) {
             return false;
         }
         const float centerX = static_cast<float>(x0) + static_cast<float>(width) * 0.5f;
@@ -6803,7 +6884,7 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         const float radius =
             std::sqrt(static_cast<float>(width) * static_cast<float>(width) +
                       static_cast<float>(depth) * static_cast<float>(depth)) * 0.5f +
-            cullPadding;
+            effCullPadding;
         return distanceCullBounds(centerX, centerZ, radius) ||
             frustumCullBounds(centerX, centerZ, radius);
     };
@@ -6943,6 +7024,16 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         (buildConfig.lodEnabled ? (1u << 28) : 0u) |
         (buildConfig.emitWater ? (1u << 29) : 0u);
 
+    // Loop 2C (FPS tail): dirty-region extraction. An edit dirties a few cells but the extractor
+    // re-meshes the WHOLE tile (~all cellCount^2 blocks). When emRegionOut != nullptr, the extractor
+    // re-meshes ONLY blocks overlapping the cell range [emRegionX0,emRegionX1) x [emRegionZ0,emRegionZ1)
+    // into *emRegionOut WITHOUT touching the cache; the caller splices it over the (unchanged) cached
+    // faces. A multiset validator (gated) compares the splice to a full re-extract and DISABLES the
+    // path on any mismatch, so an imperfect splice boundary falls back to full extraction and never
+    // ships a hole. Region calls are serial (per dirty tile), so these capture vars are race-free.
+    uint32_t emRegionX0 = 0u, emRegionX1 = cellCount, emRegionZ0 = 0u, emRegionZ1 = cellCount;
+    std::vector<SparseSurfaceFace>* emRegionOut = nullptr;
+
     // ===== PER-TILE EXTRACTION (factored for parallelism) =====
     // Re-extract one tile's mid-mesh faces into its persistent meshCacheFaces. Reads
     // only `tile.packedSamples` + shared read-only build config; writes only this
@@ -6961,7 +7052,19 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         const bool* childResident,
         uint32_t cellSize) -> bool
     {
-        std::vector<SparseSurfaceFace> tileFaces;
+        // Loop E (extraction parallel-scaling): the pre-pass workers each reserve+move a face
+        // vector per tile -> per-tile malloc/free on the GLOBAL heap, which serializes 14 workers
+        // (measured negative scaling: 16 workers slower than 4 = contention, not bandwidth). With
+        // extractScratch, reuse a per-WORKER (thread_local) retained buffer + capacity-reuse assign
+        // into the persistent meshCacheFaces -> zero steady-state heap ops, no global-lock contention.
+        // Behavior-identical (same faces). OFF => per-call local vector + move (current behavior).
+        static thread_local std::vector<SparseSurfaceFace> s_extractScratch;
+        std::vector<SparseSurfaceFace> localTileFaces;
+        std::vector<SparseSurfaceFace>& tileFaces =
+            buildConfig.extractScratch ? s_extractScratch : localTileFaces;
+        if (buildConfig.extractScratch) {
+            tileFaces.clear();  // retains capacity across this worker's tiles
+        }
         const uint32_t blockCountPerAxis = (cellCount + mergeCells - 1u) / mergeCells;
         tileFaces.reserve(static_cast<size_t>(blockCountPerAxis) * static_cast<size_t>(blockCountPerAxis) * 3u);
 
@@ -7053,6 +7156,12 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             const uint32_t zEnd = std::min(cellCount, z + mergeCells);
             for (uint32_t x = 0; x < cellCount && faceBudgetOk; x += mergeCells) {
                 const uint32_t xEnd = std::min(cellCount, x + mergeCells);
+                // Dirty-region mode: re-mesh only blocks overlapping the requested cell range.
+                if (emRegionOut &&
+                    (x >= emRegionX1 || xEnd <= emRegionX0 ||
+                     z >= emRegionZ1 || zEnd <= emRegionZ0)) {
+                    continue;
+                }
                 // Skip mid-mesh cells over brush edits: emit no top, no riser, no
                 // all-air fill, so the voxel raymarch renders the live edit there.
                 if (!editXzBoxes.empty() &&
@@ -7244,6 +7353,16 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         // depend on, so subsequent frames reuse them until the tile actually changes.
         // MOVE (not copy) - tileFaces is not needed after this; downstream reads the
         // persistent meshCacheFaces via emittedFaces.
+        if (faceBudgetOk && emRegionOut) {
+            // Dirty-region mode: hand the region faces to the caller for splicing; do NOT touch
+            // the persistent cache or its version keys (the caller owns the merged result).
+            if (buildConfig.extractScratch) {
+                emRegionOut->assign(tileFaces.begin(), tileFaces.end());
+            } else {
+                *emRegionOut = std::move(tileFaces);
+            }
+            return true;
+        }
         if (faceBudgetOk) {
             // Compute the direction mask + face AABB ONCE here (faces just changed), so the
             // per-build emission below can reuse them instead of rescanning every tile's
@@ -7254,7 +7373,11 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
                 static_cast<uint32_t>(tileFaces.size()),
                 &tile.meshCacheMinX, &tile.meshCacheMinY, &tile.meshCacheMinZ,
                 &tile.meshCacheMaxX, &tile.meshCacheMaxY, &tile.meshCacheMaxZ);
-            tile.meshCacheFaces = std::move(tileFaces);
+            if (buildConfig.extractScratch) {
+                tile.meshCacheFaces.assign(tileFaces.begin(), tileFaces.end());
+            } else {
+                tile.meshCacheFaces = std::move(tileFaces);
+            }
             tile.meshCacheContentVersion = tile.meshContentVersion;
             tile.meshCacheMergeCells = mergeCells;
             tile.meshCacheChildMask = childMask;
@@ -7293,6 +7416,29 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         bool& anyChildResident,
         bool childResident[4])
     {
+        // ---- LOD cache fast path (Loop 1, FPS tail) ----
+        // computeTileLod is called per tile in the pre-extract pre-pass AND the main loop, and
+        // its childResident scan does up to 4 m_slotByCoord lookups/tile. The result depends only
+        // on (camera XZ, content version, residency epoch); when none changed, reuse the cached
+        // result. This is the measured editing build floor (buildMs 14-34ms, generated/extract~0).
+        const bool lodCacheHit =
+            buildConfig.lodCache &&
+            tile.lodCacheValid &&
+            tile.lodCacheCameraX == buildConfig.cameraX &&
+            tile.lodCacheCameraZ == buildConfig.cameraZ &&
+            tile.lodCacheContentVersion == tile.meshContentVersion &&
+            tile.lodCacheResidencyEpoch == m_midMeshResidencyEpoch;
+        if (lodCacheHit && !buildConfig.lodCacheValidate) {
+            cellSize = tile.lodCacheCellSize;
+            mergeCells = tile.lodCacheMergeCells;
+            childMask = tile.lodCacheChildMask;
+            anyChildResident = tile.lodCacheAnyChildResident;
+            childResident[0] = tile.lodCacheChildResident[0];
+            childResident[1] = tile.lodCacheChildResident[1];
+            childResident[2] = tile.lodCacheChildResident[2];
+            childResident[3] = tile.lodCacheChildResident[3];
+            return;
+        }
         cellSize = static_cast<uint32_t>(std::max(
             1,
             RoundToInt32Clamped(tile.record.cellSize)));
@@ -7414,6 +7560,43 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         childMask =
             (childResident[0] ? 1u : 0u) | (childResident[1] ? 2u : 0u) |
             (childResident[2] ? 4u : 0u) | (childResident[3] ? 8u : 0u);
+        // ---- shadow validator: when validating, compare what the cache WOULD have returned
+        // against this fresh recompute, and log any drift (the cache key missed a dependency). ----
+        if (buildConfig.lodCacheValidate && lodCacheHit) {
+            const bool mismatch =
+                tile.lodCacheCellSize != cellSize ||
+                tile.lodCacheMergeCells != mergeCells ||
+                tile.lodCacheChildMask != childMask ||
+                tile.lodCacheAnyChildResident != anyChildResident ||
+                tile.lodCacheChildResident[0] != childResident[0] ||
+                tile.lodCacheChildResident[1] != childResident[1] ||
+                tile.lodCacheChildResident[2] != childResident[2] ||
+                tile.lodCacheChildResident[3] != childResident[3];
+            if (mismatch) {
+                ++m_midMeshLodCacheMismatches;
+                spdlog::error(
+                    "MIDMESH_LODCACHE_MISMATCH slot={} ring={} cachedMerge/mask={}/{} freshMerge/mask={}/{} epoch={} contentVer={}",
+                    tile.record.slot, tile.record.coord.ring,
+                    tile.lodCacheMergeCells, tile.lodCacheChildMask,
+                    mergeCells, childMask, m_midMeshResidencyEpoch, tile.meshContentVersion);
+            }
+        }
+        // ---- store result into the per-tile LOD cache ----
+        if (buildConfig.lodCache) {
+            tile.lodCacheValid = true;
+            tile.lodCacheCameraX = buildConfig.cameraX;
+            tile.lodCacheCameraZ = buildConfig.cameraZ;
+            tile.lodCacheContentVersion = tile.meshContentVersion;
+            tile.lodCacheResidencyEpoch = m_midMeshResidencyEpoch;
+            tile.lodCacheCellSize = cellSize;
+            tile.lodCacheMergeCells = mergeCells;
+            tile.lodCacheChildMask = childMask;
+            tile.lodCacheAnyChildResident = anyChildResident;
+            tile.lodCacheChildResident[0] = childResident[0];
+            tile.lodCacheChildResident[1] = childResident[1];
+            tile.lodCacheChildResident[2] = childResident[2];
+            tile.lodCacheChildResident[3] = childResident[3];
+        }
     };
 
     // ===== MESH-CACHE-HIT PREDICATE (factored so the pre-pass collects exactly the same
@@ -7434,6 +7617,61 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             tile.meshCacheRing == tile.record.coord.ring;
     };
 
+    // ===== REGION-ELIGIBILITY PREDICATES (HYBRID) =====
+    // A cache-MISS tile whose cache is still valid for the SAME location/LOD/childMask/buildVersion
+    // (only the CONTENT changed = an edit) can be dirty-region spliced in the main loop instead of
+    // fully re-extracted. The parallel pre-pass uses these to SKIP such tiles (leaving them for the
+    // cheap region path) while still pre-extracting the genuinely-new/recentered/LOD-changed misses.
+    // Frustum-on tiles are excluded (orientation cull not recoverable from the cache's frozen params).
+    auto computeRegionKeysOk = [&](const TilePayload& tile, uint32_t mergeCells, uint32_t childMask) -> bool {
+        return
+            tile.meshCacheValid &&
+            !buildConfig.frustumCull &&
+            tile.meshCacheOriginX == tile.record.originX &&
+            tile.meshCacheOriginZ == tile.record.originZ &&
+            tile.meshCacheRing == tile.record.coord.ring &&
+            tile.meshCacheMergeCells == mergeCells &&
+            tile.meshCacheChildMask == childMask &&
+            tile.meshCacheBuildVersion == midMeshBuildVersion;
+    };
+    // Compute the dirty-region splice rect [rx0,rx1)x[rz0,rz1) (cell units, +halo) for a tile from
+    // the edit boxes. Shared by the pre-pass (to skip tiles it will splice) and the main loop (to
+    // splice them) so both agree EXACTLY on which tiles take the region path. Returns:
+    //   0 = no edit box intersects this tile (nothing to splice)
+    //   1 = intersects but rect >= half the tile (full extract is as cheap -> NOT spliced)
+    //   2 = spliceable (rect < half the tile); rx0/rx1/rz0/rz1 are written.
+    auto computeRegionSpliceRect = [&](const TilePayload& tile, uint32_t cellSize, uint32_t mergeCells,
+        uint32_t& rx0, uint32_t& rx1, uint32_t& rz0, uint32_t& rz1) -> int {
+        const int32_t tileOX = tile.record.originX;
+        const int32_t tileOZ = tile.record.originZ;
+        const int64_t tileSpan = static_cast<int64_t>(cellCount) * static_cast<int64_t>(cellSize);
+        int32_t dMinX = INT32_MAX, dMinZ = INT32_MAX, dMaxX = INT32_MIN, dMaxZ = INT32_MIN;
+        for (const EditXzBox& b : editXzBoxes) {
+            if (b.maxX < tileOX || b.minX > tileOX + tileSpan ||
+                b.maxZ < tileOZ || b.minZ > tileOZ + tileSpan) {
+                continue;
+            }
+            const int32_t lx0 = static_cast<int32_t>(std::max<int64_t>(0, (static_cast<int64_t>(b.minX) - tileOX - 1) / cellSize));
+            const int32_t lx1 = static_cast<int32_t>(std::min<int64_t>(cellCount, (static_cast<int64_t>(b.maxX) - tileOX) / cellSize + 1));
+            const int32_t lz0 = static_cast<int32_t>(std::max<int64_t>(0, (static_cast<int64_t>(b.minZ) - tileOZ - 1) / cellSize));
+            const int32_t lz1 = static_cast<int32_t>(std::min<int64_t>(cellCount, (static_cast<int64_t>(b.maxZ) - tileOZ) / cellSize + 1));
+            dMinX = std::min(dMinX, lx0); dMaxX = std::max(dMaxX, lx1);
+            dMinZ = std::min(dMinZ, lz0); dMaxZ = std::max(dMaxZ, lz1);
+        }
+        if (!(dMaxX > dMinX && dMaxZ > dMinZ)) {
+            return 0;
+        }
+        const uint32_t halo = mergeCells;
+        rx0 = (static_cast<uint32_t>(dMinX) > halo) ? static_cast<uint32_t>(dMinX) - halo : 0u;
+        rz0 = (static_cast<uint32_t>(dMinZ) > halo) ? static_cast<uint32_t>(dMinZ) - halo : 0u;
+        rx1 = std::min(cellCount, static_cast<uint32_t>(dMaxX) + halo);
+        rz1 = std::min(cellCount, static_cast<uint32_t>(dMaxZ) + halo);
+        const bool small =
+            static_cast<uint64_t>(rx1 - rx0) * (rz1 - rz0) * 2ull <
+            static_cast<uint64_t>(cellCount) * cellCount;
+        return small ? 2 : 1;
+    };
+
     // ===== PARALLEL PRE-EXTRACTION PRE-PASS =====
     // On the primed-dirty incremental path, the dominant residual build cost is re-extracting
     // a handful of independent fine/near tiles SERIALLY (~3.75ms each, 4-17 per editing build).
@@ -7442,6 +7680,11 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     // writes between workers (extractTileMesh writes only its own tile). The LOD decision +
     // meshCacheHit predicate match the main loop EXACTLY (same lambdas), so the pre-pass and the
     // loop agree on which tiles are misses by construction.
+    // HYBRID: the pre-pass runs even with dirtyRegionExtract on -- it pre-extracts the cache-MISS
+    // tiles the region path CANNOT help (new/recenter/LOD), and skips region-eligible edited tiles
+    // (below) so the cheap region splice handles them in the main loop. (Previously region-on
+    // disabled the pre-pass entirely, which dropped new/recenter tiles to serial full extraction
+    // and inflated the build count -- directive STEP 3.)
     if (buildConfig.parallelExtract && buildConfig.emitDirtyPayload && !m_midMeshEmittedCoords.empty()) {
         struct PreExtractTile {
             uint32_t slot;
@@ -7453,6 +7696,11 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         };
         std::vector<PreExtractTile> preExtract;
         preExtract.reserve(m_tiles.size());
+        // Loop D parallel-budget: cap reusable-cache (edited/LOD-stable) tiles pre-extracted in
+        // parallel this build; the rest defer (main loop keeps stale faces, catchup drains them).
+        uint32_t asyncPreExtractCount = 0;
+        const uint32_t asyncBudgetTiles =
+            (buildConfig.maxRebuildTiles != 0u) ? buildConfig.maxRebuildTiles : 8u;
         for (uint32_t tileSlot = 0; tileSlot < static_cast<uint32_t>(m_tiles.size()); ++tileSlot) {
             TilePayload& tile = m_tiles[tileSlot];
             // Same residency guard as the main loop (skip empty/uninitialized slots).
@@ -7466,7 +7714,12 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             uint32_t childMask = 0u;
             bool anyChildResident = false;
             bool childResident[4] = { false, false, false, false };
-            computeTileLod(tile, cellSize, mergeCells, childMask, anyChildResident, childResident);
+            {
+                const auto lodT0 = std::chrono::steady_clock::now();
+                computeTileLod(tile, cellSize, mergeCells, childMask, anyChildResident, childResident);
+                lodScanMsAccum += ElapsedMs(lodT0, std::chrono::steady_clock::now());
+                ++lodScanCalls;
+            }
             // Same cull as the main loop: a culled tile is never emitted/extracted there, so
             // it must NOT be pre-extracted here (would mark it dirty with no emission -> a
             // dangling dirty coord). tileWorldSize = cellSize * cellCount (matches the loop).
@@ -7481,6 +7734,38 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             if (computeMeshCacheHit(tile, mergeCells, childMask)) {
                 continue;  // already cached -> the loop reuses it; nothing to pre-extract
             }
+            // HYBRID: leave a tile for the main loop's cheap dirty-region splice ONLY if it will
+            // actually be spliced -- cache valid for this location/LOD (keys ok), and the edit rect
+            // is small (status 2). A too-large rect (status 1) or non-intersecting tile still gets
+            // the PARALLEL full pre-pass here (skipping it would drop it to a serial full extract in
+            // the main loop and inflate edit-frame cost -- the regression seen earlier).
+            if (buildConfig.dirtyRegionExtract && !editXzBoxes.empty() &&
+                computeRegionKeysOk(tile, mergeCells, childMask)) {
+                uint32_t prx0, prx1, prz0, prz1;
+                if (computeRegionSpliceRect(tile, cellSize, mergeCells, prx0, prx1, prz0, prz1) == 2) {
+                    continue;
+                }
+            }
+            // Loop D: a miss tile with a reusable SAME-LOCATION cache can defer (the main loop
+            // keeps drawing its stale faces under the maxRebuildMs budget = no hole). Skip
+            // pre-extracting it so the budget bounds the synchronous edit-frame spike; only
+            // new/recenter misses (no patch to hold) get the unbudgeted parallel pre-pass.
+            if (buildConfig.asyncRemesh) {
+                const bool cacheSameLocation =
+                    tile.meshCacheValid &&
+                    tile.meshCacheOriginX == tile.record.originX &&
+                    tile.meshCacheOriginZ == tile.record.originZ &&
+                    tile.meshCacheRing == tile.record.coord.ring;
+                if (cacheSameLocation) {
+                    // Pre-extract up to asyncBudgetTiles reusable-cache misses IN PARALLEL this
+                    // build; defer the rest (the main loop force-defers same-location misses ->
+                    // keeps stale faces, no hole; catchup drains over next builds in parallel).
+                    if (asyncPreExtractCount >= asyncBudgetTiles) {
+                        continue;
+                    }
+                    ++asyncPreExtractCount;
+                }
+            }
             PreExtractTile entry;
             entry.slot = tileSlot;
             entry.cellSize = cellSize;
@@ -7494,18 +7779,49 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             preExtract.push_back(entry);
         }
         if (!preExtract.empty()) {
+            const auto preExtractT0 = std::chrono::steady_clock::now();
+            preExtractTileCount += static_cast<uint32_t>(preExtract.size());
             // Extract every miss across workers. No per-build budget: parallelism bounds the
             // cost, so the floor is always fresh (no deferral on the parallel path). Each
             // worker touches distinct tiles -> only that tile's meshCache* is written. The
             // shared outSnapshot vectors are NOT touched here (extractTileMesh appends only to
             // its own local tileFaces, then moves into tile.meshCacheFaces).
             const uint32_t hw = std::max(1u, std::thread::hardware_concurrency());
-            const uint32_t workerCount = std::min(hw, static_cast<uint32_t>(preExtract.size()));
+            const uint32_t workerCap =
+                buildConfig.preExtractMaxWorkers > 0u ? buildConfig.preExtractMaxWorkers : hw;
+            const uint32_t workerCount =
+                std::min(std::min(hw, workerCap), static_cast<uint32_t>(preExtract.size()));
             if (workerCount <= 1u) {
                 for (const PreExtractTile& e : preExtract) {
                     TilePayload& tile = m_tiles[e.slot];
                     extractTileMesh(tile, e.mergeCells, e.childMask, e.anyChildResident,
                                     e.childResident, e.cellSize);
+                }
+            } else if (buildConfig.workStealExtract) {
+                // WORK-STEALING: per-tile extraction cost varies ~50x (fine near tile ~3.3ms vs
+                // coarse far ~0.06ms). Contiguous count-based chunks give one worker the heavy
+                // cluster (long pole), capping effective parallelism (~6.5x measured). A shared
+                // atomic cursor lets idle workers grab the next tile, auto-balancing -> closer to
+                // physical-core scaling. Each worker still touches only its own tile (no races).
+                std::atomic<size_t> nextIndex{0};
+                std::vector<std::thread> extractWorkers;
+                extractWorkers.reserve(workerCount);
+                for (uint32_t worker = 0u; worker < workerCount; ++worker) {
+                    extractWorkers.emplace_back([this, &preExtract, &extractTileMesh, &nextIndex]() {
+                        for (;;) {
+                            const size_t index = nextIndex.fetch_add(1u, std::memory_order_relaxed);
+                            if (index >= preExtract.size()) {
+                                break;
+                            }
+                            const PreExtractTile& e = preExtract[index];
+                            TilePayload& tile = m_tiles[e.slot];
+                            extractTileMesh(tile, e.mergeCells, e.childMask, e.anyChildResident,
+                                            e.childResident, e.cellSize);
+                        }
+                    });
+                }
+                for (std::thread& w : extractWorkers) {
+                    w.join();
                 }
             } else {
                 std::vector<std::thread> extractWorkers;
@@ -7530,6 +7846,7 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
                     w.join();
                 }
             }
+            preExtractMsAccum += ElapsedMs(preExtractT0, std::chrono::steady_clock::now());
             // CRITICAL no-hole step: a tile this pre-pass extracted now matches its cache, so
             // the main loop sees it as meshCacheHit and will NOT take its tileReEmitted path —
             // i.e. it would NOT mark the tile dirty, and its NEW faces would never upload
@@ -7574,7 +7891,12 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         uint32_t childMask = 0u;
         bool anyChildResident = false;
         bool childResident[4] = { false, false, false, false };
-        computeTileLod(tile, cellSize, mergeCells, childMask, anyChildResident, childResident);
+        {
+            const auto lodT0 = std::chrono::steady_clock::now();
+            computeTileLod(tile, cellSize, mergeCells, childMask, anyChildResident, childResident);
+            lodScanMsAccum += ElapsedMs(lodT0, std::chrono::steady_clock::now());
+            ++lodScanCalls;
+        }
         const uint32_t tileWorldSize = cellSize * cellCount;
         if (blockCullBounds(
                 tile.record.originX,
@@ -7636,7 +7958,12 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             // tile.meshCacheFaces) - do NOT copy them into a local vector. The dirty path
             // never assembles a global face vector, so copying ~4600 faces here per cached
             // tile, every build, was pure waste (the residual build spike).
-        } else if (overRebuildBudget && cacheSameLocation) {
+        } else if ((overRebuildBudget || buildConfig.asyncRemesh) && cacheSameLocation) {
+            // Loop D: with asyncRemesh, the parallel pre-pass already extracted up to the
+            // per-build budget of reusable-cache misses (they are cache HITS here now); any
+            // remaining same-location miss is DEFERRED rather than serially re-extracted (the
+            // serial path was the measured regression). It keeps drawing its stale faces (no
+            // hole) and the catchup drains it over subsequent builds in parallel.
             // NO-HOLE deferral: over the per-build budget AND this tile has a same-location
             // cached version -> keep drawing its stale faces (emittedFaces references them)
             // and defer the expensive re-emit to a later build. The floor never disappears;
@@ -7663,10 +7990,224 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             m_midMeshTileDeferredSince.erase(reExtractCoord);
         }
         const auto extractStart = std::chrono::steady_clock::now();
-        faceBudgetOk = extractTileMesh(
-            tile, mergeCells, childMask, anyChildResident, childResident, cellSize);
-        extractMsAccum +=
+        bool didRegionExtract = false;
+        // Loop 2C: dirty-region extraction. If only a small edit footprint changed and the tile's
+        // cached faces are still valid for the SAME location/LOD/childMask, re-mesh just the dirty
+        // cell rectangle (+1-block halo) and splice it over the unchanged cached faces, instead of
+        // re-meshing all ~cellCount^2 blocks. A multiset validator (gated) compares to a full
+        // re-extract and disables on any mismatch -> never ships a hole.
+        // The extracted face SET is camera-cull-dependent (blockCullBounds skips culled cells at
+        // emit, line ~7136), and the cache FREEZES the build-time cull (computeMeshCacheHit does
+        // NOT re-check cull, so a moved camera reuses frozen-cull faces for the whole tile). A
+        // region splice keeps frozen-cull cache faces OUTSIDE the rect, so to stay self-consistent
+        // it must re-extract INSIDE the rect with the SAME frozen cull basis (the tile's cached
+        // cull params), NOT the current camera -- otherwise the two cull bases disagree for any
+        // out-of-rect cell whose cull flipped (the observed EXTRA-faces/missing=0 mismatch at
+        // margin x border corners). The region extract + validator reference both override cull to
+        // tile.meshCacheCull* below, so the spliced tile is bit-exact to a full extract done with
+        // its own frozen cull -- which is exactly the face set production reuses for a cache HIT.
+        // Frustum cull (camera ORIENTATION) is not recoverable from stored params, so the region
+        // path requires it off (it is default-off); frustum-on tiles fall back to full extraction.
+        const bool drrKeysOk = computeRegionKeysOk(tile, mergeCells, childMask);
+        if (buildConfig.dirtyRegionExtract && !drrKeysOk) {
+            // frustum-on tiles can't use the region path (orientation cull not recoverable from
+            // stored params); count them separately from true key changes (new/recenter/lod).
+            if (tile.meshCacheValid && buildConfig.frustumCull) { ++drrCullMiss; }
+            else { ++drrKeyMismatch; }
+        } else if (buildConfig.dirtyRegionExtract && editXzBoxes.empty()) {
+            ++drrNoEditBox;
+        }
+        if (buildConfig.dirtyRegionExtract && drrKeysOk && !editXzBoxes.empty()) {
+            const int32_t tileOX = tile.record.originX;
+            const int32_t tileOZ = tile.record.originZ;
+            // Shared rect computation (identical to the pre-pass skip decision). Status:
+            // 0 = no intersect, 1 = too large (full path), 2 = spliceable.
+            uint32_t rx0 = 0u, rx1 = 0u, rz0 = 0u, rz1 = 0u;
+            const int regionStatus = computeRegionSpliceRect(tile, cellSize, mergeCells, rx0, rx1, rz0, rz1);
+            if (regionStatus == 0) { ++drrNoIntersect; }
+            else if (regionStatus == 1) { ++drrTooLarge; }
+            if (regionStatus == 2) {
+                // Informational only: does the (bit-exact-validated) spliced rect touch a tile border?
+                if (!(rx0 > 0u && rz0 > 0u && rx1 < cellCount && rz1 < cellCount)) { ++drrBoundary; }
+                    std::vector<SparseSurfaceFace> regionFaces;
+                    // Scan ONE block below the splice rect on each axis: faces are emitted at a
+                    // block's +edge (forward risers at worldX+width / worldZ+depth), so the block
+                    // just below the rect emits the riser ENTERING the rect's low edge. Scanning it
+                    // (then clipping the region OUTPUT to the rect) makes the rect a clean partition:
+                    // cached-outside-rect + region-inside-rect == full re-extract (rect blocks are
+                    // edited; the 1-block scan margin is unchanged halo so its kept faces are exact).
+                    emRegionX0 = (rx0 > 0u) ? rx0 - 1u : 0u;
+                    emRegionZ0 = (rz0 > 0u) ? rz0 - 1u : 0u;
+                    emRegionX1 = rx1; emRegionZ1 = rz1;
+                    emRegionOut = &regionFaces;
+                    // FROZEN-CULL OVERRIDE: re-extract the in-rect region against the tile's CACHED
+                    // cull basis (the camera the kept out-of-rect faces were frozen at), not the
+                    // current camera. When the camera hasn't moved this is a no-op; when it has,
+                    // it keeps the whole spliced tile cull-consistent (no mixed-basis stale faces).
+                    // Restored before the next tile / any full-extract fallback (single-threaded).
+                    const bool savedCullEnabled = effCullDistanceEnabled;
+                    const float savedCullCamX = effCullCameraX, savedCullCamZ = effCullCameraZ;
+                    const float savedCullMinD = effCullMinDistance, savedCullMaxD = effCullMaxDistance;
+                    const float savedCullPad = effCullPadding;
+                    effCullDistanceEnabled = tile.meshCacheCullDistanceEnabled;
+                    effCullCameraX = tile.meshCacheCullCameraX;
+                    effCullCameraZ = tile.meshCacheCullCameraZ;
+                    effCullMinDistance = tile.meshCacheCullMinDistance;
+                    effCullMaxDistance = tile.meshCacheCullMaxDistance;
+                    effCullPadding = tile.meshCacheCullPadding;
+                    const auto drrRegionT0 = std::chrono::steady_clock::now();
+                    faceBudgetOk = extractTileMesh(tile, mergeCells, childMask, anyChildResident, childResident, cellSize);
+                    drrRegionTimeMs += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - drrRegionT0).count();
+                    emRegionOut = nullptr;
+                    emRegionX0 = 0; emRegionX1 = cellCount; emRegionZ0 = 0; emRegionZ1 = cellCount;
+                    if (faceBudgetOk) {
+                        const int32_t rwx0 = tileOX + static_cast<int32_t>(rx0 * cellSize);
+                        const int32_t rwz0 = tileOZ + static_cast<int32_t>(rz0 * cellSize);
+                        // Upper bound is EXCLUSIVE for an interior edge (a forward riser at rwx1 is
+                        // owned by the unchanged halo block beyond, kept from cache to avoid a dup),
+                        // but INCLUSIVE at a true tile border (rx1==cellCount): the border SKIRT sits
+                        // at worldX==cellWorld(cellCount) and there is no halo block beyond it, so an
+                        // edited border cell's skirt must be re-meshed, not kept stale.
+                        const int32_t rwx1 = tileOX + static_cast<int32_t>(rx1 * cellSize) +
+                            ((rx1 == cellCount) ? 1 : 0);
+                        const int32_t rwz1 = tileOZ + static_cast<int32_t>(rz1 * cellSize) +
+                            ((rz1 == cellCount) ? 1 : 0);
+                        std::vector<SparseSurfaceFace> merged;
+                        merged.reserve(tile.meshCacheFaces.size() + regionFaces.size());
+                        for (const SparseSurfaceFace& f : tile.meshCacheFaces) {
+                            if (f.worldX >= rwx0 && f.worldX < rwx1 && f.worldZ >= rwz0 && f.worldZ < rwz1) {
+                                continue;  // inside the re-meshed region -> region emits the fresh version
+                            }
+                            merged.push_back(f);
+                        }
+                        // Clip region faces to the splice rect [rwx0,rwx1)x[rwz0,rwz1): the
+                        // scan margin (one block below) emits faces below the rect that the cache
+                        // already owns; keeping only in-rect region faces makes the partition exact.
+                        for (const SparseSurfaceFace& f : regionFaces) {
+                            if (f.worldX >= rwx0 && f.worldX < rwx1 && f.worldZ >= rwz0 && f.worldZ < rwz1) {
+                                merged.push_back(f);
+                            }
+                        }
+                        if (buildConfig.dirtyRegionExtractValidate) {
+                            std::vector<SparseSurfaceFace> fullRef;
+                            emRegionX0 = 0; emRegionX1 = cellCount; emRegionZ0 = 0; emRegionZ1 = cellCount;
+                            emRegionOut = &fullRef;
+                            const auto drrFullRefT0 = std::chrono::steady_clock::now();
+                            extractTileMesh(tile, mergeCells, childMask, anyChildResident, childResident, cellSize);
+                            drrFullRefTimeMs += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - drrFullRefT0).count();
+                            emRegionOut = nullptr;
+                            auto faceLess = [](const SparseSurfaceFace& a, const SparseSurfaceFace& b) {
+                                return std::memcmp(&a, &b, sizeof(SparseSurfaceFace)) < 0;
+                            };
+                            std::vector<SparseSurfaceFace> ms = merged, fs = fullRef;
+                            std::sort(ms.begin(), ms.end(), faceLess);
+                            std::sort(fs.begin(), fs.end(), faceLess);
+                            const bool equal = ms.size() == fs.size() &&
+                                std::memcmp(ms.data(), fs.data(), ms.size() * sizeof(SparseSurfaceFace)) == 0;
+                            if (!equal) {
+                                spdlog::error(
+                                    "MIDMESH_DIRTYREGION_MISMATCH frame={} slot={} ring={} merged={} full={} "
+                                    "rect cell=[{},{})x[{},{}) world=[{},{})x[{},{}) cellCount={} cellSize={} mergeCells={} tileO=({},{})",
+                                    m_lastStatsFrame, tile.record.slot, tile.record.coord.ring,
+                                    merged.size(), fullRef.size(), rx0, rx1, rz0, rz1,
+                                    rwx0, rwx1, rwz0, rwz1, cellCount, cellSize, mergeCells, tileOX, tileOZ);
+                                spdlog::error(
+                                    "  cull cache[en={} cam=({:.1f},{:.1f}) min={:.1f} max={:.1f} pad={:.1f}] "
+                                    "build[en={} cam=({:.1f},{:.1f}) min={:.1f} max={:.1f} pad={:.1f}] eff[en={} cam=({:.1f},{:.1f}) min={:.1f} max={:.1f} pad={:.1f}] anyChild={} childMask={}",
+                                    tile.meshCacheCullDistanceEnabled, tile.meshCacheCullCameraX, tile.meshCacheCullCameraZ,
+                                    tile.meshCacheCullMinDistance, tile.meshCacheCullMaxDistance, tile.meshCacheCullPadding,
+                                    buildConfig.distanceCull, buildConfig.cameraX, buildConfig.cameraZ, minDistance, maxDistance, cullPadding,
+                                    effCullDistanceEnabled, effCullCameraX, effCullCameraZ, effCullMinDistance, effCullMaxDistance, effCullPadding,
+                                    anyChildResident ? 1 : 0, childMask);
+                                // Symmetric multiset difference (ms,fs are sorted copies). "extra" =
+                                // in merged not full (dup/wrong-retain); "missing" = in full not merged.
+                                static const char* kDirName[6] = {"NegX","PosX","NegY","PosY","NegZ","PosZ"};
+                                std::vector<SparseSurfaceFace> extra, missing;
+                                std::set_difference(ms.begin(), ms.end(), fs.begin(), fs.end(),
+                                    std::back_inserter(extra), faceLess);
+                                std::set_difference(fs.begin(), fs.end(), ms.begin(), ms.end(),
+                                    std::back_inserter(missing), faceLess);
+                                auto dumpFace = [&](const char* kind, const SparseSurfaceFace& f) {
+                                    const uint32_t dir = SparseSurfacePayloadDirection(f.payload);
+                                    const int32_t cx = (f.worldX - tileOX);
+                                    const int32_t cz = (f.worldZ - tileOZ);
+                                    const int32_t cellX = (cellSize > 0) ? cx / cellSize : -1;
+                                    const int32_t cellZ = (cellSize > 0) ? cz / cellSize : -1;
+                                    const bool inRect = (f.worldX >= rwx0 && f.worldX < rwx1 &&
+                                                         f.worldZ >= rwz0 && f.worldZ < rwz1);
+                                    const bool loBX = (cellX <= 0), hiBX = (cellX >= static_cast<int32_t>(cellCount) - 1);
+                                    const bool loBZ = (cellZ <= 0), hiBZ = (cellZ >= static_cast<int32_t>(cellCount) - 1);
+                                    // Does full-extract SKIP this cell as edit-footprint? (cellWorldX/Z = tileO + idx*cs)
+                                    const int32_t cwx0 = tileOX + cellX * cellSize, cwx1 = tileOX + (cellX + 1) * cellSize;
+                                    const int32_t cwz0 = tileOZ + cellZ * cellSize, cwz1 = tileOZ + (cellZ + 1) * cellSize;
+                                    const bool inFoot = cellInEditFootprint(cwx0, cwz0, cwx1, cwz1);
+                                    spdlog::error(
+                                        "  {} dir={} w({},{},{}) wh={}x{} vox={} cell=({},{}) inRect={} inFoot={} "
+                                        "edge[loX={} hiX={} loZ={} hiZ={}] corner={}",
+                                        kind, kDirName[dir & 7u], f.worldX, f.worldY, f.worldZ,
+                                        SparseSurfacePayloadWidth(f.payload), SparseSurfacePayloadHeight(f.payload),
+                                        SparseSurfacePayloadVoxel(f.payload), cellX, cellZ, inRect ? 1 : 0, inFoot ? 1 : 0,
+                                        loBX ? 1 : 0, hiBX ? 1 : 0, loBZ ? 1 : 0, hiBZ ? 1 : 0,
+                                        ((loBX || hiBX) && (loBZ || hiBZ)) ? 1 : 0);
+                                };
+                                const size_t cap = 24;
+                                spdlog::error("  extra={} missing={} (dumping up to {} each)", extra.size(), missing.size(), cap);
+                                for (size_t i = 0; i < extra.size() && i < cap; ++i) dumpFace("EXTRA", extra[i]);
+                                for (size_t i = 0; i < missing.size() && i < cap; ++i) dumpFace("MISSING", missing[i]);
+                                merged = std::move(fullRef);  // safe fallback: ship the exact full mesh
+                            }
+                        }
+                        tile.meshCacheDirectionMask = BuildSparseSurfaceDirectionMask(merged);
+                        ComputeSparseSurfaceFaceBounds(
+                            merged.data(), static_cast<uint32_t>(merged.size()),
+                            &tile.meshCacheMinX, &tile.meshCacheMinY, &tile.meshCacheMinZ,
+                            &tile.meshCacheMaxX, &tile.meshCacheMaxY, &tile.meshCacheMaxZ);
+                        tile.meshCacheFaces = std::move(merged);
+                        tile.meshCacheContentVersion = tile.meshContentVersion;
+                        tile.meshCacheMergeCells = mergeCells;
+                        tile.meshCacheChildMask = childMask;
+                        tile.meshCacheBuildVersion = midMeshBuildVersion;
+                        tile.meshCacheOriginX = tile.record.originX;
+                        tile.meshCacheOriginZ = tile.record.originZ;
+                        tile.meshCacheRing = tile.record.coord.ring;
+                        tile.meshCacheValid = true;
+                        // Faces were extracted against the FROZEN cull basis (the override above),
+                        // so the cache's cull params stay the frozen ones (already these values) --
+                        // NOT the current build's. Writing current params here would desync the
+                        // cull mask from the actually-emitted faces. Re-assert the frozen values
+                        // explicitly for clarity (they equal the pre-existing cached params).
+                        tile.meshCacheCullDistanceEnabled = effCullDistanceEnabled;
+                        tile.meshCacheCullCameraX = effCullCameraX;
+                        tile.meshCacheCullCameraZ = effCullCameraZ;
+                        tile.meshCacheCullMinDistance = effCullMinDistance;
+                        tile.meshCacheCullMaxDistance = effCullMaxDistance;
+                        tile.meshCacheCullPadding = effCullPadding;
+                        didRegionExtract = true;
+                        ++drrUsed;
+                    }
+                    // Restore the build-default cull basis (covers both faceBudgetOk paths) before
+                    // any full-extract fallback or the next tile -> the pre-pass/main loop only
+                    // ever see build defaults outside this region splice.
+                    effCullDistanceEnabled = savedCullEnabled;
+                    effCullCameraX = savedCullCamX;
+                    effCullCameraZ = savedCullCamZ;
+                    effCullMinDistance = savedCullMinD;
+                    effCullMaxDistance = savedCullMaxD;
+                    effCullPadding = savedCullPad;
+                }
+        }
+        if (!didRegionExtract) {
+            faceBudgetOk = extractTileMesh(
+                tile, mergeCells, childMask, anyChildResident, childResident, cellSize);
+        }
+        const double drrThisMs =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - extractStart).count();
+        extractMsAccum += drrThisMs;
+        if (buildConfig.dirtyRegionExtract) {
+            if (didRegionExtract) drrUsedMs += drrThisMs; else drrFullMs += drrThisMs;
+        }
         } // end cache-miss emission (meshCacheHit ? reuse : emit)
 
         if (!faceBudgetOk) {
@@ -7822,10 +8363,20 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     // below is silent), so a steady frame that re-extracts nothing reports 0 ms / 0 tiles.
     m_lastMidMeshExtractMs = extractMsAccum;
     m_lastMidMeshReExtractTiles = rebuiltThisBuild;
+    // Loop 1 attribution (unconditional, one line per actual build): split buildMs into the
+    // computeTileLod scan vs extraction vs assembly, so the dominant cost is MEASURED not inferred.
+    spdlog::info(
+        "MIDMESH_BUILDSPLIT frame={} lodScanMs={:.2f} lodCalls={} preExtractMs={:.2f} preExtractTiles={} extractMs={:.2f} assemblyMs={:.2f} emitted={} reExtract={} lodCache={} "
+        "drr=used/keyMis/cullMis/noBox/noInt/bound/large:{}/{}/{}/{}/{}/{}/{} drrMs=used/full:{:.2f}/{:.2f} "
+        "drrTime=region/fullRef:{:.3f}/{:.3f}",
+        m_lastStatsFrame, lodScanMsAccum, lodScanCalls, preExtractMsAccum, preExtractTileCount, extractMsAccum, assemblyMsAccum,
+        emittedTiles, rebuiltThisBuild, buildConfig.lodCache ? 1 : 0,
+        drrUsed, drrKeyMismatch, drrCullMiss, drrNoEditBox, drrNoIntersect, drrBoundary, drrTooLarge, drrUsedMs, drrFullMs,
+        drrRegionTimeMs, drrFullRefTimeMs);
     if (rebuiltThisBuild > 0u || missNew + missRecenter + missLod + missContent + missChild + missBuildVer > 0u) {
         spdlog::info(
-            "MIDMESH_MISS_CAUSE emitted={} reExtract={} extractMs={:.2f} assemblyMs={:.2f} skipAssembly={} pending={} maxStaleAge={} miss=new/recenter/lod/content/child/buildver:{}/{}/{}/{}/{}/{}",
-            emittedTiles, rebuiltThisBuild, extractMsAccum, assemblyMsAccum, skipFullAssembly ? 1 : 0,
+            "MIDMESH_MISS_CAUSE frame={} emitted={} reExtract={} extractMs={:.2f} assemblyMs={:.2f} skipAssembly={} pending={} maxStaleAge={} miss=new/recenter/lod/content/child/buildver:{}/{}/{}/{}/{}/{}",
+            m_lastStatsFrame, emittedTiles, rebuiltThisBuild, extractMsAccum, assemblyMsAccum, skipFullAssembly ? 1 : 0,
             m_lastMidMeshPendingCount, m_lastMidMeshMaxStaleAge,
             missNew, missRecenter, missLod, missContent, missChild, missBuildVer);
     }

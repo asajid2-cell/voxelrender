@@ -271,6 +271,37 @@ struct SparseMidHeightSurfaceBuildConfig {
     // runs. The main loop then sees those tiles as cache HITS and emits via the hit path.
     // OFF => byte-identical to the serial path (this flag gates everything).
     bool parallelExtract = false;
+    // Loop 1 (FPS tail): cache computeTileLod's result per tile keyed on (camera XZ, content
+    // version, residency epoch). OFF => recompute every call (byte-identical reference). When
+    // ON, an editing build (stationary camera, few tiles changed) skips the per-tile LOD +
+    // childResident scan that is the measured build floor. lodCacheValidate forces a recompute
+    // + equality check on every call (shadow validator) and logs any mismatch.
+    bool lodCache = false;
+    bool lodCacheValidate = false;
+    // Loop 2 (FPS tail): cap pre-extraction worker threads. The pre-pass spawns
+    // min(hardware_concurrency, dirtyTiles) threads/build; on a high-logical-core CPU that
+    // over-subscribes and contends (measured ~2.2x scaling, not ~14x). 0 => hardware_concurrency
+    // (old behavior); a smaller cap (physical cores) can cut contention. Reversible knob.
+    uint32_t preExtractMaxWorkers = 0;
+    // Loop 2C (FPS tail): re-mesh only the edit-dirty cell rectangle (+halo) and splice over the
+    // cached faces, instead of re-meshing the whole tile. OFF => full re-extraction (reference).
+    // Validate forces a full re-extract + multiset compare per dirty tile (shadow validator).
+    bool dirtyRegionExtract = false;
+    bool dirtyRegionExtractValidate = false;
+    // Loop D (async remesh): route tiles with a reusable same-location cache (edited / LOD-stable)
+    // through the main loop's maxRebuildMs budget+deferral instead of the unbudgeted parallel
+    // pre-pass. This bounds the synchronous edit-frame re-extraction to the budget (the rest defer,
+    // keeping their stale faces = no hole, re-extracting over subsequent frames). New/recenter
+    // tiles (no patch to hold) still pre-extract in parallel. OFF => current behavior.
+    bool asyncRemesh = false;
+    // Loop E: per-worker thread_local scratch + capacity-reuse assign in the extractor, to remove
+    // per-tile global-heap malloc/free contention that caps parallel pre-pass scaling. Behavior-
+    // identical. OFF => per-call local vector + move.
+    bool extractScratch = false;
+    // Loop E: work-stealing distribution for the parallel pre-pass (atomic cursor instead of
+    // contiguous count-chunks) to balance the ~50x-skewed per-tile cost -> higher effective
+    // parallelism on the editing burst. Behavior-identical. OFF => contiguous chunks.
+    bool workStealExtract = false;
     bool emitWater = true;
     bool distanceCull = true;
     bool frustumCull = false;
@@ -1018,6 +1049,25 @@ private:
         float meshCacheCullMinDistance = 0.0f;
         float meshCacheCullMaxDistance = 0.0f;
         float meshCacheCullPadding = 0.0f;
+        // Loop 1 (FPS tail): computeTileLod result cache. computeTileLod runs per tile in BOTH
+        // the pre-extract pre-pass AND the main emit loop (~2x m_tiles.size() calls/build), and
+        // its childResident finer-suppression scan does up to 4 m_slotByCoord hash lookups/tile.
+        // That per-tile loop is the measured mid-mesh build floor (buildMs 14-34ms while extract
+        // and assembly are ~0). The result depends ONLY on (camera XZ, content version, child
+        // residency epoch); caching it lets an editing build (stationary camera) skip the scan,
+        // and within a single build the second call reuses the first. Pure memoization: the
+        // cached values are bit-identical to a recompute, so geometry/LOD/extractTileMesh are
+        // unchanged. A shadow validator (debug) recomputes and compares to catch any drift.
+        bool lodCacheValid = false;
+        float lodCacheCameraX = 0.0f;
+        float lodCacheCameraZ = 0.0f;
+        uint64_t lodCacheContentVersion = UINT64_MAX;
+        uint64_t lodCacheResidencyEpoch = UINT64_MAX;
+        uint32_t lodCacheCellSize = 0;
+        uint32_t lodCacheMergeCells = 0;
+        uint32_t lodCacheChildMask = 0;
+        bool lodCacheAnyChildResident = false;
+        bool lodCacheChildResident[4] = { false, false, false, false };
     };
 
     struct VoxelColumnSample {
@@ -1157,6 +1207,12 @@ private:
     bool MissingBrickWithinFarSvoDomain(const SparseVoxelClipmapCoord& coord) const;
 
     SparseClipmapConfig m_config;
+    // Loop 1 (FPS tail): bumped on every m_slotByCoord mutation (tile insert/erase/clear/
+    // recenter). A tile's computeTileLod childResident scan reads child residency from
+    // m_slotByCoord, so this epoch is the invalidation signal for the per-tile LOD cache:
+    // unchanged epoch + same camera + same content version => the cached LOD is still exact.
+    uint64_t m_midMeshResidencyEpoch = 0;
+    uint64_t m_midMeshLodCacheMismatches = 0;  // shadow-validator drift count (must stay 0)
     SparseClipmapFarSvoFallbackMetadata m_farSvoFallbackMetadata;
     SparseTerrainGenerator m_terrain;
     const SparseEditStore* m_edits = nullptr;

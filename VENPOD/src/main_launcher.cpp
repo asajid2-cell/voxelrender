@@ -979,6 +979,32 @@ int RunSandbox(int argc, char* argv[]) {
     }
     spdlog::info("===========================================");
 
+    // ---- PIX programmatic GPU capture (env-gated independent ground-truth) ----
+    // Loads WinPixGpuCapturer.dll BEFORE D3D12 device creation (a PIX requirement)
+    // and captures the single frame VENPOD_PIX_CAPTURE_FRAME to a .wpix. Analyze
+    // headless: pixtool open-capture <file> save-event-list <csv>. Off (not loaded)
+    // unless VENPOD_PIX_CAPTURE_FRAME != 0, so normal benchmark runs are unperturbed.
+    const uint32_t pixCaptureFrame = ReadUIntEnv("VENPOD_PIX_CAPTURE_FRAME", 0u);
+    typedef HRESULT(WINAPI* PIXGpuCaptureNextFramesFn)(PCWSTR, UINT32);
+    PIXGpuCaptureNextFramesFn pixGpuCaptureNextFrames = nullptr;
+    std::wstring pixCaptureOutPath =
+        L"z:\\328\\CMPUT328-A2\\codexworks\\301\\3d\\VENPOD\\build\\bin\\captures\\pix_capture.wpix";
+    if (pixCaptureFrame != 0u) {
+        const char* pixDllEnv = std::getenv("VENPOD_PIX_DLL");
+        std::wstring pixDll = pixDllEnv
+            ? std::wstring(pixDllEnv, pixDllEnv + std::strlen(pixDllEnv))
+            : L"C:\\Program Files\\Microsoft PIX\\2509.25\\WinPixGpuCapturer.dll";
+        HMODULE pixMod = LoadLibraryW(pixDll.c_str());
+        if (pixMod) {
+            pixGpuCaptureNextFrames = reinterpret_cast<PIXGpuCaptureNextFramesFn>(
+                reinterpret_cast<void*>(GetProcAddress(pixMod, "CaptureNextFrame")));
+            spdlog::info("PIX_CAPTURE_INIT capturer loaded; will capture frame {} (fn={})",
+                pixCaptureFrame, pixGpuCaptureNextFrames ? "ok" : "MISSING_EXPORT");
+        } else {
+            spdlog::warn("PIX_CAPTURE_INIT LoadLibrary failed err={}", static_cast<uint32_t>(GetLastError()));
+        }
+    }
+
     // Initialize DX12 Device
     auto device = std::make_unique<DX12Device>();
     DeviceConfig deviceConfig;
@@ -1266,9 +1292,14 @@ int RunSandbox(int argc, char* argv[]) {
     sparseWorldConfig.surfaceStrictTimeBudget =
         sparseBackendRequested &&
         ReadUIntEnv("VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET", 0u) != 0u;
+    // Default ON (was 0): moves heavy surface re-extraction (the editing re-mesh) off
+    // the main thread onto workers. A/B on mtns_edit (identical meshes; tested feature):
+    // editing p50 77->99 fps, p99 61.3->45.9 ms, frames >33ms 125->50 (-60%), >50ms 23->5
+    // (-78%), max 75.8->55.6 ms. No quality change (same per-brick extraction, parallelized);
+    // gated by MinBricks so light frames are unaffected. Set =0 to restore single-threaded.
     sparseWorldConfig.parallelSurfaceExtraction =
         sparseBackendRequested &&
-        ReadUIntEnv("VENPOD_SPARSE_SURFACE_PARALLEL_EXTRACTION", 0u) != 0u;
+        ReadUIntEnv("VENPOD_SPARSE_SURFACE_PARALLEL_EXTRACTION", 1u) != 0u;
     sparseWorldConfig.parallelSurfaceExtractionTimeBudgeted =
         sparseBackendRequested &&
         ReadUIntEnv("VENPOD_SPARSE_SURFACE_PARALLEL_TIME_BUDGETED", 0u) != 0u;
@@ -3117,6 +3148,34 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseMidMeshParallelExtract =
         sparseMidMeshIncrementalUpload &&
         ReadUIntEnv("VENPOD_MIDMESH_PARALLEL", 1u) != 0u;
+    // Loop 1 (FPS tail): cache computeTileLod per tile (camera/content/residency keyed) to skip
+    // the all-tiles LOD + childResident scan that is the measured mid-mesh build floor. Default
+    // OFF until A/B-promoted. VALIDATE forces a recompute+compare every call (shadow validator).
+    const bool sparseMidMeshLodCache =
+        ReadUIntEnv("VENPOD_MIDMESH_LOD_CACHE", 0u) != 0u;
+    const bool sparseMidMeshLodCacheValidate =
+        ReadUIntEnv("VENPOD_MIDMESH_LOD_CACHE_VALIDATE", 0u) != 0u;
+    // Loop 2: cap mid-mesh pre-extraction workers (0 = hardware_concurrency). Tunable for the
+    // contention A/B; the dirty-tile re-extraction is the measured editing-tail build spike.
+    const uint32_t sparseMidMeshExtractMaxWorkers =
+        ReadUIntEnv("VENPOD_MIDMESH_EXTRACT_MAX_WORKERS", 0u);
+    // Loop 2C: dirty-region mid-mesh extraction (re-mesh only the edit footprint + halo, splice
+    // over cached faces). Default OFF until A/B-promoted. VALIDATE = full re-extract + multiset
+    // compare per dirty tile (proves correctness; disables the splice + falls back on mismatch).
+    const bool sparseMidMeshDirtyRegionExtract =
+        ReadUIntEnv("VENPOD_MIDMESH_DIRTY_REGION_EXTRACT", 0u) != 0u;
+    const bool sparseMidMeshDirtyRegionValidate =
+        ReadUIntEnv("VENPOD_MIDMESH_DIRTY_REGION_VALIDATE", 0u) != 0u;
+    // Loop D: async/budgeted remesh — route reusable-cache tiles through the maxRebuildMs
+    // budget+deferral (bound the synchronous edit-frame spike) instead of the unbudgeted pre-pass.
+    const bool sparseMidMeshAsyncRemesh =
+        ReadUIntEnv("VENPOD_MIDMESH_ASYNC_REMESH", 0u) != 0u;
+    // Loop E: per-worker scratch + capacity-reuse to remove extractor heap contention.
+    const bool sparseMidMeshExtractScratch =
+        ReadUIntEnv("VENPOD_MIDMESH_EXTRACT_SCRATCH", 0u) != 0u;
+    // Loop E: work-stealing pre-pass distribution (balance the 50x-skewed per-tile extraction cost).
+    const bool sparseMidMeshWorkSteal =
+        ReadUIntEnv("VENPOD_MIDMESH_WORKSTEAL", 0u) != 0u;
     const uint32_t sparseMidMeshLodBaseMerge =
         std::max(1u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_LOD_BASE_MERGE", 1u));
     // Default merge cap 2 (was 4): both visual judges ranked the finer distant
@@ -6230,6 +6289,10 @@ int RunSandbox(int argc, char* argv[]) {
         lastRawFrameMs = dt * 1000.0f;
         smoothedFrameMs = smoothedFrameMs * 0.92f + lastRawFrameMs * 0.08f;
         dt = std::clamp(dt, 1.0f / 240.0f, 1.0f / 30.0f);
+        if (pixGpuCaptureNextFrames && frameCount == static_cast<uint64_t>(pixCaptureFrame)) {
+            const HRESULT pr = pixGpuCaptureNextFrames(pixCaptureOutPath.c_str(), 1u);
+            spdlog::info("PIX_CAPTURE_TRIGGER frame={} hr=0x{:08X}", frameCount, static_cast<uint32_t>(pr));
+        }
         const auto ticksToMs = [performanceFrequency](uint64_t ticks) {
             return static_cast<float>(static_cast<double>(ticks) * 1000.0 / performanceFrequency);
         };
@@ -16980,6 +17043,14 @@ int RunSandbox(int argc, char* argv[]) {
                 midMeshBuildConfig.cullPadding = sparseMidMeshCullPadding;
                 midMeshBuildConfig.emitDirtyPayload = sparseMidMeshIncrementalUpload;
                 midMeshBuildConfig.parallelExtract = sparseMidMeshParallelExtract;
+                midMeshBuildConfig.lodCache = sparseMidMeshLodCache;
+                midMeshBuildConfig.lodCacheValidate = sparseMidMeshLodCacheValidate;
+                midMeshBuildConfig.preExtractMaxWorkers = sparseMidMeshExtractMaxWorkers;
+                midMeshBuildConfig.dirtyRegionExtract = sparseMidMeshDirtyRegionExtract;
+                midMeshBuildConfig.dirtyRegionExtractValidate = sparseMidMeshDirtyRegionValidate;
+                midMeshBuildConfig.asyncRemesh = sparseMidMeshAsyncRemesh;
+                midMeshBuildConfig.extractScratch = sparseMidMeshExtractScratch;
+                midMeshBuildConfig.workStealExtract = sparseMidMeshWorkSteal;
                 // Split the chain so a failure names the stage that rejected it and the
                 // snapshot's counts-vs-caps -> the replay log pins the exact overflow cap.
                 // Throttle-robust timing split: BUILD self-time is pure CPU; STAGE+EMIT
@@ -23975,6 +24046,20 @@ int RunSandbox(int argc, char* argv[]) {
                 perfFenceWaitMs,
                 gpuTiming.valid ? gpuTiming.frameMs : 0.0,
                 gpuTiming.valid ? 1 : 0);
+            // Residency budget (rules out eviction/over-budget stalls as a hidden cost):
+            // GPU local-memory usage vs the OS budget this frame.
+            if (auto vmem = device->QueryVideoMemoryInfo(); vmem.IsOk()) {
+                const auto& vm = vmem.Value();
+                spdlog::info(
+                    "PERF_RESIDENCY frame={} usageMB={:.1f} budgetMB={:.1f} usagePct={:.1f} overBudget={}",
+                    frameCount,
+                    static_cast<double>(vm.currentUsageBytes) / 1048576.0,
+                    static_cast<double>(vm.budgetBytes) / 1048576.0,
+                    vm.budgetBytes ? 100.0 * static_cast<double>(vm.currentUsageBytes) /
+                                         static_cast<double>(vm.budgetBytes)
+                                   : 0.0,
+                    (vm.budgetBytes && vm.currentUsageBytes > vm.budgetBytes) ? 1 : 0);
+            }
             if (sparseBackendRequested && sparseVoxelWorldReady) {
                 spdlog::info(
                     "PERF_BACKEND_PIPE frame={} configured=0x{:X} active=0x{:X} warn=0x{:X} cpu={} gpu={} ray={} near={} surfaceGpu={} surfaceRaster={} surfaceAuth={} mid={} far={} own={} coll={} phys={}",
@@ -25940,6 +26025,23 @@ int RunSandbox(int argc, char* argv[]) {
                     perfSparseRequestBrushRetryMs, perfSparseRequestOwnershipFeedbackMs,
                     perfSparseRequestMissFeedbackMs, perfSparseRequestHiddenExactMs,
                     perfSparseGenerationPrepMs);
+                // genPrep internal split: prove whether the 20+ms genPrep on edit/move
+                // frames (where generated=0) is the async-completion APPLY (writing
+                // worker-generated bricks back into the pool) vs worker/parallel cost.
+                {
+                    const auto& gpStats = sparseVoxelWorld.GetStats();
+                    spdlog::info(
+                        "PERF_GENPREP frame={} genPrep={:.1f} = asyncExactApplyMs={:.2f} asyncExactWorkerMs={:.2f} "
+                        "parallelWallMs={:.2f} parallelActive={} parallelBricks={} appliedVisible={} appliedPublicCrit={}",
+                        frameCount, perfSparseGenerationPrepMs,
+                        gpStats.asyncExactGenerationApplyMsLastFrame,
+                        gpStats.asyncExactGenerationWorkerMsLastFrame,
+                        gpStats.parallelExactGenerationWallMsLastFrame,
+                        gpStats.parallelExactGenerationActive,
+                        gpStats.parallelExactGenerationBricksLastFrame,
+                        gpStats.asyncExactGenerationAppliedVisibleLaneLastFrame,
+                        gpStats.asyncExactGenerationAppliedPublicCriticalLaneLastFrame);
+                }
             }
         }
 
