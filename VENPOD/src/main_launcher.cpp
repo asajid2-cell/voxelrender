@@ -1657,6 +1657,24 @@ int RunSandbox(int argc, char* argv[]) {
             ReadUIntEnv("VENPOD_SPARSE_TERRAIN_CRITICAL_PARALLEL_GENERATION_MIN_BRICKS", 16u),
             2u,
             256u);
+    // Hidden-exact-miss forced generation: measured as THE editing/streaming dip cause -- the loop
+    // at the genPrep stage generates ~80-123 bricks SERIALLY on catchup frames (~0.16ms each =
+    // 13-20ms spikes) while the terrain-critical loop above it already has a parallel path. Route
+    // the hidden-exact Requested coords through PumpGenerationForCoordsParallel too (same bricks,
+    // off the main thread). Default ON; env-toggle for A/B against the serial baseline.
+    const bool enableSparseHiddenExactParallelGeneration =
+        sparseBackendRequested &&
+        ReadUIntEnv("VENPOD_SPARSE_HIDDEN_EXACT_PARALLEL_GENERATION", 1u) != 0u;
+    const uint32_t sparseHiddenExactParallelGenerationMaxWorkers =
+        std::clamp(
+            ReadUIntEnv("VENPOD_SPARSE_HIDDEN_EXACT_PARALLEL_GENERATION_MAX_WORKERS", 8u),
+            1u,
+            16u);
+    const uint32_t sparseHiddenExactParallelGenerationMinBricks =
+        std::clamp(
+            ReadUIntEnv("VENPOD_SPARSE_HIDDEN_EXACT_PARALLEL_GENERATION_MIN_BRICKS", 8u),
+            2u,
+            256u);
     const uint32_t sparseTerrainScreenCriticalProtectedUploadBudget =
         ReadUIntEnv("VENPOD_SPARSE_TERRAIN_SCREEN_CRITICAL_PROTECTED_UPLOAD_BUDGET", 192u);
     const uint32_t sparseTerrainScreenCriticalProtectedSurfaceBudget =
@@ -12143,6 +12161,7 @@ int RunSandbox(int argc, char* argv[]) {
             }
             sparseGenerationBudgetLastFrame = sparseGenerationBudgetThisFrame;
             sparseVoxelWorld.SetStatsRefreshDeferred(true);
+            const uint64_t genLoopsT0 = SDL_GetPerformanceCounter();  // DIAG: time the forced-gen loops
             if (enableSparseTerrainScreenCriticalPrefetch &&
                 sparseTerrainCriticalActiveLastFrame != 0u &&
                 sparseTerrainScreenCriticalProtectedGenerationBudget > 0u &&
@@ -12267,17 +12286,56 @@ int RunSandbox(int argc, char* argv[]) {
                         : (hiddenExactPostOpenCatchupActive
                             ? sparseHiddenExactMissPostOpenGenerationBudget
                             : sparseHiddenExactMissGenerationBudget);
-                for (const Simulation::BrickCoord& coord : hiddenExactForcedGenerationCoords) {
-                    if (sparseHiddenExactMissGeneratedLastFrame >= hiddenExactGenerationBudgetThisFrame) {
-                        break;
+                if (enableSparseHiddenExactParallelGeneration) {
+                    // Collect the Requested coords (up to budget) then generate them across worker
+                    // threads. Distinct coords => independent generation (same path the
+                    // terrain-critical loop uses). Kills the serial catchup spike.
+                    std::vector<Simulation::BrickCoord> hiddenExactParallelCoords;
+                    hiddenExactParallelCoords.reserve(
+                        std::min<size_t>(hiddenExactForcedGenerationCoords.size(),
+                                         static_cast<size_t>(hiddenExactGenerationBudgetThisFrame)));
+                    for (const Simulation::BrickCoord& coord : hiddenExactForcedGenerationCoords) {
+                        if (hiddenExactParallelCoords.size() >=
+                            static_cast<size_t>(hiddenExactGenerationBudgetThisFrame)) {
+                            break;
+                        }
+                        if (sparseVoxelWorld.GetRenderReadinessState(coord) ==
+                            Simulation::SparseRenderReadinessState::Requested) {
+                            hiddenExactParallelCoords.push_back(coord);
+                        }
                     }
-                    const Simulation::SparseRenderReadinessState readiness =
-                        sparseVoxelWorld.GetRenderReadinessState(coord);
-                    if (readiness != Simulation::SparseRenderReadinessState::Requested) {
-                        continue;
+                    if (hiddenExactParallelCoords.size() >=
+                        static_cast<size_t>(sparseHiddenExactParallelGenerationMinBricks)) {
+                        float hiddenExactParallelWallMs = 0.0f;
+                        sparseHiddenExactMissGeneratedLastFrame +=
+                            sparseVoxelWorld.PumpGenerationForCoordsParallel(
+                                hiddenExactParallelCoords,
+                                hiddenExactGenerationBudgetThisFrame,
+                                sparseHiddenExactParallelGenerationMaxWorkers,
+                                &hiddenExactParallelWallMs);
+                    } else {
+                        for (const Simulation::BrickCoord& coord : hiddenExactParallelCoords) {
+                            if (sparseHiddenExactMissGeneratedLastFrame >=
+                                hiddenExactGenerationBudgetThisFrame) {
+                                break;
+                            }
+                            sparseHiddenExactMissGeneratedLastFrame +=
+                                sparseVoxelWorld.PumpGenerationForCoord(coord);
+                        }
                     }
-                    sparseHiddenExactMissGeneratedLastFrame +=
-                        sparseVoxelWorld.PumpGenerationForCoord(coord);
+                } else {
+                    for (const Simulation::BrickCoord& coord : hiddenExactForcedGenerationCoords) {
+                        if (sparseHiddenExactMissGeneratedLastFrame >= hiddenExactGenerationBudgetThisFrame) {
+                            break;
+                        }
+                        const Simulation::SparseRenderReadinessState readiness =
+                            sparseVoxelWorld.GetRenderReadinessState(coord);
+                        if (readiness != Simulation::SparseRenderReadinessState::Requested) {
+                            continue;
+                        }
+                        sparseHiddenExactMissGeneratedLastFrame +=
+                            sparseVoxelWorld.PumpGenerationForCoord(coord);
+                    }
                 }
                 if (sparseHiddenExactMissGeneratedLastFrame != 0u) {
                     spdlog::info(
@@ -12291,13 +12349,31 @@ int RunSandbox(int argc, char* argv[]) {
                         sparseHiddenExactMissRepairCoordsLastFrame.size());
                 }
             }
+            const uint64_t genSplitPumpT0 = SDL_GetPerformanceCounter();
             sparseVoxelWorld.PumpGenerationAround(
                 sparseGenerationBudgetThisFrame,
                 sparseCenter,
                 sparseResidencyFrame);
+            const uint64_t genSplitFlushT0 = SDL_GetPerformanceCounter();
             sparseVoxelWorld.SetStatsRefreshDeferred(false);
             if (!enableSparseStatsSingleFlush) {
                 sparseVoxelWorld.FlushStats();
+            }
+            const uint64_t genSplitEnd = SDL_GetPerformanceCounter();
+            // DIAGNOSTIC: genPrep on dip frames is ~17ms with generated=0 and all gen sub-timers
+            // zero -> the cost is NOT generation. Split the pump vs the deferred-stats-flush to find
+            // where it goes (Codex flagged FlushStats/RefreshStats walking dirty queues).
+            static const bool genprepProfile = (std::getenv("VENPOD_GENPREP_PROFILE") != nullptr);
+            if (genprepProfile) {
+                spdlog::info("GENPREP_SPLIT frame={} loopsMs={:.2f} pumpMs={:.2f} flushMs={:.2f} "
+                    "terrainCritGen={} hiddenExactGen={} hiddenExactTracked={}",
+                    frameCount,
+                    ticksToMs(genSplitPumpT0 - genLoopsT0),
+                    ticksToMs(genSplitFlushT0 - genSplitPumpT0),
+                    ticksToMs(genSplitEnd - genSplitFlushT0),
+                    sparseTerrainCriticalProtectedGeneratedLastFrame,
+                    sparseHiddenExactMissGeneratedLastFrame,
+                    static_cast<uint32_t>(sparseHiddenExactMissTrackedCoords.size()));
             }
             if (enableSparseStreamingLaneDiagnostics && enableSparseCpuDetailLog) {
                 const auto& sparseLaneStatsAfterGeneration = sparseVoxelWorld.GetStats();
