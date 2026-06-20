@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -447,6 +448,18 @@ public:
         const Simulation::SparseSurfaceGpuSnapshot& snapshot,
         SparseSurfaceUploadTicket* outTicket = nullptr);
     bool EmitCopy(ID3D12GraphicsCommandList* commandList, const SparseSurfaceUploadTicket& ticket);
+    bool BuildFallbackDrawArgsExcluding(
+        ID3D12GraphicsCommandList* commandList,
+        const std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash>& excludedCoords,
+        uint32_t* outExcludedDrawSlots = nullptr,
+        uint32_t* outCommandCount = nullptr);
+    bool CopyFixedSlotFacesIntoCompactRanges(
+        ID3D12GraphicsCommandList* commandList,
+        ID3D12Resource* fixedSlotFaceBuffer,
+        uint32_t fixedSlotFaceCapacity,
+        const std::vector<std::pair<uint32_t, Simulation::BrickCoord>>& slotCoords,
+        uint32_t* outCopiedTiles = nullptr,
+        uint32_t* outCopiedFaces = nullptr);
     bool DispatchGpuCull(
         ID3D12GraphicsCommandList* commandList,
         float cameraX,
@@ -478,6 +491,7 @@ public:
     const DescriptorHandle& SurfaceRecordSRV() const { return m_surfaceRecordBuffer.GetShaderVisibleSRV(); }
     const DescriptorHandle& SurfaceClusterSRV() const { return m_surfaceClusterBuffer.GetShaderVisibleSRV(); }
     ID3D12Resource* DrawArgsResource() const { return m_drawArgsBuffer.GetResource(); }
+    ID3D12Resource* FallbackDrawArgsResource() const { return m_fallbackDrawArgsBuffer.GetResource(); }
     ID3D12Resource* DrawCountResource() const { return m_drawCountBuffer.GetResource(); }
     const D3D12_VERTEX_BUFFER_VIEW& VertexIdBufferView() const { return m_vertexIdBufferView; }
     const D3D12_INDEX_BUFFER_VIEW& IndexBufferView() const { return m_indexBufferView; }
@@ -516,6 +530,7 @@ private:
     GPUBuffer m_faceBuffer;
     GPUBuffer m_rangeBuffer;
     GPUBuffer m_drawArgsBuffer;
+    GPUBuffer m_fallbackDrawArgsBuffer;
     GPUBuffer m_surfaceRecordBuffer;
     GPUBuffer m_surfaceClusterBuffer;
     GPUBuffer m_drawCountBuffer;
@@ -523,6 +538,7 @@ private:
     std::array<bool, 3> m_cullStatsReadbackPending = {};
     std::array<uint32_t, 3> m_cullStatsReadbackQueuedFrames = {};
     std::array<UploadBuffer, 3> m_uploadRing;
+    UploadBuffer m_fallbackDrawArgsUpload;
     std::array<UploadBuffer, 3> m_cullConstantUploads;
     GPUBuffer m_vertexIdStream;
     GPUBuffer m_indexStream;

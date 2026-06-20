@@ -613,6 +613,26 @@ Result<void> SparseSurfaceGpuResources::Initialize(
         Shutdown();
         return Error("Failed to create sparse surface draw args UAV: {}", result.error());
     }
+    result = m_fallbackDrawArgsBuffer.Initialize(
+        device,
+        static_cast<uint64_t>(config.maxDrawCommands) * sizeof(Simulation::SparseSurfaceDrawArgs),
+        BufferUsage::IndirectArgument | BufferUsage::StructuredBuffer,
+        sizeof(Simulation::SparseSurfaceDrawArgs),
+        "SparseSurfaceFallbackDrawArgsBuffer");
+    if (!result) {
+        Shutdown();
+        return Error("Failed to create sparse surface fallback draw args buffer: {}", result.error());
+    }
+    result = m_fallbackDrawArgsUpload.Initialize(
+        device,
+        std::max<uint64_t>(
+            static_cast<uint64_t>(config.maxDrawCommands) * sizeof(Simulation::SparseSurfaceDrawArgs),
+            256u),
+        "SparseSurfaceFallbackDrawArgsUpload");
+    if (!result) {
+        Shutdown();
+        return Error("Failed to create sparse surface fallback draw args upload: {}", result.error());
+    }
 
     result = m_surfaceRecordBuffer.Initialize(
         device,
@@ -760,6 +780,7 @@ void SparseSurfaceGpuResources::Shutdown() {
     m_faceBuffer.Shutdown();
     m_rangeBuffer.Shutdown();
     m_drawArgsBuffer.Shutdown();
+    m_fallbackDrawArgsBuffer.Shutdown();
     m_surfaceRecordBuffer.Shutdown();
     m_surfaceClusterBuffer.Shutdown();
     m_drawCountBuffer.Shutdown();
@@ -767,6 +788,7 @@ void SparseSurfaceGpuResources::Shutdown() {
     m_indexStream.Shutdown();
     m_vertexIdStreamUpload.Shutdown();
     m_indexStreamUpload.Shutdown();
+    m_fallbackDrawArgsUpload.Shutdown();
     m_vertexIdBufferView = {};
     m_indexBufferView = {};
     m_vertexIdCapacityFaces = 0;
@@ -3632,6 +3654,131 @@ bool SparseSurfaceGpuResources::EmitCopy(
     m_stats.stableDrawSlotCapacity = static_cast<uint32_t>(m_drawSlotOccupied.size());
     m_stats.stableDrawFreeSlots = static_cast<uint32_t>(m_freeDrawSlots.size());
     return true;
+}
+
+bool SparseSurfaceGpuResources::BuildFallbackDrawArgsExcluding(
+    ID3D12GraphicsCommandList* commandList,
+    const std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash>& excludedCoords,
+    uint32_t* outExcludedDrawSlots,
+    uint32_t* outCommandCount)
+{
+    if (outExcludedDrawSlots) {
+        *outExcludedDrawSlots = 0u;
+    }
+    if (outCommandCount) {
+        *outCommandCount = 0u;
+    }
+    if (!commandList ||
+        !m_stats.initialized ||
+        !m_fallbackDrawArgsBuffer.GetResource() ||
+        !m_fallbackDrawArgsUpload.GetResource() ||
+        m_drawArgsMirror.empty()) {
+        return false;
+    }
+
+    std::vector<Simulation::SparseSurfaceDrawArgs> fallback = m_drawArgsMirror;
+    uint32_t excludedSlots = 0u;
+    for (const Simulation::BrickCoord& coord : excludedCoords) {
+        auto it = m_drawSlotByCoord.find(coord);
+        if (it == m_drawSlotByCoord.end()) {
+            continue;
+        }
+        const uint32_t drawSlot = it->second;
+        if (drawSlot < fallback.size()) {
+            fallback[drawSlot] = {};
+            ++excludedSlots;
+        }
+    }
+
+    const uint64_t bytes =
+        static_cast<uint64_t>(fallback.size()) * sizeof(Simulation::SparseSurfaceDrawArgs);
+    if (bytes == 0u || bytes > m_fallbackDrawArgsUpload.GetSize()) {
+        return false;
+    }
+    if (auto* mapped = m_fallbackDrawArgsUpload.GetMappedData()) {
+        std::memcpy(mapped, fallback.data(), static_cast<size_t>(bytes));
+    } else {
+        return false;
+    }
+
+    m_fallbackDrawArgsBuffer.TransitionTo(commandList, D3D12_RESOURCE_STATE_COPY_DEST);
+    commandList->CopyBufferRegion(
+        m_fallbackDrawArgsBuffer.GetResource(), 0,
+        m_fallbackDrawArgsUpload.GetResource(), 0,
+        bytes);
+    m_fallbackDrawArgsBuffer.TransitionTo(
+        commandList, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+
+    if (outExcludedDrawSlots) {
+        *outExcludedDrawSlots = excludedSlots;
+    }
+    if (outCommandCount) {
+        *outCommandCount = static_cast<uint32_t>(fallback.size());
+    }
+    return true;
+}
+
+bool SparseSurfaceGpuResources::CopyFixedSlotFacesIntoCompactRanges(
+    ID3D12GraphicsCommandList* commandList,
+    ID3D12Resource* fixedSlotFaceBuffer,
+    uint32_t fixedSlotFaceCapacity,
+    const std::vector<std::pair<uint32_t, Simulation::BrickCoord>>& slotCoords,
+    uint32_t* outCopiedTiles,
+    uint32_t* outCopiedFaces)
+{
+    if (outCopiedTiles) {
+        *outCopiedTiles = 0u;
+    }
+    if (outCopiedFaces) {
+        *outCopiedFaces = 0u;
+    }
+    if (!commandList ||
+        !fixedSlotFaceBuffer ||
+        fixedSlotFaceCapacity == 0u ||
+        !m_stats.initialized ||
+        !m_faceBuffer.GetResource() ||
+        slotCoords.empty()) {
+        return false;
+    }
+
+    uint32_t copiedTiles = 0u;
+    uint32_t copiedFaces = 0u;
+    m_faceBuffer.TransitionTo(commandList, D3D12_RESOURCE_STATE_COPY_DEST);
+    for (const auto& item : slotCoords) {
+        const uint32_t fixedSlot = item.first;
+        const Simulation::BrickCoord& coord = item.second;
+        SparseSurfaceGpuBrickDebugInfo info;
+        if (!TryGetBrickDebugInfo(coord, &info) ||
+            !info.surfaceRecordPresent ||
+            info.surfaceRecordFaceCount == 0u ||
+            info.surfaceRecordFaceCount > fixedSlotFaceCapacity) {
+            continue;
+        }
+
+        const uint64_t srcFirstFace =
+            static_cast<uint64_t>(fixedSlot) * static_cast<uint64_t>(fixedSlotFaceCapacity);
+        const uint64_t dstFirstFace = info.surfaceRecordFirstFace;
+        const uint64_t faceCount = info.surfaceRecordFaceCount;
+        const uint64_t byteCount = faceCount * sizeof(Simulation::SparseSurfaceFace);
+        commandList->CopyBufferRegion(
+            m_faceBuffer.GetResource(),
+            dstFirstFace * sizeof(Simulation::SparseSurfaceFace),
+            fixedSlotFaceBuffer,
+            srcFirstFace * sizeof(Simulation::SparseSurfaceFace),
+            byteCount);
+        ++copiedTiles;
+        copiedFaces += static_cast<uint32_t>(faceCount);
+    }
+    m_faceBuffer.TransitionTo(
+        commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    if (outCopiedTiles) {
+        *outCopiedTiles = copiedTiles;
+    }
+    if (outCopiedFaces) {
+        *outCopiedFaces = copiedFaces;
+    }
+    return copiedTiles > 0u;
 }
 
 bool SparseSurfaceGpuResources::DispatchGpuCull(

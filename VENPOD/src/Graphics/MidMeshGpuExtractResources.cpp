@@ -58,6 +58,7 @@ Result<void> MidMeshGpuExtractResources::Initialize(
     }
 
     m_config = config;
+    m_heapManager = &heapManager;
     m_samplesPerTile = config.tileSampleSide * config.tileSampleSide;
     m_sampleTileBytes = static_cast<uint64_t>(m_samplesPerTile) * sizeof(uint32_t);
 
@@ -150,6 +151,10 @@ Result<void> MidMeshGpuExtractResources::Initialize(
     m_stats.productionFaceBufferBytes = 0;
     m_stats.productionFaceCountBufferBytes = 0;
     m_stats.productionFaceStatusBufferBytes = 0;
+    m_stats.productionDrawArgsBufferBytes = 0;
+    m_stats.productionCommitBufferBytes = 0;
+    m_stats.productionDrawCommandCount = 0;
+    m_stats.productionCommittedSlots = 0;
     return {};
 }
 
@@ -169,11 +174,18 @@ void MidMeshGpuExtractResources::Shutdown() {
     m_productionFaceBuffer.Shutdown();
     m_productionFaceCountBuffer.Shutdown();
     m_productionFaceStatusBuffer.Shutdown();
+    m_productionCommitBuffer.Shutdown();
+    m_productionDrawArgsBuffer.Shutdown();
     m_productionCountClearUpload.Shutdown();
+    m_productionCommitUpload.Shutdown();
     m_productionFaceCapacityPerTile = 0;
     m_productionFaceBufferBytes = 0;
     m_productionFaceCountBufferBytes = 0;
     m_productionFaceStatusBufferBytes = 0;
+    m_productionDrawArgsBufferBytes = 0;
+    m_productionCommitBufferBytes = 0;
+    m_productionDrawArgsPipeline.Shutdown();
+    m_productionDrawArgsShader = {};
     // B1.3.0 readback ring: unmap the persistent maps, then release the buffers.
     for (auto& slot : m_smokeReadbackRing) {
         if (slot.facePtr) {
@@ -217,6 +229,7 @@ void MidMeshGpuExtractResources::Shutdown() {
     m_smokeSelfTestDone = false;
     m_smokeAbVerifyCount = 0;
     m_smokeReady = false;
+    m_heapManager = nullptr;
     m_smokeTimestampFrequency = 0;
     m_smokeFaceCapacityPerTile = 0;
     m_debugFaceCapacityPerTile = 0;
@@ -552,6 +565,12 @@ Result<void> MidMeshGpuExtractResources::InitializeSmoke(
             "MidMeshGpuExtractProductionFaces"); !r) {
         return Error("InitializeSmoke - production face buffer: {}", r.error());
     }
+    if (!m_heapManager) {
+        return Error("InitializeSmoke - descriptor heap manager is null");
+    }
+    if (auto r = m_productionFaceBuffer.CreateSRV(device, *m_heapManager); !r) {
+        return Error("InitializeSmoke - production face SRV: {}", r.error());
+    }
     if (auto r = m_productionFaceCountBuffer.Initialize(
             device, m_productionFaceCountBufferBytes,
             BufferUsage::Default | BufferUsage::StructuredBuffer | BufferUsage::UnorderedAccess,
@@ -566,9 +585,34 @@ Result<void> MidMeshGpuExtractResources::InitializeSmoke(
             "MidMeshGpuExtractProductionFaceStatuses"); !r) {
         return Error("InitializeSmoke - production status buffer: {}", r.error());
     }
+    m_productionCommitBufferBytes =
+        static_cast<uint64_t>(m_config.maxTiles) * sizeof(uint32_t);
+    if (auto r = m_productionCommitBuffer.Initialize(
+            device, m_productionCommitBufferBytes,
+            BufferUsage::Default | BufferUsage::StructuredBuffer,
+            sizeof(uint32_t),
+            "MidMeshGpuExtractProductionCommitFlags"); !r) {
+        return Error("InitializeSmoke - production commit buffer: {}", r.error());
+    }
+    m_productionDrawArgsBufferBytes =
+        static_cast<uint64_t>(m_config.maxTiles) * sizeof(Simulation::SparseSurfaceDrawArgs);
+    if (auto r = m_productionDrawArgsBuffer.Initialize(
+            device, m_productionDrawArgsBufferBytes,
+            BufferUsage::Default | BufferUsage::StructuredBuffer |
+                BufferUsage::UnorderedAccess | BufferUsage::IndirectArgument,
+            sizeof(Simulation::SparseSurfaceDrawArgs),
+            "MidMeshGpuExtractProductionDrawArgs"); !r) {
+        return Error("InitializeSmoke - production draw args buffer: {}", r.error());
+    }
     if (auto r = m_productionCountClearUpload.Initialize(
             device, 256u, "MidMeshGpuExtractProductionCountClear"); !r) {
         return Error("InitializeSmoke - production count clear upload: {}", r.error());
+    }
+    if (auto r = m_productionCommitUpload.Initialize(
+            device,
+            std::max<uint64_t>(m_productionCommitBufferBytes, 256u),
+            "MidMeshGpuExtractProductionCommitUpload"); !r) {
+        return Error("InitializeSmoke - production commit upload: {}", r.error());
     }
     if (auto* clear = static_cast<uint32_t*>(m_productionCountClearUpload.GetMappedData())) {
         clear[0] = 0u;
@@ -577,6 +621,9 @@ Result<void> MidMeshGpuExtractResources::InitializeSmoke(
     m_stats.productionFaceBufferBytes = m_productionFaceBufferBytes;
     m_stats.productionFaceCountBufferBytes = m_productionFaceCountBufferBytes;
     m_stats.productionFaceStatusBufferBytes = m_productionFaceStatusBufferBytes;
+    m_stats.productionDrawArgsBufferBytes = m_productionDrawArgsBufferBytes;
+    m_stats.productionCommitBufferBytes = m_productionCommitBufferBytes;
+    m_stats.productionDrawCommandCount = m_config.maxTiles;
 
     // B1.3.0 readback RING (debug-only verify path): kSmokeReadbackSlots slots, each
     // a face + metadata readback buffer Map()'d ONCE here and kept persistently mapped
@@ -1397,6 +1444,26 @@ Result<void> MidMeshGpuExtractResources::InitializeB13aTopFace(
         return Error("InitializeB13aTopFace - PSO init: {}", r.error());
     }
 
+    const std::filesystem::path drawArgsCsPath =
+        shaderPath / "Compute" / "CS_MidMeshBuildProductionDrawArgs.hlsl";
+    auto drawArgsCompile = shaderCompiler.CompileComputeShader(drawArgsCsPath, L"main", false);
+    if (!drawArgsCompile || !drawArgsCompile.value().IsValid()) {
+        return Error("InitializeB13aTopFace - production draw-args CS compile failed: {}",
+            drawArgsCompile ? drawArgsCompile.value().errors : drawArgsCompile.error());
+    }
+    m_productionDrawArgsShader = drawArgsCompile.value();
+    ComputePipelineDesc drawArgsDesc;
+    drawArgsDesc.computeShader = m_productionDrawArgsShader;
+    drawArgsDesc.debugName = "CS_MidMeshBuildProductionDrawArgs";
+    drawArgsDesc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 4 }); // b0
+    drawArgsDesc.rootParams.push_back({ RootParamType::ShaderResource, 0, 0, 1 }); // t0 counts
+    drawArgsDesc.rootParams.push_back({ RootParamType::ShaderResource, 1, 0, 1 }); // t1 statuses
+    drawArgsDesc.rootParams.push_back({ RootParamType::ShaderResource, 2, 0, 1 }); // t2 commit flags
+    drawArgsDesc.rootParams.push_back({ RootParamType::UnorderedAccess, 0, 0, 1 }); // u0 draw args
+    if (auto r = m_productionDrawArgsPipeline.Initialize(device, drawArgsDesc); !r) {
+        return Error("InitializeB13aTopFace - production draw-args PSO init: {}", r.error());
+    }
+
     m_b13aReady = true;
     spdlog::info(
         "[GPU_EXTRACT_B13A] top-face compute ready: topFaceCapacityPerTile={} "
@@ -1768,6 +1835,100 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatchProduction(
         device, fixture, cpuReferenceFaces, terraceStep, currentTileVersionForSlot,
         emitRisers, emitSkirts, applyChildSuppression, equalityMode, applyEditSkip,
         editBoxes, emitWater, applyDistanceCull, cullBlockMask, true);
+}
+
+bool MidMeshGpuExtractResources::UpdateProductionDrawArgs(
+    ID3D12GraphicsCommandList* commandList,
+    const std::vector<uint32_t>& committedSlots)
+{
+    if (!commandList ||
+        !m_b13aReady ||
+        !m_productionDrawArgsPipeline.IsValid() ||
+        !m_productionFaceCountBuffer.GetResource() ||
+        !m_productionFaceStatusBuffer.GetResource() ||
+        !m_productionCommitBuffer.GetResource() ||
+        !m_productionDrawArgsBuffer.GetResource() ||
+        m_config.maxTiles == 0u ||
+        m_productionFaceCapacityPerTile == 0u) {
+        return false;
+    }
+
+    std::vector<uint32_t> commitFlags(m_config.maxTiles, 0u);
+    uint32_t committedCount = 0u;
+    for (const uint32_t slot : committedSlots) {
+        if (slot < m_config.maxTiles && commitFlags[slot] == 0u) {
+            commitFlags[slot] = 1u;
+            ++committedCount;
+        }
+    }
+
+    const uint64_t commitBytes =
+        static_cast<uint64_t>(commitFlags.size()) * sizeof(uint32_t);
+    if (commitBytes == 0u || commitBytes > m_productionCommitUpload.GetSize()) {
+        return false;
+    }
+    if (auto* mapped = static_cast<uint8_t*>(m_productionCommitUpload.GetMappedData())) {
+        std::memcpy(mapped, commitFlags.data(), static_cast<size_t>(commitBytes));
+    } else {
+        return false;
+    }
+
+    m_productionCommitBuffer.TransitionTo(commandList, D3D12_RESOURCE_STATE_COPY_DEST);
+    commandList->CopyBufferRegion(
+        m_productionCommitBuffer.GetResource(), 0,
+        m_productionCommitUpload.GetResource(), 0,
+        commitBytes);
+    m_productionCommitBuffer.TransitionTo(
+        commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    m_productionFaceCountBuffer.TransitionTo(
+        commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    m_productionFaceStatusBuffer.TransitionTo(
+        commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    m_productionDrawArgsBuffer.TransitionTo(
+        commandList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    const uint32_t consts[4] = {
+        m_config.maxTiles,
+        m_productionFaceCapacityPerTile,
+        0u,
+        0u
+    };
+    m_productionDrawArgsPipeline.Bind(commandList);
+    m_productionDrawArgsPipeline.SetRoot32BitConstants(commandList, 0, 4, consts);
+    commandList->SetComputeRootShaderResourceView(
+        1, m_productionFaceCountBuffer.GetGPUVirtualAddress());
+    commandList->SetComputeRootShaderResourceView(
+        2, m_productionFaceStatusBuffer.GetGPUVirtualAddress());
+    commandList->SetComputeRootShaderResourceView(
+        3, m_productionCommitBuffer.GetGPUVirtualAddress());
+    commandList->SetComputeRootUnorderedAccessView(
+        4, m_productionDrawArgsBuffer.GetGPUVirtualAddress());
+    m_productionDrawArgsPipeline.Dispatch(
+        commandList, (m_config.maxTiles + 63u) / 64u, 1u, 1u);
+
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier.UAV.pResource = m_productionDrawArgsBuffer.GetResource();
+    commandList->ResourceBarrier(1, &barrier);
+
+    m_productionDrawArgsBuffer.TransitionTo(
+        commandList, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    m_productionFaceBuffer.TransitionTo(
+        commandList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    m_stats.productionCommittedSlots = committedCount;
+    m_stats.productionDrawCommandCount = m_config.maxTiles;
+    return true;
+}
+
+void MidMeshGpuExtractResources::TransitionProductionFaceBuffer(
+    ID3D12GraphicsCommandList* commandList,
+    D3D12_RESOURCE_STATES state)
+{
+    if (commandList && m_productionFaceBuffer.GetResource()) {
+        m_productionFaceBuffer.TransitionTo(commandList, state);
+    }
 }
 
 bool MidMeshGpuExtractResources::RunB13aTopFaceDispatchInternal(

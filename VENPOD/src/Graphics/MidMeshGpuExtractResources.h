@@ -26,6 +26,7 @@
 #include "RHI/GPUBuffer.h"
 #include "RHI/ShaderCompiler.h"
 #include "Simulation/SparseClipmap.h"
+#include "Simulation/SparseSurfaceCache.h"
 #include "Simulation/SparseSurfaceExtractor.h"
 #include "Utils/Result.h"
 
@@ -130,11 +131,11 @@ struct MidMeshGpuExtractConfig {
     // borrow the CPU tile.faceCount. For side=33, the worst block count is merge=1:
     // 32*32 = 1024 top blocks, with at most 2*32*31 interior neighbor probes plus 4*32
     // border skirt edges before 32-unit extent / vertical riser splitting. The production
-    // mtns_edit replay currently peaks at 13,540 faces, so 16k is the validated bound for
-    // current terrain/config with explicit overflow reporting if a future tile exceeds it.
-    // Overflow sets status and the A/B rejects the result instead of truncating or drawing
-    // partial geometry.
-    uint32_t productionFaceCapacityPerTile = 16384u;
+    // mtns_edit replay now peaks at 17,758 CPU faces / 16,632 attempted GPU appends with
+    // the draw-promotion gates active. 24k stays under the current 3,145,728-face mid-mesh
+    // IA stream when maxTiles=128 (128*24,576), and overflow still sets status and rejects
+    // the result instead of truncating or drawing partial geometry.
+    uint32_t productionFaceCapacityPerTile = 24576u;
     // B1.3e EDIT-FOOTPRINT: per-tile cap on the number of edited-cell XZ boxes uploaded to
     // the GPU. An edited tile in practice overlaps a handful of brush strokes; 256 is ample
     // headroom. If a tile exceeds it the dispatch is SKIPPED + reported (never a partial/OOB
@@ -154,6 +155,10 @@ struct MidMeshGpuExtractStats {
     uint64_t productionFaceBufferBytes = 0;
     uint64_t productionFaceCountBufferBytes = 0;
     uint64_t productionFaceStatusBufferBytes = 0;
+    uint64_t productionDrawArgsBufferBytes = 0;
+    uint64_t productionCommitBufferBytes = 0;
+    uint32_t productionDrawCommandCount = 0;
+    uint32_t productionCommittedSlots = 0;
     // Per-frame (last upload):
     uint32_t sampleUploadTiles = 0;     // tiles whose samples+metadata were copied
     uint64_t sampleUploadBytes = 0;     // samples + metadata bytes copied this frame
@@ -540,6 +545,27 @@ public:
         bool applyDistanceCull,
         const std::vector<uint8_t>& cullBlockMask);
 
+    bool UpdateProductionDrawArgs(
+        ID3D12GraphicsCommandList* commandList,
+        const std::vector<uint32_t>& committedSlots);
+    const DescriptorHandle& ProductionFaceBufferSRV() const {
+        return m_productionFaceBuffer.GetShaderVisibleSRV();
+    }
+    ID3D12Resource* ProductionFaceBufferResource() const {
+        return m_productionFaceBuffer.GetResource();
+    }
+    ID3D12Resource* ProductionDrawArgsResource() const {
+        return m_productionDrawArgsBuffer.GetResource();
+    }
+    uint32_t ProductionDrawCommandCount() const { return m_config.maxTiles; }
+    uint32_t ProductionFaceCapacityPerTile() const { return m_productionFaceCapacityPerTile; }
+    uint32_t ProductionFaceCountCapacity() const {
+        return m_config.maxTiles * m_productionFaceCapacityPerTile;
+    }
+    void TransitionProductionFaceBuffer(
+        ID3D12GraphicsCommandList* commandList,
+        D3D12_RESOURCE_STATES state);
+
     // Delayed, DEBUG-ONLY containment A/B via the fence-tracked ring (same FIFO/ring as
     // the smoke poll, non-blocking by default). Reads the GPU top faces + status for the
     // oldest completed dispatch and compares them against that dispatch's captured CPU
@@ -641,6 +667,7 @@ private:
 
     MidMeshGpuExtractConfig m_config;
     MidMeshGpuExtractStats m_stats;
+    DescriptorHeapManager* m_heapManager = nullptr;
 
     GPUBuffer m_sampleBuffer;    // persistent, maxTiles * side*side uint32
     GPUBuffer m_metadataBuffer;  // persistent, maxTiles * MidMeshGpuExtractTileMeta
@@ -687,11 +714,18 @@ private:
     GPUBuffer m_productionFaceBuffer;
     GPUBuffer m_productionFaceCountBuffer;
     GPUBuffer m_productionFaceStatusBuffer;
+    GPUBuffer m_productionCommitBuffer;
+    GPUBuffer m_productionDrawArgsBuffer;
     UploadBuffer m_productionCountClearUpload;
+    UploadBuffer m_productionCommitUpload;
     uint32_t m_productionFaceCapacityPerTile = 0;
     uint64_t m_productionFaceBufferBytes = 0;
     uint64_t m_productionFaceCountBufferBytes = 0;
     uint64_t m_productionFaceStatusBufferBytes = 0;
+    uint64_t m_productionDrawArgsBufferBytes = 0;
+    uint64_t m_productionCommitBufferBytes = 0;
+    DX12ComputePipeline m_productionDrawArgsPipeline;
+    CompiledShader m_productionDrawArgsShader;
     // B1.3.0: fence-tracked, persistently-mapped readback RING (replaces B1.2's
     // single once-per-process readback). 3 slots so a dispatch's copy can be read
     // a frame or two later, after its fence is naturally satisfied - no per-frame
