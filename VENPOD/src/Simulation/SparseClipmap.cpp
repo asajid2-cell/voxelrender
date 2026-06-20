@@ -8900,6 +8900,16 @@ bool SparseClipmapTileCache::MissingBrickWithinFarSvoDomain(const SparseVoxelCli
         maxY <= domainMaxY;
 }
 
+void SparseClipmapTileCache::RefreshStatsForTelemetry()
+{
+    m_statsHeavyTelemetryRequestedThisFrame = true;
+    RefreshStats(
+        m_stats.generatedTilesLastFrame,
+        m_stats.evictedTilesLastFrame,
+        m_stats.generatedVoxelBricksLastFrame,
+        m_stats.evictedVoxelBricksLastFrame);
+}
+
 void SparseClipmapTileCache::RefreshStats(
     uint32_t generatedLastFrame,
     uint32_t evictedLastFrame,
@@ -8919,9 +8929,66 @@ void SparseClipmapTileCache::RefreshStats(
     m_stats.queuedVoxelBricks = static_cast<uint32_t>(m_voxelGenerationQueue.size());
     m_stats.backlogHeightBricks = m_stats.queuedTiles;
     m_stats.backlogVoxelBricks = m_stats.queuedVoxelBricks;
+    m_stats.generatedVoxelBricksLastFrame = generatedVoxelLastFrame;
+    m_stats.evictedVoxelBricksLastFrame = evictedVoxelLastFrame;
+    m_stats.generatedVoxelBricksByRingLastFrame = m_generatedVoxelBricksByRingLastFrame;
     m_stats.voxelRingCount = std::min<uint32_t>(
         static_cast<uint32_t>(m_config.ringCount),
         SPARSE_CLIPMAP_MAX_STATS_RINGS);
+    if (m_lastCoverageStatsFrame != m_lastStatsFrame) {
+        m_lastCoverageStatsFrame = m_lastStatsFrame;
+        PruneAsyncVisibleReservations(m_lastStatsFrame);
+        m_stats.missingInterestedTiles = 0;
+        for (const SparseClipmapTileCoord& coord : m_interestSet) {
+            if (m_slotByCoord.find(coord) == m_slotByCoord.end()) {
+                ++m_stats.missingInterestedTiles;
+            }
+        }
+        m_stats.interestedVoxelBricks = static_cast<uint32_t>(m_voxelInterestSet.size());
+        m_stats.missingInterestedVoxelBricks = 0;
+        m_stats.interestedVoxelBricksByRing.fill(0u);
+        m_stats.missingInterestedVoxelBricksByRing.fill(0u);
+        for (const SparseVoxelClipmapCoord& coord : m_voxelInterestSet) {
+            if (coord.ring >= 0 &&
+                static_cast<uint32_t>(coord.ring) < SPARSE_CLIPMAP_MAX_STATS_RINGS) {
+                ++m_stats.interestedVoxelBricksByRing[static_cast<uint32_t>(coord.ring)];
+            }
+            if (m_voxelSlotByCoord.find(coord) == m_voxelSlotByCoord.end()) {
+                ++m_stats.missingInterestedVoxelBricks;
+                if (coord.ring >= 0 &&
+                    static_cast<uint32_t>(coord.ring) < SPARSE_CLIPMAP_MAX_STATS_RINGS) {
+                    ++m_stats.missingInterestedVoxelBricksByRing[static_cast<uint32_t>(coord.ring)];
+                }
+            }
+        }
+        m_stats.visiblePriorityVoxelBricks = 0;
+        for (auto it = m_visiblePriorityVoxelSet.begin();
+             it != m_visiblePriorityVoxelSet.end();) {
+            const SparseVoxelClipmapCoord coord = *it;
+            if ((!m_voxelInterestSet.empty() && m_voxelInterestSet.find(coord) == m_voxelInterestSet.end()) ||
+                m_voxelSlotByCoord.find(coord) != m_voxelSlotByCoord.end() ||
+                m_queuedVoxelSet.find(coord) == m_queuedVoxelSet.end()) {
+                it = m_visiblePriorityVoxelSet.erase(it);
+                continue;
+            }
+            ++m_stats.visiblePriorityVoxelBricks;
+            ++it;
+        }
+        m_stats.cachePriorityVoxelBricks =
+            m_stats.missingInterestedVoxelBricks > m_stats.visiblePriorityVoxelBricks
+                ? m_stats.missingInterestedVoxelBricks - m_stats.visiblePriorityVoxelBricks
+                : 0u;
+        uint32_t criticalMissing = 0;
+        const uint32_t criticalRingCount = std::min<uint32_t>(2u, m_stats.voxelRingCount);
+        for (uint32_t ring = 0u; ring < criticalRingCount; ++ring) {
+            criticalMissing += m_stats.missingInterestedVoxelBricksByRing[ring];
+        }
+        m_stats.visibleCriticalMissingVoxelBricks = criticalMissing;
+        m_stats.nonCriticalMissingVoxelBricks =
+            m_stats.missingInterestedVoxelBricks > criticalMissing
+                ? m_stats.missingInterestedVoxelBricks - criticalMissing
+                : 0u;
+    }
     // Everything below is heavy TELEMETRY-ONLY aggregation — a 245-tile scan, the
     // 16384-brick sweep, the generation-queue/reservation/priority loops, and ~60 field
     // copies. RefreshStats is called HUNDREDS of times per frame from gen/evict
@@ -8931,11 +8998,20 @@ void SparseClipmapTileCache::RefreshStats(
     // Opt-in (engine main loop sets it): skip the heavy refresh if it already ran for
     // this stats frame. OFF by default so unit tests / isolated callers — which don't
     // advance m_lastStatsFrame — always get a fully refreshed snapshot.
-    if (m_statsHeavyRefreshOncePerFrame && m_lastFullStatsFrame == m_lastStatsFrame) {
+    if (m_statsHeavyRefreshOncePerFrame &&
+        m_lastFullStatsFrame == m_lastStatsFrame) {
+        m_statsHeavyTelemetryRequestedThisFrame = false;
         (void)generatedVoxelLastFrame;
         (void)evictedVoxelLastFrame;
         return;
     }
+    if (m_statsHeavyRefreshOncePerFrame &&
+        !m_statsHeavyTelemetryRequestedThisFrame) {
+        (void)generatedVoxelLastFrame;
+        (void)evictedVoxelLastFrame;
+        return;
+    }
+    m_statsHeavyTelemetryRequestedThisFrame = false;
     m_lastFullStatsFrame = m_lastStatsFrame;
     PruneAsyncVisibleReservations(m_lastStatsFrame);
     m_stats.missingInterestedTiles = 0;

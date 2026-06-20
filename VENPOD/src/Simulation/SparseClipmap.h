@@ -881,6 +881,9 @@ public:
     // once per stats frame instead of on every (hundreds of) internal calls. Leave OFF
     // for tests/isolated use so every RefreshStats() yields a complete snapshot.
     void SetStatsHeavyRefreshOncePerFrame(bool enable) { m_statsHeavyRefreshOncePerFrame = enable; }
+    // Opt-in refresh for telemetry consumers. Coverage-critical stats remain current
+    // without this; the heavy diagnostics sweep runs only when logs/overlays need it.
+    void RefreshStatsForTelemetry();
     // L3 motion guard: XZ distance from the camera to the nearest INTERESTED height
     // tile that is not yet resident (FLT_MAX when full coverage). Fed to the renderer
     // per frame so the shader can suppress the bare far-water fallback beyond the
@@ -1327,7 +1330,9 @@ private:
     // per frame (~14% of frame CPU, the top profiled hot spot). Recompute it at most
     // once per stats frame; UINT32_MAX so the first call each frame always runs it.
     uint32_t m_lastFullStatsFrame = 0xFFFFFFFFu;
+    uint32_t m_lastCoverageStatsFrame = 0xFFFFFFFFu;
     bool m_statsHeavyRefreshOncePerFrame = false;
+    bool m_statsHeavyTelemetryRequestedThisFrame = false;
     uint32_t m_lastMidMeshDeferredTiles = 0;
     float m_lastCameraYForStats = 0.0f;
     uint32_t m_interestReusedLastFrame = 0;
