@@ -6,8 +6,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <intrin.h>
 #include <limits>
+#include <memory>
 
 #pragma intrinsic(_ReturnAddress)
 
@@ -20,9 +22,62 @@ constexpr int32_t kMinScenicSpawnSampleSpacing = 16;
 constexpr int32_t kMaxScenicSpawnSampleSpacing = 512;
 constexpr float kProceduralHeightUpperBound =
     static_cast<float>(TERRAIN_MAX_Y);
+constexpr size_t kHeightMemoSlotCount = 1u << 18;
+static_assert((kHeightMemoSlotCount & (kHeightMemoSlotCount - 1u)) == 0u);
+
+struct HeightMemoSlot {
+    int32_t worldX = 0;
+    int32_t worldZ = 0;
+    uint32_t seed = 0;
+    float height = 0.0f;
+    bool valid = false;
+};
+
+struct HeightMemo {
+    std::unique_ptr<HeightMemoSlot[]> slots;
+
+    HeightMemo()
+        : slots(std::make_unique<HeightMemoSlot[]>(kHeightMemoSlotCount)) {}
+
+    bool TryGet(uint32_t seed, int32_t worldX, int32_t worldZ, float& outHeight) const {
+        const HeightMemoSlot& slot = slots[SlotIndex(worldX, worldZ)];
+        if (!slot.valid ||
+            slot.seed != seed ||
+            slot.worldX != worldX ||
+            slot.worldZ != worldZ) {
+            return false;
+        }
+        outHeight = slot.height;
+        return true;
+    }
+
+    void Store(uint32_t seed, int32_t worldX, int32_t worldZ, float height) {
+        HeightMemoSlot& slot = slots[SlotIndex(worldX, worldZ)];
+        slot.worldX = worldX;
+        slot.worldZ = worldZ;
+        slot.seed = seed;
+        slot.height = height;
+        slot.valid = true;
+    }
+
+    static size_t SlotIndex(int32_t worldX, int32_t worldZ) {
+        uint32_t h = static_cast<uint32_t>(worldX) * 0x8da6b343u;
+        h ^= static_cast<uint32_t>(worldZ) * 0xd8163841u;
+        h ^= h >> 16;
+        return static_cast<size_t>(h) & (kHeightMemoSlotCount - 1u);
+    }
+};
 
 uint32_t AddFlag(uint32_t flags, BrickResidencyFlags flag) {
     return flags | static_cast<uint32_t>(flag);
+}
+
+bool HeightMemoEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("VENPOD_TERRAIN_HEIGHT_MEMO");
+        return env == nullptr || env[0] == '\0' || env[0] != '0';
+    }();
+    return enabled;
 }
 
 bool TryAddInt32(int32_t value, int32_t delta, int32_t& out) {
@@ -92,6 +147,20 @@ float SparseTerrainGenerator::ValueNoise2D(float x, float z, uint32_t seed) {
 
 float SparseTerrainGenerator::HeightAt(int32_t worldX, int32_t worldZ) const {
     HeightAtAttribution::RecordHeight(worldX, worldZ, _ReturnAddress());
+    if (HeightMemoEnabled()) {
+        thread_local HeightMemo memo;
+        float cachedHeight = 0.0f;
+        if (memo.TryGet(m_seed, worldX, worldZ, cachedHeight)) {
+            return cachedHeight;
+        }
+        const float height = HeightAtUncached(worldX, worldZ);
+        memo.Store(m_seed, worldX, worldZ, height);
+        return height;
+    }
+    return HeightAtUncached(worldX, worldZ);
+}
+
+float SparseTerrainGenerator::HeightAtUncached(int32_t worldX, int32_t worldZ) const {
     const float x = static_cast<float>(worldX);
     const float z = static_cast<float>(worldZ);
 

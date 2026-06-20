@@ -70,6 +70,7 @@ private:
     static float Lerp(float a, float b, float t);
     static float ValueNoise2D(float x, float z, uint32_t seed);
     static uint32_t Hash3D(int32_t x, int32_t y, int32_t z, uint32_t seed);
+    float HeightAtUncached(int32_t worldX, int32_t worldZ) const;
 
     uint32_t m_seed = 12345u;
 };
