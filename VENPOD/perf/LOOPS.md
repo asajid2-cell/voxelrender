@@ -308,3 +308,127 @@ is not a clean gate in this tree; it still reports 28 existing sparse/terrain fa
 this one-file runtime gate. Commit: final hash reported after commit. Loop 12 pick: reduce the
 remaining edit tail from dirty surface extraction itself, likely by preserving partial-region extraction
 more often when merged faces overlap a small edit region.
+
+## Loop 11 VERDICT (watcher) — REVERTED (ab25ed8). Reported win was a measurement artifact.
+Codex committed the admission gate (4abfc9e) claiming editing sub60 53.94%->12.42%. Watcher
+verification refuted it three ways: (1) Codex's before/after FRAMETIME logs were TRUNCATED (0 frames
+past ~240 -- compared runs of different completeness); (2) a clean same-session A/B (gate off vs on,
+same binary) showed NO dip change (sub60 39.9% vs 39.2%, p99 63 vs 69); (3) the DETERMINISTIC
+hidden-critical work count was NOT reduced (3826 vs 3939). The gate's no-hole safety (pending-critical
+latch + contract-nonready promotion) keeps ~all coords critical -> it demotes nothing -> no-op.
+No holes (visibleMissing=0, miss=0) but no benefit. Reverted main_launcher; kept ledger.
+
+### TWO HARD LESSONS for the editing dips
+1. MEASUREMENT: editing FRAMETIME sub60%/p99 is TOO NOISY to gate on (baselines ranged 29% / 40% /
+   54% across runs; GPU-scheduling variance dominates). Do NOT trust single-run or cross-session
+   FRAMETIME deltas. Gate dip-fixes on the DETERMINISTIC signal: the hidden-critical / generated /
+   uploaded brick COUNTS per frame (CPU/streaming-determined, low noise) + visibleMissing=0. Treat
+   FRAMETIME as informational, and only believe a FRAMETIME delta from a MULTI-RUN (>=3 each) A/B.
+2. REDUCIBILITY: the spike work (~80 bricks/frame generate+upload+surface even at miss=0) is gated by
+   real coherence readiness (contract-nonready), so it CANNOT be safely demoted/deferred/async'd
+   (Loops 8,9,11 all confirmed: relocating or gating it either regresses or no-ops). The only
+   untried REDUCING angle is NARROWER EDIT INVALIDATION: why does a local brush stroke invalidate ~80
+   hidden-exact bricks? If the invalidation footprint is broader than the actual edited voxels, tightening
+   it cuts the brick COUNT at the source (fewer to generate/upload/surface) -- a real reduction, not a
+   relocation. That is the next diagnostic. If invalidation is already tight, the dips may be
+   irreducible without an architectural change to the surface-coherence model (high risk).
+
+## STATUS after Loop 11: editing dip tail is a HARD WALL (4 loops, 0 safe win). Big wins banked:
+flythrough 42->97fps (2.5% dips), editing median 74->96fps, 5 committed CPU wins. HEAD = ab25ed8.
+
+## Loop 12 (diagnostic): edit-invalidation breadth, no code change
+Goal: test the only remaining reducing angle from Loop 11: whether a local brush edit over-invalidates
+hidden-exact exact bricks, causing the recurring ~80-brick generate/upload/surface spike. No source code
+was changed and no commit was made.
+
+Evidence command: `VENPOD_PROFILE=1 VENPOD_PROFILE_STACKS=1 VENPOD_PROFILE_TOP_N=20 .\playrun.ps1 -Path build\bin\mtns_edit.rec`.
+The run completed normally; evidence log is `build/bin/venpod_runtime.log` from 2026-06-20 18:13:50.
+Profiler was usable on editing: `PROF_TOP: 7074 samples total`; notable costs included `HeightAt` 6.0%,
+`SparseSurfaceExtractor::ExtractRegion` 4.1%, and `RtlCreateUnicodeString` 4.2%. Safety held for the
+deterministic count gate: max `PERF_SPARSE_READINESS missing=0`, max ownership `missPct=0`;
+`unsafeNearMissPct` reached 1 on a few shader repair frames, but no visible-missing page hole was logged.
+
+Measured brush footprint vs hidden-exact count:
+- `EDIT_TELEM` edited frames with radius 5 were sparse and small in exact-brick footprint: frame 293 edited
+  4,848 voxels across 20 brush bricks (`regenUploads=8`, `invBricks=19`); frame 383 edited 11,979 voxels
+  across 43 brush bricks (`regenUploads=8`, `invBricks=8`); frame 608 edited 14,944 voxels across 41 brush
+  bricks (`regenUploads=8`, `invBricks=4`). A radius-5 brush is smaller than one 16-voxel brick on each
+  axis; a single stamp can only touch a small brick footprint, while the large telemetry counts come from
+  many swept stamps in one frame, not a hidden-exact halo.
+- The post-open hidden-exact spike did not line up as direct edit invalidation. Frame 293 had the large edit
+  above, but hidden generation/upload/pre-publish was zero on that frame. Frames 298-304 then processed
+  hidden-exact batches (`generated/uploaded/hiddenCritical`: 76/76/76, 80/80/80, 52/52/49, 58/58/68,
+  45/45/45, 37/37/37, 5/5/5) with no `EDIT_TELEM` edit frame on those frames.
+- The same hidden-exact batch shape appeared before the first logged edit: frames 248-255 were all
+  `hiddenCritical=48` with `postOpen=1`, before the first edit telemetry frame at 293. Across parsed frames,
+  hidden-critical surface work summed to 4,171 on non-edit frames and 0 on the seven edit telemetry frames.
+
+Source read:
+- Exact brush edits are tight to changed voxels. `SparseEditStore::SetVoxel` stores per-local-voxel edits in
+  the overlay (`SparseEditStore.cpp:262-301`). `SparseVoxelWorld::ApplyBrushEdit` walks the brush SDF,
+  skips no-op/material-equivalent voxels, records `touchedBricks`, merges per-brick dirty regions, and queues
+  regen upload only for those touched coords (`SparseVoxelWorld.cpp:7516-7689`).
+- Exact render/surface dirtying is not a large halo. `QueueSurfaceDirtyRegionNoStats` queues the edited brick
+  plus only the six face-neighbor bricks when the dirty region touches a brick boundary; there is no 27-brick
+  halo (`SparseVoxelWorld.cpp:6388-6471`). The edited brick itself is queued after voxel upload; adjacent
+  face-neighbors are resident-surface-only work, not hidden-exact exact-page generation.
+- Hidden-exact batches are a separate camera/ray feedback path. `requestHiddenExactCoord` requests visible
+  hidden-exact coords from probe candidates and tracks them in `sparseHiddenExactMissTrackedCoords` /
+  `sparseHiddenExactMissCriticalCoordsLastFrame` (`main_launcher.cpp:9656-9785`). Generation and upload then
+  iterate those hidden-exact tracked/critical lists (`main_launcher.cpp:12281-12372`,
+  `main_launcher.cpp:16044-16100`), and pre-publish surface catchup drains
+  `sparseHiddenExactMissCriticalCoordsLastFrame` (`main_launcher.cpp:16354-16358`). That path does not consume
+  brush dirty regions.
+- There is conservative edit invalidation in the mid-clipmap path: `SparseClipmapTileCache::InvalidateEditedOverlays`
+  maps whole edited overlay bricks plus a one-cell ring halo to mid voxel clipmap bricks
+  (`SparseClipmap.cpp:1665-1751`). That can overinvalidate mid-distance clipmap slots, but the measured
+  `prop.invBricks` was only 0-19 and this is not the `PERF_SPARSE_PRE_PUBLISH_SURFACE hiddenCritical` exact
+  path that produces the ~80-brick spike.
+
+Tandem helper cross-check: converged. The helper independently concluded that the ~80 `hiddenCritical` exact
+bricks are not caused by a direct brush edit footprint halo; brush dirtying is touched exact bricks plus
+face-neighbor surface only, while hidden-exact is camera/ray feedback driven. It noted the same nuance that
+mid-clipmap invalidation is conservative but is a different counter/path.
+
+Recommendation: ACCEPT the current state for the edit-invalidation-breadth angle. There is no specific Loop 13
+fix that will reduce the deterministic hidden-exact generated/uploaded/hiddenCritical count by tightening brush
+invalidation, because the ~80-brick batch is not directly edit-invalidated. A possible cleanup loop could tighten
+mid-clipmap invalidation to actual edited-voxel bounds, but expected reduction applies to `prop.invBricks` /
+mid-clipmap work, not the foreground hidden-exact spike. Reducing the remaining dips now requires an architectural
+change to hidden-exact/surface-coherence readiness, which is out of scope for another small perf loop.
+
+## Loop 12 VERDICT (Codex + helper CONVERGED) — editing dips are ARCHITECTURAL; small loops are done.
+The "editing" dips are NOT edit-caused. The ~80-brick hidden-exact spike is the camera/ray hidden-exact
+miss-feedback path (requestHiddenExactCoord from probe candidates), independent of edits: across the run,
+hidden-critical work = 4171 on NON-edit frames, 0 on the 7 edit frames. Brush invalidation is already
+TIGHT (touched coords + 6 face-neighbors, no halo). So the only untried REDUCING angle is a dead end.
+Both brains converge: no safe small-loop fix exists; reducing these dips needs an ARCHITECTURAL change
+to hidden-exact/surface-coherence readiness (e.g. smoothing the near-field hidden-exact request/generation
+rate without causing holes) — high risk, NOT a small perf loop.
+
+## CAMPAIGN RESULT (HEAD ab25ed8)
+- Flythrough mtns.rec: ~42fps -> ~97fps, 2.5% sub-60 dips. SOLVED.
+- Editing mtns_edit.rec: median ~74fps -> ~96fps. Median SOLVED. Dip tail (camera-driven near-field
+  hidden-exact bursts) remains and is architectural.
+- 5 committed, verified, byte/parity-clean CPU wins: terrain octave-skip (3912997), HeightAt memo
+  (b8b9d7a), telemetry-logging throttle (76a78c3), ExtractRegion unpack (99f5fe5), RefreshStats gate
+  (55a19fc). Plus the trusted-measurement toolkit (sampling profiler caveats, FRAMETIME_LOG, deterministic
+  brick-count gating) the whole campaign now relies on.
+- Honesty record: caught + reverted Loop 11's measurement-artifact "win"; abandoned Loops 4,6,8,9 cleanly.
+DECISION POINT for the human: ACCEPT this strong result, or commission the architectural hidden-exact
+readiness change (a separate, higher-risk multi-loop effort).
+
+## DECISION (human): commission the ARCHITECTURAL hidden-exact readiness change for the editing dips.
+Sub-campaign, no-hole invariant PARAMOUNT, every step flag-gated + measured. Plan:
+- Loop 13 (DECISIVE EXPERIMENT): add a flag-gated AGGRESSIVE defer of PROACTIVE hidden-exact coords --
+  defer same-frame generate/upload/surface/publish for hidden-exact coords that are NOT tied to an actual
+  visible deficit (ownership miss / unsafeNearMiss / a coord the camera ray needs THIS frame), OVERRIDING
+  the contract-nonready promotion that made Loop 11 a no-op. Keep them tracked; let the normal budget
+  catch up over later frames. MEASURE THE HOLE TEST: visibleMissing must stay 0 and ownership miss must
+  not rise across the whole replay. If visibleMissing stays 0 AND the deterministic hidden-critical
+  work-count drops on the spike frames -> the proactive work is UNNECESSARY -> real safe reduction found,
+  proceed to build the proper spread mechanism. If visibleMissing>0 -> the work is genuinely required ->
+  dips irreducible, default stays safe, report + accept. Flag OFF by default so the experiment can never
+  ship a hole.
+- Gate dip effect on a MULTI-RUN (>=3 each) FRAMETIME A/B (single runs are too noisy) + the deterministic
+  brick-count. Profiler safe on mtns_edit only.
