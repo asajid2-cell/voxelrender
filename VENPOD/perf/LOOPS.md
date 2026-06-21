@@ -495,3 +495,19 @@ Recommendation: ACCEPT the current architecture for this deferral route. If the 
 architectural campaign, the next loop should not optimize yet; it should first build a visual-diff classifier
 for the hidden-exact deferred pixels and explain why the ownership/missing counters stay clean while BMPs
 change. Until that oracle exists, the NO-HOLE invariant blocks shipping hidden-exact proactive deferral.
+
+## Loop 13 PERCEPTIBILITY (watcher) — the deferral cost is PERCEPTIBLE, not sub-threshold.
+Analyzed Codex's off-vs-on captures (frames 298-304). The 1-2% differing pixels are NOT imperceptible
+noise: ~41-44% of the diff pixels exceed a perceptible threshold (>30/255; peak per-channel 117-182),
+and they span nearly the WHOLE frame (bbox ~949x530 of 960x540). So the deferred proactive hidden-exact
+work provides BROAD near-field surface precision; deferring it visibly degrades terrain detail during
+edit spikes (transient -- it catches up -- but perceptible).
+
+## ARCHITECTURAL VERDICT (definitive): the editing dips and near-field quality are COUPLED.
+The dips are reducible ~50% (proven: deferral cuts spike work 52-59%, no holes by visibleMissing/miss),
+BUT the work being deferred IS the near-field image precision -- cutting the dips perceptibly reduces
+terrain detail during edits. Under the standing "NO image-quality reduction" constraint, the editing
+dips are therefore at their floor: they are the cost of the near-field precision. The flag-gated
+experiment (c02788d, VENPOD_SPARSE_HIDDEN_EXACT_DEFER_PROACTIVE, OFF by default) stays as proof + an
+opt-in lever if the quality constraint is ever relaxed. FINAL DECISION is a perf-vs-quality call for the
+human; default ships full quality (flag off).
