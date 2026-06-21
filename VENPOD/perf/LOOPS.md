@@ -432,3 +432,66 @@ Sub-campaign, no-hole invariant PARAMOUNT, every step flag-gated + measured. Pla
   ship a hole.
 - Gate dip effect on a MULTI-RUN (>=3 each) FRAMETIME A/B (single runs are too noisy) + the deterministic
   brick-count. Profiler safe on mtns_edit only.
+
+## Loop 13 (Codex): hidden-exact proactive deferral decisive experiment
+Implemented an OFF-by-default experiment flag in `src/main_launcher.cpp`:
+`VENPOD_SPARSE_HIDDEN_EXACT_DEFER_PROACTIVE=1`. With the flag enabled, post-open hidden-exact
+coords that are not tied to hard current-view evidence are kept tracked but demoted out of same-frame
+critical generation/upload/surface/publish. Startup proof/reserve remains critical. Ownership miss,
+unsafe near-miss, and hard shader unsafe feedback remain critical. The implementation also overrides
+the shader contract-nonready foreground-repair promotion that made Loop 11 a no-op, routing clean-frame
+contract repair through nonurgent repair-lane tracking instead of `sparseHiddenExactMissCriticalCoordsLastFrame`.
+
+Tandem cross-check note: the requested Claude-helper route was not available through the bridge in this
+session; `peer.mjs` routed to a recursive Codex peer and had to be stopped. Its source-level verdict still
+flagged the correct risk: contract-nonready also promotes through shader foreground repair, not only
+`requestHiddenExactCoord`. Codex applied that correction before measuring.
+
+Build gate: `.\build.ps1 -Config Release` passed. Only the pre-existing `rayDir` shadow warnings and the
+recurring post-build `vswhere.exe` message appeared.
+
+Hole-test replay: full `mtns_edit.rec` with verbose perf logging, same binary, flag OFF then ON.
+Evidence logs:
+- `build/bin/loop13_off.log`
+- `build/bin/loop13_on.log`
+- capture logs: `build/bin/loop13_capture_off.log`, `build/bin/loop13_capture_on.log`
+
+Safety counters over the full replay:
+- flag OFF: `PERF_SPARSE_READINESS missing max=0`, `residentMissingSurface max=0`,
+  `PERF_RENDER_OWNERSHIP miss max=0`, `unsafeNearMiss max=1148`, `maxVisibleMissing=0`.
+- flag ON: `PERF_SPARSE_READINESS missing max=0`, `residentMissingSurface max=0`,
+  `PERF_RENDER_OWNERSHIP miss max=0`, `unsafeNearMiss max=1148`, `maxVisibleMissing=0`.
+So the explicit no-hole counters did not regress, and ownership miss did not rise.
+
+Deterministic work-count result on the requested spike frames (`248-255`, `298-304`):
+- Combined frames: generated `668 -> 274` (-394, -59.0%), uploaded `728 -> 330` (-398, -54.7%),
+  pre-publish `hiddenCritical 691 -> 330` (-361, -52.2%), hidden-exact priority publishes
+  `599 -> 72` (-527, -88.0%).
+- Clean-ownership spike `248-255`: generated `395 -> 0`, uploaded `395 -> 0`,
+  pre-publish `hiddenCritical 347 -> 0`, publishes `280 -> 0`.
+- Unsafe-near-miss spike `298-304`: generated `273 -> 274`, uploaded `333 -> 330`,
+  pre-publish `hiddenCritical 344 -> 330`, publishes `319 -> 72`. This is expected: frames
+  `297-302` had real `unsafeNearMiss` (`916/1148/1148/1148/1074/92`), so most work stayed critical.
+
+Visual gate: FAILED. Captured flag-off vs flag-on BMPs at edit-spike frames `298/300/302/304`
+(`build/captures/loop13_off_frames_298_304`, `build/captures/loop13_on_frames_298_304`). All four
+SHA-256 pairs differed:
+- frame 298: `A63D43B1788FE6E0EF5FDF9765A55F7407D6343A12026E873134D2948E46041C` ->
+  `FEDB4A32AE4AB3B1983569A74005A97BC67AAEE81F979239EBD5882D615E5001`, 5,972 pixels (1.1520%) differed.
+- frame 300: `5485E0989DEE703EC8F82A1DB75F8900DF34FC332D74300FF2229C14E2B6B38B` ->
+  `09DE4C8EA7162B88C7FC5FE81961F572D02BC0B48AC32F577B48A39F3AAB02F2`, 7,290 pixels (1.4062%) differed.
+- frame 302: `9EA470979D36F55EF6679836807FDBD38D064196B204598263864DC3CEF9B0FB` ->
+  `929400A2DB2482A661A1C009C8518DAD549E5DF9008CF26E21F436E85E200A7D`, 9,085 pixels (1.7525%) differed.
+- frame 304: `E4B64A236538AFC5DF143C91E76AA45B017C359107621E646B597D4E3E555CCB` ->
+  `F000AD1D1A10BFA514A1408D84A331F4D13C921A453E829D1C1DECBEC71DE8A5`, 9,498 pixels (1.8322%) differed.
+
+VERDICT: the aggressive proactive deferral is not a safe win. It proves a large fraction of the clean-frame
+same-frame work is deferrable by counters, but the visual SHA gate fails on the edit-spike frames even though
+`visibleMissing` and ownership `miss` stay zero. That means the current counters are not a sufficient oracle
+for this deferral; some deferred hidden-exact readiness affects visible output without being counted as a
+miss/hole. Do not proceed to a perf Loop 14 spread/budget mechanism from this experiment.
+
+Recommendation: ACCEPT the current architecture for this deferral route. If the human wants another
+architectural campaign, the next loop should not optimize yet; it should first build a visual-diff classifier
+for the hidden-exact deferred pixels and explain why the ownership/missing counters stay clean while BMPs
+change. Until that oracle exists, the NO-HOLE invariant blocks shipping hidden-exact proactive deferral.

@@ -2234,6 +2234,9 @@ int RunSandbox(int argc, char* argv[]) {
         static_cast<float>(ReadUIntEnv("VENPOD_SPARSE_EXACT_NEAR_DISTANCE", 1024u));
     const bool enableSparseHiddenExactMissFeedback =
         sparseBackendRequested && ReadUIntEnv("VENPOD_SPARSE_HIDDEN_EXACT_MISS_FEEDBACK", 1u) != 0u;
+    const bool enableSparseHiddenExactDeferProactive =
+        sparseBackendRequested &&
+        ReadUIntEnv("VENPOD_SPARSE_HIDDEN_EXACT_DEFER_PROACTIVE", 0u) != 0u;
     const bool sparseHiddenExactMissDuringStartup =
         ReadUIntEnv("VENPOD_SPARSE_HIDDEN_EXACT_MISS_DURING_STARTUP", 0u) != 0u;
     const bool sparseStartupHiddenExactRepairBlocksPublicRender =
@@ -5617,6 +5620,7 @@ int RunSandbox(int argc, char* argv[]) {
     uint32_t sparseHiddenExactMissPublishedLastFrame = 0;
     uint32_t sparseHiddenExactMissCriticalAcceptedLastFrame = 0;
     uint32_t sparseHiddenExactMissRepairAcceptedLastFrame = 0;
+    uint32_t sparseHiddenExactMissProactiveDeferredLastFrame = 0;
     uint32_t sparseHiddenExactMissRepairActiveSkipsLastFrame = 0;
     uint32_t sparseHiddenExactMissRepairLimitSkipsLastFrame = 0;
     std::vector<Simulation::BrickCoord> sparseHiddenExactMissCriticalCoordsLastFrame;
@@ -7668,6 +7672,7 @@ int RunSandbox(int argc, char* argv[]) {
             sparseHiddenExactMissPublishedLastFrame = 0;
             sparseHiddenExactMissCriticalAcceptedLastFrame = 0;
             sparseHiddenExactMissRepairAcceptedLastFrame = 0;
+            sparseHiddenExactMissProactiveDeferredLastFrame = 0;
             sparseHiddenExactMissRepairActiveSkipsLastFrame = 0;
             sparseHiddenExactMissRepairLimitSkipsLastFrame = 0;
             sparseHiddenExactMissCriticalCoordsLastFrame.clear();
@@ -7799,6 +7804,10 @@ int RunSandbox(int argc, char* argv[]) {
                 sparseHiddenExactFramesSinceEdit >= sparseHiddenExactEditGraceFrames;
             const bool hiddenExactRuntimeFeedbackActive =
                 enableSparseHiddenExactMissFeedback && !hiddenExactMovingSuppressed;
+            const bool sparseHiddenExactVisibleDeficitThisFrame =
+                sparseOwnershipMissPctLastRetire > 0u ||
+                sparseOwnershipUnsafeNearMissPctLastRetire > 0u ||
+                sparseShaderUnsafeFeedbackUnsafePixelsLastFrame > 0u;
             uint32_t sparseFastRequestScaleThisFrame = 1;
             if (sparseFastRequestSpeed > 0u && sparseAdmissionSpeed > static_cast<float>(sparseFastRequestSpeed)) {
                 sparseFastRequestScaleThisFrame = std::min<uint32_t>(
@@ -8838,6 +8847,11 @@ int RunSandbox(int argc, char* argv[]) {
                             shaderMissForegroundRepairActive &&
                             sample.distance > 0u &&
                             sample.distance <= sparseShaderUnsafeForegroundRepairMaxDistance;
+                        const bool foregroundRepairDeferredByExperiment =
+                            enableSparseHiddenExactDeferProactive &&
+                            foregroundRepairEligible &&
+                            !shaderMissIsRenderCritical &&
+                            !sparseHiddenExactVisibleDeficitThisFrame;
                         const bool insideActiveExactRepairContract =
                             sample.distance > 0u &&
                             sample.distance <= sparseShaderUnsafeForegroundRepairMaxDistance;
@@ -8858,7 +8872,8 @@ int RunSandbox(int argc, char* argv[]) {
                             continue;
                         }
                         const bool shaderMissRequestIsUrgent =
-                            shaderMissIsRenderCritical || foregroundRepairSelected;
+                            shaderMissIsRenderCritical ||
+                            (foregroundRepairSelected && !foregroundRepairDeferredByExperiment);
                         // Bounded foreground repair is important, but it is not
                         // allowed to spend the terrain-critical page reserve
                         // unless the owner pass reported a real unsafe near
@@ -8867,9 +8882,15 @@ int RunSandbox(int argc, char* argv[]) {
                         const bool shaderMissRequestUsesTerrainCriticalReserve =
                             shaderMissIsRenderCritical;
                         const int32_t shaderMissQueuePriority =
-                            foregroundRepairSelected
+                            foregroundRepairDeferredByExperiment
+                                ? 4000
+                                : foregroundRepairSelected
                                 ? 60000
                                 : (shaderMissIsCurrentFrameCritical ? 20000 : 12000);
+                        const Simulation::SparseStreamingLane shaderMissRequestedLane =
+                            foregroundRepairDeferredByExperiment
+                                ? Simulation::SparseStreamingLane::Repair
+                                : Simulation::SparseStreamingLane::Cache;
                         if (requestSparseBrick(
                                 coord,
                                 shaderMissRequestIsUrgent,
@@ -8878,12 +8899,18 @@ int RunSandbox(int argc, char* argv[]) {
                                 shaderMissRequestIsUrgent,
                                 false,
                                 shaderMissRequestUsesTerrainCriticalReserve,
-                                shaderMissQueuePriority)) {
+                                shaderMissQueuePriority,
+                                shaderMissRequestedLane)) {
                             ++requestedShaderMissBricks;
                             if (foregroundRepairSelected) {
                                 ++shaderMissForegroundRepairRequested;
+                                const bool trackAsCritical =
+                                    !foregroundRepairDeferredByExperiment;
                                 sparseShaderUnsafeForegroundRepairTrackedLastFrame +=
-                                    trackHiddenExactRenderRepairCoord(coord, true) ? 1u : 0u;
+                                    trackHiddenExactRenderRepairCoord(coord, trackAsCritical) ? 1u : 0u;
+                                if (foregroundRepairDeferredByExperiment) {
+                                    ++sparseHiddenExactMissProactiveDeferredLastFrame;
+                                }
                             }
                         }
                     }
@@ -9680,16 +9707,25 @@ int RunSandbox(int argc, char* argv[]) {
                          hiddenExactStartupProofMode ||
                          hiddenExactStartupWarmupActive ||
                          startupProof);
-                    const bool hiddenExactPostOpenRepairLaneCandidate =
-                        enableSparseHiddenExactPostOpenRepairLane &&
+                    const bool hiddenExactPostOpenEligibleForRepairLane =
                         enableSparseRequestExplicitSourceLanes &&
                         enableSparseStartupPublicRenderGate &&
                         sparseStartupPublicRenderGateOpened &&
                         !hiddenExactStartupReserveRequest &&
                         !startupProof &&
                         (!waterSurface || enableSparseHiddenExactPostOpenWaterRepairLane);
+                    const bool hiddenExactPostOpenRepairLaneCandidate =
+                        enableSparseHiddenExactPostOpenRepairLane &&
+                        hiddenExactPostOpenEligibleForRepairLane;
+                    const bool hiddenExactProactiveDeferCandidate =
+                        enableSparseHiddenExactDeferProactive &&
+                        hiddenExactPostOpenEligibleForRepairLane &&
+                        !sparseHiddenExactVisibleDeficitThisFrame;
+                    const bool hiddenExactDeferredRepairCandidate =
+                        hiddenExactPostOpenRepairLaneCandidate ||
+                        hiddenExactProactiveDeferCandidate;
                     const bool hiddenExactRequestIsCritical =
-                        !hiddenExactPostOpenRepairLaneCandidate;
+                        !hiddenExactDeferredRepairCandidate;
                     const bool wasSubmitted =
                         sparseHiddenExactMissSubmittedCoords.find(coord) != sparseHiddenExactMissSubmittedCoords.end();
                     const Simulation::SparseRenderReadinessState readiness =
@@ -9708,22 +9744,27 @@ int RunSandbox(int argc, char* argv[]) {
                             sparseStartupHiddenExactProofTrackedCoords.push_back(coord);
                         }
                         trackHiddenExactRenderRepairCoord(coord, hiddenExactRequestIsCritical);
-                        if (hiddenExactPostOpenRepairLaneCandidate) {
+                        if (hiddenExactDeferredRepairCandidate) {
                             ++sparseHiddenExactMissRepairActiveSkipsLastFrame;
+                            if (hiddenExactProactiveDeferCandidate) {
+                                ++sparseHiddenExactMissProactiveDeferredLastFrame;
+                            }
                         }
                         ++hiddenExactSubmittedActiveSkips;
                         return;
                     }
-                    if (hiddenExactPostOpenRepairLaneCandidate) {
+                    if (hiddenExactDeferredRepairCandidate) {
                         if (waterSurface) {
-                            if (hiddenExactRepairWaterRequestsThisFrame >=
+                            if (hiddenExactPostOpenRepairLaneCandidate &&
+                                hiddenExactRepairWaterRequestsThisFrame >=
                                 sparseHiddenExactPostOpenWaterRepairLaneMaxRequests) {
                                 ++sparseHiddenExactMissRepairLimitSkipsLastFrame;
                                 return;
                             }
                             ++hiddenExactRepairWaterRequestsThisFrame;
                         } else {
-                            if (hiddenExactRepairRequestsThisFrame >=
+                            if (hiddenExactPostOpenRepairLaneCandidate &&
+                                hiddenExactRepairRequestsThisFrame >=
                                 sparseHiddenExactPostOpenRepairLaneMaxRequests) {
                                 ++sparseHiddenExactMissRepairLimitSkipsLastFrame;
                                 return;
@@ -9747,9 +9788,9 @@ int RunSandbox(int argc, char* argv[]) {
                     const int32_t hiddenExactQueuePriority =
                         waterSurface
                             ? 70000
-                            : (hiddenExactPostOpenRepairLaneCandidate ? 4000 : 60000);
+                            : (hiddenExactDeferredRepairCandidate ? 4000 : 60000);
                     const Simulation::SparseStreamingLane hiddenExactRequestedLane =
-                        hiddenExactPostOpenRepairLaneCandidate
+                        hiddenExactDeferredRepairCandidate
                             ? Simulation::SparseStreamingLane::Repair
                             : Simulation::SparseStreamingLane::Cache;
                     const bool accepted = requestSparseBrick(
@@ -9764,8 +9805,11 @@ int RunSandbox(int argc, char* argv[]) {
                         hiddenExactRequestedLane);
                     if (accepted) {
                         ++sparseHiddenExactMissAcceptedLastFrame;
-                        if (hiddenExactPostOpenRepairLaneCandidate) {
+                        if (hiddenExactDeferredRepairCandidate) {
                             ++sparseHiddenExactMissRepairAcceptedLastFrame;
+                            if (hiddenExactProactiveDeferCandidate) {
+                                ++sparseHiddenExactMissProactiveDeferredLastFrame;
+                            }
                         } else {
                             ++sparseHiddenExactMissCriticalAcceptedLastFrame;
                         }
@@ -12281,7 +12325,8 @@ int RunSandbox(int argc, char* argv[]) {
             if (enableSparseHiddenExactMissFeedback &&
                 sparseHiddenExactMissGenerationBudget > 0u) {
                 const bool hiddenExactPostOpenRepairLaneCriticalOnly =
-                    enableSparseHiddenExactPostOpenRepairLane &&
+                    (enableSparseHiddenExactPostOpenRepairLane ||
+                     enableSparseHiddenExactDeferProactive) &&
                     enableSparseStartupPublicRenderGate &&
                     sparseStartupPublicRenderGateOpened;
                 const std::vector<Simulation::BrickCoord>& hiddenExactForcedGenerationCoords =
@@ -16046,7 +16091,8 @@ int RunSandbox(int argc, char* argv[]) {
                 (!sparseHiddenExactMissTrackedCoords.empty() ||
                  !sparseHiddenExactMissCriticalCoordsLastFrame.empty())) {
                 const bool hiddenExactPostOpenRepairLaneCriticalOnly =
-                    enableSparseHiddenExactPostOpenRepairLane &&
+                    (enableSparseHiddenExactPostOpenRepairLane ||
+                     enableSparseHiddenExactDeferProactive) &&
                     enableSparseStartupPublicRenderGate &&
                     sparseStartupPublicRenderGateOpened;
                 const std::vector<Simulation::BrickCoord>& hiddenExactForcedUploadCoords =
@@ -16189,7 +16235,8 @@ int RunSandbox(int argc, char* argv[]) {
                             readyAfterUploads));
             }
             const bool sparseHiddenExactPostOpenRepairLaneCriticalOnlyForPublish =
-                enableSparseHiddenExactPostOpenRepairLane &&
+                (enableSparseHiddenExactPostOpenRepairLane ||
+                 enableSparseHiddenExactDeferProactive) &&
                 enableSparseStartupPublicRenderGate &&
                 sparseStartupPublicRenderGateOpened;
             const bool sparseHiddenExactRuntimePublishPriority =
@@ -16275,6 +16322,11 @@ int RunSandbox(int argc, char* argv[]) {
                     sparsePageTableSurfaceReadyGateExtractBudgetThisFrame,
                     sparseHiddenExactMissPostOpenSurfaceBudget);
             }
+            const bool hiddenExactPostOpenCriticalOnlyForForcedWork =
+                (enableSparseHiddenExactPostOpenRepairLane ||
+                 enableSparseHiddenExactDeferProactive) &&
+                enableSparseStartupPublicRenderGate &&
+                sparseStartupPublicRenderGateOpened;
             if (enableSparsePageTableSurfaceReadyGate &&
                 sparsePageTableSurfaceReadyGateExtractBudgetThisFrame > 0u &&
                 sparsePagePublishesEligibleThisFrame > 0u &&
@@ -16290,7 +16342,7 @@ int RunSandbox(int argc, char* argv[]) {
                     frameCount <= sparseStartupPublicRenderOpenedFrame +
                         static_cast<uint64_t>(sparseHiddenExactMissPostOpenCatchupFrames) &&
                     sparseHiddenExactRuntimeCleanFrames < sparseHiddenExactMissCleanIdleFrames &&
-                    (!enableSparseHiddenExactPostOpenRepairLane ||
+                    (!hiddenExactPostOpenCriticalOnlyForForcedWork ||
                      !sparseHiddenExactMissCriticalCoordsLastFrame.empty());
                 const float prePublishSurfaceMaxMs = startupSurfaceCatchup
                     ? sparseStartupPrePublishSurfaceExtractionMaxMs
@@ -16357,9 +16409,7 @@ int RunSandbox(int argc, char* argv[]) {
                         pumpPrePublishSurfaceCoords(sparseHiddenExactMissCriticalCoordsLastFrame);
                 }
                 const bool hiddenExactPostOpenRepairLaneCriticalOnlyForPrePublish =
-                    enableSparseHiddenExactPostOpenRepairLane &&
-                    enableSparseStartupPublicRenderGate &&
-                    sparseStartupPublicRenderGateOpened;
+                    hiddenExactPostOpenCriticalOnlyForForcedWork;
                 if (enableSparseHiddenExactMissFeedback &&
                     prePublishSurfaceExtracted < prePublishSurfaceBudget &&
                     !prePublishSurfaceTimeExpired() &&
@@ -16584,7 +16634,7 @@ int RunSandbox(int argc, char* argv[]) {
                                 &sparseHiddenExactPriorityPublishes);
                     }
                     if (priorityPublishesPopped < sparseMaxPriorityPublishesThisFrame &&
-                        !sparseHiddenExactPostOpenRepairLaneCriticalOnlyForPublish &&
+                        !hiddenExactPostOpenCriticalOnlyForForcedWork &&
                         !sparseHiddenExactMissTrackedSet.empty()) {
                         priorityPublishesPopped +=
                             sparsePagePublishQueue.PopReadyBatchForAnyCoord(
@@ -16876,9 +16926,11 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseHiddenExactMissTrackedCoords.size(),
                     sparseHiddenExactMissCriticalCoordsLastFrame.size());
             }
-            if (enableSparseHiddenExactPostOpenRepairLane &&
+            if ((enableSparseHiddenExactPostOpenRepairLane ||
+                 enableSparseHiddenExactDeferProactive) &&
                 enableSparseCpuDetailLog &&
                 (sparseHiddenExactMissAcceptedLastFrame != 0u ||
+                 sparseHiddenExactMissProactiveDeferredLastFrame != 0u ||
                  sparseHiddenExactMissRepairActiveSkipsLastFrame != 0u ||
                  sparseHiddenExactMissRepairLimitSkipsLastFrame != 0u ||
                  sparseHiddenExactMissGeneratedLastFrame != 0u ||
@@ -16890,13 +16942,15 @@ int RunSandbox(int argc, char* argv[]) {
                     enableSparseStartupPublicRenderGate &&
                     sparseStartupPublicRenderGateOpened;
                 spdlog::info(
-                    "PERF_SPARSE_HIDDEN_EXACT_REPAIR_LANE frame={} enabled=1 publicOpen={} criticalOnly={} accepted={} criticalAccepted={} repairAccepted={} repairActiveSkips={} repairLimitSkips={} repairMax={} repairWaterMax={} criticalCurrent={} repairCurrent={} tracked={} forcedGenerated={} forcedUploaded={} forcedSurfaced={} priorityPublished={} missScreenPct={} unsafeNearMissPct={}",
+                    "PERF_SPARSE_HIDDEN_EXACT_REPAIR_LANE frame={} enabled=1 deferProactive={} publicOpen={} criticalOnly={} accepted={} criticalAccepted={} repairAccepted={} proactiveDeferred={} repairActiveSkips={} repairLimitSkips={} repairMax={} repairWaterMax={} criticalCurrent={} repairCurrent={} tracked={} forcedGenerated={} forcedUploaded={} forcedSurfaced={} priorityPublished={} missScreenPct={} unsafeNearMissPct={}",
                     frameCount,
+                    enableSparseHiddenExactDeferProactive ? 1u : 0u,
                     (!enableSparseStartupPublicRenderGate || sparseStartupPublicRenderGateOpened) ? 1u : 0u,
                     hiddenExactPostOpenRepairLaneCriticalOnly ? 1u : 0u,
                     sparseHiddenExactMissAcceptedLastFrame,
                     sparseHiddenExactMissCriticalAcceptedLastFrame,
                     sparseHiddenExactMissRepairAcceptedLastFrame,
+                    sparseHiddenExactMissProactiveDeferredLastFrame,
                     sparseHiddenExactMissRepairActiveSkipsLastFrame,
                     sparseHiddenExactMissRepairLimitSkipsLastFrame,
                     sparseHiddenExactPostOpenRepairLaneMaxRequests,
@@ -18354,7 +18408,8 @@ int RunSandbox(int argc, char* argv[]) {
                 (!sparseHiddenExactMissTrackedCoords.empty() ||
                  !sparseHiddenExactMissCriticalCoordsLastFrame.empty())) {
                 const bool hiddenExactPostOpenRepairLaneCriticalOnly =
-                    enableSparseHiddenExactPostOpenRepairLane &&
+                    (enableSparseHiddenExactPostOpenRepairLane ||
+                     enableSparseHiddenExactDeferProactive) &&
                     enableSparseStartupPublicRenderGate &&
                     sparseStartupPublicRenderGateOpened;
                 const std::vector<Simulation::BrickCoord>& hiddenExactForcedSurfaceCoords =
