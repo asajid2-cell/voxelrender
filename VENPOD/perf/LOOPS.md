@@ -592,3 +592,100 @@ authoritative byte-equal reference, NO per-frame readback -- the Step-4 lesson);
 GPU/sync bursts (reduce the GPU-side upload/publish cost so the CPU stops stalling on it). Next loop =
 GPU implementation diagnostic/design: profile the GPU side of the edit-spike frames (gpuFrameMs, the
 upload/publish path) to pick which GPU target has real, measurable, quality-safe headroom.
+
+## Loop 15 (GPU diagnostic)
+No code change, no commit. Built current HEAD `c8468a7` (`_agent_build.bat`: `ninja: no work to do`) and
+measured with non-intrusive replay logs:
+- `build/bin/loop15_mtns_ft.log` (`mtns.rec`, no profiler; profiler still avoided because it can deadlock
+  this GPU-heavy replay).
+- `build/bin/loop15_mtns_edit_ft.log` (`mtns_edit.rec`, non-profile timing).
+- `build/bin/loop15_mtns_edit_profile.log` (`mtns_edit.rec`, sampling profiler safe there).
+
+Flythrough (`mtns.rec`) verdict: CPU/sync-bound, not GPU-bound. This run was noisier than the earlier
+clean ledger baseline (~10.3ms body / ~97fps / 2.5% sub-60): measured body p50/p90/p99/max
+`13.52/20.67/35.04/40.17ms`, sub-60 `24.6%`. The relationship is still decisive: GPU frame samples were
+only p50/p90/p99/max `4.8/5.6/9.02/9.02ms`. GPU pass samples were dominated by raymarch
+(`avg 3.74ms`, `max 6.94ms`), with sparse upload `avg 0.39ms max 0.78`, sparse surface
+`avg 0.68ms max 1.41`, and UI/readback ~`0.01ms`. `PERF_SPARSE_STEPS` samples showed
+`postWaitRegion p50 6.9ms`, `fence 0`, `surfExtract p50 2.8ms p90/max 11.7ms`, `brickUpload p50 0.7ms
+max 1.3ms`, `publish max 0.2ms`, and `midUpload max 3.2ms`. Realistic path to true 120fps (8.3ms) is not
+raymarch/GPU-frame reduction; the GPU already has headroom. It requires reducing the remaining CPU/sync
+streaming work on the main-frame path, or moving that work without adding Step-4-style per-frame readback/copy.
+
+Editing (`mtns_edit.rec`) verdict: the measured edit spikes are not GPU upload/page-publish bound. The
+no-profiler timing run measured body p50/p90/p99/max `12.6/35.46/66.12/90.57ms`, sub-60 `39.5%`
+(again noisier than the prior 3-run medians around `23-25%` sub-60 and p99 ~`42ms`). GPU frame samples were
+p50/p90/p99/max `8.6/12.3/14.25/14.25ms`; the largest GPU pass is raymarch (`avg 8.20ms`, `max 13.13ms`),
+not upload or publish (`gpu upload avg 0.32ms max 0.55`, sparse surface `avg 0.54ms max 0.84`). The
+sparse timing samples showed the visible tail instead in sync/streaming work: `postWaitRegion p95/max 72.6ms`,
+`midUpload p95/max 65.3ms`, `surfExtract p95/max 17.4ms`, `brickUpload max 1.8ms`, `publish max 0.2ms`,
+and `fence 0`.
+
+Edit spike frames:
+- Frames `248-255`: hidden-critical generation/upload stayed about `48/48` per frame. Pre-publish elapsed
+  `11.8-18.5ms`, `surfExtract 15.9-22.6ms`, `postWaitRegion 20.4-26.8ms`, `brickUpload 1.0-3.0ms`,
+  `publish 0.1-0.3ms`; sampled `gpuFrameMs` was only `3.1-3.6ms` with raymarch ~`2.9ms`, and `fence=0`.
+- Frames `298-304`: hiddenCritical `74/80/59/56/46/26/5`; generated/uploaded
+  `74/75, 54/80, 40/62, 44/50, 43/46, 26/26, 5/5`; publishes `74/81/72/47/40/18` where logged.
+  Pre-publish elapsed `24.9/24.6/19.8/19.2/16.2/9.6/1.0ms`, `surfExtract`
+  `24.9/28.8/24.0/23.3/16.6/9.6/1.0ms`, `postWaitRegion`
+  `29.3/31.4/27.0/28.7/19.3/18.6/3.9ms`; `brickUpload <=1.8ms`, `publish <=0.21ms`,
+  `midUpload <=0.9ms` except frame `303 = 7.5ms`; sampled frame `301` had `gpuFrameMs=4.27ms`
+  (`upload 0.55`, `surface 0.75`, `ray 2.94`), with `fence=0`.
+
+Profiler cross-check on `mtns_edit.rec`: `PROF_TOP` had `1301` samples and was wait/diffuse rather than a
+single CPU kernel: `NtWaitForSingleObject 19.8%`, `HeightAtUncached 6.2%`, `HeightAt 5.5%`,
+`ValueNoise2D 4.2%`, `RtlCreateUnicodeString 4.1%`, `SparseSurfaceExtractor::ExtractRegion 3.9%`,
+`NtGdiDdDDIWaitForSynchronizationObjectFromCpu 1.5%`. Individual hitches had only a few samples each and
+mixed wait, terrain, extraction, upload-driver, and allocation symbols. This supports the corrected
+interpretation: the prior 52% hidden-exact CPU work cut did not move the dip tail because the visible tail
+is sync/streaming/order-bound and noisy, not because a large GPU upload/page-publish pass is waiting to be
+optimized.
+
+Claude-helper cross-check / reconciliation: converged on the negative finding that flythrough is not
+GPU-frame-bound and edit spikes are not upload/page-table-publish-bound. The bridge misdetected the peer as
+Codex, so the recursive peer was not used as the requested Claude helper; the configured Claude executable was
+also invoked directly in print mode. Claude's direct answer was conservative and rejected GPU surface extraction
+as if it necessarily required per-frame readback. The recursive peer caught the better implementation shape:
+GPU-resident same-frame surface/exact-brick extraction can keep CPU as the authoritative reference/fallback and
+test oracle without per-frame production readback. Existing `perf/GPU_SURFACE_EXTRACTOR_PLAN.md` and
+`perf/GPU_MIDMESH_PROMOTION_PLAN.md` already describe that fixed-capacity GPU-output/indirect-draw pattern.
+
+Recommendation: do **not** start a GPU upload/page-table-publish optimization loop; the measured upload and
+publish costs are too small on the spike frames to explain the dips. The single GPU implementation target with
+the best evidence of real, measurable, quality-safe headroom is **GPU-resident critical sparse surface
+extraction** for the hidden-critical / near exact surface bricks:
+- Why this target: the spike windows spend `~16-29ms` in pre-publish/surface extraction while sampled
+  `gpuFrameMs` is only `~3-4ms` on those same frames, and flythrough still has `surfExtract p50 2.8ms` /
+  `p90 11.7ms` samples. That is CPU work with visible frame cost and available GPU headroom.
+- Required shape: fixed-capacity per-brick GPU face output + GPU-written counts/indirect args, CPU fallback for
+  overflow/edited/uncommitted bricks, and CPU extraction retained as the byte-equal reference/test oracle. No
+  per-frame CPU<->GPU readback or CPU-count dependency in production; validation readbacks only in gated test
+  modes.
+- Expected win: on the edit-spike frames, plausibly remove `5-15ms` of main-frame cost if the GPU extractor can
+  replace the forced same-frame `surfExtract` work without adding an equivalent GPU/render bubble. It will not
+  eliminate inherent streaming nondeterminism, `postWaitRegion`, or the rare `midUpload` tail by itself. For
+  flythrough 120fps, this is also more relevant than raymarch because the GPU frame is already below the body
+  time; removing the remaining `surfExtract`/streaming CPU work is the path toward `8.3ms`.
+- Risk: high. Neighbor sampling at brick borders, exact face parity, edited overlay fallback, fixed-capacity
+  sizing/overflow, GPU scheduling before draw, and interaction with the already-8-14ms edit raymarch pass must
+  be proven. The Step-4 regression is the hard constraint: any design that reintroduces per-frame readback/copy
+  to keep CPU authority should be rejected immediately.
+
+Raymarch traversal acceleration remains the largest pure GPU pass (`mtns avg 3.74ms max 6.94`, `mtns_edit avg
+8.20ms max 13.13`) and is the lower-risk GPU-only target, but it is currently off the critical path for both
+goals: expected end-to-end fps/dip win is near zero until the CPU/sync surface path stops dominating misses.
+
+## DIRECTION CORRECTION (watcher, post-Loop-15): CPU is NOT exhausted; GPU is poor ROI now.
+Loop 15 + helper converged: both replays are CPU/sync-bound (gpuFrameMs 3-4ms, fence=0 on edit spikes;
+GPU has headroom). The dominant spike cost is SERIAL CPU surfExtract (24-28ms on frames 298-304). GPU
+upload/publish are tiny -> a GPU upload/publish optimization is the WRONG target. The real lever is
+PARALLELIZING surfExtract -- which is Loop 14, REJECTED on the now-invalid pixel-SHA gate, not on real
+failure (Loop 14 even saw "surface-extraction body often lower"). Re-examine it with the VALID oracle.
+- Loop 16: re-apply Loop 14 same-frame surfExtract parallelization (recover from its reverted diff /
+  git history). Validate with the VALID methodology: (a) multi-run (>=3 each) FRAMETIME_LOG mtns_edit
+  AND mtns, parallel OFF vs ON -- does sub60/p99/spike-body DROP beyond run-to-run noise? (b) VALID
+  visual oracle: parallel-vs-baseline difference must be <= baseline run-to-run noise (NOT pixel-identity);
+  (c) visibleMissing=0 every frame; (d) work-count change must be within run-to-run variation, not a
+  systematic shift. If it reduces dips within-noise-quality -> commit (helps BOTH replays). This is still
+  "moving the CPU bottleneck off" (off the single main thread onto cores) -- GPU stays deferred (poor ROI).
