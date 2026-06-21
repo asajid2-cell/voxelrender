@@ -525,3 +525,70 @@ SAME quality, SAME frame -- just not serially on the one main thread.
   the risk to solve (each brick writes its own faces; gather after join).
 - After that, if more is needed without quality loss: GPU-migrate the per-brick generate+extract
   (CPU stays authoritative byte-equal reference; NO per-frame readback -- the Step-4 lesson).
+
+## Loop 14 (Codex, ABANDONED)
+Attempted same-frame fork-join parallelization of forced pre-publish coord-batch surface extraction in
+`SparseVoxelWorld.cpp/.h` plus `main_launcher.cpp`, then reverted all source changes after the hard
+visual/race gates failed. No commit.
+
+Thread-safety review: Codex + tandem helper converged on "conditionally safe". The worker body itself was
+isolated: each thread used its own `SurfaceWorkerColumnCache`, wrote only its own `results[index]`, and
+`m_surfaceCache.UpdateBrickWithExtractedFaces`, stats, and ticket completion stayed after join. The helper
+found one real integration hazard: coords already present in `m_asyncSurfaceExtractionPending` could be
+same-frame extracted and later overwritten by a stale async completion. A guard was added during the
+attempt to reject/fallback on async-in-flight coords, but the visual gate still failed.
+
+Build gate: `.\_agent_build.bat` passed after the guard/fallback edits.
+
+Visual SHA gate failed on `mtns_edit.rec` frames 298/300/302/304 with coord-batch OFF vs ON:
+- frame 298: `FE8D1ECC111DFA0E1F4FF3D1C7CDA8850D721EB273E67DEF3DDE8018F4BC5C1C` -> `E06275D2C27AF21FC83E2F9363A4BE576289DC243DBAF4018AEE54F790E26C49`
+- frame 300: `A68A14428D0DE080E00CBD0026248FC29615473D442CE60C4B9C6212A48CEA99` -> `E4852B71AD4E58EFAF0C5C3506D932652439058903540F923F9D5D9295A1C4F2`
+- frame 302: `9CDF527F027C4A92C4614F09ADCE70C85C897BC85378331E16A8623C567A8C91` -> `9E792845B56FC3260E597179AC11F573A0AC47C798FA940DA18895C7B385672E`
+- frame 304: `E3F6DB3B788D2C7CA088D85C48C3789816DA04076EA615E0B7089DC12CE36989` -> `148CFEDECD39AD2A760EEFA005A87370CFDFA6443DFAB469D53E8BD9EE33A04D`
+
+Work-count equality also failed, so this was not a byte-only artifact. On the same OFF/ON capture pair,
+openedFrame shifted `95 -> 90`; generated/uploaded/hiddenCritical at frames 298/300/302/304 were
+`73/74/73, 34/58/55, 30/35/34, 3/3/3` vs
+`80/81/80, 23/45/43, 25/29/31, 3/3/3`. No PERF multi-run was run because the visual/count gate failed
+first.
+
+Race gate also failed: two parallel-ON captures of the same replay produced different SHA-256 hashes for
+all four frames:
+`C709E2BA.../07D54BAC...`, `EABAE910.../971B508D...`, `3DBDAE80.../1B6B305A...`,
+`2CF6C25B.../934A192E...`. Under the standing rule, this nondeterminism blocks shipping the change even
+though the measured surface-extraction body was often lower.
+
+Verdict: abandon Loop 14. The current same-frame parallel path changes timing enough to perturb the
+existing async streaming state, and the strict no-quality-loss oracle catches it. Source files were reverted
+to HEAD `3c8ce9a`; only this ledger records the failed attempt.
+
+Loop 15 pick: before retrying CPU offload, build a deterministic spike-frame oracle for this replay path
+(or make the existing async exact/surface pipeline frame-deterministic with generation tokens/barriers) so
+OFF/ON and ON/ON visual/count comparisons are stable. Without that, another parallelization attempt cannot
+distinguish a real surface race from async timing drift and will keep failing the no-quality-loss gate.
+
+## CRITICAL CORRECTION (watcher, post-Loop-14): the pixel-SHA visual gate was INVALID.
+The engine is NONDETERMINISTIC frame-to-frame. SAME committed binary (HEAD 3c8ce9a), run twice,
+differs at edit-spike frames 298-304 by 0.74/1.60/1.59/1.83% (maxChan up to 182) -- the SAME magnitude
+Loops 13 & 14 were rejected for. So the BMP-SHA-identical gate cannot be passed even baseline-vs-baseline;
+it was measuring streaming-order nondeterminism, not quality loss.
+3-way proof for Loop 13 deferral: baseline run-to-run noise avg 1.44%; deferral-vs-baseline avg
+1.43-1.64% (defer-vs-B 1.43% < baseline noise 1.44%). The deferral adds NO detectable difference beyond
+inherent nondeterminism -> NO real quality loss. (Loop 14 parallel "race" was the same inherent
+nondeterminism.) FUTURE visual gates must compare change-vs-baseline against baseline run-to-run noise,
+NOT demand pixel-identity.
+
+## BUT: CPU optimization is EXHAUSTED for the editing dips (they are GPU/sync-bound).
+Multi-run (3x each) FRAMETIME_LOG mtns_edit, deferral OFF vs ON medians: sub60 23.0% vs 25.0%, p99 42.4
+vs 41.6, p50 9.8 vs 9.9. The deferral cuts 52% of hidden-exact CPU work yet does NOT reduce the dips
+(within noise, slightly worse). Therefore the editing dips are NOT bound by hidden-exact CPU work -- they
+are GPU/streaming-sync bound (CPU waits on GPU during upload/publish bursts; NtWaitForSingleObject) plus
+inherent streaming nondeterminism. No CPU change (defer/parallel/gate) can move them. Loops 8,9,11,13,14
+collectively confirm this. CPU is genuinely exhausted for the editing dips.
+
+## DIRECTION (per human): CPU exhausted -> GPU implementations next.
+Two GPU targets: (a) the flythrough 120 (still ~97fps; GPU terrain-gen / surface-extract, CPU
+authoritative byte-equal reference, NO per-frame readback -- the Step-4 lesson); (b) the editing-dip
+GPU/sync bursts (reduce the GPU-side upload/publish cost so the CPU stops stalling on it). Next loop =
+GPU implementation diagnostic/design: profile the GPU side of the edit-spike frames (gpuFrameMs, the
+upload/publish path) to pick which GPU target has real, measurable, quality-safe headroom.
