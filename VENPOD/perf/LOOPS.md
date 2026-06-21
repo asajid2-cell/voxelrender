@@ -511,3 +511,17 @@ dips are therefore at their floor: they are the cost of the near-field precision
 experiment (c02788d, VENPOD_SPARSE_HIDDEN_EXACT_DEFER_PROACTIVE, OFF by default) stays as proof + an
 opt-in lever if the quality constraint is ever relaxed. FINAL DECISION is a perf-vs-quality call for the
 human; default ships full quality (flag off).
+
+## DECISION (human, after Loop 13): keep pushing the bottleneck OFF CPU, NO quality sacrifice.
+Deferral (Loop 13) is OFF the table (it trades quality). New direction: do the SAME hidden-exact work,
+SAME quality, SAME frame -- just not serially on the one main thread.
+- Loop 14: SAME-FRAME PARALLELIZATION of the forced pre-publish hidden-exact surface extraction (the
+  ~13-26ms serial main-thread spike, ~80 independent per-brick extractions). Fan out across a thread
+  pool / the existing async-extraction workers, JOIN before publish. This is NOT Loop 9's async
+  deferral (publish-later) -- it is same-frame parallel-then-join, so surfaces are identical + ready
+  this frame: visual must be BYTE-IDENTICAL, visibleMissing=0, deterministic work-count UNCHANGED
+  (same work, just parallel). GATE: multi-run (>=3) FRAMETIME A/B editing p99/spike DROP, visual SHA
+  identical on the spike frames, no holes. If per-brick extraction has shared-state hazards, that is
+  the risk to solve (each brick writes its own faces; gather after join).
+- After that, if more is needed without quality loss: GPU-migrate the per-brick generate+extract
+  (CPU stays authoritative byte-equal reference; NO per-frame readback -- the Step-4 lesson).
