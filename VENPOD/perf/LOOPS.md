@@ -868,3 +868,52 @@ ONLY on dirty frames; GPU faces persist across non-dirty frames (NO per-frame co
 the Step-4 trap); CPU fallback for edited/uncommitted tiles (NEVER a hole). HARD GATE: a steady-state
 (non-dirty) frame must add ~ZERO cost (prove no per-frame overhead), spike-frame midMeshUpload/buildMs
 + p99 DROP (multi-run >=3), visibleMissing=0 every frame, bit-equal faces, within-noise visual.
+
+## Loop 20 (Codex, abandoned)
+
+No source change, no commit. Re-read the full ledger bottom-up and inspected current HEAD `b58446d`
+for the requested narrow no-readback CPU-skip. The watcher's equality result is accepted as the
+oracle (not rerun): GPU production extraction + draw foundation is bit-equal under the B1.3f-c/full
+validation flags. The Loop 20-specific question was whether CPU midmesh ownership can be skipped
+now, with no production readback and no per-frame compact-copy, while preserving CPU fallback for
+any uncommitted/version-mismatched/new/overflow tile.
+
+Verdict: abandon this narrow loop. Current HEAD is still one architecture step short of the
+required no-readback ownership contract:
+- `BuildMidHeightSurfaceSnapshot` is still the root that discovers `midMeshSnapshot.dirtyBricks`
+  before GPU extraction (`main_launcher.cpp` around frame-loop lines `17212` and `17289`). There is
+  no current API for "build only CPU fallback tiles while skipping GPU-owned/version-matched tiles";
+  skipping the full build would also skip the dirty worklist the GPU path needs.
+- The current GPU draw promotion commits slots through validation readback: `sparseMidMeshGpuDraw`
+  forces the readback-wait path, and slots are inserted into `sparseMidMeshGpuDrawCommittedSlots`
+  only after `PollB13aReadback()` proves equality/version/no-overflow. That violates the Loop 20
+  skip rule: the production skip decision must be a CPU-side version compare, not a GPU readback.
+- The render path still does the Step-4 failure mode: each frame it compact-copies committed
+  production GPU faces into the CPU midmesh GPU resource (`CopyFixedSlotFacesIntoCompactRanges`
+  in `renderSparseMidMeshLayer`). Direct production-buffer draw args exist
+  (`UpdateProductionDrawArgs` and `CS_MidMeshBuildProductionDrawArgs.hlsl`), but they are not the
+  active ownership path.
+- Overflow fallback is not knowable on the CPU without readback in the current contract. The draw
+  args shader can zero an overflowed slot on GPU, but the CPU cannot then know to rebuild/fallback
+  that tile without reading the status/count back, unless a separate no-overflow capacity proof is
+  established.
+- Production extraction runs on the isolated smoke queue. A no-readback direct draw would need the
+  production dispatch and draw-args update ordered before the render draw on the main queue, or an
+  explicit GPU queue wait. The current safe commit path relies on later CPU polling/readback.
+
+Because of those blockers, the hard gates were not run: any candidate small patch would either keep
+the forbidden per-frame compact-copy/readback overhead, fail to reduce the 72ms CPU build spike, or
+risk a hole on overflow/uncommitted tiles. This is an honest architecture-blocked abandon, not a perf
+failure after measurement.
+
+Independent helper cross-check: the configured Claude/tandem bridge did not start a peer turn in
+this shell, so a read-only subagent was used for the required second review. It converged on the same
+blockers: build worklist dependency, readback-based commit, overflow unknowability without readback,
+isolated-queue ordering, and render-time compact-copy.
+
+Loop 21 pick: promote Step 3 explicitly before retrying CPU skip. Move production extraction and
+`UpdateProductionDrawArgs()` onto an ordered production/render-queue path, bind
+`ProductionFaceBufferSRV()` + `ProductionDrawArgsResource()` directly, track CPU-side
+`{slot, coord, version}` ownership, invalidate on dirty/new/removal/mismatch, and establish either a
+formal no-overflow face-capacity proof or a non-readback fallback contract. Only after that direct
+no-readback GPU ownership path is proven should Loop 20's per-tile CPU build skip be retried.
