@@ -1099,3 +1099,57 @@ Commit: `7df4842`. Loop 24 pick: CPU build-skip / production scheduler. With no 
 direct ownership proven non-regressing, the next loop should skip `BuildMidHeightSurfaceSnapshot` for
 GPU-owned/version-matched tiles and schedule additional production work only where it replaces CPU
 work, not as extra draw-only work on edit spikes.
+
+## Loop 24 (Codex, no commit; HEAD df0f487)
+
+Attempted the requested CPU build-skip design review for the Loop 23 direct path before editing
+`BuildMidHeightSurfaceSnapshot`. Verdict: do not patch under the current production ownership
+contract. The skip and the missing contract change are the same work; a narrow builder-only skip would
+either be a no-op on the dirty spike frames or would invalidate the no-hole/bit-equality guarantees.
+
+Design finding:
+- The builder can already draw last-good same-location CPU faces on a cache miss, and it can still
+  discover dirty coords for `CollectMidMeshGpuExtractDirtyTiles`. That is the right no-hole primitive:
+  new/recenter/no-cache tiles must CPU-build immediately; same-location cached tiles may show stale
+  faces briefly.
+- The current production path is still CPU-anchored at dispatch and ownership. `main_launcher.cpp`
+  dispatches production only after `GetMidMeshTileCacheFacesBySlot()` returns a CPU cache whose
+  `meshCacheContentVersion` equals the current `tile.meshContentVersion`; promotion stores and later
+  validates `cpuRefFaces.size()`. If the CPU skip leaves `meshCacheContentVersion` stale, the GPU
+  production dispatch for the new version is rejected. If the code lies and treats stale CPU faces as
+  current, B13A equality compares against stale geometry and the direct fallback exclusion can hide a
+  GPU overflow.
+- The direct draw args shader correctly zeroes a committed slot when `FaceStatuses[slot] != 0` or the
+  GPU count exceeds capacity, but `BuildFallbackDrawArgsExcluding()` has already removed that coord's
+  CPU fallback on the CPU. Therefore a skipped dirty tile cannot be safely CPU-excluded unless the
+  fallback exclusion is driven by the same GPU status/count validity, or ownership is delayed until a
+  valid in-capacity GPU result is known.
+
+Helper cross-check:
+- Claude helper converged. It independently traced the same four CPU anchors: dispatch eligibility
+  (`meshCacheContentVersion == meshContentVersion`), B13A CPU reference, CPU face-count capacity
+  admission, and promotion face-count validation. It also called out the same hard failure modes:
+  permanent stale if CPU skip prevents dispatch, invalid bit-equality if stale CPU faces are used as
+  the reference, overflow holes if fallback is excluded before GPU status/count is known, and
+  new/recenter holes if same-location last-good is not required.
+
+Gates:
+- No source change was made, so build and multi-run FRAMETIME gates were not run for a candidate patch.
+- The requested 72ms `BuildMidHeightSurfaceSnapshot` drop was not claimed. Under the current contract,
+  a safe no-contract-change skip can only skip already GPU-owned/version-matched steady tiles, not the
+  dirty frame's expensive content/recenter extraction. That would not remove the frame-670-style spike.
+- `visibleMissing=0`, B13A equality, within-noise visual, and mtns non-regression remain untested for
+  a build-skip because there is no safe candidate to promote in this loop.
+
+Minimum Loop 25 pick:
+- Move production ownership off the CPU mesh cache: pending owners should be keyed by
+  `{coord, meshContentVersion, fence}` rather than CPU face count; promotion must validate the completed
+  GPU result's own count/status for that slot and the still-current coord/version.
+- Make fallback exclusion status-aware. Either build fallback args with a GPU-side status/count/commit
+  predicate, or otherwise ensure an overflowed/invalid production slot never removes its CPU fallback.
+- Keep last-good CPU faces for dirty-frame fallback and never skip CPU for new/recenter/no-cache tiles.
+  After this contract exists, retry the build-skip and run the required multi-run `mtns_edit.rec` /
+  `mtns.rec` FRAMETIME, visibleMissing, B13A, and within-noise visual gates.
+
+Commit: none. Loop 25 should be the GPU-status/count ownership plus fallback-safe exclusion contract;
+only then can Loop 24's CPU extraction skip remove the dirty-frame build spike without risking holes.
