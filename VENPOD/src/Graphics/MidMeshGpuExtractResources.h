@@ -563,6 +563,9 @@ public:
         ID3D12GraphicsCommandList* commandList,
         D3D12_RESOURCE_STATES state);
     bool QueueWaitForProduction(ID3D12CommandQueue* commandQueue) const;
+    uint64_t ProductionQueueSubmittedFenceValue() const { return m_smokeFenceValue; }
+    uint64_t ProductionQueueCompletedFenceValue() const;
+    bool ProductionQueueIdle() const;
 
     // Delayed, DEBUG-ONLY containment A/B via the fence-tracked ring (same FIFO/ring as
     // the smoke poll, non-blocking by default). Reads the GPU top faces + status for the

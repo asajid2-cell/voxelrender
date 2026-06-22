@@ -1031,3 +1031,71 @@ Commit: none. The worktree contains the partial flag-gated implementation only. 
 replace same-frame isolated-queue production dispatch with completed-fence ownership (dispatch now,
 own only after fence completion) and/or a same-render-queue batched production path, then rerun
 multi-run FRAMETIME on both `mtns_edit.rec` and `mtns.rec` before retrying CPU build-skip.
+
+## Loop 23 (Codex, 38acdf5)
+
+Implemented the flag-gated no-stall direct midmesh draw ownership fix. Direct draw still defaults OFF
+(`VENPOD_MIDMESH_GPU_DRAW_DIRECT=0`) and remains draw-only; CPU midmesh build-skip is still Loop 24.
+
+Design:
+- Replaced same-frame direct ownership with pending `{coord, version, faceCount, productionFence,
+  dispatchedFrame}` ownership. A slot is GPU-owned only after its production fence has completed on a
+  later frame and the CPU cache identity still matches. Pending/stale/dirty/removed/over-cap slots are
+  CPU fallback, so there is no hole.
+- Removed the direct render path's synchronous `QueueWaitForProduction()` call. Render builds direct
+  args only from already-completed owners; it never waits on the isolated production queue.
+- Added nonblocking production admission: direct mode submits only when the producer queue is idle.
+  The default direct owner warmup cap is `1`, enough to keep the default direct path active while
+  avoiding extra draw-only production work on hot edit frames. Later dirty tiles stay CPU fallback
+  until Loop 24 gives production work a real CPU-skip payoff/scheduler.
+- Added the reverse cross-queue lifetime guard from the helper review: production admission also
+  requires the last submitted direct-render main-queue fence to be complete before production may write
+  shared production buffers again.
+
+Build:
+- `_agent_build.bat` passed after the change; only the pre-existing `rayDir` shadow warnings remained.
+
+Multi-run FRAMETIME gate (`FT`, frames >= 40, three complete runs per side):
+- `mtns_edit.rec` OFF:
+  - run1 `p50=11.602 p90=31.502 p99=56.574 max=71.663 sub60=34.04%`
+  - run2 `p50=10.888 p90=32.718 p99=52.967 max=69.764 sub60=35.37%`
+  - run3 `p50=11.267 p90=30.249 p99=51.627 max=62.622 sub60=33.78%`
+- `mtns_edit.rec` ON:
+  - run1 `p50=11.993 p90=31.836 p99=55.449 max=65.116 sub60=34.71%`
+  - run2 `p50=11.994 p90=34.071 p99=57.906 max=76.817 sub60=36.30%`
+  - run3 `p50=10.300 p90=26.802 p99=48.343 max=55.704 sub60=29.65%`
+  - Median ON stayed within OFF noise: no 373ms stall; max improved; p99/sub60 within run variance.
+- `mtns.rec` OFF:
+  - run1 `p50=12.191 p90=17.219 p99=31.678 max=46.097 sub60=11.94%`
+  - run2 `p50=19.611 p90=45.793 p99=75.935 max=95.636 sub60=62.57%` (noisy complete run)
+  - run3 `p50=10.040 p90=13.280 p99=17.943 max=21.524 sub60=1.96%`
+- `mtns.rec` ON:
+  - run1 `p50=10.979 p90=16.769 p99=28.950 max=45.286 sub60=10.34%`
+  - run2 `p50=10.863 p90=15.021 p99=20.938 max=27.339 sub60=5.35%`
+  - run3 `p50=10.063 p90=15.127 p99=26.192 max=37.571 sub60=5.53%`
+  - Median ON improved p90/p99/max/sub60 versus median OFF.
+
+Correctness / activation:
+- `visibleMissing=[1-9]`: 0 in all final gate logs.
+- `compactCopiedTiles=[1-9]`: 0 in all ON logs; direct branch does not use the old compact-copy path.
+- `GPU_MIDMESH_DRAW_DIRECT_REJECT`: 0 in all ON logs.
+- Direct active on default 512-slot build: `mtns_edit` ON direct lines `768/768` each run;
+  `mtns` ON direct lines `574/574`, `574/574`, `574/574`.
+- Face parity: `B13A_VERIFY abMismatch=[1-9]`: 0; `GPU_EXTRACT_PROD match=0`: 0.
+- Post-helper guard sanity (`loop23_edit_on_postguard.log`): direct `768`, reject `0`,
+  visibleMissing `0`, compact copy `0`, ab/prod mismatch `0`; frame 598/670 production dispatches
+  skipped by owner cap and remained CPU fallback.
+
+Helper cross-check:
+- The tandem bridge still identified the peer as Codex rather than Claude, but it provided an
+  independent source review. It converged that removing `QueueWaitForProduction()` fixed the direct
+  render stall, and it found one missing reverse lifetime edge: production must not overwrite shared
+  production buffers while a submitted direct render may still read them. Added the main-queue direct
+  render fence guard before commit. Its other notes were accepted as residual constraints:
+  `QueueWaitForProduction()` remains as an unused public footgun, and production/smoke still share the
+  isolated fence/queue.
+
+Commit: `38acdf5`. Loop 24 pick: CPU build-skip / production scheduler. With no readback/no-copy
+direct ownership proven non-regressing, the next loop should skip `BuildMidHeightSurfaceSnapshot` for
+GPU-owned/version-matched tiles and schedule additional production work only where it replaces CPU
+work, not as extra draw-only work on edit spikes.

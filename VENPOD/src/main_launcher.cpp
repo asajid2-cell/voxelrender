@@ -1186,11 +1186,20 @@ int RunSandbox(int argc, char* argv[]) {
     // Phase B1.1: persistent per-tile GPU sample + metadata buffers for the SHADOW
     // GPU mesh-extraction input path. Only active when VENPOD_MIDMESH_GPU_EXTRACT=1.
     MidMeshGpuExtractResources midMeshGpuExtractResources;
+    struct SparseMidMeshGpuDrawPendingOwner {
+        Simulation::BrickCoord coord;
+        uint64_t version = 0u;
+        uint32_t faceCount = 0u;
+        uint64_t fenceValue = 0u;
+        uint64_t dispatchedFrame = 0u;
+    };
     std::unordered_set<uint32_t> sparseMidMeshGpuDrawCommittedSlots;
     std::unordered_map<uint32_t, Simulation::BrickCoord> sparseMidMeshGpuDrawCoordBySlot;
     std::unordered_map<uint32_t, uint64_t> sparseMidMeshGpuDrawVersionBySlot;
     std::unordered_map<uint32_t, uint32_t> sparseMidMeshGpuDrawFaceCountBySlot;
+    std::unordered_map<uint32_t, SparseMidMeshGpuDrawPendingOwner> sparseMidMeshGpuDrawPendingBySlot;
     std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash> sparseMidMeshGpuDrawCommittedCoords;
+    uint64_t sparseMidMeshGpuDrawLastDirectRenderFenceValue = 0u;
     Simulation::SparseVoxelWorld sparseVoxelWorld;
     bool sparseVoxelWorldReady = false;
     enum class SurfaceFillWaterProofResult : uint8_t {
@@ -14592,6 +14601,7 @@ int RunSandbox(int argc, char* argv[]) {
         // Get current frame context
         uint32_t frameIndex = window->GetCurrentBackBufferIndex();
         FrameContext& ctx = frameContexts[frameIndex];
+        bool sparseMidMeshGpuDrawDirectSubmittedThisFrame = false;
         const bool sparseCpuRaycastAuthoritative =
             sparseRuntimeTestMode && sparseVoxelWorldReady && !enableSparseGpuRaycast;
         if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
@@ -17445,9 +17455,17 @@ int RunSandbox(int argc, char* argv[]) {
                             uint32_t prodBudgetSkipped = 0u;
                             uint32_t prodDrawCommitted = 0u;
                             uint32_t prodDrawFallback = 0u;
-                            const uint32_t productionDispatchBudget =
+                            uint32_t prodDrawPending = 0u;
+                            uint32_t prodQueueBusySkipped = 0u;
+                            uint32_t prodOwnerCapSkipped = 0u;
+                            uint32_t prodRenderFenceSkipped = 0u;
+                            const uint32_t directOwnerWarmupCap =
+                                ReadUIntEnv("VENPOD_MIDMESH_GPU_DRAW_DIRECT_OWNER_WARMUP_CAP", 1u);
+                            const uint32_t configuredProductionDispatchBudget =
                                 std::max(1u, ReadUIntEnv(
                                     "VENPOD_MIDMESH_GPU_EXTRACT_PRODUCTION_BUDGET", 16u));
+                            const uint32_t productionDispatchBudget =
+                                sparseMidMeshGpuDrawDirect ? 1u : configuredProductionDispatchBudget;
                             auto removeGpuDrawCommit = [&](uint32_t slot) {
                                 sparseMidMeshGpuDrawCommittedSlots.erase(slot);
                                 auto coordIt = sparseMidMeshGpuDrawCoordBySlot.find(slot);
@@ -17457,6 +17475,51 @@ int RunSandbox(int argc, char* argv[]) {
                                 }
                                 sparseMidMeshGpuDrawVersionBySlot.erase(slot);
                                 sparseMidMeshGpuDrawFaceCountBySlot.erase(slot);
+                                sparseMidMeshGpuDrawPendingBySlot.erase(slot);
+                            };
+                            auto promoteCompletedGpuDrawOwners = [&]() -> uint32_t {
+                                if (!sparseMidMeshGpuDraw ||
+                                    sparseMidMeshGpuDrawPendingBySlot.empty()) {
+                                    return 0u;
+                                }
+                                const uint64_t completedFence =
+                                    midMeshGpuExtractResources.ProductionQueueCompletedFenceValue();
+                                std::vector<uint32_t> finishedSlots;
+                                finishedSlots.reserve(sparseMidMeshGpuDrawPendingBySlot.size());
+                                uint32_t promoted = 0u;
+                                for (const auto& [slot, pending] : sparseMidMeshGpuDrawPendingBySlot) {
+                                    if (pending.fenceValue == 0u ||
+                                        pending.dispatchedFrame >= frameCount ||
+                                        completedFence < pending.fenceValue) {
+                                        continue;
+                                    }
+                                    Simulation::BrickCoord currentCoord;
+                                    uint64_t currentVersion = 0u;
+                                    uint32_t currentFaceCount = 0u;
+                                    const bool identityOk =
+                                        sparseClipmapTileCache.GetMidMeshTileCacheIdentityBySlot(
+                                            slot, &currentCoord, &currentVersion, &currentFaceCount);
+                                    const bool ownerOk =
+                                        identityOk &&
+                                        currentCoord == pending.coord &&
+                                        currentVersion == pending.version &&
+                                        currentFaceCount == pending.faceCount &&
+                                        currentFaceCount <=
+                                            midMeshGpuExtractResources.ProductionFaceCapacityPerTile();
+                                    if (ownerOk) {
+                                        sparseMidMeshGpuDrawCommittedSlots.insert(slot);
+                                        sparseMidMeshGpuDrawCoordBySlot[slot] = pending.coord;
+                                        sparseMidMeshGpuDrawVersionBySlot[slot] = pending.version;
+                                        sparseMidMeshGpuDrawFaceCountBySlot[slot] = pending.faceCount;
+                                        sparseMidMeshGpuDrawCommittedCoords.insert(pending.coord);
+                                        ++promoted;
+                                    }
+                                    finishedSlots.push_back(slot);
+                                }
+                                for (const uint32_t slot : finishedSlots) {
+                                    sparseMidMeshGpuDrawPendingBySlot.erase(slot);
+                                }
+                                return promoted;
                             };
                             auto drainProductionPolls = [&]() {
                                 while (midMeshGpuExtractResources.PollB13aReadback()) {
@@ -17501,6 +17564,7 @@ int RunSandbox(int argc, char* argv[]) {
                             };
 
                             drainProductionPolls();
+                            prodDrawCommitted += promoteCompletedGpuDrawOwners();
                             for (const auto& tile : gpuExtractTiles) {
                                 if (prodDispatched >= productionDispatchBudget) {
                                     if (sparseMidMeshGpuDraw && tile.slot != UINT32_MAX) {
@@ -17520,7 +17584,29 @@ int RunSandbox(int argc, char* argv[]) {
                                 }
                                 if (sparseMidMeshGpuDraw) {
                                     removeGpuDrawCommit(tile.slot);
-                                    sparseMidMeshGpuDrawCoordBySlot[tile.slot] = tile.coord;
+                                    if (sparseMidMeshGpuDrawDirect &&
+                                        directOwnerWarmupCap > 0u &&
+                                        sparseMidMeshGpuDrawCommittedSlots.size() +
+                                                sparseMidMeshGpuDrawPendingBySlot.size() >=
+                                            directOwnerWarmupCap) {
+                                        ++prodOwnerCapSkipped;
+                                        ++prodSkipped;
+                                        continue;
+                                    }
+                                    if (sparseMidMeshGpuDrawDirect &&
+                                        sparseMidMeshGpuDrawLastDirectRenderFenceValue != 0u &&
+                                        commandQueue->GetLastCompletedFenceValue() <
+                                            sparseMidMeshGpuDrawLastDirectRenderFenceValue) {
+                                        ++prodRenderFenceSkipped;
+                                        ++prodSkipped;
+                                        continue;
+                                    }
+                                    if (sparseMidMeshGpuDrawDirect &&
+                                        !midMeshGpuExtractResources.ProductionQueueIdle()) {
+                                        ++prodQueueBusySkipped;
+                                        ++prodSkipped;
+                                        continue;
+                                    }
                                 }
 
                                 std::vector<Simulation::SparseSurfaceFace> cpuRefFaces;
@@ -17577,6 +17663,16 @@ int RunSandbox(int argc, char* argv[]) {
                                     continue;
                                 }
 
+                                if (sparseMidMeshGpuDrawDirect &&
+                                    !midMeshGpuExtractResources.ProductionQueueIdle()) {
+                                    if (sparseMidMeshGpuDraw) {
+                                        removeGpuDrawCommit(tile.slot);
+                                    }
+                                    ++prodQueueBusySkipped;
+                                    ++prodSkipped;
+                                    continue;
+                                }
+
                                 const bool dispatched =
                                     midMeshGpuExtractResources.RunB13aTopFaceDispatchProduction(
                                         device->GetDevice(), tile, cpuRefFaces,
@@ -17593,15 +17689,24 @@ int RunSandbox(int argc, char* argv[]) {
                                 if (dispatched) {
                                     ++prodDispatched;
                                     if (sparseMidMeshGpuDraw) {
-                                        sparseMidMeshGpuDrawCommittedSlots.insert(tile.slot);
-                                        sparseMidMeshGpuDrawCoordBySlot[tile.slot] = tile.coord;
-                                        sparseMidMeshGpuDrawVersionBySlot[tile.slot] = refContentVersion;
-                                        sparseMidMeshGpuDrawFaceCountBySlot[tile.slot] =
-                                            static_cast<uint32_t>(cpuRefFaces.size());
-                                        sparseMidMeshGpuDrawCommittedCoords.insert(tile.coord);
-                                        ++prodDrawCommitted;
+                                        const uint64_t fenceValue =
+                                            midMeshGpuExtractResources.ProductionQueueSubmittedFenceValue();
+                                        if (fenceValue != 0u) {
+                                            sparseMidMeshGpuDrawPendingBySlot[tile.slot] = {
+                                                tile.coord,
+                                                refContentVersion,
+                                                static_cast<uint32_t>(cpuRefFaces.size()),
+                                                fenceValue,
+                                                frameCount
+                                            };
+                                            ++prodDrawPending;
+                                        } else {
+                                            removeGpuDrawCommit(tile.slot);
+                                            ++prodDrawFallback;
+                                        }
                                     }
                                     drainProductionPolls();
+                                    prodDrawCommitted += promoteCompletedGpuDrawOwners();
                                 } else {
                                     if (sparseMidMeshGpuDraw) {
                                         removeGpuDrawCommit(tile.slot);
@@ -17610,19 +17715,25 @@ int RunSandbox(int argc, char* argv[]) {
                                 }
                             }
                             drainProductionPolls();
+                            prodDrawCommitted += promoteCompletedGpuDrawOwners();
                             spdlog::info(
                                 "GPU_EXTRACT_PROD_SUMMARY frame={} dirtyTiles={} dispatched={} "
                                 "compared={} equal={} mismatched={} overflow={} skipped={} "
                                 "cpuOverCapacity={} budgetSkipped={} productionBudget={} maxGpuFaces={} "
-                                "faceCapacityPerTile={} gpuDrawCommittedThisFrame={} "
-                                "gpuDrawFallbackThisFrame={} gpuDrawCommittedTotal={}",
+                                "faceCapacityPerTile={} gpuDrawCommittedThisFrame={} gpuDrawPendingThisFrame={} "
+                                "gpuDrawFallbackThisFrame={} gpuDrawQueueBusySkipped={} gpuDrawOwnerCapSkipped={} "
+                                "gpuDrawRenderFenceSkipped={} "
+                                "gpuDrawPendingTotal={} gpuDrawCommittedTotal={}",
                                 frameCount,
                                 static_cast<uint32_t>(gpuExtractTiles.size()),
                                 prodDispatched, prodCompared, prodEqual, prodMismatch,
                                 prodOverflow, prodSkipped, prodCpuOverCapacity, prodBudgetSkipped,
                                 productionDispatchBudget, prodMaxGpuFaces,
                                 midMeshGpuExtractResources.GetStats().productionFaceCapacityPerTile,
-                                prodDrawCommitted, prodDrawFallback,
+                                prodDrawCommitted, prodDrawPending,
+                                prodDrawFallback, prodQueueBusySkipped, prodOwnerCapSkipped,
+                                prodRenderFenceSkipped,
+                                static_cast<uint32_t>(sparseMidMeshGpuDrawPendingBySlot.size()),
                                 static_cast<uint32_t>(sparseMidMeshGpuDrawCommittedSlots.size()));
                         }
 
@@ -23028,6 +23139,44 @@ int RunSandbox(int argc, char* argv[]) {
             uint32_t gpuMidMeshFallbackCommands = 0u;
             uint32_t gpuMidMeshCopiedTiles = 0u;
             uint32_t gpuMidMeshCopiedFaces = 0u;
+            if (sparseMidMeshGpuDrawDirect &&
+                !sparseMidMeshGpuDrawPendingBySlot.empty()) {
+                const uint64_t completedFence =
+                    midMeshGpuExtractResources.ProductionQueueCompletedFenceValue();
+                std::vector<uint32_t> finishedSlots;
+                finishedSlots.reserve(sparseMidMeshGpuDrawPendingBySlot.size());
+                for (const auto& [slot, pending] : sparseMidMeshGpuDrawPendingBySlot) {
+                    if (pending.fenceValue == 0u ||
+                        pending.dispatchedFrame >= frameCount ||
+                        completedFence < pending.fenceValue) {
+                        continue;
+                    }
+                    Simulation::BrickCoord currentCoord;
+                    uint64_t currentVersion = 0u;
+                    uint32_t currentFaceCount = 0u;
+                    const bool identityOk =
+                        sparseClipmapTileCache.GetMidMeshTileCacheIdentityBySlot(
+                            slot, &currentCoord, &currentVersion, &currentFaceCount);
+                    const bool ownerOk =
+                        identityOk &&
+                        currentCoord == pending.coord &&
+                        currentVersion == pending.version &&
+                        currentFaceCount == pending.faceCount &&
+                        currentFaceCount <=
+                            midMeshGpuExtractResources.ProductionFaceCapacityPerTile();
+                    if (ownerOk) {
+                        sparseMidMeshGpuDrawCommittedSlots.insert(slot);
+                        sparseMidMeshGpuDrawCoordBySlot[slot] = pending.coord;
+                        sparseMidMeshGpuDrawVersionBySlot[slot] = pending.version;
+                        sparseMidMeshGpuDrawFaceCountBySlot[slot] = pending.faceCount;
+                        sparseMidMeshGpuDrawCommittedCoords.insert(pending.coord);
+                    }
+                    finishedSlots.push_back(slot);
+                }
+                for (const uint32_t slot : finishedSlots) {
+                    sparseMidMeshGpuDrawPendingBySlot.erase(slot);
+                }
+            }
             if (sparseMidMeshGpuDraw &&
                 useMidMeshIndirect &&
                 midMeshGpuExtractResources.B13aReady() &&
@@ -23084,13 +23233,9 @@ int RunSandbox(int argc, char* argv[]) {
                     const bool productionFitsIa =
                         productionFaceCapacity > 0u &&
                         productionFaceCapacity <= sparseMidMeshGpuResources.VertexIdCapacityFaces();
-                    const bool productionQueueReady =
-                        midMeshGpuExtractResources.QueueWaitForProduction(
-                            commandQueue->GetCommandQueue());
                     const bool productionArgsReady =
                         !committedSlots.empty() &&
                         productionFitsIa &&
-                        productionQueueReady &&
                         midMeshGpuExtractResources.UpdateProductionDrawArgs(
                             commandList.Get(), committedSlots);
                     const bool fallbackArgsReady =
@@ -23111,12 +23256,12 @@ int RunSandbox(int argc, char* argv[]) {
                         loggedGpuMidMeshDirectReject = true;
                         spdlog::warn(
                             "GPU_MIDMESH_DRAW_DIRECT_REJECT frame={} committedSlots={} "
-                            "productionFitsIa={} productionQueueReady={} productionFaceCapacity={} "
+                            "productionFitsIa={} productionFenceOwned={} productionFaceCapacity={} "
                             "iaFaces={} staleSlots={} fallbackExcluded={} fallbackCommands={}",
                             frameCount,
                             static_cast<uint32_t>(committedSlots.size()),
                             productionFitsIa ? 1 : 0,
-                            productionQueueReady ? 1 : 0,
+                            1,
                             productionFaceCapacity,
                             sparseMidMeshGpuResources.VertexIdCapacityFaces(),
                             static_cast<uint32_t>(staleSlots.size()),
@@ -23167,6 +23312,7 @@ int RunSandbox(int argc, char* argv[]) {
                     gpuMidMeshFallbackCommands);
             }
             if (useGpuMidMeshDirectDraw) {
+                sparseMidMeshGpuDrawDirectSubmittedThisFrame = true;
                 renderer->RenderSparseSurfaceFaces(
                     commandList.Get(),
                     midMeshGpuExtractResources.ProductionFaceBufferSRV(),
@@ -26336,6 +26482,9 @@ int RunSandbox(int argc, char* argv[]) {
         // Signal fence for this frame
         uint64_t perfSignalGenStart = SDL_GetPerformanceCounter();
         ctx.fenceValue = commandQueue->Signal();
+        if (sparseMidMeshGpuDrawDirectSubmittedThisFrame) {
+            sparseMidMeshGpuDrawLastDirectRenderFenceValue = ctx.fenceValue;
+        }
         if (traceFrameStages && frameCount < kFrameStageTraceLimit) {
             spdlog::info("FRAME_STAGE {} signaled fence {}", frameCount, ctx.fenceValue);
         }

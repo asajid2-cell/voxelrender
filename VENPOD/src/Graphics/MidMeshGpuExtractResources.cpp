@@ -1946,6 +1946,19 @@ bool MidMeshGpuExtractResources::QueueWaitForProduction(ID3D12CommandQueue* comm
     return true;
 }
 
+uint64_t MidMeshGpuExtractResources::ProductionQueueCompletedFenceValue() const
+{
+    return m_smokeFence ? m_smokeFence->GetCompletedValue() : 0u;
+}
+
+bool MidMeshGpuExtractResources::ProductionQueueIdle() const
+{
+    if (!m_smokeFence || m_smokeFenceValue == 0u) {
+        return true;
+    }
+    return m_smokeFence->GetCompletedValue() >= m_smokeFenceValue;
+}
+
 bool MidMeshGpuExtractResources::RunB13aTopFaceDispatchInternal(
     ID3D12Device* device,
     const Simulation::MidMeshGpuExtractDirtyTile& fixture,
