@@ -855,3 +855,16 @@ Loop 19 pick: GPU-resident midmesh extraction/promotion is the architectural ans
 readback shape. Use the existing B1.3/Step-1..3 byte-equal work as the oracle, avoid Step-4 per-frame readback, and
 move the dirty-tile face generation/output to GPU-resident buffers or indirect draw so the CPU no longer waits on
 `BuildMidHeightSurfaceSnapshot` for same-frame midmesh readiness.
+
+## Loop 19 (watcher re-validation; turn timed out before promotion)
+Loop 19's Codex turn hit the cap during re-validation/design (left only a SparseClipmap.h stub, reverted).
+Watcher re-validated Steps 1-3 directly on HEAD f0159e8 with flags VENPOD_MIDMESH_GPU_EXTRACT +
+_PRODUCTION + _FULL + _B13FC + _GPU_DRAW on mtns_edit: STILL BIT-EQUAL. GPU_EXTRACT_PROD gpuFaces=1997
+cpuFaces=1997 extra=0 missing=0; AB_VERIFY label=b13fc mode=equal match=1; visibleMissing=0. The GPU
+mid-mesh extraction+draw foundation is intact and correct. Only the no-readback CPU-skip remains.
+PLAN: the GPU promotion is too big for one turn -> bound it. Loop 20 = ONLY the no-readback CPU-skip:
+CPU skips BuildMidHeightSurfaceSnapshot for GPU-committed+version-matched tiles; GPU extract+draw runs
+ONLY on dirty frames; GPU faces persist across non-dirty frames (NO per-frame compact-copy/readback --
+the Step-4 trap); CPU fallback for edited/uncommitted tiles (NEVER a hole). HARD GATE: a steady-state
+(non-dirty) frame must add ~ZERO cost (prove no per-frame overhead), spike-frame midMeshUpload/buildMs
++ p99 DROP (multi-run >=3), visibleMissing=0 every frame, bit-equal faces, within-noise visual.
