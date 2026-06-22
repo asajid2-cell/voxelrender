@@ -129,9 +129,9 @@ struct MidMeshGpuExtractConfig {
     uint32_t topFaceCapacityPerTile = 16384u;
     // STEP 1 PRODUCTION OUTPUT: fixed per-slot face arena. 16k is the largest default
     // capacity that fits the sparse-surface IA stream at the default 512 slots
-    // (512*16,384 == 8,388,608). Tiles whose cached CPU face count exceeds this cap
-    // are not GPU-owned and remain on the CPU fallback pass, so capacity overflow is a
-    // logged fallback decision, never a partial draw.
+    // (512*16,384 == 8,388,608). Tiles whose completed GPU face count exceeds this cap
+    // or set a non-zero status are not GPU-owned and remain on the CPU fallback pass,
+    // so capacity overflow is a logged fallback decision, never a partial draw.
     uint32_t productionFaceCapacityPerTile = 16384u;
     // B1.3e EDIT-FOOTPRINT: per-tile cap on the number of edited-cell XZ boxes uploaded to
     // the GPU. An edited tile in practice overlaps a handful of brush strokes; 256 is ample
@@ -566,6 +566,11 @@ public:
     uint64_t ProductionQueueSubmittedFenceValue() const { return m_smokeFenceValue; }
     uint64_t ProductionQueueCompletedFenceValue() const;
     bool ProductionQueueIdle() const;
+    bool TryGetProductionSlotCountStatus(
+        uint32_t slot,
+        uint64_t readyFenceValue,
+        uint32_t* outFaceCount,
+        uint32_t* outStatus) const;
 
     // Delayed, DEBUG-ONLY containment A/B via the fence-tracked ring (same FIFO/ring as
     // the smoke poll, non-blocking by default). Reads the GPU top faces + status for the
@@ -715,6 +720,8 @@ private:
     GPUBuffer m_productionFaceBuffer;
     GPUBuffer m_productionFaceCountBuffer;
     GPUBuffer m_productionFaceStatusBuffer;
+    GPUBuffer m_productionFaceCountReadback;
+    GPUBuffer m_productionFaceStatusReadback;
     GPUBuffer m_productionCommitBuffer;
     GPUBuffer m_productionDrawArgsBuffer;
     UploadBuffer m_productionCountClearUpload;
@@ -723,6 +730,8 @@ private:
     uint64_t m_productionFaceBufferBytes = 0;
     uint64_t m_productionFaceCountBufferBytes = 0;
     uint64_t m_productionFaceStatusBufferBytes = 0;
+    const uint32_t* m_productionFaceCountReadbackPtr = nullptr;
+    const uint32_t* m_productionFaceStatusReadbackPtr = nullptr;
     uint64_t m_productionDrawArgsBufferBytes = 0;
     uint64_t m_productionCommitBufferBytes = 0;
     DX12ComputePipeline m_productionDrawArgsPipeline;

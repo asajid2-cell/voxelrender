@@ -174,6 +174,16 @@ void MidMeshGpuExtractResources::Shutdown() {
     m_productionFaceBuffer.Shutdown();
     m_productionFaceCountBuffer.Shutdown();
     m_productionFaceStatusBuffer.Shutdown();
+    if (m_productionFaceCountReadbackPtr) {
+        m_productionFaceCountReadback.Unmap();
+        m_productionFaceCountReadbackPtr = nullptr;
+    }
+    if (m_productionFaceStatusReadbackPtr) {
+        m_productionFaceStatusReadback.Unmap();
+        m_productionFaceStatusReadbackPtr = nullptr;
+    }
+    m_productionFaceCountReadback.Shutdown();
+    m_productionFaceStatusReadback.Shutdown();
     m_productionCommitBuffer.Shutdown();
     m_productionDrawArgsBuffer.Shutdown();
     m_productionCountClearUpload.Shutdown();
@@ -584,6 +594,25 @@ Result<void> MidMeshGpuExtractResources::InitializeSmoke(
             sizeof(uint32_t),
             "MidMeshGpuExtractProductionFaceStatuses"); !r) {
         return Error("InitializeSmoke - production status buffer: {}", r.error());
+    }
+    if (auto r = m_productionFaceCountReadback.Initialize(
+            device, std::max<uint64_t>(m_productionFaceCountBufferBytes, 256u),
+            BufferUsage::Readback, sizeof(uint32_t),
+            "MidMeshGpuExtractProductionFaceCountsReadback"); !r) {
+        return Error("InitializeSmoke - production count readback: {}", r.error());
+    }
+    if (auto r = m_productionFaceStatusReadback.Initialize(
+            device, std::max<uint64_t>(m_productionFaceStatusBufferBytes, 256u),
+            BufferUsage::Readback, sizeof(uint32_t),
+            "MidMeshGpuExtractProductionFaceStatusesReadback"); !r) {
+        return Error("InitializeSmoke - production status readback: {}", r.error());
+    }
+    m_productionFaceCountReadbackPtr =
+        static_cast<const uint32_t*>(m_productionFaceCountReadback.Map());
+    m_productionFaceStatusReadbackPtr =
+        static_cast<const uint32_t*>(m_productionFaceStatusReadback.Map());
+    if (!m_productionFaceCountReadbackPtr || !m_productionFaceStatusReadbackPtr) {
+        return Error("InitializeSmoke - production count/status readback map failed");
     }
     m_productionCommitBufferBytes =
         static_cast<uint64_t>(m_config.maxTiles) * sizeof(uint32_t);
@@ -1959,6 +1988,35 @@ bool MidMeshGpuExtractResources::ProductionQueueIdle() const
     return m_smokeFence->GetCompletedValue() >= m_smokeFenceValue;
 }
 
+bool MidMeshGpuExtractResources::TryGetProductionSlotCountStatus(
+    uint32_t slot,
+    uint64_t readyFenceValue,
+    uint32_t* outFaceCount,
+    uint32_t* outStatus) const
+{
+    if (outFaceCount) {
+        *outFaceCount = 0u;
+    }
+    if (outStatus) {
+        *outStatus = 0u;
+    }
+    if (!m_smokeFence ||
+        readyFenceValue == 0u ||
+        m_smokeFence->GetCompletedValue() < readyFenceValue ||
+        slot >= m_config.maxTiles ||
+        !m_productionFaceCountReadbackPtr ||
+        !m_productionFaceStatusReadbackPtr) {
+        return false;
+    }
+    if (outFaceCount) {
+        *outFaceCount = m_productionFaceCountReadbackPtr[slot];
+    }
+    if (outStatus) {
+        *outStatus = m_productionFaceStatusReadbackPtr[slot];
+    }
+    return true;
+}
+
 bool MidMeshGpuExtractResources::RunB13aTopFaceDispatchInternal(
     ID3D12Device* device,
     const Simulation::MidMeshGpuExtractDirtyTile& fixture,
@@ -2068,6 +2126,8 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatchInternal(
     ID3D12GraphicsCommandList* const list = m_smokeCmdList.Get();
     const bool haveTimestamps = (m_smokeQueryHeap != nullptr);
 
+    const bool recordFaceValidationReadback =
+        !productionOutput || equalityMode || !cpuReferenceFaces.empty();
     const uint32_t writeSlot = m_smokeReadbackWriteSlot;
     SmokeReadbackSlot& ringSlot = m_smokeReadbackRing[writeSlot];
 
@@ -2245,29 +2305,44 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatchInternal(
         list->EndQuery(m_smokeQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 2);
     }
 
-    // Copy this dispatch's faces + metadata into the current ring slot (persistently
-    // mapped, fence-tracked) so a later poll reads it back. Copy the FULL top-face
-    // capacity (the poll clamps to the GPU-written faceCount).
-    outputFaceBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    m_smokeMetaBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    // Copy validation faces + metadata into the current ring slot only when a CPU
+    // reference was supplied. Production ownership uses the count/status mirror below.
+    if (recordFaceValidationReadback) {
+        outputFaceBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        m_smokeMetaBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
     m_productionFaceCountBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COPY_SOURCE);
     m_productionFaceStatusBuffer.TransitionTo(list, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    list->CopyBufferRegion(
-        ringSlot.faceReadback.GetResource(), 0,
-        outputFaceBuffer.GetResource(), static_cast<uint64_t>(ctl.baseFace) * sizeof(Simulation::SparseSurfaceFace),
-        static_cast<uint64_t>(outputFaceCapacity) * sizeof(Simulation::SparseSurfaceFace));
-    list->CopyBufferRegion(
-        ringSlot.metaReadback.GetResource(), 0,
-        m_smokeMetaBuffer.GetResource(), 0,
-        sizeof(MidMeshGpuExtractTileMeta));
-    list->CopyBufferRegion(
-        ringSlot.countReadback.GetResource(), 0,
-        m_productionFaceCountBuffer.GetResource(), countOffset,
-        sizeof(uint32_t));
-    list->CopyBufferRegion(
-        ringSlot.statusReadback.GetResource(), 0,
-        m_productionFaceStatusBuffer.GetResource(), countOffset,
-        sizeof(uint32_t));
+    if (recordFaceValidationReadback) {
+        list->CopyBufferRegion(
+            ringSlot.faceReadback.GetResource(), 0,
+            outputFaceBuffer.GetResource(), static_cast<uint64_t>(ctl.baseFace) * sizeof(Simulation::SparseSurfaceFace),
+            static_cast<uint64_t>(outputFaceCapacity) * sizeof(Simulation::SparseSurfaceFace));
+        list->CopyBufferRegion(
+            ringSlot.metaReadback.GetResource(), 0,
+            m_smokeMetaBuffer.GetResource(), 0,
+            sizeof(MidMeshGpuExtractTileMeta));
+        list->CopyBufferRegion(
+            ringSlot.countReadback.GetResource(), 0,
+            m_productionFaceCountBuffer.GetResource(), countOffset,
+            sizeof(uint32_t));
+        list->CopyBufferRegion(
+            ringSlot.statusReadback.GetResource(), 0,
+            m_productionFaceStatusBuffer.GetResource(), countOffset,
+            sizeof(uint32_t));
+    }
+    if (productionOutput &&
+        m_productionFaceCountReadback.GetResource() &&
+        m_productionFaceStatusReadback.GetResource()) {
+        list->CopyBufferRegion(
+            m_productionFaceCountReadback.GetResource(), 0,
+            m_productionFaceCountBuffer.GetResource(), 0,
+            m_productionFaceCountBufferBytes);
+        list->CopyBufferRegion(
+            m_productionFaceStatusReadback.GetResource(), 0,
+            m_productionFaceStatusBuffer.GetResource(), 0,
+            m_productionFaceStatusBufferBytes);
+    }
     if (haveTimestamps && m_smokeQueryReadback.GetResource()) {
         list->ResolveQueryData(
             m_smokeQueryHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 3,
@@ -2299,11 +2374,13 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatchInternal(
 
     ctl.fenceValue = fence;
 
-    // Record into the ring (no blocking wait on its fence; the poll reads it later).
-    ringSlot.fenceValue = fence;
-    ringSlot.pending = true;
-    ringSlot.tile = ctl;
-    m_smokeReadbackWriteSlot = (writeSlot + 1u) % kSmokeReadbackSlots;
+    if (recordFaceValidationReadback) {
+        // Record into the ring (no blocking wait on its fence; the poll reads it later).
+        ringSlot.fenceValue = fence;
+        ringSlot.pending = true;
+        ringSlot.tile = ctl;
+        m_smokeReadbackWriteSlot = (writeSlot + 1u) % kSmokeReadbackSlots;
+    }
 
     const bool stale = (currentTileVersionForSlot != ctl.version);
 
@@ -2613,8 +2690,17 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     const std::vector<Simulation::SparseSurfaceFace>& cpuFaces = slot.tile.cpuReferenceFaces;
     const MidMeshFaceAbMode abMode =
         equalityMode ? MidMeshFaceAbMode::Equal : MidMeshFaceAbMode::Containment;
-    const MidMeshFaceAbResult ab = CompareMidMeshFacesMultiset(
-        gpuFaces, cpuFaces, abMode, gpuStatus, 8u);
+    const bool runFaceValidation = !productionOutput || equalityMode || !cpuFaces.empty();
+    MidMeshFaceAbResult ab;
+    ab.mode = abMode;
+    ab.gpuFaceCount = gpuFaceCount;
+    ab.cpuFaceCount = static_cast<uint32_t>(cpuFaces.size());
+    ab.overflow = gpuStatus;
+    ab.match = (gpuStatus == 0u);
+    if (runFaceValidation) {
+        ab = CompareMidMeshFacesMultiset(
+            gpuFaces, cpuFaces, abMode, gpuStatus, 8u);
+    }
     // Label: b13fc if the camera-distance CULL was on (its own corpus label - the new increment).
     // Else b13fb if WATER + all-air-fill, else b13e if edit skip, else b13d if child suppression,
     // else b13c/b/a. (Cull takes the top label since it can stack on water + everything below.)
@@ -2627,13 +2713,17 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
                       : (applyChildSuppression
                              ? "b13d"
                              : (emitSkirts ? "b13c" : (emitRisers ? "b13b" : "b13a")))));
-    LogMidMeshFaceAbResult(modeLabel, ab);
+    if (runFaceValidation) {
+        LogMidMeshFaceAbResult(modeLabel, ab);
+    }
 
     slot.pending = false;
     slot.tile = {};
     m_smokeReadbackReadSlot = (m_smokeReadbackReadSlot + 1u) % kSmokeReadbackSlots;
 
-    ++m_b13aAbVerifyCount;
+    if (runFaceValidation) {
+        ++m_b13aAbVerifyCount;
+    }
     m_b13aStats.emitRisers = emitRisers;
     m_b13aStats.emitSkirts = emitSkirts;
     m_b13aStats.applyChildSuppression = applyChildSuppression;
@@ -2651,7 +2741,7 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     m_b13aStats.editBoxCount = editBoxCountForStats;
     m_b13aStats.gpuFaceCount = gpuFaceCount;
     m_b13aStats.gpuStatusOverflow = gpuStatus;
-    m_b13aStats.verified = true;
+    m_b13aStats.verified = runFaceValidation;
     m_b13aStats.verifyCount = m_b13aAbVerifyCount;
     m_b13aStats.verifyMatched = ab.match ? 1u : 0u;
     m_b13aStats.verifyMismatch = ab.match ? 0u : 1u;
@@ -2667,24 +2757,26 @@ bool MidMeshGpuExtractResources::PollB13aReadback() {
     // gpuRiserFaces > 0 is part of the B1.3b gate (the increment really added risers);
     // gpuSuppressedCells > 0 is the B1.3d gate (suppression actually removed faces).
     // For EQUALITY mode the gate is missing==0 AND extra==0 (gpuFaces==cpuMeshFaces).
-    spdlog::info(
-        "B13A_VERIFY mode={} abMode={} productionOutput={} abVerifyCount={} match={} equalityHeld={} containSubset={} "
-        "mergeCells={} emitWater={} applyDistanceCull={} culledBlocks={} gpuFaces={} gpuRiserFaces={} gpuSkirtFaces={} "
-        "gpuWaterFaces={} gpuAirFillFaces={} maxTopQuadW={} maxTopQuadH={} "
-        "gpuSuppressedCells={} gpuEditSkippedCells={} "
-        "editBoxes={} cpuMeshFaces={} extraGpuFaces={} missingCpuFaces={} multiplicityMismatches={} "
-        "gpuStatus={}",
-        modeLabel, equalityMode ? "equal" : "contain", productionOutput ? 1 : 0,
-        m_b13aAbVerifyCount, ab.match ? 1 : 0,
-        (equalityMode && ab.missingCpuFaces == 0u && ab.extraGpuFaces == 0u &&
-         ab.multiplicityMismatches == 0u && gpuStatus == 0u) ? 1 : 0,
-        (ab.extraGpuFaces == 0u && gpuStatus == 0u) ? 1 : 0,
-        mergeCellsForStats, emitWater ? 1 : 0, applyDistanceCull ? 1 : 0, culledBlocks,
-        gpuFaceCount, gpuRiserFaces, gpuSkirtFaces,
-        gpuWaterFaces, gpuAirFillFaces, gpuMaxTopQuadW, gpuMaxTopQuadH,
-        gpuSuppressedCells, gpuEditSkippedCells,
-        editBoxCountForStats, ab.cpuFaceCount,
-        ab.extraGpuFaces, ab.missingCpuFaces, ab.multiplicityMismatches, gpuStatus);
+    if (runFaceValidation) {
+        spdlog::info(
+            "B13A_VERIFY mode={} abMode={} productionOutput={} abVerifyCount={} match={} equalityHeld={} containSubset={} "
+            "mergeCells={} emitWater={} applyDistanceCull={} culledBlocks={} gpuFaces={} gpuRiserFaces={} gpuSkirtFaces={} "
+            "gpuWaterFaces={} gpuAirFillFaces={} maxTopQuadW={} maxTopQuadH={} "
+            "gpuSuppressedCells={} gpuEditSkippedCells={} "
+            "editBoxes={} cpuMeshFaces={} extraGpuFaces={} missingCpuFaces={} multiplicityMismatches={} "
+            "gpuStatus={}",
+            modeLabel, equalityMode ? "equal" : "contain", productionOutput ? 1 : 0,
+            m_b13aAbVerifyCount, ab.match ? 1 : 0,
+            (equalityMode && ab.missingCpuFaces == 0u && ab.extraGpuFaces == 0u &&
+             ab.multiplicityMismatches == 0u && gpuStatus == 0u) ? 1 : 0,
+            (ab.extraGpuFaces == 0u && gpuStatus == 0u) ? 1 : 0,
+            mergeCellsForStats, emitWater ? 1 : 0, applyDistanceCull ? 1 : 0, culledBlocks,
+            gpuFaceCount, gpuRiserFaces, gpuSkirtFaces,
+            gpuWaterFaces, gpuAirFillFaces, gpuMaxTopQuadW, gpuMaxTopQuadH,
+            gpuSuppressedCells, gpuEditSkippedCells,
+            editBoxCountForStats, ab.cpuFaceCount,
+            ab.extraGpuFaces, ab.missingCpuFaces, ab.multiplicityMismatches, gpuStatus);
+    }
     return true;
 }
 
