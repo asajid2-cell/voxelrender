@@ -1224,3 +1224,59 @@ Loop 26 pick:
   face counts. Keep last-good CPU fallback for unowned/stale/pending/overflow/new/recenter/no-cache tiles,
   and only skip CPU extraction for GPU-owned, live-version-matched tiles whose fallback exclusion remains
   status/count-safe.
+
+## Loop 26 (Codex, no commit; HEAD fe43554)
+
+Attempted the requested direct-GPU CPU build-skip. The candidate was not committed because it removed
+the CPU extraction spike but failed the async ownership and frame-time gates.
+
+Design attempted:
+- Split `BuildMidHeightSurfaceSnapshot` so same-location last-good tiles could skip CPU extraction
+  under `VENPOD_MIDMESH_GPU_BUILD_SKIP_DIRECT=1`, while still marking their coords dirty for
+  `CollectMidMeshGpuExtractDirtyTiles()`.
+- Preserved the no-hole rule for new/recenter/no-cache/over-cap/forced-CPU tiles: those still CPU-build.
+- Added forced-CPU recovery for GPU production failures and overflow.
+- After Claude cross-check, tightened the intended contract: skip must be content-only, not LOD/child-mask
+  misses, and the builder needs a "GPU owns this coord/version with matching keys" terminal state or it
+  will re-dirty the same tile forever.
+
+Positive measurement from the narrow skip smoke:
+- Baseline Loop 25 direct frame 670: `preExtractMs=64.45`, `preExtractTiles=40`, `buildMs=80.69`,
+  `visibleMissing=0`.
+- Build-skip smoke frame 670: `preExtractMs=0.00`, `preExtractTiles=0`, `buildMs=13.89`,
+  `gpuBuildSkip=120`, `visibleMissing=0`.
+- This proves the target CPU cost can be removed: the ~65ms pre-extract region and ~80ms build self-time
+  dropped to ~14ms when CPU extraction was skipped.
+
+Why it failed:
+- Existing direct production dispatch is still effectively one tile per frame on the isolated production
+  queue. The smoke run at frame 670 had `dirtyTiles=96 dispatched=1 skipped=95
+  gpuDrawQueueBusySkipped=95`; later frames stayed at `dirtyTiles=97 dispatched=1
+  gpuDrawQueueBusySkipped=96`.
+- Because the builder had no GPU-owned-current terminal state in the first candidate, skipped tiles stayed
+  dirty and stale indefinitely: `maxStaleAge` reached `569`, pending stayed around `121`, and steady frames
+  kept paying the dirty build/upload path.
+- A second candidate batched 78-79 production dispatches on the main command list to test whether ownership
+  could land quickly. It did dispatch all dirty tiles (`productionBudget=512`, `dispatched=78/79`,
+  `gpuDrawQueueBusySkipped=0`, `visibleMissing=0`), but it moved the cost onto the frame-critical GPU
+  timeline: frame 670 `body=1211.854 raw=1123.216`, frame 674 `body=1549.991 raw=1526.329`, frame 676
+  `body=1431.632 raw=1400.340`. This is worse than the original 72ms CPU dip and was killed early.
+
+Gates:
+- Build passed after reverting the failed candidate (`_agent_build.bat`, only pre-existing `rayDir`
+  shadow warnings).
+- No source commit. The working source was restored to `HEAD`; only this ledger records the failed loop.
+- `visibleMissing=0` held in both failed candidates, but the required gates did not pass:
+  no multi-run win, no steady-state zero-overhead proof, no within-noise visual proof, and no default-on
+  recommendation.
+
+Default-on recommendation:
+- No. The safe conclusion is that CPU build-skip is blocked until production has a genuinely asynchronous
+  batch path: per-slot edit/cull inputs and multi-tile GPU extraction behind a fence that does not add a
+  main-frame wait or repeated dirty redispatch.
+
+Next loop:
+- Implement production batching on a non-frame-critical async path, or otherwise make the production
+  scheduler own the full dirty burst in 1-2 frames without CPU/GPU frame waits. Then reapply the stricter
+  content-only CPU skip plus GPU-owned-current terminal state and rerun the full FRAMETIME, no-hole,
+  B13A/test-mode, and within-noise visual gates.
