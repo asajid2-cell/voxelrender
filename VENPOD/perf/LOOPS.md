@@ -1280,3 +1280,69 @@ Next loop:
   scheduler own the full dirty burst in 1-2 frames without CPU/GPU frame waits. Then reapply the stricter
   content-only CPU skip plus GPU-owned-current terminal state and rerun the full FRAMETIME, no-hole,
   B13A/test-mode, and within-noise visual gates.
+
+## Loop 27 (Codex, no commit; HEAD 8c99046)
+
+Attempted the requested async-batch production scheduler. The candidate was not committed because it
+fixed isolated-queue throughput but failed the no-main-frame-stall gate.
+
+Design attempted:
+- Added a real production batch entry point instead of looping the old one-tile primitive. The batch
+  used dedicated per-slot sample/metadata/edit-box/cull-mask input arenas on the isolated production
+  queue, recorded many tile dispatches into one command list, submitted one fence for the batch, and
+  never queued a main render wait.
+- Scheduler changes treated same `{coord, meshContentVersion, mergeCells, childMask, cellSize}` pending
+  or committed owners as terminal, so a dirty tile already dispatched for the current identity was not
+  removed and re-dispatched every frame.
+- Direct defaults in the candidate were raised to `productionBudget=64` and `directOwnerWarmupCap=512`
+  so a ~96-tile burst could drain across roughly two production frames.
+
+Positive throughput proof:
+- Direct-on probe log `build/bin/loop27_edit_on_probe3.log` drained production on the isolated queue
+  without the Loop 26 one-tile/frame busy skip:
+  - frame 20 startup burst: `dirtyTiles=193 dispatched=64 skipped=129 budgetSkipped=129
+    gpuDrawQueueBusySkipped=0`.
+  - frame 242 edit burst: `dirtyTiles=40 dispatched=40 skipped=0 gpuDrawQueueBusySkipped=0`.
+  - frame 670 edit burst: `dirtyTiles=25 dispatched=25 skipped=0 gpuDrawQueueBusySkipped=0`.
+- No repeated dirty redispatch showed up in those probes: pending/current owners were skipped rather
+  than erased, and `gpuDrawQueueBusySkipped` stayed `0`.
+- Correctness smoke for the failed candidate: `visibleMissing=[1-9]` count `0`,
+  `GPU_MIDMESH_DRAW_DIRECT_REJECT` count `0`, and `compactCopiedTiles=[1-9]` count `0` in the direct-on
+  probes. B13A test-mode and multi-run promotion were not run because the no-stall gate failed first.
+
+Why it failed:
+- The batch submission still added a large main-frame stall inside the mid-upload phase. With
+  `productionBudget=64`, frame 670 in `loop27_edit_on_probe3.log` had
+  `MIDMESH_SELFTIME buildMs=70.10 visibleMissing=0`, then the batch dispatched all 25 dirty tiles, but
+  `FT 670 body=490.886 raw=43.725`; `PERF_FRAME_END` attributed `midUpload=458.99ms`.
+- The batch's `cpuSubmitUs` was small (`152.70us` at frame 670), so the stall was in batch preparation /
+  command recording before `Close/Execute`, not in the final queue submit. Trimming cull staging and
+  recording transitions once per batch did not fix it.
+- Lowering to `productionBudget=16` did not salvage the candidate: `build/bin/loop27_edit_on_budget16.log`
+  still hit `FT 670 body=510.739`, did not drain the frame-670 burst (`dirtyTiles=27 dispatched=16
+  budgetSkipped=11`), and regressed the run distribution (`p50=20.564 p90=53.098 p99=99.979
+  max=510.739 sub60=61.57%`).
+- Therefore this was not the true async production path requested by the gate. It improved dispatch
+  throughput, but the producer-side preparation still ran on the frame-critical thread.
+
+Helper cross-check:
+- Claude helper converged on the required contract before implementation: the existing one-tile primitive
+  cannot be budget-raised because it blocks on the previous smoke fence before allocator reset and uses
+  slot-0 input buffers. It recommended a new one-list/one-fence batch with dedicated per-slot input
+  arenas or a proven cross-queue wait on persistent inputs, no per-tile queue-idle gates, no re-dispatch
+  of pending current slots, and expanded owner identity including LOD fields. The candidate followed
+  those design points but still failed the measured no-stall gate.
+
+Gates:
+- Build passed twice after the candidate (`_agent_build.bat`; only the pre-existing `rayDir` shadow
+  warnings).
+- Required promotion gates failed: no no-main-stall proof, no multi-run both-replay FRAMETIME, no B13A
+  test-mode promotion, and no commit.
+- The failed source candidate was reverted; only this ledger records Loop 27.
+
+Loop 28 pick:
+- Do not retry a bigger main-thread production batch. The next coherent slice is to move production
+  batch preparation off the frame-critical path: maintain a CPU-side production work queue with cached
+  per-slot edit/cull inputs prepared incrementally or on a worker, then submit a prebuilt isolated-queue
+  batch from the main thread with O(tiles) lightweight command recording only after proving the submit
+  path has sub-millisecond main-thread cost. After that, reapply the Loop 26 CPU build-skip.
