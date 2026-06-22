@@ -1032,7 +1032,7 @@ replace same-frame isolated-queue production dispatch with completed-fence owner
 own only after fence completion) and/or a same-render-queue batched production path, then rerun
 multi-run FRAMETIME on both `mtns_edit.rec` and `mtns.rec` before retrying CPU build-skip.
 
-## Loop 23 (Codex, 38acdf5)
+## Loop 23 (Codex, 7df4842)
 
 Implemented the flag-gated no-stall direct midmesh draw ownership fix. Direct draw still defaults OFF
 (`VENPOD_MIDMESH_GPU_DRAW_DIRECT=0`) and remains draw-only; CPU midmesh build-skip is still Loop 24.
@@ -1095,7 +1095,7 @@ Helper cross-check:
   `QueueWaitForProduction()` remains as an unused public footgun, and production/smoke still share the
   isolated fence/queue.
 
-Commit: `38acdf5`. Loop 24 pick: CPU build-skip / production scheduler. With no readback/no-copy
+Commit: `7df4842`. Loop 24 pick: CPU build-skip / production scheduler. With no readback/no-copy
 direct ownership proven non-regressing, the next loop should skip `BuildMidHeightSurfaceSnapshot` for
 GPU-owned/version-matched tiles and schedule additional production work only where it replaces CPU
 work, not as extra draw-only work on edit spikes.
