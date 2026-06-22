@@ -689,3 +689,48 @@ failure (Loop 14 even saw "surface-extraction body often lower"). Re-examine it 
   (c) visibleMissing=0 every frame; (d) work-count change must be within run-to-run variation, not a
   systematic shift. If it reduces dips within-noise-quality -> commit (helps BOTH replays). This is still
   "moving the CPU bottleneck off" (off the single main thread onto cores) -- GPU stays deferred (poor ROI).
+
+## Loop 16 (Codex, ABANDONED)
+Re-implemented the same-frame fork-join coord-batch surface extraction experiment behind a new
+`VENPOD_SPARSE_SURFACE_PARALLEL_COORD_BATCH` flag. Workers used copied terrain/edit inputs and wrote only
+per-index face results; surface cache mutation, stats, tickets, and publish readiness stayed serial after join.
+The async in-flight coord guard was kept so coords already present in `m_asyncSurfaceExtractionPending` were
+rejected before their pending brick could be moved and later overwritten by stale async completion. Build gate
+passed with `_agent_build.bat`.
+
+Thread-safety/helper cross-check: the tandem bridge again misdetected the peer as Codex, but the peer converged
+on the required invariant: workers must not touch `m_pool`, `m_surfaceCache`, queues, stats, streaming tickets,
+or `m_edits`; edit overlays must be snapshotted before launch; results must apply in original order after join;
+async-pending coords must be rejected before queue mutation. Direct Claude CLI cross-check then rejected the
+first unconditional dispatch because it made no-edit flythroughs pay edit-snapshot overhead. A guarded retry
+routed no-edit batches back to the existing `ExtractSurfaceBatchNoEdit` path.
+
+Final guarded candidate visual gate: FAILED. Fresh current-binary baseline A/B vs guarded parallel-ON captures
+at frames `298/300/302/304`:
+- baseline A/B pixel diff: `1.1294% / 1.5081% / 1.3173% / 1.3206%`.
+- parallel ON vs baseline A: `1.9074% / 2.1003% / 2.8225% / 3.1557%`.
+So the candidate exceeded the valid within-noise oracle on all four spike frames. This was not judged by SHA.
+
+Safety counters: no holes. Across all measured OFF/ON replay runs, `visibleMissing=0`,
+`PERF_SPARSE_READINESS missing=0`, `residentMissingSurface=0`, and `PERF_RENDER_OWNERSHIP miss=0`.
+
+Multi-run FRAMETIME medians (frames >= 40), OFF vs guarded ON:
+- `mtns_edit.rec`: p99 `60.471 -> 56.302ms`, sub60 `36.84% -> 38.30%`, spike-frame body avg
+  `46.62 -> 39.66ms`, spike-frame pre-publish elapsed avg `15.25 -> 10.02ms`.
+- `mtns.rec`: p99 `28.615 -> 28.205ms`, sub60 `25.13% -> 24.42%`, spike-frame body avg
+  `14.82 -> 16.91ms`, spike-frame pre-publish elapsed avg `2.62 -> 4.10ms`.
+
+Work-count check on edit spike windows `248-255` plus `298/300/302/304`: pre-publish extracted/hiddenCritical
+stayed within baseline variation. OFF runs were `515/515`, `507/507`, `604/604`; guarded ON runs were
+`527/527`, `557/556`, `566/566`. The change did not systematically reduce work volume; it only moved part of
+the extraction body off the main serial path.
+
+Verdict: abandon and revert source. The local `surfExtract` body reduction is real, but the shipped gates do not
+pass: visual exceeds baseline noise, edit sub60 gets worse, and flythrough spike-body/pre-publish do not drop.
+No commit. Source files were restored to HEAD; this ledger entry records the experiment.
+
+Loop 17 pick: stop retrying CPU coord-batch scheduling. The next useful loop should attack the downstream
+post-extraction frame tail directly: classify why reduced `surfExtract` turns into worse sub60/visual timing
+(surface staging/dirty-stage/midmesh publish ordering), then pick a lever that reduces that tail without changing
+same-frame readiness. If no such CPU-side lever emerges, return to the GPU-resident critical surface extractor
+design with no production readback.
