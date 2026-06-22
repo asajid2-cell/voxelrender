@@ -3027,6 +3027,9 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseMidMeshGpuDraw =
         sparseMidMeshIncrementalUpload &&
         ReadUIntEnv("VENPOD_MIDMESH_GPU_DRAW", 0u) != 0u;
+    const bool sparseMidMeshGpuDrawDirect =
+        sparseMidMeshGpuDraw &&
+        ReadUIntEnv("VENPOD_MIDMESH_GPU_DRAW_DIRECT", 0u) != 0u;
     const bool sparseMidMeshGpuExtract =
         sparseMidMeshIncrementalUpload &&
         (ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT", 0u) != 0u ||
@@ -3594,6 +3597,26 @@ int RunSandbox(int argc, char* argv[]) {
         if (enableSparseMidMesh && enableSparseSurfaceUpload) {
             SparseSurfaceGpuConfig midMeshConfig;
             midMeshConfig.maxFaces = sparseMidMeshMaxFaces;
+            if (sparseMidMeshGpuDrawDirect) {
+                MidMeshGpuExtractConfig directExtractConfig;
+                directExtractConfig.maxTiles = std::max(1u, sparseClipmapConfig.maxTiles);
+                const uint64_t directFaceCapacity =
+                    static_cast<uint64_t>(directExtractConfig.maxTiles) *
+                    static_cast<uint64_t>(directExtractConfig.productionFaceCapacityPerTile);
+                constexpr uint64_t kSparseSurfaceGpuMaxFaces = 1ull << 23u;
+                if (directFaceCapacity <= std::numeric_limits<uint32_t>::max() &&
+                    directFaceCapacity <= kSparseSurfaceGpuMaxFaces) {
+                    midMeshConfig.maxFaces = std::max(
+                        midMeshConfig.maxFaces,
+                        static_cast<uint32_t>(directFaceCapacity));
+                } else {
+                    spdlog::warn(
+                        "VENPOD_MIDMESH_GPU_DRAW_DIRECT requested but fixed-slot face capacity "
+                        "{} exceeds sparse surface IA limit {}; keeping compact mid-mesh IA capacity",
+                        directFaceCapacity,
+                        kSparseSurfaceGpuMaxFaces);
+                }
+            }
             midMeshConfig.maxBrickRanges =
                 ReadUIntEnv("VENPOD_SPARSE_MID_MESH_MAX_RANGES", midMeshConfig.maxBrickRanges);
             midMeshConfig.maxDrawCommands =
@@ -22955,6 +22978,9 @@ int RunSandbox(int argc, char* argv[]) {
                 sparseMidMeshGpuResources.DrawArgsResource() != nullptr &&
                 midMeshStats.uploadedDrawCommands > 0u;
             bool useGpuMidMeshDraw = false;
+            bool useGpuMidMeshDirectDraw = false;
+            uint32_t gpuMidMeshFallbackExcluded = 0u;
+            uint32_t gpuMidMeshFallbackCommands = 0u;
             uint32_t gpuMidMeshCopiedTiles = 0u;
             uint32_t gpuMidMeshCopiedFaces = 0u;
             if (sparseMidMeshGpuDraw &&
@@ -22962,42 +22988,142 @@ int RunSandbox(int argc, char* argv[]) {
                 midMeshGpuExtractResources.B13aReady() &&
                 midMeshGpuExtractResources.ProductionFaceBufferResource() != nullptr &&
                 !sparseMidMeshGpuDrawCommittedSlots.empty()) {
-                std::vector<std::pair<uint32_t, Simulation::BrickCoord>> compactCopySlots;
-                compactCopySlots.reserve(sparseMidMeshGpuDrawCommittedSlots.size());
-                for (const uint32_t slot : sparseMidMeshGpuDrawCommittedSlots) {
-                    auto coordIt = sparseMidMeshGpuDrawCoordBySlot.find(slot);
-                    if (coordIt == sparseMidMeshGpuDrawCoordBySlot.end()) {
-                        continue;
+                if (sparseMidMeshGpuDrawDirect &&
+                    midMeshGpuExtractResources.ProductionDrawArgsResource() != nullptr) {
+                    std::vector<uint32_t> committedSlots;
+                    committedSlots.reserve(sparseMidMeshGpuDrawCommittedSlots.size());
+                    for (const uint32_t slot : sparseMidMeshGpuDrawCommittedSlots) {
+                        if (sparseMidMeshGpuDrawCoordBySlot.find(slot) !=
+                            sparseMidMeshGpuDrawCoordBySlot.end()) {
+                            committedSlots.push_back(slot);
+                        }
                     }
-                    SparseSurfaceGpuBrickDebugInfo info;
-                    if (!sparseMidMeshGpuResources.TryGetBrickDebugInfo(coordIt->second, &info) ||
-                        !info.drawSlotPresent ||
-                        !info.surfaceRecordPresent) {
-                        continue;
+                    const uint32_t productionFaceCapacity =
+                        midMeshGpuExtractResources.ProductionFaceCountCapacity();
+                    const bool productionFitsIa =
+                        productionFaceCapacity > 0u &&
+                        productionFaceCapacity <= sparseMidMeshGpuResources.VertexIdCapacityFaces();
+                    const bool productionArgsReady =
+                        !committedSlots.empty() &&
+                        productionFitsIa &&
+                        midMeshGpuExtractResources.UpdateProductionDrawArgs(
+                            commandList.Get(), committedSlots);
+                    const bool fallbackArgsReady =
+                        productionArgsReady &&
+                        sparseMidMeshGpuResources.BuildFallbackDrawArgsExcluding(
+                            commandList.Get(),
+                            sparseMidMeshGpuDrawCommittedCoords,
+                            &gpuMidMeshFallbackExcluded,
+                            &gpuMidMeshFallbackCommands);
+                    useGpuMidMeshDirectDraw =
+                        productionArgsReady &&
+                        fallbackArgsReady &&
+                        gpuMidMeshFallbackCommands > 0u;
+                    useGpuMidMeshDraw = useGpuMidMeshDirectDraw;
+                    static bool loggedGpuMidMeshDirectReject = false;
+                    if (!useGpuMidMeshDirectDraw &&
+                        enableRuntimeLog &&
+                        !loggedGpuMidMeshDirectReject) {
+                        loggedGpuMidMeshDirectReject = true;
+                        spdlog::warn(
+                            "GPU_MIDMESH_DRAW_DIRECT_REJECT frame={} committedSlots={} "
+                            "productionFitsIa={} productionFaceCapacity={} iaFaces={} "
+                            "fallbackExcluded={} fallbackCommands={}",
+                            frameCount,
+                            static_cast<uint32_t>(committedSlots.size()),
+                            productionFitsIa ? 1 : 0,
+                            productionFaceCapacity,
+                            sparseMidMeshGpuResources.VertexIdCapacityFaces(),
+                            gpuMidMeshFallbackExcluded,
+                            gpuMidMeshFallbackCommands);
                     }
-                    compactCopySlots.push_back({slot, coordIt->second});
-                }
-                if (!compactCopySlots.empty()) {
-                    midMeshGpuExtractResources.TransitionProductionFaceBuffer(
-                        commandList.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE);
-                    useGpuMidMeshDraw =
-                        sparseMidMeshGpuResources.CopyFixedSlotFacesIntoCompactRanges(
-                        commandList.Get(),
-                        midMeshGpuExtractResources.ProductionFaceBufferResource(),
-                        midMeshGpuExtractResources.ProductionFaceCapacityPerTile(),
-                        compactCopySlots,
-                        &gpuMidMeshCopiedTiles,
-                        &gpuMidMeshCopiedFaces);
+                } else {
+                    std::vector<std::pair<uint32_t, Simulation::BrickCoord>> compactCopySlots;
+                    compactCopySlots.reserve(sparseMidMeshGpuDrawCommittedSlots.size());
+                    for (const uint32_t slot : sparseMidMeshGpuDrawCommittedSlots) {
+                        auto coordIt = sparseMidMeshGpuDrawCoordBySlot.find(slot);
+                        if (coordIt == sparseMidMeshGpuDrawCoordBySlot.end()) {
+                            continue;
+                        }
+                        SparseSurfaceGpuBrickDebugInfo info;
+                        if (!sparseMidMeshGpuResources.TryGetBrickDebugInfo(coordIt->second, &info) ||
+                            !info.drawSlotPresent ||
+                            !info.surfaceRecordPresent) {
+                            continue;
+                        }
+                        compactCopySlots.push_back({slot, coordIt->second});
+                    }
+                    if (!compactCopySlots.empty()) {
+                        midMeshGpuExtractResources.TransitionProductionFaceBuffer(
+                            commandList.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        useGpuMidMeshDraw =
+                            sparseMidMeshGpuResources.CopyFixedSlotFacesIntoCompactRanges(
+                            commandList.Get(),
+                            midMeshGpuExtractResources.ProductionFaceBufferResource(),
+                            midMeshGpuExtractResources.ProductionFaceCapacityPerTile(),
+                            compactCopySlots,
+                            &gpuMidMeshCopiedTiles,
+                            &gpuMidMeshCopiedFaces);
+                    }
                 }
             }
             if (enableRuntimeLog && sparseMidMeshGpuDraw) {
                 spdlog::info(
-                    "GPU_MIDMESH_DRAW frame={} enabled={} compactCopiedTiles={} "
-                    "compactCopiedFaces={} committedCoords={}",
+                    "GPU_MIDMESH_DRAW frame={} enabled={} direct={} compactCopiedTiles={} "
+                    "compactCopiedFaces={} committedCoords={} fallbackExcluded={} "
+                    "fallbackCommands={}",
                     frameCount, useGpuMidMeshDraw ? 1 : 0,
+                    useGpuMidMeshDirectDraw ? 1 : 0,
                     gpuMidMeshCopiedTiles,
                     gpuMidMeshCopiedFaces,
-                    static_cast<uint32_t>(sparseMidMeshGpuDrawCommittedCoords.size()));
+                    static_cast<uint32_t>(sparseMidMeshGpuDrawCommittedCoords.size()),
+                    gpuMidMeshFallbackExcluded,
+                    gpuMidMeshFallbackCommands);
+            }
+            if (useGpuMidMeshDirectDraw) {
+                renderer->RenderSparseSurfaceFaces(
+                    commandList.Get(),
+                    midMeshGpuExtractResources.ProductionFaceBufferSRV(),
+                    voxelWorld->GetPaletteSRV(),
+                    midMeshGpuExtractResources.ProductionFaceCountCapacity(),
+                    midMeshCamera,
+                    midMeshGpuExtractResources.ProductionDrawArgsResource(),
+                    midMeshGpuExtractResources.ProductionDrawCommandCount(),
+                    nullptr,
+                    &sparseMidMeshGpuResources.VertexIdBufferView(),
+                    &sparseMidMeshGpuResources.IndexBufferView(),
+                    sparseMidMeshGpuResources.VertexIdCapacityFaces(),
+                    nullptr,
+                    nullptr,
+                    cameraParams.renderOwnershipStatsEnabled ? &sparseNearField.renderOwnershipUAV : nullptr,
+                    &sparseNearField.brickPoolSRV,
+                    &sparseNearField.pageTableSRV,
+                    &sparseNearField.occupancySRV,
+                    &sparseNearField.pageGenerationSRV,
+                    sparseNearField.maxBrickPages,
+                    sparseNearField.pageTableCapacity);
+                renderer->RenderSparseSurfaceFaces(
+                    commandList.Get(),
+                    sparseMidMeshGpuResources.FaceBufferSRV(),
+                    voxelWorld->GetPaletteSRV(),
+                    midMeshStats.uploadedFaces,
+                    midMeshCamera,
+                    sparseMidMeshGpuResources.FallbackDrawArgsResource(),
+                    gpuMidMeshFallbackCommands,
+                    nullptr,
+                    &sparseMidMeshGpuResources.VertexIdBufferView(),
+                    &sparseMidMeshGpuResources.IndexBufferView(),
+                    sparseMidMeshGpuResources.VertexIdCapacityFaces(),
+                    &sparseMidMeshGpuResources.SurfaceRecordSRV(),
+                    &sparseMidMeshGpuResources.SurfaceClusterSRV(),
+                    cameraParams.renderOwnershipStatsEnabled ? &sparseNearField.renderOwnershipUAV : nullptr,
+                    &sparseNearField.brickPoolSRV,
+                    &sparseNearField.pageTableSRV,
+                    &sparseNearField.occupancySRV,
+                    &sparseNearField.pageGenerationSRV,
+                    sparseNearField.maxBrickPages,
+                    sparseNearField.pageTableCapacity);
+                return;
             }
             renderer->RenderSparseSurfaceFaces(
                 commandList.Get(),

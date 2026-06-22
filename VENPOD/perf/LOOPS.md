@@ -917,3 +917,52 @@ Loop 21 pick: promote Step 3 explicitly before retrying CPU skip. Move productio
 `{slot, coord, version}` ownership, invalidate on dirty/new/removal/mismatch, and establish either a
 formal no-overflow face-capacity proof or a non-readback fallback contract. Only after that direct
 no-readback GPU ownership path is proven should Loop 20's per-tile CPU build skip be retried.
+
+## Loop 21 (Codex, partial)
+
+Implemented the smallest coherent first slice of the direct production-buffer draw path in
+`src/main_launcher.cpp`, behind `VENPOD_MIDMESH_GPU_DRAW_DIRECT=1` and still nested under the existing
+`VENPOD_MIDMESH_GPU_DRAW=1` validation gate. The render path now has a direct mode that:
+- builds GPU-written production indirect args with `UpdateProductionDrawArgs()`;
+- binds `ProductionFaceBufferSRV()` + `ProductionDrawArgsResource()` directly for committed slots;
+- builds CPU fallback indirect args with `BuildFallbackDrawArgsExcluding()` for non-committed slots;
+- draws production committed slots and CPU fallback slots as two passes;
+- skips the old per-frame `CopyFixedSlotFacesIntoCompactRanges()` path when direct mode is active.
+
+No-copy proof for the direct branch:
+- Constrained activation smoke (`VENPOD_SPARSE_MID_MAX_TILES=128`, direct flags on) saved at
+  `build/bin/loop21_direct_128_smoke.log`: `GPU_MIDMESH_DRAW` lines `768`, `direct=1` lines `768`,
+  `compactCopiedTiles=[1-9]` count `0`.
+- No-hole / parity on that smoke: `visibleMissing=[1-9]` count `0`; hard verify failures
+  (`AB_VERIFY/B13A_VERIFY match=0`, production `match=0`, overflow, terrain parity fail) count `0`;
+  `GPU_EXTRACT_FULL_VERDICT pass=1 (abChecks=192 abMismatched=0 overflowHits=0 deviceRemovals=0
+  maxVisibleMissing=0)`.
+
+Default production-capacity guard:
+- Default `mtns_edit.rec` direct-flag run saved at `build/bin/loop21_direct_default_guard.log`.
+  The current mid clipmap initializes 512 production slots, so fixed-slot addressing needs
+  `512 * 24576 = 12582912` IA faces. The sparse-surface IA runtime limit is `8388608`, and the
+  compact CPU midmesh IA stream in the run was `3145728`.
+- The code now rejects direct mode cleanly instead of failing midmesh initialization:
+  `midmeshInitFailures=0`, one `GPU_MIDMESH_DRAW_DIRECT_REJECT`, `visibleMissing=[1-9]` count `0`.
+
+Blockers / not promoted:
+- This is not the full Loop 21 no-readback ownership contract. Commits are still derived from
+  `PollB13aReadback()`, and production extraction still submits through the isolated smoke queue.
+- The default production slot count exceeds the current fixed-slot IA address-space limit, so direct
+  draw cannot be enabled for the real 512-slot replay without either a formal lower per-slot capacity
+  proof, a larger/different IA stream contract, or a different indirect addressing scheme.
+- Multi-run FRAMETIME and within-noise visual gates were not run because the default-capacity direct
+  path is intentionally rejected; the constrained 128-slot smoke is an activation/correctness proof,
+  not a production perf gate.
+
+Helper cross-check: converged. The tandem helper independently called out the same contract: direct
+draw is viable only with exact visible-tile ownership or CPU fallback, invalidation on dirty/new/
+removed/mismatch, capacity proof/guarding, and production dispatch ordered before render. It also
+agreed that current readback-derived commits and smoke-queue ordering are not the final no-readback
+ownership contract.
+
+Commit: partial checkpoint. Loop 22 pick: do not start CPU build-skip yet. First finish
+Loop 21b by replacing readback-derived commits with CPU `{slot, coord, version}` ownership, solving
+the 512-slot production capacity/addressing blocker, and moving production extract + draw-args update
+onto an ordered render-queue path or adding an explicit GPU wait.
