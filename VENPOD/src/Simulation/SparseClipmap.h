@@ -789,6 +789,11 @@ public:
         uint32_t* outMergeCells = nullptr,
         uint32_t* outChildMask = nullptr,
         uint64_t* outContentVersion = nullptr) const;
+    bool GetMidMeshTileCacheIdentityBySlot(
+        uint32_t slot,
+        BrickCoord* outCoord = nullptr,
+        uint64_t* outContentVersion = nullptr,
+        uint32_t* outFaceCount = nullptr) const;
     // Phase B1.3a fixture check (DEBUG / READ-ONLY): true iff any brush edit footprint
     // overlaps this tile's XZ extent. A B1.3a fixture must have NO edit footprint, since
     // the CPU `extractTileMesh` suppresses edited cells (the GPU would then emit a top

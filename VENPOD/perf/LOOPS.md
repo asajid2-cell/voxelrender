@@ -966,3 +966,68 @@ Commit: partial checkpoint. Loop 22 pick: do not start CPU build-skip yet. First
 Loop 21b by replacing readback-derived commits with CPU `{slot, coord, version}` ownership, solving
 the 512-slot production capacity/addressing blocker, and moving production extract + draw-args update
 onto an ordered render-queue path or adding an explicit GPU wait.
+
+## Loop 22 (Codex, partial - uncommitted)
+
+Implemented the smallest viable direct-default foundation slice, but did not commit because the
+FRAMETIME gate regressed.
+
+Capacity / no-overflow solution:
+- Default production fixed-slot capacity is now `16384` faces/tile, so the default 512-slot direct
+  arena fits the IA stream exactly: `512 * 16384 = 8388608`.
+- `VENPOD_MIDMESH_GPU_PRODUCTION_FACE_CAPACITY_PER_TILE` can override the cap for experiments.
+- Any tile whose cached CPU mid-mesh face count exceeds the cap is not GPU-owned; it stays in the
+  CPU fallback draw args. This is the hard no-truncation proof: over-cap tiles are excluded from
+  the GPU ownership set before dispatch/draw.
+- The old default run showed actual high-face tiles (`17758` max in
+  `loop21_direct_default_guard.log`). With the new cap, the unbudgeted draw-only proof logged the
+  two over-cap tiles explicitly:
+  `tile=234 cpuFaces=16744 cap=16384`, `tile=235 cpuFaces=17758 cap=16384`, both CPU fallback.
+
+No-readback ownership design:
+- Added CPU ownership state per slot: coord, cached mesh version, and cached CPU face count.
+- New `SparseClipmapTileCache::GetMidMeshTileCacheIdentityBySlot()` validates slot/coord/version/
+  face count without copying face vectors.
+- Production draw ownership is now admitted from CPU-side dispatch/version/capacity checks, not
+  created by `PollB13aReadback()`. Validation readback, when enabled, can still revoke a bad owner,
+  but it is no longer the commit source.
+- Per-frame direct draw validates CPU slot identity/version/face count; mismatch, removal, dirty
+  invalidation, missing metadata, or over-cap state drops ownership and uses CPU fallback.
+
+Queue/order slice:
+- Added `MidMeshGpuExtractResources::QueueWaitForProduction()` to queue a GPU wait from the main
+  render queue to the isolated production/smoke queue before direct draw args consume production
+  buffers.
+- Added `VENPOD_MIDMESH_GPU_EXTRACT_PRODUCTION_BUDGET` default `16` so dirty bursts do not dispatch
+  all production tiles in one frame; budget-skipped tiles are unowned and CPU fallback draws them.
+
+Default `mtns_edit.rec` draw-only proof:
+- Log: `build/bin/loop22_direct_budget16.log`.
+- Direct active on default 512 slots: `GPU_MIDMESH_DRAW` lines `768`, `direct=1` lines `768`,
+  `GPU_MIDMESH_DRAW_DIRECT_REJECT` count `0`.
+- No per-frame compact copy: `compactCopiedTiles=[1-9]` count `0`.
+- No holes: `visibleMissing=[1-9]` count `0`.
+- Production face parity: `GPU_EXTRACT_PROD` lines `180`, `prodMismatch=0`, `prodOverflow=0`;
+  `B13A_VERIFY` lines `180`, `abMismatch=0`.
+- Budget/fallback proof: max `budgetSkipped=177`; max `fallbackCommands=251`; max GPU-owned
+  committed slots `117`.
+
+Perf gate failed:
+- Same-build single-run baseline `build/bin/loop22_baseline_default.log`:
+  `frames=792 p50=11.719 p90=29.737 p99=50.152 max=75.998 sub60=35.10% visibleMissing=0`.
+- Budgeted direct `build/bin/loop22_direct_budget16.log`:
+  `frames=792 p50=11.535 p90=32.757 p99=77.034 max=373.924 sub60=34.09% visibleMissing=0`.
+- The initial unbudgeted direct proof was correct/no-copy but worse (`p99=103.95 max=426.579`);
+  budget 16 reduced the first dirty burst but later edit frames still regressed
+  (`frame 670 body=373.924` vs baseline `frame 670 body=53.162`).
+- Therefore multi-run FRAMETIME and both-replay promotion gates were not run; this slice is not
+  promoted despite passing activation/correctness/no-copy.
+
+Helper cross-check: converged. The tandem helper independently recommended the same capacity and
+ownership contract: 512 slots, `16384` cap, CPU face-count admission, fallback for over-cap/
+unowned/stale/removed/dirty tiles, and explicit production-before-render ordering.
+
+Commit: none. The worktree contains the partial flag-gated implementation only. Loop 23 pick:
+replace same-frame isolated-queue production dispatch with completed-fence ownership (dispatch now,
+own only after fence completion) and/or a same-render-queue batched production path, then rerun
+multi-run FRAMETIME on both `mtns_edit.rec` and `mtns.rec` before retrying CPU build-skip.

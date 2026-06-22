@@ -127,15 +127,12 @@ struct MidMeshGpuExtractConfig {
     // at ~4628+ faces (overflowing the old 4096), so size for the worst stepped tile with
     // headroom; overflow still sets the status flag (a rejected result, never an OOB write).
     uint32_t topFaceCapacityPerTile = 16384u;
-    // STEP 1 PRODUCTION OUTPUT: fixed per-slot face arena. This intentionally does NOT
-    // borrow the CPU tile.faceCount. For side=33, the worst block count is merge=1:
-    // 32*32 = 1024 top blocks, with at most 2*32*31 interior neighbor probes plus 4*32
-    // border skirt edges before 32-unit extent / vertical riser splitting. The production
-    // mtns_edit replay now peaks at 17,758 CPU faces / 16,632 attempted GPU appends with
-    // the draw-promotion gates active. 24k stays under the current 3,145,728-face mid-mesh
-    // IA stream when maxTiles=128 (128*24,576), and overflow still sets status and rejects
-    // the result instead of truncating or drawing partial geometry.
-    uint32_t productionFaceCapacityPerTile = 24576u;
+    // STEP 1 PRODUCTION OUTPUT: fixed per-slot face arena. 16k is the largest default
+    // capacity that fits the sparse-surface IA stream at the default 512 slots
+    // (512*16,384 == 8,388,608). Tiles whose cached CPU face count exceeds this cap
+    // are not GPU-owned and remain on the CPU fallback pass, so capacity overflow is a
+    // logged fallback decision, never a partial draw.
+    uint32_t productionFaceCapacityPerTile = 16384u;
     // B1.3e EDIT-FOOTPRINT: per-tile cap on the number of edited-cell XZ boxes uploaded to
     // the GPU. An edited tile in practice overlaps a handful of brush strokes; 256 is ample
     // headroom. If a tile exceeds it the dispatch is SKIPPED + reported (never a partial/OOB
@@ -565,6 +562,7 @@ public:
     void TransitionProductionFaceBuffer(
         ID3D12GraphicsCommandList* commandList,
         D3D12_RESOURCE_STATES state);
+    bool QueueWaitForProduction(ID3D12CommandQueue* commandQueue) const;
 
     // Delayed, DEBUG-ONLY containment A/B via the fence-tracked ring (same FIFO/ring as
     // the smoke poll, non-blocking by default). Reads the GPU top faces + status for the

@@ -8518,6 +8518,34 @@ bool SparseClipmapTileCache::GetMidMeshTileCacheFacesBySlot(
     return true;
 }
 
+bool SparseClipmapTileCache::GetMidMeshTileCacheIdentityBySlot(
+    uint32_t slot,
+    BrickCoord* outCoord,
+    uint64_t* outContentVersion,
+    uint32_t* outFaceCount) const
+{
+    if (slot >= m_tiles.size()) {
+        return false;
+    }
+    const TilePayload& tile = m_tiles[slot];
+    if (tile.record.slot == UINT32_MAX || !tile.meshCacheValid) {
+        return false;
+    }
+    if (outCoord) {
+        *outCoord = BrickCoord{
+            tile.record.coord.x,
+            tile.record.coord.ring,
+            tile.record.coord.z};
+    }
+    if (outContentVersion) {
+        *outContentVersion = tile.meshCacheContentVersion;
+    }
+    if (outFaceCount) {
+        *outFaceCount = static_cast<uint32_t>(tile.meshCacheFaces.size());
+    }
+    return true;
+}
+
 bool SparseClipmapTileCache::MidMeshTileHasEditFootprintBySlot(uint32_t slot) const {
     // Phase B1.3a fixture check: does any edited brick's XZ footprint overlap this tile?
     // Pure read of the edit overlays (mirrors the build's editXzBoxes intersection rule).

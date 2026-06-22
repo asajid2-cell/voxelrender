@@ -1931,6 +1931,21 @@ void MidMeshGpuExtractResources::TransitionProductionFaceBuffer(
     }
 }
 
+bool MidMeshGpuExtractResources::QueueWaitForProduction(ID3D12CommandQueue* commandQueue) const
+{
+    if (!commandQueue || !m_smokeFence || m_smokeFenceValue == 0u) {
+        return true;
+    }
+    const HRESULT hr = commandQueue->Wait(m_smokeFence.Get(), m_smokeFenceValue);
+    if (FAILED(hr)) {
+        spdlog::error(
+            "MidMeshGpuExtractResources::QueueWaitForProduction failed: 0x{:08X}",
+            static_cast<unsigned>(hr));
+        return false;
+    }
+    return true;
+}
+
 bool MidMeshGpuExtractResources::RunB13aTopFaceDispatchInternal(
     ID3D12Device* device,
     const Simulation::MidMeshGpuExtractDirtyTile& fixture,
