@@ -792,3 +792,66 @@ Claude helper cross-check: converged. The direct Claude CLI verdict was that `pu
 is contradicted by the numbers; `postWaitRegion=80.9` with `midMeshUpload=74.1`, plus `MIDMESH_SELFTIME
 buildMs=72.82 stageEmitMs=0.96`, identifies synchronous CPU midmesh build as the barrier. The tandem peer also
 independently converged on the same diagnosis.
+
+## Loop 18 (Codex, abandoned)
+
+No source change, no production code commit. Built current HEAD `01ea7c0` (`_agent_build.bat`: `ninja: no work to do`)
+and tested the frame-670 midmesh CPU spike with current-binary env toggles only.
+
+Diagnosis:
+- Frame `670` is edit/content-triggered, not a pure recenter. Existing peer evidence from `abc_edit_*` logs reports
+  `miss=new/recenter/lod/content/child/buildver:0/0/0/26/0/0`; the fresh Loop 18 runs match the shape:
+  `SPARSE_MID_CLIPMAP_EDIT_INVALIDATE frame=670 ... heightTiles=2`, then `MIDMESH_BUILDSPLIT frame=670`.
+- Default/OFF frame `670` does the whole content-miss burst in one build:
+  `preExtractTiles=38/38/40`, `preExtractMs=51.68/47.84/50.84`, `MIDMESH_SELFTIME buildMs=68.35/60.02/64.28`,
+  `dirtyTiles=24/24/26`, `visibleMissing=0`. `PERF_FRAME_END` shows the same bucket:
+  `midUpload=69.68/61.28/65.48ms`, with `surfExtract=3.68/3.35/3.11ms`.
+- The incremental interest-ring scheduler at `SparseClipmap.cpp` around `voxelInterestRebuildRingsPerFrame`
+  only spreads voxel INTEREST rebuilding. It does not budget this midmesh surface pre-extract path. The midmesh
+  pre-pass is cache-aware and parallel, but it pre-extracts the whole miss set in one frame by default.
+
+Candidate A: `VENPOD_MIDMESH_ASYNC_REMESH=1`.
+- This is the correct low-risk CPU lever to test: it defers only same-location cached tiles and keeps last-good
+  faces, so it should never create holes; new/recenter/no-cache tiles still rebuild immediately.
+- It reduced the single frame-670 build, but failed the multi-run replay gate by spreading the burst into a train:
+  default async budget 8 gave frame `670` `preExtractTiles=8`, `preExtractMs=15.59/11.72/13.45`,
+  `buildMs=32.64/25.35/30.61`, `visibleMissing=0`, but frames `671-675` still carried `~24-34ms` midmesh
+  builds. FRAMETIME `mtns_edit.rec` medians, OFF vs async-8 ON:
+  p99 `61.289/60.106/55.564 -> 58.202/64.470/65.583ms`,
+  sub60 `35.77/36.04/35.11% -> 36.84/37.50/39.76%`.
+- Tuned async budget 2 reduced max midmesh build further (`MaxMidBuild 23.12/22.62/24.08ms`,
+  `MaxPreMs 8.62/8.45/8.44ms`, `visibleMissing=0`) but worsened the frame distribution:
+  p90 `33.802/33.785/34.480 -> 43.515/42.046/41.374ms`,
+  p99 `61.289/60.106/55.564 -> 62.050/61.316/61.889ms`,
+  sub60 `35.77/36.04/35.11% -> 39.76/39.49/40.96%`.
+
+Candidate B: `VENPOD_MIDMESH_DIRTY_REGION_EXTRACT=1`.
+- Tested because frame `670` is edit/content-triggered. It used the region path (`DrrUsedSum=117` across each run)
+  and kept `visibleMissing=0`, but did not reduce the tail enough to pass:
+  frame `670` `preExtractTiles=18`, `preExtractMs=29.72/32.19/25.05`, `buildMs=58.97/60.38/52.13`.
+  FRAMETIME OFF vs DRR ON:
+  p99 `61.289/60.106/55.564 -> 57.645/58.922/60.204ms`,
+  sub60 `35.77/36.04/35.11% -> 37.50/39.23/38.30%`.
+
+Parity/safety:
+- `visibleMissing=0` for all OFF, async-8, async-2, and dirty-region runs.
+- No terrain math touched; `VENPOD_TERRAIN_CHECKSUM` not applicable.
+- Dirty-region existing region-vs-full timing/instrumentation stayed active (`drrTime`/`drrMs` logged), but the
+  replay metric failed, so no promotion was made.
+- Pixel SHA was not used; the valid oracle is within-noise visual/no-hole plus multi-run frame metrics. No visual
+  promotion gate was run after the perf gate failed.
+
+Claude/helper cross-check:
+- The tandem bridge still identified the peer as Codex, not Claude. The peer nevertheless independently converged
+  on the diagnosis and on async-remesh as the candidate to test, with the same caveat: do not promote unless A/B
+  p95/p99, `midMeshUpload/postWaitRegion`, and stale catch-up improve beyond noise. The local A/B did not meet
+  that condition.
+
+Verdict: abandon Loop 18 CPU promotion. Async-remesh and dirty-region extraction reduce selected self-time fields,
+but the valid `mtns_edit.rec` gates show the work is relocated/spread into more edit frames instead of producing a
+clean p99/sub60 win. There is no code change to commit.
+
+Loop 19 pick: GPU-resident midmesh extraction/promotion is the architectural answer, but only in the no-production-
+readback shape. Use the existing B1.3/Step-1..3 byte-equal work as the oracle, avoid Step-4 per-frame readback, and
+move the dirty-tile face generation/output to GPU-resident buffers or indirect draw so the CPU no longer waits on
+`BuildMidHeightSurfaceSnapshot` for same-frame midmesh readiness.
