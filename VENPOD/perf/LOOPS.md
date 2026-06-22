@@ -1153,3 +1153,74 @@ Minimum Loop 25 pick:
 
 Commit: none. Loop 25 should be the GPU-status/count ownership plus fallback-safe exclusion contract;
 only then can Loop 24's CPU extraction skip remove the dirty-frame build spike without risking holes.
+
+## Loop 25 (Codex, 27afefd)
+
+Implemented the draw-only production ownership decoupling needed before retrying CPU build-skip.
+Direct draw remains flag-gated (`VENPOD_MIDMESH_GPU_DRAW_DIRECT=1`) and default-off; no CPU
+midmesh build-skip was added in this loop.
+
+Design:
+- Pending production ownership is now `{coord, meshContentVersion, productionFence, dispatchedFrame}`;
+  CPU face count is no longer part of the pending key.
+- Added `SparseClipmapTileCache::GetMidMeshTileCurrentIdentityBySlot()`, which reads the live
+  tile coord + `meshContentVersion` without requiring `meshCacheValid`. Promotion and render
+  validation use this live content identity, not `meshCacheContentVersion`.
+- Added a full per-slot production `FaceCounts` / `FaceStatuses` readback mirror in
+  `MidMeshGpuExtractResources`, fence-checked by `TryGetProductionSlotCountStatus()`.
+- A pending slot promotes only after its production fence completed, its coord/version is still
+  current, and the completed GPU result is valid: `status == 0 && 0 < gpuFaceCount <= cap`.
+  GPU count/status are stored with the committed owner.
+- `BuildFallbackDrawArgsExcluding()` is only fed coords from that GPU-valid committed-owner set.
+  Overflow, over-capacity, zero-count, stale, unknown, or still-pending production results do not
+  exclude CPU fallback.
+- The old B13A face equality is now test-mode only for direct draw:
+  `VENPOD_MIDMESH_GPU_DRAW_VALIDATE_B13A=1`. Production ownership does not depend on a live CPU
+  face reference. Normal direct production no longer records the old B13A face readback ring.
+
+Source proof:
+- Production promotion: `src/main_launcher.cpp` `promoteCompletedGpuDrawOwners()` gates on
+  `GetMidMeshTileCurrentIdentityBySlot()` plus `TryGetProductionSlotCountStatus()`.
+- Direct render validation: `src/main_launcher.cpp` rebuilds `committedCoords` only from committed
+  owners whose stored GPU status/count are still valid and whose live coord/version still match.
+- Fallback exclusion: `BuildFallbackDrawArgsExcluding()` is called only after that filtered committed
+  coord set is built, so an invalid/overflow production slot keeps CPU fallback.
+- B13A validation mode remains available but is no longer the commit source.
+
+Build:
+- `_agent_build.bat` passed. Only pre-existing `rayDir` shadow warnings appeared before the final
+  successful relink.
+
+Correctness gates:
+- Default direct ON, `mtns_edit.rec`: 3/3 runs direct-active (`768/768` draw lines each), `REJECT=0`,
+  `visibleMissing=[1-9]` count `0`, `compactCopiedTiles=[1-9]` count `0`, validated mismatch count `0`.
+- Default direct ON, `mtns.rec`: 3/3 runs direct-active (`574/574` draw lines each), `REJECT=0`,
+  `visibleMissing=[1-9]` count `0`, `compactCopiedTiles=[1-9]` count `0`, validated mismatch count `0`.
+- Test-mode B13A pass (`VENPOD_MIDMESH_GPU_DRAW_VALIDATE_B13A=1`, `mtns_edit.rec`):
+  `B13A_VERIFY` lines `1`, bad lines `0`; production validation log:
+  `gpuFaces=1997 cpuFaces=1997 extra=0 missing=0 multiplicity=0 overflow=0 match=1 validated=1`.
+
+FRAMETIME gate (same build, frames >= 40, 3 runs each):
+- `mtns_edit.rec` OFF medians: `p50=14.148 p90=39.452 p99=71.076 max=124.286 sub60=42.02%`.
+- `mtns_edit.rec` ON medians: `p50=14.338 p90=41.369 p99=70.506 max=119.030 sub60=44.95%`.
+  ON is within the same noisy edit-tail band; p99/max did not regress.
+- `mtns.rec` OFF medians: `p50=15.160 p90=21.208 p99=43.139 max=51.368 sub60=36.01%`.
+- `mtns.rec` ON medians: `p50=15.821 p90=24.243 p99=41.354 max=45.989 sub60=43.67%`.
+  ON stayed within the large same-session flythrough variance; p99/max did not regress.
+
+Helper cross-check:
+- Claude helper converged on the contract and found the key hazard: status-blind CPU fallback
+  exclusion could create holes if B13A equality was demoted before GPU count/status gated commit.
+  It also flagged the version-domain trap between `meshContentVersion` and `meshCacheContentVersion`.
+  The implementation follows that review: live content identity plus GPU count/status mirror gates
+  commit/exclusion before B13A is demoted to test-mode.
+
+Residual:
+- This loop is still draw-only. The CPU build still runs, so the dirty worklist and CPU fallback remain
+  intact. The production scheduler is still conservative (`productionBudget=1`, default warmup owner cap).
+
+Loop 26 pick:
+- Retry the CPU build-skip now that production ownership no longer depends on CPU cache identity or CPU
+  face counts. Keep last-good CPU fallback for unowned/stale/pending/overflow/new/recenter/no-cache tiles,
+  and only skip CPU extraction for GPU-owned, live-version-matched tiles whose fallback exclusion remains
+  status/count-safe.
