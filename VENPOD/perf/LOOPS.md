@@ -734,3 +734,61 @@ post-extraction frame tail directly: classify why reduced `surfExtract` turns in
 (surface staging/dirty-stage/midmesh publish ordering), then pick a lever that reduces that tail without changing
 same-frame readiness. If no such CPU-side lever emerges, return to the GPU-resident critical surface extractor
 design with no production readback.
+
+## Loop 17 (diagnostic)
+No source change, no commit. This loop decomposed the post-extraction frame tail from the existing Loop 15/16
+logs and source timing points.
+
+Finding: reducing/parallelizing the forced same-frame `surfExtract` body exposes a different post-region barrier
+instead of reducing the editing sub-60 tail. The publish ordering gate is real, but it is not where the frame time
+goes. The expensive tail is `postWaitRegion`, and the worst post-reduction samples are dominated by the
+misleadingly named `midMeshUpload` bucket. `MIDMESH_SELFTIME` shows that bucket is mostly synchronous CPU
+`BuildMidHeightSurfaceSnapshot` work, not GPU upload.
+
+Evidence:
+- Loop 16 guarded ON reduced the edit-spike extraction body: logged `surfExtract` p95 dropped about
+  `25.5ms -> 16.8ms` in the sampled `PERF_FRAME_END` rows, and spike-window pre-publish elapsed dropped from
+  roughly `15.25ms -> 10.02ms`. But the non-extraction tail did not shrink: `(postWaitRegion - surfExtract)`
+  p95 was about `37.4ms -> 39.9ms`, and edit sub-60 still worsened.
+- On the hidden-exact spike frames, page-table publish and surface GPU staging are small. Example:
+  `loop16_mtns_edit_off_1.log` frame `298` had `postWaitRegion=31.49ms`, `surfExtract=26.72ms`,
+  `brickUpload=1.49ms`, `publish=0.10ms`, `midUpload=0.23ms`, `surfStage=1.20ms`, `surfEmit=0.66ms`.
+  Guarded ON frame `298` reduced `surfExtract` to `13.5-15.0ms`, with publish still about `0.09-0.14ms`.
+- The real tail is later edit/midmesh waves. Loop 15 frame `670` had
+  `fence=0.0 postWaitRegion=72.6 | midMeshUpload=65.3 surfExtract=3.1 surfStage=1.5 surfEmit=0.8 publish=0.1`.
+  Loop 16 guarded ON frame `670` repeated the same shape:
+  `fence=0.0 postWaitRegion=80.9 | midMeshUpload=74.1 surfExtract=2.9 surfStage=1.3 surfEmit=0.8 publish=0.1`.
+  `MIDMESH_SELFTIME` on that same ON frame decomposed it as `buildMs=72.82 stageEmitMs=0.96 upload=dirty`.
+  Across Loop 16 samples, midmesh build p95/max stayed about `72-77ms`; stage/emit was usually around `1ms`
+  on the largest tail frames, and `visibleMissing=0`.
+- Source ordering matches the logs. `main_launcher.cpp` uploads bricks, then queues/deferred page-table publishes;
+  publish rechecks `IsSurfaceKnown` for non-speculative non-empty pages and requeues unsurfaced entries. That is
+  the serialization/ordering constraint that requires pre-publish surface readiness. However, the publish block is
+  separately timed as `perfSparsePublishMs` and is tiny on the spike frames. The later midmesh block times
+  `BuildMidHeightSurfaceSnapshot` before dirty/full `Stage...` + `EmitCopy`, and the `MIDMESH_SELFTIME` logs prove
+  the large `midMeshUpload` rows are CPU build/pre-extract time, not GPU fence or copy time.
+
+Barrier identification:
+- **Surface staging (`surfStage`/`surfEmit`)**: not binding on the edit tail. Usually sub-ms to ~2ms on the
+  relevant frames, with occasional small dirty payload staging.
+- **Dirty-region surface staging**: not the Loop 17 tail. `PERF_SPARSE_SURFACE` shows dirty copies/staged MB on
+  some frames, but the measured `surfStage`/`surfEmit` costs are much smaller than the tail.
+- **Page-table publish ordering**: logically required and order-sensitive, but not the measured cost. It gates
+  visibility on surface readiness and can perturb streaming order, explaining why moving extraction changes visual
+  timing/noise. Once the surface is known, actual `publish` is about `0.0-0.3ms` on the spike frames.
+- **Post-wait region**: the binding bucket. On the worst frames it is almost entirely `midMeshUpload`, and
+  `MIDMESH_SELFTIME` decomposes that into CPU midmesh build/pre-extract rather than upload.
+
+Recommendation: do not retry coord-batch `surfExtract` scheduling, page-table publish tuning, or generic surface
+staging. The next CPU-side lever, if we keep this on CPU, should target the midmesh build itself without changing
+same-frame surface/page readiness or streaming order: split `BuildMidHeightSurfaceSnapshot` further around its
+`preExtractMs`, dirty-region candidate selection, LOD/interest scan, and dirty-tile cache reuse; then reduce or
+incrementalize the CPU pre-extract/build work that produces the `midMeshUpload` tail. If that cannot be reduced
+without changing same-frame midmesh readiness, then the honest architectural answer is that the remaining dip tail
+is the streaming/publish-order plus synchronous midmesh-build barrier; reducing it requires an architectural
+midmesh scheduler/GPU-resident midmesh extractor, not more hidden-exact `surfExtract` work movement.
+
+Claude helper cross-check: converged. The direct Claude CLI verdict was that `publish`/surface staging attribution
+is contradicted by the numbers; `postWaitRegion=80.9` with `midMeshUpload=74.1`, plus `MIDMESH_SELFTIME
+buildMs=72.82 stageEmitMs=0.96`, identifies synchronous CPU midmesh build as the barrier. The tandem peer also
+independently converged on the same diagnosis.
