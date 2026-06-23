@@ -322,6 +322,7 @@ private:
     CompiledShader m_dagRaymarchPS;
     CompiledShader m_sparseSurfaceVS;
     CompiledShader m_sparseSurfacePS;
+    CompiledShader m_sparseSurfaceEarlyDepthPS;
     CompiledShader m_sparseSurfaceDepthPrepassPS;
     CompiledShader m_overlayPS;
     CompiledShader m_backgroundCompositePS;

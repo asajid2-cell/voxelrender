@@ -1842,6 +1842,8 @@ void Renderer::RenderDagRaymarch(
 Result<void> Renderer::CreateSparseSurfacePipeline(ID3D12Device* device) {
     std::filesystem::path vsPath = m_config.shaderPath / "Graphics" / "VS_SparseSurface.hlsl";
     std::filesystem::path psPath = m_config.shaderPath / "Graphics" / "PS_SparseSurface.hlsl";
+    std::filesystem::path earlyDepthPsPath =
+        m_config.shaderPath / "Graphics" / "PS_SparseSurfaceEarlyDepth.hlsl";
     std::filesystem::path depthPrepassPsPath =
         m_config.shaderPath / "Graphics" / "PS_SparseSurfaceDepthPrepass.hlsl";
 
@@ -1864,6 +1866,18 @@ Result<void> Renderer::CreateSparseSurfacePipeline(ID3D12Device* device) {
     }
 
     if (m_config.sparseSurfaceDepthPrepass) {
+        auto earlyDepthPsResult =
+            m_shaderCompiler.CompilePixelShader(earlyDepthPsPath, L"main", m_config.debugShaders);
+        if (!earlyDepthPsResult) {
+            return Error("Failed to compile sparse surface early-depth pixel shader: {}", earlyDepthPsResult.error());
+        }
+        m_sparseSurfaceEarlyDepthPS = earlyDepthPsResult.value();
+        if (!m_sparseSurfaceEarlyDepthPS.IsValid()) {
+            return Error(
+                "Sparse surface early-depth pixel shader compilation failed: {}",
+                m_sparseSurfaceEarlyDepthPS.errors);
+        }
+
         auto depthPrepassPsResult =
             m_shaderCompiler.CompilePixelShader(depthPrepassPsPath, L"main", m_config.debugShaders);
         if (!depthPrepassPsResult) {
@@ -2005,6 +2019,7 @@ Result<void> Renderer::CreateSparseSurfacePipeline(ID3D12Device* device) {
         }
         spdlog::info("Sparse surface depth pre-pass pipeline created successfully");
 
+        pipelineDesc.pixelShader = m_sparseSurfaceEarlyDepthPS;
         pipelineDesc.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
         pipelineDesc.depthFunc = D3D12_COMPARISON_FUNC_EQUAL;
     }

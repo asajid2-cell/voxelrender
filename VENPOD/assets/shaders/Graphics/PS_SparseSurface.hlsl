@@ -240,6 +240,9 @@ float3 DebugSurfaceOwnerMaterialColor(uint material) {
     return saturate(materialColor * 0.86f + exactSurfaceTint * 0.14f);
 }
 
+#if defined(VENPOD_SPARSE_SURFACE_EARLY_DEPTH) && VENPOD_SPARSE_SURFACE_EARLY_DEPTH
+[earlydepthstencil]
+#endif
 float4 main(PSInput input) : SV_Target {
     const float surfaceDistance = distance(input.worldPos, frame.cameraPosition.xyz);
     const float exactNearDistance = max(frame.exactNearParams.x, 0.0f);
