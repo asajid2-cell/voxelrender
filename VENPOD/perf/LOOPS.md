@@ -2027,3 +2027,30 @@ using the same frame-end log cadence. Fields:
 
 Build passed via `_agent_build.bat`. The orchestrator will run the mtns.rec / mtns_edit A/B and use
 `PERF_WAITSPLIT` to identify which wait dominates the profiled `NtWaitForSingleObject` slice.
+
+## Loop 51 (Claude) -- CRITICAL: gpuValid=0; the "GPU is idle" premise was NEVER measured
+
+Chasing the user's correct "kneecapped" intuition, the wait-split (Codex 6ad495d) + caller attribution
+DISPROVED my Loop 49 fork-join diagnosis and surfaced a deeper problem:
+- PERF_WAITSPLIT (frames>90): pumpWaitMs=0, exactGenWaitMs=0, surfaceWaitMs=0, noncritWaitMs=0. The
+  fork-join producers do NOT block the main thread. Loop 49 was WRONG.
+- The 24% NtWaitForSingleObject is the GPU FENCE wait (fenceWaitMs mean ~3.78ms, max ~110ms, bursty;
+  commandQueue->WaitForFenceValue(ctx.fenceValue) at main_launcher:14638).
+- Present is NOT 60Hz-gated: syncInterval=0 + DXGI_PRESENT_ALLOW_TEARING, log confirms tearing
+  supported. So the ~16-18ms frame is real CPU+GPU time, not a DWM cap.
+- ** gpuValid=0 in ALL replay/sandbox runs ** (PERF line "fenceWait .. gpuFrameMs .. gpuValid=0";
+  PERF_SPARSE_STEPS gpuMs(valid=0)). The GPU TIMESTAMP TIMING IS INVALID. So the "gpuTiming.frameMs
+  3-4ms / GPU 96% idle" claim (Loop 44 workflow + my Loop 49) was NEVER a valid measurement -- it read
+  an invalid/zeroed gpuTiming. The engine may well be GPU-BOUND (full-res raymarch at render-scale 1.0
+  in quality mode), with the fenceWait being the CPU genuinely waiting on a busy GPU.
+
+CONSEQUENCE: the bottleneck (GPU-bound vs CPU-bound vs sync-bound) is UNKNOWN because the GPU clock was
+broken the whole time. Every "GPU idle" inference is suspect. This is the measurement to fix FIRST.
+
+Loop 52 (delegated to Codex): fix the GPU timestamp resolve/readback so gpuValid=1 in the replay/
+sandbox config (likely a missing ResolveQueryData / EndQuery / readback-fence step in that path), and
+add a clean per-frame PERF_GPU log (gpuFrameMs + raymarchMs + sparseSurfaceMs + sparseUploadMs +
+overlayMs). Then the orchestrator measures the ACTUAL GPU work vs the fenceWait vs the CPU body and
+finally identifies what bounds the frame -- before any fix. If GPU-bound at full quality, the 120fps
+path is GPU-side (and may trade against render-scale = the quality knob); if sync-bound, it is the
+fence/present path.
