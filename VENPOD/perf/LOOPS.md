@@ -1984,3 +1984,32 @@ FINAL HONEST ASSESSMENT of the 120fps goal:
   floor. Further median progress = a FUNDAMENTAL REWORK (true multi-queue async submit + GPU-side
   edit-extraction + frame-structure overhaul), a multi-loop project, OR accept the current
   well-optimized state. Not a bounded single-lever loop.
+
+## Loop 49 (Claude) -- REAL HEADROOM FOUND: 24% main-thread fork-join sync wait vs 96% idle GPU
+
+User pushed back on "well-optimized/converged" -- correctly. Clean-system profile (rebooted,
+degradation-immune) + caller attribution (VENPOD_PROFILE_STACKS=1, PROF_CALLERS) + GPU timing nail a
+real kneecap I had mis-framed as a diffuse floor:
+- gpuTiming.frameMs = 3-4ms but frame = 16-20ms -> the GPU is ~96% IDLE. The engine is CPU-serialized
+  against an idle GPU.
+- PROF_TOP #1 = NtWaitForSingleObject at 24.0% (216/725 samples) -- the MAIN THREAD BLOCKED. It is NOT
+  the GPU fence (perfFenceWaitMs ~= 0, triple-buffered ctx.fenceValue is 3 frames old). PROF_CALLERS
+  bottoms out at WaitForSingleObjectEx (profiler walks only 1 frame up) but RtlWakeConditionVariable
+  activity (#23) confirms it is CONDITION-VARIABLE waits = the main thread fork-joining the async
+  producer worker pools.
+- The "async" producers are FORK-JOIN, not pipelined: the main thread enqueues a batch, notifies
+  workers, then BLOCKS on a done-cv every frame -- m_persistentVoxelPumpDoneCv.wait (SparseClipmap.cpp
+  :812; prev-batch wait :794), m_persistentExactGenerationDoneCv.wait (SparseVoxelWorld.cpp:2226), the
+  async surface-mesher apply, the noncritical-gen cv. So the main thread waits for the workers instead
+  of overlapping their work with the next frame / the idle GPU.
+
+THE KNEECAP = fork-join serialization, not actual work. A 3-4ms GPU frame with diffuse worker-offloaded
+CPU SHOULD pipeline well below 16ms. This is the headroom.
+
+Loop 50 (delegated to Codex, INSTRUMENT-FIRST, no behavior change): add per-frame ms timers around
+EVERY main-thread blocking wait in the frame path (pump done-cv 812 + prev 794, exact-gen done-cv 2226,
+surface-mesher apply, noncritical-gen cv, and the already-timed fence wait), emit a PERF_WAITSPLIT
+line, run BOTH replays (mtns.rec + mtns_edit, quality, clean) and report which wait dominates the 24%
+on each. The waits should sum to ~the NtWaitForSingleObject 24%. This PINS the exact fork-join before
+Loop 51 makes that producer truly async (fire-and-forget + best-available, main thread never blocks),
+gated no-hole + within-noise visual + the wait% + frame-time drop.
