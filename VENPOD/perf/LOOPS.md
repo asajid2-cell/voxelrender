@@ -1827,3 +1827,30 @@ lever found this session -- the early-Z surface depth-prepass -- is SHIPPED (def
 overdraw, zero quality loss). Further 120fps progress requires either accepting quality tradeoffs
 (forbidden) or a from-scratch architectural change (e.g. async-compute multi-queue GPU pacing, or a
 fundamentally cheaper render path) -- a new project, not a loop iteration.
+
+## Loop 44 (Claude + layer) -- ARCHITECTURAL FRONT: the dips are present-queue pacing, a REAL no-quality-loss lever
+
+Layer workflow (loop44-gpu-pacing, HIGH conf): the gapPrev dips are a SYNC/PACING artifact, NOT GPU
+saturation. Arithmetic: gpuTiming.frameMs (full GPU command-list span, main_launcher.cpp:502) = 3-4ms,
+vs gapPrev=93.9ms -> ~96% idle GPU, saturation impossible. gapPrev = wall-time AFTER the body timer
+(:26660) and BEFORE the next loop top (:26384) -- the thread is DESCHEDULED between iterations. With
+benches at VENPOD_VSYNC=0 + Present(0, ALLOW_TEARING) returning immediately and ZERO frame-latency
+throttle in src (no SetMaximumFrameLatency / FRAME_LATENCY_WAITABLE), the CPU outruns DWM, the 3-deep
+FLIP_DISCARD present queue (Window.h:69 BUFFER_COUNT=3) fills, and DXGI parks the thread = the 93ms
+burst. The engine is a SINGLE DIRECT queue (everything serializes; DX12CommandQueue.cpp:67-95).
+
+LEVER (relax-fence-pacing, render-INVISIBLE by construction): add a DXGI waitable-swapchain frame-
+latency throttle. 3 localized Core/Window.cpp changes, zero render/shader edits: (1) OR
+DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT into swapChainDesc.Flags (Window.cpp:94) AND the
+ResizeBuffers flags; (2) after As(&m_swapChain) (Window.cpp:114) call SetMaximumFrameLatency(2) + cache
+GetFrameLatencyWaitableObject(); (3) WaitForSingleObject(handle, 1000) at the loop top beside
+WaitForFenceValue (main_launcher.cpp:14634). Converts the random 93ms park into a deterministic bounded
+throttle. Removes ZERO work (render scale 1.0, PS_Raymarch untouched) -> cannot trip the NVIDIA JIT
+crash / TDR. Do NOT add swapchain buffers (vsync-off: deeper queue = WORSE burst latency). Copy-queue
+split for producer uploads = SECONDARY (edit/stream frames, not this clean pacing burst).
+
+NOTE: for 120fps, vsync MUST be off (vsync caps at refresh), so this present-queue pacing IS the real
+no-dips lever for the goal. CHEAP CONFIRM (zero code): VENPOD_VSYNC=1 should make the gapPrev bursts
+vanish/regularize while gpuTiming stays 3-4ms -> confirms present-queue pacing. GATE for the fix:
+render-invisible (capsheet pixel-equiv) + gapPrev outliers collapse toward body with gpuTS flat +
+perfFenceWaitMs flat + no TDR (walk_bench).
