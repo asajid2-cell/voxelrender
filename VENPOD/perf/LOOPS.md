@@ -2235,6 +2235,23 @@ must A/B that removing it nets DOWN on raymarchMs overall, not just spike frames
 mid-mesh far reach (documented to WORSEN the dip via 60-86ms CPU rebuild); bg-pass (forbidden quality
 downscale).
 
-Loop 59 = Codex adds the inert env threshold (PS_Raymarch careful, 7-min recompile, no-TDR verify);
-then orchestrator A/Bs flip-to-1.1: raymarchMs spike + median drop, capsheet pixel-equiv on frames
-269/501-504, walk_bench no-TDR, visibleMissing=0, backgroundPixels ~462k unchanged.
+  Loop 59 = Codex adds the inert env threshold (PS_Raymarch careful, 7-min recompile, no-TDR verify);
+  then orchestrator A/Bs flip-to-1.1: raymarchMs spike + median drop, capsheet pixel-equiv on frames
+  269/501-504, walk_bench no-TDR, visibleMissing=0, backgroundPixels ~462k unchanged.
+
+## Loop 59 -- far-SVO step quality gate env-fed through FrameConstants
+
+Added `VENPOD_FAR_SVO_STEP_QUALITY_GATE` as the inert A/B lever for the far fallback's
+`FarSvoSuggestedStep` probe. CPU reads it once in `main_launcher.cpp` with default `0.92f`, stores it
+on `Renderer::CameraParams::farSvoStepQualityGate`, then `Renderer.cpp` writes it into the existing
+`FrameConstants.surfaceRasterParams.z` slot in both frame-constant fill paths. `surfaceRasterParams.z`
+was previously zeroed and unread; the cbuffer layout and `renderBudgetParams` components are unchanged.
+`PS_Raymarch.hlsl` now compares `frame.renderBudgetParams.z > frame.surfaceRasterParams.z` at the
+single former `0.92f` threshold site. Default `0.92f` keeps quality mode on the original probe path;
+setting the env above `1.0` (for example `1.1`) makes quality use the cheap analytic `distanceStep`.
+
+Verification: `_agent_build.bat` completed cleanly (only pre-existing `rayDir` shadow warnings in
+`main_launcher.cpp`). A short `./rebrun.ps1 -NoBuild -Sparse -ExitAfterFrames 150` smoke attempt did
+not reach frame exit: the launched VENPOD process remained unresponsive before runtime log output and
+was stopped after a bounded wait. No new device-hung/TDR event was found during that smoke window; older
+nvlddmkm watchdog entries predated this change.

@@ -45,7 +45,7 @@ struct FrameConstantsCpu {
     float midResidencyParams[4];  // x/y = height/voxel coverage, z/w = resident height/voxel counts
     float farOwnershipParams[4];  // x = ready, y = upload coverage, z = page coverage, w = effective quality
     float exactNearParams[4];     // x = exact sparse voxel distance, y = world seed bits, z/w = mid voxel handoff coverage/worst ring
-    float surfaceRasterParams[4]; // x = public exact sparse surface draw/resolve distance, y/z = background stats/defer flags
+    float surfaceRasterParams[4]; // x = public exact sparse surface draw/resolve distance, y = mid safe distance, z = far SVO step quality gate
 };
 
 static_assert(sizeof(FrameConstantsCpu) == 368);
@@ -752,7 +752,7 @@ void Renderer::RenderVoxels(
     constants.surfaceRasterParams[0] = NonNegativeFiniteOr(camera.surfaceRasterMaxDistance, 0.0f);
     // y = L3 motion guard: streamed-mid safe distance (0 = off). See CameraParams.
     constants.surfaceRasterParams[1] = NonNegativeFiniteOr(camera.midStreamSafeDistance, 0.0f);
-    constants.surfaceRasterParams[2] = 0.0f;
+    constants.surfaceRasterParams[2] = FiniteOr(camera.farSvoStepQualityGate, 0.92f);
     constants.surfaceRasterParams[3] = 0.0f;
 
     const bool sparseNearEnabled =
@@ -1107,7 +1107,7 @@ void Renderer::RenderSparseSurfaceFaces(
     constants.nearOwnershipParams[3] = camera.surfaceRasterMaxDistance;
     constants.surfaceRasterParams[0] = NonNegativeFiniteOr(camera.surfaceRasterMaxDistance, 0.0f);
     constants.surfaceRasterParams[1] = 0.0f;
-    constants.surfaceRasterParams[2] = 0.0f;
+    constants.surfaceRasterParams[2] = FiniteOr(camera.farSvoStepQualityGate, 0.92f);
     const bool sparseMaterialLookupEnabled =
         sparseBrickPoolSRV && sparseBrickPoolSRV->IsValid() &&
         sparsePageTableSRV && sparsePageTableSRV->IsValid() &&

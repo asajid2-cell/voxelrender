@@ -116,6 +116,7 @@ public:
         uint32_t midFieldResidentVoxelBricks = 0;
         float surfaceRasterMaxDistance = 0.0f;
         float exactNearDistance = 0.0f;
+        float farSvoStepQualityGate = 0.92f;
         // L3 motion guard: nearest missing-visible-height-tile distance this frame
         // (0 = guard off / startup). Shader reads it via surfaceRasterParams.y to
         // suppress the bare far-water fallback beyond the streamed mid region.

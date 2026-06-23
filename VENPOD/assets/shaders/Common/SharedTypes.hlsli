@@ -138,6 +138,7 @@ struct FrameConstants {
       // surface hits. This is intentionally separate from the wider sparse
       // ownership/feedback radius so lower LOD can remain coherent until exact
       // terrain is ready for a deliberate foreground promotion.
+      // y = streamed-mid safe distance, z = far-SVO empty-space step quality gate.
       float4   surfaceRasterParams;
   };
 

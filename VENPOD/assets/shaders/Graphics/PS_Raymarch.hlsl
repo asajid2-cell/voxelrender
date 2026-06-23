@@ -3769,7 +3769,7 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     [loop]
     for (int i = 0; i < farStepBudget && t < farMaxDist; ++i) {
         float distanceStep = lerp(128.0f, 420.0f, saturate(t / farMaxDist));
-        float svoStep = frame.renderBudgetParams.z > 0.92f
+        float svoStep = frame.renderBudgetParams.z > frame.surfaceRasterParams.z
             ? FarSvoSuggestedStep(rayOrigin, rayDir, t)
             : distanceStep;
         float stepSize = max(FAR_SVO_MIN_CELL_SIZE, max(svoStep, distanceStep));

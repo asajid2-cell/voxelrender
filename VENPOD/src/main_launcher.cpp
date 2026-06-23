@@ -5186,6 +5186,7 @@ int RunSandbox(int argc, char* argv[]) {
         static_cast<float>(ReadUIntEnv("VENPOD_SPARSE_RAYMARCH_WATERLINE_MAX_SCALE_PERCENT", 25u)) / 100.0f,
         0.10f,
         sparseRaymarchMaxScale);
+    const float farSvoStepQualityGate = ReadFloatEnv("VENPOD_FAR_SVO_STEP_QUALITY_GATE", 0.92f);
     float currentRaymarchMaxDistance = enableSparseRaymarch
         ? sparseRaymarchScaledDistance
         : denseRaymarchScaledDistance;
@@ -21982,6 +21983,7 @@ int RunSandbox(int argc, char* argv[]) {
             0.0f,
             1.0f);
         cameraParams.renderQuality = currentRenderQuality;
+        cameraParams.farSvoStepQualityGate = farSvoStepQualityGate;
         cameraParams.frameIndex = static_cast<uint32_t>(frameCount);
         cameraParams.backgroundPassSurfaceRaymarchFill =
             backgroundPassSurfaceRaymarchFillThisFrame || sparseStartupPublicRenderHeld;
