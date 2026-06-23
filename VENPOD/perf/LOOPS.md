@@ -1920,3 +1920,31 @@ CONVERGED HONEST STATE of the 120fps goal (clean system, quality config):
   backgroundPixels composition, visibleMissing, brick counts). Timing dips (rawMs/gapPrev p99/max) are
   noise-dominated and must be gated on MULTI-RUN medians of degradation-immune signals, never single
   timing outliers.
+
+## Loop 47 (Claude) -- clean re-profile CONFIRMS diffuse; the loop has CONVERGED
+
+Clean-system sampling profile (VENPOD_PROFILE=1, mtns_edit.rec quality). PROF_HITCH frames (the dips)
+have NO single dominant self-time function -- each hitch's top differs: NtWaitForSingleObject (main
+thread waiting on the async worker pool -- the best-available async design working), terrain gen
+(ValueNoise2D / HeightAt / HeightAtUncached / ComputeOccupancyAndFlags during edit re-extraction),
+SparseSurfaceExtractor::ExtractRegion, BuildMidEditOverridesForBrick, EvaluateBrushEdit, and
+RtlCreateUnicodeString (spdlog string formatting -- inflated here by the bench's
+VENPOD_PERF_FRAME_END_LOG_INTERVAL=1; the ship config logs far less, so this slice is partly a bench
+artifact). No single function dominates -> confirms Loop 34's "diffuse" finding on a CLEAN system.
+
+CONVERGENCE. The orchestrator loop has exhausted the single-lever search:
+- ONE real architectural win shipped: early-Z surface depth-prepass (overdraw 3.7->1.0, composition-
+  proven zero quality loss).
+- Everything else that looked like a big "dip" was a measurement artifact (prefetch wrong-config,
+  splice/778ms contention, pacing-burst degradation) or is diffuse system noise.
+- The 120fps-median gap is real but DIFFUSE main-thread work (terrain gen + extraction + bounded async
+  waits) with the big sinks already removed. Closing it is a broad micro-opt grind (many small wins:
+  e.g. shave HeightAt/ValueNoise call counts, cut per-frame string formatting in the ship logging
+  path, trim allocations in the edit-extract path) -- NOT a single architectural lever. Each step is
+  small + the desktop's perf noise makes sub-ms wins hard to measure (gate only on degradation-immune
+  multi-run medians).
+
+RECOMMENDATION: the engine is well-optimized. Further 120fps progress = either (a) accept the broad
+micro-opt grind (low yield/step, noise-limited measurement) or (b) a bigger architectural rework
+(genuine multi-queue async-submit, or GPU-side edit-extraction) that is a multi-loop project, not a
+bounded loop. The single-lever loop has done its job.
