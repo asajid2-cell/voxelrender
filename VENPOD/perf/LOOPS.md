@@ -2211,3 +2211,30 @@ TWO LOAD-BEARING REALIZATIONS:
 NEXT: the raymarch-dip lever -- raise FAR-surface coverage so less far terrain hits the full-res
 raymarch (the workers extract far surface -> the raymarch shrinks), or a cheaper far path WITHOUT the
 low-res background pass (no quality hit). Measurable via raymarchMs (valid GPU timing) + the dip p99/max.
+
+## Loop 58 (layer scope) -- raymarch dip lever found: skip the FarSvoSuggestedStep probe in quality
+
+Layer scope (loop58-raymarch-dips, MEDIUM conf): the dip = grazing/low-angle horizon rays that miss the
+cheap sky-exit and burn the full 52-step far budget (ScaleFarFieldStepBudget(52..), PS_Raymarch.hlsl
+~3754) out to farMaxDist=10400. AMPLIFIER (quality-mode-specific): at line 3772, z=1.0>0.92 swaps the
+cheap analytic distanceStep for FarSvoSuggestedStep -- an [unroll] 3-level probe, each level =
+FarSvoCellOccupied = 5x FarTerrainHeight (~3590) -> up to ~15 EXTRA noise evals PER STEP. A 52-step
+grazing ray -> hundreds of FarTerrainHeight evals = the 37-127ms spikes. (backgroundPixels constant
+~462k confirms it's per-ray, not coverage.)
+
+LEVER: env-feed the 3772 threshold (VENPOD_FAR_SVO_STEP_QUALITY_GATE, default 0.92 = INERT). Raised
+>1.0, quality takes svoStep=distanceStep (skips the probe) -> worst far-tail step drops ~16 evals -> 1.
+NO QUALITY LOSS: FarSvoSuggestedStep is only an empty-space-SKIP spacing heuristic; the hit is found by
+the UNCHANGED crossing test (3790) + bisection refine (3793) + unchanged shade -> byte-identical
+horizon (full-res far preserved; never enables the bg downscale). SAFETY: edits ONE comparison +
+REMOVES FarTerrainHeight call sites (opposite of the TDR-fatal spawn-reshape/xz-quant/second-inline);
+does NOT touch the FarTerrainHeight math body. Residual: a coarser fixed step could straddle-miss a
+thin distant ridge (capsheet must catch) + any PS_Raymarch edit pays the ~7-min recompile + nonzero JIT
+exposure (walk_bench no-TDR). UNCERTAINTY (medium conf): the probe also SAVES steps (empty-space skip);
+must A/B that removing it nets DOWN on raymarchMs overall, not just spike frames. Rejected: extending
+mid-mesh far reach (documented to WORSEN the dip via 60-86ms CPU rebuild); bg-pass (forbidden quality
+downscale).
+
+Loop 59 = Codex adds the inert env threshold (PS_Raymarch careful, 7-min recompile, no-TDR verify);
+then orchestrator A/Bs flip-to-1.1: raymarchMs spike + median drop, capsheet pixel-equiv on frames
+269/501-504, walk_bench no-TDR, visibleMissing=0, backgroundPixels ~462k unchanged.
