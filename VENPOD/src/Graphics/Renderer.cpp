@@ -376,6 +376,7 @@ void Renderer::Shutdown() {
 
     m_fullscreenPipeline.Shutdown();
     m_sparseSurfacePipeline.Shutdown();
+    m_sparseSurfaceDepthPrepassPipeline.Shutdown();
     m_overlayPipeline.Shutdown();
     m_backgroundCompositePipeline.Shutdown();
     m_midCompositePipeline.Shutdown();
@@ -1162,6 +1163,77 @@ void Renderer::RenderSparseSurfaceFaces(
         (sparseMaterialLookupEnabled && sparsePageGenerationSRV)
             ? sparsePageGenerationSRV->gpu
             : surfaceFacesSRV.gpu);
+
+    auto drawSurfaceStreams = [&]() {
+        if (indirectDrawArgs && indirectDrawCommandCount > 0 && m_sparseSurfaceDrawSignature) {
+            cmdList->ExecuteIndirect(
+                m_sparseSurfaceDrawSignature.Get(),
+                indirectDrawCommandCount,
+                indirectDrawArgs,
+                0,
+                indirectDrawCount,
+                0);
+        } else {
+            cmdList->DrawIndexedInstanced(drawableFaceCount * 6u, 1u, 0u, 0, 0u);
+        }
+    };
+    auto bindSurfaceDescriptors = [&]() {
+        cmdList->SetGraphicsRootConstantBufferView(0, frameConstantsUpload.GetGPUVirtualAddress());
+        cmdList->SetGraphicsRootDescriptorTable(1, surfaceFacesSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(2, materialPaletteSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(
+            3,
+            (camera.renderOwnershipStatsEnabled && renderOwnershipUAV && renderOwnershipUAV->IsValid())
+                ? renderOwnershipUAV->gpu
+                : m_dummyRenderOwnershipUAV.GetShaderVisibleUAV().gpu);
+        cmdList->SetGraphicsRootDescriptorTable(
+            4,
+            (surfaceRecordsSRV && surfaceRecordsSRV->IsValid())
+                ? surfaceRecordsSRV->gpu
+                : surfaceFacesSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(
+            5,
+            (surfaceClustersSRV && surfaceClustersSRV->IsValid())
+                ? surfaceClustersSRV->gpu
+                : surfaceFacesSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(
+            6,
+            (sparseMaterialLookupEnabled && sparseBrickPoolSRV)
+                ? sparseBrickPoolSRV->gpu
+                : surfaceFacesSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(
+            7,
+            (sparseMaterialLookupEnabled && sparsePageTableSRV)
+                ? sparsePageTableSRV->gpu
+                : surfaceFacesSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(
+            8,
+            (sparseMaterialLookupEnabled && sparseOccupancySRV)
+                ? sparseOccupancySRV->gpu
+                : surfaceFacesSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(
+            9,
+            (sparseMaterialLookupEnabled && sparsePageGenerationSRV)
+                ? sparsePageGenerationSRV->gpu
+                : surfaceFacesSRV.gpu);
+    };
+
+    if (m_config.sparseSurfaceDepthPrepass &&
+        m_sparseSurfaceDepthPrepassPipeline.GetPSO() != nullptr &&
+        m_dsvHandle.IsValid()) {
+        D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = m_dsvHandle.cpu;
+        cmdList->OMSetRenderTargets(0, nullptr, FALSE, &dsvHandle);
+        m_sparseSurfaceDepthPrepassPipeline.Bind(cmdList);
+        // Safe to draw the shaded pass after this because stencil writes are REPLACE->1.
+        cmdList->OMSetStencilRef(1);
+        bindSurfaceDescriptors();
+        drawSurfaceStreams();
+
+        SetMainRenderTarget(cmdList);
+        m_sparseSurfacePipeline.Bind(cmdList);
+        cmdList->OMSetStencilRef(1);
+        bindSurfaceDescriptors();
+    }
     if (indirectDrawArgs && indirectDrawCommandCount > 0 && m_sparseSurfaceDrawSignature) {
         cmdList->ExecuteIndirect(
             m_sparseSurfaceDrawSignature.Get(),
@@ -1770,6 +1842,8 @@ void Renderer::RenderDagRaymarch(
 Result<void> Renderer::CreateSparseSurfacePipeline(ID3D12Device* device) {
     std::filesystem::path vsPath = m_config.shaderPath / "Graphics" / "VS_SparseSurface.hlsl";
     std::filesystem::path psPath = m_config.shaderPath / "Graphics" / "PS_SparseSurface.hlsl";
+    std::filesystem::path depthPrepassPsPath =
+        m_config.shaderPath / "Graphics" / "PS_SparseSurfaceDepthPrepass.hlsl";
 
     auto vsResult = m_shaderCompiler.CompileVertexShader(vsPath, L"main", m_config.debugShaders);
     if (!vsResult) {
@@ -1787,6 +1861,20 @@ Result<void> Renderer::CreateSparseSurfacePipeline(ID3D12Device* device) {
     m_sparseSurfacePS = psResult.value();
     if (!m_sparseSurfacePS.IsValid()) {
         return Error("Sparse surface pixel shader compilation failed: {}", m_sparseSurfacePS.errors);
+    }
+
+    if (m_config.sparseSurfaceDepthPrepass) {
+        auto depthPrepassPsResult =
+            m_shaderCompiler.CompilePixelShader(depthPrepassPsPath, L"main", m_config.debugShaders);
+        if (!depthPrepassPsResult) {
+            return Error("Failed to compile sparse surface depth-prepass pixel shader: {}", depthPrepassPsResult.error());
+        }
+        m_sparseSurfaceDepthPrepassPS = depthPrepassPsResult.value();
+        if (!m_sparseSurfaceDepthPrepassPS.IsValid()) {
+            return Error(
+                "Sparse surface depth-prepass pixel shader compilation failed: {}",
+                m_sparseSurfaceDepthPrepassPS.errors);
+        }
     }
 
     GraphicsPipelineDesc pipelineDesc;
@@ -1904,6 +1992,22 @@ Result<void> Renderer::CreateSparseSurfacePipeline(ID3D12Device* device) {
     pipelineDesc.dsvFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
     pipelineDesc.frontCounterClockwise = true;
     pipelineDesc.cullMode = D3D12_CULL_MODE_BACK;
+
+    if (m_config.sparseSurfaceDepthPrepass) {
+        GraphicsPipelineDesc depthPrepassDesc = pipelineDesc;
+        depthPrepassDesc.pixelShader = m_sparseSurfaceDepthPrepassPS;
+        depthPrepassDesc.debugName = "SparseSurfaceDepthPrepassPipeline";
+        depthPrepassDesc.rtvFormats.clear();
+        auto depthPrepassResult =
+            m_sparseSurfaceDepthPrepassPipeline.Initialize(device, depthPrepassDesc);
+        if (!depthPrepassResult) {
+            return Error("Failed to create sparse surface depth-prepass pipeline: {}", depthPrepassResult.error());
+        }
+        spdlog::info("Sparse surface depth pre-pass pipeline created successfully");
+
+        pipelineDesc.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        pipelineDesc.depthFunc = D3D12_COMPARISON_FUNC_EQUAL;
+    }
 
     auto result = m_sparseSurfacePipeline.Initialize(device, pipelineDesc);
     if (!result) {

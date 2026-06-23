@@ -1403,3 +1403,282 @@ a durable diagnostic.
 
 Loop 29 decision (next): resolve the OPEN QUESTION above via deep analysis (off-thread feasibility of
 the ~237ms hostPrep) before any implementation -- run it through the orchestration layer.
+
+## Loop 29 (Claude, orchestration-layer feasibility verdict) + Loop 30 GROUND-TRUTH REDIRECT
+
+Loop 29 feasibility workflow (loop29-feasibility, 4 parallel read-only agents + adversarial verdict,
+HIGH confidence): GPU promotion CANNOT net out on edits. (a) off-thread infeasible -- the dispatch
+record half is bound to one allocator/queue/fence + shared staging (the reverted Loop 27 batch), and
+the gather reads LIVE clipmap state via a raw pointer with no snapshot (worker = use-after-free);
+(b) it does not net out anyway -- render promotes GPU owners LATE, so the dip is the CPU FALLBACK
+build, not GPU latency; moving prep off-thread relocates it without removing the dip. Verdict:
+CONSOLIDATE the committed GPU foundation (leave it flag-OFF), stop chasing GPU production for edits,
+attack the CPU build directly.
+
+THEN the decisive ground-truth (scripts/buildbench.ps1 = SHIP config: mtns_edit.rec with NO GPU
+production, the actual shipped editing path). Decomposed the edit-spike body END TO END and the
+campaign's whole premise was WRONG about where the dip is:
+- The mid-mesh CPU build is NOT the dip. SHIP-config frame 666: `MIDMESH_SELFTIME buildMs=31.22`,
+  `preExtractMs=16.50` -- only ~11% of the `body=289ms`. (The 54-80ms "buildMs" seen earlier was
+  DRAW=1 contention inflating the parallel pre-extract; in ship config the build is ~31ms.)
+- THE REAL EDITING DIP IS TERRAIN SURFACE PREFETCH. `PERF_SPIKE_SPARSE_REQUEST` decomposes the spike:
+  `hierarchy` (the 10522..11906 sparse-request bracket) is `surfacePrefetch` almost entirely:
+  | frame | reqMs | hierarchy | surfacePrefetch | mid-mesh buildMs |
+  | 400 | 168.70 | 156.62 | 141.44 | ~ |
+  | 622 | 136.00 | 113.61 | 110.58 | ~ |
+  | 642 | 166.24 | 105.12 | 101.90 | ~ |
+  | 666 | 167.65 | 138.29 | 123.46 | 31.22 |
+  surfacePrefetch (the `traceTerrainSurfacePrefetchRay` grid loop, main_launcher ~11886) is
+  100-141ms = the dominant editing-dip cost, ~4x the entire mid-mesh build. The Loops 19-29 mid-mesh
+  GPU campaign + Loop 29's "attack the 72ms CPU build" were optimizing a fraction of the real dip.
+  visibleMissing=0 every frame (no hole in baseline).
+- Surface prefetch is SPECULATIVE (prefetch future terrain surface), not render-critical, and is
+  loosely bounded: `VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH` default ON, `_MAX_REQUESTS=512`,
+  `_RAY_BUDGET=0` (UNBOUNDED per frame!), `_CLEAN_THROTTLE=0`, ray grid 33x19=627. So it can spike
+  unbudgeted to 141ms on an edit/camera frame.
+
+Loop 30 target (NOW): bound the terrain-surface-prefetch edit spike (env-flippable on the committed
+binary, no rebuild) -- RAY_BUDGET / CLEAN_THROTTLE / MAX_REQUESTS -- and verify the dip drops with
+visibleMissing=0 AND no terrain-surface pop-in/quality loss (prefetch arriving a frame or two later
+must not leave a visible gap). A/B in ship config via buildbench.ps1, then adversarial no-hole/quality
+verify via the orchestration layer before committing a new default.
+
+## Loop 30 CORRECTION (Claude) -- the prefetch finding was measured in a NON-SHIP config
+
+CAUGHT BY RECONCILING THE BASELINE DISCREPANCY (do not skip this discipline): my buildbench.ps1
+ship-config baseline read rawMs p50=66ms / p99=312ms on mtns_edit and p50=209ms on mtns.rec -- but
+the ledger's committed flythrough number is body p50=10.3ms (~97fps), max 29.7ms at ab25ed8. A ~20x
+gap. The prefetch existed at ab25ed8 (commit 6440e67 predates it) yet the run never exceeded 29.7ms,
+so the prefetch was CHEAP there and the gap had to be config, not a regression.
+
+ROOT CAUSE: the canonical run is `rebrun.ps1 -PerfMode 60fps` (and quality/30fps/detail), and for ANY
+PerfMode != none it sets `VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH = 0` (rebrun.ps1:663, comment
+"speculative; not needed under best-available"; :741 "the aggressive prefetch is a net regression").
+It ALSO sets the real perf budgets: STREAMING_V2=1, MID_CLIPMAP_PUMP_HARD_BUDGET_MS=16,
+SURFACE_ASYNC_EXTRACTION=1 (8 workers), SURFACE_EXTRACTION_MAX_MS=4, async EXACT gen
+(GENERATION/VISIBLE/PREFETCH_LANE), async MID_CLIPMAP gen, SURFACE_UPLOAD_MIN_INTERVAL_FRAMES=3,
+SURFACE_ASYNC_MAX_APPLY_PER_FRAME=192, STATS_SINGLE_FLUSH=1, bgScale 0.3, etc. My buildbench used
+PerfMode=none (raw defaults: prefetch ON, no async budgets) -> UNREPRESENTATIVE. So "terrain surface
+prefetch is the editing dip" is TRUE only with PerfMode=none; in EVERY shipped PerfMode the prefetch
+is already off and the work is async/bounded. The RAY_BUDGET=192 / MAX_REQUESTS lever is MOOT for the
+ship path. Nothing prefetch-related committed (good -- the gate caught it before a commit).
+
+WHAT STILL STANDS: Loop 28 (committed 6c8e0c5, GPU producer sub-phase timers + the hostPrep finding,
+measured with DRAW=1 which is a real path) and Loop 29 (consolidate-GPU verdict). buildbench.ps1 /
+editsplit.ps1 are still useful harnesses but MUST be driven with the rebrun PerfMode env to be
+representative.
+
+Loop 31 target (NEXT): re-measure the editing + flythrough dips in the REAL ship config
+(rebrun.ps1 -PerfMode 60fps, and quality for the 120-target) -- add a PerfMode env block to
+buildbench.ps1 mirroring rebrun.ps1:654-745 -- then decompose the dip THERE (prefetch off, async
+budgets on) to find the actual dominant cost on the path the user runs. The 120fps goal is against
+that config, not raw defaults.
+
+## Loop 31 (Claude) -- REAL quality-config baseline; target = quality mode -> 120 (user-chosen)
+
+Added `-PerfMode quality` to buildbench.ps1 (mirrors rebrun.ps1:654-806 quality branch: prefetch OFF,
+render scale 1.0, full-res near+far/no background pass, async surface extraction 8 workers, async
+exact gen + async mid-clipmap gen, parallel visible pump 10 workers, GPU mid-voxel gen, 24ms budgets,
+upload every frame). Measured both recorded replays in this REAL ship config (visibleMissing=0 both):
+- FLYTHROUGH `mtns.rec`: max body 33.99ms (~near the committed 97fps/max-29.7 baseline). Essentially
+  fine; pushing it to 120 (8.3ms) is a smaller separate effort. NOT the problem.
+- EDITING `mtns_edit.rec`: rawMs p50=93.7 p90=246.6 p99=423.1 max=778.8ms. THIS is the real dip
+  (down to ~1.3fps on the heaviest edit-burst frames 360-394).
+
+ACCOUNTING GOTCHA (important): on heavy frames `body` (778) > `rawMs` (392) -- the PERF_FRAME_END
+phase sums DOUBLE-COUNT async-worker time, so `body` is NOT wall-clock. Gate on rawMs / the gaps.
+Worst frame 382: rawMs=392, gap `postWait=333.96` (= 85% of the frame). postWait brackets the ENTIRE
+sparse-update region (main_launcher.cpp 14642..20139, perfGapStart..perfPostWaitGapMs). Within it the
+heavy terms on edit-burst frames are MAIN-THREAD: `MIDMESH_SELFTIME buildMs` up to 229ms (the edit
+re-extraction BuildMidHeightSurfaceSnapshot) + sparsePost `midUpload` up to 245ms (mid-mesh face GPU
+upload) ; `surfExtract` ~60-94ms is the async surface mesher (worker pool, likely not main-thread
+critical path). The sparse REQUEST (hierarchy/terrainCritical) is NOT the dip here (top spike 59ms,
+prefetch off) -- correcting the Loop 30 artifact.
+
+So the genuine quality-mode editing dip is the MAIN-THREAD mid-mesh build + the mid-mesh upload during
+heavy edits -- the SAME costs the Loops 19-29 GPU campaign tried to move (and Loop 29 proved GPU
+promotion can't net out). The open lever: the rebrun config already made surface extraction / exact
+gen / mid-clipmap gen ASYNC (off the main thread) -- is the mid-mesh build+upload still SYNCHRONOUS on
+the main thread, and can it be made async/incremental the same way (the clean CPU-async producer, not
+the GPU one), or reduced? That is Loop 32.
+
+## Loop 32 (Claude + layer) -- dirty-region splice: 4.5x steady win, PROVEN bit-identical, but a tail regression blocks it
+
+Layer workflow (loop32-editdip, 3/5 agents -- 2 rate-limited, verdict still high-conf) + my empirical
+A/B CONVERGED on the lever and the cost split. The quality-mode editing dip is co-equal MAIN-THREAD
+CPU build (~229ms BuildMidHeightSurfaceSnapshot, main_launcher.cpp:17266) + GPU upload (~245ms
+StageDirtyPayloadSnapshot+EmitCopy on the single DIRECT queue); surfExtract ~70ms is off-thread.
+
+LEVER A/B (buildbench.ps1 -PerfMode quality, mtns_edit.rec, env-flippable on the committed binary):
+VENPOD_MIDMESH_DIRTY_REGION_EXTRACT=1 (computeRegionSpliceRect: re-mesh only the edit rect+halo when
+< half a tile, splice over cached faces; gated content-only by computeRegionKeysOk):
+  | metric (rawMs>90) | quality baseline | +DIRTY_REGION_EXTRACT |
+  | p50 | 93.69 | 22.83  (4.1x) |
+  | p90 | 246.60 | 43.61 (5.6x) |
+  | p99 | 423.11 | 95.04 (4.5x) |
+  | max | 778.83 | 1417.74 (WORSE) |
+  | buildMs max | 229.11 | 62.65 |
+
+CORRECTNESS GATE PASSED (decisive): VENPOD_MIDMESH_DIRTY_REGION_VALIDATE=1 run reached frame 683,
+replayed all 203 edits, used the splice (e.g. f258 used=4), and logged ZERO MIDMESH_DIRTYREGION_MISMATCH
+-> the spliced faces are BIT-IDENTICAL to a full re-extract. visibleMissing=0. No hole, no quality loss
+-- enforced by the binary (validator ships full-ref on any mismatch).
+
+BUT GROUND-TRUTH CAUGHT A REGRESSION THE CODE-ANALYSIS MISSED (the layer's "low risk / no regression"
+was wrong on the tail): the splice makes 6 frames WORSE (total +3867ms), e.g. frame 248 (first edit,
+9 bricks) 99.33ms -> 1417.74ms = 14x. At f248 the 1417ms is NOT in postWait (5.42), sparsePost (all
+<4ms), or buildMs (no MIDMESH_BUILDSPLIT emitted that frame) -- it is unaccounted, smelling of a
+first-use splice-scratch allocation or a cold-cache keyMis-fallback pathology (full-ref + splice
+attempt both paid). NET it saves ~47s across the run, but the "no dips" bar fails on a WORSE max.
+
+VERDICT: dirty-region splice is the right steady-state lever (4.5x p99, bit-identical) but NOT
+shippable as-is. Do NOT flip the default yet. Co-dominant UPLOAD (245ms) is untouched (splice still
+produces full tile.meshCacheFaces -> whole tile uploaded; region-upload scaffolding exists at
+VENPOD_MIDMESH_UPLOAD_REGION_BUDGET:3662 but the splice doesn't feed it a partial range).
+
+Loop 33 target: (1) root-cause + kill the 6-frame cold-cache/first-edit splice regression (find the
+unaccounted ~1400ms at f248), then (2) feed the splice's region face-range to the region-upload path
+to cut the co-dominant 245ms upload. Both gated by validate(zero-mismatch)+visibleMissing=0+rawMs A/B.
+Only after the max no longer regresses: flip VENPOD_MIDMESH_DIRTY_REGION_EXTRACT default 0->1.
+
+## Loop 33 CORRECTION (Claude) -- the "editing dip" AND the splice win were both MEASUREMENT CONTENTION
+
+THIRD artifact of the session, the worst one, caught by the no-blame discipline (clean re-run +
+multi-run + kill competing procs). Root-caused the splice's "6-frame regression": it was 100% in
+`gapPrev` (the inter-frame gap, body was small), and a clean re-run (q_drr2, full 723 frames/203
+edits) had ZERO hitches and rawMs p99=38/max=55. The hitches were NOT deterministic.
+
+The real cause: I had been running buildbench.ps1 WHILE the orchestration WORKFLOWS were active --
+their node subagent procs steal CPU cores, starving the engine's worker pools (8 surface workers +
+10 mid-pump workers + async gen). That inflated EVERY contaminated run. The decisive CLEAN A/B (killed
+all node/codex first, 2 runs each, no concurrent workflow):
+  | run (quality, mtns_edit.rec) | p50 | p99 | max | gapPrev>400 | visibleMissing |
+  | baseline #1 | 20.5 | 39.6 | 55.5 | 0 | 0 |
+  | baseline #2 | 21.3 | 47.9 | 63.5 | 0 | 0 |
+  | splice #1   | 20.3 | 43.5 | 66.0 | 0 | 0 |
+  | splice #2   | 20.4 | 40.6 | 60.8 | 0 | 0 |
+CLEAN flythrough (mtns.rec): p50=11.3-12.3, p99=37, max=107-128 (visibleMissing=0). The flythrough
+p50=11.3ms MATCHES the committed "97fps body p50 10.3ms" baseline -> proves the clean run is the real
+one and the contaminated runs (p99=423, max=778) were the artifact.
+
+CONSEQUENCES (honest):
+- The "editing dip p99=423 / max=778" of Loops 31-32 was CONTENTION, not the engine. REAL clean
+  editing = p50~20, p99~44, max~60. No catastrophic dips exist.
+- The dirty-region splice gives ~ZERO clean benefit (baseline approx= splice within run-to-run noise).
+  It is bit-identical+no-hole (Loop 32 correctness still valid) but NOT a perf lever here. Do NOT
+  flip its default. The "229ms buildMs / 245ms midUpload" decomposition was contention-inflated too.
+- Loop 28 (committed) is just behavior-inert instrumentation -> commit stands regardless.
+
+HARD RULE (added to method): perf A/B MUST run with NO competing CPU procs -- kill all node/codex and
+run no concurrent Workflow during a buildbench/editsplit measurement, because the engine is
+worker-pool-parallel and node subagents starve it. Use the orchestration layer for read-only ANALYSIS,
+never while a perf run is in flight. (ops.sh cleanup before every perf run.)
+
+REAL Loop 34 target (toward 120fps = 8.3ms, on the CLEAN quality baseline): editing steady p50=20ms
+(halve it) + the occasional max spikes (flythrough max 107-128ms, editing max 60ms). Decompose the
+CLEAN 20ms editing frame and the clean flythrough max-spike -- with NO workflow running during the
+measurement.
+
+## Loop 34 (Claude) -- CLEAN-baseline decomposition: balanced stack, partial GPU-bound, no single lever
+
+Decomposed the CLEAN editing frame (ab_base1, no contention) via PERF_BODYRECON (body = named-phases +
+gaps, bodyResidual ~0 = fully accounted). The frame is a BALANCED MIX, not one dominant cost:
+- `prep` (perfFramePrepMs, start-of-frame) ~5ms p50 steady.
+- sparse update (postWait bracket) ~3-5ms; sparsePost surfExtract ~1ms (async, cheap).
+- `fenceWait` = main thread blocking on the GPU present fence (commandQueue->WaitForFenceValue,
+  main_launcher.cpp:14628) -- INTERMITTENT: ~0ms on the median frame, spikes to ~17ms at p90/max. So
+  the GPU is the bottleneck on SOME frames (when the GPU falls behind), not steadily.
+- `renderSubmit` ~0.1ms (cheap CPU-side), present ~0.2ms.
+- overdrawRatio 3.6-3.8x (surface drawn ~3.7x/pixel -- a real GPU-side inefficiency).
+- body double-counts async worker time; rawMs is wall-clock.
+
+HONEST CONCLUSION: the long CPU campaign SUCCEEDED -- in the clean quality config the per-frame CPU
+work is small (prep 5 + sparse 5 + submit ~0.3) and there are NO catastrophic CPU dips (the 778ms was
+contention). The remaining gap from p50=20ms (editing)/11.5ms (flythrough) to 8.3ms (120fps) is a
+BALANCED stack: ~5ms prep + ~5ms sparse + intermittent GPU fence (0..17ms) + the GPU render itself
+(overdraw 3.7x). There is no single 80% lever; reaching 120 needs shaving the whole stack, and the
+GPU side (fence spikes + 3.7x overdraw) is now co-equal with CPU -- matching the user's "if CPU is
+exhausted, then GPU" path. This is a different, harder phase than the CPU-dip hunting of Loops 1-33.
+
+Candidate next levers (all need clean, no-contention A/B + no quality loss):
+- GPU overdraw 3.7x -> a depth pre-pass or front-to-back surface ordering cuts GPU fill with NO image
+  change (highest-EV no-quality-loss GPU lever; verify overdrawRatio drops + fenceWait p90 drops).
+- prep ~5ms (perfFramePrepMs, 14624) -- decompose what start-of-frame work it is; may be trimmable.
+- the intermittent fence spikes -- is the GPU genuinely saturated at full-res, or a sync/pacing issue?
+Loop 35: pick ONE, clean-A/B it (kill all node/codex first), gate on no-quality-loss + the metric.
+
+## Loop 35 (Claude + layer) -- GPU OVERDRAW is the next lever (user chose: quality->120 via overdraw pre-pass)
+
+Layer workflow (loop35-overdraw, 5 agents, HIGH conf) mapped the 3.7x overdraw: it is OPAQUE late-Z
+overdraw WITHIN the surface layer (NOT raymarch [already [earlydepthstencil]+stencil], NOT blending
+[surface PSO opaque]). Two surface raster streams -- exact near-surface + coarse mid-mesh -- both run
+the HEAVY PS_SparseSurface (Renderer.cpp:1027-1066) in arbitrary slot order under FORCED LATE-Z, so
+hidden fragments shade then fail depth. Late-Z is forced by: unconditional discard at
+PS_SparseSurface.hlsl:259 (live-erase) + :299 (water/submerged), a RenderOwnershipStats UAV
+InterlockedAdd :286 (UAV bound, VENPOD_SPARSE_RENDER_OWNERSHIP default 1), and NO [earlydepthstencil]
+(only PS_Raymarch has it). Compounded by VENPOD_SPARSE_MID_MESH_MIN_DISTANCE default 0.0 (mid
+co-covers the exact near band) + GPU cull appends draw args in arbitrary order.
+
+LEVER = DEPTH PRE-PASS (new code, NOT a hot-shader edit; PS_Raymarch -- the 7-min/TDR/driver-JIT cliff
+-- is untouched): depth-only pre-pass over the SAME surface streams reusing the EXACT compiled
+VS_SparseSurface (non-standard linear depth ndcDepth*viewZ -> EQUAL-compare valid only with the same
+VS), depthFunc=LESS+write+stencil REPLACE->1; then flip the shaded surface PSO (Renderer.cpp:1894-1906)
+to depthFunc=EQUAL, depthWriteMask=ZERO. Pre-pass PS must replicate the 3 discard predicates verbatim
+(else erased carves/water become opaque holes + stencil diverges). overdraw 3.7 -> ~1.0-1.2; net new
+work is a cheap vertex-bound+discard pass that dedups the heavy color PS. Wire behind a new env gate
+VENPOD_SPARSE_SURFACE_DEPTH_PREPASS for pixel-exact A/B.
+
+RISK: image-correctness (EQUAL-depth fragility -> SHARE the exact VS binary, no second VS; discard/
+stencil parity -> copy predicates verbatim, branchless). TDR/JIT LOW (doesn't touch PS_Raymarch).
+GATE (clean, no contention): overdrawRatio 3.7->~1.0-1.2 AND fenceWait-p90 drops AND native-1:1
+pixel-identical surface ACROSS MOTION + the 3 discard views (live carve / above+below water / mid-exact
+overlap band) AND visibleMissing=0 + stencil ownership stable.
+
+DE-RISK ORDER (verdict): FIRST the cull-side layer-split (env-flippable precursor:
+VENPOD_SPARSE_MID_MESH_MIN_DISTANCE = the exact RASTER_MAX_DISTANCE, removes the mid/exact co-cover
+overlap) -- measure overdraw + no-hole -- THEN implement the pre-pass. Loop 36 = the layer-split A/B;
+Loop 37 = the pre-pass (likely a Codex tandem build given it's serialized GPU render code).
+
+## Loop 36 (Claude) -- layer-split precursor is a DEAD END; median is CPU-bound, overdraw helps only the tail
+
+Clean A/B (no contention) of the env layer-split VENPOD_SPARSE_MID_MESH_MIN_DISTANCE=1024 on mtns.rec:
+- overdrawRatio 3.57 -> 2.43 (32% less GPU fill), visibleMissing=0 (exact already owned the near band).
+- BUT frame time got WORSE, reproducibly: baseline p50=11.3/p99=37/max=107 vs split run1
+  p50=13.2/p99=93/max=407, run2 p50=12.1/p99=59/max=155. The p50 is ~CPU-bound flat and the TAIL is
+  reliably worse (pushing mid-mesh out to 1024 adds mid re-streaming cost that outweighs the fill win).
+
+KEY REFRAMING (load-bearing for the GPU phase): the engine is NOT cleanly GPU-bound. fenceWait
+(GPU present-fence wait) is 0 on the MEDIAN frame and spikes only at p90/p99. So the MEDIAN frame time
+(11.3ms fly / 20ms edit) is CPU-BOUND -- cutting GPU overdraw does NOT speed the median (proven: 32%
+less overdraw, median unchanged/worse). Overdraw reduction can only help the GPU-bound TAIL frames
+(the dips). So:
+- The depth pre-pass (Loop 35 lever) is a "reduce the DIPS" lever (GPU-bound tail), NOT a "raise median
+  fps toward 120" lever. It is still worth doing for the no-dips goal -- and unlike the layer-split it
+  does NOT add streaming cost (both streams still render, just early-Z'd) -- but its ceiling is the
+  tail, not the median.
+- Reaching 120fps on the MEDIAN needs cutting the CPU-bound median (prep ~5 + sparse ~5 + render
+  submit/loop), which is DIFFUSE (Loop 34) -- broad micro-opt, no single 80% lever.
+
+HONEST STATE: the engine is well-optimized. The CPU campaign (Loops 1-34) removed the big CPU sinks
+and all the "dips" that turned out to be real were either contention artifacts or the GPU-bound tail.
+The remaining path to "120fps + no dips" is two separate, harder fronts: (a) depth pre-pass for the
+GPU-bound tail dips [substantial GPU render code, env-gated, pixel-exact gate], and (b) broad CPU
+micro-opt of the diffuse ~11-20ms median [no single lever]. Do NOT pursue the layer-split.
+
+## Loop 37 -- sparse surface depth pre-pass is implemented behind an OFF flag
+
+Implemented `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS` (default 0/OFF) for A/B only. OFF remains the current
+surface path: existing `PS_SparseSurface.hlsl`, one shaded draw over the surface streams, `LESS` depth,
+and depth writes. ON compiles `PS_SparseSurfaceDepthPrepass.hlsl`, creates a DSV-only pre-pass PSO that
+reuses the exact compiled `VS_SparseSurface` bytecode, draws the same exact + mid-mesh streams first with
+`LESS` + depth write + stencil `REPLACE -> 1`, then runs the shaded surface PSO as `EQUAL` + depth write
+zero. `PS_Raymarch.hlsl` is untouched.
+
+Tandem cross-check verdict: EQUAL-depth bit-safety passes because both PSOs share the same compiled VS
+and the pre-pass copy is made before flipping the shaded PSO to `EQUAL`; discard parity passes because
+the pre-pass PS contains only the live-erase and water/submerged discard predicates needed to match
+stencil/depth ownership, with no ownership UAV, palette, debug, or shading work.
+
+Next A/B with the flag ON: verify native 1:1 pixel parity across motion plus live carve / above-water /
+below-water / mid-exact overlap views, then measure overdrawRatio and GPU fenceWait p90/p99. Expected win
+is tail/dip reduction, not median FPS, per Loop 36.

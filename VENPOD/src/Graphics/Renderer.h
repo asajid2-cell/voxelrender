@@ -40,6 +40,7 @@ struct RendererConfig {
     bool backgroundPassCompositeForceColor = false;
     bool midPassEnabled = false;
     float midPassScale = 0.5f;
+    bool sparseSurfaceDepthPrepass = false;
 };
 
 class Renderer {
@@ -310,6 +311,7 @@ private:
     DX12GraphicsPipeline m_midPassPipeline;
     DX12GraphicsPipeline m_dagRaymarchPipeline;
     DX12GraphicsPipeline m_sparseSurfacePipeline;
+    DX12GraphicsPipeline m_sparseSurfaceDepthPrepassPipeline;
     DX12GraphicsPipeline m_overlayPipeline;
     DX12GraphicsPipeline m_backgroundCompositePipeline;
     DX12GraphicsPipeline m_midCompositePipeline;
@@ -320,6 +322,7 @@ private:
     CompiledShader m_dagRaymarchPS;
     CompiledShader m_sparseSurfaceVS;
     CompiledShader m_sparseSurfacePS;
+    CompiledShader m_sparseSurfaceDepthPrepassPS;
     CompiledShader m_overlayPS;
     CompiledShader m_backgroundCompositePS;
     CompiledShader m_midCompositePS;

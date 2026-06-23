@@ -1093,6 +1093,8 @@ int RunSandbox(int argc, char* argv[]) {
         ReadFloatEnv("VENPOD_RAYMARCH_MID_PASS_SCALE", 0.5f),
         0.25f,
         2.0f);
+    const bool sparseSurfaceDepthPrepass =
+        ReadUIntEnv("VENPOD_SPARSE_SURFACE_DEPTH_PREPASS", 0u) != 0u;
     spdlog::info(
         "RAYMARCH_FLOOR_CONFIG renderScale={:.3f} output={}x{} preset={} explicitScale={}",
         raymarchRenderScale,
@@ -1154,6 +1156,7 @@ int RunSandbox(int argc, char* argv[]) {
     rendererConfig.backgroundPassCompositeForceColor = backgroundPassCompositeForceColor;
     rendererConfig.midPassEnabled = midPassEnableRequested;
     rendererConfig.midPassScale = midPassScale;
+    rendererConfig.sparseSurfaceDepthPrepass = sparseSurfaceDepthPrepass;
 
     // Find shader path
     std::filesystem::path exeDir = GetExecutableDirectorySandbox();
