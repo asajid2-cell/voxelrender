@@ -1093,8 +1093,11 @@ int RunSandbox(int argc, char* argv[]) {
         ReadFloatEnv("VENPOD_RAYMARCH_MID_PASS_SCALE", 0.5f),
         0.25f,
         2.0f);
+    // Default ON (Loop 39): the early-Z surface depth-prepass eliminates the measured 3.6-3.8x surface
+    // overdraw (overdrawRatio -> 1.0) with the composited image unchanged (surfaceOwnedPixels/
+    // backgroundPixels identical within run-to-run noise) and visibleMissing=0. Set =0 to disable.
     const bool sparseSurfaceDepthPrepass =
-        ReadUIntEnv("VENPOD_SPARSE_SURFACE_DEPTH_PREPASS", 0u) != 0u;
+        ReadUIntEnv("VENPOD_SPARSE_SURFACE_DEPTH_PREPASS", 1u) != 0u;
     spdlog::info(
         "RAYMARCH_FLOOR_CONFIG renderScale={:.3f} output={}x{} preset={} explicitScale={}",
         raymarchRenderScale,

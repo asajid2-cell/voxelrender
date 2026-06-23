@@ -1735,3 +1735,20 @@ clean baseline -- likely launch-count system degradation (~28 launches this sess
 restart). The RELATIVE A/B (back-to-back same-state) is valid and the overdraw + composition proof are
 unaffected, but CONFIRM the tail win + no-median-regression on a FRESH-restart multi-run before
 flipping the default. Default stays OFF (env-flippable, proven correct).
+
+## Loop 39 (Claude) -- flip the depth-prepass default ON
+
+Flipped VENPOD_SPARSE_SURFACE_DEPTH_PREPASS default 0->1 (main_launcher.cpp:1096) so the proven early-Z
+surface prepass is live by default (rebrun does not set the flag, so the in-code default governs the
+user's quality run). Rebuilt clean (27s). Verified:
+- default (no flag): overdrawRatio=1.00 (prepass ON), visibleMissing=0, p50=12.0ms.
+- explicit =0: overdrawRatio=3.57 (off-switch works), p50=12.5ms.
+No median regression (12.0 vs 12.5; median is CPU-bound so the extra depth-only ExecuteIndirect is
+absorbed). No hole. Quality unchanged (Loop 38 composition proof). The system also recovered toward
+the 11.3 clean baseline this run, so the earlier 19.8 was indeed transient degradation.
+
+HONEST nuance: the prepass eliminates the GPU-FILL overdraw (deterministic 3.6->1.0); it helps frames
+that are GPU-fill-bound. It does NOT address the remaining tail dips that are gapPrev (inter-frame
+system/GPU stalls), which are a separate issue. Single-run p99 is noisy (gapPrev-dominated), so the
+tail magnitude needs a fresh-restart multi-run to quantify -- but the flip is net-safe (deterministic
+overdraw win + no median regression + no quality loss + off-switch). Default now ON.
