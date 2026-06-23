@@ -2099,3 +2099,28 @@ Loop 54 = scope the CPU->GPU planning-sample offload (the median lever) via the 
 HeightAt-driven systems (PlanViewCone / UpdateVoxelInterest / readiness) are bulk-parallel enough to
 move to a GPU compute pre-pass, what feeds back to CPU control flow, and the no-quality-loss/no-hole
 contract. This is the real path to the 120fps median against the idle GPU.
+
+## Loop 54-55 (Claude + layer) -- FIRST REAL MEDIAN WIN: interest frequency-cut, +13% median, no quality loss
+
+Layer scoping (loop54-gpu-offload) skeptically CORRECTED the Loop 53 GPU-offload framing: of the 4
+PROF_CALLERS, only UpdateVoxelInterest is a real per-frame HeightAt consumer, and its sampling is
+already ~0.04ms -- the cost is CPU candidate-set BOOKKEEPING (quotas/anchors/dedup/scoring) that NO GPU
+pass can offload. GPU offload = a wash (control-flow samples, same-frame readback = a rejected
+fork-join stall). The real median bottleneck = the per-frame UpdateVoxelInterest rebuild, which the
+QUALITY preset deliberately forces every frame (rebrun.ps1:778 MID_INTEREST_INTERVAL=1) while disabling
+the already-built signature-reuse short-circuits (rebrun.ps1:782-787 gated `if (-not $quality)`).
+
+ENV A/B (clean, mtns.rec quality): enabling MID_INTEREST_INTERVAL=2 + FOOTPRINT_INTEREST_SIGNATURE=1 +
+VOXEL_INTEREST_SIGNATURE_REUSE=1 (the signature-reuse early-out, SparseClipmap.cpp:4561-4571):
+- interest rebuild 6.26ms -> 1.68ms (-73%). rawMs p50 18.9 -> 16.4 (-13%, 53->61fps). p99 49.0 -> 42.7.
+NO-QUALITY-LOSS GATE PASSED (degradation-immune, full replay incl. fast-yaw): missing max=0 +
+residentMissingSurface max=0 BOTH configs (no hole, no under-coverage); ready bricks median 503 -> 535
+(iv_on has MORE coverage, not less -- freed CPU let more bricks finish). The staler-interest
+leading-edge risk did NOT materialize; the prefetch margin held. Maintainer notes corroborate
+(interval "+3fps no visual difference"; reuse "+8fps no recenter bursts").
+
+ACTION: flip the rebrun.ps1 quality preset to enable these (config-only, no code, revertible). This is
+the real path the user sensed -- the median was CPU-bound on a redundant per-frame rebuild the quality
+preset had pessimized. Residual: a visual confirm under sustained fast-yaw is the ideal final check
+(capture harness is flaky; cleanest is a live fast-yaw look), but the quantitative no-hole + coverage
+gate is strong + maintainer-validated.

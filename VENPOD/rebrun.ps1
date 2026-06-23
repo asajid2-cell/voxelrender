@@ -774,17 +774,18 @@ try {
         }
         # Mid interest set is rebuilt EVERY frame (interestInterval=1) -- a big chunk of
         # 'clip'. Amortize it across frames (camera moves smoothly, the set barely changes
-        # frame-to-frame). quality keeps 1 for max responsiveness.
-        $midInterestInterval = if ($quality) { "1" } elseif ($PerfMode -eq "60fps") { "2" } else { "2" }
+        # frame-to-frame). Loop 54: quality=2 too -- the per-frame rebuild was a redundant CPU cost
+        # against a 94%-idle GPU. A/B: interest 6.26->1.68ms, median 18.9->16.4ms (-13%), missing=0 +
+        # residentMissingSurface=0 + MORE ready bricks across the full mtns.rec fast-yaw replay.
+        $midInterestInterval = if ($quality) { "2" } elseif ($PerfMode -eq "60fps") { "2" } else { "2" }
         $env:VENPOD_SPARSE_MID_INTEREST_INTERVAL = $midInterestInterval
         # Interest SIGNATURE REUSE: skip the mid interest rebuild when the camera footprint
-        # is unchanged (a big chunk of 'clip'). Verified +8fps, no recenter bursts.
-        if (-not $quality) {
-            $env:VENPOD_SPARSE_MID_CLIPMAP_FOOTPRINT_INTEREST_SIGNATURE = "1"
-            $env:VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE = "1"
-            # (Extending REUSE_MAX_AGE was tried + reverted: longer reuse caused bigger
-            # catch-up bursts -> MORE fps variance. Default age is steadier.)
-        }
+        # is unchanged (a big chunk of 'clip'). Verified +8fps, no recenter bursts. Loop 54: enabled
+        # for quality too (A/B above: no hole, no under-coverage on the fast-yaw replay).
+        $env:VENPOD_SPARSE_MID_CLIPMAP_FOOTPRINT_INTEREST_SIGNATURE = "1"
+        $env:VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE = "1"
+        # (Extending REUSE_MAX_AGE was tried + reverted: longer reuse caused bigger
+        # catch-up bursts -> MORE fps variance. Default age is steadier.)
         # Low-res far/background raymarch (the GPU win); near terrain stays full-res.
         # quality mode disables it for a sharp full-res horizon.
         if ($useBgPass) {
