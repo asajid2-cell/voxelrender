@@ -1948,3 +1948,39 @@ RECOMMENDATION: the engine is well-optimized. Further 120fps progress = either (
 micro-opt grind (low yield/step, noise-limited measurement) or (b) a bigger architectural rework
 (genuine multi-queue async-submit, or GPU-side edit-extraction) that is a multi-loop project, not a
 bounded loop. The single-lever loop has done its job.
+
+## Loop 47 addendum / Loop 48 lever (Claude) -- PROF_TOP found a real leading lever, not pure diffuse
+
+Correcting Loop 47: the clean PROF_TOP (725 samples, steady-state self-time) is NOT flatly diffuse --
+it has a leading cluster: NtWaitForSingleObject 19.9% (main-thread sync wait on async workers/present,
+not CPU work), then TERRAIN GEN ~18.7% = HeightAtUncached 7.7% + ValueNoise2D 4.4% + HeightAt 4.3% +
+ComputeOccupancyAndFlags 1.5% + CachedTerrainHeightAt 0.8%. RtlCreateUnicodeString 5.8% (logging,
+partly bench LOG_INTERVAL=1 artifact). Then ExtractRegion 3.4%, coord-hash _Find 3.6%, heap 4.3%.
+
+THE LEVER: HeightAtUncached at 7.7% is the #1 real-CPU function -- a CACHE-MISS path being top means
+the HeightAt memo (added earlier) misses heavily on the edit re-extraction path. Loop 48 = find why
+(edit re-extract samples cold/new columns? cache too small? poor key locality?) and improve the hit
+rate / pre-warm, cutting the 7.7% (+ the ValueNoise2D it calls). Highest-yield single CPU lever on the
+editing median. Gate on degradation-immune signals: HeightAtUncached sample-% drop in a clean re-prof,
+multi-run rawMs median, brick-count parity, no quality change.
+
+## Loop 48 (Claude) -- terrain-gen lever sized: real but a MICRO-OPT; 120fps needs a rework, not a lever
+
+Sized the PROF_TOP leading lever. HeightAtUncached (7.7% of the ~20ms editing median = ~1.5ms; the
+whole terrain-gen cluster ~18.7% = ~3.7ms). The memo (SparseTerrainGenerator.cpp:25-67) is a 262144-
+slot DIRECT-MAPPED THREAD-LOCAL cache. On edits + forward camera motion the misses are predominantly
+COLD (new columns revealed), not collisions -> set-associativity wouldn't help; only pre-warm / fewer
+redundant calls (SurfaceRelief samples 4 neighbors/column) / cross-worker cache sharing would, all
+uncertain ~sub-ms wins that this desktop's perf noise can't cleanly measure.
+
+FINAL HONEST ASSESSMENT of the 120fps goal:
+- The editing median ~20ms / flythrough ~16ms breaks down (clean PROF_TOP) as ~20% async-sync wait
+  (NtWaitForSingleObject -- the best-available worker pipeline) + ~18.7% terrain gen + ~5.8% logging
+  (ship-config-lower) + a long diffuse tail (heap, hashes, extraction, stats). To reach 8.3ms you must
+  cut ~12ms -- which means attacking the async-pipeline sync AND terrain gen AND the diffuse tail
+  together. There is NO single lever that gets there; the biggest one (terrain gen) is ~3.7ms.
+- The single-lever orchestrator loop has CONVERGED. It delivered the one real architectural win (early-
+  Z prepass) and proved the rest is either measurement artifact (5 caught) or a well-optimized diffuse
+  floor. Further median progress = a FUNDAMENTAL REWORK (true multi-queue async submit + GPU-side
+  edit-extraction + frame-structure overhaul), a multi-loop project, OR accept the current
+  well-optimized state. Not a bounded single-lever loop.
