@@ -1752,3 +1752,24 @@ that are GPU-fill-bound. It does NOT address the remaining tail dips that are ga
 system/GPU stalls), which are a separate issue. Single-run p99 is noisy (gapPrev-dominated), so the
 tail magnitude needs a fresh-restart multi-run to quantify -- but the flip is net-safe (deterministic
 overdraw win + no median regression + no quality loss + off-switch). Default now ON.
+
+## Loop 40 (Claude) -- editing median = diffuse main-thread prep; confirms the diffuse-CPU conclusion
+
+Decomposed the CLEAN editing frame (PERF_BODYRECON): median is prep=9.56ms (vs ~5ms flythrough),
+fence=0 on the median (CPU-bound) spiking to ~14ms at p90 (GPU tail). The mid-mesh build (MIDMESH_
+SELFTIME buildMs p50=8.74, p90=48, max=64) fires on only ~32 of ~670 frames AND runs on the quality
+config's async worker pool, so it is OFF the main-thread critical path -- which is why the Loop 32
+dirty-region splice (proven bit-identical) gave zero clean FRAME-TIME benefit (it cuts worker time,
+not rawMs). So the editing median is the DIFFUSE pre-fence edit pipeline (input/brush/sparse-request/
+generation/residency), no single 80% lever -- same conclusion as the flythrough prep (Loop 34).
+
+SESSION CONCLUSION (honest): the engine is well-optimized. The long CPU campaign removed the big CPU
+sinks; the per-frame CPU work is now diffuse main-thread prep (flythrough ~5ms, editing ~9.6ms) with
+no single dramatic lever, plus an intermittent GPU fence tail. The two real, measured wins this
+session were: (1) catching that the "778ms editing dips" were MEASUREMENT CONTENTION (not the engine),
+and (2) the SHIPPED early-Z surface depth-prepass (Loops 37-39, default ON) that eliminates the
+3.6-3.8x surface overdraw with zero quality loss. Reaching a true 120fps MEDIAN from here is a broad
+incremental micro-opt grind of the diffuse prep (each piece ~sub-ms), not a single lever -- best done
+as targeted prep-region instrumentation + per-piece A/B on a clean system, accepting diminishing
+returns. The dips that were ever real are the GPU-fill (now prepass-addressed) + occasional gapPrev/
+streaming spikes.
