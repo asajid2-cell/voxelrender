@@ -1790,3 +1790,21 @@ FINAL (tested): the engine is well-optimized. Real session wins = the SHIPPED ea
 (default ON, -2.6x surface overdraw, zero quality loss) + catching that the dramatic "dips" were
 measurement contention. The CPU median is genuinely diffuse: the top lever is 0.2ms, so closing the
 ~12ms (flythrough) / ~21ms (editing) -> 8.3ms gap is a long tail of sub-ms micro-opts, not a lever.
+
+## Loop 42 (Claude) -- clean tail dips = gapPrev GPU-pacing stalls; LOOP CONVERGED
+
+The worst CLEAN flythrough dips (max 107ms @ frames 270-271) are gapPrev=93.93ms (inter-frame stall),
+body normal at 12.89ms, no streaming/recenter event -- i.e. the GPU falls behind on a burst and the
+main thread stalls at present. These are full-res GPU-pacing stalls; the shipped prepass helps them
+(less surface fill -> smaller GPU bursts) but full-res render scale 1.0 is the quality floor (lowering
+it = the forbidden quality loss).
+
+CONVERGENCE (both fronts characterized + the top levers tested):
+- 120fps MEDIAN: diffuse main-thread prep; top lever (interest signature reuse) tested = 0.2ms. A long
+  tail of sub-ms micro-opts, no dramatic lever. Below the diminishing-returns + measurement-noise floor.
+- NO DIPS: the real dips are (a) GPU-fill -- SHIPPED prepass addresses it; (b) gapPrev GPU-pacing at
+  full-res -- bounded by the quality floor; (c) the "dramatic" 778ms dips were measurement contention,
+  not real.
+The meaningful levers are exhausted: GPU mid-mesh promotion proven dead (Loop 29), CPU big sinks gone
+(diffuse), the one clean no-quality-loss GPU lever (surface overdraw) SHIPPED. Remaining progress is a
+sub-ms grind or quality tradeoffs (forbidden). The loop has converged on a well-optimized engine.
