@@ -2255,3 +2255,24 @@ Verification: `_agent_build.bat` completed cleanly (only pre-existing `rayDir` s
 not reach frame exit: the launched VENPOD process remained unresponsive before runtime log output and
 was stopped after a bounded wait. No new device-hung/TDR event was found during that smoke window; older
 nvlddmkm watchdog entries predated this change.
+
+## Loop 59 (Codex 12ba7e2 + Claude A/B) -- FarSvo probe-skip is a WASH; raymarch dips are ~inherent
+
+Codex added VENPOD_FAR_SVO_STEP_QUALITY_GATE (default 0.92 inert; PS_Raymarch:3772 threshold env-fed via
+surfaceRasterParams.z; the PS_Raymarch edit forces the ~7-min uber-shader recompile on first run = the
+"hang" -- prime the shader cache with one warmup run, then A/B is normal speed).
+A/B (mtns.rec quality, cache primed, valid GPU timing):
+- gate=0.92 (probe on):  raymarchMs p99=31.8 max=195  frames>30ms=7  >50ms=2  visibleMissing=0
+- gate=1.1 (probe off):  raymarchMs p99=35.9 max=124  frames>30ms=13 >50ms=3  visibleMissing=0
+The probe-skip TRADES the single worst grazing spike (195->124) for MORE moderate spikes (7->13 frames
+>30ms; p99 32->36). The FarSvoSuggestedStep empty-space-skip is doing its job on most spike frames --
+removing it nets NEUTRAL-to-WORSE. DO NOT FLIP. Env kept inert (committed, for future experiments).
+(Median rawMs unaffected by the gate: raymarchMs median=0 both -> the gate only touches the ~1.5% of
+frames with far terrain to march; the p50 noise (15.4 vs 18.2) is system variance, not the lever.)
+
+CONCLUSION on the DIPS: the raymarch spikes are ~7 of 466 frames (~1.5%), grazing/low-angle horizon
+views where full-res far rays march far (30-195ms). This is largely the INHERENT cost of quality mode's
+full-res sharp far horizon (render scale 1.0, bg-pass OFF). The probe already optimizes it; the rejected
+alternatives (mid-mesh-far-reach WORSENS; bg-pass = quality downscale) confirm there is no free dip
+lever. Cutting these further at full quality needs a TEMPORAL far-field reprojection/amortization (a
+real multi-loop project, reprojection-artifact risk) or accepting the occasional grazing-view stutter.
