@@ -1346,3 +1346,60 @@ Loop 28 pick:
   per-slot edit/cull inputs prepared incrementally or on a worker, then submit a prebuilt isolated-queue
   batch from the main thread with O(tiles) lightweight command recording only after proving the submit
   path has sub-millisecond main-thread cost. After that, reapply the Loop 26 CPU build-skip.
+
+## Loop 28 (Claude, orchestration-layer measurement; instrumentation flag-gated, ready to commit)
+
+Ran via the new dynamic-workflow + tandem orchestration layer (`tandem/workflows/perf-loop.mjs`):
+parallel-Claude diagnose -> Codex implement (build-timeout, left a correct in-tree change) ->
+parallel adversarial verify. Diagnose's lever (correct, high-leverage): the campaign chased a single
+coarse `midUpload` bracket; before building another async-prep scheduler (Loop 27 burned + reverted
+one), SPLIT the bracket. Added flag-gated producer sub-phase timers
+(`VENPOD_MIDMESH_GPU_PROD_PHASE_TIMERS`, default OFF): `hostPrep / recordSubmit / producerWait`
+(`producerWaitUs` threaded out via the existing `MidMeshGpuExtractB13aStats` struct, no dispatch
+signature change). New harness `scripts/editsplit.ps1` drives the REAL `mtns_edit.rec` (the smoke
+harness only ran a synthetic walk where the producer goes idle after frame 20 -- which is why every
+prior measurement, including Loop 27's, mis-read the producer behavior).
+
+THE DECISIVE MEASUREMENT (mtns_edit.rec, DRAW=1, validation OFF, timers ON, ms):
+- STARTUP/fly-in frames are producerWait-dominant -- frame 0 `46.23/34.55/230.78` (coarse 353),
+  frame 20 `3.69/10.74/151.68`. This is the GPU fence wait on initial generation. It is NOT the
+  editing dip; earlier reasoning that fixated on it (incl. the workflow verify's walk-scenario
+  frame 20/539) was measuring the wrong frames.
+- EDIT-SPIKE frames INVERT completely -- hostPrep dominates, producerWait ~= 0:
+  | frame | coarse midUpload | hostPrep | recordSubmit | producerWait |
+  | 400 | 159.25 | 141.23 | 1.49 | 0.00 |
+  | 622 | 183.83 | 162.12 | 1.33 | 0.00 |
+  | 642 | 196.86 | 173.02 | 1.29 | 0.00 |
+  | 666 | 270.94 | 237.25 | 1.54 | 0.00 |
+  | 686 | 140.86 | 113.95 | 0.68 | 0.00 |
+  Split sums to ~87-88% of the coarse bracket (frame 666: 238.8 of 270.9; ~32ms remainder lives in
+  the per-tile skip iteration / readback poll / removeGpuDrawCommit outside the three brackets).
+
+WHAT hostPrep IS (validation confirmed OFF, so NOT the cpuRefFaces copy): the per-tile input gather
+(`MidMeshTileCullBlockMaskBySlot` + `MidMeshTileEditBoxesBySlot`) PLUS the dispatch's host-side GPU
+input upload + command recording -- everything in the production region EXCEPT the carved-out
+`cpuSubmitUs` (~152us) and `producerWaitUs`. It is all CPU work on the main thread.
+
+THE CAMPAIGN-DEFINING IMPLICATION:
+- On edit frames the GPU producer's main-thread prep is ~237ms vs the ~72ms CPU build it replaces
+  (Loop 26 `buildMs=80.69`). GPU promotion is net-NEGATIVE (~3x worse) on edits as currently
+  structured -- this is the real root of Loop 27's "459ms frame-critical".
+- BUT the Loop 28-pick precondition IS now proven: the SUBMIT path is sub-millisecond
+  (`recordSubmit`/`cpuSubmitUs` ~152us-1.5ms). So the viable Loop 29 path is precisely targeted: move
+  the ~237ms hostPrep (gather + GPU upload + command recording) off the main thread to a worker, leave
+  only the ~152us submit on the frame-critical path; results land via the existing fence-async
+  ownership (no hole). OPEN QUESTION gating Loop 29: thread-safety / feasibility of off-thread per-tile
+  gather (reads the clipmap tile cache) + off-thread D3D12 command recording (separate allocator/list).
+  If infeasible, the honest call is to CONSOLIDATE the GPU foundation and attack the 72ms CPU build
+  directly (the editing dip is a CPU-build cost; the GPU path cannot beat it while prep is synchronous
+  on the main thread).
+
+Gates (timer instrumentation): no-hole `visibleMissing=0` every frame both flags; bit-equal flag-OFF
+vs ON dispatch sequence (workflow verify, diff=0); builds clean; timers-OFF ran clean to all 791
+frames (the frame-173 STACK_BUFFER_OVERRUN on one timers-ON run did NOT reproduce -- nondeterministic
+known teardown instability, also seen by the verify at frame 275, not the timer code). Behavior-inert
+(default-OFF flag, only effect is reading already-stored timers into accumulators). Ready to commit as
+a durable diagnostic.
+
+Loop 29 decision (next): resolve the OPEN QUESTION above via deep analysis (off-thread feasibility of
+the ~237ms hostPrep) before any implementation -- run it through the orchestration layer.

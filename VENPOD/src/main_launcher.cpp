@@ -3171,6 +3171,9 @@ int RunSandbox(int argc, char* argv[]) {
         sparseMidMeshGpuExtract &&
         (ReadUIntEnv("VENPOD_MIDMESH_GPU_EXTRACT_PRODUCTION", 0u) != 0u ||
          sparseMidMeshGpuDraw);
+    const bool sparseMidMeshGpuProdPhaseTimers =
+        sparseMidMeshGpuExtractProduction &&
+        ReadUIntEnv("VENPOD_MIDMESH_GPU_PROD_PHASE_TIMERS", 0u) != 0u;
     // The B1.3a..f-d top-face path reuses the smoke compute side (queue/fence/readback ring),
     // so the smoke compute objects must be stood up whenever ANY path is enabled. B1.3b-f-d
     // share the B1.3a top-face PSO, so they also need the B1.3a init to run.
@@ -5236,6 +5239,9 @@ int RunSandbox(int argc, char* argv[]) {
     float perfSparseBrickUploadMs = 0.0f;
     float perfSparsePublishMs = 0.0f;
     float perfSparseMidUploadMs = 0.0f;
+    float perfSparseMidUploadHostPrepMs = 0.0f;
+    float perfSparseMidUploadRecordSubmitMs = 0.0f;
+    float perfSparseMidUploadProducerWaitMs = 0.0f;
     float perfSparseStatsFlushMs = 0.0f;
     float perfSparseSurfaceExtractMs = 0.0f;
     float perfSparseSurfacePlanMs = 0.0f;
@@ -6434,6 +6440,9 @@ int RunSandbox(int argc, char* argv[]) {
         perfSparseBrickUploadMs = 0.0f;
         perfSparsePublishMs = 0.0f;
         perfSparseMidUploadMs = 0.0f;
+        perfSparseMidUploadHostPrepMs = 0.0f;
+        perfSparseMidUploadRecordSubmitMs = 0.0f;
+        perfSparseMidUploadProducerWaitMs = 0.0f;
         perfSparseStatsFlushMs = 0.0f;
         perfSparseSurfaceExtractMs = 0.0f;
         perfSparseSurfacePlanMs = 0.0f;
@@ -17538,6 +17547,9 @@ int RunSandbox(int argc, char* argv[]) {
                                 return promoted;
                             };
                             auto drainProductionPolls = [&]() {
+                                const uint64_t hostPrepStart = sparseMidMeshGpuProdPhaseTimers
+                                    ? SDL_GetPerformanceCounter()
+                                    : 0u;
                                 while (midMeshGpuExtractResources.PollB13aReadback()) {
                                     const auto& st = midMeshGpuExtractResources.GetB13aStats();
                                     if (!st.productionOutput) {
@@ -17584,6 +17596,22 @@ int RunSandbox(int argc, char* argv[]) {
                                         st.abMultiplicityMismatches, st.gpuStatusOverflow,
                                         eq ? 1 : 0, validationCompared ? 1 : 0);
                                 }
+                                if (sparseMidMeshGpuProdPhaseTimers) {
+                                    perfSparseMidUploadHostPrepMs +=
+                                        ticksToMs(SDL_GetPerformanceCounter() - hostPrepStart);
+                                }
+                            };
+                            auto timedProductionQueueIdle = [&]() {
+                                const uint64_t waitStart = sparseMidMeshGpuProdPhaseTimers
+                                    ? SDL_GetPerformanceCounter()
+                                    : 0u;
+                                const bool idle =
+                                    midMeshGpuExtractResources.ProductionQueueIdle();
+                                if (sparseMidMeshGpuProdPhaseTimers) {
+                                    perfSparseMidUploadProducerWaitMs +=
+                                        ticksToMs(SDL_GetPerformanceCounter() - waitStart);
+                                }
+                                return idle;
                             };
 
                             drainProductionPolls();
@@ -17625,12 +17653,26 @@ int RunSandbox(int argc, char* argv[]) {
                                         continue;
                                     }
                                     if (sparseMidMeshGpuDrawDirect &&
-                                        !midMeshGpuExtractResources.ProductionQueueIdle()) {
+                                        !timedProductionQueueIdle()) {
                                         ++prodQueueBusySkipped;
                                         ++prodSkipped;
                                         continue;
                                     }
                                 }
+
+                                const uint64_t prodHostPrepStart = sparseMidMeshGpuProdPhaseTimers
+                                    ? SDL_GetPerformanceCounter()
+                                    : 0u;
+                                float producerWaitInsideHostPrepMs = 0.0f;
+                                auto finishProdHostPrep = [&](float subtractMs = 0.0f) {
+                                    if (!sparseMidMeshGpuProdPhaseTimers) {
+                                        return;
+                                    }
+                                    const float elapsedMs =
+                                        ticksToMs(SDL_GetPerformanceCounter() - prodHostPrepStart);
+                                    perfSparseMidUploadHostPrepMs +=
+                                        std::max(0.0f, elapsedMs - subtractMs);
+                                };
 
                                 std::vector<Simulation::SparseSurfaceFace> cpuRefFaces;
                                 if (productionFaceValidation) {
@@ -17642,6 +17684,7 @@ int RunSandbox(int argc, char* argv[]) {
                                         if (sparseMidMeshGpuDraw) {
                                             removeGpuDrawCommit(tile.slot);
                                         }
+                                        finishProdHostPrep();
                                         ++prodSkipped;
                                         continue;
                                     }
@@ -17667,17 +17710,31 @@ int RunSandbox(int argc, char* argv[]) {
                                         "[GPU_EXTRACT_PROD] tile slot {} has {} edit boxes "
                                         "> cap {}; skipping (raise editBoxCapacityPerTile)",
                                         tile.slot, tileEditTotal, editBoxCap);
+                                    finishProdHostPrep();
                                     continue;
                                 }
 
-                                if (sparseMidMeshGpuDrawDirect &&
-                                    !midMeshGpuExtractResources.ProductionQueueIdle()) {
-                                    if (sparseMidMeshGpuDraw) {
-                                        removeGpuDrawCommit(tile.slot);
+                                if (sparseMidMeshGpuDrawDirect) {
+                                    const uint64_t waitStart = sparseMidMeshGpuProdPhaseTimers
+                                        ? SDL_GetPerformanceCounter()
+                                        : 0u;
+                                    const bool productionQueueIdle =
+                                        midMeshGpuExtractResources.ProductionQueueIdle();
+                                    if (sparseMidMeshGpuProdPhaseTimers) {
+                                        producerWaitInsideHostPrepMs =
+                                            ticksToMs(SDL_GetPerformanceCounter() - waitStart);
+                                        perfSparseMidUploadProducerWaitMs +=
+                                            producerWaitInsideHostPrepMs;
                                     }
-                                    ++prodQueueBusySkipped;
-                                    ++prodSkipped;
-                                    continue;
+                                    if (!productionQueueIdle) {
+                                        if (sparseMidMeshGpuDraw) {
+                                            removeGpuDrawCommit(tile.slot);
+                                        }
+                                        finishProdHostPrep(producerWaitInsideHostPrepMs);
+                                        ++prodQueueBusySkipped;
+                                        ++prodSkipped;
+                                        continue;
+                                    }
                                 }
 
                                 const bool dispatched =
@@ -17693,6 +17750,20 @@ int RunSandbox(int argc, char* argv[]) {
                                         /*emitWater=*/true,
                                         /*applyDistanceCull=*/true,
                                         tileCullMask);
+                                float recordSubmitMs = 0.0f;
+                                float producerWaitMs = 0.0f;
+                                if (sparseMidMeshGpuProdPhaseTimers && dispatched) {
+                                    const auto& st =
+                                        midMeshGpuExtractResources.GetB13aStats();
+                                    recordSubmitMs =
+                                        static_cast<float>(st.cpuSubmitUs * 0.001);
+                                    producerWaitMs =
+                                        static_cast<float>(st.producerWaitUs * 0.001);
+                                    perfSparseMidUploadRecordSubmitMs += recordSubmitMs;
+                                    perfSparseMidUploadProducerWaitMs += producerWaitMs;
+                                }
+                                finishProdHostPrep(
+                                    producerWaitInsideHostPrepMs + recordSubmitMs + producerWaitMs);
                                 if (dispatched) {
                                     ++prodDispatched;
                                     if (sparseMidMeshGpuDraw) {
@@ -26647,7 +26718,7 @@ int RunSandbox(int argc, char* argv[]) {
             }
             if (allowSlowFrameLog) {
             spdlog::info(
-                "PERF_FRAME_END frame={} present={:.2f} postGen={:.2f} inputEnd={:.2f} gaps=postWait/prePhys/preRender/postRender:{:.2f}/{:.2f}/{:.2f}/{:.2f} sparsePost=feedback/cmd/begin/midSnap/plan/upload/publish/midUpload/stats/surfExtract/surfPlan/surfSnap/surfStage/surfEmit:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} feedbackSplit=legacy/raycast/miss/brush/own/phys:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} body={:.2f} gapPrev={:.2f} vsync={} rawMs={:.2f}",
+                "PERF_FRAME_END frame={} present={:.2f} postGen={:.2f} inputEnd={:.2f} gaps=postWait/prePhys/preRender/postRender:{:.2f}/{:.2f}/{:.2f}/{:.2f} sparsePost=feedback/cmd/begin/midSnap/plan/upload/publish/midUpload/stats/surfExtract/surfPlan/surfSnap/surfStage/surfEmit:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} midUploadSplit=hostPrep/recordSubmit/producerWait:{:.2f}/{:.2f}/{:.2f} feedbackSplit=legacy/raycast/miss/brush/own/phys:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} body={:.2f} gapPrev={:.2f} vsync={} rawMs={:.2f}",
                 frameCount,
                 perfPresentMs,
                 perfPostGenerationMsLastFrame,
@@ -26670,6 +26741,9 @@ int RunSandbox(int argc, char* argv[]) {
                 perfSparseSurfaceSnapshotMs,
                 perfSparseSurfaceStageMs,
                 perfSparseSurfaceEmitMs,
+                perfSparseMidUploadHostPrepMs,
+                perfSparseMidUploadRecordSubmitMs,
+                perfSparseMidUploadProducerWaitMs,
                 perfSparsePostLegacyFeedbackMs,
                 perfSparsePostRaycastMs,
                 perfSparsePostMissFeedbackMs,

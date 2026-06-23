@@ -2114,9 +2114,15 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatchInternal(
     // Reuse the persistent allocator/list. Wait the PREVIOUS dispatch's fence so the
     // allocator can be reset (non-blocking in steady state; NOT a wait on this dispatch).
     const uint64_t prevFence = m_smokeFenceValue;
+    double producerWaitUs = 0.0;
     if (prevFence != 0u && m_smokeFence->GetCompletedValue() < prevFence) {
+        const auto producerWaitStart = std::chrono::steady_clock::now();
         m_smokeFence->SetEventOnCompletion(prevFence, m_smokeFenceEvent);
         WaitForSingleObject(m_smokeFenceEvent, INFINITE);
+        const auto producerWaitStop = std::chrono::steady_clock::now();
+        producerWaitUs +=
+            std::chrono::duration<double, std::micro>(
+                producerWaitStop - producerWaitStart).count();
     }
     if (FAILED(m_smokeCmdAllocator->Reset()) ||
         FAILED(m_smokeCmdList->Reset(m_smokeCmdAllocator.Get(), nullptr))) {
@@ -2424,6 +2430,7 @@ bool MidMeshGpuExtractResources::RunB13aTopFaceDispatchInternal(
     m_b13aStats.dispatchGpuUs = dispatchUs;
     m_b13aStats.barrierGpuUs = barrierUs;
     m_b13aStats.cpuSubmitUs = cpuSubmitUs;
+    m_b13aStats.producerWaitUs = producerWaitUs;
     m_b13aStats.verified = keepVerified;
     m_b13aStats.verifyCount = keepVerifyCount;
 

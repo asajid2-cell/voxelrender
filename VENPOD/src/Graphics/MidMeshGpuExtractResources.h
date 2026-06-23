@@ -235,6 +235,7 @@ struct MidMeshGpuExtractB13aStats {
     double dispatchGpuUs = 0.0;
     double barrierGpuUs = 0.0;
     double cpuSubmitUs = 0.0;
+    double producerWaitUs = 0.0;
     // CONTAINMENT A/B (filled by the delayed readback ring + multiset harness):
     bool verified = false;          // at least one AB_VERIFY(contain) has run
     uint32_t verifyCount = 0;       // TOTAL containment comparisons (ring repeatability)
