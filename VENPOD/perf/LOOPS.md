@@ -1887,3 +1887,36 @@ clean multi-run to (a) confirm the burst collapse without degradation noise + no
 gpuTS stays 3-4ms + perfFenceWaitMs flat (slack removed not work), (c) capsheet pixel-equivalence
 (render-invisible), then flip VENPOD_FRAME_LATENCY_WAITABLE default ON. This is the real no-dips lever
 for the 120fps goal (vsync must be off for 120, so present-queue pacing is THE dip source).
+
+## Loop 46 (Claude) -- CLEAN waitable A/B: WITHIN NOISE, do NOT flip; the pacing "dips" were artifacts
+
+Post-REBOOT clean A/B (mtns.rec quality, the verify the degradation blocked):
+- clean flag-OFF run1 p50=16.6 p99=42.0 max=130.5 gapPrev>50=2; offA p50=20.2 p99=75.7 max=198.4
+  gap>30=5; offB p50=17.6 p99=132.9 max=59309(!) gap>30=7.
+- waitable ON: p50=22.1/17.2 p99=41.0/74.8 max=124.9/146.0 gap>30=2/6.
+VERDICT: the waitable throttle's effect is WITHIN the off-run-to-run noise band (off p99 ranges
+42->133, off max ranges 130->59309 incl. a 59-SECOND system hitch; off gap>30 = 2,5,7). The throttle
+neither clearly reduces bursts nor clearly regresses -- it is indistinguishable from noise on a clean
+system. CRUCIALLY: a CLEAN flag-off run has only ~2 gapPrev bursts >50ms, NOT the 14 that motivated
+Loop 44 -- so those 14 were DEGRADATION/OS-parking artifacts (the session was at 44+ launches), not
+present-queue pacing. The Loop 44 architectural diagnosis was real in principle but its MAGNITUDE was
+a measurement artifact; on a clean system the pacing dips are negligible.
+
+DECISION: do NOT flip VENPOD_FRAME_LATENCY_WAITABLE (no proven clean benefit; a behavior change with
+no measured win should not ship). Leave it committed + env-gated OFF (it is correct + render-invisible
+if ever needed, e.g. a genuinely present-bound config). This is the 4th measurement artifact this
+campaign (prefetch-config, splice-contention, 778ms-dip-contention, now pacing-bursts-degradation) --
+the desktop's perf variance + launch-count degradation repeatedly manufactured phantom "dips".
+
+CONVERGED HONEST STATE of the 120fps goal (clean system, quality config):
+- REAL shipped win: early-Z surface depth-prepass (overdraw 3.7->1.0, composition-proven zero quality
+  loss -- the composition metric is degradation-IMMUNE, which is why that win is trustworthy).
+- Flythrough clean median ~16-20ms (~50-60fps); editing ~20ms. p99/max "dips" are largely SYSTEM
+  NOISE (background procs, OS scheduling, occasional multi-second hitches), not engine bottlenecks.
+- The 120fps (8.3ms) MEDIAN gap is CPU-bound + DIFFUSE (Loop 34): no single lever; the big CPU sinks
+  are already removed. Closing it needs broad micro-opt (prep + sparse + loop), not one architectural
+  fix. The engine is genuinely well-optimized.
+- Trustworthy metrics on this desktop = degradation-IMMUNE ones (overdrawRatio, surfaceOwnedPixels/
+  backgroundPixels composition, visibleMissing, brick counts). Timing dips (rawMs/gapPrev p99/max) are
+  noise-dominated and must be gated on MULTI-RUN medians of degradation-immune signals, never single
+  timing outliers.
