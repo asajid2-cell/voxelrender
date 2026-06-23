@@ -1773,3 +1773,20 @@ incremental micro-opt grind of the diffuse prep (each piece ~sub-ms), not a sing
 as targeted prep-region instrumentation + per-piece A/B on a clean system, accepting diminishing
 returns. The dips that were ever real are the GPU-fill (now prepass-addressed) + occasional gapPrev/
 streaming spikes.
+
+## Loop 41 (Claude) -- TESTED the top prep lever: diffuse grind CONFIRMED by measurement
+
+Decomposed the editing prep via PERF_SPARSE_CLIPMAP: the biggest sub-piece is the mid-clipmap
+`interest` rebuild. One run read interest p50=8.44ms, but a fresh clean run read p50=3.47ms -- it is
+VARIABLE run-to-run while the editing frame p50 stays stable ~21ms, so interest is NOT the stable
+dominant cost. A/B of the interest-signature-reuse lever (VENPOD_SPARSE_MID_CLIPMAP_FOOTPRINT_INTEREST_
+SIGNATURE=1 + VOXEL_INTEREST_SIGNATURE_REUSE=1, which the rebrun quality config deliberately leaves OFF
+for responsiveness): interest 3.47->3.05, rawMs p50 21.0->20.8 (~0.2ms = within noise), visibleMissing
+=0. So the single most-promising CPU-prep lever yields SUB-MILLISECOND -- the diffuse-grind / diminishing
+-returns prediction is now CONFIRMED BY MEASUREMENT, not asserted. Not worth flipping (0.2ms + the
+author's responsiveness choice).
+
+FINAL (tested): the engine is well-optimized. Real session wins = the SHIPPED early-Z depth-prepass
+(default ON, -2.6x surface overdraw, zero quality loss) + catching that the dramatic "dips" were
+measurement contention. The CPU median is genuinely diffuse: the top lever is 0.2ms, so closing the
+~12ms (flythrough) / ~21ms (editing) -> 8.3ms gap is a long tail of sub-ms micro-opts, not a lever.
