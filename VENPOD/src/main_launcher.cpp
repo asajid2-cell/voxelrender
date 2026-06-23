@@ -3290,11 +3290,14 @@ int RunSandbox(int argc, char* argv[]) {
     const bool sparseMidMeshFailBackoffEnabled =
         ReadUIntEnv("VENPOD_SPARSE_MID_MESH_FAIL_BACKOFF", 1u) != 0u;
     uint64_t sparseMidClipmapEditRevisionSeen = 0;
+    const bool sparseRefreshStatsLazy =
+        ReadUIntEnv("VENPOD_SPARSE_REFRESHSTATS_LAZY", 1u) != 0u;
     if (sparseBackendRequested) {
         sparseClipmapTileCacheReady = sparseClipmapTileCache.Initialize(sparseClipmapPolicy.Config());
         sparseClipmapTileCache.SetEditStore(&sparseVoxelWorld.GetEdits());
         // m_lastStatsFrame advances once per frame in the main loop, so collapse
-        // RefreshStats' heavy aggregation to once/frame (it was ~14% of frame CPU).
+        // RefreshStats' heavy aggregation to telemetry consumers. Set
+        // VENPOD_SPARSE_REFRESHSTATS_LAZY=0 to restore the previous once/frame flush.
         sparseClipmapTileCache.SetStatsHeavyRefreshOncePerFrame(true);
         // Same for the voxel world's RefreshStats (fired ~84x/frame from bookkeeping).
         sparseVoxelWorld.SetStatsRefreshOncePerFrame(true);
@@ -23820,6 +23823,28 @@ int RunSandbox(int argc, char* argv[]) {
                 sparseMidResidencyMetadata.voxelCoverageRatio);
         }
         const auto& physicsStats = physicsDispatcher->GetStats();
+        const bool sparseClipmapEditTelemetryDue =
+            editTelemetryEnabled &&
+            (editTelem.painting || editTelem.erasing ||
+             editTelem.deltaCount != 0u || editTelem.bakeRan ||
+             editTelem.propRegenUploads != 0u || editTelem.propInvalidatedBricks != 0u ||
+             perfFrameBodyMsLastFrame > 30.0f ||
+             (frameCount % 15u) == 0u);
+        const bool sparseSurfaceSpikeLog =
+            perfSparseBrickUploadMs > 2.0f ||
+            perfSparseSurfaceSnapshotMs > 2.0f ||
+            perfSparseSurfaceStageMs > 4.0f ||
+            perfSparseSurfaceEmitMs > 1.0f;
+        const bool sparseClipmapRuntimeLogDue =
+            enableRuntimeLog &&
+            ((frameCount % static_cast<uint64_t>(perfSummaryLogInterval) == 0) ||
+             sparseSurfaceSpikeLog);
+        if (sparseBackendRequested && sparseClipmapTileCacheReady &&
+            (!sparseRefreshStatsLazy ||
+             sparseClipmapEditTelemetryDue ||
+             sparseClipmapRuntimeLogDue)) {
+            sparseClipmapTileCache.RefreshStatsForTelemetry();
+        }
 
         if (!hideUiForCapture) {
             // Dedicated FPS counter, top-right, away from the metrics blob.
@@ -23888,6 +23913,9 @@ int RunSandbox(int argc, char* argv[]) {
                         : " | sparse requested, dense fallback active")
                     : "");
             if (sparseBackendRequested) {
+                if (sparseClipmapTileCacheReady) {
+                    sparseClipmapTileCache.RefreshStatsForTelemetry();
+                }
                 const auto& sparseStats = sparseGpuResources.GetStats();
                 ImGui::Text("Sparse raymarch visual %s | debug %u | only %u",
                     enableSparseRaymarch ? "on" : "off",
@@ -24709,11 +24737,6 @@ int RunSandbox(int argc, char* argv[]) {
             }
         }
 
-        const bool sparseSurfaceSpikeLog =
-            perfSparseBrickUploadMs > 2.0f ||
-            perfSparseSurfaceSnapshotMs > 2.0f ||
-            perfSparseSurfaceStageMs > 4.0f ||
-            perfSparseSurfaceEmitMs > 1.0f;
         const uint64_t perfLoggingStart = SDL_GetPerformanceCounter();
         if (enableRuntimeLog &&
             ((frameCount % static_cast<uint64_t>(perfSummaryLogInterval) == 0) ||

@@ -9013,6 +9013,8 @@ void SparseClipmapTileCache::RefreshStats(
     m_stats.voxelRingCount = std::min<uint32_t>(
         static_cast<uint32_t>(m_config.ringCount),
         SPARSE_CLIPMAP_MAX_STATS_RINGS);
+    // Always-on coverage and maintenance. This block owns gameplay-visible stats
+    // and the prune side effects, so it must stay before the heavy telemetry gate.
     if (m_lastCoverageStatsFrame != m_lastStatsFrame) {
         m_lastCoverageStatsFrame = m_lastStatsFrame;
         PruneAsyncVisibleReservations(m_lastStatsFrame);
@@ -9083,8 +9085,10 @@ void SparseClipmapTileCache::RefreshStats(
         (void)evictedVoxelLastFrame;
         return;
     }
-    if (m_statsHeavyRefreshOncePerFrame &&
-        !m_statsHeavyTelemetryRequestedThisFrame) {
+    const bool willConsumeTelemetry =
+        !m_statsHeavyRefreshOncePerFrame ||
+        m_statsHeavyTelemetryRequestedThisFrame;
+    if (!willConsumeTelemetry) {
         (void)generatedVoxelLastFrame;
         (void)evictedVoxelLastFrame;
         return;

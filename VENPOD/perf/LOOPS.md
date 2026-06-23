@@ -2172,3 +2172,19 @@ GATE: byte-identical logged stats on logged frames; PruneAsyncVisibleReservation
 :13817 budget unchanged frame-for-frame; visibleMissing=0 + residentMissingSurface=0; rawMs A/B median
 -~0.5-0.75ms with GPU still 1.17ms. Then the series: surface-apply, request-planning, interest-async
 (last, residency/pop-in risk).
+
+## Loop 57 (Codex + Claude) -- SparseClipmap RefreshStats telemetry gate wired
+
+Implemented the first Loop 56 slice in the engine path: `RefreshStatsForTelemetry()` is now called
+only when the sparse clipmap heavy stats are consumed by telemetry: the edit telemetry cadence
+(editing/slow/every-15th frame), the runtime `PERF_SPARSE_CLIPMAP` interval/spike log, or the
+expanded ImGui metrics overlay. `VENPOD_SPARSE_REFRESHSTATS_LAZY=0` restores the previous
+once-per-frame heavy flush for A/B.
+
+Side-effect audit (Claude cross-check converged): block 1 in `RefreshStats` remains before the heavy
+telemetry gate and owns the frame-critical `PruneAsyncVisibleReservations`, missing-interest scan,
+and visible-priority prune cadence. Block 2's duplicate work stays in place for test/isolated callers
+where `m_statsHeavyRefreshOncePerFrame` is off and each `RefreshStats()` call must still produce a
+complete snapshot.
+
+Build: `_agent_build.bat` passed; only existing `rayDir` shadow warnings in `main_launcher.cpp`.
