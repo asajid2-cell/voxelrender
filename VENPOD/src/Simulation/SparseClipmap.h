@@ -431,6 +431,8 @@ struct SparseClipmapCacheStats {
     uint32_t asyncVisibleReservationApplyLimitLastFrame = UINT32_MAX;
     float asyncNoncriticalGenerationWorkerMsLastFrame = 0.0f;
     float asyncNoncriticalGenerationApplyMsLastFrame = 0.0f;
+    float persistentVoxelPumpWaitMsLastFrame = 0.0f;
+    float asyncNoncriticalGenerationWaitMsLastFrame = 0.0f;
     uint32_t predictedVisibleAdmissionSamplesLastFrame = 0;
     float predictedVisibleAdmissionSnapshotMsLastFrame = 0.0f;
     float predictedVisibleAdmissionRebuildMsLastFrame = 0.0f;
@@ -1416,6 +1418,8 @@ private:
     uint32_t m_asyncVisibleReservationApplyLimitLastFrame = UINT32_MAX;
     float m_asyncNoncriticalGenerationWorkerMsLastFrame = 0.0f;
     float m_asyncNoncriticalGenerationApplyMsLastFrame = 0.0f;
+    float m_persistentVoxelPumpWaitMsLastFrame = 0.0f;
+    float m_asyncNoncriticalGenerationWaitMsLastFrame = 0.0f;
     uint32_t m_predictedVisibleAdmissionSamplesLastFrame = 0;
     uint32_t m_predictedVisibleAdmissionStatsFrame = 0;
     float m_predictedVisibleAdmissionSnapshotMsLastFrame = 0.0f;

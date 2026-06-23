@@ -177,6 +177,7 @@ struct SparseVoxelWorldStats {
     uint32_t parallelExactGenerationBricksLastFrame = 0;
     uint32_t parallelExactGenerationWorkersLastFrame = 0;
     float parallelExactGenerationWallMsLastFrame = 0.0f;
+    float persistentExactGenerationWaitMsLastFrame = 0.0f;
     uint32_t uploadQueuedBricks = 0;
     uint32_t uploadQueuedSpeculativeBricks = 0;
     uint32_t uploadQueuedVisibleBricks = 0;
@@ -273,6 +274,7 @@ struct SparseVoxelWorldStats {
     uint32_t parallelSurfaceExtractionBricksLastFrame = 0;
     uint32_t parallelSurfaceExtractionWorkersLastFrame = 0;
     float parallelSurfaceExtractionWallMsLastFrame = 0.0f;
+    float surfaceExtractionWaitMsLastFrame = 0.0f;
     uint32_t terrainColumnCachePersistentActive = 0;
     uint32_t terrainColumnCacheEntries = 0;
     uint32_t terrainColumnCacheMaxEntries = 0;
@@ -1093,6 +1095,7 @@ private:
     uint32_t m_parallelExactGenerationBricksLastFrame = 0;
     uint32_t m_parallelExactGenerationWorkersLastFrame = 0;
     float m_parallelExactGenerationWallMsLastFrame = 0.0f;
+    float m_persistentExactGenerationWaitMsLastFrame = 0.0f;
     uint32_t m_uploadedSpeculativeBricksLastFrame = 0;
     uint32_t m_uploadedVisibleBricksLastFrame = 0;
     uint32_t m_uploadedCollisionBricksLastFrame = 0;
@@ -1110,6 +1113,7 @@ private:
     uint32_t m_parallelSurfaceExtractionBricksLastFrame = 0;
     uint32_t m_parallelSurfaceExtractionWorkersLastFrame = 0;
     float m_parallelSurfaceExtractionWallMsLastFrame = 0.0f;
+    float m_surfaceExtractionWaitMsLastFrame = 0.0f;
     std::unordered_map<BrickCoord, StreamingWorkTicket, BrickCoordHash> m_streamingTickets;
     StreamingTicketStageOwnershipCounts m_streamingTicketPendingStageOwnershipCounts{};
     uint32_t m_streamingTicketCompletedLastFrame = 0;

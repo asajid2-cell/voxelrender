@@ -324,6 +324,7 @@ target_include_directories(VENPODTests PRIVATE
 )
 
 target_link_libraries(VENPODTests PRIVATE
+    SDL3::SDL3
     spdlog::spdlog
     Microsoft::DirectX-Headers
     Microsoft::DirectX-Guids

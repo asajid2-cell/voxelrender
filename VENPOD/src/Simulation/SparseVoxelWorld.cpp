@@ -4,6 +4,7 @@
 #include "Simulation/TerrainConstants.h"
 #include "Utils/BitPacking.h"
 
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <atomic>
 #include <array>
@@ -38,6 +39,17 @@ constexpr uint32_t SPARSE_PHYSICS_PACKET_STATUS_KNOWN_MASK =
     SPARSE_PHYSICS_PACKET_STATUS_PROPOSAL |
     SPARSE_PHYSICS_PACKET_STATUS_MISSING_BELOW |
     SPARSE_PHYSICS_PACKET_STATUS_EDIT_DELTA_HIT;
+
+float WaitTicksToMs(uint64_t startTicks) {
+    const uint64_t endTicks = SDL_GetPerformanceCounter();
+    const uint64_t frequency = SDL_GetPerformanceFrequency();
+    if (frequency == 0u || endTicks < startTicks) {
+        return 0.0f;
+    }
+    return static_cast<float>(
+        (static_cast<double>(endTicks - startTicks) * 1000.0) /
+        static_cast<double>(frequency));
+}
 constexpr float kMaxSparseRaycastDistance = 8192.0f;
 
 enum class SparseSurfaceOccupancyClass : uint8_t {
@@ -1013,6 +1025,7 @@ bool SparseVoxelWorld::Initialize(const SparseVoxelWorldConfig& config) {
     m_parallelExactGenerationBricksLastFrame = 0;
     m_parallelExactGenerationWorkersLastFrame = 0;
     m_parallelExactGenerationWallMsLastFrame = 0.0f;
+    m_persistentExactGenerationWaitMsLastFrame = 0.0f;
     m_surfaceCache.Clear();
     m_evictedBricksLastFrame = 0;
     m_emptyRequestsSkippedLastFrame = 0;
@@ -1025,6 +1038,7 @@ bool SparseVoxelWorld::Initialize(const SparseVoxelWorldConfig& config) {
     m_parallelSurfaceExtractionBricksLastFrame = 0;
     m_parallelSurfaceExtractionWorkersLastFrame = 0;
     m_parallelSurfaceExtractionWallMsLastFrame = 0.0f;
+    m_surfaceExtractionWaitMsLastFrame = 0.0f;
     m_streamingTicketCompletedLastFrame = 0;
     m_streamingTicketProtectedSortsLastFrame = 0;
     m_deferredGeneratedDownstreamPromotedLastFrame = 0;
@@ -1087,6 +1101,7 @@ void SparseVoxelWorld::BeginFrame() {
     m_asyncExactGenerationAppliedPublicCriticalLaneLastFrame = 0;
     m_asyncExactGenerationWorkerMsLastFrame = 0.0f;
     m_asyncExactGenerationApplyMsLastFrame = 0.0f;
+    m_persistentExactGenerationWaitMsLastFrame = 0.0f;
     m_uploadedSpeculativeBricksLastFrame = 0;
     m_uploadedVisibleBricksLastFrame = 0;
     m_uploadedCollisionBricksLastFrame = 0;
@@ -1104,6 +1119,7 @@ void SparseVoxelWorld::BeginFrame() {
     m_parallelSurfaceExtractionBricksLastFrame = 0;
     m_parallelSurfaceExtractionWorkersLastFrame = 0;
     m_parallelSurfaceExtractionWallMsLastFrame = 0.0f;
+    m_surfaceExtractionWaitMsLastFrame = 0.0f;
     m_terrainColumnCacheFrameStats = {};
     m_terrainColumnCacheClearedLastFrame = 0;
     if (!m_config.persistentTerrainColumnCache) {
@@ -2223,9 +2239,11 @@ bool SparseVoxelWorld::GenerateExactBricksWithPersistentWorkers(
 
     {
         std::unique_lock<std::mutex> lock(m_persistentExactGenerationMutex);
+        const uint64_t waitStartTicks = SDL_GetPerformanceCounter();
         m_persistentExactGenerationDoneCv.wait(lock, [this]() {
             return !m_persistentExactGenerationActive;
         });
+        m_persistentExactGenerationWaitMsLastFrame += WaitTicksToMs(waitStartTicks);
         m_persistentExactGenerationTerrain = &terrain;
         m_persistentExactGenerationCoords = &coords;
         m_persistentExactGenerationBricks = &bricks;
@@ -2237,9 +2255,11 @@ bool SparseVoxelWorld::GenerateExactBricksWithPersistentWorkers(
 
     {
         std::unique_lock<std::mutex> lock(m_persistentExactGenerationMutex);
+        const uint64_t waitStartTicks = SDL_GetPerformanceCounter();
         m_persistentExactGenerationDoneCv.wait(lock, [this]() {
             return !m_persistentExactGenerationActive;
         });
+        m_persistentExactGenerationWaitMsLastFrame += WaitTicksToMs(waitStartTicks);
     }
     return true;
 }
@@ -2999,9 +3019,11 @@ uint32_t SparseVoxelWorld::ExtractSurfaceBatchNoEdit(std::vector<SurfaceExtracti
                 }
             });
         }
+        const uint64_t waitStartTicks = SDL_GetPerformanceCounter();
         for (std::thread& worker : workers) {
             worker.join();
         }
+        m_surfaceExtractionWaitMsLastFrame += WaitTicksToMs(waitStartTicks);
     }
 
     const uint32_t batchBricks = static_cast<uint32_t>(
@@ -3439,6 +3461,7 @@ uint32_t SparseVoxelWorld::PumpGeneration(uint32_t maxBricks, uint32_t currentFr
     m_parallelExactGenerationBricksLastFrame = 0;
     m_parallelExactGenerationWorkersLastFrame = 0;
     m_parallelExactGenerationWallMsLastFrame = 0.0f;
+    m_persistentExactGenerationWaitMsLastFrame = 0.0f;
     uint32_t generated = 0;
     uint32_t processed = 0;
     uint32_t ownershipProcessed = 0;
@@ -3563,9 +3586,11 @@ uint32_t SparseVoxelWorld::PumpGeneration(uint32_t maxBricks, uint32_t currentFr
                             }
                         });
                     }
+                    const uint64_t waitStartTicks = SDL_GetPerformanceCounter();
                     for (std::thread& worker : workers) {
                         worker.join();
                     }
+                    m_persistentExactGenerationWaitMsLastFrame += WaitTicksToMs(waitStartTicks);
                 }
             } else {
                 std::vector<std::thread> workers;
@@ -3597,9 +3622,11 @@ uint32_t SparseVoxelWorld::PumpGeneration(uint32_t maxBricks, uint32_t currentFr
                         }
                     });
                 }
+                const uint64_t waitStartTicks = SDL_GetPerformanceCounter();
                 for (std::thread& worker : workers) {
                     worker.join();
                 }
+                m_persistentExactGenerationWaitMsLastFrame += WaitTicksToMs(waitStartTicks);
             }
             (void)elapsedMs;
             m_parallelExactGenerationBricksLastFrame =
@@ -3857,6 +3884,7 @@ uint32_t SparseVoxelWorld::PumpGenerationAround(
     m_parallelExactGenerationBricksLastFrame = 0;
     m_parallelExactGenerationWorkersLastFrame = 0;
     m_parallelExactGenerationWallMsLastFrame = 0.0f;
+    m_persistentExactGenerationWaitMsLastFrame = 0.0f;
     uint32_t generated = 0;
     uint32_t processed = 0;
     m_generationQueuePriorityDirty = false;
@@ -4007,9 +4035,11 @@ uint32_t SparseVoxelWorld::PumpGenerationAround(
                             }
                         });
                     }
+                    const uint64_t waitStartTicks = SDL_GetPerformanceCounter();
                     for (std::thread& worker : workers) {
                         worker.join();
                     }
+                    m_persistentExactGenerationWaitMsLastFrame += WaitTicksToMs(waitStartTicks);
                 }
             } else {
                 std::vector<std::thread> workers;
@@ -4037,9 +4067,11 @@ uint32_t SparseVoxelWorld::PumpGenerationAround(
                         }
                     });
                 }
+                const uint64_t waitStartTicks = SDL_GetPerformanceCounter();
                 for (std::thread& worker : workers) {
                     worker.join();
                 }
+                m_persistentExactGenerationWaitMsLastFrame += WaitTicksToMs(waitStartTicks);
             }
             m_parallelExactGenerationBricksLastFrame =
                 static_cast<uint32_t>(
@@ -4744,7 +4776,10 @@ uint32_t SparseVoxelWorld::ApplyAsyncSurfaceExtractionCompletions() {
     while (applied < maxApply) {
         AsyncSurfaceExtractionResult result;
         {
-            std::lock_guard<std::mutex> lock(m_asyncSurfaceExtractionMutex);
+            const uint64_t waitStartTicks = SDL_GetPerformanceCounter();
+            std::unique_lock<std::mutex> lock(m_asyncSurfaceExtractionMutex);
+            m_surfaceExtractionWaitMsLastFrame += WaitTicksToMs(waitStartTicks);
+            m_stats.surfaceExtractionWaitMsLastFrame = m_surfaceExtractionWaitMsLastFrame;
             if (m_asyncSurfaceExtractionResults.empty()) {
                 break;
             }
@@ -8004,6 +8039,8 @@ void SparseVoxelWorld::RefreshStats() {
     m_stats.parallelExactGenerationBricksLastFrame = m_parallelExactGenerationBricksLastFrame;
     m_stats.parallelExactGenerationWorkersLastFrame = m_parallelExactGenerationWorkersLastFrame;
     m_stats.parallelExactGenerationWallMsLastFrame = m_parallelExactGenerationWallMsLastFrame;
+    m_stats.persistentExactGenerationWaitMsLastFrame =
+        m_persistentExactGenerationWaitMsLastFrame;
     m_stats.uploadQueuedBricks = static_cast<uint32_t>(m_uploadQueue.size());
     m_stats.uploadQueuedSpeculativeBricks = m_uploadQueueClassCounts.speculative;
     m_stats.uploadQueuedVisibleBricks = m_uploadQueueClassCounts.visible;
@@ -8240,6 +8277,7 @@ void SparseVoxelWorld::RefreshStats() {
     m_stats.parallelSurfaceExtractionBricksLastFrame = m_parallelSurfaceExtractionBricksLastFrame;
     m_stats.parallelSurfaceExtractionWorkersLastFrame = m_parallelSurfaceExtractionWorkersLastFrame;
     m_stats.parallelSurfaceExtractionWallMsLastFrame = m_parallelSurfaceExtractionWallMsLastFrame;
+    m_stats.surfaceExtractionWaitMsLastFrame = m_surfaceExtractionWaitMsLastFrame;
     m_stats.terrainColumnCachePersistentActive = m_config.persistentTerrainColumnCache ? 1u : 0u;
     m_stats.terrainColumnCacheEntries = static_cast<uint32_t>(std::min<size_t>(
         m_surfaceTerrainColumnCache.size(),

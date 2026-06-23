@@ -2013,3 +2013,17 @@ line, run BOTH replays (mtns.rec + mtns_edit, quality, clean) and report which w
 on each. The waits should sum to ~the NtWaitForSingleObject 24%. This PINS the exact fork-join before
 Loop 51 makes that producer truly async (fire-and-forget + best-available, main thread never blocks),
 gated no-hole + within-noise visual + the wait% + frame-time drop.
+
+## Loop 50 (Codex) -- PERF_WAITSPLIT wait attribution instrumentation
+
+Instrumentation-only pass added a new `PERF_WAITSPLIT` line at the `PERF_FRAME_END` emit site,
+using the same frame-end log cadence. Fields:
+- `pumpWaitMs`: persistent voxel pump done-cv waits plus frame-path height/voxel pump joins.
+- `exactGenWaitMs`: persistent exact generation done-cv waits plus exact generation join fallbacks.
+- `surfaceWaitMs`: parallel surface extraction joins plus async surface-completion mutex acquisition.
+- `noncritWaitMs`: reserved for main-thread `m_asyncNoncriticalGenerationCv` waits; no frame-path
+  main-thread CV wait found, so this remains 0 unless one is added later.
+- `fenceWaitMs`: existing GPU fence/frame-latency wait value for completeness.
+
+Build passed via `_agent_build.bat`. The orchestrator will run the mtns.rec / mtns_edit A/B and use
+`PERF_WAITSPLIT` to identify which wait dominates the profiled `NtWaitForSingleObject` slice.

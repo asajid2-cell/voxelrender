@@ -6,6 +6,7 @@
 #include "TerrainConstants.h"
 #include "Utils/BitPacking.h"
 
+#include <SDL3/SDL.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -37,6 +38,17 @@ uint32_t NextPowerOfTwo(uint32_t value) {
 
 float FiniteOr(float value, float fallback) {
     return std::isfinite(value) ? value : fallback;
+}
+
+float WaitTicksToMs(uint64_t startTicks) {
+    const uint64_t endTicks = SDL_GetPerformanceCounter();
+    const uint64_t frequency = SDL_GetPerformanceFrequency();
+    if (frequency == 0u || endTicks < startTicks) {
+        return 0.0f;
+    }
+    return static_cast<float>(
+        (static_cast<double>(endTicks - startTicks) * 1000.0) /
+        static_cast<double>(frequency));
 }
 
 double FiniteOr(double value, double fallback) {
@@ -576,6 +588,8 @@ bool SparseClipmapTileCache::Initialize(const SparseClipmapConfig& config) {
     m_asyncVisibleReservationApplyLimitLastFrame = UINT32_MAX;
     m_asyncNoncriticalGenerationWorkerMsLastFrame = 0.0f;
     m_asyncNoncriticalGenerationApplyMsLastFrame = 0.0f;
+    m_persistentVoxelPumpWaitMsLastFrame = 0.0f;
+    m_asyncNoncriticalGenerationWaitMsLastFrame = 0.0f;
     m_predictedVisibleAdmissionStatsFrame = 0u;
     m_lastStatsFrame = 0;
     m_pumpBudgetHitLastFrame = 0;
@@ -791,9 +805,11 @@ bool SparseClipmapTileCache::GenerateVoxelBricksWithPersistentWorkers(
 
     {
         std::unique_lock<std::mutex> lock(m_persistentVoxelPumpMutex);
+        const uint64_t waitStartTicks = SDL_GetPerformanceCounter();
         m_persistentVoxelPumpDoneCv.wait(lock, [this]() {
             return !m_persistentVoxelPumpActive;
         });
+        m_persistentVoxelPumpWaitMsLastFrame += WaitTicksToMs(waitStartTicks);
         ++m_persistentVoxelPumpBatchSerial;
         m_persistentVoxelPumpSlots = &slots;
         m_persistentVoxelPumpPolicy = &policy;
@@ -809,9 +825,11 @@ bool SparseClipmapTileCache::GenerateVoxelBricksWithPersistentWorkers(
 
     {
         std::unique_lock<std::mutex> lock(m_persistentVoxelPumpMutex);
+        const uint64_t waitStartTicks = SDL_GetPerformanceCounter();
         m_persistentVoxelPumpDoneCv.wait(lock, [this]() {
             return !m_persistentVoxelPumpActive;
         });
+        m_persistentVoxelPumpWaitMsLastFrame += WaitTicksToMs(waitStartTicks);
     }
     return true;
 }
@@ -1958,6 +1976,8 @@ void SparseClipmapTileCache::UpdateInterest(
     m_asyncVisibleReservationApplyLimitLastFrame = UINT32_MAX;
     m_asyncNoncriticalGenerationWorkerMsLastFrame = 0.0f;
     m_asyncNoncriticalGenerationApplyMsLastFrame = 0.0f;
+    m_persistentVoxelPumpWaitMsLastFrame = 0.0f;
+    m_asyncNoncriticalGenerationWaitMsLastFrame = 0.0f;
     if (!policy.IsEnabled() || m_tiles.empty()) {
         m_interestSet.clear();
         m_voxelInterestSet.clear();
@@ -2361,6 +2381,8 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
     m_parallelVoxelPumpBricksLastFrame = 0;
     m_parallelVoxelPumpWorkersLastFrame = 0;
     m_parallelVoxelPumpWallMsLastFrame = 0.0f;
+    m_persistentVoxelPumpWaitMsLastFrame = 0.0f;
+    m_asyncNoncriticalGenerationWaitMsLastFrame = 0.0f;
     if (policy.Config().sharedVoxelColumnCache) {
         m_sharedVoxelColumnCache.clear();
         m_sharedVoxelColumnCache.reserve(std::max<size_t>(
@@ -2461,9 +2483,11 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
                         }
                     });
                 }
+                const uint64_t waitStartTicks = SDL_GetPerformanceCounter();
                 for (std::thread& worker : heightWorkers) {
                     worker.join();
                 }
+                m_persistentVoxelPumpWaitMsLastFrame += WaitTicksToMs(waitStartTicks);
             }
             // Single-threaded commit: publish slots + dirty marks in queue order.
             for (const PendingHeightGeneration& item : pendingHeight) {
@@ -2666,9 +2690,11 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
                             }
                         });
                     }
+                    const uint64_t waitStartTicks = SDL_GetPerformanceCounter();
                     for (std::thread& worker : workers) {
                         worker.join();
                     }
+                    m_persistentVoxelPumpWaitMsLastFrame += WaitTicksToMs(waitStartTicks);
                 }
                 if (useWorkerColumnCache) {
                     for (uint32_t worker = 0u; worker < workerCount; ++worker) {
@@ -9231,6 +9257,10 @@ void SparseClipmapTileCache::RefreshStats(
         m_asyncNoncriticalGenerationWorkerMsLastFrame;
     m_stats.asyncNoncriticalGenerationApplyMsLastFrame =
         m_asyncNoncriticalGenerationApplyMsLastFrame;
+    m_stats.persistentVoxelPumpWaitMsLastFrame =
+        m_persistentVoxelPumpWaitMsLastFrame;
+    m_stats.asyncNoncriticalGenerationWaitMsLastFrame =
+        m_asyncNoncriticalGenerationWaitMsLastFrame;
     m_stats.predictedVisibleAdmissionSamplesLastFrame =
         m_predictedVisibleAdmissionSamplesLastFrame;
     m_stats.predictedVisibleAdmissionSnapshotMsLastFrame =
@@ -9465,6 +9495,9 @@ void SparseClipmapTileCache::RefreshStats(
     m_stats.parallelVoxelPumpBricksLastFrame = m_parallelVoxelPumpBricksLastFrame;
     m_stats.parallelVoxelPumpWorkersLastFrame = m_parallelVoxelPumpWorkersLastFrame;
     m_stats.parallelVoxelPumpWallMsLastFrame = m_parallelVoxelPumpWallMsLastFrame;
+    m_stats.persistentVoxelPumpWaitMsLastFrame = m_persistentVoxelPumpWaitMsLastFrame;
+    m_stats.asyncNoncriticalGenerationWaitMsLastFrame =
+        m_asyncNoncriticalGenerationWaitMsLastFrame;
     m_stats.interestReusedLastFrame = m_interestReusedLastFrame;
     m_stats.voxelInterestRingsRebuiltLastFrame = m_voxelInterestRingsRebuiltLastFrame;
     m_stats.voxelInterestBudgetedRebuildsLastFrame = m_voxelInterestBudgetedRebuildsLastFrame;

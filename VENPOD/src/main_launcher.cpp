@@ -5257,6 +5257,10 @@ int RunSandbox(int argc, char* argv[]) {
     float perfSparseSurfaceEmitMs = 0.0f;
     uint32_t perfSparseSurfaceGeneralStrictSkipped = 0;
     float perfSparseSurfaceGeneralRemainingMs = 0.0f;
+    float perfPumpWaitMs = 0.0f;
+    float perfExactGenWaitMs = 0.0f;
+    float perfSurfaceWaitMs = 0.0f;
+    float perfNoncritWaitMs = 0.0f;
     uint32_t perfSparseTerrainCriticalInlineSurfaceDeferred = 0;
     uint32_t perfSparseTerrainCriticalInlineSurfaceExtracted = 0;
     uint32_t perfSparseTerrainCriticalPrePublishSurfaceExtracted = 0;
@@ -6458,6 +6462,10 @@ int RunSandbox(int argc, char* argv[]) {
         perfSparseSurfaceEmitMs = 0.0f;
         perfSparseSurfaceGeneralStrictSkipped = 0;
         perfSparseSurfaceGeneralRemainingMs = 0.0f;
+        perfPumpWaitMs = 0.0f;
+        perfExactGenWaitMs = 0.0f;
+        perfSurfaceWaitMs = 0.0f;
+        perfNoncritWaitMs = 0.0f;
         perfSparseTerrainCriticalInlineSurfaceDeferred = 0;
         perfSparseTerrainCriticalInlineSurfaceExtracted = 0;
         perfSparseTerrainCriticalPrePublishSurfaceExtracted = 0;
@@ -26727,6 +26735,25 @@ int RunSandbox(int argc, char* argv[]) {
                 ++slowFrameEndLogs;
             }
             if (allowSlowFrameLog) {
+            {
+                const auto& waitSplitWorldStats = sparseVoxelWorld.GetStats();
+                const auto& waitSplitClipmapStats = sparseClipmapTileCache.GetStats();
+                perfPumpWaitMs = waitSplitClipmapStats.persistentVoxelPumpWaitMsLastFrame;
+                perfExactGenWaitMs =
+                    waitSplitWorldStats.persistentExactGenerationWaitMsLastFrame;
+                perfSurfaceWaitMs =
+                    waitSplitWorldStats.surfaceExtractionWaitMsLastFrame;
+                perfNoncritWaitMs =
+                    waitSplitClipmapStats.asyncNoncriticalGenerationWaitMsLastFrame;
+                spdlog::info(
+                    "PERF_WAITSPLIT frame={} pumpWaitMs={:.2f} exactGenWaitMs={:.2f} surfaceWaitMs={:.2f} noncritWaitMs={:.2f} fenceWaitMs={:.2f}",
+                    frameCount,
+                    perfPumpWaitMs,
+                    perfExactGenWaitMs,
+                    perfSurfaceWaitMs,
+                    perfNoncritWaitMs,
+                    perfFenceWaitMs);
+            }
             spdlog::info(
                 "PERF_FRAME_END frame={} present={:.2f} postGen={:.2f} inputEnd={:.2f} gaps=postWait/prePhys/preRender/postRender:{:.2f}/{:.2f}/{:.2f}/{:.2f} sparsePost=feedback/cmd/begin/midSnap/plan/upload/publish/midUpload/stats/surfExtract/surfPlan/surfSnap/surfStage/surfEmit:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} midUploadSplit=hostPrep/recordSubmit/producerWait:{:.2f}/{:.2f}/{:.2f} feedbackSplit=legacy/raycast/miss/brush/own/phys:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} body={:.2f} gapPrev={:.2f} vsync={} rawMs={:.2f}",
                 frameCount,
