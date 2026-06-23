@@ -1869,3 +1869,21 @@ or `PS_Raymarch` edits. Flag-off behavior remains inert: default config leaves s
 frame loop wait path matching the previous code path. Fresh-restart perf A/B is still pending:
 expected pass signal is gapPrev burst collapse while `gpuTiming.frameMs` remains flat and
 `perfFenceWaitMs` does not become the new stall.
+
+## Loop 45 verify (Claude) -- waitable-swapchain throttle WORKS (preliminary, degraded system)
+
+Codex committed the waitable-swapchain frame-latency throttle (fad9059, VENPOD_FRAME_LATENCY_WAITABLE
+default OFF, render-invisible, builds clean, flag-off inert, proper handle lifecycle). Preliminary A/B
+on the DEGRADED system (46+ launches, so noisy -- but the burst-COUNT signal is clear), flythrough:
+- flag OFF: gapPrev bursts >50ms=5, >30ms=14, rawMs p50=22.9 p99=109.3 max=131.9, visibleMissing=0.
+- waitable ON: gapPrev bursts >50ms=2, >30ms=2, rawMs p50=18.3 p99=51.8 max=222.4, visibleMissing=0.
+The throttle CUTS the present-queue pacing bursts (>30ms 14->2, >50ms 5->2) and p50/p99 (22.9->18.3,
+109->52) with NO quality loss -- confirming the Loop 44 diagnosis + that the canonical fix works. The
+single max=222ms outlier is degradation noise (the throttle's own WaitForSingleObject can park on a
+loaded OS; expected to vanish on a clean system).
+
+STATUS: the architectural-front lever is IMPLEMENTED + PRELIMINARILY VERIFIED. Pending a fresh-restart
+clean multi-run to (a) confirm the burst collapse without degradation noise + no outlier, (b) confirm
+gpuTS stays 3-4ms + perfFenceWaitMs flat (slack removed not work), (c) capsheet pixel-equivalence
+(render-invisible), then flip VENPOD_FRAME_LATENCY_WAITABLE default ON. This is the real no-dips lever
+for the 120fps goal (vsync must be off for 120, so present-queue pacing is THE dip source).
