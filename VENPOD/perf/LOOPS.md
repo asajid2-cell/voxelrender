@@ -2068,3 +2068,34 @@ Added `PERF_GPU` on the `VENPOD_PERF_FRAME_END_LOG_INTERVAL` cadence with:
 
 Build passed via `_agent_build.bat`. The next orchestrator run should verify `valid=1` on steady
 replay/sandbox frames before drawing any GPU-bound vs CPU/sync-bound conclusion.
+
+## Loop 53 (Claude) -- VALID GPU TIMING at last: median is CPU-bound w/ 94% IDLE GPU; dips = raymarch spike
+
+Codex fixed the GPU-timestamp readback fence (44aafb5) -> gpuValid=1 (598 valid frames). FIRST real
+GPU measurement of the campaign (quality, mtns.rec, clean):
+- gpuFrameMs median=1.17ms, max=162.9ms. raymarchMs median=0.10ms, max=144.5ms. sparseSurface
+  median=0.71/max=10.7. sparseUpload median=0.19/max=3.65. Frame rawMs p50=18.7 p99=40.7 max=243.
+INTERPRETATION (now grounded, not assumed):
+- MEDIAN frame: GPU=1.17ms in an 18.7ms frame -> GPU ~94% IDLE -> the median is CPU-BOUND. The user's
+  "kneecapped" intuition is CORRECT and proven: ~17ms CPU serialized against a near-idle GPU. The 24%
+  fenceWait is present-PACING (GPU finished its 1.17ms long ago; the CPU waits on a buffer), not GPU
+  work -- consistent with Loop 44, and confirms the GPU is NOT the median bottleneck.
+- DIP frames: raymarchMs spikes 0.10 -> 144ms on uncovered-far-terrain views (quality mode raymarches
+  the far field full-res; the low-res background pass is OFF for full-res horizon). That is the
+  max=243ms dips = a GPU raymarch spike, not CPU.
+
+TWO REAL LEVERS (validly measured):
+1. MEDIAN (the big one): the GPU is 94% idle while the CPU is the wall. The CPU body is led by terrain
+   HeightAt sampling for planning/interest/readiness (PROF_CALLERS: HeightAt <- CachedTerrainHeightAt/
+   PlanViewCone/UpdateVoxelInterest/BuildRenderReadinessStats; HeightAtUncached 7.7%) + a diffuse tail.
+   Lever = OFFLOAD that bulk terrain sampling to the idle GPU (a compute pre-pass that computes the
+   heights/decisions the CPU planning needs), moving ~CPU body down and using the wasted GPU. Rework,
+   but it is the structural idle-GPU win. (Mid-voxel GEN is already GPU; this is the PLANNING/interest
+   HeightAt, which is still CPU.)
+2. DIPS: cut the full-res far raymarch spike (144ms) -- raise far-surface coverage so less is
+   raymarched, without the quality hit of the low-res background pass.
+
+Loop 54 = scope the CPU->GPU planning-sample offload (the median lever) via the layer: which CPU
+HeightAt-driven systems (PlanViewCone / UpdateVoxelInterest / readiness) are bulk-parallel enough to
+move to a GPU compute pre-pass, what feeds back to CPU control flow, and the no-quality-loss/no-hole
+contract. This is the real path to the 120fps median against the idle GPU.
