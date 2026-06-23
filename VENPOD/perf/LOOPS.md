@@ -1808,3 +1808,22 @@ CONVERGENCE (both fronts characterized + the top levers tested):
 The meaningful levers are exhausted: GPU mid-mesh promotion proven dead (Loop 29), CPU big sinks gone
 (diffuse), the one clean no-quality-loss GPU lever (surface overdraw) SHIPPED. Remaining progress is a
 sub-ms grind or quality tradeoffs (forbidden). The loop has converged on a well-optimized engine.
+
+## Loop 43 (Claude) -- env-lever space exhaustively TESTED + empty (do not retry these)
+
+Continued grinding for committable no-quality-loss wins. Tested dead/marginal (clean A/B, quality):
+- VENPOD_MIDMESH_WORKSTEAL + EXTRACT_SCRATCH + LOD_CACHE (build opts): REGRESS -- buildMs p50 9.9->14.3,
+  rawMs p99 61.4->84.0, max 78.5->195.4 (visibleMissing=0). Worker/cache overhead on the small per-frame
+  quality-config builds. DEAD END, do not enable.
+- interest signature-reuse (Loop 41): 0.2ms, + responsiveness tradeoff the rebrun author avoids. Skip.
+- The remaining env knobs (MID_INTEREST_INTERVAL=2, SURFACE_UPLOAD_MIN_INTERVAL_FRAMES=2, lower PUMP_
+  HARD_BUDGET / render scale) all TRADE QUALITY (staleness/coverage/sharpness) -- forbidden by the
+  no-quality-loss constraint; the rebrun quality config already sets them to the no-tradeoff values.
+
+EXHAUSTIVE CONVERGENCE: the no-quality-loss lever space for the quality config is now tested and empty.
+The quality config is well-tuned; the async producers are off the critical path; the CPU median is
+diffuse (top lever 0.2ms); the dips are GPU-pacing at the full-res floor. The ONE no-quality-loss code
+lever found this session -- the early-Z surface depth-prepass -- is SHIPPED (default ON, -2.6x
+overdraw, zero quality loss). Further 120fps progress requires either accepting quality tradeoffs
+(forbidden) or a from-scratch architectural change (e.g. async-compute multi-queue GPU pacing, or a
+fundamentally cheaper render path) -- a new project, not a loop iteration.
