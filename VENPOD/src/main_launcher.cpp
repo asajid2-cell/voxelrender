@@ -3973,6 +3973,7 @@ int RunSandbox(int argc, char* argv[]) {
     ComPtr<ID3D12Resource> gpuTimestampReadback;
     uint64_t gpuTimestampFrequency = 0;
     GpuTimingStats gpuTiming = {};
+    std::array<uint64_t, kFrameCount> gpuTimestampFenceValues = {};
     {
         HRESULT freqHr = commandQueue->GetCommandQueue()->GetTimestampFrequency(&gpuTimestampFrequency);
         if (FAILED(freqHr) || gpuTimestampFrequency == 0) {
@@ -14625,6 +14626,7 @@ int RunSandbox(int argc, char* argv[]) {
         // Get current frame context
         uint32_t frameIndex = window->GetCurrentBackBufferIndex();
         FrameContext& ctx = frameContexts[frameIndex];
+        const uint32_t gpuTimestampSlot = static_cast<uint32_t>(frameCount % kFrameCount);
         bool sparseMidMeshGpuDrawDirectSubmittedThisFrame = false;
         const bool sparseCpuRaycastAuthoritative =
             sparseRuntimeTestMode && sparseVoxelWorldReady && !enableSparseGpuRaycast;
@@ -14654,7 +14656,13 @@ int RunSandbox(int argc, char* argv[]) {
         }
         if (gpuTimestampReadback && gpuTimestampFrequency != 0) {
             uint64_t perfGpuTimingReadStart = SDL_GetPerformanceCounter();
-            ReadGpuTiming(gpuTimestampReadback.Get(), gpuTimestampFrequency, frameIndex, gpuTiming);
+            const uint64_t timestampFenceValue = gpuTimestampFenceValues[gpuTimestampSlot];
+            if (timestampFenceValue != 0u) {
+                commandQueue->WaitForFenceValue(timestampFenceValue);
+                ReadGpuTiming(gpuTimestampReadback.Get(), gpuTimestampFrequency, gpuTimestampSlot, gpuTiming);
+            } else {
+                gpuTiming = {};
+            }
             perfGpuTimingReadMs = ticksToMs(SDL_GetPerformanceCounter() - perfGpuTimingReadStart);
         }
         uint64_t perfGapStart = SDL_GetPerformanceCounter();
@@ -15468,7 +15476,7 @@ int RunSandbox(int argc, char* argv[]) {
         perfSparseStepStart = SDL_GetPerformanceCounter();
         ctx.commandAllocator->Reset();
         commandList->Reset(ctx.commandAllocator.Get(), nullptr);
-        const uint32_t gpuTimestampBase = frameIndex * kGpuTimestampCount;
+        const uint32_t gpuTimestampBase = gpuTimestampSlot * kGpuTimestampCount;
         if (gpuTimestampHeap) {
             commandList->EndQuery(gpuTimestampHeap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, gpuTimestampBase + 0);
         }
@@ -26591,6 +26599,9 @@ int RunSandbox(int argc, char* argv[]) {
         // Signal fence for this frame
         uint64_t perfSignalGenStart = SDL_GetPerformanceCounter();
         ctx.fenceValue = commandQueue->Signal();
+        if (gpuTimestampHeap && gpuTimestampReadback) {
+            gpuTimestampFenceValues[gpuTimestampSlot] = ctx.fenceValue;
+        }
         if (sparseMidMeshGpuDrawDirectSubmittedThisFrame) {
             sparseMidMeshGpuDrawLastDirectRenderFenceValue = ctx.fenceValue;
         }
@@ -26723,6 +26734,17 @@ int RunSandbox(int argc, char* argv[]) {
         const bool perfFrameEndIntervalDue =
             perfFrameEndLogIntervalOverride &&
             (frameCount % static_cast<uint64_t>(perfFrameEndLogInterval) == 0);
+        if (enableRuntimeLog && perfFrameEndIntervalDue) {
+            spdlog::info(
+                "PERF_GPU frame={} gpuFrameMs={:.2f} raymarchMs={:.2f} sparseSurfaceMs={:.2f} sparseUploadMs={:.2f} overlayMs={:.2f} valid={}",
+                frameCount,
+                gpuTiming.valid ? gpuTiming.frameMs : 0.0,
+                gpuTiming.valid ? gpuTiming.raymarchMs : 0.0,
+                gpuTiming.valid ? gpuTiming.sparseSurfaceMs : 0.0,
+                gpuTiming.valid ? gpuTiming.sparseUploadMs : 0.0,
+                gpuTiming.valid ? gpuTiming.overlayMs : 0.0,
+                gpuTiming.valid ? 1 : 0);
+        }
         if (enableRuntimeLog &&
             (perfFrameBodyMsLastFrame > 40.0f || (frameCount % 120 == 0) || perfFrameEndIntervalDue)) {
             static uint32_t slowFrameEndLogs = 0;

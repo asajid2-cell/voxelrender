@@ -2054,3 +2054,17 @@ overlayMs). Then the orchestrator measures the ACTUAL GPU work vs the fenceWait 
 finally identifies what bounds the frame -- before any fix. If GPU-bound at full quality, the 120fps
 path is GPU-side (and may trade against render-scale = the quality knob); if sync-bound, it is the
 fence/present path.
+
+## Loop 52 (Codex) -- GPU timestamp readback fencing + PERF_GPU log
+
+Measurement-only patch: the timestamp query/readback ring now has explicit per-slot fence tracking
+instead of relying on the current swap-chain back-buffer slot as the timestamp readback lifetime.
+Each timestamp slot is read only after the fence for the frame that resolved that slot has completed,
+then the same slot is reused for the current frame. The first ring pass can still be invalid warmup;
+steady frames should now report valid GPU timing if the device writes timestamp queries.
+
+Added `PERF_GPU` on the `VENPOD_PERF_FRAME_END_LOG_INTERVAL` cadence with:
+`gpuFrameMs`, `raymarchMs`, `sparseSurfaceMs`, `sparseUploadMs`, `overlayMs`, and `valid`.
+
+Build passed via `_agent_build.bat`. The next orchestrator run should verify `valid=1` on steady
+replay/sandbox frames before drawing any GPU-bound vs CPU/sync-bound conclusion.
