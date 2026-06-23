@@ -2145,3 +2145,30 @@ REMAINING HEADROOM (120fps = 8.3ms, so ~2x to go on the median):
 3. STRUCTURAL: the 94%-idle GPU. The interest-sample offload was a wash (CPU bookkeeping, not sampling),
    but the broader question -- can more of the CPU body pipeline against the idle GPU, or move to a
    worker -- is the only path to a ~2x median, and it is a multi-loop rework, not a config flip.
+
+## Loop 56 (Claude + layer) -- "move off CPU" scoped: it's a BROAD GRIND, not a big-bang; first slice = telemetry gate
+
+Layer scope (loop56-move-off-cpu, HIGH conf) + the campaign's drift-immune timers (VENPOD_CLIPINTEREST_
+PROFILE per OPUS_CONTINUATION.md:85-88) SKEPTICALLY CORRECTED the "~14ms orchestration" premise: that
+number came from the PERF_SPARSE_STEPS bucket columns, which are INFLATED ~4x (NEXT_LEVERS.md:5-6,
+"clipInterest claimed 6.4ms vs real 1.47"). Real orchestration is a SUM of modest phases, NO single
+dominant lever (OPUS_CONTINUATION.md:105 "120Hz needs BROAD small wins, not one fix"):
+- UpdateVoxelInterest 2.34ms but only ~25% frames (~0.6ms weighted); per-brick HeightAt 0.036ms
+  (negligible, already cached SparseClipmap.cpp:4790-4816); RefreshStats heavy telemetry 0.5-0.75ms
+  EVERY frame; surface-apply ~2ms; reqPrep ~1.3ms; + present-pacing fence wait ~3.78ms.
+So "move off CPU" = a series of ~0.5-2ms slices, not a 2x big-bang. (The median is genuinely a sum of
+small CPU phases + present-pacing against the idle GPU.)
+
+FIRST SLICE (safest, every-frame, zero-risk -- a same-thread SKIP, not a worker move): gate the
+LOG-ONLY heavy block of SparseClipmapTileCache::RefreshStats (SparseClipmap.cpp block 2, ~9092-9159+:
+the full 16384-brick m_voxelSlotByCoord sweep :9107-9116, reservation-age + priority/queue loops) to
+run ONLY when telemetry is consumed (the existing log/overlay gate editingThisFrame||slowFrameThisFrame
+||frameCount%15==0 at main_launcher.cpp:26840). CRITICAL: block 2 also re-runs side-effects
+(PruneAsyncVisibleReservations :9094, m_visiblePriorityVoxelSet prune :9151+) that are duplicates of
+always-on block 1's (:9018/:9042) -- HOIST or confirm-co-firing before gating so prune cadence is
+unchanged. The one gameplay field (missingInterestedTiles -> mid-clipmap budget main_launcher:13817)
+lives in always-on block 1 -> ZERO render/streaming/gameplay staleness. ~0.5-0.75ms/frame.
+GATE: byte-identical logged stats on logged frames; PruneAsyncVisibleReservations cadence + the
+:13817 budget unchanged frame-for-frame; visibleMissing=0 + residentMissingSurface=0; rawMs A/B median
+-~0.5-0.75ms with GPU still 1.17ms. Then the series: surface-apply, request-planning, interest-async
+(last, residency/pop-in risk).
