@@ -2188,3 +2188,26 @@ where `m_statsHeavyRefreshOncePerFrame` is off and each `RefreshStats()` call mu
 complete snapshot.
 
 Build: `_agent_build.bat` passed; only existing `rayDir` shadow warnings in `main_launcher.cpp`.
+
+## Loop 57 (Codex 0f94b6a + Claude A/B) -- telemetry gate WITHIN-NOISE; median is ~100fps; pivot to DIPS
+
+Codex committed the RefreshStats lazy telemetry gate (0f94b6a, VENPOD_SPARSE_REFRESHSTATS_LAZY default
+1; heavy log-only block skipped on non-telemetry frames; prune side-effects kept always-on).
+A/B (frequency-cut config, mtns.rec, 2 runs each): lazy0 p50=10.07/10.46, lazy1 p50=10.81/10.82 -- the
+~0.5ms expected win is BELOW the run-to-run noise floor (same-config variance 0.4ms). visibleMissing=0.
+=> safe, no regression, but NOT separately measurable. Kept (default ON) as a safe behavior-neutral
+slice, NOT a claimed win.
+
+TWO LOAD-BEARING REALIZATIONS:
+1. The median rawMs VARIES 10-16ms by SYSTEM LOAD for the SAME config (this session: ~10ms / 100fps;
+   earlier: ~16ms / 62fps). The engine's INHERENT median is ~10ms (~100fps) -- much closer to 120 than
+   the loaded 16ms suggested. The desktop's session-to-session variance (~6ms) DWARFS the move-off-CPU
+   slices (~0.5-2ms each), so those slices are UNMEASURABLE individually in rawMs. Only above-noise
+   wins (the prepass overdraw, the interest -13%) are confirmable here; the CPU grind is below the floor.
+2. The real remaining gap is the DIPS, which ARE above noise: p90 ~29ms + raymarchMs spikes 0.10->144ms
+   on uncovered-far-terrain views (quality full-res far raymarch). That is the "no visible dips" goal +
+   the actual stutter. PIVOT here -- it is measurable (144ms >> noise) and is the user's real complaint.
+
+NEXT: the raymarch-dip lever -- raise FAR-surface coverage so less far terrain hits the full-res
+raymarch (the workers extract far surface -> the raymarch shrinks), or a cheaper far path WITHOUT the
+low-res background pass (no quality hit). Measurable via raymarchMs (valid GPU timing) + the dip p99/max.
