@@ -1854,3 +1854,18 @@ no-dips lever for the goal. CHEAP CONFIRM (zero code): VENPOD_VSYNC=1 should mak
 vanish/regularize while gpuTiming stays 3-4ms -> confirms present-queue pacing. GATE for the fix:
 render-invisible (capsheet pixel-equiv) + gapPrev outliers collapse toward body with gpuTS flat +
 perfFenceWaitMs flat + no TDR (walk_bench).
+
+## Loop 45 -- env-gated waitable-swapchain throttle implemented; perf A/B pending
+
+Implemented the Loop 44 present-queue pacing lever behind `VENPOD_FRAME_LATENCY_WAITABLE` (default
+OFF): when enabled, swapchain create/resize flags include
+`DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`, the IDXGISwapChain3 path sets maximum frame
+latency to 2 and caches the DXGI waitable handle, and the frame loop performs a finite
+`WaitForSingleObject(handle, 1000)` beside the existing per-frame fence wait. The cached handle is
+closed before resize re-fetch and shutdown.
+
+Render-invisible by construction: no command list, resource state, shader, resolution, render-scale,
+or `PS_Raymarch` edits. Flag-off behavior remains inert: default config leaves swapchain flags and the
+frame loop wait path matching the previous code path. Fresh-restart perf A/B is still pending:
+expected pass signal is gapPrev burst collapse while `gpuTiming.frameMs` remains flat and
+`perfFenceWaitMs` does not become the new stall.

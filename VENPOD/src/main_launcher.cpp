@@ -1051,6 +1051,7 @@ int RunSandbox(int argc, char* argv[]) {
         180u,
         static_cast<uint32_t>(std::lround(static_cast<float>(kDefaultWindowHeight) * raymarchRenderScale)));
     windowConfig.vsync = ReadUIntEnv("VENPOD_VSYNC", 1u) != 0u;
+    windowConfig.frameLatencyWaitable = ReadUIntEnv("VENPOD_FRAME_LATENCY_WAITABLE", 0u) != 0u;
     const bool backgroundPassEnableRequested =
         ReadUIntEnv("VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE", 0u) != 0u;
     const bool explicitBackgroundPassScale =
@@ -14631,6 +14632,9 @@ int RunSandbox(int argc, char* argv[]) {
 
         // Wait for this frame's previous work to complete
         uint64_t perfPhaseStart = SDL_GetPerformanceCounter();
+        if (HANDLE frameLatencyWaitable = window->GetFrameLatencyWaitable()) {
+            WaitForSingleObject(frameLatencyWaitable, 1000);
+        }
         commandQueue->WaitForFenceValue(ctx.fenceValue);
         perfFenceWaitMs = ticksToMs(SDL_GetPerformanceCounter() - perfPhaseStart);
         if (traceFrameStages && frameCount < kFrameStageTraceLimit) {

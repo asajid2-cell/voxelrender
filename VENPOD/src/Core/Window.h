@@ -23,6 +23,7 @@ struct WindowConfig {
     uint32_t height = 1080;
     bool fullscreen = false;
     bool vsync = true;
+    bool frameLatencyWaitable = false;
 };
 
 // Window wrapper with SDL3 and DX12 swapchain
@@ -59,6 +60,7 @@ public:
     [[nodiscard]] SDL_Window* GetSDLWindow() const { return m_window; }
     [[nodiscard]] HWND GetHWND() const { return m_hwnd; }
     [[nodiscard]] IDXGISwapChain3* GetSwapChain() const { return m_swapChain.Get(); }
+    [[nodiscard]] HANDLE GetFrameLatencyWaitable() const { return m_frameLatencyWaitable; }
     [[nodiscard]] bool IsVSyncEnabled() const { return m_vsync; }
 
     void SetVSync(bool enabled) { m_vsync = enabled; }
@@ -72,11 +74,16 @@ private:
     Result<void> CreateSwapChain(Graphics::DX12Device* device, Graphics::DX12CommandQueue* commandQueue);
     Result<void> CreateRenderTargetViews(Graphics::DX12Device* device);
     void ReleaseRenderTargetViews();
+    void ReleaseFrameLatencyWaitableObject();
+    [[nodiscard]] UINT GetSwapChainFlags() const;
+    void RefreshFrameLatencyWaitableObject();
 
     SDL_Window* m_window = nullptr;
     uint32_t m_width = 0;
     uint32_t m_height = 0;
     bool m_vsync = true;
+    bool m_frameLatencyWaitableEnabled = false;
+    HANDLE m_frameLatencyWaitable = nullptr;
     HWND m_hwnd = nullptr;
 
     // Stored for resize operations

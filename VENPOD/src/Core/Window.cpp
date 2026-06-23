@@ -17,6 +17,7 @@ Result<void> Window::Initialize(const WindowConfig& config, Graphics::DX12Device
     m_width = config.width;
     m_height = config.height;
     m_vsync = config.vsync;
+    m_frameLatencyWaitableEnabled = config.frameLatencyWaitable;
 
     // Initialize SDL3 (returns true on success)
     if (!SDL_Init(SDL_INIT_VIDEO)) {
@@ -53,6 +54,7 @@ Result<void> Window::InitializeSwapChain(Graphics::DX12Device* device, Graphics:
 void Window::Shutdown() {
     // IMPORTANT: Caller should have called WaitForGPU() before this!
     ReleaseRenderTargetViews();
+    ReleaseFrameLatencyWaitableObject();
     m_swapChain.Reset();
 
     if (m_window) {
@@ -91,7 +93,7 @@ Result<void> Window::CreateSwapChain(Graphics::DX12Device* device, Graphics::DX1
     swapChainDesc.Scaling = DXGI_SCALING_STRETCH;
     swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     swapChainDesc.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
-    swapChainDesc.Flags = device->SupportsTearing() ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    swapChainDesc.Flags = GetSwapChainFlags();
 
     ComPtr<IDXGISwapChain1> swapChain1;
     HRESULT hr = device->GetFactory()->CreateSwapChainForHwnd(
@@ -116,6 +118,7 @@ Result<void> Window::CreateSwapChain(Graphics::DX12Device* device, Graphics::DX1
         return Result<void>::Err("Failed to query IDXGISwapChain3 interface");
     }
 
+    RefreshFrameLatencyWaitableObject();
     m_currentBackBufferIndex = m_swapChain->GetCurrentBackBufferIndex();
 
     spdlog::info("Swap chain created with {} buffers (triple buffering)", BUFFER_COUNT);
@@ -165,6 +168,39 @@ void Window::ReleaseRenderTargetViews() {
         m_backBuffers[i].Reset();
     }
     m_rtvHeap.Reset();
+}
+
+void Window::ReleaseFrameLatencyWaitableObject() {
+    if (m_frameLatencyWaitable) {
+        CloseHandle(m_frameLatencyWaitable);
+        m_frameLatencyWaitable = nullptr;
+    }
+}
+
+UINT Window::GetSwapChainFlags() const {
+    UINT flags = (m_device && m_device->SupportsTearing()) ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    if (m_frameLatencyWaitableEnabled) {
+        flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    }
+    return flags;
+}
+
+void Window::RefreshFrameLatencyWaitableObject() {
+    ReleaseFrameLatencyWaitableObject();
+    if (!m_frameLatencyWaitableEnabled || !m_swapChain) {
+        return;
+    }
+
+    HRESULT hr = m_swapChain->SetMaximumFrameLatency(2);
+    if (FAILED(hr)) {
+        spdlog::warn("SetMaximumFrameLatency(2) failed: 0x{:08X}", static_cast<unsigned int>(hr));
+        return;
+    }
+
+    m_frameLatencyWaitable = m_swapChain->GetFrameLatencyWaitableObject();
+    if (!m_frameLatencyWaitable) {
+        spdlog::warn("GetFrameLatencyWaitableObject returned null");
+    }
 }
 
 void Window::Present() {
@@ -233,7 +269,7 @@ void Window::OnResize(uint32_t width, uint32_t height) {
         width,
         height,
         DXGI_FORMAT_R8G8B8A8_UNORM,
-        m_device->SupportsTearing() ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0
+        GetSwapChainFlags()
     );
 
     if (FAILED(hr)) {
@@ -250,6 +286,7 @@ void Window::OnResize(uint32_t width, uint32_t height) {
 
     m_width = width;
     m_height = height;
+    RefreshFrameLatencyWaitableObject();
     m_currentBackBufferIndex = m_swapChain->GetCurrentBackBufferIndex();
 
     auto rtvResult = CreateRenderTargetViews(m_device);
