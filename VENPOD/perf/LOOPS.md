@@ -2124,3 +2124,24 @@ the real path the user sensed -- the median was CPU-bound on a redundant per-fra
 preset had pessimized. Residual: a visual confirm under sustained fast-yaw is the ideal final check
 (capture harness is flaky; cleanest is a live fast-yaw look), but the quantitative no-hole + coverage
 gate is strong + maintainer-validated.
+
+## Loop 55 (Claude) -- column-cache no-go; consolidated state after the median win
+
+persistentTerrainColumnCache=1 A/B on top of the frequency-cut (mtns.rec): median 15.7->16.6 (slight
+regression, within noise), no benefit -- it serves the surface-extraction path, not the flythrough
+median, and adds cache bookkeeping. Rejected. The HeightAtUncached thrashing fix would be a
+set-associative HeightMemo (code change, ~1ms micro-opt, the verdict's "lower leverage" follow-up).
+
+STATE (validly measured, quality config, clean):
+- Median ~15.7-16.4ms (~62fps), down from 18.9 (the shipped interest frequency-cut). CPU-bound; GPU
+  ~94% idle (1.17ms median GPU). Led by terrain HeightAt cache-miss thrashing (HeightMemo, direct-
+  mapped) + a diffuse tail (edit-overrides, readiness, requests).
+- Dips: GPU raymarch spike (0.10->144ms) on uncovered-far-terrain views (quality full-res far).
+- SHIPPED: early-Z prepass (overdraw 3.7->1.0) + interest frequency-cut (-13% median). Both no quality
+  loss, validly gated.
+REMAINING HEADROOM (120fps = 8.3ms, so ~2x to go on the median):
+1. Median micro-opt grind: set-associative HeightMemo (~1ms), trim the diffuse tail. Incremental.
+2. Raymarch-dip lever: raise far-surface coverage so the 144ms raymarch spike shrinks (no quality hit).
+3. STRUCTURAL: the 94%-idle GPU. The interest-sample offload was a wash (CPU bookkeeping, not sampling),
+   but the broader question -- can more of the CPU body pipeline against the idle GPU, or move to a
+   worker -- is the only path to a ~2x median, and it is a multi-loop rework, not a config flip.
