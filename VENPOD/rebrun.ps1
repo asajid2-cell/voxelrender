@@ -71,11 +71,14 @@ param(
     [switch]$SparseGpuRaycastStrict,
     [int]$ExitAfterFrames = 0,
     # Generation Overhaul V2 performance modes (see generation-overhaul-v2.md):
+    #   quality -> ~100 FPS median, FULL-RES near+far, NO quality reduction. THE DEFAULT
+    #     no-dip ~100fps build (early-Z prepass + interest signature-reuse/interval=2 + lazy
+    #     stats; GPU ~94% idle headroom; only ~1.5% grazing-horizon frames dip on far raymarch).
     #   60fps -> ~60 FPS, stable, no holes; terrain COARSER (bounded generation)
     #   30fps -> ~30 FPS, stable, no holes; terrain DETAILED (high coverage)
-    # Both use best-available-LOD render (no freezes/holes). "none" = legacy path.
+    # All use best-available-LOD render (no freezes/holes). "none" = legacy raw path.
     [ValidateSet("none", "60fps", "30fps", "detail", "quality")]
-    [string]$PerfMode = "none",
+    [string]$PerfMode = "quality",
     # Raymarch render scale (the dominant FPS lever, since the frame is GPU-raymarch
     # bound). <1.0 renders the voxel raymarch at lower res then upscales: lower =
     # faster but softer. 0 = use the perf-mode default. e.g. -RenderScale 0.4
