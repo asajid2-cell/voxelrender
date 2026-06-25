@@ -2276,3 +2276,30 @@ full-res sharp far horizon (render scale 1.0, bg-pass OFF). The probe already op
 alternatives (mid-mesh-far-reach WORSENS; bg-pass = quality downscale) confirm there is no free dip
 lever. Cutting these further at full quality needs a TEMPORAL far-field reprojection/amortization (a
 real multi-loop project, reprojection-artifact risk) or accepting the occasional grazing-view stutter.
+
+## CHECKPOINT (2026-06-23) -- no-dip ~100fps build shipped to main as the DEFAULT
+
+Committed fc696c3, fast-forwarded main (f1b8242 -> fc696c3, clean FF, 142 commits), pushed to
+origin (github asajid2-cell/voxelrender), tag `no-dip-100fps-baseline`. rebrun default PerfMode is
+now `quality` so a bare `rebrun -NoBuild` IS the shipped build.
+
+SHIPPED DEFAULTS (all no-hole, validly gated):
+- early-Z surface depth-prepass (VENPOD_SPARSE_SURFACE_DEPTH_PREPASS default 1) -- overdraw 3.7->1.0.
+- interest signature-reuse + MID_INTEREST_INTERVAL=2 (rebrun quality preset) -- median -13%.
+- lazy clipmap-stats (VENPOD_SPARSE_REFRESHSTATS_LAZY default 1) -- safe telemetry skip.
+- GPU timestamp readback fence fix (44aafb5) -- gpuValid=1, PERF_GPU per-frame now real.
+- FarSvo dip env (VENPOD_FAR_SVO_STEP_QUALITY_GATE) committed INERT (0.92); probe-skip was a wash.
+Ship verify (cache primed): 601 frames, visibleMissing=0, residentMissingSurface=0, GPU 1.64ms idle.
+
+STATE: median ~100fps at a quiet state (CPU-bound, GPU ~94% idle); ~1.5% grazing-horizon frames dip
+on the full-res far raymarch. Median rawMs varies 10-16ms by desktop LOAD (not the build).
+
+NEXT (keep going -- all HARD multi-loop reworks, no quick levers left):
+1. Present-pacing: ~3.78ms/frame fence wait = CPU idle-waiting on a swapchain buffer (GPU done in
+   1.17ms). Biggest single median chunk, benefits EVERY frame. DWM-level; the waitable throttle was
+   within-noise -- needs a deeper look (frame-latency=1? a different present/fence structure?).
+2. Temporal far-field reprojection/amortization -> kills the grazing-horizon raymarch dips at full
+   quality (the only no-quality-loss path; reprojection-artifact risk).
+3. Sub-noise CPU orchestration slices (gate on per-phase timers, not rawMs -- desktop too noisy).
+Measurement doctrine: trust degradation-immune signals (PERF_GPU/overdraw/composition/visibleMissing/
+brick counts); rawMs median is noise-dominated; PS_Raymarch edits cost a ~7-min recompile (prime cache).
