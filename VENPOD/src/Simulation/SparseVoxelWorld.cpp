@@ -1120,6 +1120,14 @@ void SparseVoxelWorld::BeginFrame() {
     m_parallelSurfaceExtractionWorkersLastFrame = 0;
     m_parallelSurfaceExtractionWallMsLastFrame = 0.0f;
     m_surfaceExtractionWaitMsLastFrame = 0.0f;
+    m_asyncSurfaceExtractionEnqueuedLastFrame = 0;
+    m_asyncSurfaceExtractionAppliedLastFrame = 0;
+    m_asyncSurfaceExtractionDiscardedLastFrame = 0;
+    m_asyncSurfaceEditGateGlobalWouldSyncLastFrame = 0;
+    m_asyncSurfaceEditGatePerCoordAsyncLastFrame = 0;
+    m_asyncSurfaceEditGatePerCoordSyncLastFrame = 0;
+    m_asyncSurfaceExtractionWorkerMsLastFrame = 0.0f;
+    m_asyncSurfaceExtractionApplyMsLastFrame = 0.0f;
     m_terrainColumnCacheFrameStats = {};
     m_terrainColumnCacheClearedLastFrame = 0;
     if (!m_config.persistentTerrainColumnCache) {
@@ -4772,8 +4780,17 @@ uint32_t SparseVoxelWorld::ApplyAsyncSurfaceExtractionCompletions() {
         return 0;
     }
     const uint32_t maxApply = std::max(1u, m_config.asyncSurfaceExtractionMaxApplyPerFrame);
+    const bool timeLimited = m_config.asyncSurfaceExtractionMaxApplyMs > 0.0f;
+    const uint64_t applyStartTicks = SDL_GetPerformanceCounter();
     uint32_t applied = 0;
     while (applied < maxApply) {
+        const float elapsedThisCallMs = WaitTicksToMs(applyStartTicks);
+        if (timeLimited &&
+            (applied > 0u || m_asyncSurfaceExtractionApplyMsLastFrame > 0.0f) &&
+            m_asyncSurfaceExtractionApplyMsLastFrame + elapsedThisCallMs >=
+                m_config.asyncSurfaceExtractionMaxApplyMs) {
+            break;
+        }
         AsyncSurfaceExtractionResult result;
         {
             const uint64_t waitStartTicks = SDL_GetPerformanceCounter();
@@ -4795,6 +4812,21 @@ uint32_t SparseVoxelWorld::ApplyAsyncSurfaceExtractionCompletions() {
             ++m_asyncSurfaceExtractionDiscardedLastFrame;
             continue;  // brick evicted/changed while meshing; drop the stale mesh
         }
+        if (m_edits.EditedBrickCount() != 0u &&
+            EditOverlapsSurfaceExtractionDependency(result.coord)) {
+            ++m_asyncSurfaceExtractionDiscardedLastFrame;
+            const bool coordDirty =
+                m_surfaceDirtyRegions.find(result.coord) != m_surfaceDirtyRegions.end();
+            const bool coordEdited = m_edits.HasOverlay(result.coord);
+            if (!coordDirty &&
+                !coordEdited &&
+                m_pendingSurfaceBricks.find(result.coord) == m_pendingSurfaceBricks.end()) {
+                m_pendingSurfaceBricks[result.coord] = std::move(result.brick);
+                QueueSurfaceExtractionCoord(result.coord);
+            }
+            MarkQueueAccountingDirty();
+            continue;
+        }
         if (m_surfaceCache.UpdateBrickWithExtractedFaces(
                 result.brick,
                 std::move(result.faces))) {
@@ -4810,19 +4842,60 @@ uint32_t SparseVoxelWorld::ApplyAsyncSurfaceExtractionCompletions() {
             ++applied;
         }
     }
+    m_asyncSurfaceExtractionApplyMsLastFrame += WaitTicksToMs(applyStartTicks);
     if (applied > 0) {
         RefreshStats();
     }
     return applied;
 }
 
+uint32_t SparseVoxelWorld::DrainAsyncSurfaceExtractionCompletions() {
+    return ApplyAsyncSurfaceExtractionCompletions();
+}
+
+bool SparseVoxelWorld::EditOverlapsSurfaceExtractionDependency(const BrickCoord& coord) const {
+    if (m_edits.EditedBrickCount() == 0u) {
+        return false;
+    }
+    if (m_surfaceDirtyRegions.find(coord) != m_surfaceDirtyRegions.end()) {
+        return true;
+    }
+    for (int32_t dz = -1; dz <= 1; ++dz) {
+        for (int32_t dy = -1; dy <= 1; ++dy) {
+            for (int32_t dx = -1; dx <= 1; ++dx) {
+                BrickCoord neighborCoord;
+                if (TryOffsetBrickCoord(coord, dx, dy, dz, &neighborCoord) &&
+                    m_edits.HasOverlay(neighborCoord)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+bool SparseVoxelWorld::CanQueueAsyncSurfaceExtractionForCoord(const BrickCoord& coord) {
+    if (!m_config.asyncSurfaceExtraction) {
+        return false;
+    }
+    if (m_edits.EditedBrickCount() == 0u) {
+        return m_surfaceDirtyRegions.find(coord) == m_surfaceDirtyRegions.end();
+    }
+    ++m_asyncSurfaceEditGateGlobalWouldSyncLastFrame;
+    if (!m_config.asyncSurfaceExtractionPerCoordEditGate ||
+        EditOverlapsSurfaceExtractionDependency(coord)) {
+        ++m_asyncSurfaceEditGatePerCoordSyncLastFrame;
+        return false;
+    }
+    ++m_asyncSurfaceEditGatePerCoordAsyncLastFrame;
+    return true;
+}
+
 // Route a coord to the async surface mesher when eligible (non-edited terrain), else
 // extract inline. Used by ALL the per-frame surface pump loops so meshing leaves the
 // main thread regardless of which pump drives it.
 bool SparseVoxelWorld::ExtractOrQueueSurfaceCoord(const BrickCoord& coord) {
-    if (m_config.asyncSurfaceExtraction &&
-        m_edits.EditedBrickCount() == 0u &&
-        m_surfaceDirtyRegions.find(coord) == m_surfaceDirtyRegions.end() &&
+    if (CanQueueAsyncSurfaceExtractionForCoord(coord) &&
         TryQueueAsyncSurfaceExtraction(coord)) {
         return true;
     }
@@ -4842,9 +4915,7 @@ bool SparseVoxelWorld::PumpSurfaceExtractionForCoord(const BrickCoord& coord) {
 
     // Fire-and-forget async meshing for non-edited terrain: enqueue and apply later
     // off the critical path. Falls back to inline extraction if not eligible/queue full.
-    if (m_config.asyncSurfaceExtraction &&
-        m_edits.EditedBrickCount() == 0u &&
-        m_surfaceDirtyRegions.find(coord) == m_surfaceDirtyRegions.end() &&
+    if (CanQueueAsyncSurfaceExtractionForCoord(coord) &&
         TryQueueAsyncSurfaceExtraction(coord)) {
         RefreshStats();
         return true;
@@ -8278,6 +8349,29 @@ void SparseVoxelWorld::RefreshStats() {
     m_stats.parallelSurfaceExtractionWorkersLastFrame = m_parallelSurfaceExtractionWorkersLastFrame;
     m_stats.parallelSurfaceExtractionWallMsLastFrame = m_parallelSurfaceExtractionWallMsLastFrame;
     m_stats.surfaceExtractionWaitMsLastFrame = m_surfaceExtractionWaitMsLastFrame;
+    m_stats.asyncSurfaceExtractionEnqueuedLastFrame = m_asyncSurfaceExtractionEnqueuedLastFrame;
+    m_stats.asyncSurfaceExtractionAppliedLastFrame = m_asyncSurfaceExtractionAppliedLastFrame;
+    m_stats.asyncSurfaceExtractionDiscardedLastFrame = m_asyncSurfaceExtractionDiscardedLastFrame;
+    m_stats.asyncSurfaceEditGateGlobalWouldSyncLastFrame =
+        m_asyncSurfaceEditGateGlobalWouldSyncLastFrame;
+    m_stats.asyncSurfaceEditGatePerCoordAsyncLastFrame =
+        m_asyncSurfaceEditGatePerCoordAsyncLastFrame;
+    m_stats.asyncSurfaceEditGatePerCoordSyncLastFrame =
+        m_asyncSurfaceEditGatePerCoordSyncLastFrame;
+    m_stats.asyncSurfaceExtractionWorkerMsLastFrame = m_asyncSurfaceExtractionWorkerMsLastFrame;
+    m_stats.asyncSurfaceExtractionApplyMsLastFrame = m_asyncSurfaceExtractionApplyMsLastFrame;
+    {
+        std::lock_guard<std::mutex> lock(m_asyncSurfaceExtractionMutex);
+        m_stats.asyncSurfaceExtractionQueueDepth = static_cast<uint32_t>(std::min<size_t>(
+            m_asyncSurfaceExtractionQueue.size(),
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+        m_stats.asyncSurfaceExtractionResultDepth = static_cast<uint32_t>(std::min<size_t>(
+            m_asyncSurfaceExtractionResults.size(),
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+        m_stats.asyncSurfaceExtractionPending = static_cast<uint32_t>(std::min<size_t>(
+            m_asyncSurfaceExtractionPending.size(),
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+    }
     m_stats.terrainColumnCachePersistentActive = m_config.persistentTerrainColumnCache ? 1u : 0u;
     m_stats.terrainColumnCacheEntries = static_cast<uint32_t>(std::min<size_t>(
         m_surfaceTerrainColumnCache.size(),

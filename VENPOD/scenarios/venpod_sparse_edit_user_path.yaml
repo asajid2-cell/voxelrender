@@ -1,0 +1,45 @@
+id: venpod_sparse_edit_user_path
+description: Verify default interactive sparse brush placement publishes edit-visible invalidations.
+
+target:
+  type: custom
+  name: venpod
+
+actions:
+  - run:
+      label: edit_smoke
+      timeout_s: 180
+      command: >
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; & 'Z:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\rebrun.ps1' -NoBuild -SparseBrushSmokeUserPath -ExitAfterFrames 600; $exit=$LASTEXITCODE; Get-Content 'Z:\328\CMPUT328-A2\codexworks\301\3d\VENPOD\build\bin\venpod_runtime.log'; exit $exit"
+
+observations:
+  - process.logs
+  - metrics.from_log:
+      patterns:
+        edit_deltas: "SPARSE_BRUSH_PAINT_SMOKE passed .* deltas=([0-9]+)"
+        edit_cases: "SPARSE_BRUSH_PAINT_SMOKE passed .* cases=([0-9]+)/4"
+        invalidated_height_tiles: "SPARSE_MID_CLIPMAP_EDIT_INVALIDATE frame=[0-9]+ revision=[0-9]+ bricks=[0-9]+ heightTiles=([1-9][0-9]*)"
+
+assertions:
+  - type: command_success
+    command: edit_smoke
+  - type: output_contains
+    value: "SPARSE_BRUSH_PAINT_SMOKE passed"
+  - type: output_contains
+    value: "VENPOD shut down cleanly"
+  - type: output_not_contains
+    value: "[critical]"
+  - type: metric_greater_than
+    name: edit_deltas
+    value: 0
+  - type: metric_greater_than
+    name: edit_cases
+    value: 3
+  - type: metric_greater_than
+    name: invalidated_height_tiles
+    value: 0
+
+artifacts:
+  require:
+    - report_json
+    - report_html

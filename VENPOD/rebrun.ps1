@@ -94,10 +94,16 @@ function Write-Info { Write-Host "  $args" -ForegroundColor Gray }
 $projectRoot = $PSScriptRoot
 $buildScript = Join-Path $projectRoot "build.ps1"
 $runScript = Join-Path $projectRoot "run.ps1"
+$activeBuildDir = if (-not [string]::IsNullOrWhiteSpace($env:VENPOD_BUILD_DIR)) {
+    $env:VENPOD_BUILD_DIR
+} else {
+    Join-Path $projectRoot "build"
+}
+$activeBinDir = Join-Path $activeBuildDir "bin"
 
 function Refresh-RuntimeAssets {
     $sourceAssets = Join-Path $projectRoot "assets"
-    $targetAssets = Join-Path $projectRoot "build\bin\assets"
+    $targetAssets = Join-Path $activeBinDir "assets"
     if (-not (Test-Path $sourceAssets)) {
         throw "Source assets not found at $sourceAssets"
     }
@@ -128,6 +134,8 @@ if (-not (Test-Path $runScript)) {
 }
 
 $savedEnv = @{
+    VENPOD_PROD_ABLATION = $env:VENPOD_PROD_ABLATION
+    VENPOD_REPLAY_BRUSH = $env:VENPOD_REPLAY_BRUSH
     VENPOD_LOG_FILE = $env:VENPOD_LOG_FILE
     VENPOD_DIAGNOSTICS = $env:VENPOD_DIAGNOSTICS
     VENPOD_BOUNDARY_TEST = $env:VENPOD_BOUNDARY_TEST
@@ -216,10 +224,22 @@ $savedEnv = @{
     VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS = $env:VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS
     VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH = $env:VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH
     VENPOD_RAYMARCH_RENDER_SCALE = $env:VENPOD_RAYMARCH_RENDER_SCALE
+    VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ = $env:VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ
     VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET = $env:VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET
     VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS = $env:VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS
+    VENPOD_SPARSE_HIDDEN_EXACT_MISS_SURFACE_BUDGET = $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_SURFACE_BUDGET
     VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $env:VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS
     VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $env:VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS
+    VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_MS = $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_MS
+    VENPOD_SPARSE_EDIT_MESH_REBUILD = $env:VENPOD_SPARSE_EDIT_MESH_REBUILD
+    VENPOD_SPARSE_MID_EDIT_BRICK_REGEN_BUDGET = $env:VENPOD_SPARSE_MID_EDIT_BRICK_REGEN_BUDGET
+    VENPOD_SPARSE_MID_EDIT_BRICK_REGEN_ACTIVE_BUDGET = $env:VENPOD_SPARSE_MID_EDIT_BRICK_REGEN_ACTIVE_BUDGET
+    VENPOD_SPARSE_MID_EDIT_HEIGHT_TILE_REGEN_BUDGET = $env:VENPOD_SPARSE_MID_EDIT_HEIGHT_TILE_REGEN_BUDGET
+    VENPOD_CLIPINTEREST_PROFILE = $env:VENPOD_CLIPINTEREST_PROFILE
+    VENPOD_SPARSE_MID_CLIPMAP_INTEREST_DETAIL = $env:VENPOD_SPARSE_MID_CLIPMAP_INTEREST_DETAIL
+    VENPOD_SPARSE_MID_CLIPMAP_HEIGHT_INTEREST_REBUILD_RINGS_PER_FRAME = $env:VENPOD_SPARSE_MID_CLIPMAP_HEIGHT_INTEREST_REBUILD_RINGS_PER_FRAME
+    VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_SURFACE_BUDGET = $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_SURFACE_BUDGET
+    VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_CATCHUP_FRAMES = $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_CATCHUP_FRAMES
     VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE = $env:VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE
     VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE = $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE
     VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL = $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL
@@ -227,7 +247,13 @@ $savedEnv = @{
     VENPOD_SPARSE_SURFACE_PARALLEL_TIME_BUDGETED = $env:VENPOD_SPARSE_SURFACE_PARALLEL_TIME_BUDGETED
     VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS = $env:VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS
     VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION = $env:VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION
+    VENPOD_SPARSE_SURFACE_CLASS_PARTIAL_SORT = $env:VENPOD_SPARSE_SURFACE_CLASS_PARTIAL_SORT
     VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS = $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS
+    VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME = $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME
+    VENPOD_SPARSE_SURFACE_EXTRACTION_BUDGET = $env:VENPOD_SPARSE_SURFACE_EXTRACTION_BUDGET
+    VENPOD_SPARSE_SURFACE_UPLOAD_MIN_INTERVAL_FRAMES = $env:VENPOD_SPARSE_SURFACE_UPLOAD_MIN_INTERVAL_FRAMES
+    VENPOD_SPARSE_SURFACE_STAGE_SKIP_BUSY_CLIP_MS = $env:VENPOD_SPARSE_SURFACE_STAGE_SKIP_BUSY_CLIP_MS
+    VENPOD_SPARSE_EDIT_LIVE_BAKE = $env:VENPOD_SPARSE_EDIT_LIVE_BAKE
     VENPOD_SPARSE_EXACT_ASYNC_GENERATION = $env:VENPOD_SPARSE_EXACT_ASYNC_GENERATION
     VENPOD_SPARSE_EXACT_ASYNC_VISIBLE = $env:VENPOD_SPARSE_EXACT_ASYNC_VISIBLE
     VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE = $env:VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE
@@ -454,6 +480,9 @@ try {
         $env:VENPOD_ENABLE_EXPERIMENTAL_SPARSE = "1"
         $env:VENPOD_RENDER_BACKEND = "sparse"
         $env:VENPOD_SPARSE_RAYMARCH = "1"
+        # Keep feedback enabled in the default playable path. Disabling it is a
+        # useful perf ablation, but it must stay opt-in until edit correctness and
+        # visible convergence are proven under live interaction.
         $env:VENPOD_SPARSE_MISS_FEEDBACK = "1"
         # Public sparse runs should not expose the world until coherent LOD
         # owners are ready. Startup hidden-exact repair prewarms the first
@@ -612,12 +641,23 @@ try {
     # Applied after the sparse env setup so it overrides the startup render gate.
     foreach ($pvName in @(
         "VENPOD_STREAMING_V2",
+        "VENPOD_REPLAY_BRUSH",
         "VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS",
         "VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH",
         "VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET",
         "VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS",
+        "VENPOD_SPARSE_HIDDEN_EXACT_MISS_SURFACE_BUDGET",
         "VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS",
         "VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS",
+        "VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_MS",
+        "VENPOD_SPARSE_EDIT_MESH_REBUILD",
+        "VENPOD_SPARSE_EDIT_LIVE_BAKE",
+        "VENPOD_SPARSE_MID_EDIT_BRICK_REGEN_BUDGET",
+        "VENPOD_SPARSE_MID_EDIT_BRICK_REGEN_ACTIVE_BUDGET",
+        "VENPOD_SPARSE_MID_EDIT_HEIGHT_TILE_REGEN_BUDGET",
+        "VENPOD_SPARSE_MID_CLIPMAP_HEIGHT_INTEREST_REBUILD_RINGS_PER_FRAME",
+        "VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_SURFACE_BUDGET",
+        "VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_CATCHUP_FRAMES",
         "VENPOD_RAYMARCH_RENDER_SCALE",
         "VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE",
         "VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE",
@@ -626,10 +666,12 @@ try {
         "VENPOD_SPARSE_SURFACE_PARALLEL_TIME_BUDGETED",
         "VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS",
         "VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION",
+        "VENPOD_SPARSE_SURFACE_CLASS_PARTIAL_SORT",
         "VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS",
         "VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME",
         "VENPOD_SPARSE_SURFACE_EXTRACTION_BUDGET",
         "VENPOD_SPARSE_SURFACE_UPLOAD_MIN_INTERVAL_FRAMES",
+        "VENPOD_SPARSE_SURFACE_STAGE_SKIP_BUSY_CLIP_MS",
         "VENPOD_SPARSE_SURFACE_COPY_FACE_BUDGET",
         "VENPOD_SPARSE_SURFACE_COPY_REGION_BUDGET",
         "VENPOD_SPARSE_STATS_SINGLE_FLUSH",
@@ -645,11 +687,18 @@ try {
         "VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_PERSISTENT_WORKERS",
         "VENPOD_SPARSE_MID_CLIPMAP_PARALLEL_PUMP_MAX_WORKERS",
         "VENPOD_SPARSE_MID_VOXEL_COVERAGE_CATCHUP_BUDGET",
+        "VENPOD_SPARSE_MID_HEIGHT_TILE_BUDGET",
         "VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ",
         "VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION",
         "VENPOD_RAYMARCH_MID_PASS_ENABLE",
         "VENPOD_SPARSE_MID_INTEREST_INTERVAL",
         "VENPOD_SPARSE_MID_CLIPMAP_FOOTPRINT_INTEREST_SIGNATURE",
+        "VENPOD_CLIPINTEREST_PROFILE",
+        "VENPOD_SPARSE_MID_CLIPMAP_INTEREST_DETAIL",
+        "VENPOD_SPARSE_MID_CLIPMAP_FINE_RING_SIDE_FAN_PAIRS",
+        "VENPOD_SPARSE_MID_CLIPMAP_VIEW_FAN_PAIRS",
+        "VENPOD_SPARSE_MID_CLIPMAP_PARENT_HELD_CPU_SAMPLE_COLS",
+        "VENPOD_SPARSE_MID_CLIPMAP_PARENT_HELD_CPU_SAMPLE_ROWS",
         "VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE",
         "VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE_MAX_AGE")) {
         Remove-Item "env:$pvName" -ErrorAction SilentlyContinue
@@ -658,9 +707,12 @@ try {
         $quality = $PerfMode -eq "quality"
         # quality mode = VISUAL CORRECTNESS first: fill coverage, full-res near+far,
         # no GPU bandaids (fps is secondary). Other modes trade coverage/sharpness for fps.
-        $bgScale = if ($PerfMode -eq "60fps") { "0.3" } else { "0.5" }  # far raymarch res
+        $bgScale = if ($PerfMode -eq "60fps") { "0.3" } else { "0.35" }  # far raymarch res
         $pumpBudget = if ($quality) { "24" } elseif ($PerfMode -eq "60fps") { "16" } else { "12" }
+        # Quality is the default playable/editing path. Keep surface convergence
+        # permissive here; edit publication must not sit behind a tiny perf cap.
         $surfBudget = if ($quality) { "24" } elseif ($PerfMode -eq "60fps") { "4" } else { "8" }
+        $prePublishSurfBudget = if ($quality) { "2" } else { $surfBudget }
         $useBgPass = -not $quality   # quality renders the far field full-res (no blocky distance)
         $env:VENPOD_STREAMING_V2 = "1"
         $env:VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH = "0"   # speculative; not needed under best-available
@@ -672,14 +724,17 @@ try {
         $env:VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS = $pumpBudget
         $env:VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET = "1"
         $env:VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS = $surfBudget
-        $env:VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $surfBudget
-        $env:VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $surfBudget
+        $env:VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $prePublishSurfBudget
+        $env:VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $prePublishSurfBudget
         # Fire-and-forget ASYNC surface meshing: surface extraction (~20ms median while
         # moving) runs on a worker pool OFF the main thread, results applied within a
         # per-frame budget. This is the clean async producer (the old fork-join parallel
         # path was contended). Best-available render shows coarser terrain until a mesh
         # lands. The synchronous surface budgets above still bound any inline fallback.
         $env:VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION = "1"
+        $env:VENPOD_SPARSE_SURFACE_PARALLEL_EXTRACTION = if ($quality) { "0" } else { "1" }
+        $env:VENPOD_SPARSE_SURFACE_CLASS_PARTIAL_SORT = "1"
+        $env:VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET = if ($quality) { "1" } else { "0" }
         # Worker count: 8 of 16 logical cores (was 4). The exact-surface mesher is the
         # near-detail throughput producer; doubling the pool lets more bricks mesh in
         # parallel while moving into fresh terrain (mirrors the mid-voxel parallel pump's
@@ -695,23 +750,34 @@ try {
         if (-not $env:VENPOD_SPARSE_SURFACE_EXTRACTION_BUDGET) {
             $env:VENPOD_SPARSE_SURFACE_EXTRACTION_BUDGET = if ($quality) { "128" } elseif ($PerfMode -eq "60fps") { "128" } else { "96" }
         }
-        # Surface mesh APPLY (UpdateBrickWithExtractedFaces, default 256/frame) dominates
-        # the post-fence cost (untracked ~12-23ms). Throttle it: workers still produce,
-        # results apply over more frames (best-available shows coarse briefly). quality=high.
+        # Do not throttle default quality/editing apply. A low cap created edited
+        # surface publication debt: edits were recorded but visible surfaces lagged
+        # hundreds of frames behind.
         $surfApply = if ($quality) { "256" } elseif ($PerfMode -eq "60fps") { "192" } else { "128" }
         $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME = $surfApply
         # Surface GPU upload (snapshot/stage/emit) every frame is a big main-thread post-fence
         # cost. Upload every Nth frame instead (best-available shows 1-frame-older surface).
-        # Verified: interval 2 -> fps 46->54, steady (max 27ms). quality uploads every frame.
         # Upload every 3rd frame: amortizes the per-upload FIXED cost (snapshot build/begin).
         # (Tested interval 1 + bounded copy to spread it -> WORSE ~47fps: the fixed per-call
         # cost x every-frame exceeds the spike x 1/3. The spike needs incremental-snapshot
         # rework to remove, not spreading.)
-        $surfUploadInterval = if ($quality) { "1" } elseif ($PerfMode -eq "60fps") { "3" } else { "2" }
+        $surfUploadInterval = if ($quality) { "3" } elseif ($PerfMode -eq "60fps") { "3" } else { "2" }
         $env:VENPOD_SPARSE_SURFACE_UPLOAD_MIN_INTERVAL_FRAMES = $surfUploadInterval
-        # Skip the per-frame stats FlushStats (~2.25ms pure telemetry overhead). Single-flush
-        # mode keeps the metrics overlay slightly staler but is invisible to gameplay.
-        if (-not $quality) { $env:VENPOD_SPARSE_STATS_SINGLE_FLUSH = "1" }
+        # If clipmap interest has already made this frame expensive, defer non-removal
+        # dirty surface payload upload by one frame. Existing resident surfaces keep
+        # drawing; removals and full catchups are still allowed through.
+        $env:VENPOD_SPARSE_SURFACE_STAGE_SKIP_BUSY_CLIP_MS = if ($quality) { "3" } else { "0" }
+        $env:VENPOD_SPARSE_SURFACE_UPLOAD_EDIT_IDLE_FRAMES = if ($quality) { "0" } else { "4" }
+        # Skip repeated stats FlushStats calls (~2.25ms pure telemetry overhead in profiling).
+        # Single-flush mode keeps the metrics overlay slightly staler but is invisible to gameplay,
+        # so the production quality path should use it too.
+        $env:VENPOD_SPARSE_STATS_SINGLE_FLUSH = "1"
+        # Interactive editing must remain visibly authoritative by default, but edited
+        # mid-brick CPU regen is expensive. Keep it strict/incremental in quality mode.
+        $env:VENPOD_SPARSE_MID_EDIT_BRICK_REGEN_BUDGET = if ($quality) { "1" } else { "2" }
+        $env:VENPOD_SPARSE_MID_EDIT_BRICK_REGEN_ACTIVE_BUDGET = if ($quality) { "1" } else { "2" }
+        $env:VENPOD_SPARSE_BRUSH_MAX_STAMPS_PER_FRAME = if ($quality) { "12" } else { "16" }
+        # Edit mesh rebuild stays on unless an explicit diagnostic env override disables it.
         # Async EXACT generation too: move brick generation (gen ~6-10ms while moving)
         # off the main thread. VISIBLE+PREFETCH lanes must be async or moving-play bricks
         # (visible lane) bail to synchronous. Generated bricks apply a frame later, then
@@ -753,6 +819,9 @@ try {
         # fill, so the coverage-catchup budget can be raised 48->192 -> ~4x faster streaming
         # when moving into new terrain, at no fps cost (verified ~59fps @ speed 44, no TDR).
         $env:VENPOD_SPARSE_MID_VOXEL_COVERAGE_CATCHUP_BUDGET = "192"
+        # Keep edit-height mesh invalidation intentionally narrow in quality mode:
+        # one tile/frame preserves prompt edit publication without letting a brush
+        # stroke trigger full mid-mesh rebuild pressure every frame.
         # Mid-voxel interest radius is the dominant per-frame CPU driver (clip/req/upload
         # scale ~quadratically with it; default 8 -> ~9200 bricks). Shrink it for fps; the
         # far LOD + background pass fill beyond the mid-detail radius. quality keeps 8.
@@ -763,32 +832,62 @@ try {
         if (-not $env:VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION) {
             $env:VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION = "1"
         }
-        # Mid overlay pass: no longer forced here. The launcher decides the default
-        # (OFF when the mesh-mid raster owns the band -- its default -- ON for the
-        # legacy raymarch-mid path). An explicit VENPOD_RAYMARCH_MID_PASS_ENABLE in
-        # the environment still wins everywhere.
+        $env:VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ = if ($quality) { "4" } elseif ($PerfMode -eq "60fps") { "6" } else { "7" }
+        $env:VENPOD_SPARSE_MID_HEIGHT_TILE_BUDGET = if ($quality) { "1" } elseif ($PerfMode -eq "60fps") { "2" } else { "2" }
+        if (-not $env:VENPOD_SPARSE_MID_VOXEL_INTEREST_PCT) {
+            $env:VENPOD_SPARSE_MID_VOXEL_INTEREST_PCT = if ($quality) { "60" } else { "75" }
+        }
         # Phase 2: when GPU mid-voxel generation is ON, the CPU no longer pays the
         # per-voxel fill, so the grown render-distance bubble (radius default 12,
         # set in main_launcher when the GPU-gen flag is on) is affordable. Do NOT
         # override the radius here in that case -- let the grown C++ default win.
         if ($env:VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION -ne "1") {
-            $midVoxRadius = if ($quality) { "8" } elseif ($PerfMode -eq "60fps") { "6" } else { "7" }
+            $midVoxRadius = if ($quality) { "4" } elseif ($PerfMode -eq "60fps") { "6" } else { "7" }
             $env:VENPOD_SPARSE_MID_VOXEL_RADIUS_XZ = $midVoxRadius
         }
-        # Mid interest set is rebuilt EVERY frame (interestInterval=1) -- a big chunk of
-        # 'clip'. Amortize it across frames (camera moves smoothly, the set barely changes
-        # frame-to-frame). Loop 54: quality=2 too -- the per-frame rebuild was a redundant CPU cost
-        # against a 94%-idle GPU. A/B: interest 6.26->1.68ms, median 18.9->16.4ms (-13%), missing=0 +
-        # residentMissingSurface=0 + MORE ready bricks across the full mtns.rec fast-yaw replay.
-        $midInterestInterval = if ($quality) { "2" } elseif ($PerfMode -eq "60fps") { "2" } else { "2" }
+        # Mid overlay pass: no longer forced here. The launcher decides the default
+        # (OFF when the mesh-mid raster owns the band -- its default -- ON for the
+        # legacy raymarch-mid path). An explicit VENPOD_RAYMARCH_MID_PASS_ENABLE in
+        # the environment still wins everywhere.
+        # Mid interest rebuilds are one of the remaining main-thread spike sources.
+        # Keep the established two-frame cadence; longer cadences can bunch
+        # convergence work into clusters even when the median looks better.
+        $midInterestInterval = if ($quality) { "4" } elseif ($PerfMode -eq "60fps") { "2" } else { "2" }
         $env:VENPOD_SPARSE_MID_INTEREST_INTERVAL = $midInterestInterval
         # Interest SIGNATURE REUSE: skip the mid interest rebuild when the camera footprint
         # is unchanged (a big chunk of 'clip'). Verified +8fps, no recenter bursts. Loop 54: enabled
         # for quality too (A/B above: no hole, no under-coverage on the fast-yaw replay).
         $env:VENPOD_SPARSE_MID_CLIPMAP_FOOTPRINT_INTEREST_SIGNATURE = "1"
+        $env:VENPOD_SPARSE_MID_CLIPMAP_HEIGHT_INTEREST_REBUILD_RINGS_PER_FRAME = "0"
         $env:VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE = "1"
+        $env:VENPOD_SPARSE_MID_CLIPMAP_FINE_RING_SIDE_FAN_PAIRS = "0"
+        $env:VENPOD_SPARSE_MID_CLIPMAP_VIEW_FAN_PAIRS = if ($quality) { "0" } else { "2" }
+        # Parent-held feedback only requests child voxels for pixels already safely
+        # owned by a parent. Keep this sparse in the production path: these samples
+        # are quality/convergence hints, not hole-prevention work.
+        $env:VENPOD_SPARSE_MID_CLIPMAP_PARENT_HELD_CPU_SAMPLE_COLS = "4"
+        $env:VENPOD_SPARSE_MID_CLIPMAP_PARENT_HELD_CPU_SAMPLE_ROWS = "3"
+        # Active editing can make frame-time-based replays bunch more brush work into
+        # the same frame window. Rebuilding two mid-voxel rings on each footprint miss
+        # then spikes clipInterest; the clipmap carries skipped rings from the previous
+        # resident set, so one ring per frame preserves coverage while removing the burst.
+        $env:VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_REBUILD_RINGS_PER_FRAME = "1"
         # (Extending REUSE_MAX_AGE was tried + reverted: longer reuse caused bigger
         # catch-up bursts -> MORE fps variance. Default age is steadier.)
+        if (-not [string]::IsNullOrWhiteSpace($savedEnv.VENPOD_CLIPINTEREST_PROFILE)) {
+            $env:VENPOD_CLIPINTEREST_PROFILE = $savedEnv.VENPOD_CLIPINTEREST_PROFILE
+        }
+        if (-not [string]::IsNullOrWhiteSpace($savedEnv.VENPOD_SPARSE_MID_CLIPMAP_INTEREST_DETAIL)) {
+            $env:VENPOD_SPARSE_MID_CLIPMAP_INTEREST_DETAIL =
+                $savedEnv.VENPOD_SPARSE_MID_CLIPMAP_INTEREST_DETAIL
+        }
+        $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_SURFACE_BUDGET =
+            if ($quality) { "64" } else { "128" }
+        $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_CATCHUP_FRAMES =
+            if ($quality) { "0" } else { "360" }
+        if ($SparseBrushPaintSmoke -or $SparseBrushFeedbackSmoke -or $SparseEditFile -ne "") {
+            $env:VENPOD_SPARSE_SURFACE_UPLOAD_MIN_INTERVAL_FRAMES = "1"
+        }
         # Low-res far/background raymarch (the GPU win); near terrain stays full-res.
         # quality mode disables it for a sharp full-res horizon.
         if ($useBgPass) {
@@ -813,6 +912,67 @@ try {
         } else {
             Write-Info "Perf mode: $PerfMode (V2 best-available + low-res far background pass $bgScale + foreground render scale $rayScale)"
         }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($savedEnv.VENPOD_REPLAY_BRUSH)) {
+        $env:VENPOD_REPLAY_BRUSH = $savedEnv.VENPOD_REPLAY_BRUSH
+    }
+
+    $prodAblation = $env:VENPOD_PROD_ABLATION
+    if (-not [string]::IsNullOrWhiteSpace($prodAblation)) {
+        foreach ($rawToken in $prodAblation.Split(',')) {
+            $token = $rawToken.Trim().ToLowerInvariant()
+            if ([string]::IsNullOrWhiteSpace($token)) {
+                continue
+            }
+            switch ($token) {
+                "camera_only" {
+                    $env:VENPOD_REPLAY_BRUSH = "0"
+                }
+                "no_live_bake" {
+                    $env:VENPOD_SPARSE_EDIT_LIVE_BAKE = "0"
+                }
+                "no_mid_edit_regen" {
+                    $env:VENPOD_SPARSE_MID_EDIT_BRICK_REGEN_BUDGET = "0"
+                    $env:VENPOD_SPARSE_MID_EDIT_BRICK_REGEN_ACTIVE_BUDGET = "0"
+                }
+                "edit_regen1" {
+                    $env:VENPOD_SPARSE_MID_EDIT_BRICK_REGEN_BUDGET = "1"
+                    $env:VENPOD_SPARSE_MID_EDIT_BRICK_REGEN_ACTIVE_BUDGET = "1"
+                }
+                "no_edit_upload_boost" {
+                    $env:VENPOD_SPARSE_SURFACE_UPLOAD_EDIT_IDLE_FRAMES = "0"
+                }
+                "no_voxel_interest_budget" {
+                    $env:VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_REBUILD_RINGS_PER_FRAME = "0"
+                }
+                "no_miss_feedback" {
+                    $env:VENPOD_SPARSE_MISS_FEEDBACK = "0"
+                }
+                "no_brush_feedback" {
+                    $env:VENPOD_SPARSE_BRUSH_FEEDBACK = "0"
+                    $env:VENPOD_SPARSE_BRUSH_FEEDBACK_APPLY = "0"
+                }
+                "no_surface_work" {
+                    $env:VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS = "0"
+                    $env:VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = "0"
+                    $env:VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = "0"
+                    $env:VENPOD_SPARSE_SURFACE_EXTRACTION_BUDGET = "0"
+                    $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME = "0"
+                    $env:VENPOD_SPARSE_SURFACE_UPLOAD_MIN_INTERVAL_FRAMES = "999999"
+                }
+                "minimal_feedback" {
+                    $env:VENPOD_SPARSE_MISS_FEEDBACK = "0"
+                    $env:VENPOD_SPARSE_BRUSH_FEEDBACK = "0"
+                    $env:VENPOD_SPARSE_BRUSH_FEEDBACK_APPLY = "0"
+                    $env:VENPOD_SPARSE_EDIT_LIVE_BAKE = "0"
+                }
+                default {
+                    throw "Unknown VENPOD_PROD_ABLATION token '$token'"
+                }
+            }
+        }
+        Write-Info "Prod ablation: $prodAblation"
     }
 
     Write-Host "VENPOD - Rebuild + Run" -ForegroundColor Magenta
@@ -902,7 +1062,7 @@ try {
     }
     $runExitCode = $LASTEXITCODE
     if (($SparseSmoke -or $SparsePhysicsSmoke -or $SparseFlickerSmoke -or $SparseSurfaceSmoke -or $SparseGpuRaycastSmoke -or $SparseMissFeedbackSmoke -or $SparseBrushFeedbackSmoke) -and $runExitCode -eq 0) {
-        $runtimeLog = Join-Path $projectRoot "build\bin\venpod_runtime.log"
+        $runtimeLog = Join-Path $activeBinDir "venpod_runtime.log"
         if (Test-Path $runtimeLog) {
             $badLogLines = Select-String `
                 -Path $runtimeLog `

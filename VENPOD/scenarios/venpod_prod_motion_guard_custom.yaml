@@ -1,0 +1,55 @@
+id: venpod_prod_motion_guard_custom
+description: Build VENPOD, run the production motion replay, and gate prod FPS/no-hole metrics from logs.
+
+target:
+  type: custom
+  name: venpod-prod-motion
+
+actions:
+  - run:
+      label: venpod_prod_motion_guard
+      cwd: Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD
+      timeout_s: 900
+      command: >
+        powershell -NoProfile -ExecutionPolicy Bypass
+        -File "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/scripts/omni_prodbench_guard.ps1"
+        -Label "omni_prod_motion_guard_custom"
+        -Frames 900
+        -Warmup 300
+        -Replay "mtns.rec"
+        -MaxBodyMaxMs 10.0
+        -MaxOver16 0
+        -MaxVisibleMissingNonzero 0
+        -MaxResidentMissingNonzero 0
+
+observations:
+  - process.logs
+  - metrics.from_log:
+      patterns:
+        body_ms_max: "bodyMsMax=([0-9.]+)"
+        over16_count: "over16=([0-9]+)"
+        visible_missing_nonzero: "visibleMissing=([0-9]+)"
+        resident_missing_surface_nonzero: "residentMissingSurface=([0-9]+)"
+
+assertions:
+  - type: command_success
+    command: venpod_prod_motion_guard
+  - type: metric_less_than
+    name: body_ms_max
+    value: 10.0
+  - type: metric_less_than
+    name: over16_count
+    value: 1
+  - type: metric_less_than
+    name: visible_missing_nonzero
+    value: 1
+  - type: metric_less_than
+    name: resident_missing_surface_nonzero
+    value: 1
+  - type: output_contains
+    value: "OMNI_METRIC"
+
+artifacts:
+  require:
+    - report_json
+    - report_html

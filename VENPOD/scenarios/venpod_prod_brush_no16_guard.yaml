@@ -1,0 +1,62 @@
+id: venpod_prod_brush_no16_guard
+description: Build VENPOD, run the production motion replay with brush input, and gate zero-hole/no-16ms metrics.
+
+target:
+  type: custom
+  name: venpod-prod-brush
+
+actions:
+  - run:
+      label: venpod_prod_brush_no16_guard
+      cwd: Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD
+      timeout_s: 900
+      command: >
+        powershell -NoProfile -ExecutionPolicy Bypass
+        -Command "$env:VENPOD_BUILD_DIR='Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build_codex_perf';
+        & 'Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/scripts/omni_prodbench_guard.ps1'
+        -Label "omni_prod_brush_no16_guard"
+        -Frames 900
+        -Warmup 300
+        -Replay "mtns.rec"
+        -ReplayBrush
+        -MaxBodyP90Ms 12.0
+        -MaxBodyMaxMs 16.67
+        -MaxOver16 0
+        -MaxVisibleMissingNonzero 0
+        -MaxResidentMissingNonzero 0"
+
+observations:
+  - process.logs
+  - metrics.from_log:
+      patterns:
+        body_ms_p90: "bodyMsP90=([0-9.]+)"
+        body_ms_max: "bodyMsMax=([0-9.]+)"
+        over16_count: "over16=([0-9]+)"
+        visible_missing_nonzero: "visibleMissing=([0-9]+)"
+        resident_missing_surface_nonzero: "residentMissingSurface=([0-9]+)"
+
+assertions:
+  - type: command_success
+    command: venpod_prod_brush_no16_guard
+  - type: metric_less_than
+    name: body_ms_p90
+    value: 12.0
+  - type: metric_less_than
+    name: body_ms_max
+    value: 16.67
+  - type: metric_less_than
+    name: over16_count
+    value: 1
+  - type: metric_less_than
+    name: visible_missing_nonzero
+    value: 1
+  - type: metric_less_than
+    name: resident_missing_surface_nonzero
+    value: 1
+  - type: output_contains
+    value: "OMNI_GUARD_PASS"
+
+artifacts:
+  require:
+    - report_json
+    - report_html

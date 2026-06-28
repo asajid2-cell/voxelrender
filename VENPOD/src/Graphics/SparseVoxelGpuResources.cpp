@@ -13,7 +13,7 @@ namespace {
 
 constexpr uint32_t kMaxUploadRingSlots = 3;
 constexpr uint32_t kSparsePhysicsDiagnosticWords = 8;
-constexpr uint32_t kSparseRenderOwnershipBaseWords = 40;
+constexpr uint32_t kSparseRenderOwnershipBaseWords = 64;
 constexpr uint32_t kSparseRenderOwnershipWords =
     kSparseRenderOwnershipBaseWords +
     kSparseRenderOwnershipUnsafeSampleCapacity * 4u +
@@ -1709,6 +1709,33 @@ bool SparseVoxelGpuResources::RetireRenderOwnership(uint32_t frameIndex) {
     m_stats.renderOwnerFarHeightFarPageMissingPixelsLastRetire = mapped[27];
     m_stats.renderOwnerFarHeightFarPageOutOfGridPixelsLastRetire = mapped[28];
     m_stats.renderOwnerFarHeightMidSampleCountLastRetire = mapped[29];
+    m_stats.renderOwnerFarTerrainCallsLastRetire = mapped[30];
+    m_stats.renderOwnerFarTerrainEarlyRejectsLastRetire = mapped[31];
+    m_stats.renderOwnerFarTerrainFirstSampleHitsLastRetire = mapped[32];
+    m_stats.renderOwnerFarTerrainLoopHitsLastRetire = mapped[33];
+    m_stats.renderOwnerFarTerrainMissesLastRetire = mapped[34];
+    m_stats.renderOwnerFarTerrainSkyBreaksLastRetire = mapped[35];
+    m_stats.renderOwnerFarTerrainStepsLastRetire = mapped[36];
+    m_stats.renderOwnerFarTerrainRefineStepsLastRetire = mapped[37];
+    m_stats.renderOwnerFarTerrainHeightEvalsLastRetire = mapped[38];
+    m_stats.renderOwnerFarTerrainSkyBreakStepsLastRetire = mapped[39];
+    m_stats.renderOwnerFarTerrainSkyBreakHeightEvalsLastRetire = mapped[40];
+    m_stats.renderOwnerFarTerrainDeepMissStepsLastRetire = mapped[41];
+    m_stats.renderOwnerFarTerrainDeepMissHeightEvalsLastRetire = mapped[42];
+    m_stats.renderOwnerFarTerrainHitStepsLastRetire = mapped[43];
+    m_stats.renderOwnerFarTerrainHitHeightEvalsLastRetire = mapped[44];
+    m_stats.renderOwnerFarTerrainHitRefineStepsLastRetire = mapped[45];
+    m_stats.renderOwnerFarTerrainFirstHitHeightEvalsLastRetire = mapped[46];
+    m_stats.renderOwnerFarTerrainLoopHitHeightEvalsLastRetire = mapped[47];
+    m_stats.renderOwnerFarTerrainCacheRejectsLastRetire = mapped[48];
+    m_stats.renderOwnerHorizonTileMaskTilesLastRetire = mapped[49];
+    m_stats.renderOwnerHorizonTileMaskTotalTilesLastRetire = mapped[50];
+    m_stats.renderOwnerHorizonTileMaskPixelUpperLastRetire = mapped[51];
+    m_stats.renderOwnerHorizonTileMaskMaxEdge255LastRetire = mapped[52];
+    m_stats.renderOwnerHorizonTileMaskFrameLastRetire = mapped[53];
+    m_stats.renderOwnerHorizonTileMaskBandTilesLastRetire = mapped[54];
+    m_stats.renderOwnerHorizonTileListCountLastRetire = mapped[55];
+    m_stats.renderOwnerHorizonTileDrawInstancesLastRetire = mapped[56];
     m_stats.renderOwnerUnsafeMissSampleStoredLastRetire = 0;
     for (uint32_t sampleSlot = 0;
          sampleSlot < kSparseRenderOwnershipUnsafeSampleCapacity &&
@@ -1763,7 +1790,7 @@ bool SparseVoxelGpuResources::RetireRenderOwnership(uint32_t frameIndex) {
     m_stats.renderOwnerFrameLastRetire = payloadFrame;
     if (m_stats.renderOwnerTotalPixelsLastRetire > 0) {
         spdlog::info(
-            "PERF_RENDER_OWNERSHIP retireFrame={} shaderFrame={} total={} near={} surfaceFragments={} farSurface={} midVoxel={} midVoxelInteriorFallback={} midHeight={} farSvo={} farHeight={} farWater={} waterContext={} valleyAtmosphere={} sky={} miss={} unsafeNearMiss={} lodParentHeld={} parentHeldUntilChildrenReady={} unsafeSample={}/{},{},{} dist={} farHeightReason=continuity/midMissing/midAir/midSolid/farPagePresent/farPageMissing/farPageOutGrid/midSamples/stored:{}/{}/{}/{}/{}/{}/{}/{}/{}",
+            "PERF_RENDER_OWNERSHIP retireFrame={} shaderFrame={} total={} near={} surfaceFragments={} farSurface={} midVoxel={} midVoxelInteriorFallback={} midHeight={} farSvo={} farHeight={} farWater={} waterContext={} valleyAtmosphere={} sky={} miss={} unsafeNearMiss={} lodParentHeld={} parentHeldUntilChildrenReady={} unsafeSample={}/{},{},{} dist={} farHeightReason=continuity/midMissing/midAir/midSolid/farPagePresent/farPageMissing/farPageOutGrid/midSamples/stored:{}/{}/{}/{}/{}/{}/{}/{}/{} farTerrainWork=calls/early/firstHit/loopHit/miss/skyBreak/steps/refine/heightEval/cacheReject:{}/{}/{}/{}/{}/{}/{}/{}/{}/{} farTerrainWorkByOutcome=skyBreakSteps/skyBreakHeightEval/deepMissSteps/deepMissHeightEval/hitSteps/hitHeightEval/hitRefine/firstHitHeightEval/loopHitHeightEval:{}/{}/{}/{}/{}/{}/{}/{}/{} horizonTileMask=tiles/total/pixelUpper/maxEdge255/frame/bandTiles:{}/{}/{}/{}/{}/{} horizonTileList=count/instances:{}/{}",
             frameIndex,
             m_stats.renderOwnerFrameLastRetire,
             m_stats.renderOwnerTotalPixelsLastRetire,
@@ -1796,7 +1823,34 @@ bool SparseVoxelGpuResources::RetireRenderOwnership(uint32_t frameIndex) {
             m_stats.renderOwnerFarHeightFarPageMissingPixelsLastRetire,
             m_stats.renderOwnerFarHeightFarPageOutOfGridPixelsLastRetire,
             m_stats.renderOwnerFarHeightMidSampleCountLastRetire,
-            m_stats.renderOwnerFarHeightMidSampleStoredLastRetire);
+            m_stats.renderOwnerFarHeightMidSampleStoredLastRetire,
+            m_stats.renderOwnerFarTerrainCallsLastRetire,
+            m_stats.renderOwnerFarTerrainEarlyRejectsLastRetire,
+            m_stats.renderOwnerFarTerrainFirstSampleHitsLastRetire,
+            m_stats.renderOwnerFarTerrainLoopHitsLastRetire,
+            m_stats.renderOwnerFarTerrainMissesLastRetire,
+            m_stats.renderOwnerFarTerrainSkyBreaksLastRetire,
+            m_stats.renderOwnerFarTerrainStepsLastRetire,
+            m_stats.renderOwnerFarTerrainRefineStepsLastRetire,
+            m_stats.renderOwnerFarTerrainHeightEvalsLastRetire,
+            m_stats.renderOwnerFarTerrainCacheRejectsLastRetire,
+            m_stats.renderOwnerFarTerrainSkyBreakStepsLastRetire,
+            m_stats.renderOwnerFarTerrainSkyBreakHeightEvalsLastRetire,
+            m_stats.renderOwnerFarTerrainDeepMissStepsLastRetire,
+            m_stats.renderOwnerFarTerrainDeepMissHeightEvalsLastRetire,
+            m_stats.renderOwnerFarTerrainHitStepsLastRetire,
+            m_stats.renderOwnerFarTerrainHitHeightEvalsLastRetire,
+            m_stats.renderOwnerFarTerrainHitRefineStepsLastRetire,
+            m_stats.renderOwnerFarTerrainFirstHitHeightEvalsLastRetire,
+            m_stats.renderOwnerFarTerrainLoopHitHeightEvalsLastRetire,
+            m_stats.renderOwnerHorizonTileMaskTilesLastRetire,
+            m_stats.renderOwnerHorizonTileMaskTotalTilesLastRetire,
+            m_stats.renderOwnerHorizonTileMaskPixelUpperLastRetire,
+            m_stats.renderOwnerHorizonTileMaskMaxEdge255LastRetire,
+            m_stats.renderOwnerHorizonTileMaskFrameLastRetire,
+            m_stats.renderOwnerHorizonTileMaskBandTilesLastRetire,
+            m_stats.renderOwnerHorizonTileListCountLastRetire,
+            m_stats.renderOwnerHorizonTileDrawInstancesLastRetire);
     }
     return true;
 }

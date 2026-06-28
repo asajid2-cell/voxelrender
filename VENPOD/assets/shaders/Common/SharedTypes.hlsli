@@ -140,6 +140,29 @@ struct FrameConstants {
       // terrain is ready for a deliberate foreground promotion.
       // y = streamed-mid safe distance, z = far-SVO empty-space step quality gate.
       float4   surfaceRasterParams;
+
+      // Conservative far max-height cache for no-hit culling (4 DWORDs).
+      // x = enabled, y/z = cache origin x/z, w = leaf cell size in world units.
+      // Any out-of-cache or under-envelope ray must fall back to RaymarchFarTerrain.
+      float4   farMaxHeightCacheParams;
+
+      // Far max-height cache shape (4 DWORDs).
+      // x = leaf grid side, y = mip level count, z = height pad baked into max heights,
+      // w = horizon state (0=off, 1=ready, 2=ready + far-sky owner horizon-only).
+      float4   farMaxHeightCacheParams2;
+
+      // Temporal far-march reprojection (4 DWORDs). x = active (1=temporal pass on),
+      // y = cameraStatic (1=camera barely moved this frame => safe to reuse same-UV history),
+      // z = tile phase count N, w = tile size px. When active+static, the temporal raymarch PS
+      // marches only this frame's Bayer tile-phase and discards the rest (they retain their last
+      // marched value in the persistent history), amortizing the far march ~N x at rest.
+      float4   temporalParams;
+      // Stage 2b motion reprojection: previous-frame camera basis (w = prev fov / prev aspect),
+      // so the compute reproject reconstructs prev world hits and projects them into the current view.
+      float4   prevCameraPosition;
+      float4   prevCameraForward;
+      float4   prevCameraRight;
+      float4   prevCameraUp;
   };
 
 // Chunk control structure for sparse optimization

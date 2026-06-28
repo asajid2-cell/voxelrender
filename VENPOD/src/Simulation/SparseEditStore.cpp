@@ -80,6 +80,25 @@ bool BeginOverlayRevisionUpdate(
     return true;
 }
 
+void ExtendOverlayXzFootprint(BrickEditOverlay& overlay, uint16_t localIndex) {
+    const LocalVoxelCoord local = LocalVoxelFromIndex(localIndex);
+    overlay.minLocalX = std::min(overlay.minLocalX, local.x);
+    overlay.minLocalZ = std::min(overlay.minLocalZ, local.z);
+    overlay.maxLocalX = std::max(overlay.maxLocalX, local.x);
+    overlay.maxLocalZ = std::max(overlay.maxLocalZ, local.z);
+}
+
+void RebuildOverlayXzFootprint(BrickEditOverlay& overlay) {
+    overlay.minLocalX = SPARSE_BRICK_SIZE - 1u;
+    overlay.minLocalZ = SPARSE_BRICK_SIZE - 1u;
+    overlay.maxLocalX = 0u;
+    overlay.maxLocalZ = 0u;
+    for (const auto& [localIndex, packedVoxel] : overlay.voxels) {
+        (void)packedVoxel;
+        ExtendOverlayXzFootprint(overlay, localIndex);
+    }
+}
+
 template <typename T>
 bool WriteBinary(std::ostream& stream, const T& value) {
     stream.write(reinterpret_cast<const char*>(&value), sizeof(T));
@@ -272,6 +291,9 @@ void SparseEditStore::SetVoxel(int32_t worldX, int32_t worldY, int32_t worldZ, u
     const bool resetRevisionEpoch = BeginOverlayRevisionUpdate(overlay, m_pendingGpuDeltas);
     const bool inserted = overlay.voxels.find(localIndex) == overlay.voxels.end();
     overlay.voxels[localIndex] = packedVoxel;
+    if (inserted) {
+        ExtendOverlayXzFootprint(overlay, localIndex);
+    }
     const uint32_t revision = ++overlay.revision;
     overlay.dirtyDisk = true;
     overlay.dirtyGpu = true;
@@ -298,6 +320,7 @@ void SparseEditStore::SetVoxel(int32_t worldX, int32_t worldY, int32_t worldZ, u
     }
     ++m_revisionSerial;
     overlay.lastGlobalRevision = m_revisionSerial;
+    m_overlayTouchLog.push_back({m_revisionSerial, brick});
 }
 
 bool SparseEditStore::TryGetVoxel(
@@ -352,6 +375,64 @@ void SparseEditStore::ForEachOverlay(
     for (const auto& [coord, overlay] : m_overlays) {
         (void)coord;
         visitor(overlay);
+    }
+}
+
+void SparseEditStore::ForEachOverlayChangedSince(
+    uint64_t sinceRevision,
+    const std::function<void(const BrickEditOverlay& overlay)>& visitor) const
+{
+    if (!visitor) {
+        return;
+    }
+
+    if (m_overlayTouchLog.empty()) {
+        ForEachOverlay([&](const BrickEditOverlay& overlay) {
+            if (overlay.lastGlobalRevision > sinceRevision) {
+                visitor(overlay);
+            }
+        });
+        return;
+    }
+
+    std::unordered_set<BrickCoord, BrickCoordHash> visited;
+    for (auto touchIt = m_overlayTouchLog.rbegin();
+         touchIt != m_overlayTouchLog.rend() && touchIt->revision > sinceRevision;
+         ++touchIt) {
+        if (!visited.insert(touchIt->coord).second) {
+            continue;
+        }
+        auto overlayIt = m_overlays.find(touchIt->coord);
+        if (overlayIt == m_overlays.end()) {
+            continue;
+        }
+        const BrickEditOverlay& overlay = overlayIt->second;
+        if (overlay.lastGlobalRevision > sinceRevision) {
+            visitor(overlay);
+        }
+    }
+}
+
+void SparseEditStore::ForEachOverlayXzFootprint(
+    const std::function<void(const SparseEditXzFootprint& footprint)>& visitor) const
+{
+    if (!visitor) {
+        return;
+    }
+
+    for (const auto& [coord, overlay] : m_overlays) {
+        (void)coord;
+        if (overlay.voxels.empty()) {
+            continue;
+        }
+        SparseEditXzFootprint footprint{};
+        footprint.coord = overlay.coord;
+        if (TryWorldVoxelFromBrickLocal(overlay.coord.x, overlay.minLocalX, &footprint.minX) &&
+            TryWorldVoxelFromBrickLocal(overlay.coord.z, overlay.minLocalZ, &footprint.minZ) &&
+            TryWorldVoxelFromBrickLocal(overlay.coord.x, overlay.maxLocalX, &footprint.maxX) &&
+            TryWorldVoxelFromBrickLocal(overlay.coord.z, overlay.maxLocalZ, &footprint.maxZ)) {
+            visitor(footprint);
+        }
     }
 }
 
@@ -588,6 +669,7 @@ bool SparseEditStore::LoadFromFile(const std::filesystem::path& path) {
         }
         readVoxelCount += voxelCount;
 
+        RebuildOverlayXzFootprint(overlay);
         overlay.dirtyDisk = false;
         overlay.dirtyGpu = false;
         if (!loaded.emplace(overlay.coord, std::move(overlay)).second) {
@@ -614,6 +696,7 @@ bool SparseEditStore::LoadFromFile(const std::filesystem::path& path) {
     }
 
     m_overlays = std::move(loaded);
+    m_overlayTouchLog.clear();
     m_pendingGpuDeltas.clear();
     m_editedVoxelCount = editedVoxelCount;
     ++m_revisionSerial;

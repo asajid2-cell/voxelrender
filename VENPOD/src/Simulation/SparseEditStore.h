@@ -117,12 +117,29 @@ struct BrickEditOverlay {
     BrickCoord coord;
     std::unordered_map<uint16_t, uint32_t> voxels;
     uint32_t revision = 0;
+    uint8_t minLocalX = SPARSE_BRICK_SIZE - 1u;
+    uint8_t minLocalZ = SPARSE_BRICK_SIZE - 1u;
+    uint8_t maxLocalX = 0u;
+    uint8_t maxLocalZ = 0u;
     // Global RevisionSerial() value when this overlay was last touched. Lets
     // consumers process only overlays changed since their last pass instead of
     // re-walking every overlay ever made (the edit-hitch fix).
     uint64_t lastGlobalRevision = 0;
     bool dirtyDisk = false;
     bool dirtyGpu = false;
+};
+
+struct SparseEditOverlayTouch {
+    uint64_t revision = 0;
+    BrickCoord coord;
+};
+
+struct SparseEditXzFootprint {
+    BrickCoord coord;
+    int32_t minX = 0;
+    int32_t minZ = 0;
+    int32_t maxX = 0;
+    int32_t maxZ = 0;
 };
 
 class SparseEditStore {
@@ -135,6 +152,11 @@ public:
         const std::function<void(uint16_t localIndex, uint32_t packedVoxel)>& visitor) const;
     void ForEachOverlay(
         const std::function<void(const BrickEditOverlay& overlay)>& visitor) const;
+    void ForEachOverlayChangedSince(
+        uint64_t sinceRevision,
+        const std::function<void(const BrickEditOverlay& overlay)>& visitor) const;
+    void ForEachOverlayXzFootprint(
+        const std::function<void(const SparseEditXzFootprint& footprint)>& visitor) const;
     void ApplyToGeneratedBrick(GeneratedSparseBrick& brick) const;
     std::vector<SparseEditDelta> BuildDeltaSnapshotForBricks(
         const std::vector<BrickCoord>& coords,
@@ -156,6 +178,7 @@ public:
 
 private:
     std::unordered_map<BrickCoord, BrickEditOverlay, BrickCoordHash> m_overlays;
+    std::vector<SparseEditOverlayTouch> m_overlayTouchLog;
     std::vector<SparseEditDelta> m_pendingGpuDeltas;
     size_t m_editedVoxelCount = 0;
     uint64_t m_revisionSerial = 0;

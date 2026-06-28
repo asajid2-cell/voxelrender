@@ -1,0 +1,39 @@
+id: venpod_sparse_edit_publish_guard
+target: { type: custom, name: venpod }
+actions:
+  - run:
+      label: edit_publish_guard
+      timeout_s: 240
+      command: >
+        powershell -NoProfile -ExecutionPolicy Bypass
+        -Command "$env:VENPOD_BUILD_DIR='Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/build_codex_perf';
+        & 'Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/scripts/omni_sparse_edit_publish_guard.ps1'"
+observations:
+  - process.logs
+  - metrics.from_log:
+      patterns:
+        smoke_pass: "smoke_pass=([0-9]+)"
+        edit_deltas: "edit_deltas=([0-9]+)"
+        edit_cases: "edit_cases=([0-9]+)"
+        critical_count: "critical_count=([0-9]+)"
+        missing_nonzero: "missing_nonzero=([0-9]+)"
+        resident_missing_surface_nonzero: "resident_missing_surface_nonzero=([0-9]+)"
+        max_publish_lag: "max_publish_lag=([0-9]+)"
+        final_publish_lag: "final_publish_lag=([0-9]+)"
+        max_pre_publish_ms: "max_pre_publish_ms=([0-9.]+)"
+        shutdown_clean: "shutdown_clean=([0-9]+)"
+        exit_after_reached: "exit_after_reached=([0-9]+)"
+assertions:
+  - { type: command_success, command: edit_publish_guard }
+  - { type: output_contains, value: "EDIT_PUBLISH_GUARD PASS" }
+  - { type: metric_greater_than, name: smoke_pass, value: 0 }
+  - { type: metric_greater_than, name: edit_deltas, value: 0 }
+  - { type: metric_greater_than, name: edit_cases, value: 3 }
+  - { type: metric_less_than, name: critical_count, value: 1 }
+  - { type: metric_less_than, name: missing_nonzero, value: 1 }
+  - { type: metric_less_than, name: resident_missing_surface_nonzero, value: 1 }
+  - { type: metric_less_than, name: max_publish_lag, value: 9 }
+  - { type: metric_less_than, name: final_publish_lag, value: 3 }
+  - { type: metric_less_than, name: max_pre_publish_ms, value: 20.1 }
+  - { type: metric_greater_than, name: shutdown_clean, value: 0 }
+  - { type: metric_greater_than, name: exit_after_reached, value: 0 }

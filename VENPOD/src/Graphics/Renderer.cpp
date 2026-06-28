@@ -7,11 +7,147 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <string>
+#include <system_error>
 #include <type_traits>
 
 namespace VENPOD::Graphics {
 
 namespace {
+
+constexpr uint32_t kFarHeightfieldCellCount = 384u;
+constexpr uint32_t kFarHeightfieldFacesPerCell = 2u; // top + one camera-facing top curtain
+constexpr uint32_t kFarHeightfieldFaceCount =
+    kFarHeightfieldCellCount * kFarHeightfieldCellCount * kFarHeightfieldFacesPerCell;
+constexpr uint32_t kFarHeightfieldVertexCount =
+    kFarHeightfieldFaceCount * 4u;
+constexpr uint32_t kFarHeightfieldIndexCount =
+    kFarHeightfieldFaceCount * 6u;
+constexpr uint32_t kFarHeightfieldFaceStride = 16u;
+constexpr uint64_t kFarHeightfieldFaceBufferBytes =
+    static_cast<uint64_t>(kFarHeightfieldFaceCount) * kFarHeightfieldFaceStride;
+constexpr uint32_t kFarHeightfieldCellSizeVoxels = 28u;
+constexpr float kFarHeightfieldCellSize = static_cast<float>(kFarHeightfieldCellSizeVoxels);
+constexpr float kFarHeightfieldMaxDistance = 10400.0f;
+constexpr float kFarHeightfieldCpuProbeSurfaceY = 260.0f;
+constexpr float kFarHeightfieldOwnerMaxDistance = 11000.0f;
+constexpr uint32_t kFarMaxHeightCacheLeafCellCount = 1366u;
+constexpr uint32_t kFarMaxHeightCacheMipLevels = 12u;
+constexpr uint32_t kFarMaxHeightCacheElementCount = 2488550u;
+constexpr uint32_t kFarMaxHeightCacheStride = sizeof(float);
+constexpr uint64_t kFarMaxHeightCacheBufferBytes =
+    static_cast<uint64_t>(kFarMaxHeightCacheElementCount) * kFarMaxHeightCacheStride;
+constexpr uint32_t kFarMaxHeightCacheCellSizeVoxels = 16u;
+constexpr float kFarMaxHeightCacheCellSize = static_cast<float>(kFarMaxHeightCacheCellSizeVoxels);
+constexpr float kFarMaxHeightCacheHeightPad = 64.0f;
+constexpr uint32_t kFarMaxHeightScreenMaskTileWidth = 8u;
+constexpr float kFarMaxHeightScreenMaskDilationPixels = 4.0f;
+constexpr uint32_t kFarMaxHeightScreenMaskProjectMipLevel = 3u;
+
+struct FarHeightfieldFaceCpu {
+    int32_t worldX;
+    int32_t worldY;
+    int32_t worldZ;
+    uint32_t payload;
+};
+
+static_assert(sizeof(FarHeightfieldFaceCpu) == kFarHeightfieldFaceStride);
+
+struct FarHeightfieldGenerateConstants {
+    uint32_t faceCount;
+    uint32_t cellCount;
+    uint32_t baseGridCellSize;
+    uint32_t worldSeed;
+    uint32_t originXBits;
+    uint32_t originZBits;
+    uint32_t farHandoffBits;
+    uint32_t ownerMaxDistanceBits;
+    uint32_t cameraXBits;
+    uint32_t cameraYBits;
+    uint32_t cameraZBits;
+    uint32_t pad0;
+};
+static_assert(sizeof(FarHeightfieldGenerateConstants) == 48);
+
+struct FarMaxHeightCacheGenerateConstants {
+    uint32_t level = 0;
+    uint32_t srcOffset = 0;
+    uint32_t dstOffset = 0;
+    uint32_t worldSeed = 0;
+    uint32_t srcWidth = 1;
+    uint32_t srcHeight = 1;
+    uint32_t dstWidth = 1;
+    uint32_t dstHeight = 1;
+    uint32_t originXBits = 0;
+    uint32_t originZBits = 0;
+    uint32_t leafCellSizeBits = 0;
+    uint32_t heightPadBits = 0;
+    uint32_t cameraXBits = 0;
+    uint32_t cameraYBits = 0;
+    uint32_t cameraZBits = 0;
+    uint32_t reserved = 0;
+};
+static_assert(sizeof(FarMaxHeightCacheGenerateConstants) == 64);
+
+struct FarMaxHeightScreenMaskConstants {
+    uint32_t passIndex = 0;
+    uint32_t tileCount = 0;
+    uint32_t tileWidth = kFarMaxHeightScreenMaskTileWidth;
+    uint32_t dilationPixelsBits = 0;
+    uint32_t projectOffset = 0;
+    uint32_t projectSide = 1;
+    uint32_t projectCellSizeBits = 0;
+    uint32_t reserved0 = 0;
+};
+static_assert(sizeof(FarMaxHeightScreenMaskConstants) == 32);
+
+struct BackgroundHorizonTileMaskConstants {
+    uint32_t fullWidth = 1;
+    uint32_t fullHeight = 1;
+    uint32_t tileSize = 8;
+    uint32_t thresholdBits = 0;
+    uint32_t y0 = 320;
+    uint32_t y1 = 480;
+    uint32_t frameIndex = 0;
+    uint32_t selectorMode = 0;
+};
+static_assert(sizeof(BackgroundHorizonTileMaskConstants) == 32);
+
+void ComputeFarMaxHeightCacheMipInfo(
+    uint32_t level,
+    uint32_t& outOffset,
+    uint32_t& outSide,
+    float& outCellSize)
+{
+    outOffset = 0u;
+    outSide = kFarMaxHeightCacheLeafCellCount;
+    outCellSize = kFarMaxHeightCacheCellSize;
+    uint32_t side = kFarMaxHeightCacheLeafCellCount;
+    for (uint32_t mip = 0; mip < level && mip + 1u < kFarMaxHeightCacheMipLevels; ++mip) {
+        outOffset += side * side;
+        side = std::max(1u, (side + 1u) / 2u);
+        outCellSize *= 2.0f;
+    }
+    outSide = side;
+}
+
+void ComputeFarMaxHeightCacheOrigin(float cameraX, float cameraZ, float& originX, float& originZ) {
+    const float extent =
+        static_cast<float>(kFarMaxHeightCacheLeafCellCount) * kFarMaxHeightCacheCellSize;
+    const float halfExtent = extent * 0.5f;
+    originX = std::floor((cameraX - halfExtent) / kFarMaxHeightCacheCellSize) *
+        kFarMaxHeightCacheCellSize;
+    originZ = std::floor((cameraZ - halfExtent) / kFarMaxHeightCacheCellSize) *
+        kFarMaxHeightCacheCellSize;
+}
+
+uint32_t PackSparseSurfacePayload(uint32_t direction, uint32_t voxel, uint32_t width, uint32_t height) {
+    return ((direction & 0x7u) << 29u) |
+        (((width - 1u) & 0x1Fu) << 24u) |
+        (((height - 1u) & 0x1Fu) << 19u) |
+        (voxel & 0x0007FFFFu);
+}
 
 // Must match SharedTypes.hlsli FrameConstants exactly. Keeping the CPU mirror
 // in one place avoids the renderer and sparse-surface paths drifting as the
@@ -46,9 +182,19 @@ struct FrameConstantsCpu {
     float farOwnershipParams[4];  // x = ready, y = upload coverage, z = page coverage, w = effective quality
     float exactNearParams[4];     // x = exact sparse voxel distance, y = world seed bits, z/w = mid voxel handoff coverage/worst ring
     float surfaceRasterParams[4]; // x = public exact sparse surface draw/resolve distance, y = mid safe distance, z = far SVO step quality gate
+    float farMaxHeightCacheParams[4]; // x = enabled, y/z = origin x/z, w = leaf cell size
+    float farMaxHeightCacheParams2[4]; // x = leaf side, y = mip levels, z = height pad, w = horizon state
+    float temporalParams[4];      // x = temporal active, y = cameraStatic, z = tile phase count N, w = tile size px
+    // Stage 2b motion reprojection: previous-frame camera basis so the compute reproject can
+    // reconstruct prev-frame world hits (prevCamPos + prevRayDir(prevUV)*prevDist) and project them
+    // into the current camera. w channels mirror the current camera (fov, aspect).
+    float prevCameraPosition[4];  // xyz = prev position, w = prev fov
+    float prevCameraForward[4];   // xyz = prev forward, w = prev aspect
+    float prevCameraRight[4];     // xyz = prev right
+    float prevCameraUp[4];        // xyz = prev up
 };
 
-static_assert(sizeof(FrameConstantsCpu) == 368);
+static_assert(sizeof(FrameConstantsCpu) == 480);
 static_assert(std::is_standard_layout_v<FrameConstantsCpu>);
 static_assert(offsetof(FrameConstantsCpu, cameraPosition) == 0u);
 static_assert(offsetof(FrameConstantsCpu, cameraForward) == 16u);
@@ -79,6 +225,13 @@ static_assert(offsetof(FrameConstantsCpu, midResidencyParams) == 304u);
 static_assert(offsetof(FrameConstantsCpu, farOwnershipParams) == 320u);
 static_assert(offsetof(FrameConstantsCpu, exactNearParams) == 336u);
 static_assert(offsetof(FrameConstantsCpu, surfaceRasterParams) == 352u);
+static_assert(offsetof(FrameConstantsCpu, farMaxHeightCacheParams) == 368u);
+static_assert(offsetof(FrameConstantsCpu, farMaxHeightCacheParams2) == 384u);
+static_assert(offsetof(FrameConstantsCpu, temporalParams) == 400u);
+static_assert(offsetof(FrameConstantsCpu, prevCameraPosition) == 416u);
+static_assert(offsetof(FrameConstantsCpu, prevCameraForward) == 432u);
+static_assert(offsetof(FrameConstantsCpu, prevCameraRight) == 448u);
+static_assert(offsetof(FrameConstantsCpu, prevCameraUp) == 464u);
 
 float FiniteOr(float value, float fallback) {
     return std::isfinite(value) ? value : fallback;
@@ -94,6 +247,13 @@ float NonNegativeFiniteOr(float value, float fallback) {
 
 float FloatBitsFromUint32(uint32_t value) {
     float bits = 0.0f;
+    static_assert(sizeof(bits) == sizeof(value));
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+uint32_t Uint32BitsFromFloat(float value) {
+    uint32_t bits = 0u;
     static_assert(sizeof(bits) == sizeof(value));
     std::memcpy(&bits, &value, sizeof(bits));
     return bits;
@@ -240,26 +400,47 @@ Result<void> Renderer::Initialize(
     // Set shader include path
     m_shaderCompiler.SetIncludePath(config.shaderPath);
 
-    // Create RTVs for swapchain
+    spdlog::info("RENDERER_INIT_STAGE begin CreateRTVsForSwapchain");
     result = CreateRTVsForSwapchain();
     if (!result) {
         return Error("Failed to create RTVs: {}", result.error());
     }
+    spdlog::info("RENDERER_INIT_STAGE end CreateRTVsForSwapchain");
+    spdlog::info("RENDERER_INIT_STAGE begin CreateDepthBuffer");
     result = CreateDepthBuffer();
     if (!result) {
         return Error("Failed to create depth buffer: {}", result.error());
     }
+    spdlog::info("RENDERER_INIT_STAGE end CreateDepthBuffer");
     if (UseBackgroundPassSplit()) {
+        spdlog::info("RENDERER_INIT_STAGE begin CreateBackgroundPassResources");
         result = CreateBackgroundPassResources();
         if (!result) {
             return Error("Failed to create background pass resources: {}", result.error());
         }
+        spdlog::info("RENDERER_INIT_STAGE end CreateBackgroundPassResources");
     }
+    if (UseTemporalReproject()) {
+        spdlog::info("RENDERER_INIT_STAGE begin CreateTemporalResources");
+        result = CreateTemporalResources();
+        if (!result) {
+            return Error("Failed to create temporal resources: {}", result.error());
+        }
+        spdlog::info("RENDERER_INIT_STAGE end CreateTemporalResources");
+    }
+    spdlog::info("RENDERER_INIT_STAGE begin CreateFarMaxHeightNoHitMaskResources");
+    result = CreateFarMaxHeightNoHitMaskResources();
+    if (!result) {
+        return Error("Failed to create far max-height no-hit mask resources: {}", result.error());
+    }
+    spdlog::info("RENDERER_INIT_STAGE end CreateFarMaxHeightNoHitMaskResources");
     if (m_config.midPassEnabled) {
+        spdlog::info("RENDERER_INIT_STAGE begin CreateMidPassResources");
         result = CreateMidPassResources();
         if (!result) {
             return Error("Failed to create mid pass resources: {}", result.error());
         }
+        spdlog::info("RENDERER_INIT_STAGE end CreateMidPassResources");
     }
 
     for (uint32_t i = 0; i < VENPOD::Window::BUFFER_COUNT; ++i) {
@@ -279,6 +460,14 @@ Result<void> Renderer::Initialize(
             name);
         if (!result) {
             return Error("Failed to create sparse surface frame constants upload buffer: {}", result.error());
+        }
+        std::snprintf(name, sizeof(name), "FarHeightfieldFrameConstants_%u", i);
+        result = m_farHeightfieldConstantUploads[i].Initialize(
+            device.GetDevice(),
+            kFrameConstantUploadBytes,
+            name);
+        if (!result) {
+            return Error("Failed to create far heightfield frame constants upload buffer: {}", result.error());
         }
         std::snprintf(name, sizeof(name), "OverlayFrameConstants_%u", i);
         result = m_overlayConstantUploads[i].Initialize(
@@ -310,7 +499,6 @@ Result<void> Renderer::Initialize(
     if (!result) {
         return Error("Failed to create dummy render ownership UAV: {}", result.error());
     }
-
     // Create fullscreen pipeline
     result = CreateFullscreenPipeline(device.GetDevice());
     if (!result) {
@@ -324,6 +512,30 @@ Result<void> Renderer::Initialize(
     result = CreateSparseSurfacePipeline(device.GetDevice());
     if (!result) {
         return Error("Failed to create sparse surface pipeline: {}", result.error());
+    }
+    if (m_config.farHeightfieldOwnerEnabled) {
+        result = CreateFarHeightfieldOwnerResources(device.GetDevice());
+        if (!result) {
+            return Error("Failed to create far heightfield owner resources: {}", result.error());
+        }
+    }
+    if (m_config.farMaxHeightCacheEnabled) {
+        result = CreateFarMaxHeightCacheResources(device.GetDevice());
+        if (!result) {
+            return Error("Failed to create far max-height cache resources: {}", result.error());
+        }
+    }
+    if (m_config.farMaxHeightNoHitMaskEnabled) {
+        result = CreateFarMaxHeightNoHitMaskPipeline(device.GetDevice());
+        if (!result) {
+            return Error("Failed to create far max-height no-hit mask pipeline: {}", result.error());
+        }
+    }
+    if (m_config.backgroundPassHorizonTileMask) {
+        result = CreateBackgroundHorizonTileMaskPipeline(device.GetDevice());
+        if (!result) {
+            return Error("Failed to create background horizon tile mask pipeline: {}", result.error());
+        }
     }
     result = CreateOverlayPipeline(device.GetDevice());
     if (!result) {
@@ -356,12 +568,31 @@ void Renderer::Shutdown() {
     for (auto& upload : m_sparseSurfaceConstantUploads) {
         upload.Shutdown();
     }
+    for (auto& upload : m_farHeightfieldConstantUploads) {
+        upload.Shutdown();
+    }
     for (auto& upload : m_overlayConstantUploads) {
         upload.Shutdown();
     }
     m_dummyRenderOwnershipUAV.Shutdown();
+    m_farHeightfieldFaces.Shutdown();
+    m_farMaxHeightCache.Shutdown();
+    m_farMaxHeightCacheValid = false;
+    m_farMaxHeightCacheKey = {};
+    m_farHeightfieldFaceReadback.Shutdown();
+    m_farHeightfieldFaceUpload.Shutdown();
+    m_farHeightfieldVertexIdUpload.Shutdown();
+    m_farHeightfieldIndexUpload.Shutdown();
+    m_farHeightfieldVertexIdView = {};
+    m_farHeightfieldIndexView = {};
+    m_farHeightfieldGeneratePipeline.Shutdown();
+    m_farMaxHeightCacheGeneratePipeline.Shutdown();
+    m_farMaxHeightNoHitMaskPipeline.Shutdown();
+    m_backgroundHorizonTileMaskPipeline.Shutdown();
+    m_farSkyOwnerPipeline.Shutdown();
     DestroyBackgroundPassResources();
     DestroyMidPassResources();
+    DestroyFarMaxHeightNoHitMaskResources();
 
     // Free RTV handles
     for (auto& handle : m_rtvHandles) {
@@ -393,10 +624,17 @@ void Renderer::Shutdown() {
 }
 
 bool Renderer::UseBackgroundPassSplit() const {
-    return m_config.backgroundPassEnabled &&
-        std::isfinite(m_config.backgroundPassScale) &&
-        m_config.backgroundPassScale > 0.0f &&
-        m_config.backgroundPassScale < 0.999f;
+    if (!m_config.backgroundPassEnabled ||
+        !std::isfinite(m_config.backgroundPassScale) ||
+        m_config.backgroundPassScale <= 0.0f) {
+        return false;
+    }
+    // Temporal mode runs the split full-res (scale ~1.0) and shares the main depth-stencil; the
+    // legacy downscale path only activates below native (scale < 0.999).
+    if (m_config.backgroundPassTemporal) {
+        return true;
+    }
+    return m_config.backgroundPassScale < 0.999f;
 }
 
 Renderer::BackgroundPassInfo Renderer::GetBackgroundPassInfo() const {
@@ -476,6 +714,9 @@ void Renderer::SetMainRenderTarget(ID3D12GraphicsCommandList* cmdList) {
 void Renderer::BeginFrame(ID3D12GraphicsCommandList* cmdList, uint32_t frameIndex) {
     if (!cmdList || !m_window) return;
     m_currentFrameIndex = frameIndex % VENPOD::Window::BUFFER_COUNT;
+    ++m_farHeightfieldFrameSerial;
+    TryRetireFarHeightfieldOwnerFaceCsv();
+    TryRetireFarMaxHeightHorizonCsv();
 
     // Get current back buffer
     ID3D12Resource* backBuffer = m_window->GetBackBuffer(frameIndex);
@@ -552,9 +793,25 @@ void Renderer::RenderVoxels(
     const BrushPreview* brushPreview,
     const CharacterPreview* characterPreview,
     const SparseFarField* sparseFarField,
-    const SparseNearField* sparseNearField)
+    const SparseNearField* sparseNearField,
+    ID3D12QueryHeap* gpuTimingHeap,
+    uint32_t gpuTimingBaseQuery,
+    uint32_t farMaxHeightCacheEndQueryOffset,
+    uint32_t farMaxHeightNoHitMaskEndQueryOffset,
+    uint32_t farSkyOwnerBeginQueryOffset,
+    uint32_t farSkyOwnerEndQueryOffset,
+    uint32_t backgroundCoreEndQueryOffset)
 {
     if (!cmdList) return;
+
+    const auto markOptionalGpuTiming = [&](uint32_t queryOffset) {
+        if (gpuTimingHeap && queryOffset != 0xFFFFFFFFu) {
+            cmdList->EndQuery(
+                gpuTimingHeap,
+                D3D12_QUERY_TYPE_TIMESTAMP,
+                gpuTimingBaseQuery + queryOffset);
+        }
+    };
 
     // Set descriptor heaps (required before using shader-visible descriptors)
     ID3D12DescriptorHeap* heaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
@@ -577,7 +834,56 @@ void Renderer::RenderVoxels(
         useBackgroundPassSplit &&
         (m_config.backgroundPassSurfaceRaymarchFill || camera.backgroundPassSurfaceRaymarchFill);
     m_backgroundPassSurfaceRaymarchFillLastFrame = backgroundPassSurfaceRaymarchFillThisFrame;
-    if (useBackgroundPassSplit) {
+    // Temporal full-res: render the raymarch into the separate bg color RT but bind the MAIN
+    // depth-stencil (already carrying the mesh stencil written this frame) so early-stencil culls
+    // the raymarch to background pixels only -- matching the default pass instead of marching the
+    // whole screen. Requires scale 1.0 (bg RT == main RT size).
+    const bool backgroundPassShareMainDepth =
+        useBackgroundPassSplit && m_config.backgroundPassTemporal && m_dsvHandle.IsValid() &&
+        m_backgroundPassWidth == m_width && m_backgroundPassHeight == m_height;
+    // Temporal 3-MRT path: the raymarch writes color+distance+meta history (cur buffer) instead of the
+    // single R8 bg color, then composites History[cur].color. Falls back to the 1b-i single-RT split if
+    // resources/PSO aren't ready.
+    const bool useTemporalPath =
+        backgroundPassShareMainDepth &&
+        m_temporalColor[0].resource && m_temporalColor[1].resource &&
+        m_temporalDistance[0].resource && m_temporalMeta[0].resource &&
+        m_temporalRaymarchPipeline.GetPSO() != nullptr &&
+        m_temporalWidth == m_width && m_temporalHeight == m_height;
+    const bool useTemporalMotionReproject = useTemporalPath && UseTemporalMotionReproject();
+    // Static tile refresh keeps one persistent history target so discarded pixels retain their last
+    // marched value. Motion reproject remains ping-pong because compute reads prev and writes cur.
+    const uint32_t temporalCur = useTemporalMotionReproject
+        ? static_cast<uint32_t>(m_temporalFrameCounter & 1ull)
+        : 0u;
+    const uint32_t temporalPrev = useTemporalMotionReproject
+        ? static_cast<uint32_t>((m_temporalFrameCounter + 1ull) & 1ull)
+        : 0u;
+    const bool temporalReprojectReady =
+        useTemporalMotionReproject && m_temporalReprojectDepthPipeline.IsValid() &&
+        m_temporalReprojectColorPipeline.IsValid() && m_temporalMarchMask.resource &&
+        m_temporalMeta[temporalCur].resource && m_temporalPrevCamValid;
+    auto transitionTemporal = [&](TemporalTarget& t, D3D12_RESOURCE_STATES to) {
+        if (t.resource && t.state != to) {
+            D3D12_RESOURCE_BARRIER b =
+                CD3DX12_RESOURCE_BARRIER::Transition(t.resource.Get(), t.state, to);
+            cmdList->ResourceBarrier(1, &b);
+            t.state = to;
+        }
+    };
+    if (useTemporalPath) {
+        if (useTemporalMotionReproject) {
+            // Stage 2b: compute writes reuse pixels to [cur], then the raymarch fills mask=1 pixels.
+            transitionTemporal(m_temporalColor[temporalCur], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            transitionTemporal(m_temporalColor[temporalPrev], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            transitionTemporal(m_temporalMarchMask, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            transitionTemporal(m_temporalMeta[temporalCur], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        } else {
+            // Stage 2a: same target persists across frames. No clear; discarded tiles keep history.
+            transitionTemporal(m_temporalColor[temporalCur], D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
+        SetViewportAndScissor(cmdList, m_temporalWidth, m_temporalHeight);
+    } else if (useBackgroundPassSplit) {
         if (m_backgroundPassColorState != D3D12_RESOURCE_STATE_RENDER_TARGET) {
             D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
                 m_backgroundPassColor.Get(),
@@ -588,7 +894,8 @@ void Renderer::RenderVoxels(
         }
 
         D3D12_CPU_DESCRIPTOR_HANDLE backgroundRtv = m_backgroundPassRtv.cpu;
-        D3D12_CPU_DESCRIPTOR_HANDLE backgroundDsv = m_backgroundPassDsv.cpu;
+        D3D12_CPU_DESCRIPTOR_HANDLE backgroundDsv =
+            backgroundPassShareMainDepth ? m_dsvHandle.cpu : m_backgroundPassDsv.cpu;
         cmdList->OMSetRenderTargets(1, &backgroundRtv, FALSE, &backgroundDsv);
         SetViewportAndScissor(cmdList, m_backgroundPassWidth, m_backgroundPassHeight);
         const float defaultClearColor[] = { 0.42f, 0.55f, 0.74f, 1.0f };
@@ -598,17 +905,25 @@ void Renderer::RenderVoxels(
             ? forceClearColor
             : (m_config.backgroundPassClearProbe ? probeClearColor : defaultClearColor);
         cmdList->ClearRenderTargetView(backgroundRtv, clearColor, 0, nullptr);
-        cmdList->ClearDepthStencilView(
-            backgroundDsv,
-            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-            1.0f,
-            0,
-            0,
-            nullptr);
+        // When sharing the main depth-stencil, do NOT clear it -- that stencil holds the mesh
+        // ownership the raymarch early-tests against; clearing would re-march the whole screen.
+        if (!backgroundPassShareMainDepth) {
+            cmdList->ClearDepthStencilView(
+                backgroundDsv,
+                D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                1.0f,
+                0,
+                0,
+                nullptr);
+        }
     }
 
-    // Bind fullscreen pipeline
-    m_fullscreenPipeline.Bind(cmdList);
+    // Bind the fullscreen raymarch pipeline. For the temporal path the bind is DEFERRED to after the
+    // compute reproject dispatch below (the compute binds its own PSO/root sig, so the graphics PSO +
+    // CBV are re-bound post-compute, just before the SRV tables + draw).
+    if (!useTemporalPath) {
+        m_fullscreenPipeline.Bind(cmdList);
+    }
     cmdList->OMSetStencilRef(0);
 
     FrameConstantsCpu constants = {};
@@ -753,7 +1068,31 @@ void Renderer::RenderVoxels(
     // y = L3 motion guard: streamed-mid safe distance (0 = off). See CameraParams.
     constants.surfaceRasterParams[1] = NonNegativeFiniteOr(camera.midStreamSafeDistance, 0.0f);
     constants.surfaceRasterParams[2] = FiniteOr(camera.farSvoStepQualityGate, 0.92f);
-    constants.surfaceRasterParams[3] = 0.0f;
+    constants.surfaceRasterParams[3] =
+        m_config.farSkyOwnerEnabled
+            ? ClampFinite(m_config.farSkyOwnerMinY, -0.20f, 0.42f, 0.06f)
+            : (m_config.raymarchAggressiveSkyPso
+                ? ClampFinite(m_config.raymarchAggressiveSkyMinY, -0.20f, 0.42f, 0.06f)
+                : 0.0f);
+    if (m_config.farMaxHeightCacheEnabled && m_farMaxHeightCache.GetResource() != nullptr) {
+        float cacheOriginX = 0.0f;
+        float cacheOriginZ = 0.0f;
+        ComputeFarMaxHeightCacheOrigin(cameraPosX, cameraPosZ, cacheOriginX, cacheOriginZ);
+        constants.farMaxHeightCacheParams[0] = 1.0f;
+        constants.farMaxHeightCacheParams[1] = cacheOriginX;
+        constants.farMaxHeightCacheParams[2] = cacheOriginZ;
+        constants.farMaxHeightCacheParams[3] = kFarMaxHeightCacheCellSize;
+        constants.farMaxHeightCacheParams2[0] = static_cast<float>(kFarMaxHeightCacheLeafCellCount);
+        constants.farMaxHeightCacheParams2[1] = static_cast<float>(kFarMaxHeightCacheMipLevels);
+        constants.farMaxHeightCacheParams2[2] = kFarMaxHeightCacheHeightPad;
+        const bool farHorizonReady =
+            m_config.farMaxHeightNoHitMaskEnabled &&
+            m_farMaxHeightScreenHorizon.GetShaderVisibleSRV().IsValid();
+        constants.farMaxHeightCacheParams2[3] =
+            farHorizonReady
+                ? ((m_config.farSkyOwnerEnabled && m_config.farSkyOwnerHorizonOnly) ? 2.0f : 1.0f)
+                : 0.0f;
+    }
 
     const bool sparseNearEnabled =
         sparseNearField &&
@@ -877,6 +1216,71 @@ void Renderer::RenderVoxels(
     constants.midResidencyParams[2] = midClipmapEnabled ? static_cast<float>(camera.midFieldResidentHeightTiles) : 0.0f;
     constants.midResidencyParams[3] = midClipmapEnabled ? static_cast<float>(camera.midFieldResidentVoxelBricks) : 0.0f;
 
+    // Temporal Stage 2a: detect a (near-)static camera. Same-UV tile reuse is only valid when both
+    // position and orientation barely changed; under motion we mark cameraStatic=0 so the temporal PS
+    // marches every background pixel (no stale reuse => no holes/ghosting). cameraPosition/Forward are
+    // already filled above.
+    bool temporalCameraStatic = false;
+    if (useTemporalPath) {
+        const float dpx = constants.cameraPosition[0] - m_temporalLastCamPos[0];
+        const float dpy = constants.cameraPosition[1] - m_temporalLastCamPos[1];
+        const float dpz = constants.cameraPosition[2] - m_temporalLastCamPos[2];
+        const float posMove2 = dpx * dpx + dpy * dpy + dpz * dpz;
+        const float fdot = constants.cameraForward[0] * m_temporalLastCamFwd[0] +
+                           constants.cameraForward[1] * m_temporalLastCamFwd[1] +
+                           constants.cameraForward[2] * m_temporalLastCamFwd[2];
+        // <0.1u movement AND <~0.57deg rotation since last frame.
+        temporalCameraStatic = m_temporalLastCamValid && posMove2 < 0.01f && fdot > 0.99995f;
+
+        // Stage 2b: publish the PREVIOUS frame's full camera basis (before overwriting it) so the
+        // compute reproject can map prev world hits into this frame. First frame: prev = current
+        // (zero motion => reproject identity, safe).
+        const bool havePrev = m_temporalPrevCamValid;
+        for (int i = 0; i < 3; ++i) {
+            constants.prevCameraPosition[i] = havePrev ? m_temporalLastCamPos[i] : constants.cameraPosition[i];
+            constants.prevCameraForward[i]  = havePrev ? m_temporalLastCamFwd[i] : constants.cameraForward[i];
+            constants.prevCameraRight[i]    = havePrev ? m_temporalLastCamRight[i] : constants.cameraRight[i];
+            constants.prevCameraUp[i]       = havePrev ? m_temporalLastCamUp[i] : constants.cameraUp[i];
+        }
+        constants.prevCameraPosition[3] = havePrev ? m_temporalLastFov : constants.cameraPosition[3];
+        constants.prevCameraForward[3]  = havePrev ? m_temporalLastAspect : constants.cameraForward[3];
+        constants.prevCameraRight[3] = 0.0f;
+        constants.prevCameraUp[3] = 0.0f;
+
+        m_temporalLastCamPos[0] = constants.cameraPosition[0];
+        m_temporalLastCamPos[1] = constants.cameraPosition[1];
+        m_temporalLastCamPos[2] = constants.cameraPosition[2];
+        m_temporalLastCamFwd[0] = constants.cameraForward[0];
+        m_temporalLastCamFwd[1] = constants.cameraForward[1];
+        m_temporalLastCamFwd[2] = constants.cameraForward[2];
+        m_temporalLastCamRight[0] = constants.cameraRight[0];
+        m_temporalLastCamRight[1] = constants.cameraRight[1];
+        m_temporalLastCamRight[2] = constants.cameraRight[2];
+        m_temporalLastCamUp[0] = constants.cameraUp[0];
+        m_temporalLastCamUp[1] = constants.cameraUp[1];
+        m_temporalLastCamUp[2] = constants.cameraUp[2];
+        m_temporalLastFov = constants.cameraPosition[3];
+        m_temporalLastAspect = constants.cameraForward[3];
+        m_temporalLastCamValid = true;
+        m_temporalPrevCamValid = true;
+    }
+    constants.temporalParams[0] = useTemporalPath ? 1.0f : 0.0f;
+    constants.temporalParams[1] = temporalCameraStatic ? 1.0f : 0.0f;
+    constants.temporalParams[2] = static_cast<float>(
+        std::clamp(
+            m_config.raymarchMaskedBandDiag && !useTemporalPath
+                ? m_config.raymarchMaskedBandDiagPhases
+                : m_config.backgroundPassTemporalStaticPhases,
+            1u,
+            16u));
+    constants.temporalParams[3] = static_cast<float>(
+        std::clamp(
+            m_config.raymarchMaskedBandDiag && !useTemporalPath
+                ? m_config.raymarchMaskedBandDiagTileSize
+                : m_config.backgroundPassTemporalTileSize,
+            4u,
+            64u));
+
     static_assert(sizeof(constants) <= kFrameConstantUploadBytes);
     UploadBuffer& frameConstantsUpload = m_frameConstantUploads[m_currentFrameIndex];
     if (void* mapped = frameConstantsUpload.GetMappedData()) {
@@ -884,31 +1288,194 @@ void Renderer::RenderVoxels(
     }
     cmdList->SetGraphicsRootConstantBufferView(0, frameConstantsUpload.GetGPUVirtualAddress());
 
-    // Use persistent shader-visible descriptors directly (no per-frame copy needed)
-    cmdList->SetGraphicsRootDescriptorTable(1, voxelGridSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(2, materialPaletteSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(3, farFieldEnabled ? sparseFarField->nodeSRV.gpu : voxelGridSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(4, farFieldEnabled ? sparseFarField->pageSRV.gpu : voxelGridSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(5, farFieldEnabled ? sparseFarField->pageIndexSRV.gpu : voxelGridSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(6, chunkValidMaskSRV.IsValid() ? chunkValidMaskSRV.gpu : voxelGridSRV.gpu);
+    GenerateFarMaxHeightCache(cmdList, &constants);
+    markOptionalGpuTiming(farMaxHeightCacheEndQueryOffset);
+    GenerateFarMaxHeightNoHitMask(cmdList, frameConstantsUpload.GetGPUVirtualAddress());
+    markOptionalGpuTiming(farMaxHeightNoHitMaskEndQueryOffset);
+
+    if (!useTemporalPath) {
+        // The far max-height/no-hit products are generated with compute PSOs.
+        // Re-establish the fullscreen graphics PSO before binding graphics root
+        // descriptors and issuing the background draw; otherwise the no-hit path
+        // can leave the clear color in the background target and record no
+        // ownership samples.
+        m_fullscreenPipeline.Bind(cmdList);
+        cmdList->OMSetStencilRef(0);
+        cmdList->SetGraphicsRootConstantBufferView(0, frameConstantsUpload.GetGPUVirtualAddress());
+    }
+
+    const bool farHeightfieldOwnerReady =
+        m_config.farHeightfieldOwnerEnabled &&
+        m_sparseSurfacePipeline.GetPSO() != nullptr &&
+        m_farHeightfieldFaces.GetResource() != nullptr &&
+        m_farHeightfieldFaceUpload.GetResource() != nullptr &&
+        m_farHeightfieldVertexIdView.BufferLocation != 0u &&
+        m_farHeightfieldIndexView.BufferLocation != 0u &&
+        materialPaletteSRV.IsValid() &&
+        (!useBackgroundPassSplit || backgroundPassShareMainDepth);
+    if (farHeightfieldOwnerReady) {
+        DrawFarHeightfieldOwner(
+            cmdList,
+            frameConstantsUpload.GetGPUVirtualAddress(),
+            &constants,
+            materialPaletteSRV);
+
+        if (!useTemporalPath) {
+            if (useBackgroundPassSplit) {
+                D3D12_CPU_DESCRIPTOR_HANDLE backgroundRtv = m_backgroundPassRtv.cpu;
+                D3D12_CPU_DESCRIPTOR_HANDLE backgroundDsv =
+                    backgroundPassShareMainDepth ? m_dsvHandle.cpu : m_backgroundPassDsv.cpu;
+                cmdList->OMSetRenderTargets(1, &backgroundRtv, FALSE, &backgroundDsv);
+                SetViewportAndScissor(cmdList, m_backgroundPassWidth, m_backgroundPassHeight);
+            } else {
+                SetMainRenderTarget(cmdList);
+            }
+            m_fullscreenPipeline.Bind(cmdList);
+            cmdList->OMSetStencilRef(0);
+            cmdList->SetGraphicsRootConstantBufferView(0, frameConstantsUpload.GetGPUVirtualAddress());
+        }
+    }
+
+    const bool farSkyOwnerReady =
+        m_config.farSkyOwnerEnabled &&
+        (!useBackgroundPassSplit || backgroundPassShareMainDepth) &&
+        m_farSkyOwnerPipeline.GetPSO() != nullptr &&
+        m_farSkyOwnerPipeline.GetRootSignature() != nullptr;
+    markOptionalGpuTiming(farSkyOwnerBeginQueryOffset);
+    if (farSkyOwnerReady) {
+        SetMainRenderTarget(cmdList);
+        SetViewportAndScissor(cmdList, m_width, m_height);
+        m_farSkyOwnerPipeline.Bind(cmdList);
+        cmdList->OMSetStencilRef(0);
+        cmdList->SetGraphicsRootConstantBufferView(0, frameConstantsUpload.GetGPUVirtualAddress());
+        cmdList->SetGraphicsRootDescriptorTable(
+            1,
+            m_farMaxHeightScreenHorizon.GetShaderVisibleSRV().IsValid()
+                ? m_farMaxHeightScreenHorizon.GetShaderVisibleSRV().gpu
+                : voxelGridSRV.gpu);
+        cmdList->DrawInstanced(3, 1, 0, 0);
+
+        m_fullscreenPipeline.Bind(cmdList);
+        cmdList->OMSetStencilRef(0);
+        cmdList->SetGraphicsRootConstantBufferView(0, frameConstantsUpload.GetGPUVirtualAddress());
+    }
+    markOptionalGpuTiming(farSkyOwnerEndQueryOffset);
+
+    if (useTemporalMotionReproject) {
+        // ---- Stage 2b: temporal motion reprojection (compute), then re-bind the raymarch state ----
+        // Clear the march mask to 1 (march every pixel) -- this is the hole-safe default, so the first
+        // frame (no prev camera) and any pixel the reproject doesn't confidently reuse get marched.
+        const UINT maskClear[4] = { 1u, 1u, 1u, 1u };
+        cmdList->ClearUnorderedAccessViewUint(
+            m_temporalMarchMask.uav.gpu, m_temporalMarchMask.stagingUav.cpu,
+            m_temporalMarchMask.resource.Get(), maskClear, 0, nullptr);
+        // ScatterDepth (reuses m_temporalMeta[cur]) cleared to 0xFFFFFFFF = empty (nearest-wins).
+        const UINT depthClear[4] = { 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu };
+        if (temporalReprojectReady) {
+            cmdList->ClearUnorderedAccessViewUint(
+                m_temporalMeta[temporalCur].uav.gpu, m_temporalMeta[temporalCur].stagingUav.cpu,
+                m_temporalMeta[temporalCur].resource.Get(), depthClear, 0, nullptr);
+        }
+        D3D12_RESOURCE_BARRIER clearBarriers[2] = {
+            CD3DX12_RESOURCE_BARRIER::UAV(m_temporalMarchMask.resource.Get()),
+            CD3DX12_RESOURCE_BARRIER::UAV(m_temporalMeta[temporalCur].resource.Get()) };
+        cmdList->ResourceBarrier(temporalReprojectReady ? 2u : 1u, clearBarriers);
+
+        if (temporalReprojectReady) {
+            const uint32_t gx = (m_temporalWidth + 7u) / 8u;
+            const uint32_t gy = (m_temporalHeight + 7u) / 8u;
+            const auto cbv = frameConstantsUpload.GetGPUVirtualAddress();
+            // Pass 1 (depth): InterlockedMin the nearest reprojected distance per current pixel.
+            m_temporalReprojectDepthPipeline.Bind(cmdList);
+            cmdList->SetComputeRootConstantBufferView(0, cbv);
+            cmdList->SetComputeRootDescriptorTable(1, m_temporalColor[temporalPrev].srv.gpu);
+            cmdList->SetComputeRootDescriptorTable(2, m_temporalMeta[temporalCur].uav.gpu);  // u0 ScatterDepth
+            m_temporalReprojectDepthPipeline.Dispatch(cmdList, gx, gy, 1u);
+            D3D12_RESOURCE_BARRIER depthDone =
+                CD3DX12_RESOURCE_BARRIER::UAV(m_temporalMeta[temporalCur].resource.Get());
+            cmdList->ResourceBarrier(1, &depthDone);
+            // Pass 2 (color): the winning prev sample writes color into [cur] + clears its march bit.
+            m_temporalReprojectColorPipeline.Bind(cmdList);
+            cmdList->SetComputeRootConstantBufferView(0, cbv);
+            cmdList->SetComputeRootDescriptorTable(1, m_temporalColor[temporalPrev].srv.gpu);
+            cmdList->SetComputeRootDescriptorTable(2, m_temporalMeta[temporalCur].uav.gpu);   // u0 ScatterDepth (read)
+            cmdList->SetComputeRootDescriptorTable(3, m_temporalColor[temporalCur].uav.gpu);  // u1 HistoryCur
+            cmdList->SetComputeRootDescriptorTable(4, m_temporalMarchMask.uav.gpu);           // u2 MarchMask
+            m_temporalReprojectColorPipeline.Dispatch(cmdList, gx, gy, 1u);
+        }
+
+        // Make the compute's [cur] + mask writes visible, then transition for the raymarch: [cur] -> RTV
+        // (march pixels), mask -> SRV (the PS mask-gate at t18 / table 20).
+        D3D12_RESOURCE_BARRIER postCompute[2] = {
+            CD3DX12_RESOURCE_BARRIER::UAV(m_temporalColor[temporalCur].resource.Get()),
+            CD3DX12_RESOURCE_BARRIER::UAV(m_temporalMarchMask.resource.Get()) };
+        cmdList->ResourceBarrier(2, postCompute);
+        transitionTemporal(m_temporalColor[temporalCur], D3D12_RESOURCE_STATE_RENDER_TARGET);
+        transitionTemporal(m_temporalMarchMask, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    }
+
+    if (useTemporalPath) {
+        // Establish the temporal raymarch state. In motion mode this rebinds graphics after compute;
+        // in static mode it is the first temporal graphics bind.
+        ID3D12DescriptorHeap* graphicsHeaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
+        cmdList->SetDescriptorHeaps(1, graphicsHeaps);
+        D3D12_CPU_DESCRIPTOR_HANDLE tcRtv = m_temporalColor[temporalCur].rtv.cpu;
+        D3D12_CPU_DESCRIPTOR_HANDLE tcDsv = m_dsvHandle.cpu;
+        cmdList->OMSetRenderTargets(1, &tcRtv, FALSE, &tcDsv);
+        SetViewportAndScissor(cmdList, m_temporalWidth, m_temporalHeight);
+        m_temporalRaymarchPipeline.Bind(cmdList);
+        cmdList->OMSetStencilRef(0);
+        cmdList->SetGraphicsRootConstantBufferView(0, frameConstantsUpload.GetGPUVirtualAddress());
+    }
+
     const uint32_t sparseBindingMask = sparseNearField ? sparseNearField->bindingMask : 0u;
-    cmdList->SetGraphicsRootDescriptorTable(7, (sparseNearEnabled && (sparseBindingMask & (1u << 0))) ? sparseNearField->brickPoolSRV.gpu : voxelGridSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(8, (sparseNearEnabled && (sparseBindingMask & (1u << 1))) ? sparseNearField->pageTableSRV.gpu : voxelGridSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(9, (sparseNearEnabled && (sparseBindingMask & (1u << 2))) ? sparseNearField->occupancySRV.gpu : voxelGridSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(10, (sparseNearEnabled && (sparseBindingMask & (1u << 3))) ? sparseNearField->pageGenerationSRV.gpu : voxelGridSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(11, (midClipmapEnabled && (sparseBindingMask & (1u << 4))) ? sparseNearField->midClipmapMetadataSRV.gpu : voxelGridSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(12, (midClipmapEnabled && (sparseBindingMask & (1u << 5))) ? sparseNearField->midClipmapLookupSRV.gpu : voxelGridSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(13, (midClipmapEnabled && (sparseBindingMask & (1u << 6))) ? sparseNearField->midClipmapSamplesSRV.gpu : voxelGridSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(14, (midClipmapEnabled && (sparseBindingMask & (1u << 7))) ? sparseNearField->midVoxelClipmapMetadataSRV.gpu : voxelGridSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(15, (midClipmapEnabled && (sparseBindingMask & (1u << 8))) ? sparseNearField->midVoxelClipmapLookupSRV.gpu : voxelGridSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(16, (midClipmapEnabled && (sparseBindingMask & (1u << 9))) ? sparseNearField->midVoxelClipmapSamplesSRV.gpu : voxelGridSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(17, (surfaceEnabled && (sparseBindingMask & (1u << 10))) ? sparseNearField->surfaceFacesSRV.gpu : voxelGridSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(18, (surfaceEnabled && (sparseBindingMask & (1u << 11))) ? sparseNearField->surfaceRangesSRV.gpu : voxelGridSRV.gpu);
-    cmdList->SetGraphicsRootDescriptorTable(
-        19,
-        renderOwnershipEnabled
-            ? sparseNearField->renderOwnershipUAV.gpu
-            : m_dummyRenderOwnershipUAV.GetShaderVisibleUAV().gpu);
+    auto bindRaymarchRootDescriptors = [&]() {
+        cmdList->SetGraphicsRootConstantBufferView(0, frameConstantsUpload.GetGPUVirtualAddress());
+        // Use persistent shader-visible descriptors directly (no per-frame copy needed)
+        cmdList->SetGraphicsRootDescriptorTable(1, voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(2, materialPaletteSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(3, farFieldEnabled ? sparseFarField->nodeSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(4, farFieldEnabled ? sparseFarField->pageSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(5, farFieldEnabled ? sparseFarField->pageIndexSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(6, chunkValidMaskSRV.IsValid() ? chunkValidMaskSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(7, (sparseNearEnabled && (sparseBindingMask & (1u << 0))) ? sparseNearField->brickPoolSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(8, (sparseNearEnabled && (sparseBindingMask & (1u << 1))) ? sparseNearField->pageTableSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(9, (sparseNearEnabled && (sparseBindingMask & (1u << 2))) ? sparseNearField->occupancySRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(10, (sparseNearEnabled && (sparseBindingMask & (1u << 3))) ? sparseNearField->pageGenerationSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(11, (midClipmapEnabled && (sparseBindingMask & (1u << 4))) ? sparseNearField->midClipmapMetadataSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(12, (midClipmapEnabled && (sparseBindingMask & (1u << 5))) ? sparseNearField->midClipmapLookupSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(13, (midClipmapEnabled && (sparseBindingMask & (1u << 6))) ? sparseNearField->midClipmapSamplesSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(14, (midClipmapEnabled && (sparseBindingMask & (1u << 7))) ? sparseNearField->midVoxelClipmapMetadataSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(15, (midClipmapEnabled && (sparseBindingMask & (1u << 8))) ? sparseNearField->midVoxelClipmapLookupSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(16, (midClipmapEnabled && (sparseBindingMask & (1u << 9))) ? sparseNearField->midVoxelClipmapSamplesSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(17, (surfaceEnabled && (sparseBindingMask & (1u << 10))) ? sparseNearField->surfaceFacesSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(18, (surfaceEnabled && (sparseBindingMask & (1u << 11))) ? sparseNearField->surfaceRangesSRV.gpu : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(
+            19,
+            renderOwnershipEnabled
+                ? sparseNearField->renderOwnershipUAV.gpu
+                : m_dummyRenderOwnershipUAV.GetShaderVisibleUAV().gpu);
+        cmdList->SetGraphicsRootDescriptorTable(
+            20,
+            (m_config.farMaxHeightCacheEnabled && m_farMaxHeightCache.GetShaderVisibleSRV().IsValid())
+                ? m_farMaxHeightCache.GetShaderVisibleSRV().gpu
+                : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(
+            21,
+            m_farMaxHeightScreenHorizon.GetShaderVisibleSRV().IsValid()
+                ? m_farMaxHeightScreenHorizon.GetShaderVisibleSRV().gpu
+                : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(
+            22,
+            m_backgroundHorizonTileMask.srv.IsValid()
+                ? m_backgroundHorizonTileMask.srv.gpu
+                : (m_backgroundPassSrv.IsValid() ? m_backgroundPassSrv.gpu : voxelGridSRV.gpu));
+    if (useTemporalMotionReproject) {
+        // t18 (table 23): the reproject march/reuse mask the temporal PS samples at top-of-main.
+        cmdList->SetGraphicsRootDescriptorTable(23, m_temporalMarchMask.srv.gpu);
+    }
+    };
+    bindRaymarchRootDescriptors();
 
     // Draw fullscreen triangle. The force-color probe intentionally leaves the
     // lower-resolution target at a known clear color to test RTV/SRV/composite
@@ -916,14 +1483,35 @@ void Renderer::RenderVoxels(
     if (!forceBackgroundPassColor) {
         cmdList->DrawInstanced(3, 1, 0, 0);
     }
+    markOptionalGpuTiming(backgroundCoreEndQueryOffset);
 
-    if (useBackgroundPassSplit) {
+    if (useTemporalPath) {
+        // Composite History[cur].color -> main RT (stencil EQUAL 0, same path as the bg split). The
+        // distance/meta MRTs stay as RTV history for next frame's reproject (Stage 2 reads them as SRV).
+        transitionTemporal(m_temporalColor[temporalCur], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        SetMainRenderTarget(cmdList);
+        m_backgroundCompositePipeline.Bind(cmdList);
+        ID3D12DescriptorHeap* compositeHeaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
+        cmdList->SetDescriptorHeaps(1, compositeHeaps);
+        cmdList->OMSetStencilRef(0);
+        cmdList->SetGraphicsRootDescriptorTable(0, m_temporalColor[temporalCur].srv.gpu);
+        cmdList->DrawInstanced(3, 1, 0, 0);
+        ++m_temporalFrameCounter;
+    } else if (useBackgroundPassSplit) {
         D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
             m_backgroundPassColor.Get(),
             D3D12_RESOURCE_STATE_RENDER_TARGET,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         cmdList->ResourceBarrier(1, &barrier);
         m_backgroundPassColorState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+        if (renderOwnershipEnabled ||
+            (m_config.backgroundPassHorizonRepair && m_config.backgroundPassHorizonTileMask)) {
+            GenerateBackgroundHorizonTileMask(
+                cmdList,
+                sparseNearField,
+                camera.frameIndex);
+        }
 
         SetMainRenderTarget(cmdList);
         m_backgroundCompositePipeline.Bind(cmdList);
@@ -932,6 +1520,39 @@ void Renderer::RenderVoxels(
         cmdList->OMSetStencilRef(0);
         cmdList->SetGraphicsRootDescriptorTable(0, m_backgroundPassSrv.gpu);
         cmdList->DrawInstanced(3, 1, 0, 0);
+
+        const uint32_t repairY0 = std::min(m_height, m_config.backgroundPassHorizonRepairY0);
+        const uint32_t repairY1 = std::min(m_height, m_config.backgroundPassHorizonRepairY1);
+        const bool useTileRepair =
+            m_config.backgroundPassHorizonRepair &&
+            m_config.backgroundPassHorizonTileMask &&
+            m_backgroundHorizonTileMask.srv.IsValid();
+        if (m_config.backgroundPassHorizonRepair &&
+            repairY0 < repairY1 &&
+            (!m_config.backgroundPassHorizonTileMask || useTileRepair)) {
+            m_fullscreenPipeline.Bind(cmdList);
+            ID3D12DescriptorHeap* repairHeaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
+            cmdList->SetDescriptorHeaps(1, repairHeaps);
+            cmdList->OMSetStencilRef(0);
+            bindRaymarchRootDescriptors();
+            cmdList->SetGraphicsRootDescriptorTable(21, m_backgroundPassSrv.gpu);
+
+            D3D12_VIEWPORT repairViewport = {};
+            repairViewport.Width = static_cast<float>(std::max(1u, m_width));
+            repairViewport.Height = static_cast<float>(std::max(1u, m_height));
+            repairViewport.MinDepth = 0.0f;
+            repairViewport.MaxDepth = 1.0f;
+            cmdList->RSSetViewports(1, &repairViewport);
+            D3D12_RECT repairScissor = {};
+            repairScissor.left = 0;
+            repairScissor.top = static_cast<LONG>(
+                useTileRepair ? std::max(repairY0, m_backgroundPassHeight) : repairY0);
+            repairScissor.right = static_cast<LONG>(m_width);
+            repairScissor.bottom = static_cast<LONG>(repairY1);
+            cmdList->RSSetScissorRects(1, &repairScissor);
+            cmdList->DrawInstanced(3, 1, 0, 0);
+            SetViewportAndScissor(cmdList, m_width, m_height);
+        }
     }
 
     // Mid-only raymarch overlay. The full raymarch pass has now drawn (and, in
@@ -1001,6 +1622,21 @@ void Renderer::RenderVoxels(
             renderOwnershipEnabled
                 ? sparseNearField->renderOwnershipUAV.gpu
                 : m_dummyRenderOwnershipUAV.GetShaderVisibleUAV().gpu);
+        cmdList->SetGraphicsRootDescriptorTable(
+            20,
+            (m_config.farMaxHeightCacheEnabled && m_farMaxHeightCache.GetShaderVisibleSRV().IsValid())
+                ? m_farMaxHeightCache.GetShaderVisibleSRV().gpu
+                : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(
+            21,
+            m_farMaxHeightScreenHorizon.GetShaderVisibleSRV().IsValid()
+                ? m_farMaxHeightScreenHorizon.GetShaderVisibleSRV().gpu
+                : voxelGridSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(
+            22,
+            m_backgroundHorizonTileMask.srv.IsValid()
+                ? m_backgroundHorizonTileMask.srv.gpu
+                : (m_backgroundPassSrv.IsValid() ? m_backgroundPassSrv.gpu : voxelGridSRV.gpu));
 
         cmdList->DrawInstanced(3, 1, 0, 0);
 
@@ -1108,6 +1744,12 @@ void Renderer::RenderSparseSurfaceFaces(
     constants.surfaceRasterParams[0] = NonNegativeFiniteOr(camera.surfaceRasterMaxDistance, 0.0f);
     constants.surfaceRasterParams[1] = 0.0f;
     constants.surfaceRasterParams[2] = FiniteOr(camera.farSvoStepQualityGate, 0.92f);
+    constants.surfaceRasterParams[3] =
+        m_config.farSkyOwnerEnabled
+            ? ClampFinite(m_config.farSkyOwnerMinY, -0.20f, 0.42f, 0.06f)
+            : (m_config.raymarchAggressiveSkyPso
+                ? ClampFinite(m_config.raymarchAggressiveSkyMinY, -0.20f, 0.42f, 0.06f)
+                : 0.0f);
     const bool sparseMaterialLookupEnabled =
         sparseBrickPoolSRV && sparseBrickPoolSRV->IsValid() &&
         sparsePageTableSRV && sparsePageTableSRV->IsValid() &&
@@ -1345,6 +1987,16 @@ Result<void> Renderer::OnResize(uint32_t width, uint32_t height) {
             return result;
         }
     }
+    if (UseTemporalReproject()) {
+        result = CreateTemporalResources();
+        if (!result) {
+            return result;
+        }
+    }
+    result = CreateFarMaxHeightNoHitMaskResources();
+    if (!result) {
+        return result;
+    }
     if (m_config.midPassEnabled) {
         result = CreateMidPassResources();
         if (!result) {
@@ -1359,6 +2011,7 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
     std::filesystem::path vsPath = m_config.shaderPath / "Graphics" / "VS_Fullscreen.hlsl";
     std::filesystem::path psPath = m_config.shaderPath / "Graphics" / "PS_Raymarch.hlsl";
 
+    spdlog::info("RENDERER_INIT_STAGE begin CreateFullscreenPipeline");
     auto vsResult = m_shaderCompiler.CompileVertexShader(vsPath, L"main", m_config.debugShaders);
     if (!vsResult) {
         return Error("Failed to compile vertex shader: {}", vsResult.error());
@@ -1367,8 +2020,81 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
     if (!m_fullscreenVS.IsValid()) {
         return Error("Vertex shader compilation failed: {}", m_fullscreenVS.errors);
     }
+    spdlog::info("RENDERER_INIT_STAGE fullscreen VS ready bytes={}", m_fullscreenVS.bytecode.size());
 
-    auto psResult = m_shaderCompiler.CompilePixelShader(psPath, L"main", m_config.debugShaders);
+    const bool useBackgroundOnlyFullscreenShader =
+        m_config.raymarchBackgroundOnlyPso || m_config.backgroundPassTemporal;
+    spdlog::info(
+        "RENDERER_INIT_STAGE begin fullscreen PS compile backgroundOnly={} temporal={} debugShaders={}",
+        useBackgroundOnlyFullscreenShader ? 1 : 0,
+        m_config.backgroundPassTemporal ? 1 : 0,
+        m_config.debugShaders ? 1 : 0);
+    auto psResult = [&]() {
+        if (useBackgroundOnlyFullscreenShader) {
+            ShaderCompileOptions psOptions;
+            psOptions.entryPoint = L"main";
+            psOptions.target = L"ps_6_0";
+            psOptions.debugInfo = false;
+            psOptions.optimizationLevel3 = true;
+            psOptions.defines.push_back(L"RAYMARCH_BACKGROUND_ONLY=1");
+            if (m_config.raymarchBackgroundOnlyPso) {
+                psOptions.defines.push_back(L"RAYMARCH_FAR_TERRAIN_WORK_STATS=1");
+            }
+            if (m_config.farMaxHeightNoHitMaskEnabled) {
+                psOptions.defines.push_back(L"RAYMARCH_FAR_MAX_HEIGHT_NO_HIT_MASK=1");
+            }
+            if (m_config.raymarchFarMaxHeightDdaEnabled) {
+                psOptions.defines.push_back(L"RAYMARCH_FAR_MAX_HEIGHT_DDA=1");
+            }
+            if (m_config.raymarchFastSkyPso) {
+                psOptions.defines.push_back(L"RAYMARCH_BACKGROUND_FAST_SKY=1");
+            }
+            if (m_config.raymarchAggressiveSkyPso) {
+                psOptions.defines.push_back(L"RAYMARCH_BACKGROUND_AGGRESSIVE_SKY=1");
+            }
+            if (m_config.raymarchMaskedBandDiag) {
+                psOptions.defines.push_back(L"RAYMARCH_MASKED_BAND_DIAG=1");
+            }
+            if (m_config.backgroundPassHorizonRepair) {
+                psOptions.defines.push_back(L"RAYMARCH_BACKGROUND_EDGE_REPAIR=1");
+                if (m_config.backgroundPassHorizonTileMask) {
+                    psOptions.defines.push_back(L"RAYMARCH_BACKGROUND_TILE_REPAIR=1");
+                    psOptions.defines.push_back(
+                        L"RAYMARCH_BACKGROUND_TILE_REPAIR_SIZE=" +
+                        std::to_wstring(std::max(1u, m_config.backgroundPassHorizonTileSize)));
+                }
+            }
+            if (m_config.raymarchFastTerrainDiagnostics) {
+                psOptions.defines.push_back(L"RAYMARCH_FAST_TERRAIN_DIAGNOSTICS=1");
+            }
+            if (m_config.raymarchProbeSkipWater) {
+                psOptions.defines.push_back(L"RAYMARCH_PROBE_SKIP_WATER=1");
+            }
+            if (m_config.raymarchProbeSkipMidDda) {
+                psOptions.defines.push_back(L"RAYMARCH_PROBE_SKIP_MID_DDA=1");
+            }
+            if (m_config.raymarchProbeSkipFarSvo) {
+                psOptions.defines.push_back(L"RAYMARCH_PROBE_SKIP_FAR_SVO=1");
+            }
+            if (m_config.raymarchProbeSkipFarHeight) {
+                psOptions.defines.push_back(L"RAYMARCH_PROBE_SKIP_FAR_HEIGHT=1");
+            }
+            if (m_config.raymarchProbeSkipFarTail) {
+                psOptions.defines.push_back(L"RAYMARCH_PROBE_SKIP_FAR_TAIL=1");
+            }
+            if (m_config.raymarchProbeSkipTerrainDiag) {
+                psOptions.defines.push_back(L"RAYMARCH_PROBE_SKIP_TERRAIN_DIAG=1");
+            }
+            if (m_config.raymarchProbeSkipClosureDiag) {
+                psOptions.defines.push_back(L"RAYMARCH_PROBE_SKIP_CLOSURE_DIAG=1");
+            }
+            if (m_config.raymarchProbeSkipMissDiag) {
+                psOptions.defines.push_back(L"RAYMARCH_PROBE_SKIP_MISS_DIAG=1");
+            }
+            return m_shaderCompiler.CompileFromFile(psPath, psOptions);
+        }
+        return m_shaderCompiler.CompilePixelShader(psPath, L"main", m_config.debugShaders);
+    }();
     if (!psResult) {
         return Error("Failed to compile pixel shader: {}", psResult.error());
     }
@@ -1376,12 +2102,33 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
     if (!m_fullscreenPS.IsValid()) {
         return Error("Pixel shader compilation failed: {}", m_fullscreenPS.errors);
     }
+    spdlog::info("RENDERER_INIT_STAGE fullscreen PS ready bytes={}", m_fullscreenPS.bytecode.size());
+    if (m_config.raymarchBackgroundOnlyPso) {
+        spdlog::info(
+            "Raymarch background-only PSO specialization: fastSky={} aggressiveSky={} maskedBandDiag={} maskedBandTile={} maskedBandPhases={} fastTerrainDiag={} farMaxHeightDda={} probeSkipWater={} probeSkipMidDda={} probeSkipFarSvo={} probeSkipFarHeight={} probeSkipFarTail={} probeSkipTerrainDiag={} probeSkipClosureDiag={} probeSkipMissDiag={}",
+            m_config.raymarchFastSkyPso ? 1 : 0,
+            m_config.raymarchAggressiveSkyPso ? 1 : 0,
+            m_config.raymarchMaskedBandDiag ? 1 : 0,
+            std::clamp(m_config.raymarchMaskedBandDiagTileSize, 4u, 64u),
+            std::clamp(m_config.raymarchMaskedBandDiagPhases, 1u, 16u),
+            m_config.raymarchFastTerrainDiagnostics ? 1 : 0,
+            m_config.raymarchFarMaxHeightDdaEnabled ? 1 : 0,
+            m_config.raymarchProbeSkipWater ? 1 : 0,
+            m_config.raymarchProbeSkipMidDda ? 1 : 0,
+            m_config.raymarchProbeSkipFarSvo ? 1 : 0,
+            m_config.raymarchProbeSkipFarHeight ? 1 : 0,
+            m_config.raymarchProbeSkipFarTail ? 1 : 0,
+            m_config.raymarchProbeSkipTerrainDiag ? 1 : 0,
+            m_config.raymarchProbeSkipClosureDiag ? 1 : 0,
+            m_config.raymarchProbeSkipMissDiag ? 1 : 0);
+    }
 
     // Create pipeline
     GraphicsPipelineDesc pipelineDesc;
     pipelineDesc.vertexShader = m_fullscreenVS;
     pipelineDesc.pixelShader = m_fullscreenPS;
-    pipelineDesc.debugName = "FullscreenPipeline";
+    pipelineDesc.debugName =
+        m_config.raymarchBackgroundOnlyPso ? "FullscreenBackgroundOnlyPipeline" : "FullscreenPipeline";
 
     // Root signature parameters (for voxel rendering)
     // b0: FrameConstants CBV. This used to be 56 DWORD root constants, which
@@ -1583,6 +2330,39 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
         1,
         D3D12_DESCRIPTOR_RANGE_TYPE_UAV
     });
+    // t19: Reserved for the conservative far max-height cache consumer. The
+    // initial GPU product is generated behind an env flag; the rejected
+    // uber-shader consumer is intentionally not compiled.
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        19,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    // t20: Optional far-height horizon. A compute pass writes one conservative
+    // screen-space horizon Y per 8px X tile; pixels above it can skip only the
+    // final far-height tail. The pixel shader still runs all earlier background
+    // owners.
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        20,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    // t21: Optional background horizon repair tile mask. Generated from the
+    // low-res background pass and consumed only by the experimental repair PSO.
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        21,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
     // Static sampler s0
     pipelineDesc.staticSamplers.push_back({
         0,  // register s0
@@ -1628,11 +2408,17 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
     // records exist and are closer.
     pipelineDesc.cullMode = D3D12_CULL_MODE_NONE;
 
+    spdlog::info(
+        "RENDERER_INIT_STAGE begin fullscreen PSO create rootParams={} rtvFormats={} dsvFormat={}",
+        pipelineDesc.rootParams.size(),
+        pipelineDesc.rtvFormats.size(),
+        static_cast<uint32_t>(pipelineDesc.dsvFormat));
     auto result = m_fullscreenPipeline.Initialize(device, pipelineDesc);
     if (!result) {
         return Error("Failed to create fullscreen pipeline: {}", result.error());
     }
 
+    spdlog::info("RENDERER_INIT_STAGE fullscreen PSO ready");
     spdlog::info("Fullscreen pipeline created successfully");
 
     // Optionally build a second "mid-only" raymarch overlay pipeline that reuses
@@ -1646,7 +2432,1195 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
         }
     }
 
+    if (m_config.backgroundPassTemporal) {
+        auto temporalResult = CreateTemporalRaymarchPipeline(device, pipelineDesc);
+        if (!temporalResult) {
+            return Error("Failed to create temporal raymarch pipeline: {}", temporalResult.error());
+        }
+    }
+
+    if (m_config.farSkyOwnerEnabled) {
+        auto farSkyOwnerResult = CreateFarSkyOwnerPipeline(device);
+        if (!farSkyOwnerResult) {
+            return Error("Failed to create far sky owner pipeline: {}", farSkyOwnerResult.error());
+        }
+    }
+
     return {};
+}
+
+Result<void> Renderer::CreateFarSkyOwnerPipeline(ID3D12Device* device) {
+    if (!device) {
+        return Error("Far sky owner pipeline: null device");
+    }
+
+    const std::filesystem::path psPath = m_config.shaderPath / "Graphics" / "PS_FarSkyOwner.hlsl";
+    ShaderCompileOptions psOptions;
+    psOptions.entryPoint = L"main";
+    psOptions.target = L"ps_6_0";
+    psOptions.debugInfo = m_config.debugShaders;
+    psOptions.optimizationLevel3 = true;
+    auto psResult = m_shaderCompiler.CompileFromFile(psPath, psOptions);
+    if (!psResult) {
+        return Error("Failed to compile far sky owner pixel shader: {}", psResult.error());
+    }
+    m_farSkyOwnerPS = psResult.value();
+    if (!m_farSkyOwnerPS.IsValid()) {
+        return Error("Far sky owner pixel shader compilation failed: {}", m_farSkyOwnerPS.errors);
+    }
+
+    GraphicsPipelineDesc desc;
+    desc.vertexShader = m_fullscreenVS;
+    desc.pixelShader = m_farSkyOwnerPS;
+    desc.debugName = "FarSkyOwnerPipeline";
+    desc.rootParams.push_back({
+        RootParamType::ConstantBuffer,
+        0,
+        0,
+        D3D12_SHADER_VISIBILITY_ALL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        0
+    });
+    desc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        0,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    desc.rtvFormats.push_back(DXGI_FORMAT_R8G8B8A8_UNORM);
+    desc.inputLayout.clear();
+    desc.depthEnable = false;
+    desc.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    desc.depthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    desc.stencilEnable = true;
+    desc.stencilReadMask = 0xFFu;
+    desc.stencilWriteMask = 0xFFu;
+    desc.frontStencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
+    desc.frontStencilPassOp = D3D12_STENCIL_OP_INCR_SAT;
+    desc.frontStencilFailOp = D3D12_STENCIL_OP_KEEP;
+    desc.frontStencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    desc.dsvFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    desc.cullMode = D3D12_CULL_MODE_NONE;
+
+    auto result = m_farSkyOwnerPipeline.Initialize(device, desc);
+    if (!result) {
+        return Error("Failed to create far sky owner pipeline: {}", result.error());
+    }
+    spdlog::info("Far sky owner pipeline created successfully");
+    return {};
+}
+
+Result<void> Renderer::CreateTemporalRaymarchPipeline(
+    ID3D12Device* device, GraphicsPipelineDesc fullscreenDesc) {
+    // SINGLE-RT temporal history at RGBA16F. A 3-MRT variant tripped the uber-shader PSO JIT cliff
+    // (E_OUTOFMEMORY); keeping ONE float4 SV_Target0 output (same shape as the working default) avoids
+    // it. The default RAYMARCH_TEMPORAL variant adds only a cheap top-of-main tile-Bayer discard
+    // (no extra SRV root table). The opt-in reproject variant samples TemporalMarchMask at t18.
+    std::filesystem::path psPath = m_config.shaderPath / "Graphics" / "PS_Raymarch.hlsl";
+    ShaderCompileOptions psOptions;
+    psOptions.entryPoint = L"main";
+    psOptions.target = L"ps_6_0";
+    psOptions.debugInfo = m_config.debugShaders;
+    psOptions.optimizationLevel3 = true;
+    psOptions.defines.push_back(L"RAYMARCH_TEMPORAL=1");
+    if (UseTemporalMotionReproject()) {
+        psOptions.defines.push_back(L"RAYMARCH_TEMPORAL_REPROJECT=1");
+    } else {
+        // Static temporal renders only background pixels through the split pass. Keep this variant off
+        // the full near/brush/avatar uber-shader so cold startup can compile and verify the path.
+        psOptions.defines.push_back(L"RAYMARCH_BACKGROUND_ONLY=1");
+    }
+    auto psResult = m_shaderCompiler.CompileFromFile(psPath, psOptions);
+    if (!psResult) {
+        return Error("Failed to compile temporal raymarch pixel shader: {}", psResult.error());
+    }
+    m_temporalRaymarchPS = psResult.value();
+    if (!m_temporalRaymarchPS.IsValid()) {
+        return Error("Temporal raymarch pixel shader compilation failed: {}", m_temporalRaymarchPS.errors);
+    }
+    fullscreenDesc.vertexShader = m_fullscreenVS;
+    fullscreenDesc.pixelShader = m_temporalRaymarchPS;
+    fullscreenDesc.blendEnable = false;
+    fullscreenDesc.rtvFormats.clear();
+    fullscreenDesc.rtvFormats.push_back(DXGI_FORMAT_R16G16B16A16_FLOAT);  // RT0 history color (a = distance, Stage 2b)
+    if (UseTemporalMotionReproject()) {
+        // Stage 2b: t18 = TemporalMarchMask SRV. Index 23 after the default tables.
+        fullscreenDesc.rootParams.push_back({
+            RootParamType::DescriptorTable, 18, 0, D3D12_SHADER_VISIBILITY_PIXEL, 1,
+            D3D12_DESCRIPTOR_RANGE_TYPE_SRV });
+    }
+    fullscreenDesc.debugName = "TemporalRaymarchPipeline";
+
+    auto result = m_temporalRaymarchPipeline.Initialize(device, fullscreenDesc);
+    if (!result) {
+        return Error("Failed to create temporal raymarch pipeline: {}", result.error());
+    }
+    spdlog::info("Temporal raymarch pipeline created successfully (single-RT RGBA16F)");
+
+    if (UseTemporalMotionReproject()) {
+        if (auto reproj = CreateTemporalReprojectPipeline(device); !reproj) {
+            return reproj;
+        }
+    }
+    return {};
+}
+
+Result<void> Renderer::CreateTemporalReprojectPipeline(ID3D12Device* device) {
+    // Stage 2b: 2-pass depth-resolved forward-scatter (CS_TemporalReproject). Pass 1 InterlockedMins the
+    // nearest reprojected distance per current pixel (overlap/disocclusion resolve); pass 2 writes the
+    // winning prev color + the reuse mask. Same source, compiled twice via REPROJECT_COLOR_PASS.
+    std::filesystem::path csPath = m_config.shaderPath / "Compute" / "CS_TemporalReproject.hlsl";
+
+    // Pass 1 (depth): b0 FrameConstants, t0 HistoryPrev, u0 ScatterDepth.
+    {
+        ShaderCompileOptions o;
+        o.entryPoint = L"main";
+        o.target = L"cs_6_0";
+        o.debugInfo = m_config.debugShaders;
+        o.optimizationLevel3 = true;
+        auto cs = m_shaderCompiler.CompileFromFile(csPath, o);
+        if (!cs) return Error("Failed to compile temporal reproject DEPTH shader: {}", cs.error());
+        m_temporalReprojectDepthCS = cs.value();
+        if (!m_temporalReprojectDepthCS.IsValid()) {
+            return Error("Temporal reproject DEPTH shader compile failed: {}", m_temporalReprojectDepthCS.errors);
+        }
+        ComputePipelineDesc desc;
+        desc.computeShader = m_temporalReprojectDepthCS;
+        desc.debugName = "TemporalReprojectDepthPipeline";
+        desc.rootParams.push_back({ RootParamType::ConstantBuffer, 0, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_SRV }); // b0
+        desc.rootParams.push_back({ RootParamType::DescriptorTable, 0, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_SRV }); // t0 HistoryPrev
+        desc.rootParams.push_back({ RootParamType::DescriptorTable, 0, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_UAV }); // u0 ScatterDepth
+        if (auto r = m_temporalReprojectDepthPipeline.Initialize(device, desc); !r) {
+            return Error("Failed to create temporal reproject depth pipeline: {}", r.error());
+        }
+    }
+    // Pass 2 (color): b0, t0 HistoryPrev, u0 ScatterDepth, u1 HistoryCur, u2 MarchMask.
+    {
+        ShaderCompileOptions o;
+        o.entryPoint = L"main";
+        o.target = L"cs_6_0";
+        o.debugInfo = m_config.debugShaders;
+        o.optimizationLevel3 = true;
+        o.defines.push_back(L"REPROJECT_COLOR_PASS=1");
+        auto cs = m_shaderCompiler.CompileFromFile(csPath, o);
+        if (!cs) return Error("Failed to compile temporal reproject COLOR shader: {}", cs.error());
+        m_temporalReprojectColorCS = cs.value();
+        if (!m_temporalReprojectColorCS.IsValid()) {
+            return Error("Temporal reproject COLOR shader compile failed: {}", m_temporalReprojectColorCS.errors);
+        }
+        ComputePipelineDesc desc;
+        desc.computeShader = m_temporalReprojectColorCS;
+        desc.debugName = "TemporalReprojectColorPipeline";
+        desc.rootParams.push_back({ RootParamType::ConstantBuffer, 0, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_SRV }); // b0
+        desc.rootParams.push_back({ RootParamType::DescriptorTable, 0, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_SRV }); // t0 HistoryPrev
+        desc.rootParams.push_back({ RootParamType::DescriptorTable, 0, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_UAV }); // u0 ScatterDepth
+        desc.rootParams.push_back({ RootParamType::DescriptorTable, 1, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_UAV }); // u1 HistoryCur
+        desc.rootParams.push_back({ RootParamType::DescriptorTable, 2, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_UAV }); // u2 MarchMask
+        if (auto r = m_temporalReprojectColorPipeline.Initialize(device, desc); !r) {
+            return Error("Failed to create temporal reproject color pipeline: {}", r.error());
+        }
+    }
+    spdlog::info("Temporal reproject compute pipelines created successfully (2-pass depth-resolved)");
+    return {};
+}
+
+Result<void> Renderer::CreateFarHeightfieldOwnerResources(ID3D12Device* device) {
+    if (!device) {
+        return Error("Far heightfield owner: null device");
+    }
+
+    spdlog::info("Far heightfield owner init: creating face buffer");
+    auto bufferResult = m_farHeightfieldFaces.Initialize(
+        device,
+        kFarHeightfieldFaceBufferBytes,
+        BufferUsage::StructuredBuffer | BufferUsage::UnorderedAccess,
+        kFarHeightfieldFaceStride,
+        "FarHeightfieldFaces");
+    if (!bufferResult) {
+        return Error("Far heightfield owner face buffer init failed: {}", bufferResult.error());
+    }
+    if (auto srv = m_farHeightfieldFaces.CreateSRV(device, m_heapManager); !srv) {
+        return Error("Far heightfield owner face SRV init failed: {}", srv.error());
+    }
+    if (auto uav = m_farHeightfieldFaces.CreateUAV(device, m_heapManager); !uav) {
+        return Error("Far heightfield owner face UAV init failed: {}", uav.error());
+    }
+
+    if (!m_config.farHeightfieldOwnerFaceCsvPath.empty()) {
+        auto readbackResult = m_farHeightfieldFaceReadback.Initialize(
+            device,
+            kFarHeightfieldFaceBufferBytes,
+            BufferUsage::Readback,
+            kFarHeightfieldFaceStride,
+            "FarHeightfieldFaceReadback");
+        if (!readbackResult) {
+            return Error("Far heightfield owner face readback init failed: {}", readbackResult.error());
+        }
+    }
+
+    if (m_config.farHeightfieldOwnerGpuGenerate) {
+        const std::filesystem::path csPath =
+            m_config.shaderPath / "Compute" / "CS_GenerateFarHeightfieldFaces.hlsl";
+        auto compileResult = m_shaderCompiler.CompileComputeShader(csPath, L"main", true);
+        if (!compileResult) {
+            return Error("Far heightfield owner generate CS compile failed: {}", compileResult.error());
+        }
+        m_farHeightfieldGenerateCS = compileResult.value();
+        if (!m_farHeightfieldGenerateCS.IsValid()) {
+            return Error(
+                "Far heightfield owner generate CS invalid: {}",
+                m_farHeightfieldGenerateCS.errors);
+        }
+
+        ComputePipelineDesc desc;
+        desc.computeShader = m_farHeightfieldGenerateCS;
+        desc.debugName = "CS_GenerateFarHeightfieldFaces";
+        desc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 12 });
+        desc.rootParams.push_back({ RootParamType::UnorderedAccess, 0, 0, 1 });
+        if (auto pipeResult = m_farHeightfieldGeneratePipeline.Initialize(device, desc); !pipeResult) {
+            return Error("Far heightfield owner generate pipeline init failed: {}", pipeResult.error());
+        }
+    }
+
+    auto uploadResult = m_farHeightfieldFaceUpload.Initialize(
+        device,
+        kFarHeightfieldFaceBufferBytes,
+        "FarHeightfieldFaceUpload");
+    if (!uploadResult) {
+        return Error("Far heightfield owner face upload init failed: {}", uploadResult.error());
+    }
+
+    spdlog::info("Far heightfield owner init: creating IA streams");
+    const uint64_t vertexByteCount =
+        static_cast<uint64_t>(kFarHeightfieldVertexCount) * sizeof(uint32_t);
+    auto vertexResult = m_farHeightfieldVertexIdUpload.Initialize(
+        device,
+        vertexByteCount,
+        "FarHeightfieldVertexIds");
+    if (!vertexResult) {
+        return Error("Far heightfield owner vertex stream init failed: {}", vertexResult.error());
+    }
+    if (auto* mapped = static_cast<uint32_t*>(m_farHeightfieldVertexIdUpload.GetMappedData())) {
+        for (uint32_t i = 0; i < kFarHeightfieldVertexCount; ++i) {
+            mapped[i] = i;
+        }
+    } else {
+        return Error("Far heightfield owner vertex stream map is null");
+    }
+    m_farHeightfieldVertexIdView.BufferLocation =
+        m_farHeightfieldVertexIdUpload.GetGPUVirtualAddress();
+    m_farHeightfieldVertexIdView.SizeInBytes = static_cast<UINT>(vertexByteCount);
+    m_farHeightfieldVertexIdView.StrideInBytes = sizeof(uint32_t);
+
+    const uint64_t indexByteCount =
+        static_cast<uint64_t>(kFarHeightfieldIndexCount) * sizeof(uint32_t);
+    auto indexResult = m_farHeightfieldIndexUpload.Initialize(
+        device,
+        indexByteCount,
+        "FarHeightfieldIndices");
+    if (!indexResult) {
+        return Error("Far heightfield owner index stream init failed: {}", indexResult.error());
+    }
+    if (auto* mappedIndices = static_cast<uint32_t*>(m_farHeightfieldIndexUpload.GetMappedData())) {
+        for (uint32_t face = 0; face < kFarHeightfieldFaceCount; ++face) {
+            const uint32_t vertexBase = face * 4u;
+            const uint32_t indexBase = face * 6u;
+            mappedIndices[indexBase + 0u] = vertexBase + 0u;
+            mappedIndices[indexBase + 1u] = vertexBase + 1u;
+            mappedIndices[indexBase + 2u] = vertexBase + 2u;
+            mappedIndices[indexBase + 3u] = vertexBase + 0u;
+            mappedIndices[indexBase + 4u] = vertexBase + 2u;
+            mappedIndices[indexBase + 5u] = vertexBase + 3u;
+        }
+    } else {
+        return Error("Far heightfield owner index stream map is null");
+    }
+    m_farHeightfieldIndexView.BufferLocation =
+        m_farHeightfieldIndexUpload.GetGPUVirtualAddress();
+    m_farHeightfieldIndexView.SizeInBytes = static_cast<UINT>(indexByteCount);
+    m_farHeightfieldIndexView.Format = DXGI_FORMAT_R32_UINT;
+
+    spdlog::info(
+        "Far heightfield owner created: cells={} faces={} indices={} generation={}",
+        kFarHeightfieldCellCount,
+        kFarHeightfieldFaceCount,
+        kFarHeightfieldIndexCount,
+        m_config.farHeightfieldOwnerGpuGenerate ? "gpu_far_height_voxelized" : "cpu_probe");
+    return {};
+}
+
+Result<void> Renderer::CreateFarMaxHeightCacheResources(ID3D12Device* device) {
+    if (!device) {
+        return Error("Far max-height cache: null device");
+    }
+    m_farMaxHeightCacheValid = false;
+    m_farMaxHeightCacheKey = {};
+
+    spdlog::info(
+        "Far max-height cache init: cells={} levels={} elements={} bytes={}",
+        kFarMaxHeightCacheLeafCellCount,
+        kFarMaxHeightCacheMipLevels,
+        kFarMaxHeightCacheElementCount,
+        kFarMaxHeightCacheBufferBytes);
+    auto bufferResult = m_farMaxHeightCache.Initialize(
+        device,
+        kFarMaxHeightCacheBufferBytes,
+        BufferUsage::StructuredBuffer | BufferUsage::UnorderedAccess,
+        kFarMaxHeightCacheStride,
+        "FarMaxHeightCache");
+    if (!bufferResult) {
+        return Error("Far max-height cache buffer init failed: {}", bufferResult.error());
+    }
+    if (auto srv = m_farMaxHeightCache.CreateSRV(device, m_heapManager); !srv) {
+        return Error("Far max-height cache SRV init failed: {}", srv.error());
+    }
+    if (auto uav = m_farMaxHeightCache.CreateUAV(device, m_heapManager); !uav) {
+        return Error("Far max-height cache UAV init failed: {}", uav.error());
+    }
+
+    const std::filesystem::path csPath =
+        m_config.shaderPath / "Compute" / "CS_GenerateFarMaxHeightCache.hlsl";
+    auto compileResult = m_shaderCompiler.CompileComputeShader(csPath, L"main", true);
+    if (!compileResult) {
+        return Error("Far max-height cache generate CS compile failed: {}", compileResult.error());
+    }
+    m_farMaxHeightCacheGenerateCS = compileResult.value();
+    if (!m_farMaxHeightCacheGenerateCS.IsValid()) {
+        return Error(
+            "Far max-height cache generate CS invalid: {}",
+            m_farMaxHeightCacheGenerateCS.errors);
+    }
+
+    ComputePipelineDesc desc;
+    desc.computeShader = m_farMaxHeightCacheGenerateCS;
+    desc.debugName = "CS_GenerateFarMaxHeightCache";
+    desc.rootParams.push_back({ RootParamType::Constants32Bit, 0, 0, 16 });
+    desc.rootParams.push_back({ RootParamType::UnorderedAccess, 0, 0, 1 });
+    if (auto pipeResult = m_farMaxHeightCacheGeneratePipeline.Initialize(device, desc); !pipeResult) {
+        return Error("Far max-height cache generate pipeline init failed: {}", pipeResult.error());
+    }
+
+    spdlog::info("Far max-height cache created: generation=gpu_voxelized_mip");
+    return {};
+}
+
+Result<void> Renderer::CreateFarMaxHeightNoHitMaskPipeline(ID3D12Device* device) {
+    if (!device) {
+        return Error("Far max-height no-hit mask: null device");
+    }
+
+    const std::filesystem::path csPath =
+        m_config.shaderPath / "Compute" / "CS_FarMaxHeightNoHitMask.hlsl";
+    auto compileResult = m_shaderCompiler.CompileComputeShader(csPath, L"main", true);
+    if (!compileResult) {
+        return Error("Far max-height no-hit mask CS compile failed: {}", compileResult.error());
+    }
+    m_farMaxHeightNoHitMaskCS = compileResult.value();
+    if (!m_farMaxHeightNoHitMaskCS.IsValid()) {
+        return Error(
+            "Far max-height no-hit mask CS invalid: {}",
+            m_farMaxHeightNoHitMaskCS.errors);
+    }
+
+    ComputePipelineDesc desc;
+    desc.computeShader = m_farMaxHeightNoHitMaskCS;
+    desc.debugName = "CS_FarMaxHeightNoHitMask";
+    desc.rootParams.push_back({ RootParamType::ConstantBuffer, 0, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_SRV }); // b0
+    desc.rootParams.push_back({ RootParamType::DescriptorTable, 0, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_SRV }); // t0 cache
+    desc.rootParams.push_back({ RootParamType::DescriptorTable, 0, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_UAV }); // u0 mask
+    desc.rootParams.push_back({ RootParamType::DescriptorTable, 1, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_UAV }); // u1 horizon
+    desc.rootParams.push_back(
+        { RootParamType::Constants32Bit, 1, 0, sizeof(FarMaxHeightScreenMaskConstants) / sizeof(uint32_t) }); // b1 pass params
+    if (auto pipeResult = m_farMaxHeightNoHitMaskPipeline.Initialize(device, desc); !pipeResult) {
+        return Error("Far max-height no-hit mask pipeline init failed: {}", pipeResult.error());
+    }
+    spdlog::info("Far max-height no-hit mask pipeline created");
+    return {};
+}
+
+Result<void> Renderer::CreateBackgroundHorizonTileMaskPipeline(ID3D12Device* device) {
+    if (!device) {
+        return Error("Background horizon tile mask: null device");
+    }
+
+    const std::filesystem::path csPath =
+        m_config.shaderPath / "Compute" / "CS_BackgroundHorizonTileMask.hlsl";
+    auto compileResult = m_shaderCompiler.CompileComputeShader(csPath, L"main", true);
+    if (!compileResult) {
+        return Error("Background horizon tile mask CS compile failed: {}", compileResult.error());
+    }
+    m_backgroundHorizonTileMaskCS = compileResult.value();
+    if (!m_backgroundHorizonTileMaskCS.IsValid()) {
+        return Error(
+            "Background horizon tile mask CS invalid: {}",
+            m_backgroundHorizonTileMaskCS.errors);
+    }
+
+    ComputePipelineDesc desc;
+    desc.computeShader = m_backgroundHorizonTileMaskCS;
+    desc.debugName = "CS_BackgroundHorizonTileMask";
+    desc.rootParams.push_back(
+        { RootParamType::Constants32Bit, 0, 0, sizeof(BackgroundHorizonTileMaskConstants) / sizeof(uint32_t) }); // b0 params
+    desc.rootParams.push_back(
+        { RootParamType::DescriptorTable, 0, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_SRV }); // t0 background color
+    desc.rootParams.push_back(
+        { RootParamType::DescriptorTable, 0, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_UAV }); // u0 render ownership stats
+    desc.rootParams.push_back(
+        { RootParamType::DescriptorTable, 1, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_UAV }); // u1 tile mask
+    desc.rootParams.push_back(
+        { RootParamType::DescriptorTable, 2, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_UAV }); // u2 compact tile list
+    desc.rootParams.push_back(
+        { RootParamType::DescriptorTable, 3, 0, 1, D3D12_DESCRIPTOR_RANGE_TYPE_UAV }); // u3 non-indexed draw args words
+    if (auto pipeResult = m_backgroundHorizonTileMaskPipeline.Initialize(device, desc); !pipeResult) {
+        return Error("Background horizon tile mask pipeline init failed: {}", pipeResult.error());
+    }
+    spdlog::info("Background horizon tile mask pipeline created");
+    return {};
+}
+
+void Renderer::GenerateFarMaxHeightCache(
+    ID3D12GraphicsCommandList* cmdList,
+    const void* frameConstantsCpu)
+{
+    if (!cmdList ||
+        !frameConstantsCpu ||
+        !m_config.farMaxHeightCacheEnabled ||
+        !m_farMaxHeightCache.GetResource() ||
+        !m_farMaxHeightCacheGeneratePipeline.IsValid()) {
+        return;
+    }
+
+    const FrameConstantsCpu& constants =
+        *static_cast<const FrameConstantsCpu*>(frameConstantsCpu);
+    float originX = 0.0f;
+    float originZ = 0.0f;
+    ComputeFarMaxHeightCacheOrigin(
+        constants.cameraPosition[0],
+        constants.cameraPosition[2],
+        originX,
+        originZ);
+
+    const uint32_t seed = Uint32BitsFromFloat(constants.exactNearParams[1]);
+    const float cacheExtent =
+        static_cast<float>(kFarMaxHeightCacheLeafCellCount) * kFarMaxHeightCacheCellSize;
+    const float canonicalCameraX = originX + cacheExtent * 0.5f + kFarMaxHeightCacheCellSize * 0.5f;
+    const float canonicalCameraZ = originZ + cacheExtent * 0.5f + kFarMaxHeightCacheCellSize * 0.5f;
+    const std::array<uint32_t, 3> cacheKey = {
+        Uint32BitsFromFloat(originX),
+        Uint32BitsFromFloat(originZ),
+        seed,
+    };
+    if (m_farMaxHeightCacheValid && m_farMaxHeightCacheKey == cacheKey) {
+        return;
+    }
+
+    std::array<uint32_t, kFarMaxHeightCacheMipLevels> widths{};
+    std::array<uint32_t, kFarMaxHeightCacheMipLevels> heights{};
+    std::array<uint32_t, kFarMaxHeightCacheMipLevels> offsets{};
+    uint32_t width = kFarMaxHeightCacheLeafCellCount;
+    uint32_t height = kFarMaxHeightCacheLeafCellCount;
+    uint32_t offset = 0;
+    for (uint32_t level = 0; level < kFarMaxHeightCacheMipLevels; ++level) {
+        widths[level] = width;
+        heights[level] = height;
+        offsets[level] = offset;
+        offset += width * height;
+        width = std::max(1u, (width + 1u) / 2u);
+        height = std::max(1u, (height + 1u) / 2u);
+    }
+
+    m_farMaxHeightCache.TransitionTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_farMaxHeightCacheGeneratePipeline.Bind(cmdList);
+
+    for (uint32_t level = 0; level < kFarMaxHeightCacheMipLevels; ++level) {
+        FarMaxHeightCacheGenerateConstants gen{};
+        gen.level = level;
+        gen.srcOffset = level == 0 ? 0u : offsets[level - 1u];
+        gen.dstOffset = offsets[level];
+        gen.worldSeed = seed;
+        gen.srcWidth = level == 0 ? widths[level] : widths[level - 1u];
+        gen.srcHeight = level == 0 ? heights[level] : heights[level - 1u];
+        gen.dstWidth = widths[level];
+        gen.dstHeight = heights[level];
+        gen.originXBits = Uint32BitsFromFloat(originX);
+        gen.originZBits = Uint32BitsFromFloat(originZ);
+        gen.leafCellSizeBits = Uint32BitsFromFloat(kFarMaxHeightCacheCellSize);
+        gen.heightPadBits = Uint32BitsFromFloat(kFarMaxHeightCacheHeightPad);
+        gen.cameraXBits = Uint32BitsFromFloat(canonicalCameraX);
+        gen.cameraYBits = Uint32BitsFromFloat(constants.cameraPosition[1]);
+        gen.cameraZBits = Uint32BitsFromFloat(canonicalCameraZ);
+
+        m_farMaxHeightCacheGeneratePipeline.SetRoot32BitConstants(
+            cmdList,
+            0,
+            sizeof(gen) / sizeof(uint32_t),
+            &gen);
+        cmdList->SetComputeRootUnorderedAccessView(
+            1,
+            m_farMaxHeightCache.GetGPUVirtualAddress());
+        const uint32_t dstCount = gen.dstWidth * gen.dstHeight;
+        m_farMaxHeightCacheGeneratePipeline.Dispatch(
+            cmdList,
+            (dstCount + 127u) / 128u,
+            1u,
+            1u);
+
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barrier.UAV.pResource = m_farMaxHeightCache.GetResource();
+        cmdList->ResourceBarrier(1, &barrier);
+    }
+
+    m_farMaxHeightCache.TransitionTo(cmdList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    m_farMaxHeightCacheKey = cacheKey;
+    m_farMaxHeightCacheValid = true;
+}
+
+void Renderer::GenerateFarMaxHeightNoHitMask(
+    ID3D12GraphicsCommandList* cmdList,
+    D3D12_GPU_VIRTUAL_ADDRESS frameConstants)
+{
+    if (!cmdList ||
+        !m_config.farMaxHeightNoHitMaskEnabled ||
+        !m_farMaxHeightNoHitMaskPipeline.IsValid() ||
+        !m_farMaxHeightCache.GetResource() ||
+        !m_farMaxHeightCache.GetShaderVisibleSRV().IsValid() ||
+        !m_farMaxHeightNoHitMask.resource ||
+        !m_farMaxHeightNoHitMask.uav.IsValid() ||
+        !m_farMaxHeightScreenHorizon.GetResource() ||
+        !m_farMaxHeightScreenHorizon.GetShaderVisibleSRV().IsValid() ||
+        !m_farMaxHeightScreenHorizon.GetShaderVisibleUAV().IsValid() ||
+        m_farMaxHeightScreenHorizonTileCount == 0u) {
+        return;
+    }
+
+    if (m_farMaxHeightNoHitMask.state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+        D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_farMaxHeightNoHitMask.resource.Get(),
+            m_farMaxHeightNoHitMask.state,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cmdList->ResourceBarrier(1, &barrier);
+        m_farMaxHeightNoHitMask.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+
+    m_farMaxHeightCache.TransitionTo(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    m_farMaxHeightScreenHorizon.TransitionTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_farMaxHeightNoHitMaskPipeline.Bind(cmdList);
+    cmdList->SetComputeRootConstantBufferView(0, frameConstants);
+    cmdList->SetComputeRootDescriptorTable(1, m_farMaxHeightCache.GetShaderVisibleSRV().gpu);
+    cmdList->SetComputeRootDescriptorTable(2, m_farMaxHeightNoHitMask.uav.gpu);
+    cmdList->SetComputeRootDescriptorTable(3, m_farMaxHeightScreenHorizon.GetShaderVisibleUAV().gpu);
+
+    FarMaxHeightScreenMaskConstants params{};
+    params.tileCount = m_farMaxHeightScreenHorizonTileCount;
+    params.tileWidth = kFarMaxHeightScreenMaskTileWidth;
+    const float maskDilationPixels = ClampFinite(
+        m_config.farMaxHeightScreenMaskDilationPixels,
+        0.0f,
+        32.0f,
+        kFarMaxHeightScreenMaskDilationPixels);
+    const uint32_t maskProjectMip = std::min(
+        m_config.farMaxHeightScreenMaskMipLevel,
+        kFarMaxHeightCacheMipLevels - 1u);
+    params.dilationPixelsBits = Uint32BitsFromFloat(maskDilationPixels);
+    float projectCellSize = 0.0f;
+    ComputeFarMaxHeightCacheMipInfo(
+        maskProjectMip,
+        params.projectOffset,
+        params.projectSide,
+        projectCellSize);
+    params.projectCellSizeBits = Uint32BitsFromFloat(projectCellSize);
+
+    params.passIndex = 0u;
+    m_farMaxHeightNoHitMaskPipeline.SetRoot32BitConstants(
+        cmdList,
+        4,
+        sizeof(params) / sizeof(uint32_t),
+        &params);
+    m_farMaxHeightNoHitMaskPipeline.Dispatch(
+        cmdList,
+        (m_farMaxHeightScreenHorizonTileCount + 7u) / 8u,
+        1u,
+        1u);
+
+    D3D12_RESOURCE_BARRIER horizonBarrier = CD3DX12_RESOURCE_BARRIER::UAV(
+        m_farMaxHeightScreenHorizon.GetResource());
+    cmdList->ResourceBarrier(1, &horizonBarrier);
+
+    params.passIndex = 1u;
+    m_farMaxHeightNoHitMaskPipeline.SetRoot32BitConstants(
+        cmdList,
+        4,
+        sizeof(params) / sizeof(uint32_t),
+        &params);
+    m_farMaxHeightNoHitMaskPipeline.Dispatch(
+        cmdList,
+        (params.projectSide + 7u) / 8u,
+        (params.projectSide + 7u) / 8u,
+        1u);
+
+    cmdList->ResourceBarrier(1, &horizonBarrier);
+    m_farMaxHeightCache.TransitionTo(cmdList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    m_farMaxHeightScreenHorizon.TransitionTo(cmdList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    QueueFarMaxHeightHorizonCsvReadback(cmdList);
+}
+
+void Renderer::GenerateBackgroundHorizonTileMask(
+    ID3D12GraphicsCommandList* cmdList,
+    const SparseNearField* sparseNearField,
+    uint32_t frameIndex)
+{
+    if (!cmdList ||
+        !m_config.backgroundPassHorizonTileMask ||
+        !UseBackgroundPassSplit() ||
+        !m_backgroundHorizonTileMaskPipeline.IsValid() ||
+        !m_backgroundPassColor.Get() ||
+        !m_backgroundPassSrv.IsValid() ||
+        !m_backgroundHorizonTileMask.resource ||
+        !m_backgroundHorizonTileMask.uav.IsValid() ||
+        !m_backgroundHorizonTileList.GetResource() ||
+        !m_backgroundHorizonTileList.GetShaderVisibleUAV().IsValid() ||
+        !m_backgroundHorizonTileDrawArgs.GetResource() ||
+        !m_backgroundHorizonTileDrawArgs.GetShaderVisibleUAV().IsValid()) {
+        return;
+    }
+
+    BackgroundHorizonTileMaskConstants params{};
+    params.fullWidth = std::max(1u, m_width);
+    params.fullHeight = std::max(1u, m_height);
+    params.tileSize = std::clamp(m_config.backgroundPassHorizonTileSize, 4u, 32u);
+    params.selectorMode = std::min(m_config.backgroundPassHorizonTileSelector, 1u);
+    const float thresholdFallback = params.selectorMode == 1u ? 0.00225f : 0.28f;
+    params.thresholdBits = Uint32BitsFromFloat(
+        ClampFinite(m_config.backgroundPassHorizonTileThreshold, 0.0f, 1.0f, thresholdFallback));
+    params.y0 = std::min(params.fullHeight, m_config.backgroundPassHorizonTileY0);
+    params.y1 = std::min(params.fullHeight, std::max(m_config.backgroundPassHorizonTileY1, params.y0));
+    params.frameIndex = frameIndex;
+
+    if (m_backgroundHorizonTileMask.state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+        D3D12_RESOURCE_BARRIER maskToUav = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_backgroundHorizonTileMask.resource.Get(),
+            m_backgroundHorizonTileMask.state,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        cmdList->ResourceBarrier(1, &maskToUav);
+        m_backgroundHorizonTileMask.state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    m_backgroundHorizonTileList.TransitionTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    m_backgroundHorizonTileDrawArgs.TransitionTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    const UINT drawArgsClear[4] = { 0u, 0u, 0u, 0u };
+    cmdList->ClearUnorderedAccessViewUint(
+        m_backgroundHorizonTileDrawArgs.GetShaderVisibleUAV().gpu,
+        m_backgroundHorizonTileDrawArgs.GetStagingUAV().cpu,
+        m_backgroundHorizonTileDrawArgs.GetResource(),
+        drawArgsClear,
+        0,
+        nullptr);
+
+    D3D12_RESOURCE_BARRIER preComputeBarrier = {};
+    preComputeBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    preComputeBarrier.UAV.pResource = nullptr;
+    cmdList->ResourceBarrier(1, &preComputeBarrier);
+
+    ID3D12DescriptorHeap* computeHeaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
+    cmdList->SetDescriptorHeaps(1, computeHeaps);
+    m_backgroundHorizonTileMaskPipeline.Bind(cmdList);
+    m_backgroundHorizonTileMaskPipeline.SetRoot32BitConstants(
+        cmdList,
+        0,
+        sizeof(params) / sizeof(uint32_t),
+        &params);
+    cmdList->SetComputeRootDescriptorTable(1, m_backgroundPassSrv.gpu);
+    cmdList->SetComputeRootDescriptorTable(
+        2,
+        (sparseNearField && sparseNearField->renderOwnershipUAV.IsValid())
+            ? sparseNearField->renderOwnershipUAV.gpu
+            : m_dummyRenderOwnershipUAV.GetShaderVisibleUAV().gpu);
+    cmdList->SetComputeRootDescriptorTable(3, m_backgroundHorizonTileMask.uav.gpu);
+    cmdList->SetComputeRootDescriptorTable(4, m_backgroundHorizonTileList.GetShaderVisibleUAV().gpu);
+    cmdList->SetComputeRootDescriptorTable(5, m_backgroundHorizonTileDrawArgs.GetShaderVisibleUAV().gpu);
+    m_backgroundHorizonTileMaskPipeline.Dispatch(
+        cmdList,
+        ((params.fullWidth + params.tileSize - 1u) / params.tileSize + 7u) / 8u,
+        ((params.fullHeight + params.tileSize - 1u) / params.tileSize + 7u) / 8u,
+        1u);
+
+    D3D12_RESOURCE_BARRIER postComputeBarrier = {};
+    postComputeBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    postComputeBarrier.UAV.pResource = nullptr;
+    cmdList->ResourceBarrier(1, &postComputeBarrier);
+    D3D12_RESOURCE_BARRIER maskToSrv = CD3DX12_RESOURCE_BARRIER::Transition(
+        m_backgroundHorizonTileMask.resource.Get(),
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    cmdList->ResourceBarrier(1, &maskToSrv);
+    m_backgroundHorizonTileMask.state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_backgroundHorizonTileList.TransitionTo(cmdList, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    m_backgroundHorizonTileDrawArgs.TransitionTo(cmdList, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+}
+
+void Renderer::TryRetireFarHeightfieldOwnerFaceCsv() {
+    if (!m_farHeightfieldOwnerFaceCsvReadbackPending ||
+        m_farHeightfieldOwnerFaceCsvWritten ||
+        m_config.farHeightfieldOwnerFaceCsvPath.empty()) {
+        return;
+    }
+    if (m_farHeightfieldFrameSerial <= m_farHeightfieldOwnerFaceCsvQueuedSerial) {
+        return;
+    }
+    if (!m_farHeightfieldFaceReadback.GetResource()) {
+        spdlog::warn(
+            "FAR_OWNER_FACE_CSV_WRITE_FAILED path={} reason=no_readback_buffer",
+            m_config.farHeightfieldOwnerFaceCsvPath.string());
+        m_farHeightfieldOwnerFaceCsvReadbackPending = false;
+        m_farHeightfieldOwnerFaceCsvWritten = true;
+        return;
+    }
+
+    if (m_commandQueue) {
+        m_commandQueue->Flush();
+    }
+
+    const auto* faces = static_cast<const FarHeightfieldFaceCpu*>(m_farHeightfieldFaceReadback.Map());
+    if (!faces) {
+        spdlog::warn(
+            "FAR_OWNER_FACE_CSV_WRITE_FAILED path={} reason=map_failed",
+            m_config.farHeightfieldOwnerFaceCsvPath.string());
+        m_farHeightfieldOwnerFaceCsvReadbackPending = false;
+        m_farHeightfieldOwnerFaceCsvWritten = true;
+        return;
+    }
+
+    const std::filesystem::path& path = m_config.farHeightfieldOwnerFaceCsvPath;
+    if (const std::filesystem::path parent = path.parent_path(); !parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            spdlog::warn(
+                "FAR_OWNER_FACE_CSV_PARENT_CREATE_FAILED path={} error={}",
+                parent.string(),
+                ec.message());
+        }
+    }
+
+    std::ofstream csv(path, std::ios::out | std::ios::trunc);
+    uint32_t activeFaces = 0;
+    if (!csv) {
+        spdlog::warn(
+            "FAR_OWNER_FACE_CSV_WRITE_FAILED path={} reason=open_failed",
+            path.string());
+    } else {
+        csv << "# cameraX=" << m_farHeightfieldOwnerFaceCsvCamera[0]
+            << " cameraY=" << m_farHeightfieldOwnerFaceCsvCamera[1]
+            << " cameraZ=" << m_farHeightfieldOwnerFaceCsvCamera[2]
+            << " faces=" << kFarHeightfieldFaceCount
+            << " cellSize=" << kFarHeightfieldCellSizeVoxels
+            << " originX=" << m_farHeightfieldOwnerFaceCsvOrigin[0]
+            << " originZ=" << m_farHeightfieldOwnerFaceCsvOrigin[1]
+            << " generation=gpu_far_height_voxelized\n";
+        csv << "worldX,worldY,worldZ,payload\n";
+        for (uint32_t index = 0; index < kFarHeightfieldFaceCount; ++index) {
+            activeFaces += faces[index].payload != 0u ? 1u : 0u;
+            csv << faces[index].worldX << ','
+                << faces[index].worldY << ','
+                << faces[index].worldZ << ','
+                << faces[index].payload << '\n';
+        }
+        csv.close();
+        if (!csv) {
+            spdlog::warn(
+                "FAR_OWNER_FACE_CSV_WRITE_INCOMPLETE path={}",
+                path.string());
+        } else {
+            spdlog::info(
+                "FAR_OWNER_FACE_CSV path={} faces={} activeFaces={} camera=({:.2f},{:.2f},{:.2f}) generation=gpu_far_height_voxelized",
+                path.string(),
+                kFarHeightfieldFaceCount,
+                activeFaces,
+                m_farHeightfieldOwnerFaceCsvCamera[0],
+                m_farHeightfieldOwnerFaceCsvCamera[1],
+                m_farHeightfieldOwnerFaceCsvCamera[2]);
+        }
+    }
+
+    m_farHeightfieldFaceReadback.Unmap();
+    m_farHeightfieldOwnerFaceCsvReadbackPending = false;
+    m_farHeightfieldOwnerFaceCsvWritten = true;
+}
+
+bool Renderer::QueueFarHeightfieldOwnerFaceCsvReadback(
+    ID3D12GraphicsCommandList* cmdList,
+    const float* cameraPosition,
+    float originX,
+    float originZ)
+{
+    if (!cmdList ||
+        !cameraPosition ||
+        m_farHeightfieldOwnerFaceCsvWritten ||
+        m_farHeightfieldOwnerFaceCsvReadbackPending ||
+        m_config.farHeightfieldOwnerFaceCsvPath.empty()) {
+        return false;
+    }
+    if (!m_farHeightfieldFaces.GetResource() || !m_farHeightfieldFaceReadback.GetResource()) {
+        spdlog::warn(
+            "FAR_OWNER_FACE_CSV_SKIPPED path={} reason=no_readback_resource generation=gpu_far_height_voxelized",
+            m_config.farHeightfieldOwnerFaceCsvPath.string());
+        m_farHeightfieldOwnerFaceCsvWritten = true;
+        return false;
+    }
+
+    m_farHeightfieldFaces.TransitionTo(cmdList, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmdList->CopyBufferRegion(
+        m_farHeightfieldFaceReadback.GetResource(),
+        0,
+        m_farHeightfieldFaces.GetResource(),
+        0,
+        kFarHeightfieldFaceBufferBytes);
+    m_farHeightfieldOwnerFaceCsvReadbackPending = true;
+    m_farHeightfieldOwnerFaceCsvQueuedSerial = m_farHeightfieldFrameSerial;
+    m_farHeightfieldOwnerFaceCsvCamera[0] = cameraPosition[0];
+    m_farHeightfieldOwnerFaceCsvCamera[1] = cameraPosition[1];
+    m_farHeightfieldOwnerFaceCsvCamera[2] = cameraPosition[2];
+    m_farHeightfieldOwnerFaceCsvOrigin[0] = originX;
+    m_farHeightfieldOwnerFaceCsvOrigin[1] = originZ;
+    spdlog::info(
+        "FAR_OWNER_FACE_CSV_QUEUED path={} faces={} generation=gpu_far_height_voxelized",
+        m_config.farHeightfieldOwnerFaceCsvPath.string(),
+        kFarHeightfieldFaceCount);
+    return true;
+}
+
+void Renderer::TryRetireFarMaxHeightHorizonCsv() {
+    if (!m_farMaxHeightHorizonCsvReadbackPending ||
+        m_farMaxHeightHorizonCsvWritten ||
+        m_config.farMaxHeightHorizonCsvPath.empty()) {
+        return;
+    }
+    if (m_farHeightfieldFrameSerial <= m_farMaxHeightHorizonCsvQueuedSerial) {
+        return;
+    }
+    if (!m_farMaxHeightHorizonReadback.GetResource()) {
+        spdlog::warn(
+            "FAR_MAX_HEIGHT_HORIZON_CSV_WRITE_FAILED path={} reason=no_readback_buffer",
+            m_config.farMaxHeightHorizonCsvPath.string());
+        m_farMaxHeightHorizonCsvReadbackPending = false;
+        m_farMaxHeightHorizonCsvWritten = true;
+        return;
+    }
+
+    if (m_commandQueue) {
+        m_commandQueue->Flush();
+    }
+
+    const auto* horizon = static_cast<const uint32_t*>(m_farMaxHeightHorizonReadback.Map());
+    if (!horizon) {
+        spdlog::warn(
+            "FAR_MAX_HEIGHT_HORIZON_CSV_WRITE_FAILED path={} reason=map_failed",
+            m_config.farMaxHeightHorizonCsvPath.string());
+        m_farMaxHeightHorizonCsvReadbackPending = false;
+        m_farMaxHeightHorizonCsvWritten = true;
+        return;
+    }
+
+    const std::filesystem::path& path = m_config.farMaxHeightHorizonCsvPath;
+    if (const std::filesystem::path parent = path.parent_path(); !parent.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(parent, ec);
+        if (ec) {
+            spdlog::warn(
+                "FAR_MAX_HEIGHT_HORIZON_CSV_PARENT_CREATE_FAILED path={} error={}",
+                parent.string(),
+                ec.message());
+        }
+    }
+
+    std::ofstream csv(path, std::ios::out | std::ios::trunc);
+    uint32_t validTiles = 0;
+    if (!csv) {
+        spdlog::warn(
+            "FAR_MAX_HEIGHT_HORIZON_CSV_WRITE_FAILED path={} reason=open_failed",
+            path.string());
+    } else {
+        csv << "# width=" << m_width
+            << " height=" << m_height
+            << " tileWidth=" << kFarMaxHeightScreenMaskTileWidth
+            << " tileCount=" << m_farMaxHeightScreenHorizonTileCount
+            << " empty=4294967295\n";
+        csv << "tile,horizonY\n";
+        for (uint32_t tile = 0; tile < m_farMaxHeightScreenHorizonTileCount; ++tile) {
+            validTiles += horizon[tile] != 0xffffffffu ? 1u : 0u;
+            csv << tile << ',' << horizon[tile] << '\n';
+        }
+        csv.close();
+        if (!csv) {
+            spdlog::warn(
+                "FAR_MAX_HEIGHT_HORIZON_CSV_WRITE_INCOMPLETE path={}",
+                path.string());
+        } else {
+            spdlog::info(
+                "FAR_MAX_HEIGHT_HORIZON_CSV path={} tiles={} validTiles={} tileWidth={}",
+                path.string(),
+                m_farMaxHeightScreenHorizonTileCount,
+                validTiles,
+                kFarMaxHeightScreenMaskTileWidth);
+        }
+    }
+
+    m_farMaxHeightHorizonReadback.Unmap();
+    m_farMaxHeightHorizonCsvReadbackPending = false;
+    m_farMaxHeightHorizonCsvWritten = true;
+}
+
+bool Renderer::QueueFarMaxHeightHorizonCsvReadback(ID3D12GraphicsCommandList* cmdList) {
+    if (!cmdList ||
+        m_farMaxHeightHorizonCsvWritten ||
+        m_farMaxHeightHorizonCsvReadbackPending ||
+        m_config.farMaxHeightHorizonCsvPath.empty()) {
+        return false;
+    }
+    if (!m_farMaxHeightScreenHorizon.GetResource() ||
+        !m_farMaxHeightHorizonReadback.GetResource() ||
+        m_farMaxHeightScreenHorizonTileCount == 0u) {
+        spdlog::warn(
+            "FAR_MAX_HEIGHT_HORIZON_CSV_SKIPPED path={} reason=no_readback_resource",
+            m_config.farMaxHeightHorizonCsvPath.string());
+        m_farMaxHeightHorizonCsvWritten = true;
+        return false;
+    }
+
+    m_farMaxHeightScreenHorizon.TransitionTo(cmdList, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    cmdList->CopyBufferRegion(
+        m_farMaxHeightHorizonReadback.GetResource(),
+        0,
+        m_farMaxHeightScreenHorizon.GetResource(),
+        0,
+        static_cast<uint64_t>(m_farMaxHeightScreenHorizonTileCount) * sizeof(uint32_t));
+    m_farMaxHeightHorizonCsvReadbackPending = true;
+    m_farMaxHeightHorizonCsvQueuedSerial = m_farHeightfieldFrameSerial;
+    m_farMaxHeightScreenHorizon.TransitionTo(cmdList, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    spdlog::info(
+        "FAR_MAX_HEIGHT_HORIZON_CSV_QUEUED path={} tiles={}",
+        m_config.farMaxHeightHorizonCsvPath.string(),
+        m_farMaxHeightScreenHorizonTileCount);
+    return true;
+}
+
+void Renderer::DrawFarHeightfieldOwner(
+    ID3D12GraphicsCommandList* cmdList,
+    D3D12_GPU_VIRTUAL_ADDRESS frameConstants,
+    const void* frameConstantsCpu,
+    const DescriptorHandle& materialPaletteSRV)
+{
+    if (!cmdList || !frameConstantsCpu || !materialPaletteSRV.IsValid() || !m_dsvHandle.IsValid()) {
+        return;
+    }
+    (void)frameConstants;
+
+    const FrameConstantsCpu& baseConstants =
+        *static_cast<const FrameConstantsCpu*>(frameConstantsCpu);
+    float forwardX = baseConstants.cameraForward[0];
+    float forwardZ = baseConstants.cameraForward[2];
+    const float forwardLen2 = forwardX * forwardX + forwardZ * forwardZ;
+    if (forwardLen2 > 1.0e-5f) {
+        const float invLen = 1.0f / std::sqrt(forwardLen2);
+        forwardX *= invLen;
+        forwardZ *= invLen;
+    } else {
+        forwardX = 0.0f;
+        forwardZ = 1.0f;
+    }
+
+    const float extent = static_cast<float>(kFarHeightfieldCellCount) * kFarHeightfieldCellSize;
+    const float halfExtent = extent * 0.5f;
+    const float forwardShift = std::max(0.0f, kFarHeightfieldMaxDistance - halfExtent);
+    const float centerX = baseConstants.cameraPosition[0] + forwardX * forwardShift;
+    const float centerZ = baseConstants.cameraPosition[2] + forwardZ * forwardShift;
+    const float originX = std::floor((centerX - halfExtent) / kFarHeightfieldCellSize) *
+        kFarHeightfieldCellSize;
+    const float originZ = std::floor((centerZ - halfExtent) / kFarHeightfieldCellSize) *
+        kFarHeightfieldCellSize;
+
+    const bool useGpuGenerate =
+        m_config.farHeightfieldOwnerGpuGenerate &&
+        m_farHeightfieldGeneratePipeline.IsValid();
+    if (useGpuGenerate) {
+        FarHeightfieldGenerateConstants gen{};
+        gen.faceCount = kFarHeightfieldFaceCount;
+        gen.cellCount = kFarHeightfieldCellCount;
+        gen.baseGridCellSize = kFarHeightfieldCellSizeVoxels;
+        gen.worldSeed = Uint32BitsFromFloat(baseConstants.exactNearParams[1]);
+        gen.originXBits = Uint32BitsFromFloat(originX);
+        gen.originZBits = Uint32BitsFromFloat(originZ);
+        gen.farHandoffBits = Uint32BitsFromFloat(baseConstants.backgroundOwnershipParams[1]);
+        gen.ownerMaxDistanceBits = Uint32BitsFromFloat(kFarHeightfieldOwnerMaxDistance);
+        gen.cameraXBits = Uint32BitsFromFloat(baseConstants.cameraPosition[0]);
+        gen.cameraYBits = Uint32BitsFromFloat(baseConstants.cameraPosition[1]);
+        gen.cameraZBits = Uint32BitsFromFloat(baseConstants.cameraPosition[2]);
+
+        m_farHeightfieldFaces.TransitionTo(cmdList, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        m_farHeightfieldGeneratePipeline.Bind(cmdList);
+        m_farHeightfieldGeneratePipeline.SetRoot32BitConstants(
+            cmdList,
+            0,
+            sizeof(gen) / sizeof(uint32_t),
+            &gen);
+        cmdList->SetComputeRootUnorderedAccessView(
+            1,
+            m_farHeightfieldFaces.GetGPUVirtualAddress());
+        m_farHeightfieldGeneratePipeline.Dispatch(
+            cmdList,
+            (kFarHeightfieldFaceCount + 127u) / 128u,
+            1u,
+            1u);
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barrier.UAV.pResource = m_farHeightfieldFaces.GetResource();
+        cmdList->ResourceBarrier(1, &barrier);
+        QueueFarHeightfieldOwnerFaceCsvReadback(cmdList, baseConstants.cameraPosition, originX, originZ);
+        m_farHeightfieldFaces.TransitionTo(
+            cmdList,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    } else {
+        if (auto* mappedFaces =
+                static_cast<FarHeightfieldFaceCpu*>(m_farHeightfieldFaceUpload.GetMappedData())) {
+            // F1 mechanism probe only: set VENPOD_FAR_HEIGHT_OWNER_GPU_GEN=1 for the
+            // production-aligned generator path.
+            const uint32_t payload = PackSparseSurfacePayload(
+                3u,
+                4u,
+                kFarHeightfieldCellSizeVoxels,
+                kFarHeightfieldCellSizeVoxels);
+
+            for (uint32_t index = 0; index < kFarHeightfieldFaceCount; ++index) {
+                const uint32_t slot = index % kFarHeightfieldFacesPerCell;
+                const uint32_t cellIndex = index / kFarHeightfieldFacesPerCell;
+                if (slot != 0u) {
+                    mappedFaces[index].worldX = 0;
+                    mappedFaces[index].worldY = 0;
+                    mappedFaces[index].worldZ = 0;
+                    mappedFaces[index].payload = 0u;
+                    continue;
+                }
+                const uint32_t cellX = cellIndex % kFarHeightfieldCellCount;
+                const uint32_t cellZ = cellIndex / kFarHeightfieldCellCount;
+                mappedFaces[index].worldX = static_cast<int32_t>(
+                    std::floor(originX + static_cast<float>(cellX) * kFarHeightfieldCellSize));
+                mappedFaces[index].worldY = static_cast<int32_t>(kFarHeightfieldCpuProbeSurfaceY) - 1;
+                mappedFaces[index].worldZ = static_cast<int32_t>(
+                    std::floor(originZ + static_cast<float>(cellZ) * kFarHeightfieldCellSize));
+                mappedFaces[index].payload = payload;
+            }
+
+            if (!m_farHeightfieldOwnerFaceCsvWritten &&
+                !m_config.farHeightfieldOwnerFaceCsvPath.empty()) {
+                std::ofstream csv(m_config.farHeightfieldOwnerFaceCsvPath, std::ios::out | std::ios::trunc);
+                if (!csv) {
+                    spdlog::warn(
+                        "FAR_OWNER_FACE_CSV_WRITE_FAILED path={}",
+                        m_config.farHeightfieldOwnerFaceCsvPath.string());
+                    m_farHeightfieldOwnerFaceCsvWritten = true;
+                } else {
+                    csv << "# cameraX=" << baseConstants.cameraPosition[0]
+                        << " cameraY=" << baseConstants.cameraPosition[1]
+                        << " cameraZ=" << baseConstants.cameraPosition[2]
+                        << " faces=" << kFarHeightfieldFaceCount
+                        << " cellSize=" << kFarHeightfieldCellSizeVoxels
+                        << " originX=" << originX
+                        << " originZ=" << originZ
+                        << " generation=cpu_probe\n";
+                    csv << "worldX,worldY,worldZ,payload\n";
+                    for (uint32_t index = 0; index < kFarHeightfieldFaceCount; ++index) {
+                        csv << mappedFaces[index].worldX << ','
+                            << mappedFaces[index].worldY << ','
+                            << mappedFaces[index].worldZ << ','
+                            << mappedFaces[index].payload << '\n';
+                    }
+                    csv.close();
+                    if (!csv) {
+                        spdlog::warn(
+                            "FAR_OWNER_FACE_CSV_WRITE_INCOMPLETE path={}",
+                            m_config.farHeightfieldOwnerFaceCsvPath.string());
+                    } else {
+                        spdlog::info(
+                            "FAR_OWNER_FACE_CSV path={} faces={} camera=({:.2f},{:.2f},{:.2f}) generation=cpu_probe",
+                            m_config.farHeightfieldOwnerFaceCsvPath.string(),
+                            kFarHeightfieldFaceCount,
+                            baseConstants.cameraPosition[0],
+                            baseConstants.cameraPosition[1],
+                            baseConstants.cameraPosition[2]);
+                    }
+                    m_farHeightfieldOwnerFaceCsvWritten = true;
+                }
+            }
+        }
+
+        m_farHeightfieldFaces.TransitionTo(cmdList, D3D12_RESOURCE_STATE_COPY_DEST);
+        cmdList->CopyBufferRegion(
+            m_farHeightfieldFaces.GetResource(),
+            0,
+            m_farHeightfieldFaceUpload.GetResource(),
+            0,
+            kFarHeightfieldFaceBufferBytes);
+        m_farHeightfieldFaces.TransitionTo(
+            cmdList,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+
+    FrameConstantsCpu farConstants =
+        baseConstants;
+    farConstants.nearOwnershipParams[3] = kFarHeightfieldOwnerMaxDistance;
+    farConstants.surfaceRasterParams[0] = kFarHeightfieldOwnerMaxDistance;
+    farConstants.surfaceParams[0] = 1.0f;
+    farConstants.surfaceParams[1] = static_cast<float>(kFarHeightfieldFaceCount);
+    farConstants.farFieldGridParams[3] = 0.0f;
+    farConstants.sparseNearParams[0] = 0.0f;
+    farConstants.sparseNearParams[1] = 0.0f;
+    farConstants.sparseNearParams[2] = 0.0f;
+
+    static_assert(sizeof(farConstants) <= kFrameConstantUploadBytes);
+    UploadBuffer& upload = m_farHeightfieldConstantUploads[m_currentFrameIndex];
+    if (void* mapped = upload.GetMappedData()) {
+        std::memcpy(mapped, &farConstants, sizeof(farConstants));
+    }
+
+    ID3D12DescriptorHeap* heaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
+    cmdList->SetDescriptorHeaps(1, heaps);
+    auto bindFarSurface = [&]() {
+        cmdList->OMSetStencilRef(1);
+        cmdList->IASetVertexBuffers(0, 1, &m_farHeightfieldVertexIdView);
+        cmdList->IASetIndexBuffer(&m_farHeightfieldIndexView);
+        cmdList->SetGraphicsRootConstantBufferView(0, upload.GetGPUVirtualAddress());
+        cmdList->SetGraphicsRootDescriptorTable(1, m_farHeightfieldFaces.GetShaderVisibleSRV().gpu);
+        cmdList->SetGraphicsRootDescriptorTable(2, materialPaletteSRV.gpu);
+        cmdList->SetGraphicsRootDescriptorTable(3, m_dummyRenderOwnershipUAV.GetShaderVisibleUAV().gpu);
+        cmdList->SetGraphicsRootDescriptorTable(4, m_farHeightfieldFaces.GetShaderVisibleSRV().gpu);
+        cmdList->SetGraphicsRootDescriptorTable(5, m_farHeightfieldFaces.GetShaderVisibleSRV().gpu);
+        cmdList->SetGraphicsRootDescriptorTable(6, m_farHeightfieldFaces.GetShaderVisibleSRV().gpu);
+        cmdList->SetGraphicsRootDescriptorTable(7, m_farHeightfieldFaces.GetShaderVisibleSRV().gpu);
+        cmdList->SetGraphicsRootDescriptorTable(8, m_farHeightfieldFaces.GetShaderVisibleSRV().gpu);
+        cmdList->SetGraphicsRootDescriptorTable(9, m_farHeightfieldFaces.GetShaderVisibleSRV().gpu);
+    };
+    auto drawFarSurface = [&]() {
+        cmdList->DrawIndexedInstanced(kFarHeightfieldIndexCount, 1u, 0u, 0, 0u);
+    };
+
+    if (m_config.sparseSurfaceDepthPrepass &&
+        m_sparseSurfaceDepthPrepassPipeline.GetPSO() != nullptr) {
+        D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = m_dsvHandle.cpu;
+        cmdList->OMSetRenderTargets(0, nullptr, FALSE, &dsvHandle);
+        SetViewportAndScissor(cmdList, m_width, m_height);
+        m_sparseSurfaceDepthPrepassPipeline.Bind(cmdList);
+        bindFarSurface();
+        drawFarSurface();
+    }
+
+    SetMainRenderTarget(cmdList);
+    m_sparseSurfacePipeline.Bind(cmdList);
+    bindFarSurface();
+    drawFarSurface();
 }
 
 Result<void> Renderer::CreateMidPassPipeline(ID3D12Device* device, GraphicsPipelineDesc fullscreenDesc) {
@@ -2123,6 +4097,9 @@ Result<void> Renderer::CreateBackgroundCompositePipeline(ID3D12Device* device) {
     if (m_config.backgroundPassCompositeForceColor) {
         psOptions.defines.push_back(L"VENPOD_BACKGROUND_COMPOSITE_FORCE_COLOR=1");
     }
+    if (m_config.backgroundPassEdgeAwareComposite) {
+        psOptions.defines.push_back(L"VENPOD_BACKGROUND_COMPOSITE_EDGE_AWARE=1");
+    }
     auto psResult = m_shaderCompiler.CompileFromFile(psPath, psOptions);
     if (!psResult) {
         return Error("Failed to compile background composite pixel shader: {}", psResult.error());
@@ -2370,6 +4347,25 @@ Result<void> Renderer::CreateDepthBuffer() {
 }
 
 void Renderer::DestroyBackgroundPassResources() {
+    if (m_backgroundHorizonTileMask.srv.IsValid()) {
+        m_heapManager.FreeShaderVisibleCbvSrvUav(m_backgroundHorizonTileMask.srv);
+    }
+    if (m_backgroundHorizonTileMask.stagingSrv.IsValid()) {
+        m_heapManager.FreeStagingCbvSrvUav(m_backgroundHorizonTileMask.stagingSrv);
+    }
+    if (m_backgroundHorizonTileMask.uav.IsValid()) {
+        m_heapManager.FreeShaderVisibleCbvSrvUav(m_backgroundHorizonTileMask.uav);
+    }
+    if (m_backgroundHorizonTileMask.stagingUav.IsValid()) {
+        m_heapManager.FreeStagingCbvSrvUav(m_backgroundHorizonTileMask.stagingUav);
+    }
+    m_backgroundHorizonTileMask.resource.Reset();
+    m_backgroundHorizonTileMask = TemporalTarget{};
+    m_backgroundHorizonTileMaskWidth = 0;
+    m_backgroundHorizonTileMaskHeight = 0;
+    m_backgroundHorizonTileList.Shutdown();
+    m_backgroundHorizonTileDrawArgs.Shutdown();
+    m_backgroundHorizonTileListCapacity = 0;
     if (m_backgroundPassSrv.IsValid()) {
         m_heapManager.FreeShaderVisibleCbvSrvUav(m_backgroundPassSrv);
     }
@@ -2387,6 +4383,257 @@ void Renderer::DestroyBackgroundPassResources() {
     m_backgroundPassColorState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     m_backgroundPassWidth = 0;
     m_backgroundPassHeight = 0;
+}
+
+Result<void> Renderer::CreateTemporalTarget(
+    ID3D12Device* device, TemporalTarget& target, DXGI_FORMAT format, const wchar_t* name) {
+    auto heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+    auto desc = CD3DX12_RESOURCE_DESC::Tex2D(
+        format,
+        static_cast<UINT64>(m_temporalWidth),
+        static_cast<UINT>(m_temporalHeight),
+        1, 1, 1, 0,
+        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    // No optimized clear value: these targets are fully written by the compute reproject (reuse pixels)
+    // + the raymarch PS (marched pixels), never RTV-cleared, so the no-clear temporal invariant holds.
+    HRESULT hr = device->CreateCommittedResource(
+        &heapProps, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&target.resource));
+    if (FAILED(hr)) {
+        return Error("Failed to create temporal target: 0x{:08X}", hr);
+    }
+    target.resource->SetName(name);
+    target.state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+    target.rtv = m_heapManager.AllocateRtv();
+    if (!target.rtv.IsValid()) return Error("Failed to allocate temporal RTV");
+    device->CreateRenderTargetView(target.resource.Get(), nullptr, target.rtv.cpu);
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = format;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Texture2D.MipLevels = 1;
+    target.stagingSrv = m_heapManager.AllocateStagingCbvSrvUav();
+    if (!target.stagingSrv.IsValid()) return Error("Failed to allocate temporal staging SRV");
+    device->CreateShaderResourceView(target.resource.Get(), &srvDesc, target.stagingSrv.cpu);
+    target.srv = m_heapManager.CopyToShaderVisible(device, target.stagingSrv);
+    if (!target.srv.IsValid()) return Error("Failed to allocate temporal shader-visible SRV");
+    device->CreateShaderResourceView(target.resource.Get(), &srvDesc, target.srv.cpu);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+    uavDesc.Format = format;
+    uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uavDesc.Texture2D.MipSlice = 0;
+    target.stagingUav = m_heapManager.AllocateStagingCbvSrvUav();
+    if (!target.stagingUav.IsValid()) return Error("Failed to allocate temporal staging UAV");
+    device->CreateUnorderedAccessView(target.resource.Get(), nullptr, &uavDesc, target.stagingUav.cpu);
+    target.uav = m_heapManager.CopyToShaderVisible(device, target.stagingUav);
+    if (!target.uav.IsValid()) return Error("Failed to allocate temporal shader-visible UAV");
+    device->CreateUnorderedAccessView(target.resource.Get(), nullptr, &uavDesc, target.uav.cpu);
+    return {};
+}
+
+Result<void> Renderer::CreateTemporalResources() {
+    if (!UseTemporalReproject()) {
+        DestroyTemporalResources();
+        return {};
+    }
+    if (!m_device) {
+        return Error("Device not initialized");
+    }
+    ID3D12Device* device = m_device->GetDevice();
+    if (!device) {
+        return Error("D3D12 device not initialized");
+    }
+    DestroyTemporalResources();
+    m_temporalWidth = std::max(1u, m_width);
+    m_temporalHeight = std::max(1u, m_height);
+    for (int i = 0; i < 2; ++i) {
+        if (auto r = CreateTemporalTarget(device, m_temporalColor[i], DXGI_FORMAT_R16G16B16A16_FLOAT,
+                i == 0 ? L"TemporalColor0" : L"TemporalColor1"); !r) return r;
+        if (auto r = CreateTemporalTarget(device, m_temporalDistance[i], DXGI_FORMAT_R32_FLOAT,
+                i == 0 ? L"TemporalDistance0" : L"TemporalDistance1"); !r) return r;
+        if (auto r = CreateTemporalTarget(device, m_temporalMeta[i], DXGI_FORMAT_R32_UINT,
+                i == 0 ? L"TemporalMeta0" : L"TemporalMeta1"); !r) return r;
+    }
+    if (auto r = CreateTemporalTarget(device, m_temporalMarchMask, DXGI_FORMAT_R8_UINT,
+            L"TemporalMarchMask"); !r) return r;
+    return {};
+}
+
+void Renderer::DestroyTemporalResources() {
+    auto reset = [&](TemporalTarget& t) {
+        if (t.srv.IsValid()) m_heapManager.FreeShaderVisibleCbvSrvUav(t.srv);
+        if (t.stagingSrv.IsValid()) m_heapManager.FreeStagingCbvSrvUav(t.stagingSrv);
+        if (t.uav.IsValid()) m_heapManager.FreeShaderVisibleCbvSrvUav(t.uav);
+        if (t.stagingUav.IsValid()) m_heapManager.FreeStagingCbvSrvUav(t.stagingUav);
+        if (t.rtv.IsValid()) m_heapManager.FreeRtv(t.rtv);
+        t.resource.Reset();
+        t = TemporalTarget{};
+    };
+    for (int i = 0; i < 2; ++i) {
+        reset(m_temporalColor[i]);
+        reset(m_temporalDistance[i]);
+        reset(m_temporalMeta[i]);
+    }
+    reset(m_temporalMarchMask);
+    m_temporalWidth = 0;
+    m_temporalHeight = 0;
+}
+
+Result<void> Renderer::CreateFarMaxHeightNoHitMaskResources() {
+    if (!m_config.farMaxHeightNoHitMaskEnabled) {
+        DestroyFarMaxHeightNoHitMaskResources();
+        return {};
+    }
+    if (!m_device) {
+        return Error("Device not initialized");
+    }
+    ID3D12Device* device = m_device->GetDevice();
+    if (!device) {
+        return Error("D3D12 device not initialized");
+    }
+
+    DestroyFarMaxHeightNoHitMaskResources();
+    m_farMaxHeightNoHitMaskWidth = std::max(1u, m_width);
+    m_farMaxHeightNoHitMaskHeight = std::max(1u, m_height);
+    m_farMaxHeightScreenHorizonTileCount =
+        (m_farMaxHeightNoHitMaskWidth + kFarMaxHeightScreenMaskTileWidth - 1u) /
+        kFarMaxHeightScreenMaskTileWidth;
+
+    auto heapProps = CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+    auto desc = CD3DX12_RESOURCE_DESC::Tex2D(
+        DXGI_FORMAT_R16_UINT,
+        static_cast<UINT64>(m_farMaxHeightNoHitMaskWidth),
+        static_cast<UINT>(m_farMaxHeightNoHitMaskHeight),
+        1, 1, 1, 0,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+    HRESULT hr = device->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &desc,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        nullptr,
+        IID_PPV_ARGS(&m_farMaxHeightNoHitMask.resource));
+    if (FAILED(hr)) {
+        return Error("Failed to create far max-height no-hit mask: 0x{:08X}", hr);
+    }
+    m_farMaxHeightNoHitMask.resource->SetName(L"FarMaxHeightNoHitMask");
+    m_farMaxHeightNoHitMask.state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_R16_UINT;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Texture2D.MipLevels = 1;
+    m_farMaxHeightNoHitMask.stagingSrv = m_heapManager.AllocateStagingCbvSrvUav();
+    if (!m_farMaxHeightNoHitMask.stagingSrv.IsValid()) {
+        DestroyFarMaxHeightNoHitMaskResources();
+        return Error("Failed to allocate far max-height no-hit staging SRV");
+    }
+    device->CreateShaderResourceView(
+        m_farMaxHeightNoHitMask.resource.Get(),
+        &srvDesc,
+        m_farMaxHeightNoHitMask.stagingSrv.cpu);
+    m_farMaxHeightNoHitMask.srv =
+        m_heapManager.CopyToShaderVisible(device, m_farMaxHeightNoHitMask.stagingSrv);
+    if (!m_farMaxHeightNoHitMask.srv.IsValid()) {
+        DestroyFarMaxHeightNoHitMaskResources();
+        return Error("Failed to allocate far max-height no-hit shader-visible SRV");
+    }
+    device->CreateShaderResourceView(
+        m_farMaxHeightNoHitMask.resource.Get(),
+        &srvDesc,
+        m_farMaxHeightNoHitMask.srv.cpu);
+
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+    uavDesc.Format = DXGI_FORMAT_R16_UINT;
+    uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    m_farMaxHeightNoHitMask.stagingUav = m_heapManager.AllocateStagingCbvSrvUav();
+    if (!m_farMaxHeightNoHitMask.stagingUav.IsValid()) {
+        DestroyFarMaxHeightNoHitMaskResources();
+        return Error("Failed to allocate far max-height no-hit staging UAV");
+    }
+    device->CreateUnorderedAccessView(
+        m_farMaxHeightNoHitMask.resource.Get(),
+        nullptr,
+        &uavDesc,
+        m_farMaxHeightNoHitMask.stagingUav.cpu);
+    m_farMaxHeightNoHitMask.uav =
+        m_heapManager.CopyToShaderVisible(device, m_farMaxHeightNoHitMask.stagingUav);
+    if (!m_farMaxHeightNoHitMask.uav.IsValid()) {
+        DestroyFarMaxHeightNoHitMaskResources();
+        return Error("Failed to allocate far max-height no-hit shader-visible UAV");
+    }
+    device->CreateUnorderedAccessView(
+        m_farMaxHeightNoHitMask.resource.Get(),
+        nullptr,
+        &uavDesc,
+        m_farMaxHeightNoHitMask.uav.cpu);
+
+    const uint64_t horizonBytes =
+        static_cast<uint64_t>(std::max(1u, m_farMaxHeightScreenHorizonTileCount)) * sizeof(uint32_t);
+    auto horizonResult = m_farMaxHeightScreenHorizon.Initialize(
+        device,
+        horizonBytes,
+        BufferUsage::StructuredBuffer | BufferUsage::UnorderedAccess,
+        sizeof(uint32_t),
+        "FarMaxHeightScreenHorizon");
+    if (!horizonResult) {
+        DestroyFarMaxHeightNoHitMaskResources();
+        return Error("Failed to create far max-height screen horizon buffer: {}", horizonResult.error());
+    }
+    if (auto horizonUav = m_farMaxHeightScreenHorizon.CreateUAV(device, m_heapManager); !horizonUav) {
+        DestroyFarMaxHeightNoHitMaskResources();
+        return Error("Failed to create far max-height screen horizon UAV: {}", horizonUav.error());
+    }
+    if (auto horizonSrv = m_farMaxHeightScreenHorizon.CreateSRV(device, m_heapManager); !horizonSrv) {
+        DestroyFarMaxHeightNoHitMaskResources();
+        return Error("Failed to create far max-height screen horizon SRV: {}", horizonSrv.error());
+    }
+    if (!m_config.farMaxHeightHorizonCsvPath.empty()) {
+        auto readbackResult = m_farMaxHeightHorizonReadback.Initialize(
+            device,
+            horizonBytes,
+            BufferUsage::Readback,
+            sizeof(uint32_t),
+            "FarMaxHeightScreenHorizonReadback");
+        if (!readbackResult) {
+            DestroyFarMaxHeightNoHitMaskResources();
+            return Error("Failed to create far max-height horizon readback: {}", readbackResult.error());
+        }
+    }
+    return {};
+}
+
+void Renderer::DestroyFarMaxHeightNoHitMaskResources() {
+    if (m_farMaxHeightNoHitMask.srv.IsValid()) {
+        m_heapManager.FreeShaderVisibleCbvSrvUav(m_farMaxHeightNoHitMask.srv);
+    }
+    if (m_farMaxHeightNoHitMask.stagingSrv.IsValid()) {
+        m_heapManager.FreeStagingCbvSrvUav(m_farMaxHeightNoHitMask.stagingSrv);
+    }
+    if (m_farMaxHeightNoHitMask.uav.IsValid()) {
+        m_heapManager.FreeShaderVisibleCbvSrvUav(m_farMaxHeightNoHitMask.uav);
+    }
+    if (m_farMaxHeightNoHitMask.stagingUav.IsValid()) {
+        m_heapManager.FreeStagingCbvSrvUav(m_farMaxHeightNoHitMask.stagingUav);
+    }
+    if (m_farMaxHeightNoHitMask.rtv.IsValid()) {
+        m_heapManager.FreeRtv(m_farMaxHeightNoHitMask.rtv);
+    }
+    m_farMaxHeightNoHitMask.resource.Reset();
+    m_farMaxHeightNoHitMask = TemporalTarget{};
+    m_farMaxHeightNoHitMaskWidth = 0;
+    m_farMaxHeightNoHitMaskHeight = 0;
+    m_farMaxHeightScreenHorizon.Shutdown();
+    m_farMaxHeightHorizonReadback.Shutdown();
+    m_farMaxHeightHorizonCsvWritten = false;
+    m_farMaxHeightHorizonCsvReadbackPending = false;
+    m_farMaxHeightHorizonCsvQueuedSerial = 0;
+    m_farMaxHeightScreenHorizonTileCount = 0;
 }
 
 Result<void> Renderer::CreateBackgroundPassResources() {
@@ -2507,15 +4754,130 @@ Result<void> Renderer::CreateBackgroundPassResources() {
     dsvDesc.Flags = D3D12_DSV_FLAG_NONE;
     device->CreateDepthStencilView(m_backgroundPassDepth.Get(), &dsvDesc, m_backgroundPassDsv.cpu);
 
+    if (m_config.backgroundPassHorizonTileMask) {
+        const uint32_t tileSize = std::max(1u, std::clamp(m_config.backgroundPassHorizonTileSize, 4u, 32u));
+        m_backgroundHorizonTileMaskWidth = (std::max(1u, m_width) + tileSize - 1u) / tileSize;
+        m_backgroundHorizonTileMaskHeight = (std::max(1u, m_height) + tileSize - 1u) / tileSize;
+        auto maskDesc = CD3DX12_RESOURCE_DESC::Tex2D(
+            DXGI_FORMAT_R32_UINT,
+            static_cast<UINT64>(m_backgroundHorizonTileMaskWidth),
+            static_cast<UINT>(m_backgroundHorizonTileMaskHeight),
+            1, 1, 1, 0,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        hr = device->CreateCommittedResource(
+            &heapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &maskDesc,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            nullptr,
+            IID_PPV_ARGS(&m_backgroundHorizonTileMask.resource));
+        if (FAILED(hr)) {
+            DestroyBackgroundPassResources();
+            return Error("Failed to create background horizon tile mask: 0x{:08X}", hr);
+        }
+        m_backgroundHorizonTileMask.resource->SetName(L"BackgroundHorizonTileMask");
+        m_backgroundHorizonTileMask.state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC maskSrvDesc = {};
+        maskSrvDesc.Format = DXGI_FORMAT_R32_UINT;
+        maskSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        maskSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        maskSrvDesc.Texture2D.MipLevels = 1;
+        m_backgroundHorizonTileMask.stagingSrv = m_heapManager.AllocateStagingCbvSrvUav();
+        if (!m_backgroundHorizonTileMask.stagingSrv.IsValid()) {
+            DestroyBackgroundPassResources();
+            return Error("Failed to allocate background horizon tile mask staging SRV");
+        }
+        device->CreateShaderResourceView(
+            m_backgroundHorizonTileMask.resource.Get(),
+            &maskSrvDesc,
+            m_backgroundHorizonTileMask.stagingSrv.cpu);
+        m_backgroundHorizonTileMask.srv =
+            m_heapManager.CopyToShaderVisible(device, m_backgroundHorizonTileMask.stagingSrv);
+        if (!m_backgroundHorizonTileMask.srv.IsValid()) {
+            DestroyBackgroundPassResources();
+            return Error("Failed to allocate background horizon tile mask shader-visible SRV");
+        }
+        device->CreateShaderResourceView(
+            m_backgroundHorizonTileMask.resource.Get(),
+            &maskSrvDesc,
+            m_backgroundHorizonTileMask.srv.cpu);
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC maskUavDesc = {};
+        maskUavDesc.Format = DXGI_FORMAT_R32_UINT;
+        maskUavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        m_backgroundHorizonTileMask.stagingUav = m_heapManager.AllocateStagingCbvSrvUav();
+        if (!m_backgroundHorizonTileMask.stagingUav.IsValid()) {
+            DestroyBackgroundPassResources();
+            return Error("Failed to allocate background horizon tile mask staging UAV");
+        }
+        device->CreateUnorderedAccessView(
+            m_backgroundHorizonTileMask.resource.Get(),
+            nullptr,
+            &maskUavDesc,
+            m_backgroundHorizonTileMask.stagingUav.cpu);
+        m_backgroundHorizonTileMask.uav =
+            m_heapManager.CopyToShaderVisible(device, m_backgroundHorizonTileMask.stagingUav);
+        if (!m_backgroundHorizonTileMask.uav.IsValid()) {
+            DestroyBackgroundPassResources();
+            return Error("Failed to allocate background horizon tile mask shader-visible UAV");
+        }
+        device->CreateUnorderedAccessView(
+            m_backgroundHorizonTileMask.resource.Get(),
+            nullptr,
+            &maskUavDesc,
+            m_backgroundHorizonTileMask.uav.cpu);
+
+        const uint32_t tileCapacity =
+            std::max(1u, m_backgroundHorizonTileMaskWidth * m_backgroundHorizonTileMaskHeight);
+        m_backgroundHorizonTileListCapacity = tileCapacity;
+        auto tileListResult = m_backgroundHorizonTileList.Initialize(
+            device,
+            static_cast<uint64_t>(tileCapacity) * sizeof(uint32_t) * 2ull,
+            BufferUsage::StructuredBuffer | BufferUsage::UnorderedAccess,
+            sizeof(uint32_t) * 2u,
+            "BackgroundHorizonTileList");
+        if (!tileListResult) {
+            DestroyBackgroundPassResources();
+            return Error("Failed to create background horizon tile list: {}", tileListResult.error());
+        }
+        if (auto srvResult = m_backgroundHorizonTileList.CreateSRV(device, m_heapManager); !srvResult) {
+            DestroyBackgroundPassResources();
+            return Error("Failed to create background horizon tile list SRV: {}", srvResult.error());
+        }
+        if (auto uavResult = m_backgroundHorizonTileList.CreateUAV(device, m_heapManager); !uavResult) {
+            DestroyBackgroundPassResources();
+            return Error("Failed to create background horizon tile list UAV: {}", uavResult.error());
+        }
+
+        auto drawArgsResult = m_backgroundHorizonTileDrawArgs.Initialize(
+            device,
+            sizeof(uint32_t) * 4ull,
+            BufferUsage::StructuredBuffer | BufferUsage::UnorderedAccess | BufferUsage::IndirectArgument,
+            sizeof(uint32_t),
+            "BackgroundHorizonTileDrawArgs");
+        if (!drawArgsResult) {
+            DestroyBackgroundPassResources();
+            return Error("Failed to create background horizon tile draw args: {}", drawArgsResult.error());
+        }
+        if (auto uavResult = m_backgroundHorizonTileDrawArgs.CreateUAV(device, m_heapManager); !uavResult) {
+            DestroyBackgroundPassResources();
+            return Error("Failed to create background horizon tile draw args UAV: {}", uavResult.error());
+        }
+    }
+
     spdlog::info(
-        "Background pass resources created: {}x{} scale={:.3f} main={}x{} srvIndex={} stagingSrvIndex={}",
+        "Background pass resources created: {}x{} scale={:.3f} main={}x{} srvIndex={} stagingSrvIndex={} horizonMask={}x{} horizonTileListCapacity={}",
         m_backgroundPassWidth,
         m_backgroundPassHeight,
         scale,
         m_width,
         m_height,
         m_backgroundPassSrv.heapIndex,
-        m_backgroundPassStagingSrv.heapIndex);
+        m_backgroundPassStagingSrv.heapIndex,
+        m_backgroundHorizonTileMaskWidth,
+        m_backgroundHorizonTileMaskHeight,
+        m_backgroundHorizonTileListCapacity);
     return {};
 }
 

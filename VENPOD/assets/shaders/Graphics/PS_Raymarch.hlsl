@@ -146,6 +146,30 @@ static const uint RAY_DIAGNOSTIC_MID_CLOSURE = 8u;
 struct PSOutput {
     float4 color : SV_Target;
 };
+#if defined(RAYMARCH_TEMPORAL_REPROJECT)
+// Stage 2b: per-pixel march/reuse mask written by CS_TemporalReproject (1=march, 0=reuse the compute-
+// reprojected history). t18 is free in the default root sig; the temporal PSO adds it.
+Texture2D<uint> TemporalMarchMask : register(t18);
+#endif
+#if defined(RAYMARCH_FAR_MAX_HEIGHT_DDA)
+StructuredBuffer<float> FarMaxHeightCache : register(t19);
+#endif
+#if defined(RAYMARCH_BACKGROUND_EDGE_REPAIR)
+Texture2D<float4> BackgroundRepairColor : register(t20);
+#if defined(RAYMARCH_BACKGROUND_TILE_REPAIR)
+Texture2D<uint> BackgroundRepairTileMask : register(t21);
+#ifndef RAYMARCH_BACKGROUND_TILE_REPAIR_SIZE
+#define RAYMARCH_BACKGROUND_TILE_REPAIR_SIZE 4
+#endif
+#endif
+#elif defined(RAYMARCH_FAR_MAX_HEIGHT_NO_HIT_MASK)
+// Separate compute pass horizon: each 8px-wide X tile stores the smallest
+// screen-space Y touched by the conservative far max-height shell.
+StructuredBuffer<uint> FarMaxHeightNoHitMask : register(t20);
+#endif
+// Temporal far-march reprojection (Stage 2) packs the far hit distance into color.a of an RGBA16F
+// history target -- a SINGLE-output change (no MRT) so it never trips the uber-shader PSO JIT cliff.
+// The stencil-gated composite force-sets alpha=1, so distance-in-alpha never reaches the main RT.
 
 int FloorDiv64(int value) {
     return value >= 0 ? value / 64 : -(((-value) + 63) / 64);
@@ -1179,6 +1203,41 @@ float3 FarTerrainMaterialVariation(
 float FarHazeDowncastScale(float rayDirY) {
     return 1.0f - saturate((-rayDirY - 0.18f) / 0.30f) * 0.65f;
 }
+
+#if defined(RAYMARCH_FAR_MAX_HEIGHT_NO_HIT_MASK) || defined(RAYMARCH_BACKGROUND_ONLY)
+float3 FarBackgroundShade(float3 rayDir, float encodedHorizonY, float pixelY) {
+    const float pixelsAboveHorizon = max(encodedHorizonY - pixelY, 0.0f);
+    const float horizonBand = saturate(1.0f - pixelsAboveHorizon / 520.0f);
+    const float horizonWeight = horizonBand * horizonBand * (3.0f - 2.0f * horizonBand);
+    const float highSkyFade = saturate((pixelsAboveHorizon - 340.0f) / 520.0f);
+
+    const float distProxy = lerp(3600.0f, 9000.0f, saturate(pixelsAboveHorizon / 720.0f));
+    const float fogFactor = saturate((distProxy - 900.0f) / (10400.0f - 900.0f));
+    const float horizonHazeWide = saturate((0.35f - abs(rayDir.y)) / 0.35f);
+    const float midFarHaze = saturate((distProxy - 3500.0f) / 5000.0f);
+    const float farHazeAmount = saturate(
+        fogFactor * 0.58f + horizonHazeWide * 0.24f
+        + midFarHaze * (0.30f + horizonHazeWide * 0.20f) + 0.05f)
+        * FarHazeDowncastScale(rayDir.y);
+
+    const float3 sky = SkyColor(rayDir);
+    const float3 farTerrainProxy = lerp(
+        float3(0.32f, 0.36f, 0.29f),
+        float3(0.50f, 0.52f, 0.44f),
+        saturate(fogFactor * 0.65f + horizonWeight * 0.25f));
+    float3 color = lerp(farTerrainProxy, sky, farHazeAmount);
+
+    const float ownershipRadius = max(frame.nearOwnershipParams.w, max(frame.exactNearParams.x, 0.0f));
+    const float nearContext = 1.0f - saturate((distProxy - ownershipRadius) / 2200.0f);
+    const float farContext = saturate((distProxy - frame.midFieldParams.y) /
+        max(frame.midFieldParams.z - frame.midFieldParams.y, 1.0f));
+    const float atmosphere = saturate(nearContext * 0.08f + farContext * 0.035f);
+    const float3 contextSky = SkyColor(float3(0.0f, -0.06f, 0.998f));
+    color = lerp(color, contextSky, atmosphere);
+
+    return lerp(color, sky, highSkyFade);
+}
+#endif
 
 float3 BackgroundTerrainMaterialVariation(
     float3 baseColor,
@@ -3622,10 +3681,314 @@ float FarSvoSuggestedStep(float3 rayOrigin, float3 rayDir, float currentT) {
     return max(FAR_SVO_MIN_CELL_SIZE, cellSize);
 }
 
+#if defined(RAYMARCH_FAR_TERRAIN_WORK_STATS)
+static const uint RENDER_OWNER_FAR_TERRAIN_CALLS = 30u;
+static const uint RENDER_OWNER_FAR_TERRAIN_EARLY_REJECTS = 31u;
+static const uint RENDER_OWNER_FAR_TERRAIN_FIRST_SAMPLE_HITS = 32u;
+static const uint RENDER_OWNER_FAR_TERRAIN_LOOP_HITS = 33u;
+static const uint RENDER_OWNER_FAR_TERRAIN_MISSES = 34u;
+static const uint RENDER_OWNER_FAR_TERRAIN_SKY_BREAKS = 35u;
+static const uint RENDER_OWNER_FAR_TERRAIN_STEPS = 36u;
+static const uint RENDER_OWNER_FAR_TERRAIN_REFINE_STEPS = 37u;
+static const uint RENDER_OWNER_FAR_TERRAIN_HEIGHT_EVALS = 38u;
+static const uint RENDER_OWNER_FAR_TERRAIN_SKY_BREAK_STEPS = 39u;
+static const uint RENDER_OWNER_FAR_TERRAIN_SKY_BREAK_HEIGHT_EVALS = 40u;
+static const uint RENDER_OWNER_FAR_TERRAIN_DEEP_MISS_STEPS = 41u;
+static const uint RENDER_OWNER_FAR_TERRAIN_DEEP_MISS_HEIGHT_EVALS = 42u;
+static const uint RENDER_OWNER_FAR_TERRAIN_HIT_STEPS = 43u;
+static const uint RENDER_OWNER_FAR_TERRAIN_HIT_HEIGHT_EVALS = 44u;
+static const uint RENDER_OWNER_FAR_TERRAIN_HIT_REFINE_STEPS = 45u;
+static const uint RENDER_OWNER_FAR_TERRAIN_FIRST_HIT_HEIGHT_EVALS = 46u;
+static const uint RENDER_OWNER_FAR_TERRAIN_LOOP_HIT_HEIGHT_EVALS = 47u;
+static const uint RENDER_OWNER_FAR_TERRAIN_CACHE_REJECTS = 48u;
+
+// Aggregate far-height fallback work. These slots intentionally live in the
+// pre-list ownership header, before the sampled ownership lists.
+void RecordFarTerrainWorkStats(uint outcomeSlot, uint stepCount, uint refineCount, uint heightEvalCount, uint skyBreakCount) {
+    if (frame.farFieldGridParams.w <= 0.5f) {
+        return;
+    }
+    InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_TERRAIN_CALLS], 1u);
+    if (outcomeSlot >= RENDER_OWNER_FAR_TERRAIN_EARLY_REJECTS &&
+        outcomeSlot <= RENDER_OWNER_FAR_TERRAIN_MISSES) {
+        InterlockedAdd(RenderOwnershipStats[outcomeSlot], 1u);
+    }
+    if (skyBreakCount != 0u) {
+        InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_TERRAIN_SKY_BREAKS], skyBreakCount);
+    }
+    if (stepCount != 0u) {
+        InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_TERRAIN_STEPS], stepCount);
+    }
+    if (refineCount != 0u) {
+        InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_TERRAIN_REFINE_STEPS], refineCount);
+    }
+    if (heightEvalCount != 0u) {
+        InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_TERRAIN_HEIGHT_EVALS], heightEvalCount);
+    }
+
+    const bool isHit =
+        outcomeSlot == RENDER_OWNER_FAR_TERRAIN_FIRST_SAMPLE_HITS ||
+        outcomeSlot == RENDER_OWNER_FAR_TERRAIN_LOOP_HITS;
+    if (outcomeSlot == RENDER_OWNER_FAR_TERRAIN_MISSES) {
+        if (skyBreakCount != 0u) {
+            if (stepCount != 0u) {
+                InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_TERRAIN_SKY_BREAK_STEPS], stepCount);
+            }
+            if (heightEvalCount != 0u) {
+                InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_TERRAIN_SKY_BREAK_HEIGHT_EVALS], heightEvalCount);
+            }
+        } else {
+            if (stepCount != 0u) {
+                InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_TERRAIN_DEEP_MISS_STEPS], stepCount);
+            }
+            if (heightEvalCount != 0u) {
+                InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_TERRAIN_DEEP_MISS_HEIGHT_EVALS], heightEvalCount);
+            }
+        }
+    } else if (isHit) {
+        if (stepCount != 0u) {
+            InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_TERRAIN_HIT_STEPS], stepCount);
+        }
+        if (heightEvalCount != 0u) {
+            InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_TERRAIN_HIT_HEIGHT_EVALS], heightEvalCount);
+            InterlockedAdd(
+                RenderOwnershipStats[outcomeSlot == RENDER_OWNER_FAR_TERRAIN_FIRST_SAMPLE_HITS
+                    ? RENDER_OWNER_FAR_TERRAIN_FIRST_HIT_HEIGHT_EVALS
+                    : RENDER_OWNER_FAR_TERRAIN_LOOP_HIT_HEIGHT_EVALS],
+                heightEvalCount);
+        }
+        if (refineCount != 0u) {
+            InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_TERRAIN_HIT_REFINE_STEPS], refineCount);
+        }
+    }
+    RenderOwnershipStats[8u] = frame.frameIndex;
+}
+
+void RecordFarTerrainCacheReject() {
+    if (frame.farFieldGridParams.w <= 0.5f) {
+        return;
+    }
+    InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_TERRAIN_CACHE_REJECTS], 1u);
+    RenderOwnershipStats[8u] = frame.frameIndex;
+}
+#else
+void RecordFarTerrainWorkStats(uint outcomeSlot, uint stepCount, uint refineCount, uint heightEvalCount, uint skyBreakCount) {
+}
+
+void RecordFarTerrainCacheReject() {
+}
+#endif
+
+#if defined(RAYMARCH_FAR_TERRAIN_WORK_STATS)
+#define FAR_TERRAIN_STAT(stmt) stmt
+#else
+#define FAR_TERRAIN_STAT(stmt)
+#endif
+
+#if defined(RAYMARCH_FAR_MAX_HEIGHT_DDA)
+static const int FAR_MAX_HEIGHT_DDA_MAX_LEVEL = 5;
+static const int FAR_MAX_HEIGHT_DDA_MAX_ITERATIONS = 192;
+
+uint FarMaxHeightMipSide(uint level) {
+    switch (level) {
+    case 0u: return 1366u;
+    case 1u: return 683u;
+    case 2u: return 342u;
+    case 3u: return 171u;
+    case 4u: return 86u;
+    case 5u: return 43u;
+    case 6u: return 22u;
+    case 7u: return 11u;
+    case 8u: return 6u;
+    case 9u: return 3u;
+    case 10u: return 2u;
+    default: return 1u;
+    }
+}
+
+uint FarMaxHeightMipOffset(uint level) {
+    switch (level) {
+    case 0u: return 0u;
+    case 1u: return 1865956u;
+    case 2u: return 2332445u;
+    case 3u: return 2449409u;
+    case 4u: return 2478650u;
+    case 5u: return 2486046u;
+    case 6u: return 2487895u;
+    case 7u: return 2488379u;
+    case 8u: return 2488500u;
+    case 9u: return 2488536u;
+    case 10u: return 2488545u;
+    default: return 2488549u;
+    }
+}
+
+bool FarMaxHeightCellIntervalPossibleHit(
+    float3 rayOrigin,
+    float3 rayDir,
+    float maxHeight,
+    float intervalStart,
+    float intervalEnd)
+{
+    if (intervalEnd < intervalStart) {
+        return false;
+    }
+    const float yStart = rayOrigin.y + rayDir.y * intervalStart;
+    const float yEnd = rayOrigin.y + rayDir.y * intervalEnd;
+    const float minY = min(yStart, yEnd);
+    return minY <= maxHeight;
+}
+
+float FarMaxHeightBlockExitT(
+    float3 rayOrigin,
+    float3 rayDir,
+    float t,
+    float tEnd,
+    int leafMinX,
+    int leafMaxX,
+    int leafMinZ,
+    int leafMaxZ,
+    float2 origin,
+    float leafCellSize)
+{
+    const float eps = 1.0e-3f;
+    float exitT = tEnd;
+    if (rayDir.x > eps) {
+        const float planeT = (origin.x + (float)leafMaxX * leafCellSize - rayOrigin.x) / rayDir.x;
+        if (planeT > t - eps) {
+            exitT = min(exitT, max(planeT, t));
+        }
+    } else if (rayDir.x < -eps) {
+        const float planeT = (origin.x + (float)leafMinX * leafCellSize - rayOrigin.x) / rayDir.x;
+        if (planeT > t - eps) {
+            exitT = min(exitT, max(planeT, t));
+        }
+    }
+    if (rayDir.z > eps) {
+        const float planeT = (origin.y + (float)leafMaxZ * leafCellSize - rayOrigin.z) / rayDir.z;
+        if (planeT > t - eps) {
+            exitT = min(exitT, max(planeT, t));
+        }
+    } else if (rayDir.z < -eps) {
+        const float planeT = (origin.y + (float)leafMinZ * leafCellSize - rayOrigin.z) / rayDir.z;
+        if (planeT > t - eps) {
+            exitT = min(exitT, max(planeT, t));
+        }
+    }
+    return clamp(exitT, t, tEnd);
+}
+
+bool FarMaxHeightDdaRejectsFarTerrain(float3 rayOrigin, float3 rayDir, float startDist) {
+    if (frame.farMaxHeightCacheParams.x <= 0.5f) {
+        return false;
+    }
+    if (rayDir.y > 0.22f || rayDir.y < -0.92f) {
+        return false;
+    }
+    const uint leafSide = max(1u, (uint)frame.farMaxHeightCacheParams2.x);
+    const uint mipLevels = max(1u, (uint)frame.farMaxHeightCacheParams2.y);
+    if (leafSide != 1366u || mipLevels < 6u) {
+        return false;
+    }
+    const float leafCellSize = max(frame.farMaxHeightCacheParams.w, 1.0f);
+    const float2 origin = frame.farMaxHeightCacheParams.yz;
+    const float farMaxDist = 10400.0f;
+    const float farTerrainCeiling = FAR_TERRAIN_MAX_HEIGHT + 64.0f;
+
+    float t = max(startDist, 160.0f);
+    if (rayOrigin.y > farTerrainCeiling) {
+        if (rayDir.y >= -0.001f) {
+            return false;
+        }
+        const float ceilingT = (farTerrainCeiling - rayOrigin.y) / rayDir.y;
+        if (ceilingT > farMaxDist) {
+            return false;
+        }
+        t = max(t, max(ceilingT, 0.0f));
+    }
+    if (t >= farMaxDist) {
+        return true;
+    }
+    if (abs(rayDir.x) <= 1.0e-8f && abs(rayDir.z) <= 1.0e-8f) {
+        const float3 pos = rayOrigin + rayDir * t;
+        const int ix = (int)floor((pos.x - origin.x) / leafCellSize);
+        const int iz = (int)floor((pos.z - origin.y) / leafCellSize);
+        if (ix < 0 || iz < 0 || ix >= (int)leafSide || iz >= (int)leafSide) {
+            return false;
+        }
+        const float maxHeight = FarMaxHeightCache[(uint)iz * leafSide + (uint)ix];
+        return !FarMaxHeightCellIntervalPossibleHit(rayOrigin, rayDir, maxHeight, t, farMaxDist);
+    }
+
+    const int maxLevel = min(FAR_MAX_HEIGHT_DDA_MAX_LEVEL, (int)mipLevels - 1);
+    [loop]
+    for (int iteration = 0; iteration < FAR_MAX_HEIGHT_DDA_MAX_ITERATIONS && t < farMaxDist; ++iteration) {
+        const float3 pos = rayOrigin + rayDir * t;
+        const int ix = (int)floor((pos.x - origin.x) / leafCellSize - (rayDir.x < 0.0f ? 1.0e-5f : 0.0f));
+        const int iz = (int)floor((pos.z - origin.y) / leafCellSize - (rayDir.z < 0.0f ? 1.0e-5f : 0.0f));
+        if (ix < 0 || iz < 0 || ix >= (int)leafSide || iz >= (int)leafSide) {
+            return false;
+        }
+
+        bool skipped = false;
+        [loop]
+        for (int level = maxLevel; level >= 0; --level) {
+            const int scale = 1 << level;
+            const int blockX = ix / scale;
+            const int blockZ = iz / scale;
+            const int leafMinX = blockX * scale;
+            const int leafMinZ = blockZ * scale;
+            const int leafMaxX = min((int)leafSide, leafMinX + scale);
+            const int leafMaxZ = min((int)leafSide, leafMinZ + scale);
+            const float nextT = FarMaxHeightBlockExitT(
+                rayOrigin,
+                rayDir,
+                t,
+                farMaxDist,
+                leafMinX,
+                leafMaxX,
+                leafMinZ,
+                leafMaxZ,
+                origin,
+                leafCellSize);
+            if (nextT <= t + 1.0e-4f) {
+                return false;
+            }
+
+            const uint mipSide = FarMaxHeightMipSide((uint)level);
+            if (blockX < 0 || blockZ < 0 || blockX >= (int)mipSide || blockZ >= (int)mipSide) {
+                return false;
+            }
+            const uint cacheIndex =
+                FarMaxHeightMipOffset((uint)level) + (uint)blockZ * mipSide + (uint)blockX;
+            const float maxHeight = FarMaxHeightCache[cacheIndex];
+            if (!FarMaxHeightCellIntervalPossibleHit(rayOrigin, rayDir, maxHeight, t, nextT)) {
+                t = min(farMaxDist, nextT + 1.0e-3f);
+                skipped = true;
+                break;
+            }
+            if (level == 0) {
+                return false;
+            }
+        }
+        if (!skipped) {
+            return false;
+        }
+    }
+
+    return t >= farMaxDist;
+}
+#else
+bool FarMaxHeightDdaRejectsFarTerrain(float3 rayOrigin, float3 rayDir, float startDist) {
+    return false;
+}
+#endif
+
 bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out RayHit farHit) {
     farHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
 
     if (!FAR_TERRAIN_HORIZON_ENABLED || frame.renderBudgetParams.z < 0.15f) {
+        FAR_TERRAIN_STAT(RecordFarTerrainWorkStats(31u, 0u, 0u, 0u, 0u);)
         return false;
     }
 
@@ -3641,18 +4004,25 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     // silhouette band (the deferral hands it the mountain tips up to ~0.22 that
     // the sparse SVO used to paint as detached dark blobs).
     if (rayDir.y > 0.22f) {
+        FAR_TERRAIN_STAT(RecordFarTerrainWorkStats(31u, 0u, 0u, 0u, 0u);)
         return false;
     }
 
+    FAR_TERRAIN_STAT(uint farTerrainStepCount = 0u;)
+    FAR_TERRAIN_STAT(uint farTerrainRefineCount = 0u;)
+    FAR_TERRAIN_STAT(uint farTerrainHeightEvalCount = 0u;)
+    FAR_TERRAIN_STAT(uint farTerrainSkyBreakCount = 0u;)
     const float farMaxDist = 10400.0f;
     const float farTerrainCeiling = FAR_TERRAIN_MAX_HEIGHT + 64.0f;
     float t = max(startDist, 160.0f);
     if (rayOrigin.y > farTerrainCeiling) {
         if (rayDir.y >= -0.001f) {
+            FAR_TERRAIN_STAT(RecordFarTerrainWorkStats(31u, 0u, 0u, 0u, 0u);)
             return false;
         }
         const float ceilingT = (farTerrainCeiling - rayOrigin.y) / rayDir.y;
         if (ceilingT > farMaxDist) {
+            FAR_TERRAIN_STAT(RecordFarTerrainWorkStats(31u, 0u, 0u, 0u, 0u);)
             return false;
         }
         t = max(t, max(ceilingT, 0.0f));
@@ -3661,6 +4031,7 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     float3 previousPos = rayOrigin + rayDir * t;
     float mountainMask, spireMask, ravineMask;
     float previousHeight = FarTerrainHeightVoxelized(previousPos.xz, previousT, mountainMask, spireMask, ravineMask);
+    FAR_TERRAIN_STAT(++farTerrainHeightEvalCount;)
     float previousSigned = previousPos.y - previousHeight;
     if (previousSigned <= 0.0f) {
         // If the caller pushed the far-height fallback behind a near ownership
@@ -3675,16 +4046,19 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             originMountainMask,
             originSpireMask,
             originRavineMask);
+        FAR_TERRAIN_STAT(++farTerrainHeightEvalCount;)
         if (rayOrigin.y > originHeight) {
             float lo = 0.0f;
             float hi = t;
             const int refineBudget = ScaleFarFieldRefineBudget(7, 5, 4);
             [loop]
             for (int refine = 0; refine < refineBudget; ++refine) {
+                FAR_TERRAIN_STAT(++farTerrainRefineCount;)
                 float mid = (lo + hi) * 0.5f;
                 float3 midPos = rayOrigin + rayDir * mid;
                 float mm, sm, rm;
                 float midHeight = FarTerrainHeightVoxelized(midPos.xz, mid, mm, sm, rm);
+                FAR_TERRAIN_STAT(++farTerrainHeightEvalCount;)
                 if (midPos.y > midHeight) {
                     lo = mid;
                 } else {
@@ -3704,6 +4078,12 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, u, 0);
             if (frame.debugMode == 54u || frame.debugMode == 56u) {
                 farHit = MakeHit(float4(DebugMaterialColor(material), 1.0f), hitT);
+                FAR_TERRAIN_STAT(RecordFarTerrainWorkStats(
+                    32u,
+                    farTerrainStepCount,
+                    farTerrainRefineCount,
+                    farTerrainHeightEvalCount,
+                    farTerrainSkyBreakCount);)
                 return true;
             }
             baseColor.rgb = FarTerrainMaterialVariation(baseColor.rgb, material, hitPos.xz, previousHeight, hitT);
@@ -3743,6 +4123,12 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
                 * FarHazeDowncastScale(rayDir.y);
             color = lerp(color, SkyColor(rayDir), farHazeAmount);
             farHit = MakeHit(float4(color, 1.0f), hitT);
+            FAR_TERRAIN_STAT(RecordFarTerrainWorkStats(
+                32u,
+                farTerrainStepCount,
+                farTerrainRefineCount,
+                farTerrainHeightEvalCount,
+                farTerrainSkyBreakCount);)
             return true;
         }
 
@@ -3768,6 +4154,7 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
     }
     [loop]
     for (int i = 0; i < farStepBudget && t < farMaxDist; ++i) {
+        FAR_TERRAIN_STAT(++farTerrainStepCount;)
         float distanceStep = lerp(128.0f, 420.0f, saturate(t / farMaxDist));
         float svoStep = frame.renderBudgetParams.z > frame.surfaceRasterParams.z
             ? FarSvoSuggestedStep(rayOrigin, rayDir, t)
@@ -3784,7 +4171,16 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
         t += stepSize;
 
         float3 pos = rayOrigin + rayDir * t;
+        // Sky early-out: once an ASCENDING ray has climbed above the maximum possible far-terrain
+        // height, no terrain can be ahead of it -> stop. This skips the long tail of expensive
+        // FarTerrainHeight evals that grazing/horizon rays otherwise spend marching empty sky above all
+        // terrain (the ray still resolves to sky, just far cheaper). IQ-identical; pure control flow.
+        if (rayDir.y >= 0.0f && pos.y > farTerrainCeiling) {
+            FAR_TERRAIN_STAT(++farTerrainSkyBreakCount;)
+            break;
+        }
         float height = FarTerrainHeightVoxelized(pos.xz, t, mountainMask, spireMask, ravineMask);
+        FAR_TERRAIN_STAT(++farTerrainHeightEvalCount;)
         float signedDistance = pos.y - height;
 
         if (signedDistance <= 0.0f && previousSigned > 0.0f) {
@@ -3793,10 +4189,12 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             const int refineBudget = ScaleFarFieldRefineBudget(5, 4, 3);
             [loop]
             for (int refine = 0; refine < refineBudget; ++refine) {
+                FAR_TERRAIN_STAT(++farTerrainRefineCount;)
                 float mid = (lo + hi) * 0.5f;
                 float3 midPos = rayOrigin + rayDir * mid;
                 float mm, sm, rm;
                 float midHeight = FarTerrainHeightVoxelized(midPos.xz, mid, mm, sm, rm);
+                FAR_TERRAIN_STAT(++farTerrainHeightEvalCount;)
                 if (midPos.y > midHeight) {
                     lo = mid;
                 } else {
@@ -3816,6 +4214,12 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             float4 baseColor = MaterialPalette.SampleLevel(PaletteSampler, u, 0);
             if (frame.debugMode == 54u || frame.debugMode == 56u) {
                 farHit = MakeHit(float4(DebugMaterialColor(material), 1.0f), hitT);
+                FAR_TERRAIN_STAT(RecordFarTerrainWorkStats(
+                    33u,
+                    farTerrainStepCount,
+                    farTerrainRefineCount,
+                    farTerrainHeightEvalCount,
+                    farTerrainSkyBreakCount);)
                 return true;
             }
             baseColor.rgb = FarTerrainMaterialVariation(baseColor.rgb, material, hitPos.xz, height, hitT);
@@ -3865,6 +4269,12 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
                 * FarHazeDowncastScale(rayDir.y);
             color = lerp(color, SkyColor(rayDir), farHazeAmount);
             farHit = MakeHit(float4(color, 1.0f), hitT);
+            FAR_TERRAIN_STAT(RecordFarTerrainWorkStats(
+                33u,
+                farTerrainStepCount,
+                farTerrainRefineCount,
+                farTerrainHeightEvalCount,
+                farTerrainSkyBreakCount);)
             return true;
         }
 
@@ -3887,10 +4297,22 @@ bool RaymarchFarTerrain(float3 rayOrigin, float3 rayDir, float startDist, out Ra
             float fogFactor = saturate((bedrockT - 900.0f) / (farMaxDist - 900.0f));
             color = lerp(color, SkyColor(rayDir), fogFactor * 0.94f + 0.06f);
             farHit = MakeHit(float4(color, 1.0f), bedrockT);
+            FAR_TERRAIN_STAT(RecordFarTerrainWorkStats(
+                33u,
+                farTerrainStepCount,
+                farTerrainRefineCount,
+                farTerrainHeightEvalCount,
+                farTerrainSkyBreakCount);)
             return true;
         }
     }
 
+    FAR_TERRAIN_STAT(RecordFarTerrainWorkStats(
+        34u,
+        farTerrainStepCount,
+        farTerrainRefineCount,
+        farTerrainHeightEvalCount,
+        farTerrainSkyBreakCount);)
     return false;
 }
 
@@ -4031,7 +4453,7 @@ static const uint RENDER_OWNER_FAR_HEIGHT_FAR_PAGE_PRESENT = 26u;
 static const uint RENDER_OWNER_FAR_HEIGHT_FAR_PAGE_MISSING = 27u;
 static const uint RENDER_OWNER_FAR_HEIGHT_FAR_PAGE_OUT_OF_GRID = 28u;
 static const uint RENDER_OWNER_FAR_HEIGHT_MID_SAMPLE_COUNT = 29u;
-static const uint RENDER_OWNER_UNSAFE_SAMPLE_LIST_BASE = 40u;
+static const uint RENDER_OWNER_UNSAFE_SAMPLE_LIST_BASE = 64u;
 static const uint RENDER_OWNER_UNSAFE_SAMPLE_LIST_CAPACITY = 256u;
 static const uint RENDER_OWNER_FAR_HEIGHT_MID_SAMPLE_LIST_BASE =
     RENDER_OWNER_UNSAFE_SAMPLE_LIST_BASE + RENDER_OWNER_UNSAFE_SAMPLE_LIST_CAPACITY * 4u;
@@ -4960,21 +5382,29 @@ bool RaymarchBackgroundField(
     // L3 lane A: the caller saw a missing NEAR brick during motion (guard armed) —
     // admit this ray to the far-height march below instead of letting the miss
     // tail classify it as sky (the white wedges at speed). Scalar plumbing only.
-    bool forceNearMotionTerrainFill = false)
+    bool forceNearMotionTerrainFill = false,
+    bool farMaxHeightNoHitReject = false)
 {
     backgroundHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
     backgroundLayer = BACKGROUND_LAYER_NONE;
 
     const bool voxelTerrainOnly = VoxelTerrainOnly();
-    RayHit waterOccluderHit;
+    RayHit waterOccluderHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
     // Water is not a fake height proxy: SparseTerrainGenerator fills all
     // below-sea basin columns with water. Keep the sea-level occluder active
     // so deterministic water hides submerged mid/far terrain instead of
     // exposing dry sand that disappears when editable sparse pages arrive.
+#ifdef RAYMARCH_PROBE_SKIP_WATER
+    const bool hasWaterOccluder = false;
+#else
     const bool hasWaterOccluder = RaymarchFarWater(rayOrigin, rayDir, 32.0f, waterOccluderHit);
+#endif
     const bool highAltitudeBackgroundView = rayOrigin.y > 384.0f;
     const bool lowAltitudeVoxelTerrainView = voxelTerrainOnly && !highAltitudeBackgroundView;
     const float farSvoCandidateQuality = min(frame.renderBudgetParams.z, frame.farOwnershipParams.w);
+#ifdef RAYMARCH_PROBE_SKIP_FAR_SVO
+    const bool farSvoCandidateView = false;
+#else
     const bool farSvoCandidateView =
         voxelTerrainOnly &&
         includeSparseFarField &&
@@ -4989,6 +5419,7 @@ bool RaymarchBackgroundField(
         frame.farFieldParams.x > 0.5f &&
         frame.farFieldParams.y > 0.0f &&
         frame.farFieldParams.z > 0.0f;
+#endif
     RayHit elevatedFarSvoCandidateHit = MakeHit(float4(SkyColor(rayDir), 1.0f), 1e20f);
     bool hasElevatedFarSvoCandidateHit = false;
     // [perf] The elevated far-SVO candidate march now runs AFTER the mid DDA
@@ -5032,9 +5463,13 @@ bool RaymarchBackgroundField(
     const float midVoxelStartDist = lowAltitudeVoxelTerrainView
         ? max(startDist, lowAltitudeVoxelContinuityStart)
         : startDist;
+#ifdef RAYMARCH_PROBE_SKIP_MID_DDA
+    const bool hasMidVoxelDdaHit = false;
+#else
     const bool hasMidVoxelDdaHit =
         !skipFullMidVoxelDda &&
         RaymarchMidVoxelClipmap(rayOrigin, rayDir, midVoxelStartDist, backgroundHit);
+#endif
     // [perf, result-identical reorder] The elevated far-SVO candidate used to
     // march the full horizon-cone SVO BEFORE the mid DDA for every qualifying
     // ray; with the mid ring converged (midCov 1.0) the consumers below then
@@ -5137,6 +5572,7 @@ bool RaymarchBackgroundField(
         includeSparseFarField &&
         rayDir.y > -0.22f &&
         rayDir.y < 0.20f) {
+#if !defined(RAYMARCH_PROBE_SKIP_FAR_HEIGHT) && !defined(RAYMARCH_PROBE_SKIP_TERRAIN_DIAG) && !defined(RAYMARCH_PROBE_SKIP_CLOSURE_DIAG) && !defined(RAYMARCH_FAST_TERRAIN_DIAGNOSTICS)
         float diagnosticTerrainT = 1e20f;
         if (DiagnosticFarTerrainWouldHit(rayOrigin, rayDir, lowAltitudeVoxelContinuityStart, diagnosticTerrainT)) {
             RayHit closureHit;
@@ -5148,8 +5584,10 @@ bool RaymarchBackgroundField(
                 return true;
             }
         }
+#endif
     }
     const bool highAltitudeDownwardView = highAltitudeBackgroundView && rayDir.y < -0.35f;
+#ifndef RAYMARCH_PROBE_SKIP_FAR_SVO
     if (highAltitudeBackgroundView &&
         includeSparseFarField &&
         RaymarchSparseFarField(
@@ -5172,6 +5610,7 @@ bool RaymarchBackgroundField(
         }
         backgroundLayer = BACKGROUND_LAYER_NONE;
     }
+#endif
     if (!voxelTerrainOnly) {
         if (RaymarchMidClipmap(rayOrigin, rayDir, startDist, backgroundHit)) {
             backgroundLayer = BACKGROUND_LAYER_MID_HEIGHT;
@@ -5211,6 +5650,7 @@ bool RaymarchBackgroundField(
         rayOrigin.y <= 384.0f &&
         rayDir.y > -0.55f &&
         rayDir.y < 0.22f;
+#ifndef RAYMARCH_PROBE_SKIP_FAR_SVO
     if (!deferFarSvoToFarHeightHorizon &&
         includeSparseFarField && RaymarchSparseFarField(rayOrigin, rayDir, farStartDist, 1e20f, backgroundHit)) {
         RayHit resolvedWaterHit;
@@ -5227,6 +5667,7 @@ bool RaymarchBackgroundField(
         }
         backgroundLayer = BACKGROUND_LAYER_NONE;
     }
+#endif
     // L3 MOTION GUARD (CPU-fed, O(1) per ray): surfaceRasterParams.y carries the
     // nearest missing-visible-height-tile distance, computed on the CPU each frame
     // (0 = guard off / startup, preserving prior behavior). A bare water hit BEYOND
@@ -5346,13 +5787,21 @@ bool RaymarchBackgroundField(
         // views, and turned far-SVO budget/coverage gaps into ocean-colored pits.
         farHeightAllowed = heightAngleOk || highAltitudeDownwardView;
     }
-    if (farHeightAllowed && RaymarchFarTerrain(rayOrigin, rayDir, heightStart, backgroundHit)) {
+#if !defined(RAYMARCH_PROBE_SKIP_FAR_HEIGHT) && !defined(RAYMARCH_PROBE_SKIP_FAR_TAIL)
+    if (farHeightAllowed && !farMaxHeightNoHitReject) {
+        farMaxHeightNoHitReject = FarMaxHeightDdaRejectsFarTerrain(rayOrigin, rayDir, heightStart);
+    }
+    FAR_TERRAIN_STAT(if (farHeightAllowed && farMaxHeightNoHitReject) {
+        RecordFarTerrainCacheReject();
+    })
+    if (farHeightAllowed && !farMaxHeightNoHitReject && RaymarchFarTerrain(rayOrigin, rayDir, heightStart, backgroundHit)) {
         backgroundLayer = BACKGROUND_LAYER_FAR_HEIGHT;
         if (BackgroundHitAllowedByExactNear(rayOrigin, rayDir, backgroundHit, backgroundLayer)) {
             return true;
         }
         backgroundLayer = BACKGROUND_LAYER_NONE;
     }
+#endif
 
     return false;
 }
@@ -5972,8 +6421,12 @@ RayHit DebugBackgroundMissHit(
         return MakeHit(float4(TerrainSkyReasonColor(reason), 1.0f), reasonTerrainT);
     }
     float diagnosticTerrainT = 1e20f;
+#if defined(RAYMARCH_PROBE_SKIP_FAR_HEIGHT) || defined(RAYMARCH_PROBE_SKIP_TERRAIN_DIAG) || defined(RAYMARCH_PROBE_SKIP_MISS_DIAG) || defined(RAYMARCH_FAST_TERRAIN_DIAGNOSTICS)
+    const bool hiddenVoxelTerrainMiss = false;
+#else
     const bool hiddenVoxelTerrainMiss =
         DiagnosticFarTerrainWouldHit(rayOrigin, rayDir, startDist, diagnosticTerrainT);
+#endif
     const bool underwaterVolume =
         CameraUnderwaterForShading() &&
         !expectedSky;
@@ -6181,7 +6634,7 @@ RayHit DebugUnsafeNearMissHit(float3 rayDir) {
 }
 
 // DDA Raymarcher
-RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug) {
+RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug, bool farMaxHeightNoHitReject) {
     // Must cover the diagonal of the moving render window. Keep this generous:
     // shortening it can make startup look like a black/empty screen while chunks
     // are visible but beyond the ray budget.
@@ -6216,7 +6669,10 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug) 
             true,
             true,
             backgroundHit,
-            backgroundLayer)) {
+            backgroundLayer,
+            false,
+            false,
+            farMaxHeightNoHitReject)) {
             return DebugBackgroundLayerHitWithExactFeedback(rayOrigin, rayDir, backgroundHit, backgroundLayer);
         }
         // A miss behind the surface-authoritative foreground is only an
@@ -6241,7 +6697,7 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug) 
         }
         RayHit farHit;
         uint farLayer;
-        if (RaymarchBackgroundField(rayOrigin, rayDir, 32.0f, true, true, farHit, farLayer)) {
+        if (RaymarchBackgroundField(rayOrigin, rayDir, 32.0f, true, true, farHit, farLayer, false, false, farMaxHeightNoHitReject)) {
             return DebugBackgroundLayerHitWithExactFeedback(rayOrigin, rayDir, farHit, farLayer);
         }
         return DebugBackgroundMissHit(rayOrigin, rayDir, 32.0f, false, runTerrainSkyReasonDebug);
@@ -6567,7 +7023,10 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug) 
                 true,
                 true,
                 backgroundHit,
-                backgroundLayer)) {
+                backgroundLayer,
+                false,
+                false,
+                farMaxHeightNoHitReject)) {
             return DebugBackgroundLayerHitWithExactFeedback(rayOrigin, rayDir, backgroundHit, backgroundLayer);
         }
         // Missing sparse pages inside the editable/collision volume are not
@@ -6618,7 +7077,8 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug) 
             backgroundHit,
             backgroundLayer,
             suppressPendingLandWaterFill || nearMotionStreamGap,
-            nearMotionStreamGap)) {
+            nearMotionStreamGap,
+            farMaxHeightNoHitReject)) {
             const float surfaceOwnershipDistance = max(frame.nearOwnershipParams.w, ExactNearDistance());
             const bool lowerLodTerrainBeforeExactSurfaceLimit =
                 backgroundLayer == BACKGROUND_LAYER_MID_VOXEL ||
@@ -6706,7 +7166,7 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug) 
         if (rayOrigin.y > 384.0f && rayDir.y < -0.35f) {
             farStart = min(farStart, max(entryDist + dist - 64.0f, 32.0f));
         }
-        if (RaymarchBackgroundField(rayOrigin, rayDir, farStart, true, true, farHit, farLayer)) {
+        if (RaymarchBackgroundField(rayOrigin, rayDir, farStart, true, true, farHit, farLayer, false, false, farMaxHeightNoHitReject)) {
             return DebugBackgroundLayerHitWithExactFeedback(rayOrigin, rayDir, farHit, farLayer);
         }
     }
@@ -6734,7 +7194,7 @@ RayHit Raymarch(float3 rayOrigin, float3 rayDir, bool runTerrainSkyReasonDebug) 
                 budgetStart,
                 max(entryDist + min(dist, maxMarchDist) - 64.0f, 32.0f));
         }
-        if (RaymarchBackgroundField(rayOrigin, rayDir, budgetStart, true, true, budgetHit, budgetLayer)) {
+        if (RaymarchBackgroundField(rayOrigin, rayDir, budgetStart, true, true, budgetHit, budgetLayer, false, false, farMaxHeightNoHitReject)) {
             return DebugBackgroundLayerHitWithExactFeedback(rayOrigin, rayDir, budgetHit, budgetLayer);
         }
     }
@@ -6902,6 +7362,32 @@ PSOutput main(PSInput input) {
     PSOutput output;
     output.color = float4(0.0f, 0.0f, 0.0f, 1.0f);
 
+#if defined(RAYMARCH_TEMPORAL_REPROJECT)
+    // Stage 2b reuse gate: CS_TemporalReproject reprojected the previous frame's far history into this
+    // frame and set mask=0 where it could reuse confidently. Discard those (they keep the compute-
+    // written history color). mask=1 (disocclusion / no valid reprojection) falls through to the full
+    // march. Hole/ghost-safe: anything not confidently reused is freshly marched. (early-stencil
+    // already culled mesh-covered pixels.)
+    if (frame.temporalParams.x > 0.5f &&
+        TemporalMarchMask.Load(int3(int2(input.position.xy), 0)) == 0u) {
+        discard;
+    }
+#elif defined(RAYMARCH_TEMPORAL)
+    // Stage 2a static-history gate: while the camera is static, refresh one coherent tile phase and
+    // leave the other tiles untouched in the persistent RGBA16F history target. Any motion disables
+    // reuse and marches every background pixel, which is the hole/ghost-safe fallback.
+    if (frame.temporalParams.x > 0.5f && frame.temporalParams.y > 0.5f) {
+        const uint tileSize = max(1u, (uint)round(frame.temporalParams.w));
+        const uint2 tile = uint2(input.position.xy) / tileSize;
+        const uint tilePhase = (tile.x & 3u) | ((tile.y & 3u) << 2u);
+        const uint phaseCount = min(16u, max(1u, (uint)round(frame.temporalParams.z)));
+        const uint framePhase = frame.frameIndex % phaseCount;
+        if ((tilePhase % phaseCount) != framePhase) {
+            discard;
+        }
+    }
+#endif
+
     // Camera data from constant buffer
     float3 cameraPos = frame.cameraPosition.xyz;
     float3 forward = frame.cameraForward.xyz;
@@ -6921,6 +7407,184 @@ PSOutput main(PSInput input) {
         right * ndc.x * tanHalfFov * aspectRatio +
         up * ndc.y * tanHalfFov
     );
+    const uint2 pixelCoord = uint2(input.position.xy);
+#if defined(RAYMARCH_FAR_MAX_HEIGHT_NO_HIT_MASK)
+    const uint farMaxHeightScreenTileWidth = 8u;
+    const uint farMaxHeightHorizonEmpty = 0xffffffffu;
+    const uint farMaxHeightHorizonBandPixels = 2u;
+    const uint farMaxHeightTileCount =
+        ((uint)frame.viewportWidth + farMaxHeightScreenTileWidth - 1u) / farMaxHeightScreenTileWidth;
+    const uint farMaxHeightTile =
+        min(max(farMaxHeightTileCount, 1u) - 1u, pixelCoord.x / farMaxHeightScreenTileWidth);
+    const uint farMaxHeightHorizonY =
+        frame.farMaxHeightCacheParams2.w > 0.5f
+            ? FarMaxHeightNoHitMask[farMaxHeightTile]
+            : farMaxHeightHorizonEmpty;
+    const uint farMaxHeightNoHitMaskValue =
+        farMaxHeightHorizonY != farMaxHeightHorizonEmpty &&
+        pixelCoord.y + farMaxHeightHorizonBandPixels < farMaxHeightHorizonY
+            ? (farMaxHeightHorizonY + 1u)
+            : 0u;
+    const bool farMaxHeightNoHitReject =
+        farMaxHeightNoHitMaskValue != 0u;
+#else
+    const uint farMaxHeightNoHitMaskValue = 0u;
+    const bool farMaxHeightNoHitReject = false;
+#endif
+
+#ifdef RAYMARCH_BACKGROUND_ONLY
+    // Sparse-surface/far-owner validation path: the raster owners have already
+    // written foreground depth/stencil, so the fullscreen pass only needs the
+    // existing background/gap fallback. Keeping this as a compile-time variant
+    // lets DXC strip the dense near DDA, brush, avatar, and debug-only branches
+    // that make the full uber-shader PSO hit the driver compile cliff.
+    {
+        const float3 gridMin = frame.regionOrigin.xyz;
+        const float3 gridMax = frame.regionOrigin.xyz +
+            float3(frame.gridSizeX, frame.gridSizeY, frame.gridSizeZ);
+        const bool sparseNearActive = frame.sparseNearParams.x > 0.5f;
+        const uint sparseNearFlags = (uint)frame.sparseNearParams.w;
+        const bool sparseSurfaceAuthoritative =
+            sparseNearActive && ((sparseNearFlags & 2u) != 0u);
+        const float backgroundStart = sparseSurfaceAuthoritative
+            ? SurfaceAuthoritativeBackgroundStartForRay(cameraPos, rayDir, gridMin, gridMax)
+            : 32.0f;
+
+#ifdef RAYMARCH_BACKGROUND_FAST_SKY
+        // Conservative sky split for the background-only PSO. Diagnostic terrain
+        // fallback paths reject upward rays above 0.42, so this branch can skip
+        // the expensive background field without erasing a valid terrain owner.
+        const bool fastSkyLowAltitude =
+            frame.debugMode == 0u &&
+            !CameraUnderwaterForShading() &&
+            sparseSurfaceAuthoritative &&
+            VoxelTerrainOnly() &&
+            frame.cameraPosition.y <= 384.0f &&
+            rayDir.y > 0.42f;
+        if (fastSkyLowAltitude) {
+            RecordRenderOwnership(RENDER_OWNER_SKY);
+            output.color = float4(SkyColor(rayDir), 1.0f);
+            return output;
+        }
+#endif
+#ifdef RAYMARCH_BACKGROUND_AGGRESSIVE_SKY
+        // Diagnostic only: measure the ceiling for moving the sky-break cohort out
+        // of the heavy background field. The threshold is env-tunable through
+        // surfaceRasterParams.w so we can find the visual/perf boundary without
+        // recompiling this giant shader for every candidate.
+        const float aggressiveSkyMinY = frame.surfaceRasterParams.w;
+        const bool aggressiveSkyLowAltitude =
+            frame.debugMode == 0u &&
+            !CameraUnderwaterForShading() &&
+            sparseSurfaceAuthoritative &&
+            VoxelTerrainOnly() &&
+            frame.cameraPosition.y <= 384.0f &&
+            rayDir.y > aggressiveSkyMinY;
+        if (aggressiveSkyLowAltitude) {
+            RecordRenderOwnership(RENDER_OWNER_SKY);
+            output.color = float4(SkyColor(rayDir), 1.0f);
+            return output;
+        }
+#endif
+#ifdef RAYMARCH_MASKED_BAND_DIAG
+        // Diagnostic only: coherently march one tile phase of the residual far
+        // band, while returning the existing cheap far-background shade for the
+        // other phases. This tests whether the post-sky residual is ray-count
+        // bound without weakening the resident/missing-surface fallback path.
+        const uint maskedBandTileSize = max(4u, min(64u, (uint)round(frame.temporalParams.w)));
+        const uint maskedBandPhaseCount = max(1u, min(16u, (uint)round(frame.temporalParams.z)));
+        const uint2 maskedBandTile = pixelCoord / maskedBandTileSize;
+        const uint maskedBandTilePhase = (maskedBandTile.x + 3u * maskedBandTile.y) % maskedBandPhaseCount;
+        const uint maskedBandFramePhase = frame.frameIndex % maskedBandPhaseCount;
+        const bool maskedBandLowAltitude =
+            frame.debugMode == 0u &&
+            !CameraUnderwaterForShading() &&
+            sparseSurfaceAuthoritative &&
+            VoxelTerrainOnly() &&
+            frame.cameraPosition.y <= 384.0f;
+        if (maskedBandLowAltitude && maskedBandTilePhase != maskedBandFramePhase) {
+            RecordRenderOwnership(RENDER_OWNER_SKY);
+            output.color = float4(FarBackgroundShade(rayDir, (float)pixelCoord.y + 64.0f, (float)pixelCoord.y), 1.0f);
+            return output;
+        }
+#endif
+#ifdef RAYMARCH_BACKGROUND_EDGE_REPAIR
+        // The split pass renders with low-res SV_Position. The later repair
+        // draw uses full-res SV_Position while the constants still carry the
+        // low-res background dimensions, so this branch only activates during
+        // that repair draw and discards non-edge pixels before heavy marching.
+        if ((float)pixelCoord.y >= frame.viewportHeight) {
+#if defined(RAYMARCH_BACKGROUND_TILE_REPAIR)
+            uint repairMaskWidth = 0u;
+            uint repairMaskHeight = 0u;
+            BackgroundRepairTileMask.GetDimensions(repairMaskWidth, repairMaskHeight);
+            const uint repairTileSize = max(1u, (uint)RAYMARCH_BACKGROUND_TILE_REPAIR_SIZE);
+            const uint2 repairTile = pixelCoord / repairTileSize;
+            if (repairTile.x >= repairMaskWidth ||
+                repairTile.y >= repairMaskHeight ||
+                BackgroundRepairTileMask.Load(int3(repairTile, 0)).r == 0u) {
+                discard;
+            }
+#else
+            const float2 repairTexel = 1.0f / max(float2(frame.viewportWidth, frame.viewportHeight), 1.0f);
+            const float3 c = BackgroundRepairColor.SampleLevel(PaletteSampler, input.uv, 0.0f).rgb;
+            const float3 cx0 = BackgroundRepairColor.SampleLevel(
+                PaletteSampler, saturate(input.uv + float2(-repairTexel.x, 0.0f)), 0.0f).rgb;
+            const float3 cx1 = BackgroundRepairColor.SampleLevel(
+                PaletteSampler, saturate(input.uv + float2(repairTexel.x, 0.0f)), 0.0f).rgb;
+            const float3 cy0 = BackgroundRepairColor.SampleLevel(
+                PaletteSampler, saturate(input.uv + float2(0.0f, -repairTexel.y)), 0.0f).rgb;
+            const float3 cy1 = BackgroundRepairColor.SampleLevel(
+                PaletteSampler, saturate(input.uv + float2(0.0f, repairTexel.y)), 0.0f).rgb;
+            const float3 edgeX = max(abs(c - cx0), abs(c - cx1));
+            const float3 edgeY = max(abs(c - cy0), abs(c - cy1));
+            if (max(max(edgeX.r, max(edgeX.g, edgeX.b)), max(edgeY.r, max(edgeY.g, edgeY.b))) < 0.08f) {
+                discard;
+            }
+#endif
+        }
+#endif
+
+        RayHit backgroundHit;
+        uint backgroundLayer;
+        if (RaymarchBackgroundField(
+            cameraPos,
+            rayDir,
+            backgroundStart,
+            true,
+            true,
+            backgroundHit,
+            backgroundLayer,
+            false,
+            false,
+            farMaxHeightNoHitReject)) {
+            RayHit resolvedHit =
+                DebugBackgroundLayerHitWithExactFeedback(cameraPos, rayDir, backgroundHit, backgroundLayer);
+            output.color = resolvedHit.color;
+            return output;
+        }
+
+        const bool nearSurfaceTerrainMiss =
+            sparseSurfaceAuthoritative &&
+            SurfaceAuthoritativeNearTerrainMiss(cameraPos, rayDir, backgroundStart);
+        if (farMaxHeightNoHitReject && !nearSurfaceTerrainMiss) {
+            const float encodedHorizonY = farMaxHeightNoHitMaskValue > 1u
+                ? (float)(farMaxHeightNoHitMaskValue - 1u)
+                : (float)pixelCoord.y + 64.0f;
+            RecordRenderOwnership(RENDER_OWNER_SKY);
+            output.color = float4(FarBackgroundShade(rayDir, encodedHorizonY, (float)pixelCoord.y), 1.0f);
+            return output;
+        }
+        RayHit missHit = DebugBackgroundMissHit(
+            cameraPos,
+            rayDir,
+            backgroundStart,
+            nearSurfaceTerrainMiss,
+            false);
+        output.color = missHit.color;
+        return output;
+    }
+#endif
 
 #ifdef RAYMARCH_MID_ONLY
     // MID-ONLY pass: a separate, simpler PSO (DXC strips far/background/near via dead-code
@@ -7011,14 +7675,13 @@ PSOutput main(PSInput input) {
         return output;
     }
 
-    const uint2 pixelCoord = uint2(input.position.xy);
     const bool runTerrainSkyReasonDebug =
         frame.debugMode == 57u &&
         ((pixelCoord.x & 7u) == 0u) &&
         ((pixelCoord.y & 7u) == 0u);
 
     // Render voxel world
-    RayHit worldHit = Raymarch(cameraPos, rayDir, runTerrainSkyReasonDebug);
+    RayHit worldHit = Raymarch(cameraPos, rayDir, runTerrainSkyReasonDebug, farMaxHeightNoHitReject);
     float4 voxelColor = worldHit.color;
     float depthDistance = worldHit.distance;
 
@@ -7056,5 +7719,11 @@ PSOutput main(PSInput input) {
     }
 
     output.color = voxelColor;
+#ifdef RAYMARCH_TEMPORAL
+    // Pack the far hit distance into history alpha for next-frame reprojection (Stage 2b). The
+    // stencil-gated composite force-sets alpha=1, so this never reaches the main RT. Sky/very-far =>
+    // large alpha => the reproject treats it as non-reusable and marches (cheap for sky).
+    output.color.a = depthDistance;
+#endif
     return output;
 }

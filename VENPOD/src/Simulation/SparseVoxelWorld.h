@@ -77,6 +77,11 @@ struct SparseVoxelWorldConfig {
     // so the frame never waits on meshing. Best-available render shows coarser terrain
     // until a coord's mesh lands.
     bool asyncSurfaceExtraction = false;
+    // Per-coord replacement for the old global "any edit -> all surface meshing sync"
+    // gate. Async surface workers use the no-edit terrain sampler, so edited coords
+    // and their one-brick surface halo remain synchronous; unrelated coords can still
+    // mesh off-thread while edits exist elsewhere.
+    bool asyncSurfaceExtractionPerCoordEditGate = true;
     // Default worker count for the async surface mesher. Raised 2->8: the exact-surface
     // near-detail extraction is the moving-into-fresh-terrain throughput producer and runs
     // entirely off the render thread, so more workers raise meshing throughput during the
@@ -84,6 +89,7 @@ struct SparseVoxelWorldConfig {
     uint32_t asyncSurfaceExtractionMaxWorkers = 8;
     uint32_t asyncSurfaceExtractionQueueMax = 4096;
     uint32_t asyncSurfaceExtractionMaxApplyPerFrame = 256;
+    float asyncSurfaceExtractionMaxApplyMs = 0.0f;
     bool persistentTerrainColumnCache = false;
     uint32_t terrainColumnCacheMaxEntries = 131072;
     bool streamingLaneQueuePriority = false;
@@ -275,6 +281,17 @@ struct SparseVoxelWorldStats {
     uint32_t parallelSurfaceExtractionWorkersLastFrame = 0;
     float parallelSurfaceExtractionWallMsLastFrame = 0.0f;
     float surfaceExtractionWaitMsLastFrame = 0.0f;
+    uint32_t asyncSurfaceExtractionEnqueuedLastFrame = 0;
+    uint32_t asyncSurfaceExtractionAppliedLastFrame = 0;
+    uint32_t asyncSurfaceExtractionDiscardedLastFrame = 0;
+    uint32_t asyncSurfaceEditGateGlobalWouldSyncLastFrame = 0;
+    uint32_t asyncSurfaceEditGatePerCoordAsyncLastFrame = 0;
+    uint32_t asyncSurfaceEditGatePerCoordSyncLastFrame = 0;
+    uint32_t asyncSurfaceExtractionQueueDepth = 0;
+    uint32_t asyncSurfaceExtractionResultDepth = 0;
+    uint32_t asyncSurfaceExtractionPending = 0;
+    float asyncSurfaceExtractionWorkerMsLastFrame = 0.0f;
+    float asyncSurfaceExtractionApplyMsLastFrame = 0.0f;
     uint32_t terrainColumnCachePersistentActive = 0;
     uint32_t terrainColumnCacheEntries = 0;
     uint32_t terrainColumnCacheMaxEntries = 0;
@@ -493,6 +510,7 @@ public:
         uint32_t currentFrame,
         double maxMilliseconds,
         bool ownershipCritical);
+    uint32_t DrainAsyncSurfaceExtractionCompletions();
     uint32_t TrimResidentBricks(
         const BrickCoord& center,
         uint32_t keepRadiusXz,
@@ -904,6 +922,8 @@ private:
     uint32_t ApplyAsyncSurfaceExtractionCompletions();
     void StartAsyncSurfaceExtractionWorkerIfNeeded();
     void StopAsyncSurfaceExtractionWorker();
+    bool EditOverlapsSurfaceExtractionDependency(const BrickCoord& coord) const;
+    bool CanQueueAsyncSurfaceExtractionForCoord(const BrickCoord& coord);
     bool QueuePhysicsCandidateNoStats(const BrickCoord& coord);
     bool QueuePhysicsRegionNoStats(
         const BrickCoord& coord,
@@ -1168,7 +1188,11 @@ private:
     uint32_t m_asyncSurfaceExtractionEnqueuedLastFrame = 0;
     uint32_t m_asyncSurfaceExtractionAppliedLastFrame = 0;
     uint32_t m_asyncSurfaceExtractionDiscardedLastFrame = 0;
+    uint32_t m_asyncSurfaceEditGateGlobalWouldSyncLastFrame = 0;
+    uint32_t m_asyncSurfaceEditGatePerCoordAsyncLastFrame = 0;
+    uint32_t m_asyncSurfaceEditGatePerCoordSyncLastFrame = 0;
     float m_asyncSurfaceExtractionWorkerMsLastFrame = 0.0f;
+    float m_asyncSurfaceExtractionApplyMsLastFrame = 0.0f;
     std::vector<std::thread> m_persistentExactGenerationThreads;
     std::mutex m_persistentExactGenerationMutex;
     std::condition_variable m_persistentExactGenerationCv;

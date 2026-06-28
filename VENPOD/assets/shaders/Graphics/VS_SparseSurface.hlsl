@@ -181,6 +181,7 @@ VSOutput main(uint faceVertex : FACEVERTEX, uint instanceId : SV_InstanceID) {
     const float surfaceMaxDistance = frame.nearOwnershipParams.w;
     const float foregroundDistanceClip =
         surfaceMaxDistance > 0.0f ? surfaceMaxDistance - length(cameraToFace) : 1.0f;
+    const float activeFaceClip = FaceVoxel(face) != MAT_AIR ? 1.0f : -1.0f;
 
     const float ndcDepth = (viewZ - kNearPlane) / (kFarPlane - kNearPlane);
     output.position = float4(
@@ -193,6 +194,8 @@ VSOutput main(uint faceVertex : FACEVERTEX, uint instanceId : SV_InstanceID) {
     output.material = GetMaterial(FaceVoxel(face));
     output.distance = max(viewZ, 0.0f);
     output.worldPos = world;
-    output.clipDistance = min(min(viewZ - kNearPlane, frontFacing + 0.0001f), foregroundDistanceClip);
+    output.clipDistance = min(
+        min(min(viewZ - kNearPlane, frontFacing + 0.0001f), foregroundDistanceClip),
+        activeFaceClip);
     return output;
 }

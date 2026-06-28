@@ -14,6 +14,7 @@
 #include "RHI/GPUBuffer.h"
 #include "RHI/ShaderCompiler.h"
 #include "RHI/DX12GraphicsPipeline.h"
+#include "RHI/DX12ComputePipeline.h"
 #include "../Core/Window.h"
 #include "../Utils/Result.h"
 #include <array>
@@ -33,14 +34,61 @@ struct RendererConfig {
     bool debugShaders = false;
     bool backgroundPassEnabled = false;
     float backgroundPassScale = 1.0f;
+    // Temporal far-march reprojection: run the background raymarch full-res (scale 1.0) into the
+    // separate bg color RT, but share the MAIN depth-stencil so the mesh stencil early-culls the
+    // raymarch to background pixels only. Foundation for history/reproject (default off).
+    bool backgroundPassTemporal = false;
+    // Experimental v2 motion reprojection. Default temporal mode uses same-UV static tile refresh
+    // because the 2-pass scatter path measured slower on the motion replay.
+    bool backgroundPassTemporalReproject = false;
+    uint32_t backgroundPassTemporalStaticPhases = 8;
+    uint32_t backgroundPassTemporalTileSize = 16;
     bool backgroundPassSurfaceRaymarchFill = false;
     bool backgroundPassClearProbe = false;
     bool backgroundPassForceColor = false;
     bool backgroundPassCompositeDebug = false;
     bool backgroundPassCompositeForceColor = false;
+    bool backgroundPassEdgeAwareComposite = false;
+    bool backgroundPassHorizonRepair = false;
+    uint32_t backgroundPassHorizonRepairY0 = 160;
+    uint32_t backgroundPassHorizonRepairY1 = 480;
+    bool backgroundPassHorizonTileMask = false;
+    uint32_t backgroundPassHorizonTileSize = 4;
+    uint32_t backgroundPassHorizonTileY0 = 320;
+    uint32_t backgroundPassHorizonTileY1 = 480;
+    float backgroundPassHorizonTileThreshold = 0.28f;
+    uint32_t backgroundPassHorizonTileSelector = 0;
     bool midPassEnabled = false;
     float midPassScale = 0.5f;
     bool sparseSurfaceDepthPrepass = false;
+    bool raymarchBackgroundOnlyPso = false;
+    bool raymarchFastSkyPso = false;
+    bool raymarchAggressiveSkyPso = false;
+    float raymarchAggressiveSkyMinY = 0.06f;
+    bool raymarchMaskedBandDiag = false;
+    uint32_t raymarchMaskedBandDiagTileSize = 16;
+    uint32_t raymarchMaskedBandDiagPhases = 4;
+    bool farSkyOwnerEnabled = false;
+    float farSkyOwnerMinY = 0.06f;
+    bool farSkyOwnerHorizonOnly = false;
+    bool raymarchFastTerrainDiagnostics = false;
+    bool raymarchProbeSkipWater = false;
+    bool raymarchProbeSkipMidDda = false;
+    bool raymarchProbeSkipFarSvo = false;
+    bool raymarchProbeSkipFarHeight = false;
+    bool raymarchProbeSkipFarTail = false;
+    bool raymarchProbeSkipTerrainDiag = false;
+    bool raymarchProbeSkipClosureDiag = false;
+    bool raymarchProbeSkipMissDiag = false;
+    bool farHeightfieldOwnerEnabled = false;
+    bool farHeightfieldOwnerGpuGenerate = true;
+    bool farMaxHeightCacheEnabled = false;
+    bool raymarchFarMaxHeightDdaEnabled = false;
+    bool farMaxHeightNoHitMaskEnabled = false;
+    uint32_t farMaxHeightScreenMaskMipLevel = 3;
+    float farMaxHeightScreenMaskDilationPixels = 4.0f;
+    std::filesystem::path farHeightfieldOwnerFaceCsvPath;
+    std::filesystem::path farMaxHeightHorizonCsvPath;
 };
 
 class Renderer {
@@ -210,7 +258,14 @@ public:
         const BrushPreview* brushPreview = nullptr,
         const CharacterPreview* characterPreview = nullptr,
         const SparseFarField* sparseFarField = nullptr,
-        const SparseNearField* sparseNearField = nullptr
+        const SparseNearField* sparseNearField = nullptr,
+        ID3D12QueryHeap* gpuTimingHeap = nullptr,
+        uint32_t gpuTimingBaseQuery = 0u,
+        uint32_t farMaxHeightCacheEndQueryOffset = 0xFFFFFFFFu,
+        uint32_t farMaxHeightNoHitMaskEndQueryOffset = 0xFFFFFFFFu,
+        uint32_t farSkyOwnerBeginQueryOffset = 0xFFFFFFFFu,
+        uint32_t farSkyOwnerEndQueryOffset = 0xFFFFFFFFu,
+        uint32_t backgroundCoreEndQueryOffset = 0xFFFFFFFFu
     );
 
     // P2 editable-SVDAG pass: a separate fullscreen raymarch over the DAG, composited
@@ -290,6 +345,53 @@ private:
     Result<void> CreateDepthBuffer();
     Result<void> CreateBackgroundPassResources();
     void DestroyBackgroundPassResources();
+    // Temporal far-march reprojection target: a full-res texture with RTV (raymarch PS writes marched
+    // pixels), SRV (composite/reproject reads), UAV (compute reproject writes reused pixels).
+    struct TemporalTarget {
+        ComPtr<ID3D12Resource> resource;
+        DescriptorHandle rtv;
+        DescriptorHandle stagingSrv;
+        DescriptorHandle srv;
+        DescriptorHandle stagingUav;
+        DescriptorHandle uav;
+        D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    };
+    Result<void> CreateTemporalResources();
+    void DestroyTemporalResources();
+    Result<void> CreateTemporalTarget(
+        ID3D12Device* device, TemporalTarget& target, DXGI_FORMAT format, const wchar_t* name);
+    Result<void> CreateTemporalRaymarchPipeline(ID3D12Device* device, GraphicsPipelineDesc fullscreenDesc);
+    Result<void> CreateTemporalReprojectPipeline(ID3D12Device* device);
+    Result<void> CreateFarSkyOwnerPipeline(ID3D12Device* device);
+    bool UseTemporalReproject() const { return m_config.backgroundPassTemporal; }
+    bool UseTemporalMotionReproject() const {
+        return m_config.backgroundPassTemporal && m_config.backgroundPassTemporalReproject;
+    }
+    Result<void> CreateFarHeightfieldOwnerResources(ID3D12Device* device);
+    Result<void> CreateFarMaxHeightCacheResources(ID3D12Device* device);
+    Result<void> CreateFarMaxHeightNoHitMaskResources();
+    void DestroyFarMaxHeightNoHitMaskResources();
+    Result<void> CreateFarMaxHeightNoHitMaskPipeline(ID3D12Device* device);
+    Result<void> CreateBackgroundHorizonTileMaskPipeline(ID3D12Device* device);
+    void GenerateFarMaxHeightCache(ID3D12GraphicsCommandList* cmdList, const void* frameConstantsCpu);
+    void GenerateFarMaxHeightNoHitMask(ID3D12GraphicsCommandList* cmdList, D3D12_GPU_VIRTUAL_ADDRESS frameConstants);
+    void GenerateBackgroundHorizonTileMask(
+        ID3D12GraphicsCommandList* cmdList,
+        const SparseNearField* sparseNearField,
+        uint32_t frameIndex);
+    void TryRetireFarHeightfieldOwnerFaceCsv();
+    void TryRetireFarMaxHeightHorizonCsv();
+    bool QueueFarHeightfieldOwnerFaceCsvReadback(
+        ID3D12GraphicsCommandList* cmdList,
+        const float* cameraPosition,
+        float originX,
+        float originZ);
+    bool QueueFarMaxHeightHorizonCsvReadback(ID3D12GraphicsCommandList* cmdList);
+    void DrawFarHeightfieldOwner(
+        ID3D12GraphicsCommandList* cmdList,
+        D3D12_GPU_VIRTUAL_ADDRESS frameConstants,
+        const void* frameConstantsCpu,
+        const DescriptorHandle& materialPaletteSRV);
     Result<void> CreateMidPassResources();
     void DestroyMidPassResources();
     Result<void> CreateMidCompositePipeline(ID3D12Device* device);
@@ -313,11 +415,13 @@ private:
     DX12GraphicsPipeline m_dagRaymarchPipeline;
     DX12GraphicsPipeline m_sparseSurfacePipeline;
     DX12GraphicsPipeline m_sparseSurfaceDepthPrepassPipeline;
+    DX12GraphicsPipeline m_farSkyOwnerPipeline;
     DX12GraphicsPipeline m_overlayPipeline;
     DX12GraphicsPipeline m_backgroundCompositePipeline;
     DX12GraphicsPipeline m_midCompositePipeline;
     ComPtr<ID3D12CommandSignature> m_sparseSurfaceDrawSignature;
     CompiledShader m_fullscreenVS;
+    CompiledShader m_temporalRaymarchPS;
     CompiledShader m_fullscreenPS;
     CompiledShader m_midPassPS;
     CompiledShader m_dagRaymarchPS;
@@ -325,16 +429,38 @@ private:
     CompiledShader m_sparseSurfacePS;
     CompiledShader m_sparseSurfaceEarlyDepthPS;
     CompiledShader m_sparseSurfaceDepthPrepassPS;
+    CompiledShader m_farSkyOwnerPS;
+    CompiledShader m_farHeightfieldGenerateCS;
     CompiledShader m_overlayPS;
     CompiledShader m_backgroundCompositePS;
     CompiledShader m_midCompositePS;
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_frameConstantUploads;
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_sparseSurfaceConstantUploads;
+    std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_farHeightfieldConstantUploads;
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_overlayConstantUploads;
     std::array<UploadBuffer, VENPOD::Window::BUFFER_COUNT> m_dagConstantUploads;
     GPUBuffer m_dummyRenderOwnershipUAV;
+    GPUBuffer m_farHeightfieldFaces;
+    GPUBuffer m_farMaxHeightCache;
+    GPUBuffer m_farMaxHeightScreenHorizon;
+    bool m_farMaxHeightCacheValid = false;
+    std::array<uint32_t, 3> m_farMaxHeightCacheKey = {};
+    GPUBuffer m_farHeightfieldFaceReadback;
+    UploadBuffer m_farHeightfieldFaceUpload;
+    UploadBuffer m_farHeightfieldVertexIdUpload;
+    UploadBuffer m_farHeightfieldIndexUpload;
+    D3D12_VERTEX_BUFFER_VIEW m_farHeightfieldVertexIdView = {};
+    D3D12_INDEX_BUFFER_VIEW m_farHeightfieldIndexView = {};
+    DX12ComputePipeline m_farHeightfieldGeneratePipeline;
+    DX12ComputePipeline m_farMaxHeightCacheGeneratePipeline;
+    DX12ComputePipeline m_farMaxHeightNoHitMaskPipeline;
+    DX12ComputePipeline m_backgroundHorizonTileMaskPipeline;
+    CompiledShader m_farMaxHeightCacheGenerateCS;
+    CompiledShader m_farMaxHeightNoHitMaskCS;
+    CompiledShader m_backgroundHorizonTileMaskCS;
 
     uint32_t m_currentFrameIndex = 0;
+    uint64_t m_farHeightfieldFrameSerial = 0;
     static constexpr uint64_t kFrameConstantUploadBytes = 512;
 
     // RTV handles for swapchain buffers
@@ -351,6 +477,45 @@ private:
     uint32_t m_backgroundPassWidth = 0;
     uint32_t m_backgroundPassHeight = 0;
     bool m_backgroundPassSurfaceRaymarchFillLastFrame = false;
+    TemporalTarget m_backgroundHorizonTileMask;
+    uint32_t m_backgroundHorizonTileMaskWidth = 0;
+    uint32_t m_backgroundHorizonTileMaskHeight = 0;
+    GPUBuffer m_backgroundHorizonTileList;
+    GPUBuffer m_backgroundHorizonTileDrawArgs;
+    uint32_t m_backgroundHorizonTileListCapacity = 0;
+
+    // --- Temporal far-march reprojection (VENPOD_RAYMARCH_TEMPORAL) ---
+    // Double-buffered history (cur = frameIndex&1): the temporal raymarch PS writes color/distance/meta
+    // for MARCHED pixels (3-MRT), CS_TemporalReproject [Stage 2] writes REUSED pixels via UAV; together
+    // they cover every background pixel (mask partition). Composite reads HistoryColor[cur].
+    TemporalTarget m_temporalColor[2];     // R16G16B16A16_FLOAT
+    TemporalTarget m_temporalDistance[2];  // R32_FLOAT
+    TemporalTarget m_temporalMeta[2];      // R32_UINT (valid/age)
+    TemporalTarget m_temporalMarchMask;    // R8_UINT (compute writes, PS samples; cleared all-march in 1b-ii)
+    uint32_t m_temporalWidth = 0;
+    uint32_t m_temporalHeight = 0;
+    uint64_t m_temporalFrameCounter = 0;
+    // Stage 2b motion reprojection: 2-pass depth-resolved forward-scatter (CS_TemporalReproject).
+    DX12ComputePipeline m_temporalReprojectDepthPipeline;   // pass 1: InterlockedMin nearest distance
+    DX12ComputePipeline m_temporalReprojectColorPipeline;   // pass 2: write color where won + mask
+    CompiledShader m_temporalReprojectDepthCS;
+    CompiledShader m_temporalReprojectColorCS;
+    // Last-frame camera basis for the static-camera detector (same-UV tile reuse is only valid when
+    // the camera barely moved; under motion the temporal pass falls back to marching every pixel).
+    bool m_temporalLastCamValid = false;
+    float m_temporalLastCamPos[3] = {0.0f, 0.0f, 0.0f};
+    float m_temporalLastCamFwd[3] = {0.0f, 0.0f, 0.0f};
+    // Full previous-frame camera basis for Stage 2b motion reprojection.
+    float m_temporalLastCamRight[3] = {0.0f, 0.0f, 0.0f};
+    float m_temporalLastCamUp[3] = {0.0f, 0.0f, 0.0f};
+    float m_temporalLastFov = 0.0f;
+    float m_temporalLastAspect = 1.0f;
+    bool m_temporalPrevCamValid = false;
+    DX12GraphicsPipeline m_temporalRaymarchPipeline;  // 3-MRT variant of the fullscreen raymarch
+    TemporalTarget m_farMaxHeightNoHitMask; // R8_UINT, 1 = skip only the far-height tail.
+    uint32_t m_farMaxHeightNoHitMaskWidth = 0;
+    uint32_t m_farMaxHeightNoHitMaskHeight = 0;
+    uint32_t m_farMaxHeightScreenHorizonTileCount = 0;
 
     // Low-resolution "mid" raymarch pass: rendered into a smaller color target
     // (alpha = mid coverage) then bilinear-upscale composited over the main RT,
@@ -362,6 +527,15 @@ private:
     D3D12_RESOURCE_STATES m_midPassColorState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     uint32_t m_midPassWidth = 0;
     uint32_t m_midPassHeight = 0;
+    bool m_farHeightfieldOwnerFaceCsvWritten = false;
+    bool m_farHeightfieldOwnerFaceCsvReadbackPending = false;
+    uint64_t m_farHeightfieldOwnerFaceCsvQueuedSerial = 0;
+    float m_farHeightfieldOwnerFaceCsvCamera[3] = {0.0f, 0.0f, 0.0f};
+    float m_farHeightfieldOwnerFaceCsvOrigin[2] = {0.0f, 0.0f};
+    GPUBuffer m_farMaxHeightHorizonReadback;
+    bool m_farMaxHeightHorizonCsvWritten = false;
+    bool m_farMaxHeightHorizonCsvReadbackPending = false;
+    uint64_t m_farMaxHeightHorizonCsvQueuedSerial = 0;
 
     // Configuration
     RendererConfig m_config;

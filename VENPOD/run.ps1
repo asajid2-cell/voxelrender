@@ -15,7 +15,11 @@ function Write-Error { Write-Host "[ERROR] $args" -ForegroundColor Red }
 function Write-Info { Write-Host "  $args" -ForegroundColor Gray }
 
 $projectRoot = $PSScriptRoot
-$buildDir = Join-Path $projectRoot "build"
+$buildDir = if (-not [string]::IsNullOrWhiteSpace($env:VENPOD_BUILD_DIR)) {
+    $env:VENPOD_BUILD_DIR
+} else {
+    Join-Path $projectRoot "build"
+}
 
 Write-Host "VENPOD - Run Script" -ForegroundColor Magenta
 

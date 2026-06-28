@@ -1,0 +1,37 @@
+id: venpod_prod_motion_guard
+description: Build VENPOD, run production motion replay, and gate the real prod FPS target from parsed perf metrics.
+
+target:
+  type: process
+  name: venpod-prod-motion
+
+actions:
+  - process.run:
+      label: venpod_prod_motion_guard
+      cwd: Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD
+      timeout_s: 900
+      command: >
+        powershell -NoProfile -ExecutionPolicy Bypass
+        -File "Z:/328/CMPUT328-A2/codexworks/301/3d/VENPOD/scripts/omni_prodbench_guard.ps1"
+        -Label "omni_prod_motion_guard"
+        -Frames 900
+        -Warmup 300
+        -Replay "mtns.rec"
+        -MaxBodyMaxMs 10.0
+        -MaxOver16 0
+        -MaxVisibleMissingNonzero 0
+        -MaxResidentMissingNonzero 0
+
+observations:
+  - process.logs
+  - test.results
+
+assertions:
+  - type: command_success
+    command: venpod_prod_motion_guard
+  - type: tests_pass
+
+artifacts:
+  require:
+    - report_json
+    - report_html

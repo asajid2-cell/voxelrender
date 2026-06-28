@@ -44,6 +44,7 @@ struct SparseClipmapConfig {
     float motionLookaheadMinSpeed = 64.0f;
     uint32_t motionLookaheadSteps = 3;
     uint32_t interestUpdateIntervalFrames = 1;
+    uint32_t heightInterestRebuildRingsPerFrame = 0;
     bool footprintInterestSignature = false;
     bool backlogAwarePump = false;
     float pumpBudgetMs = 0.0f;
@@ -66,6 +67,8 @@ struct SparseClipmapConfig {
     uint32_t asyncVisibleCriticalGenerationMaxEnqueuePerFrame = 16;
     uint32_t asyncVisibleCriticalGenerationMaxApplyPerFrame = 16;
     bool voxelInterestDetail = false;
+    uint32_t voxelInterestFineRingSideFanPairs = 2;
+    uint32_t voxelInterestViewFanPairs = 2;
     bool voxelInterestSignatureReuse = false;
     uint32_t voxelInterestSignatureReuseMaxAgeFrames = 1;
     // Frame-budgeted (incremental) voxel interest rebuild. When the camera crosses
@@ -932,6 +935,7 @@ private:
         uint32_t motionLookaheadMinSpeed = 0;
         uint32_t motionLookaheadSteps = 0;
         uint32_t interestUpdateIntervalFrames = 1;
+        uint32_t heightInterestRebuildRingsPerFrame = 0;
         uint32_t footprintInterestSignature = 0;
         uint32_t backlogAwarePump = 0;
         uint32_t pumpBudgetMs = 0;
@@ -947,6 +951,8 @@ private:
         uint32_t asyncVisibleCriticalGenerationMaxEnqueuePerFrame = 0;
         uint32_t asyncVisibleCriticalGenerationMaxApplyPerFrame = 0;
         uint32_t voxelInterestDetail = 0;
+        uint32_t voxelInterestFineRingSideFanPairs = 0;
+        uint32_t voxelInterestViewFanPairs = 0;
         uint32_t voxelInterestSignatureReuse = 0;
         uint32_t voxelInterestSignatureReuseMaxAgeFrames = 0;
         uint32_t sharedVoxelColumnCache = 0;
@@ -982,6 +988,7 @@ private:
                 motionLookaheadMinSpeed == other.motionLookaheadMinSpeed &&
                 motionLookaheadSteps == other.motionLookaheadSteps &&
                 interestUpdateIntervalFrames == other.interestUpdateIntervalFrames &&
+                heightInterestRebuildRingsPerFrame == other.heightInterestRebuildRingsPerFrame &&
                 footprintInterestSignature == other.footprintInterestSignature &&
                 backlogAwarePump == other.backlogAwarePump &&
                 pumpBudgetMs == other.pumpBudgetMs &&
@@ -1001,6 +1008,8 @@ private:
                 asyncVisibleCriticalGenerationMaxApplyPerFrame ==
                     other.asyncVisibleCriticalGenerationMaxApplyPerFrame &&
                 voxelInterestDetail == other.voxelInterestDetail &&
+                voxelInterestFineRingSideFanPairs == other.voxelInterestFineRingSideFanPairs &&
+                voxelInterestViewFanPairs == other.voxelInterestViewFanPairs &&
                 voxelInterestSignatureReuse == other.voxelInterestSignatureReuse &&
                 voxelInterestSignatureReuseMaxAgeFrames == other.voxelInterestSignatureReuseMaxAgeFrames &&
                 sharedVoxelColumnCache == other.sharedVoxelColumnCache &&
@@ -1304,6 +1313,8 @@ private:
     InterestSignature m_lastVoxelInterestSignature;
     bool m_lastVoxelInterestSignatureValid = false;
     uint32_t m_lastVoxelInterestBuildFrame = 0;
+    uint32_t m_heightInterestRebuildRingCursor = 0;
+    bool m_heightInterestRebuildInProgress = false;
     // Frame-budgeted voxel interest rebuild cursor: the next ring index to refresh
     // on a footprint-cell cross. While >0 the spread is mid-flight (some rings are
     // still carried from the prior set) so the signature must NOT be committed yet.
@@ -1342,6 +1353,7 @@ private:
     // once per stats frame; UINT32_MAX so the first call each frame always runs it.
     uint32_t m_lastFullStatsFrame = 0xFFFFFFFFu;
     uint32_t m_lastCoverageStatsFrame = 0xFFFFFFFFu;
+    uint32_t m_lastExpensiveCoverageStatsFrame = 0xFFFFFFFFu;
     bool m_statsHeavyRefreshOncePerFrame = false;
     bool m_statsHeavyTelemetryRequestedThisFrame = false;
     uint32_t m_lastMidMeshDeferredTiles = 0;
@@ -1462,6 +1474,8 @@ private:
     uint32_t m_dirtyVoxelEndSlot = 0;
     std::vector<uint32_t> m_dirtyHeightSlots;
     std::vector<uint32_t> m_dirtyVoxelSlots;
+    std::unordered_set<uint32_t> m_dirtyHeightSlotSet;
+    std::unordered_set<uint32_t> m_dirtyVoxelSlotSet;
     // Edit-invalidated bricks awaiting their budgeted regeneration (see
     // PumpEditedBrickRegens). The set mirrors the deque for O(1) dedup.
     std::deque<uint32_t> m_editRegenQueue;

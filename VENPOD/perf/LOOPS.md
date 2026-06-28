@@ -2303,3 +2303,2788 @@ NEXT (keep going -- all HARD multi-loop reworks, no quick levers left):
 3. Sub-noise CPU orchestration slices (gate on per-phase timers, not rawMs -- desktop too noisy).
 Measurement doctrine: trust degradation-immune signals (PERF_GPU/overdraw/composition/visibleMissing/
 brick counts); rawMs median is noise-dominated; PS_Raymarch edits cost a ~7-min recompile (prime cache).
+
+## Loop 60 (Codex + Claude partial) -- far no-hit split: raymarch removed, raster cliff exposed
+
+Context correction after the 2026-06-25 far-cache/no-hit work: the stationary spawn bottleneck is real
+full-res far raymarch, but the fast no-hit branch is NOT production-ready. Fixed-camera captures showed
+the no-hit branch replaces the hazy far atmospheric band with hard saturated blue sky even though
+visibleMissing=0/residentMissingSurface=0. Counters alone are insufficient; image gate still FAILS.
+
+Instrumentation added in `src/main_launcher.cpp`: expanded GPU timestamps from 7 to 8 and split the old
+`sparseSurfaceMs` bucket into `sparseNearSurfaceMs` and `sparseMidMeshMs`, preserving total
+`sparseSurfaceMs`. Build command:
+`cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat"" -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`
+passed (only existing `rayDir` shadow warnings).
+
+Verifier/control: `scripts/statbench.ps1 -Temporal 0 -Frames 420`, parse only frame > 360 to avoid the
+startup/catchup window. All runs had visibleMissingNonzero=0 and residentMissingNonzero=0.
+
+Post-catchup GPU p50:
+- `split_baseline_pre1_420` (`VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`, no no-hit, surface prepass=1):
+  `gpu=23.87 ray=21.45 surface=2.19 near=1.80 mid=0.36 upload=0.08`.
+- `split_nohit_pre0_420` (`VENPOD_FAR_MAX_HEIGHT_NO_HIT_MASK=1`, surface prepass=0):
+  `gpu=17.85 ray=0.10 surface=15.94 near=9.11 mid=6.33 upload=0.28`.
+- `split_nohit_pre1_420` (`VENPOD_FAR_MAX_HEIGHT_NO_HIT_MASK=1`, surface prepass=1):
+  `gpu=20.68 ray=0.07 surface=19.33 near=14.03 mid=5.23 upload=0.26`.
+
+Conclusion: the no-hit mask proves the far raymarch has huge removable cost, but the current branch
+does not turn that into production FPS. It shifts the measured GPU time into raster (near surface +
+mid mesh), with nearly identical sparse surface face counts post-catchup, and forcing the depth prepass
+back on worsens it. This is NOT far max-height cache generation in stationary mode (`raymarchMs` stays
+~0.1ms after the cache is warm).
+
+Claude partial tandem audit independently found a motion-path landmine: `GenerateFarMaxHeightCache`
+keys the cache by quantized origin AND raw cameraPosition components (`Renderer.cpp` cache key around
+2603-2610). Since `FarTerrainHeightVoxelized` is distance-quantized, the raw camera term prevents reuse
+for moving cameras; the full 12-mip max-height cache can regenerate every moving frame. Do not "fix" by
+dropping camera from the key until the cache is made conservatively valid over a camera-position cell or
+distance band.
+
+Next loop: prove why no-hit raster time jumps. Candidate hypotheses: GPU power-state/idle-gap artifact
+from CPU-heavy statbench, depth/stencil/composite state change, or mid/surface shader path interaction.
+Verifier should include a controlled post-catchup run with stable CPU load and/or an isolated raster-only
+micro A/B, plus a visual gate for the hard-blue-sky regression. Production far-cache work must also add a
+conservative moving-camera cache key/envelope before any motion benchmark can be trusted.
+
+## Loop 61 (Codex + Claude) -- no-hit "raster cliff" is draw-path slowdown under cheap far shader, not cull/cache
+
+Added finer GPU timestamp instrumentation in `src/main_launcher.cpp`: `PERF_GPU` now preserves the
+existing `sparseSurfaceMs/sparseNearSurfaceMs/sparseMidMeshMs` fields and appends
+`sparseNearCullMs/sparseNearDrawMs/sparseMidSetupMs/sparseMidDrawMs`. Also added the diagnostic-only,
+default-off `VENPOD_GPU_DRAIN_SURFACE_TIMESTAMPS=1` verifier, which transitions the backbuffer
+RTV->PSR->RTV before the near/mid draw-complete timestamp markers to force a render-target drain for
+bucket-attribution testing. Build passed with only the pre-existing `rayDir` shadow warnings.
+
+Verifier commands: stationary `scripts/statbench.ps1 -Temporal 0 -Frames 420`, parse frame > 360,
+all runs `visibleMissingNonzero=0`.
+
+Measured split:
+- `split2_baseline_pre1_420`: `gpu=23.80 ray=21.47 surface=2.16 nearDraw=1.71 midDraw=0.36 upload=0.08`.
+- `split2_nohit_pre0_420`: `gpu=18.24 ray=0.10 surface=16.16 nearCull=0.41 nearDraw=8.63 midDraw=6.38 upload=0.28`.
+- `split2_baseline_pre1_drain_420` (`VENPOD_GPU_DRAIN_SURFACE_TIMESTAMPS=1`): `gpu=24.71 ray=22.26 surface=2.27 nearDraw=1.82 midDraw=0.38`.
+- `split2_skipfarheight_pre1_420` (`VENPOD_RAYMARCH_PROBE_SKIP_FAR_HEIGHT=1`, no no-hit mask): `gpu=21.45 ray=12.23 surface=8.24 nearDraw=5.91 midDraw=1.66 upload=0.16`.
+
+Conclusions:
+- The no-hit slowdown is not the GPU cull dispatch: no-hit `nearCullP50=0.41`; the time is in the
+  near/mid surface draw buckets.
+- The simple "surface tail was hidden under the ray bucket" theory is refuted by the drain verifier:
+  forcing a backbuffer drain before surface timestamps did not move baseline surface time up or ray time
+  down; total stayed in the same range.
+- The slowdown is also not uniquely caused by the no-hit resource/mask path: skipping far-height inside
+  the normal raymarch PSO, without enabling no-hit, partially reproduces the surface draw slowdown as
+  the raymarch bucket gets cheaper. This points to GPU operating-state / less-heavy-far-shader
+  interaction, not a new inherent 50-70 FPS raster bound.
+- The current no-hit branch remains visually invalid: it replaces the hazy far band with hard blue sky,
+  and `visibleMissing=0` does not catch that. Do not ship it; use it only as a diagnostic proof that
+  far-raymarch cost is removable.
+
+Next loop: stop chasing the draw-bucket inflation as the primary blocker. The production path is still
+the additive far-terrain owner/cache with raymarch fallback and visual parity at the mid->far handoff.
+Keep the fine GPU split and drain flag as diagnostics, but the next implementation gate is visual:
+far owner must reduce `backgroundPixels/raymarchMs` without sky substitution, with `visibleMissing=0`,
+`residentMissingSurface=0`, and no handoff seam.
+
+## Loop 62 (Codex) -- far-horizon visual verifier built and proven red/green
+
+Purpose: convert the known no-hit/far-cache visual failure into a trusted gate before more far-cache
+optimization. The current no-hit path proves the far raymarch cost is removable, but it is not
+shippable because it turns the hazy far band into hard blue sky while `visibleMissing=0` still passes.
+
+Added:
+- `tools/far_horizon_visual_check.js`: dependency-free 24-bit BMP comparator. It reports
+  `upper_sky`, `horizon_sky`, `far_horizon_band`, `mid_terrain_control`, and `full_frame` metrics
+  (`mae`, `maxDelta`, average RGB, RGB bias). It enforces the sky/horizon bands plus full-frame MAE;
+  the terrain band is a reported control, not a failure criterion.
+- `scripts/check_far_horizon_visual.ps1`: PowerShell wrapper for the Node checker.
+
+Verifier proof:
+- GREEN control:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check_far_horizon_visual.ps1
+  -Reference build/bin/statbench/visual_baseline_held_420/cap/engine_frame_0400.bmp
+  -Candidate build/bin/statbench/visual_baseline_held_420/cap/engine_frame_0400.bmp`
+  exited `0`, `FAR_HORIZON_VISUAL ok=true`, all bands `mae=0 maxDelta=0`.
+- RED known-bad:
+  `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check_far_horizon_visual.ps1
+  -Reference build/bin/statbench/visual_baseline_held_420/cap/engine_frame_0400.bmp
+  -Candidate build/bin/statbench/visual_nohit_held_420/cap/engine_frame_0400.bmp`
+  exited `1`, `FAR_HORIZON_VISUAL ok=false`: `upper_sky mae=16.305`,
+  `horizon_sky mae=26.855 maxDelta=126`, `far_horizon_band mae=23.435`, `full_frame mae=8.2`.
+- Syntax gate: `node --check tools/far_horizon_visual_check.js` exited `0`.
+
+Loop result: verifier is now trusted for the fixed-camera far-horizon artifact. The next optimization
+loop may only claim no-hit/far-cache progress if it preserves the green control, flips the current
+known-bad red case toward green, and still passes the non-visual invariants:
+`visibleMissing=0`, `residentMissingSurface=0`, and no loss of fallback raymarch coverage.
+
+## Loop 63 (Codex) -- no-hit haze shader tweak rejected; capture gate corrected
+
+Goal: make the fast far no-hit path visually closer to the baseline far-horizon haze while preserving
+the measured raymarch collapse.
+
+Attempted candidates:
+- `visual_nohit_haze1_420`: added a local atmospheric lift in `FarBackgroundShade`. Build was clean
+  (`cmake --build build --config Release --parallel --target VENPOD`, known `vswhere.exe` warning only),
+  shader was copied to `build/bin/assets`, PS_Raymarch cache was cleared, and the runtime compiled a
+  new `PS_Raymarch` CSO. Result: bitmap SHA matched the old known-bad no-hit capture exactly; visual
+  verifier unchanged. Perf remained fast: `gpuFrameMsP50=21.25`, `raymarchMsP50=0.08`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- `visual_nohit_haze2_420`: moved the lift to `DebugBackgroundMissHit`. Result: still byte-identical
+  to the old known-bad no-hit capture. Perf: `gpuFrameMsP50=22.07`, `raymarchMsP50=0.08`,
+  no missing counters.
+- `visual_nohit_sky1_420`: moved the lift to `SkyColor`, compile-time gated to
+  `RAYMARCH_BACKGROUND_ONLY && RAYMARCH_FAR_MAX_HEIGHT_NO_HIT_MASK`. Result: still byte-identical while
+  `SPARSE_STARTUP_PUBLIC_RENDER_HELD frame=400 ... shaderUnsafeBlocked=1`, proving the capture was
+  still sampling a held/private path for this iteration, not the edited public PSO.
+
+Verifier/capture correction:
+- Updated `scripts/statbench.ps1` with `-ShaderUnsafeBlocks` (default `1`, preserving existing safe
+  behavior). This lets visual-candidate runs explicitly set
+  `VENPOD_SPARSE_STARTUP_SHADER_UNSAFE_BLOCKS=0` without weakening the default benchmark.
+- `visual_nohit_sky1_public_420` ran with `-ShaderUnsafeBlocks 0`. Frame 400 log no longer had a
+  public-render-held line; `PERF_SPARSE_READINESS frame=400` showed `missing=0` and
+  `residentMissingSurface=0`. The capture SHA changed (`AFD76095...` vs old no-hit `008F1B...`), so
+  the public path was finally being captured.
+- The SkyColor tweak still failed the visual gate and was rejected:
+  `upper_sky mae=16.305`, `horizon_sky mae=26.857`, `far_horizon_band mae=23.436`,
+  `full_frame mae=8.204`; perf stayed in the expected fast range
+  (`gpuFrameMsP50=22.36`, `raymarchMsP50=0.08`, `visibleMissingNonzero=0`,
+  `residentMissingNonzero=0`).
+
+Decision: reverted the shader-color tweak and restored `build/bin/assets/shaders/Graphics/PS_Raymarch.hlsl`;
+cleared the PS_Raymarch cache so the failed candidate is not left active. Keep the statbench switch and
+the public-path capture lesson. Next loop should not chase scalar sky tinting; the visual mismatch is
+structural. The likely next target is to inspect the no-hit ownership/color source with an explicit
+debug-owner capture (or a tiny debug color behind a new env/macro) and then make the cached far-horizon
+product produce a real haze-equivalent layer, not a post-hoc sky tint.
+
+## Loop 64 (Codex) -- far-owner miss-tail diagnostic; mesh-only owner is insufficient
+
+Purpose: answer the user's objection to the "50-70 fps bound" conclusion with measured current-state
+evidence, and prevent the next far-cache loop from optimizing the wrong surface. No renderer behavior
+was changed except removing the rejected `upperSkyLift` / `warmHorizonLift` tint block left in
+`FarBackgroundShade`; `build/bin/assets/shaders/Graphics/PS_Raymarch.hlsl` was resynced from source and
+the PS_Raymarch runtime cache was cleared.
+
+Added derived fields to `scripts/parse_farfield_perf.ps1`:
+`farTerrainHitCallsP50`, `farTerrainHitCallPctP50`, `farTerrainNonHitCallPctP50`,
+`farTerrainMissCallPctP50`, `farTerrainSkyBreakMissPctP50`, and height-eval percentages for
+sky-break, deep-miss, and hit outcomes. This is parser-only diagnostic work; it does not weaken any
+gate.
+
+Verifier commands, all exit `0`:
+- `parse_farfield_perf.ps1 -LogPath build/bin/statbench/visual_current_baseline_public_420/run.log
+  -MinFrame 200 -Label visual_current_baseline_public_420`
+- `parse_farfield_perf.ps1 -LogPath build/bin/statbench/farowner_current_420/run.log
+  -MinFrame 200 -Label farowner_current_420`
+- `parse_farfield_perf.ps1 -LogPath build/bin/statbench/farowner_segmented_420/run.log
+  -MinFrame 200 -Label farowner_segmented_420`
+
+Measured result:
+- Baseline: `gpu=23.79 ray=21.73 backgroundPixels=799251`, but far-height hits are only
+  `farTerrainHitCallPctP50=3.03%`; non-hit/miss calls are `96.97%`. Height evals are mostly
+  miss work: sky-break `46.28%`, deep-miss `50.15%`, hits only `3.56%`.
+- `farowner_current_420`: `backgroundPixels=780656`, `ray=21.86`; hit calls fall to `0.63%`,
+  non-hit calls rise to `99.37%`.
+- `farowner_segmented_420`: `backgroundPixels=778201`, `ray=24.31`; hit calls fall to `0.25%`,
+  non-hit calls rise to `99.75%`.
+- All three parsed runs report `visibleMissingNonzero=0` and `residentMissingNonzero=0`.
+
+Conclusion: the current additive far-owner prototype removes some actual far terrain hits, but the
+stationary cost is dominated by the miss / sky-break / deep-miss proof tail. A mesh-only far owner
+will not collapse the 21-24ms raymarch unless the cached product also provides a conservative
+horizon/no-hit/miss classifier or equivalent far-horizon visual product. The no-hit path proves the
+tail is removable (`raymarchMs ~0.10`) but remains visually invalid, so the next implementation loop
+should build/cache the far horizon classification and haze-equivalent output, not keep tuning scalar
+sky tint or only adding top-surface mesh coverage.
+
+Tandem note: an adversarial Claude review was requested, but the bridge stayed in thinking-only output
+for several minutes and produced no verdict. Local measured evidence above is the loop record.
+
+## Loop 65 (Codex) -- no-hit miss-resolver candidate rejected; visual mismatch is not the hidden-diagnostic branch
+
+Purpose: test the smallest possible follow-up to Loop 64's finding that most stationary far cost is
+miss/sky-break/deep-miss proof work. Candidate: keep `RAYMARCH_FAR_MAX_HEIGHT_NO_HIT_MASK` conservative
+and skip the expensive far-height march, but route no-hit pixels through `DebugBackgroundMissHit` while
+skipping only `DiagnosticFarTerrainWouldHit`, instead of returning `FarBackgroundShade`.
+
+Verifier setup:
+- Source shader was patched, copied to `build/bin/assets/shaders/Graphics/PS_Raymarch.hlsl`, and
+  `build/bin/.venpod_shader_cache/PS_Raymarch*` was cleared.
+- Build command:
+  `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat"" -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`
+  exited `0` (`ninja: no work to do`; known `vswhere.exe` warning).
+- Candidate run:
+  `scripts/statbench.ps1 -Temporal 0 -Frames 420 -Label nohit_miss_resolver_420 -ShaderUnsafeBlocks 0`
+  with `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`, `VENPOD_FAR_MAX_HEIGHT_NO_HIT_MASK=1`, and a frame-400
+  capture. The run exited `0`; quick summary: `settled gpuFrameMs p50=16.2 p90=17.91 max=31.94 n=209`,
+  `visibleMissingNonzero=0`.
+
+Measured counters:
+- `parse_farfield_perf.ps1 -LogPath build/bin/statbench/nohit_miss_resolver_420/run.log -MinFrame 200
+  -Label nohit_miss_resolver_420` exited `1` only because `PERF_RENDER_COMPOSITION` samples were absent
+  in this run. The parsed GPU/missing fields were still usable:
+  `gpuFrameMsP50=16.07`, `raymarchMsP50=0.10`, `sparseSurfaceMsP50=14.68`,
+  `sparseNearDrawMsP50=7.19`, `sparseMidDrawMsP50=6.69`, `visibleMissingNonzero=0`,
+  `residentMissingNonzero=0`.
+- Frame-400 readiness confirmed public path and no holes:
+  `PERF_SPARSE_READINESS frame=400 total=19216 missing=0 ... residentMissingSurface=0`.
+
+Visual gate:
+- `check_far_horizon_visual.ps1 -Reference build/bin/statbench/visual_current_baseline_public_420/cap/engine_frame_0400.bmp
+  -Candidate build/bin/statbench/nohit_miss_resolver_420/cap/engine_frame_0400.bmp` exited `1`.
+- Failure was essentially the same horizon/sky class as the earlier no-hit path:
+  `upper_sky mae=16.305`, `horizon_sky mae=26.854 maxDelta=126`,
+  `far_horizon_band mae=23.434`, `full_frame mae=8.201`; `mid_terrain_control mae=0.487`.
+
+Decision: rejected and reverted. The shader candidate was removed from source and runtime copies, and
+the PS_Raymarch cache was cleared again. This rules out the cheap explanation that the no-hit visual
+failure is merely caused by bypassing `DebugBackgroundMissHit`'s normal miss classification. The fast
+path still needs a cached far-horizon/atmosphere-equivalent product or a conservative reuse of the real
+baseline background color, not another scalar sky or branch-selection tweak. Keep the no-hit mask as a
+trusted work-removal diagnostic, not a shippable path.
+
+## Loop 66 (Codex) -- no-hit "raymarch collapse" was a compute-PSO rebind bug, not a real optimization
+
+Purpose: explain why no-hit candidate runs had `raymarchMs ~0.1` but no `PERF_RENDER_COMPOSITION`.
+This was blocking valid A/B proof and made the no-hit path look much faster than it actually was.
+
+Root cause:
+- `Renderer::RenderVoxels` bound the fullscreen graphics pipeline before generating far max-height /
+  no-hit products.
+- `GenerateFarMaxHeightNoHitMask` dispatches compute PSOs. In the non-temporal path, the renderer did
+  not re-bind the fullscreen graphics PSO before `DrawInstanced(3, 1, 0, 0)`.
+- Evidence before the fix:
+  `nohit_current_composition_520` had `gpuFrameMsP50=17.32`, `raymarchMsP50=0.10`,
+  `visibleMissingNonzero=0`, but `compositionSamples=0`, no `PERF_RENDER_OWNERSHIP`, and
+  `PERF_SPARSE_OWNERSHIP_PRESSURE frame=500 terrainPct=0`. The frame-500 candidate sky averaged
+  `107,140,189`, matching the background clear color (`0.42,0.55,0.74`) rather than an edited shader
+  branch. This also explains why prior `FarBackgroundShade`/`SkyColor` color edits appeared to do
+  nothing.
+
+Change:
+- In `src/Graphics/Renderer.cpp`, after `GenerateFarMaxHeightCache` and
+  `GenerateFarMaxHeightNoHitMask`, re-bind `m_fullscreenPipeline`, reset stencil ref, and restore the
+  frame CBV for the non-temporal path before any fullscreen background draw.
+
+Verifier:
+- Build command:
+  `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat"" -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`
+  exited `0` (known `vswhere.exe` warning only).
+- Run:
+  `scripts/statbench.ps1 -Temporal 0 -Frames 520 -Label nohit_rebind_composition_520 -ShaderUnsafeBlocks 0`
+  with `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`, `VENPOD_FAR_MAX_HEIGHT_NO_HIT_MASK=1`, and a frame-500
+  capture exited `0`; quick summary `settled gpuFrameMs p50=23.49 p90=25.06`, `visibleMissingNonzero=0`.
+- Parse:
+  `parse_farfield_perf.ps1 -LogPath build/bin/statbench/nohit_rebind_composition_520/run.log -MinFrame 300
+  -Label nohit_rebind_composition_520` exited `0`:
+  `compositionSamples=216`, `gpuFrameMsP50=23.46`, `raymarchMsP50=20.68`,
+  `backgroundPixelsP50=798616`, `surfaceOwnedPixelsP50=1275043`, `visibleMissingNonzero=0`,
+  `residentMissingNonzero=0`.
+- Frame-500 proof:
+  `PERF_RENDER_OWNERSHIP ... shaderFrame=500 total=797152 ... sky=777071 ... farTerrainWork ... cacheReject=37382`
+  and `PERF_RENDER_COMPOSITION frame=500 screen=2073600 backgroundPixels=797152 surfaceOwnedPixels=1276448`.
+
+Visual gate:
+- `check_far_horizon_visual.ps1` against `visual_current_baseline_public_420/cap/engine_frame_0400.bmp`
+  and `nohit_rebind_composition_520/cap/engine_frame_0500.bmp` exited `1`, but the failure class changed:
+  the horizon bands are now close on average (`horizon_sky mae=4.398`, `far_horizon_band mae=4.303`),
+  while upper sky/full-frame still fail (`upper_sky mae=12.606`, `full_frame mae=5.381`) and max deltas
+  remain high. This is no longer the hard clear-color no-draw artifact.
+
+Conclusion:
+- The previous claim that the no-hit mask alone collapses `raymarchMs` from ~21ms to ~0.1ms was invalid.
+  It mostly measured a background draw that was not executing correctly after compute PSO dispatch.
+- With the graphics rebind fixed, the no-hit mask is a small safe cull (`raymarchMs ~20.7ms` vs baseline
+  ~21.7ms; `backgroundPixels` barely moves). The dominant far miss-tail still needs a real architectural
+  cache/owner, but the work-removal proof must be re-established with valid composition telemetry.
+
+## Loop 67 (Codex) -- corrected far-owner A/B: current mesh owner is not enough
+
+Purpose: remeasure the existing additive far-height owner after Loop 66's graphics-PSO rebind fix. The
+older `farowner_current_420` / `farowner_segmented_420` data was directionally useful, but it predated the
+no-hit/composition correction and could not be the final evidence for the user's architecture question.
+
+Verifier command:
+- `scripts/statbench.ps1 -Temporal 0 -Frames 520 -Label farowner_rebind_520 -ShaderUnsafeBlocks 0`
+  with `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`, `VENPOD_FAR_HEIGHT_OWNER=1`,
+  `VENPOD_FAR_HEIGHT_OWNER_GPU_GEN=1`, no no-hit mask, and a frame-500 capture. Exit `0`.
+  Quick summary: `gpuFrameMs p50=23.75`, `visibleMissingNonzero=0`.
+
+Parse:
+- `scripts/parse_farfield_perf.ps1 -LogPath build/bin/statbench/farowner_rebind_520/run.log -MinFrame 300
+  -Label farowner_rebind_520` exited `0`.
+- Settled result: `gpuFrameMsP50=23.75`, `raymarchMsP50=21.42`,
+  `backgroundPixelsP50=780331`, `surfaceOwnedPixelsP50=1293282`,
+  `farTerrainHitCallPctP50=0.63%`, `farTerrainNonHitCallPctP50=99.37%`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Frame 500 proof: `PERF_RENDER_COMPOSITION frame=500 ... backgroundPixels=779835
+  surfaceOwnedPixels=1293765`; `PERF_RENDER_OWNERSHIP ... farHeight=1687 sky=774810
+  farTerrainWork ... calls=284459 miss=282776 skyBreak=166777 heightEval=2986312`.
+
+Visual gate:
+- `scripts/check_far_horizon_visual.ps1` against
+  `visual_current_baseline_public_420/cap/engine_frame_0400.bmp` and
+  `farowner_rebind_520/cap/engine_frame_0500.bmp` exited `1`.
+- Average difference is small (`full_frame mae=0.408`, `far_horizon_band mae=1.195`), but max-delta
+  seam/horizon failures remain (`horizon_sky maxDelta=151`, `far_horizon_band maxDelta=151`, threshold 96).
+
+Conclusion:
+- The current additive far-height owner is safe in the hole sense, but it is not the architectural win yet:
+  it removes only about 19k of the ~799k baseline background pixels and leaves the raymarch at ~21.4ms.
+- It mostly removes the already-small true far-terrain-hit subset (`farTerrainHitCallPct` drops from
+  baseline ~3.03% to ~0.63%). The cost is still dominated by sky-break/deep-miss proof work over almost the
+  same background pixel count.
+- Claude's high-level root-cause diagnosis remains right (full-res procedural far background dominates),
+  but the existing far mesh/cache prototype does not prove a path to 100+ fps. The next architecture loop
+  must make the cached product own/classify most background pixels, including the miss/horizon band, while
+  retaining raymarch fallback for uncovered tiles and fixing the handoff max-delta seam.
+
+## Loop 68 (Codex) -- existing far max-height DDA rejects work but not time; full far-tail removal lower bound
+
+Purpose: separate three candidates that were previously conflated: the screen-space no-hit horizon mask,
+the per-ray far max-height DDA, and the non-shippable "skip far height entirely" lower bound. Loop 66's
+valid no-hit run only enabled `VENPOD_FAR_MAX_HEIGHT_NO_HIT_MASK=1`; it did not define
+`RAYMARCH_FAR_MAX_HEIGHT_DDA`.
+
+Verifier A -- per-ray DDA only:
+- Command: `scripts/statbench.ps1 -Temporal 0 -Frames 520 -Label farmaxdda_rebind_520
+  -ShaderUnsafeBlocks 0` with `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1` and
+  `VENPOD_RAYMARCH_FAR_MAX_HEIGHT_DDA=1`. Exit `0`; quick summary
+  `gpuFrameMs p50=23.74`, `visibleMissingNonzero=0`.
+- Parse exited `0`: `gpuFrameMsP50=23.74`, `raymarchMsP50=21.32`,
+  `backgroundPixelsP50=798616`, `surfaceOwnedPixelsP50=1275043`,
+  `farTerrainCallsP50=44289`, `farTerrainHeightEvalP50=576600`,
+  `farTerrainCacheRejectP50=251402`, `visibleMissingNonzero=0`,
+  `residentMissingNonzero=0`.
+- Visual gate exited `1`, but average drift was tiny (`full_frame mae=0.066`,
+  `far_horizon_band mae=0.152`); the same max-delta handoff failure remained (`maxDelta=151`).
+
+Verifier B -- non-shippable lower bound, skip the far-height tail:
+- Command: `scripts/statbench.ps1 -Temporal 0 -Frames 520 -Label skipfarheight_rebind_520
+  -ShaderUnsafeBlocks 0` with `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1` and
+  `VENPOD_RAYMARCH_PROBE_SKIP_FAR_HEIGHT=1`. Exit `0`; quick summary
+  `gpuFrameMs p50=20.99`, `visibleMissingNonzero=0`.
+- Parse exited `0`: `gpuFrameMsP50=20.87`, `raymarchMsP50=12.15`,
+  `sparseSurfaceMsP50=8.28`, `backgroundPixelsP50=798616`,
+  `farTerrainCallsP50=0`, `farTerrainHeightEvalP50=0`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Visual gate exited `1`: `far_horizon_band mae=2.666`, `full_frame mae=0.835`,
+  and the same `maxDelta=151` failure.
+
+Conclusion:
+- The existing per-ray DDA is not the production shape. It rejects most far-height tail calls
+  (`cacheReject ~251k`, calls drop ~296k -> ~44k, height evals ~3.1M -> ~0.58M), but GPU time barely
+  moves (`raymarchMs ~21.3ms`, frame ~23.7ms). The DDA's own per-pixel traversal/buffer-load control
+  flow is replacing the procedural tail cost inside the pixel shader.
+- Full tail removal is a real but bounded win under the corrected renderer: `raymarchMs` drops to
+  ~12.15ms, yet total frame only reaches ~20.9ms because the sparse-surface/timestamp bucket inflates
+  to ~8.28ms when the far shader becomes cheaper. This reproduces Loop 61's "raster cliff" shape with
+  valid composition telemetry.
+- Therefore, a shippable cache cannot just move the same per-pixel proof into `PS_Raymarch`. The next
+  architecture loop should build a cached/rasterized far-background owner/product that either writes
+  depth/color outside the fullscreen raymarch path or provides a very cheap screen/tile-level
+  background classification. It must also address the persistent horizon max-delta seam.
+
+## Loop 69 (Codex) -- aggressive sky split proves the removable sky-break cohort, but not shippable
+
+Purpose: measure whether the dominant sky-break/deep-miss cohort can be removed by a cheap classification
+before `RaymarchBackgroundField`, rather than moving the proof into the per-pixel DDA. This is a
+diagnostic/env-gated path only, not a default change.
+
+Change:
+- Added `VENPOD_RAYMARCH_AGGRESSIVE_SKY_PSO=1`, compiling the background-only PSO with
+  `RAYMARCH_BACKGROUND_AGGRESSIVE_SKY`.
+- Added `VENPOD_RAYMARCH_AGGRESSIVE_SKY_MIN_Y` (default `0.06`) plumbed through
+  `surfaceRasterParams.w`, so the ray-dir threshold can be tuned without recompiling the giant
+  `PS_Raymarch` shader.
+- The diagnostic classifies low-altitude, upward grazing background rays before
+  `RaymarchBackgroundField` and returns `SkyColor(rayDir)`. Defaults are unchanged.
+
+Build:
+- `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat""
+  -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`
+  exited `0` with the known `vswhere.exe` warning and pre-existing `rayDir` shadow warnings.
+
+Verifier A -- existing conservative fast-sky split:
+- `scripts/statbench.ps1 -Temporal 0 -Frames 520 -Label fastsky_rebind_520 -ShaderUnsafeBlocks 0`
+  with `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`, `VENPOD_RAYMARCH_FAST_SKY_PSO=1`.
+- Parse exited `0`: `gpuFrameMsP50=23.87`, `raymarchMsP50=21.66`,
+  `farTerrainCallsP50=295691`, `farTerrainHeightEvalP50=3131339`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Conclusion: the existing `rayDir.y > 0.42` split misses the expensive horizon/sky-break cohort.
+
+Verifier B -- aggressive sky split, threshold `0.06`, first haze-proxy shade:
+- `aggrsky_rebind_520` exited `0`: `gpuFrameMsP50=14.31`, `raymarchMsP50=4.75`,
+  `farTerrainCallsP50=8539`, `farTerrainHeightEvalP50=120893`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Visual failed badly because the cheap haze proxy was too dark:
+  `upper_sky mae=22.556`, `far_horizon_band mae=17.407`, `full_frame mae=8.319`.
+
+Verifier C -- aggressive sky split, threshold `0.06`, `SkyColor` shade:
+- `scripts/statbench.ps1 -Temporal 0 -Frames 520 -Label aggrsky_skycolor_006_520
+  -ShaderUnsafeBlocks 0` with `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_PSO=1`, `VENPOD_RAYMARCH_AGGRESSIVE_SKY_MIN_Y=0.06`.
+- Parse exited `0`: `gpuFrameMsP50=14.42`, `gpuFrameMsP90=27.98`, `raymarchMsP50=4.68`,
+  `sparseSurfaceMsP50=8.67`, `backgroundPixelsP50=798616`, `farTerrainCallsP50=8539`,
+  `farTerrainSkyBreakP50=0`, `farTerrainHeightEvalP50=120893`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Visual average was much closer than the haze-proxy attempt, but still failed the horizon gate:
+  `upper_sky mae=0`, `horizon_sky mae=1.716`, `far_horizon_band mae=2.325`,
+  `full_frame mae=0.616`, with the persistent `maxDelta=151` horizon/handoff failure.
+
+Conclusion:
+- The expensive sky-break cohort is removable by a cheap pre-background classification: far terrain
+  calls drop ~296k -> ~8.5k, height evals ~3.1M -> ~0.12M, and raymarch p50 drops ~21.7ms -> ~4.7ms.
+- The current diagnostic is not shippable: it still runs inside the fullscreen background PS,
+  leaves `backgroundPixels` unchanged, inflates the sparse-surface bucket to ~8.7ms, has poor p90
+  stability, and fails the visual max-delta gate. It also removes some real far-height hits
+  (`farHeight` falls to ~3.2k), so the threshold/classifier needs a conservative horizon/terrain
+  mask, not a raw `rayDir.y` cut.
+- This redirects the next production loop: build a conservative screen/tile far-background classifier
+  that marks only proven-sky/atmosphere pixels before the heavy background path, then eventually
+  writes color/stencil outside `PS_Raymarch` so those pixels leave the background composition entirely.
+
+## Loop 70 (Codex) -- far max-height screen-mask tuning rejects the current column-horizon shape
+
+Purpose: before designing a new far-background owner, verify whether the existing far max-height
+screen-horizon product is simply over-coarse. The current path projects a conservative max-height shell
+into one horizon Y per 8px screen-X tile and the pixel shader skips only the far-height tail above that
+horizon. Defaults were hard-coded at project mip 3 and 4px dilation.
+
+Change:
+- Added diagnostic env knobs, defaulting to the existing behavior:
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_MIP` and
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_DILATION`.
+- Startup logs now include `farMaxHeightMaskMip` and `farMaxHeightMaskDilation`.
+- Renderer now uses those config values when choosing the projected cache mip and screen dilation.
+- Clarified the fullscreen root comment: t20 is the per-column horizon buffer, not a full-resolution
+  pixel mask. The full-resolution `FarMaxHeightNoHitMask` texture/pass-2 compute path is dead in the
+  current renderer and is not the explanation for the weak no-hit result.
+
+Build:
+- `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat""
+  -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`
+  exited `0` with the known `vswhere.exe` warning and pre-existing `rayDir` shadow warnings.
+
+Verifier A -- finer projection, same dilation:
+- Command: `scripts/statbench.ps1 -Temporal 0 -Frames 420 -Label nohit_mip2_dil4_420
+  -ShaderUnsafeBlocks 0` with `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_FAR_MAX_HEIGHT_NO_HIT_MASK=1`,
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_MIP=2`,
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_DILATION=4`.
+- Quick summary: `settled gpuFrameMs p50=23.49 p90=27.57`, `visibleMissingNonzero=0`.
+- Parse exited `0`: `gpuFrameMsP50=23.49`, `raymarchMsP50=21.09`,
+  `backgroundPixelsP50=799251`, `surfaceOwnedPixelsP50=1274349`,
+  `farTerrainCacheRejectP50=38954`, `farTerrainCallsP50=257019`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+
+Verifier B -- aggressive finer projection, no dilation:
+- Command: `scripts/statbench.ps1 -Temporal 0 -Frames 420 -Label nohit_mip1_dil0_420
+  -ShaderUnsafeBlocks 0` with the same no-hit flags plus
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_MIP=1`,
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_DILATION=0`.
+- Quick summary: `settled gpuFrameMs p50=24.35 p90=27.28`, `visibleMissingNonzero=0`.
+- Parse exited `0`: `gpuFrameMsP50=24.40`, `raymarchMsP50=22.17`,
+  `backgroundPixelsP50=799251`, `surfaceOwnedPixelsP50=1274349`,
+  `farTerrainCacheRejectP50=0`, `farTerrainCallsP50=295973`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+
+Conclusion:
+- The existing per-column max-height horizon representation is not the production classifier. Finer
+  projection did not meaningfully reduce `backgroundPixels` or `raymarchMs`; an aggressive setting
+  actually rejected nothing and regressed time.
+- The next architecture loop should stop tuning this column horizon and build a different additive
+  far-background owner/classifier: a screen/tile product that owns proven sky/atmosphere pixels before
+  the heavy background shader, preserves a conservative silhouette band around far terrain, and leaves
+  uncertain pixels to the existing raymarch fallback. The far mesh remains useful only for true terrain
+  hits; it will not collapse the sky-break/deep-miss cohort by itself.
+
+## Loop 71 (Codex) -- far sky owner proves removability but rejects fullscreen color owner shape
+
+Purpose: test whether proven-sky/background pixels can be owned before the expensive background
+raymarch instead of only short-circuiting inside `PS_Raymarch`. This is diagnostic only, behind
+`VENPOD_FAR_SKY_OWNER=1`; the normal fallback raymarch remains enabled for all unowned pixels.
+
+Change:
+- Added an env-gated `PS_FarSkyOwner.hlsl` fullscreen pass that uses the same camera ray and sky
+  color as `PS_Raymarch`, classifies conservative upward rays (`VENPOD_FAR_SKY_OWNER_MIN_Y`, default
+  `0.06`), writes color, and increments stencil from `0` to `1` so the later background raymarch
+  skips those pixels.
+- Corrected the diagnostic PSO to use stencil `EQUAL ref 0` + `INCR_SAT`, and added
+  `[earlydepthstencil]` to the shader entry point.
+- The pass is off by default and disabled for temporal/background-split paths.
+
+Build:
+- `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat""
+  -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`
+  exited `0` with the known `vswhere.exe` warning.
+
+Verifier A -- same-binary owner OFF:
+- Command: `scripts/statbench.ps1 -Temporal 0 -Frames 420 -Label current_bgonly_off_420
+  -ShaderUnsafeBlocks 0` with `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`.
+- Quick summary: `settled gpuFrameMs p50=24.54 p90=27.23`, `visibleMissingNonzero=0`.
+- Parse exited `0`: `gpuFrameMsP50=24.47`, `raymarchMsP50=22.60`,
+  `sparseSurfaceMsP50=2.03`, `backgroundPixelsP50=799251`,
+  `surfaceOwnedPixelsP50=1274349`, `farTerrainCallsP50=295973`,
+  `farTerrainHeightEvalP50=3134802`, `visibleMissingNonzero=0`,
+  `residentMissingNonzero=0`.
+
+Verifier B -- far sky owner ON:
+- Command: `scripts/statbench.ps1 -Temporal 0 -Frames 420 -Label farskyowner_006_earlyz_420
+  -ShaderUnsafeBlocks 0` with `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_FAR_SKY_OWNER=1`, `VENPOD_FAR_SKY_OWNER_MIN_Y=0.06`.
+- Quick summary: `settled gpuFrameMs p50=19.41 p90=22.17`, `visibleMissingNonzero=0`.
+- Parse produced settled GPU counters but returned nonzero because composition rows were absent:
+  `gpuFrameMsP50=19.36`, `gpuFrameMsP90=22.17`, `raymarchMsP50=0.20`,
+  `raymarchMsP90=0.25`, `sparseSurfaceMsP50=18.11`, `sparseNearDrawMsP50=12.30`,
+  `sparseMidDrawMsP50=5.39`, `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+
+Conclusion:
+- The sky/background cohort is not inherently bound to the 22-23ms far raymarch: the diagnostic
+  collapses `raymarchMs` to about `0.2ms` and improves total GPU p50 by about `5.1ms` on the same
+  binary with no holes.
+- This pass shape is not the production answer. It moves most of the work into other GPU timing
+  buckets and still leaves total GPU at about `19.4ms` (~51 fps), with missing composition rows and
+  no visual parity gate yet. Treat the sparse bucket attribution as unreliable for this pass because
+  code order puts the owner in `RenderVoxels`, but the measured cost appears outside `raymarchMs`.
+- Next production architecture should avoid a full-resolution color/stencil owner pass. Build a
+  conservative cached/tiled owner or indirect draw product: far terrain mesh for true hits plus a
+  low-cost sky/empty/background ownership mask or coarse draw that writes only the proven background
+  regions, keeps a protected horizon/silhouette band, and lets uncertain pixels fall back to the
+  existing raymarch. The target is not "make the far raymarch cheaper"; it is "do not launch the
+  expensive far shader on the 799k known-empty pixels."
+- Tandem peer review was requested with these A/B numbers, but the bridge reported the background
+  job still running with no attached session after the wait window. No convergence claim recorded.
+
+## Loop 72 (Codex) -- direct far-owner timing exposes raster/prepass as the next bottleneck
+
+Purpose: resolve the Loop 71 attribution ambiguity. The far-sky owner collapsed `raymarchMs`, but
+the old GPU buckets reported the time under sparse surface raster. This loop added direct GPU
+timestamps inside `RenderVoxels` to split owner setup, far-sky owner draw, background core draw,
+and render tail under the same query heap/fence path as `PERF_GPU`.
+
+Change:
+- Expanded the main GPU timestamp ring from 10 to 13 query slots.
+- Added optional query indices to `Renderer::RenderVoxels()` and stamped:
+  `renderPreOwnerMs`, `farSkyOwnerMs`, `backgroundCoreMs`, `renderTailMs`.
+- Appended those fields to `PERF_GPU` while preserving existing field names.
+- Updated `scripts/parse_farfield_perf.ps1` to report the new p50 fields.
+
+Build:
+- `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat""
+  -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`
+  exited `0`; only the known `rayDir` shadow warnings appeared.
+
+Verifier A -- same-binary owner OFF:
+- `scripts/statbench.ps1 -Temporal 0 -Frames 420 -Label timing_split_owner_off_420
+  -ShaderUnsafeBlocks 0` with `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`.
+- Parse: `gpuFrameMsP50=24.26`, `raymarchMsP50=22.25`,
+  `renderPreOwnerMsP50=0`, `farSkyOwnerMsP50=0`, `backgroundCoreMsP50=22.25`,
+  `renderTailMsP50=0`, `sparseSurfaceMsP50=2.08`,
+  `sparseNearDrawMsP50=1.54`, `sparseMidDrawMsP50=0.38`,
+  `backgroundPixelsP50=799251`, `farTerrainCallsP50=295973`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+
+Verifier B -- far-sky owner ON:
+- `scripts/statbench.ps1 -Temporal 0 -Frames 420 -Label timing_split_farskyowner_006_420
+  -ShaderUnsafeBlocks 0` with `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_FAR_SKY_OWNER=1`, `VENPOD_FAR_SKY_OWNER_MIN_Y=0.06`.
+- Parse returned nonzero only because composition rows vanish when the raymarch is almost fully
+  skipped. GPU counters are valid: `gpuFrameMsP50=18.89`, `raymarchMsP50=0.20`,
+  `renderPreOwnerMsP50=0`, `farSkyOwnerMsP50=0.14`, `backgroundCoreMsP50=0.06`,
+  `renderTailMsP50=0`, `sparseSurfaceMsP50=17.74`,
+  `sparseNearDrawMsP50=11.95`, `sparseMidDrawMsP50=5.38`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+
+Verifier C -- far-sky owner ON, render ownership stats OFF:
+- `scripts/statbench.ps1 -Temporal 0 -Frames 360 -Label timing_split_farskyowner_006_ownoff_360
+  -ShaderUnsafeBlocks 0` with `VENPOD_SPARSE_RENDER_OWNERSHIP=0`.
+- Parse: `gpuFrameMsP50=18.58`, `raymarchMsP50=0.19`, `farSkyOwnerMsP50=0.13`,
+  `backgroundCoreMsP50=0.06`, `sparseSurfaceMsP50=17.16`,
+  `sparseNearDrawMsP50=11.01`, `sparseMidDrawMsP50=5.49`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+
+Verifier D -- far-sky owner ON, surface depth prepass OFF:
+- `scripts/statbench.ps1 -Temporal 0 -Frames 360 -Label timing_split_farskyowner_006_pre0_360
+  -ShaderUnsafeBlocks 0` with `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`.
+- Parse: `gpuFrameMsP50=15.55`, `raymarchMsP50=0.21`, `farSkyOwnerMsP50=0.16`,
+  `backgroundCoreMsP50=0.06`, `sparseSurfaceMsP50=14.02`,
+  `sparseNearDrawMsP50=6.46`, `sparseMidDrawMsP50=6.73`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+
+Verifier E -- far-sky owner ON, surface depth prepass OFF, ownership stats OFF:
+- `scripts/statbench.ps1 -Temporal 0 -Frames 360 -Label timing_split_farskyowner_006_pre0_ownoff_360
+  -ShaderUnsafeBlocks 0` with `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`,
+  `VENPOD_SPARSE_RENDER_OWNERSHIP=0`.
+- Parse: `gpuFrameMsP50=15.68`, `raymarchMsP50=0.22`, `farSkyOwnerMsP50=0.16`,
+  `backgroundCoreMsP50=0.06`, `sparseSurfaceMsP50=14.06`,
+  `sparseNearDrawMsP50=6.51`, `sparseMidDrawMsP50=6.75`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+
+Conclusion:
+- The far-sky owner pass is not expensive. It costs about `0.13-0.16ms` p50, and the remaining
+  background core costs about `0.06ms`. The direct timestamps refute the "fullscreen owner pass is
+  the new 18ms cost" theory.
+- Once the heavy far raymarch is removed, sparse raster becomes the dominant exposed GPU cost.
+  With the current depth prepass it is about `17-18ms`; turning the prepass off drops total GPU to
+  about `15.6ms`, but raster is still about `14ms`.
+- Render ownership/composition atomics are not the cause: disabling them changes little.
+- Next production loop should pivot from far-sky masking to exposed-raster optimization and visual
+  validation: make depth-prepass policy adaptive/off for the far-owned path, then reduce the near/mid
+  mesh raster load itself (face count/overdraw/LOD/indirect cluster coverage). The far-field owner
+  remains necessary, but by itself it reveals a second bottleneck rather than producing production FPS.
+- Tandem cross-check: converged. The delayed Claude review framed the same result as foreground
+  overlap exposure: the old 22ms background raymarch hid much of the near/mid raster floor, so
+  collapsing the background buys only the slack above that floor. It agreed the next production
+  work must target exposed near/mid raster, not more far-background threshold tuning.
+
+## Loop 73 (Codex) -- mid-mesh range sweep rejects the fixed 50-70fps raster-floor theory
+
+Purpose: test whether the exposed sparse raster floor under the diagnostic far-sky owner is fixed,
+or whether the mid mesh is over-covering the stationary spawn once the far/background pixels are
+owned before the expensive raymarch.
+
+Conditions:
+- Same diagnostic binary/path as Loop 72: `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_FAR_SKY_OWNER=1`, `VENPOD_FAR_SKY_OWNER_MIN_Y=0.06`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`.
+- Stationary verifier: `scripts/statbench.ps1 -Temporal 0 -Frames 360 -ShaderUnsafeBlocks 0`,
+  parsed with `scripts/parse_farfield_perf.ps1 -MinFrame 180`.
+- Composition rows are absent because the far owner skips the background pass, so the parser reports
+  `ok=False`; the engine run exits `0`, GPU counters are present, and missing counters are still valid.
+
+Evidence:
+- 2048 cap, label `timing_split_farskyowner_006_pre0_midmax2048_seq_360`:
+  `gpuFrameMsP50=14.14`, `gpuFrameMsP90=16.19`, `raymarchMsP50=0.23`,
+  `sparseSurfaceMsP50=12.61`, `sparseNearDrawMsP50=6.15`,
+  `sparseMidDrawMsP50=5.93`, `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- 1536 cap, label `timing_split_farskyowner_006_pre0_midmax1536_seq_360`:
+  `gpuFrameMsP50=14.13`, `gpuFrameMsP90=16.42`, `raymarchMsP50=0.22`,
+  `sparseSurfaceMsP50=12.53`, `sparseNearDrawMsP50=6.50`,
+  `sparseMidDrawMsP50=5.59`, `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- 1024 cap, label `timing_split_farskyowner_006_pre0_midmax1024_seq_360`:
+  `gpuFrameMsP50=13.67`, `gpuFrameMsP90=15.53`, `raymarchMsP50=0.23`,
+  `sparseSurfaceMsP50=11.97`, `sparseNearDrawMsP50=6.46`,
+  `sparseMidDrawMsP50=5.14`, `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- 768 cap, label `timing_split_farskyowner_006_pre0_midmax768_seq_360`:
+  `gpuFrameMsP50=12.95`, `gpuFrameMsP90=15.28`, `raymarchMsP50=0.23`,
+  `raymarchMsP90=1.51`, `sparseSurfaceMsP50=11.26`, `sparseNearDrawMsP50=6.24`,
+  `sparseMidDrawMsP50=4.73`, `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- 512 cap, label `timing_split_farskyowner_006_pre0_midmax512_seq_360`:
+  `gpuFrameMsP50=11.79`, `gpuFrameMsP90=14.48`, `raymarchMsP50=0.22`,
+  `raymarchMsP90=0.36`, `sparseSurfaceMsP50=10.37`, `sparseNearDrawMsP50=6.01`,
+  `sparseMidDrawMsP50=4.15`, `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- 256 cap, label `timing_split_farskyowner_006_pre0_midmax256_seq_360`:
+  `gpuFrameMsP50=9.43`, `gpuFrameMsP90=11.28`, `raymarchMsP50=0.21`,
+  `raymarchMsP90=0.37`, `sparseSurfaceMsP50=7.52`, `sparseNearDrawMsP50=5.49`,
+  `sparseMidDrawMsP50=1.47`, `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- 128 cap, label `timing_split_farskyowner_006_pre0_midmax128_seq_360`:
+  `gpuFrameMsP50=7.35`, `gpuFrameMsP90=9.42`, `raymarchMsP50=0.26`,
+  `raymarchMsP90=1.56`, `sparseSurfaceMsP50=5.69`, `sparseNearDrawMsP50=4.48`,
+  `sparseMidDrawMsP50=0.45`, `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+
+Conclusion:
+- The earlier "foreground raster floor is about 17-18ms / 50-70fps" framing is too pessimistic for
+  this stationary spawn. The floor was not fixed; it contained a large mid-mesh range component.
+- The architecture picture is now two-stage: first remove/own the far-background raymarch cohort,
+  then treat the mid mesh as an LOD/coverage problem. With the diagnostic far owner and prepass off,
+  shrinking mid-mesh max distance from the default far range to 128 lowers stationary GPU p50 from
+  the original `24.26ms` to `7.35ms` with no missing pixels in this verifier.
+- This is not shippable proof yet. `visibleMissing=0` only proves no holes; it does not prove visual
+  parity. The far owner still needs horizon parity, and small mid caps can create seam/LOD popping,
+  terrain silhouette loss, or motion/reveal fallback spikes. Next gate: visual captures against a
+  no-cap reference and motion replay (`mtns.rec`) before any default change.
+
+## Loop 74 (Codex) -- visual gate rejects the fast capped diagnostic
+
+Purpose: prove whether Loop 73's fastest stationary result is real visual headroom or terrain
+deletion hidden by the diagnostic far-sky owner.
+
+Verifier:
+- Stationary captures at frame 340 through `scripts/statbench.ps1 -Temporal 0 -Frames 360
+  -ShaderUnsafeBlocks 0` with `VENPOD_CAPTURE_DIR`, `VENPOD_CAPTURE_START_FRAME=340`,
+  `VENPOD_CAPTURE_INTERVAL_FRAMES=1`, `VENPOD_CAPTURE_COUNT=1`, and `VENPOD_CAPTURE_HIDE_UI=1`.
+- Visual comparison with `scripts/check_far_horizon_visual.ps1`, which checks full-frame and
+  sky/horizon bands.
+
+Captures:
+- Reference owner-off, full mid range:
+  `build/bin/visual_farfield/visual_owneroff_pre0_full_360/engine_frame_0340.bmp`.
+  Run exited `0`; settled `gpuFrameMsP50=23.81`, `gpuFrameMsP90=24.39`,
+  `visibleMissingNonzero=0`.
+- Far-sky owner `minY=0.06`, full mid range:
+  `build/bin/visual_farfield/visual_farskyowner006_pre0_full_360/engine_frame_0340.bmp`.
+  Run exited `0`; settled `gpuFrameMsP50=15.51`, `gpuFrameMsP90=17.77`,
+  `visibleMissingNonzero=0`.
+- Far-sky owner `minY=0.06`, mid cap 128:
+  `build/bin/visual_farfield/visual_farskyowner006_pre0_midmax128_360/engine_frame_0340.bmp`.
+  Run exited `0`; settled `gpuFrameMsP50=7.03`, `gpuFrameMsP90=9.50`,
+  `visibleMissingNonzero=0`.
+
+Results:
+- Owner-off reference vs full-range far-sky owner: verifier failed despite low average error.
+  `full_frame mae=0.802`, but `horizon_sky maxDelta=139` and
+  `far_horizon_band maxDelta=139` exceeded the `96` threshold. The owner is close on average but
+  still changes horizon silhouettes.
+- Full-range far-sky owner vs 128m cap: verifier failed badly:
+  `full_frame mae=26.600`, `far_horizon_band mae=13.345`,
+  `mid_terrain_control mae=64.531`, and blue-channel terrain-control bias `122.578`.
+- Owner-off reference vs 128m cap: verifier failed badly:
+  `full_frame mae=27.401`, `horizon_sky mae=9.800`,
+  `far_horizon_band mae=16.047`, `mid_terrain_control mae=65.017`.
+
+Conclusion:
+- Loop 73's 128m result is a performance diagnostic, not a candidate setting. It deletes the
+  mid/far terrain representation and lets the diagnostic sky owner paint over the gap. The
+  missing-pixel counters correctly report no ownership/residency holes but are blind to
+  sky-over-terrain visual deletion.
+- The production path remains: keep the raymarch fallback, make any sky owner conservative enough
+  to pass the horizon gate, and add a real far terrain representation before reducing mid-mesh
+  coverage. A small mid cap is only safe after a far-heightfield/mesh/cache owns the terrain
+  silhouette and handoff region.
+
+## Loop 75 (Codex) -- existing far-heightfield owner and conservative horizon-sky owner
+
+Purpose: measure the already-present env-gated far-heightfield owner path and test a cheaper
+screen-horizon sky owner built from the existing far max-height cache.
+
+Existing far-heightfield owner:
+- `VENPOD_FAR_HEIGHT_OWNER=1`, `VENPOD_FAR_HEIGHT_OWNER_GPU_GEN=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`, `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`.
+- Stationary label `farheightowner_gpu_pre0_full_420`: run exited `0`;
+  `gpuFrameMsP50=23.78`, `raymarchMsP50=21.59`, `renderPreOwnerMsP50=0.76`,
+  `backgroundPixelsP50=780659`, `farTerrainCallsP50=284887`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Face CSV `build/bin/visual_farfield/farheightowner_gpu_faces.csv` showed the GPU generator is
+  active: `activePayloadRows=271904` of `294912`, with origin/camera recorded by the renderer.
+- Visual capture `visual_farheightowner_gpu_pre0_full_360` was close on average but failed horizon
+  max-delta: `full_frame mae=0.372`, `horizon_sky maxDelta=141`,
+  `far_horizon_band maxDelta=141`.
+- Conclusion: the existing mesh path is real and additive, but it barely shifts composition and
+  does not remove the expensive sky/deep-miss cohort.
+
+Layered far-heightfield + raw sky owner:
+- Label `visual_farheightowner_gpu_farsky006_pre0_full_420`: run exited `0`;
+  `gpuFrameMsP50=19.28`, `raymarchMsP50=6.28`, `renderPreOwnerMsP50=6.04`,
+  `farSkyOwnerMsP50=0.13`, `sparseSurfaceMsP50=12.15`, `visibleMissingNonzero=0`.
+- Visual still failed horizon max-delta: `full_frame mae=0.655`,
+  `horizon_sky maxDelta=141`, `far_horizon_band maxDelta=141`.
+- Conclusion: layering protects some terrain but costs too much and still leaves too much fallback.
+
+Change:
+- Added a conservative horizon mode to `PS_FarSkyOwner.hlsl`. When the existing far max-height
+  no-hit product is enabled, the owner samples `FarScreenHorizonY` and owns only pixels above the
+  projected conservative max-height shell; otherwise it preserves the old ray-direction diagnostic.
+- Added a far-sky owner root SRV binding in `Renderer.cpp` and bound
+  `m_farMaxHeightScreenHorizon` to it.
+- Built Release successfully:
+  `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat""
+  -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`
+  exited `0` with only the known `vswhere.exe` warning.
+- Copied the updated runtime shader to `build/bin/assets/shaders/Graphics/PS_FarSkyOwner.hlsl`
+  because the build had no C++ work and did not refresh the asset copy.
+
+Conservative horizon-sky owner:
+- Label `horizonskyowner_nohit_mip3_dil4_pre0_up006_420` with
+  `VENPOD_FAR_MAX_HEIGHT_CACHE=1`, `VENPOD_FAR_MAX_HEIGHT_NO_HIT_MASK=1`,
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_MIP=3`,
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_DILATION=4`,
+  `VENPOD_FAR_SKY_OWNER=1`, `VENPOD_FAR_SKY_OWNER_MIN_Y=0.06`:
+  run exited `0`; `gpuFrameMsP50=16.10`, `gpuFrameMsP90=18.62`,
+  `raymarchMsP50=0.22`, `farSkyOwnerMsP50=0.10`,
+  `sparseSurfaceMsP50=14.44`, `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Visual label `visual_horizonskyowner_nohit_mip3_dil4_pre0_up006_360` failed:
+  `full_frame mae=6.131`, `upper_sky mae=10.980`, `horizon_sky mae=24.119`,
+  `far_horizon_band mae=20.862`. The captured frame shows a rectangular sky-color discontinuity
+  where only the horizon-owned columns use the owner color.
+- Raising the threshold to `VENPOD_FAR_SKY_OWNER_MIN_Y=0.18` did not fix the visual:
+  perf label `horizonskyowner_nohit_mip3_dil4_pre0_up018_360` had
+  `gpuFrameMsP50=15.78`, `raymarchMsP50=0.21`, `visibleMissingNonzero=0`;
+  visual label `visual_horizonskyowner_nohit_mip3_dil4_pre0_up018_360` still failed with
+  `full_frame mae=6.393`, `upper_sky mae=10.980`, `horizon_sky mae=25.765`.
+
+Conclusion:
+- The conservative horizon owner is performance-promising: it collapses the expensive background
+  raymarch at about `0.1ms` owner cost and no missing pixels, without the 6ms far-height mesh draw.
+- It is not visually shippable yet because partial-column sky ownership is not color-equivalent to
+  the background sky/miss path. The next slice should fix color parity for owned sky pixels or move
+  ownership to a depth/stencil-only path paired with the exact background color producer; then
+  re-run the same visual gate before motion/default work.
+
+Correction / follow-up:
+- Source diagnosis found a more direct root cause for the dark rectangular blocks:
+  `PS_FarSkyOwner.hlsl` used `[earlydepthstencil]` while also using `discard`. That lets stencil
+  update before the shader rejects the pixel, so rejected pixels can still block the later
+  background pass and expose old/clear color. This also explains why the failure was column-shaped
+  and why missing counters stayed zero.
+- Removed `[earlydepthstencil]` from `PS_FarSkyOwner.hlsl` and copied the shader to the runtime
+  asset tree.
+- Safe horizon-owner perf label `horizonskyowner_noearly_nohit_mip3_dil4_pre0_up006_360`:
+  run exited `0`; `gpuFrameMsP50=21.75`, `gpuFrameMsP90=23.43`,
+  `raymarchMsP50=19.08`, `renderPreOwnerMsP50=0.04`, `farSkyOwnerMsP50=0.02`,
+  `backgroundCoreMsP50=19.02`, `sparseSurfaceMsP50=2.12`,
+  `backgroundPixelsP50=503905`, `surfaceOwnedPixelsP50=1569697`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Safe horizon-owner visual label
+  `visual_horizonskyowner_noearly_nohit_mip3_dil4_pre0_up006_360`:
+  run exited `0`, and `scripts/check_far_horizon_visual.ps1` passed with exact parity:
+  `upper_sky mae=0 maxDelta=0`, `horizon_sky mae=0 maxDelta=0`,
+  `far_horizon_band mae=0 maxDelta=0`, `mid_terrain_control mae=0 maxDelta=0`,
+  `full_frame mae=0 maxDelta=0`.
+- Safe horizon owner + mid cap 256 label `horizonskyowner_noearly_nohit_pre0_midmax256_360`:
+  run exited `0`; `gpuFrameMsP50=23.74`, `raymarchMsP50=22.76`,
+  `backgroundPixelsP50=914860`, `sparseSurfaceMsP50=0.79`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+
+Revised conclusion:
+- The conservative horizon owner is visually safe once stencil is late, but the safe shape only
+  removes the upper-sky cohort: `backgroundPixels` drops about `799k -> 504k`, not enough to reach
+  production FPS. The remaining protected horizon/terrain band still spends about `19ms` in the
+  far raymarch.
+- Shrinking mid mesh without a real far terrain owner is not a path: the work moves back into
+  far raymarch (`23.74ms` p50 with a 256m cap).
+- Next production slice is therefore a cheaper correct far-terrain representation for the protected
+  band, or a screen/tile empty-space acceleration that reduces the remaining `503k` fallback pixels
+  without claiming terrain as sky.
+- Tandem divergence: Claude attributed the dark blocks to `PS_Raymarch` no-hit `FarBackgroundShade`,
+  but the no-early-stencil run kept the same no-hit flags and produced exact visual parity. Ground
+  truth resolves the failure to early stencil plus discard.
+
+## Loop 76 (Codex) -- late-stencil sky-owner threshold and DDA audit
+
+Purpose: test whether the remaining far-background work can be safely removed by a more aggressive
+late-stencil sky owner, and whether the existing far max-height DDA acceleration reduces the
+protected fallback band.
+
+Evidence:
+- Safe horizon owner + DDA, label `horizonskyowner_noearly_nohit_dda_pre0_360`:
+  run exited `0`; `gpuFrameMsP50=21.99`, `gpuFrameMsP90=26.03`,
+  `raymarchMsP50=19.39`, `backgroundPixelsP50=503905`,
+  `farTerrainCallsP50=44845`, `farTerrainHeightEvalP50=583242`,
+  `farTerrainCacheRejectP50=214030`, `visibleMissingNonzero=0`.
+  The DDA rejected substantial work but did not improve frame time.
+- Raw late-stencil sky owner `minY=0.12`, label `rawskyowner_noearly_pre0_min012_360`:
+  `gpuFrameMsP50=17.30`, `gpuFrameMsP90=20.32`, `raymarchMsP50=10.76`,
+  `backgroundPixelsP50=90013`, `visibleMissingNonzero=0`. Visual gate failed
+  horizon/far-horizon max-delta (`maxDelta=137`), so this is not shippable.
+- Raw late-stencil sky owner `minY=0.18`, label `rawskyowner_noearly_pre0_min018_360`:
+  `gpuFrameMsP50=21.98`, `gpuFrameMsP90=22.66`, `raymarchMsP50=16.69`,
+  `backgroundPixelsP50=217199`, `visibleMissingNonzero=0`. Visual gate passed exactly.
+- Raw late-stencil sky owner `minY=0.15`, label `rawskyowner_noearly_pre0_min015_360`:
+  `gpuFrameMsP50=19.63`, `gpuFrameMsP90=21.47`, `raymarchMsP50=13.52`,
+  `backgroundPixelsP50=151509`, `visibleMissingNonzero=0`. Visual gate passed with
+  `maxDelta=62`.
+- Raw late-stencil sky owner `minY=0.14`, label `rawskyowner_noearly_pre0_min014_360`:
+  `gpuFrameMsP50=20.92`, `gpuFrameMsP90=21.68`, `raymarchMsP50=14.48`,
+  `backgroundPixelsP50=129869`, `visibleMissingNonzero=0`. Visual gate passed at
+  threshold (`maxDelta=96`) but was slower/noisier than `minY=0.15`.
+- Raw late-stencil sky owner `minY=0.15` + DDA, label
+  `rawskyowner_noearly_pre0_min015_dda_360`: `gpuFrameMsP50=21.03`,
+  `gpuFrameMsP90=21.79`, `raymarchMsP50=15.09`,
+  `backgroundPixelsP50=151509`, `farTerrainCallsP50=44137`,
+  `farTerrainHeightEvalP50=575157`, `farTerrainCacheRejectP50=96778`,
+  `visibleMissingNonzero=0`. The DDA again reduced procedural eval counts but worsened
+  end-to-end time.
+
+Conclusion:
+- The best visually valid stationary sky-owner staging point is currently raw late-stencil
+  `minY=0.15`: it cuts background pixels from about `799k -> 151k` and frame p50 from
+  about `24.3ms -> 19.6ms`, but it is still far from production and has not been motion
+  validated.
+- `minY=0.12` demonstrates additional headroom (`17.3ms`) but fails the visual horizon gate,
+  meaning it is claiming terrain/silhouette pixels as sky.
+- The current far max-height DDA is not a viable performance path. It rejects work on paper,
+  but the shader-side branch/memory/control-flow cost cancels or exceeds the saved height
+  evaluations in both safe-horizon and raw-owner runs.
+- The remaining bottleneck after the safe `minY=0.15` owner is still the protected horizon
+  terrain band: about `151k` pixels cost `13.5ms`. That band needs a correct far terrain
+  representation or a cheaper representation-driven classifier; more scalar sky thresholds
+  are now correctness-limited.
+
+## Loop 77 (Codex + Claude) -- motion A/B for safe raw owner and next-slice challenge
+
+Purpose: validate whether the best stationary-safe raw late-stencil sky owner (`minY=0.15`) is
+only a spawn-specific diagnostic or also a useful motion staging point, then use tandem review to
+challenge the next architecture slice.
+
+Motion verifier:
+- Replay command shape: `scripts/buildbench.ps1 -Replay mtns.rec -PerfMode quality
+  -ExitAfterFrames 900`.
+- Parse command: `scripts/parse_farfield_perf.ps1 -MinFrame 300`.
+- Fair A/B uses the same background-only PSO and no sparse-surface depth prepass in both runs.
+
+Aborted/default baseline:
+- Label `baseline_mtns_900`, no flags. The process was stopped after `268.1s` because it stayed
+  before frame 0 in the full non-background-only shader path. The log reached
+  `RAYMARCH_BACKGROUND_PASS_CONFIG ... backgroundOnlyPso=0 ... farSkyOwner=0`, then did not
+  produce useful frame telemetry. This is treated as runtime shader/JIT environment evidence only,
+  not as benchmark data.
+
+Fair baseline:
+- Label `baseline_bgonly_pre0_mtns_900`, flags
+  `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`, `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`.
+- Run exited `0`; `visibleMissing nonzero-samples = 0`.
+- Parse: `gpuFrameMsP50=13.37`, `gpuFrameMsP90=14.00`, `raymarchMsP50=11.78`,
+  `raymarchMsP90=12.38`, `backgroundPixelsP50=462477`,
+  `surfaceOwnedPixelsP50=1611234`, `sparseSurfaceMsP50=0.99`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Residual work: `farTerrainCallsP50=440400`, `farTerrainMissP50=440341`,
+  `farTerrainSkyBreakP50=418982`, `farTerrainHitCallsP50=4`,
+  `farTerrainHitCallPctP50=0.0009`, `farTerrainSkyBreakHeightEvalPctP50=71.18`,
+  `farTerrainDeepMissHeightEvalPctP50=27.41`.
+
+Candidate:
+- Label `rawskyowner_noearly_pre0_min015_mtns_900`, flags
+  `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`, `VENPOD_FAR_SKY_OWNER=1`,
+  `VENPOD_FAR_SKY_OWNER_MIN_Y=0.15`, `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`.
+- Run exited `0`; `visibleMissing nonzero-samples = 0`.
+- Parse: `gpuFrameMsP50=9.64`, `gpuFrameMsP90=10.09`, `raymarchMsP50=8.07`,
+  `raymarchMsP90=8.58`, `backgroundPixelsP50=291180`,
+  `surfaceOwnedPixelsP50=1782546`, `sparseSurfaceMsP50=0.99`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Residual work: `farTerrainCallsP50=287376`, `farTerrainMissP50=287294`,
+  `farTerrainSkyBreakP50=265972`, `farTerrainHitCallsP50=4`,
+  `farTerrainHitCallPctP50=0.0014`, `farTerrainSkyBreakHeightEvalPctP50=66.43`,
+  `farTerrainDeepMissHeightEvalPctP50=31.86`.
+
+Conclusion:
+- `minY=0.15` is a real motion win in `mtns.rec` under the split-shader verifier:
+  `13.37ms -> 9.64ms` GPU p50 and `11.78ms -> 8.07ms` raymarch p50, with no missing pixels.
+- It is not enough to close the goal and is not visually validated in motion. The remaining motion
+  band is still overwhelmingly miss/sky-break proof work, not far terrain hit shading: only about
+  four far-height hit calls at p50. This directly limits the value of improving the current far
+  height mesh as the primary performance lever.
+- Tandem cross-check diverged from "improve the far mesh" and converged with the counters:
+  Claude independently argued the current far mesh should be retired as the main perf lever because
+  it only owns rare hits, while the expensive cohort is miss/sky-break. It recommended the next
+  slice as exact shared far-height generation plus measurement, then a lower-cost real far-band
+  product only if the residual stats stay miss/sky dominated.
+- Next implementation slice should therefore harden the GPU cached far product around the exact
+  `FarTerrainHeightVoxelized` convention and the screen-horizon/no-hit classifier, rather than
+  spending the next loop on more mesh faces or mid-mesh caps.
+
+## Loop 78 (Codex) -- shared far-terrain helper for GPU cached products
+
+Purpose: start the next architecture slice by reducing drift in the GPU far cached products. The
+far max-height cache and far-heightfield owner each carried their own copied far-height function;
+that makes seam/horizon failures likely and makes future cached classifiers untrustworthy.
+
+Change:
+- Added `assets/shaders/Common/FarTerrainShared.hlsli`.
+- Routed `CS_GenerateFarMaxHeightCache.hlsl` through the shared helper for raw far height,
+  distance-dependent fallback cell size, spawn-land reshape, top-height quantization, and voxelized
+  height.
+- Routed `CS_GenerateFarHeightfieldFaces.hlsl` through the same helper for raw height,
+  voxelized top height, fallback cell size, and the simplified far material rule.
+- The conservative product contracts remain unchanged: the max-height cache still adds its own
+  height pad and treats uncertainty as fallback, and the far-height owner remains additive.
+
+Verifier:
+- Release build command exited `0` with only the known `vswhere.exe` warning:
+  `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat""
+  -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`.
+  Ninja had no C++ work, so the changed shaders and new include were manually copied to
+  `build/bin/assets/shaders`.
+- First runtime smoke `farshared_compile_smoke_140` failed before frames because a local variable
+  was named `shared`, which is a reserved HLSL keyword. No perf evidence was taken from that run.
+- Fixed the HLSL reserved-word compile error and reran
+  `scripts/statbench.ps1 -Temporal 0 -Frames 140 -Label farshared_compile_smoke_140b
+  -ShaderUnsafeBlocks 0` with:
+  `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`, `VENPOD_FAR_MAX_HEIGHT_CACHE=1`,
+  `VENPOD_FAR_MAX_HEIGHT_NO_HIT_MASK=1`, `VENPOD_FAR_HEIGHT_OWNER=1`,
+  `VENPOD_FAR_HEIGHT_OWNER_GPU_GEN=1`, `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`.
+- Runtime compile evidence:
+  `CS_GenerateFarHeightfieldFaces.hlsl` cache miss compiled in `0.51s` and created its compute
+  pipeline; `CS_GenerateFarMaxHeightCache.hlsl` cache miss compiled in `0.89s` and created its
+  compute pipeline; `CS_FarMaxHeightNoHitMask.hlsl` loaded from cache and created its pipeline.
+- Smoke parse `farshared_compile_smoke_140b`, frame>90: `ok=True`,
+  `gpuFrameMsP50=23.12`, `raymarchMsP50=21.25`, `renderPreOwnerMsP50=0.84`,
+  `backgroundPixelsP50=780980`, `farTerrainCacheRejectP50=37382`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+
+Conclusion:
+- This is an enabling correctness slice, not a measured performance win. It makes the GPU cache and
+  far-owner products depend on one shared PS-aligned far-terrain convention while preserving their
+  conservative fallback semantics.
+- The far-heightfield owner is still weak after this slice, as expected (`~781k` background pixels
+  remain in the short smoke). The next loop should use the now-shared far product to improve the
+  screen-horizon/no-hit classifier or a real lower-cost far-band representation, and should keep
+  the `minY=0.15` owner as a staging/proof point rather than a final default.
+
+## Loop 79 (Codex + Claude) -- far-mesh conclusion challenge and low-res background diagnostic
+
+Purpose: answer whether the current evidence really supports retiring the rasterized far-height owner
+as the primary performance lever, and test whether reducing the number of pixels that enter the real
+far shader behaves like the dominant lever.
+
+Evidence:
+- Re-read `TANDEM.md` 2026-06-25 entries. The original root cause remains: stationary spawn is
+  `~799k` background pixels at `~23ms` raymarch while mesh/raster is cheap; temporal was validated
+  as a stationary band-aid and motion-neutral.
+- Re-parsed baseline `baseline_current_split_420`, frame > 200:
+  `gpuFrameMsP50=23.78`, `raymarchMsP50=21.75`, `backgroundPixelsP50=799248`,
+  `farTerrainCallsP50=295970`, `farTerrainHitCallsP50=8978`,
+  `farTerrainMissP50=286992`, `farTerrainSkyBreakP50=166788`, missing counters zero.
+- Re-parsed current GPU far-height owner `farheightowner_gpu_pre0_full_420`, frame > 200:
+  `gpuFrameMsP50=23.78`, `raymarchMsP50=21.59`, `backgroundPixelsP50=780659`,
+  `farTerrainHitCallsP50=1806`, `farTerrainMissP50=283081`, missing counters zero.
+  This owner removes only about `18.6k` of `799k` background pixels while adding pre-owner work.
+- Re-parsed safe raw sky owner `rawskyowner_noearly_pre0_min015_360`, frame > 200:
+  `gpuFrameMsP50=18.40`, `raymarchMsP50=13.04`, `backgroundPixelsP50=151492`,
+  missing counters zero. This validates that the profitable cohort is screen/no-hit ownership, not
+  more far-height hit rasterization.
+- Motion reparse from Loop 77 still holds: `rawskyowner_noearly_pre0_min015_mtns_900`, frame > 300,
+  `gpuFrameMsP50=9.64`, `raymarchMsP50=8.07`, `backgroundPixelsP50=291180`,
+  `farTerrainHitCallsP50=4`, `farTerrainMissP50=287294`,
+  `farTerrainSkyBreakP50=265972`, missing counters zero.
+- New diagnostic run:
+  `scripts/statbench.ps1 -Temporal 0 -Frames 420 -Label analysis_bgpass_scale050_420
+  -ShaderUnsafeBlocks 0` with `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE=0.5`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`.
+  Run exited `0`, missing counters zero. Parse frame > 360:
+  `gpuFrameMsP50=21.62`, `raymarchMsP50=15.87`, `backgroundCoreMsP50=15.04`,
+  `sparseSurfaceMsP50=5.32`, `backgroundPixelsP50=518400`.
+  The low-res split reduces far calls and ray time, but current plumbing raymarches the full
+  low-res screen and increases the sparse-surface bracket, so it is diagnostic evidence, not a
+  shippable production answer.
+- Tandem challenge: Claude converged with the distinction that "retire the far mesh" means retire
+  the current rasterized far-height owner as the primary lever, not discard far-terrain cached
+  knowledge. It recommended keeping the far max-height/cache product as a screen-space horizon or
+  lower-res real far-band input.
+
+Conclusion:
+- The current far-height mesh/cache product is architecturally the wrong main lever for the measured
+  wall. It owns hit pixels, but both stationary and motion residuals are overwhelmingly miss/sky-break
+  proof work. Improving top/side faces or seam fidelity may be needed for correctness if the product
+  remains, but it will not collapse the expensive cohort.
+- The next viable architectural direction is a cached screen-space far-band classifier / horizon product
+  that removes no-hit sky/miss pixels before the heavy shader, plus a lower-resolution real far-band
+  fallback for pixels that cannot be safely classified. Any version must remain additive: uncertain tiles
+  and classifier misses must still run the existing raymarch, preserving `visibleMissing=0` and
+  `residentMissingSurface=0`.
+- A background-pass-scale approach alone is not enough in the current graph: it lowers ray work but
+  introduces low-res IQ risk and sparse-surface/tail overhead. If pursued, it needs a depth/stencil-aware
+  masked far-band pass rather than full low-res-screen raymarch plus blind upscale.
+
+## Loop 80 (Codex + Claude) -- far-field architecture verdict and masked-band contingency
+
+Purpose: answer the user's skepticism about the prior "mesh/cache the far field" conclusion and
+separate three different claims: (1) the far/background raymarch is the wall, (2) the current
+rasterized far-height owner is the fix, and (3) the renderer is inherently bound around 50-70 fps.
+
+Re-parse evidence from current artifacts:
+- `baseline_current_split_420`, frame > 200:
+  `gpuFrameMsP50=23.78`, `raymarchMsP50=21.75`, `backgroundPixelsP50=799248`,
+  `farTerrainCallsP50=295970`, `farTerrainHitCallsP50=8978`,
+  `farTerrainMissP50=286992`, `farTerrainSkyBreakP50=166788`,
+  `farTerrainHitCallPctP50=3.03`, `farTerrainNonHitCallPctP50=96.97`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- `farheightowner_gpu_pre0_full_420`, frame > 200:
+  `gpuFrameMsP50=23.78`, `raymarchMsP50=21.59`, `renderPreOwnerMsP50=0.76`,
+  `backgroundPixelsP50=780659`, `farTerrainHitCallsP50=1806`,
+  `farTerrainNonHitCallPctP50=99.37`, missing counters zero. The existing GPU-generated,
+  rasterized far-height owner removes only about 18.6k of 799k background pixels and is net-zero
+  on frame time.
+- `farsky_union_raw015_horizon_360`, frame > 200:
+  `gpuFrameMsP50=20.29`, `raymarchMsP50=13.66`, `backgroundPixelsP50=146028`,
+  `renderPreOwnerMsP50=0.06`, `farSkyOwnerMsP50=0.05`, `sparseSurfaceMsP50=4.57`,
+  missing counters zero. This is weaker than the previously measured raw `minY=0.15` owner
+  (`gpuFrameMsP50=18.40`, `raymarchMsP50=13.04`, `backgroundPixelsP50=151492`), so the
+  raw+horizon union is rejected as a performance direction despite being hole-free.
+- Motion `rawskyowner_noearly_pre0_min015_mtns_900`, frame > 300:
+  `gpuFrameMsP50=9.64`, `raymarchMsP50=8.07`, `backgroundPixelsP50=291180`,
+  `farTerrainHitCallsP50=4`, `farTerrainMissP50=287294`,
+  `farTerrainSkyBreakP50=265972`, missing counters zero. The remaining motion work is
+  essentially non-hit proof work, not far terrain hit shading.
+
+Tandem challenge:
+- Claude independently converged that VENPOD is not currently raster/surface-bound; surface/mesh is
+  about 0.8-2ms in the relevant comparisons while the far/background proof work dominates.
+- Claude also converged that the current rasterized far-height owner should be demoted as the main
+  lever: it addresses hit pixels, but the measured cohort is overwhelmingly miss/sky-break/deep-miss.
+- The useful uncertainty Claude added: the present ~54fps-ish safe stationary owner result is not yet
+  a proven hard ceiling. The unresolved question is whether the residual protected horizon band is
+  mostly ray-count-bound or march-depth-bound. If ray-count-bound, a properly masked lower-resolution
+  far-band pass can still break the apparent ceiling; if march-depth-bound, the remaining lossless path
+  is much narrower and any approximate far-field replacement must pass the visual/seam gates.
+
+Conclusion:
+- The root bottleneck diagnosis still holds: full-resolution procedural far/background raymarch is the
+  wall. The "far mesh/cache" prescription needs refinement: cached far-terrain knowledge is still
+  valuable, but not as the current rasterized heightfield owner.
+- The main architecture should move toward a screen/depth-aware residual-band product: use the safe
+  sky-owner/stencil classification to remove confidently empty sky, then shade only the uncertain
+  protected horizon band with fewer rays or a cheaper cached representation. Uncertain pixels must
+  keep the existing full raymarch fallback.
+- The next concrete loop should build a masked low-res far-band verifier, not a whole-screen
+  background-pass-scale diagnostic and not more heightfield faces. Gate it on `visibleMissing=0`,
+  `residentMissingSurface=0`, production-path `gpuFrameMs/raymarchMs`, image-diff/slow-pan seam review,
+  and composition shift. This loop decides whether the 50-70fps claim is a real lossless ceiling or a
+  byproduct of the current full-res residual-band graph.
+
+## Loop 81 (Codex) -- masked residual-band ray-count diagnostic
+
+Purpose: test the Loop 80 uncertainty directly. If the protected residual far band is simply
+ray-count-bound, coherently marching only one of four 16x16 tile phases should collapse the
+raymarch bracket roughly in proportion to the dropped far-terrain calls. This is explicitly
+diagnostic and visually invalid: skipped tiles return the existing cheap `FarBackgroundShade`, not
+a reconstructed history/upscale. It must not become a default production path.
+
+Change:
+- Added env-gated background-only PSO define `VENPOD_RAYMARCH_MASKED_BAND_DIAG=1`, with
+  `VENPOD_RAYMARCH_MASKED_BAND_DIAG_TILE_SIZE` and `VENPOD_RAYMARCH_MASKED_BAND_DIAG_PHASES`.
+- The shader branch runs after the aggressive sky branch and before `RaymarchBackgroundField`.
+  It marches only the current coherent tile phase and returns cheap far-background shade for the
+  other phases. Default is off.
+
+Build:
+- `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat"" -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`
+- Exit `0`. Only pre-existing `main_launcher.cpp` shadow warnings were emitted.
+
+Control run:
+- Command: env `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_PSO=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_MIN_Y=0.15`,
+  `VENPOD_RAYMARCH_MASKED_BAND_DIAG=0`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`;
+  `scripts/statbench.ps1 -Temporal 0 -Frames 400 -Label aggrsky_pso_min015_pre0_control_400 -ShaderUnsafeBlocks 0`.
+- Parse frame > 200:
+  `gpuFrameMsP50=22.24`, `raymarchMsP50=16.41`, `backgroundCoreMsP50=16.41`,
+  `sparseSurfaceMsP50=4.60`, `backgroundPixelsP50=799346`,
+  `farTerrainCallsP50=140654`, `farTerrainMissP50=131675`,
+  `farTerrainHeightEvalP50=1821533`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+
+Masked diagnostic run:
+- Command: same env plus `VENPOD_RAYMARCH_MASKED_BAND_DIAG=1`,
+  `VENPOD_RAYMARCH_MASKED_BAND_DIAG_TILE_SIZE=16`,
+  `VENPOD_RAYMARCH_MASKED_BAND_DIAG_PHASES=4`;
+  `scripts/statbench.ps1 -Temporal 0 -Frames 400 -Label maskedband_diag_t16_p4_min015_pre0_400 -ShaderUnsafeBlocks 0`.
+- Parse frame > 200:
+  `gpuFrameMsP50=21.22`, `raymarchMsP50=14.08`, `backgroundCoreMsP50=14.08`,
+  `sparseSurfaceMsP50=5.82`, `backgroundPixelsP50=799346`,
+  `farTerrainCallsP50=35348`, `farTerrainMissP50=33090`,
+  `farTerrainHeightEvalP50=457654`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+
+Near-zero march diagnostic:
+- Command: same env but `VENPOD_RAYMARCH_MASKED_BAND_DIAG_PHASES=16`;
+  `scripts/statbench.ps1 -Temporal 0 -Frames 400 -Label maskedband_diag_t16_p16_min015_pre0_400 -ShaderUnsafeBlocks 0`.
+- Parse frame > 200:
+  `gpuFrameMsP50=20.53`, `raymarchMsP50=8.68`, `backgroundCoreMsP50=8.68`,
+  `sparseSurfaceMsP50=9.00`, `backgroundPixelsP50=799346`,
+  `farTerrainCallsP50=8849`, `farTerrainMissP50=8297`,
+  `farTerrainHeightEvalP50=114482`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+
+Tandem challenge:
+- Claude converged with the main interpretation that reducing far-terrain work inside the same
+  full-screen background PSO is the wrong lever compared with reducing invocations through stencil,
+  a real lower-resolution pass, or a leaner PSO.
+- Claude's stronger claim after the 1-of-4 result was that far-terrain height evals were a red
+  herring and that most cost is fixed per background invocation. The 1-of-16 result refines this:
+  raymarch time can still fall much further when almost all march phases are skipped, but total frame
+  remains poor because the production graph/timestamped sparse-surface bracket grows sharply. This
+  keeps the "invocation count/graph architecture" conclusion, but it is not yet a clean decomposition
+  of ALU versus occupancy/timestamp/pipeline interaction.
+
+Conclusion:
+- The diagnostic worked as intended mechanically: far-terrain calls and height evals dropped by
+  about 75%, matching the one-of-four tile phase mask, and no missing-surface holes appeared.
+- The frame did not scale with far-terrain eval count. Raymarch improved only `16.41 -> 14.08 ms`
+  and GPU frame only `22.24 -> 21.22 ms`; sparse-surface time also rose `4.60 -> 5.82 ms`, eating
+  part of the raymarch gain.
+- The 1-of-16 run dropped raymarch further to `8.68 ms` and far-terrain height evals to `114482`,
+  but GPU frame only reached `20.53 ms` because the sparse-surface bracket rose to `9.00 ms`. This
+  weakens the simple "masked low-res residual alone breaks the ceiling" hypothesis. The wall is the
+  current full-screen production graph: too many background invocations plus residual marching plus
+  pass/timestamp/occupancy interactions, not just the raw count of `FarTerrainHeightVoxelized` calls.
+- The strongest measured lever is still ownership/composition, not approximating more height hits:
+  the raw sky/stencil owner cut background pixels to about 151k and measured around
+  `gpuFrameMsP50=18.40`, while this full-screen masked diagnostic still shaded/composited all
+  799k background pixels and landed at `21.22 ms` for one-of-four and `20.53 ms` for one-of-sixteen.
+- Next move should be a real stencil/depth-aware residual-band pass that changes composition
+  ownership and launches fewer pixels, or a compute/tile classifier that dispatches work only for
+  uncertain tiles. More far-height raster faces are not supported by this evidence.
+
+## Loop 82 (Codex) -- invocation-count production path probes
+
+Purpose: follow Loop 81's conclusion by measuring paths that reduce actual background invocations,
+not just work inside the same fullscreen invocation. Gate every run on missing counters first, then
+composition, GPU time, and visual diff where a path could plausibly become a default.
+
+Change:
+- Lifted the `farSkyOwnerReady` guard in `Renderer::RenderVoxels` so the far-sky owner can run when
+  a background path shares the main depth-stencil (`backgroundPassShareMainDepth`). The owner remains
+  env-gated by `VENPOD_FAR_SKY_OWNER`; low-res split paths with their own DSV are still excluded.
+  This preserves the fallback: pixels the owner does not stencil still run the existing raymarch.
+
+Build:
+- `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat"" -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`
+- Exit `0`; only the known `vswhere.exe` warning appeared.
+
+Shared-main-depth temporal probe:
+- Control env: `VENPOD_RAYMARCH_TEMPORAL=1`,
+  `VENPOD_RAYMARCH_TEMPORAL_STATIC_PHASES=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`.
+- `temporal_fullres_phase1_control_400`, frame > 200:
+  `gpuFrameMsP50=24.41`, `raymarchMsP50=22.19`,
+  `backgroundPixelsP50=799346`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Same env plus `VENPOD_FAR_SKY_OWNER=1`, `VENPOD_FAR_SKY_OWNER_MIN_Y=0.15`:
+  `temporal_fullres_phase1_farsky015_400`, frame > 200:
+  `gpuFrameMsP50=21.20`, `raymarchMsP50=15.76`,
+  `backgroundCoreMsP50=14.87`, `farSkyOwnerMsP50=0.05`,
+  `backgroundPixelsP50=151174`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Conclusion: the guard change works and proves real invocation reduction through stencil in the
+  shared-main-depth path. It is not the preferred default because the temporal/split graph is still
+  slower than a direct path.
+
+Direct owner and residual-floor probes:
+- Direct owner env: `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_FAR_SKY_OWNER=1`, `VENPOD_FAR_SKY_OWNER_MIN_Y=0.15`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`.
+- `direct_farsky015_current_400`, frame > 200:
+  `gpuFrameMsP50=21.09`, `raymarchMsP50=14.62`,
+  `backgroundPixelsP50=151174`, `farTerrainCallsP50=140654`,
+  `farTerrainHeightEvalP50=1821533`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Same env plus diagnostic `VENPOD_RAYMARCH_MASKED_BAND_DIAG=1`,
+  `VENPOD_RAYMARCH_MASKED_BAND_DIAG_PHASES=16`:
+  `direct_farsky015_maskp16_diag_400`, frame > 200:
+  `gpuFrameMsP50=15.76`, `raymarchMsP50=8.16`,
+  `backgroundPixelsP50=151174`, `farTerrainCallsP50=8849`,
+  `farTerrainHeightEvalP50=114482`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Conclusion: sky ownership alone removes high-sky invocations but leaves the hard residual band
+  doing almost all far-terrain proof work. A real residual-band solution is required; the masked
+  branch is only a non-visual floor estimate.
+
+Existing true low-res invocation probes:
+- Env: `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_PSO=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_MIN_Y=0.15`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`.
+- `bgpass025_aggrsky015_diag_400`, with `VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE=0.25`,
+  frame > 200:
+  `gpuFrameMsP50=15.95`, `raymarchMsP50=9.29`,
+  `backgroundPixelsP50=129600`, `farTerrainCallsP50=10633`,
+  `farTerrainHeightEvalP50=131453`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Capture visual reference/candidate at frame 220:
+  reference `vis_full_aggr015/engine_frame_0220.bmp`;
+  candidate `vis_bg025_aggr015/engine_frame_0220.bmp`.
+  `scripts/check_far_horizon_visual.ps1 ... -Json` exited `1`:
+  full-frame MAE `0.185`, horizon MAE `0.545`, but failed
+  `horizon_sky maxDelta 135 > 96` and `far_horizon_band maxDelta 135 > 96`.
+- `vis_bg050_aggr015_240`, scale `0.5`: settled `gpuFrameMsP50=18.99`,
+  missing zero; visual checker exited `1` with `horizon_sky maxDelta 131 > 96`.
+- `vis_bg075_aggr015_240`, scale `0.75`: settled `gpuFrameMsP50=21.04`,
+  missing zero; visual checker exited `1` with `horizon_sky maxDelta 135 > 96`.
+
+Conclusion:
+- The 0.25 low-res background pass proves that true lower invocation count can reach the same
+  mid-teens stationary range as the invalid owner+mask floor. So the user's skepticism about a
+  50-70 fps hard ceiling remains justified.
+- The existing blind low-res composite cannot be promoted: even at 0.75 scale it fails the current
+  horizon max-delta visual gate, and at 0.75 the performance win is mostly gone.
+- The next production loop should build a residual-specific path, not a whole-screen low-res
+  background pass: keep full-res/stencil sky ownership for safe sky pixels, run the residual horizon
+  band through a lower-invocation representation with edge-aware reconstruction or tile dispatch,
+  and leave uncertain pixels on the existing full raymarch fallback.
+
+## Loop 83 (Codex + Claude) -- reject scissored full-res repair; require tile/indirect horizon protection
+
+Purpose: test the smallest implementation after Loop 82's visual failure: keep the fast 0.25
+background pass, then repair only the failing far-horizon rows with a full-res raymarch draw. This
+was intended to fix the `maxDelta > 96` horizon outliers without returning to a full-screen march.
+
+Change:
+- Added env-gated `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_REPAIR`.
+- The first version re-ran the existing fullscreen raymarch after low-res background composite with
+  a configurable full-res scissor band. Pixels outside the band stayed on the low-res composite.
+- The second version added `RAYMARCH_BACKGROUND_EDGE_REPAIR`: during the repair draw, the shader
+  samples the low-res background texture and discards non-edge pixels before `RaymarchBackgroundField`.
+  This remains default-off and diagnostic.
+
+Build:
+- `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat"" -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`
+- Exit `0`; only the known `vswhere.exe` warning and pre-existing `main_launcher.cpp` shadow
+  warnings appeared across the rebuilds.
+
+Verifier setup:
+- Base env: `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE=0.25`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_PSO=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_MIN_Y=0.15`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`.
+- Reference from Loop 82: no repair, `bgpass025_aggrsky015_diag_400`, frame > 200:
+  `gpuFrameMsP50=15.95`, `raymarchMsP50=9.29`,
+  `backgroundPixelsP50=129600`, `farTerrainCallsP50=10633`,
+  missing counters zero, but visual failed with
+  `horizon_sky maxDelta 135 > 96` and `far_horizon_band maxDelta 135 > 96`.
+
+High-delta localization:
+- A BMP scan of `vis_full_aggr015/engine_frame_0220.bmp` versus
+  `vis_bg025_aggr015/engine_frame_0220.bmp` found only `219` pixels with per-channel delta `>96`.
+- Those pixels were localized to y rows `325..473`; largest clusters:
+  `406..414` (`53` px), `465..473` (`37` px), `377..379` (`32` px),
+  `397..402` (`18` px), `441..443` (`14` px).
+
+Scissored row repair results:
+- Broad repair `Y=160..500`, frame > 200:
+  `gpuFrameMsP50=23.64`, `raymarchMsP50=18.42`,
+  `backgroundCoreMsP50=4.55`, `renderTailMsP50=13.81`,
+  `backgroundPixelsP50=621746`, `farTerrainCallsP50=150462`,
+  `farTerrainHeightEvalP50=1943246`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Narrow repair `Y=360..480`, frame > 200:
+  `gpuFrameMsP50=22.85`, `raymarchMsP50=17.04`,
+  `backgroundCoreMsP50=5.47`, `renderTailMsP50=11.37`,
+  `backgroundPixelsP50=240975`, `farTerrainCallsP50=111022`,
+  `farTerrainHeightEvalP50=1442093`,
+  missing counters zero.
+
+Edge-gated repair results:
+- Edge-gated repair `Y=360..480`, frame > 200:
+  `gpuFrameMsP50=22.12`, `raymarchMsP50=16.00`,
+  `backgroundCoreMsP50=6.37`, `renderTailMsP50=9.49`,
+  `backgroundPixelsP50=148630`, `farTerrainCallsP50=25030`,
+  `farTerrainHeightEvalP50=321803`,
+  missing counters zero.
+- Tight edge-gated strip `Y=370..420`, frame > 200:
+  `gpuFrameMsP50=21.75`, `raymarchMsP50=14.85`,
+  `backgroundCoreMsP50=7.42`, `renderTailMsP50=7.38`,
+  `backgroundPixelsP50=138865`, `farTerrainCallsP50=17533`,
+  `farTerrainHeightEvalP50=220084`,
+  missing counters zero.
+
+Tandem challenge:
+- Claude independently selected a minimal horizon-protect band as the next production loop because
+  the visual failure was localized to the horizon silhouette while the 0.25 low-res pass already hit
+  the target performance range.
+- The local scissored repair experiments refine that recommendation: a rectangular fullscreen
+  repair draw, even with an edge discard, is not viable. It preserves correctness but reintroduces
+  too much full-res invocation/control overhead before the visual gate is even worth running.
+
+Conclusion:
+- Rejected: scissored full-res repair over horizon rows. It is too expensive (`21.75..23.64 ms`) and
+  does not preserve the 0.25 path's `~15.95 ms` performance.
+- The viable version of Claude's recommendation must avoid fullscreen row invocation: generate a
+  small horizon/edge tile mask from the low-res background or existing `FarScreenHorizonY`, then
+  repair only those tiles/pixels via a truly sparse/indirect path, or perform composite-side
+  silhouette protection without running the heavy raymarch.
+- Next loop should build a tile-mask verifier first: produce a GPU-visible mask/count for the
+  localized >96-delta horizon tiles, report candidate tile count/coverage, and only then attach a
+  repair shader/dispatch. The exit gate remains unchanged: missing counters zero, visual checker
+  green, and stationary p50 materially below the direct full-res owner path.
+
+## Loop 84 (Codex) -- composite-only repair rejected; tile-mask verifier proves sparse target
+
+Purpose: test a cheaper alternative before building GPU tile/indirect repair. The 0.25 low-res
+path's visual failure is mostly dark terrain bleeding into horizon-sky pixels, so an edge-aware
+composite might remove the outliers without invoking any full-res raymarch.
+
+Change:
+- Added env-gated `VENPOD_RAYMARCH_BACKGROUND_PASS_EDGE_AWARE_COMPOSITE`.
+- Added `VENPOD_BACKGROUND_COMPOSITE_EDGE_AWARE` in `PS_BackgroundComposite.hlsl`. In the horizon
+  UV band, the shader samples the low-res 4-neighborhood and selects the brightest sample only when
+  local luminance contrast is high. Default is off.
+- Added `tools/horizon_tile_repair_sim.js`, a reusable BMP verifier that simulates repairing only
+  selected full-res tiles around pixels whose candidate/reference per-channel delta exceeds the
+  visual-gate threshold.
+
+Build:
+- `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat"" -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`
+- Exit `0`; only the known `vswhere.exe` warning and pre-existing `main_launcher.cpp` shadow
+  warnings appeared.
+
+Composite-only test:
+- Env: `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE=0.25`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_EDGE_AWARE_COMPOSITE=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_PSO=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_MIN_Y=0.15`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`.
+- Capture command:
+  `scripts/statbench.ps1 -Temporal 0 -Frames 240 -Label vis_bg025_aggr015_edgeaware_240 -ShaderUnsafeBlocks 0`.
+- Run exited `0`; short settled sample reported
+  `gpuFrameMsP50=20.51`, `visibleMissingNonzero=0`.
+- Visual check against `vis_full_aggr015/engine_frame_0220.bmp` exited `1`:
+  `horizon_sky maxDelta 139 > 96`, `far_horizon_band maxDelta 139 > 96`.
+  The edge-aware composite worsened the max-delta outlier and is rejected.
+
+Tile-mask simulation:
+- Command:
+  `node tools/horizon_tile_repair_sim.js --reference build/bin/captures/vis_full_aggr015/engine_frame_0220.bmp --candidate build/bin/captures/vis_bg025_aggr015/engine_frame_0220.bmp --json`.
+- Baseline before repair:
+  `horizonSky maxDelta=135`, `farHorizonBand maxDelta=135`, `fullFrame maxDelta=135`.
+- Simulated full-res tile replacement results:
+  `tileSize=4`: `tileCount=98`, `repairedPctUpperBound=0.0756`, repaired maxDelta `96`.
+  `tileSize=8`: `tileCount=80`, `repairedPctUpperBound=0.2469`, repaired maxDelta `96`.
+  `tileSize=16`: `tileCount=67`, `repairedPctUpperBound=0.8272`, repaired maxDelta `96`.
+  `tileSize=32`: `tileCount=50`, `repairedPctUpperBound=2.4691`, repaired maxDelta `96`.
+
+Conclusion:
+- Composite-side brightest-neighbor repair is rejected: it fails visual and costs too much in the
+  short capture run.
+- The tile verifier supports the next production architecture: a sparse repair mask can satisfy the
+  existing max-delta visual gate while touching well under 1% of the frame for 8-16px tiles.
+- Next loop should implement the GPU-visible tile mask/count first, using the existing horizon/low-res
+  background evidence to mark candidate tiles. Do not attach heavy repair until the mask reports
+  coverage in the same range as the BMP verifier.
+
+## Loop 85 (Codex) -- runtime GPU horizon tile-mask telemetry
+
+Purpose: move the Loop 84 BMP oracle into the renderer as default-off GPU telemetry before attaching
+any repair shader. The loop only counts candidate horizon tiles; it does not change render output and
+does not remove the raymarch fallback.
+
+Change:
+- Added `assets/shaders/Compute/CS_BackgroundHorizonTileMask.hlsl`.
+- Added env-gated controls:
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_MASK`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_SIZE`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_Y0`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_Y1`, and
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_THRESHOLD`.
+- The compute pass samples the low-res background pass after color transition and before composite,
+  then writes ownership stats slots `49..54`:
+  selected tiles, total tiles, selected pixel upper bound, max edge, frame, and band tiles.
+- `PERF_RENDER_OWNERSHIP` and `PERF_RENDER_COMPOSITION` now append
+  `horizonTileMask=tiles/total/pixelUpper/maxEdge255/frame/bandTiles`.
+- `scripts/parse_farfield_perf.ps1` now parses those optional fields.
+
+Build:
+- `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat"" -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`
+- Exit `0`; only the known `vswhere.exe` warning and pre-existing shader/main shadow warnings
+  appeared.
+- Verified runtime shader copy exists at
+  `build/bin/assets/shaders/Compute/CS_BackgroundHorizonTileMask.hlsl`.
+
+Verifier runs:
+- Base env:
+  `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE=0.25`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_PSO=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_MIN_Y=0.15`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`.
+- Control, mask disabled:
+  `scripts/statbench.ps1 -Temporal 0 -Frames 180 -Label horizon_tilemask_control_180 -ShaderUnsafeBlocks 0`
+  exited `0`; frame > 90 parse showed `gpuFrameMsP50=20.5`,
+  `raymarchMsP50=10.66`, `backgroundPixelsP50=129600`, missing counters zero,
+  and all horizon tile-mask fields zero.
+- Threshold sweep:
+  `threshold=0.12`: `1253` tiles, `pixelUpperPct=3.867`, `maxEdge255=139`;
+  `threshold=0.40`: `745` tiles, `pixelUpperPct=2.299`, `maxEdge255=139`;
+  `threshold=0.52`: `233` tiles, `pixelUpperPct=0.719`, `maxEdge255=139`;
+  `threshold=0.54`: `46` tiles, `pixelUpperPct=0.142`, `maxEdge255=139`.
+- The default threshold was set to `0.52`: broader than the offline `80`-tile oracle but less
+  likely to under-mark than `0.54`.
+- Full verifier:
+  `scripts/statbench.ps1 -Temporal 0 -Frames 400 -Label horizon_tilemask_thr052_400 -ShaderUnsafeBlocks 0`
+  exited `0`.
+  For frame > 200:
+  `gpuFrameMsP50=17.02`, `gpuFrameMsP90=25.12`,
+  `raymarchMsP50=9.92`, `raymarchMsP90=12.39`,
+  `backgroundCoreMsP50=8.84`, `sparseSurfaceMsP50=7.11`,
+  `backgroundPixelsP50=129600`, `backgroundPct=6.25`,
+  `horizonTileMaskTilesP50=243`, `horizonTileMaskTotalTilesP50=32400`,
+  `horizonTileMaskBandTilesP50=4800`,
+  `horizonTileMaskPixelUpperP50=15552`, `horizonTileMaskPixelUpperPctP50=0.75`,
+  `horizonTileMaskMaxEdge255P50=139`,
+  `farTerrainCallsP50=10640`, `farTerrainHeightEvalP50=131507`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+
+Conclusion:
+- The runtime GPU telemetry path is green and default-off; it does not create holes and does not
+  alter image output.
+- The runtime heuristic is conservative relative to the offline visual oracle: `243` 8px tiles
+  (`0.75%` frame upper bound) versus the BMP oracle's `80` tiles (`0.2469%` frame upper bound).
+- This is sparse enough to justify continuing mask work, but not enough to attach repair directly:
+  the count does not prove the runtime mask contains the offline oracle tiles.
+- Tandem challenge from Claude converged on a stricter next gate: measure runtime-mask/oracle
+  intersection and require `oracleTilesMissed=0`; then actually repair the flagged tiles and require
+  the visual checker to pass (`maxDelta <= 96`) with missing counters still zero; then repeat on a
+  slow-pan/motion run. The `0.52` threshold is telemetry only until those coverage and efficacy gates
+  pass.
+- Do not use a scissored fullscreen repair; Loop 83 already showed that row invocation cost destroys
+  the performance win.
+
+## Loop 86 (Codex) -- horizon tile-mask coverage verifier; 0.52 rejected
+
+Purpose: close the correctness gap from Loop 85. A tile count is not proof that the runtime mask
+contains the visual-failure oracle tiles, so this loop builds an offline coverage gate that matches the
+runtime-style low-res edge classifier before any sparse repair path is attached.
+
+Change:
+- Added `tools/horizon_tile_mask_coverage.js`.
+- The tool reads a full-res reference BMP and a low-res-background candidate BMP, computes the oracle
+  tile set from pixels whose per-channel delta exceeds the visual threshold, reconstructs a virtual
+  low-res background, applies the same tile-to-low-res neighborhood edge test as
+  `CS_BackgroundHorizonTileMask.hlsl`, and reports oracle coverage plus simulated repaired metrics.
+- Changed the engine default `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_THRESHOLD` from `0.52` to
+  `0.30` in `src/main_launcher.cpp` and `src/Graphics/Renderer.h` because `0.52` misses oracle tiles.
+
+Verifier proof:
+- Syntax:
+  `node --check tools/horizon_tile_mask_coverage.js` exited `0`.
+- RED control:
+  `node tools/horizon_tile_mask_coverage.js --reference build/bin/captures/vis_full_aggr015/engine_frame_0220.bmp --candidate build/bin/captures/vis_bg025_aggr015/engine_frame_0220.bmp --tile-size 8 --edge-threshold 0.35 --require-oracle-covered --require-repaired-max 96`
+  exited `1`:
+  `runtimeTiles=685`, `oracleTiles=80`, `missed=2`, `pixelUpperPct=2.1142`,
+  `repairedMaxDelta=120`, `ok=false`.
+- GREEN:
+  `node tools/horizon_tile_mask_coverage.js --reference build/bin/captures/vis_full_aggr015/engine_frame_0220.bmp --candidate build/bin/captures/vis_bg025_aggr015/engine_frame_0220.bmp --tile-size 8 --edge-threshold 0.30 --require-oracle-covered --require-repaired-max 96`
+  exited `0`:
+  `runtimeTiles=740`, `oracleTiles=80`, `missed=0`, `pixelUpperPct=2.2840`,
+  `repairedMaxDelta=88`, `ok=true`.
+- Rejected old default:
+  `threshold=0.52` selected `219` tiles but missed `47/80` oracle tiles and left
+  `repairedMaxDelta=120`. It was broad enough to look plausible but did not cover the true failures.
+
+Build:
+- `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat"" -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`
+  exited `0`; only the known `vswhere.exe` warning and pre-existing `rayDir` shadow warnings appeared.
+
+Runtime check:
+- Command:
+  `scripts/statbench.ps1 -Temporal 0 -Frames 180 -Label horizon_tilemask_thr030_default_180 -ShaderUnsafeBlocks 0`
+  with background pass `0.25`, aggressive sky minY `0.15`, depth prepass off, and
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_MASK=1`, with no explicit threshold env.
+- Run exited `0`; `visibleMissingNonzero=0`.
+- Parsed frame > 90:
+  `gpuFrameMsP50=19.66`, `raymarchMsP50=10.26`, `backgroundPixelsP50=129600`,
+  `horizonTileMaskTilesP50=799`, `horizonTileMaskPixelUpperPctP50=2.4660`,
+  `horizonTileMaskMaxEdge255P50=139`, `visibleMissingNonzero=0`,
+  `residentMissingNonzero=0`.
+
+Conclusion:
+- `0.52` is rejected as unsafe for repair because it misses most oracle tiles.
+- `0.30` is the first verified stationary threshold with coverage and simulated repaired visual pass
+  on the existing capture pair. Runtime count is close enough to the offline verifier (`799` vs `740`)
+  to use it as the next implementation gate.
+- Tandem challenge from Claude agreed the verifier is the right shape, but rejected jumping directly
+  to repair from this classifier: `0.30` covers the oracle by over-selecting `740` tiles for an
+  `80`-tile oracle (`~9.25x`). That could plausibly spend the whole low-res performance win on repair
+  work, and it is validated on only one pose.
+- The next loop should compare this edge classifier against a deterministic geometric horizon-band
+  selector using `FarScreenHorizonY`/horizon geometry, then gate across multiple poses or motion. Only
+  after a selector has both oracle coverage and reasonable tile count should the renderer output a GPU
+  tile list/mask and run a sparse repair pass. Any repair implementation must still require: visual
+  checker green, missing counters zero, and runtime composition/perf A/B.
+
+## Loop 87 (Codex) -- FarScreenHorizonY export; geometric selector rejected for low-res bleed
+
+Purpose: test Claude's proposed deterministic geometric selector before spending implementation effort
+on a sparse repair pass. The hypothesis was that the existing projected far max-height horizon
+(`FarScreenHorizonY`) could identify the visual-failure band more robustly than the weak low-res edge
+threshold.
+
+Change:
+- Added default-off horizon CSV export:
+  `VENPOD_FAR_MAX_HEIGHT_HORIZON_CSV=<path>`.
+- When `VENPOD_FAR_MAX_HEIGHT_NO_HIT_MASK=1` generates `FarScreenHorizonY`, the renderer can now queue
+  a one-shot readback and write:
+  `# width=<w> height=<h> tileWidth=8 tileCount=<n> empty=4294967295`
+  followed by `tile,horizonY`.
+- Extended `tools/horizon_tile_mask_coverage.js` with:
+  `--horizon-csv`, `--horizon-above`, and `--horizon-below`, so exported horizon bands can be compared
+  against the same oracle tile set used for the edge-classifier gate.
+
+Build:
+- `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat"" -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`
+  exited `0`; only the known `vswhere.exe` warning and pre-existing `rayDir` shadow warnings appeared.
+- `node --check tools/horizon_tile_mask_coverage.js` exited `0`.
+
+Runtime horizon export:
+- Command:
+  `scripts/statbench.ps1 -Temporal 0 -Frames 180 -Label horizon_geo_csv_180 -ShaderUnsafeBlocks 0`
+  with background pass `0.25`, aggressive sky minY `0.15`, depth prepass off,
+  `VENPOD_FAR_MAX_HEIGHT_NO_HIT_MASK=1`, and
+  `VENPOD_FAR_MAX_HEIGHT_HORIZON_CSV=build/bin/statbench/horizon_geo_csv_180/horizon.csv`.
+- Run exited `0`; CSV written at
+  `build/bin/statbench/horizon_geo_csv_180/horizon.csv`.
+- Parsed frame > 90:
+  `gpuFrameMsP50=18.82`, `raymarchMsP50=9.49`, `backgroundPixelsP50=129600`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- CSV stats:
+  `tileCount=240`, valid horizon tiles `73`, `min=25`, `p50=25`, `p90=77`, `max=82`.
+
+Selector comparison:
+- Edge classifier control:
+  `threshold=0.30` remained green:
+  `runtimeTiles=740`, `oracleTiles=80`, `missed=0`, `pixelUpperPct=2.2840`,
+  `repairedMaxDelta=88`.
+- Geometric horizon selector with `--horizon-above 24 --horizon-below 8`:
+  `selectedTiles=360`, `oracleTiles=80`, `missed=80`, `pixelUpperPct=1.1111`,
+  `repairedMaxDelta=135`.
+- Wider `--horizon-above 48 --horizon-below 16`:
+  `selectedTiles=502`, `missed=80`, `pixelUpperPct=1.5494`, `repairedMaxDelta=135`.
+- Very wide `--horizon-above 96 --horizon-below 32`:
+  `selectedTiles=716`, `missed=80`, `pixelUpperPct=2.2099`, `repairedMaxDelta=135`.
+- Even an extreme downward band, `--horizon-above 32 --horizon-below 420`, still missed `54`
+  oracle tiles and selected `4121` tiles (`12.7191%` frame), because the exported horizon is only valid
+  over part of the screen.
+
+Tile-size follow-up:
+- The edge classifier is less wasteful with 4px tiles:
+  `--tile-size 4 --edge-threshold 0.28` selected `2297` tiles, missed `0/98` oracle tiles,
+  `pixelUpperPct=1.7724`, and repaired maxDelta `88`.
+- A short runtime telemetry run,
+  `scripts/statbench.ps1 -Temporal 0 -Frames 180 -Label horizon_tilemask_t4_thr028_180 -ShaderUnsafeBlocks 0`
+  with `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_MASK=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_SIZE=4`, and threshold `0.28`, exited `0`.
+  Parsed frame > 90:
+  `gpuFrameMsP50=18.09`, `raymarchMsP50=9.21`, `backgroundPixelsP50=129600`,
+  `horizonTileMaskTilesP50=2489`, `horizonTileMaskPixelUpperPctP50=1.9205`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+
+Conclusion:
+- The existing `FarScreenHorizonY` product is not the selector for the 0.25-background visual failure.
+  It identifies a high-sky far max-height no-hit boundary near rows `25..82`, while the low-res bleed
+  oracle lies in the lower horizon band. Treating it as the repair mask would miss the artifact.
+- Keep the CSV exporter and checker support as useful geometry diagnostics, but reject
+  `FarScreenHorizonY` as the next sparse-repair selector for this artifact.
+- Next loop should either:
+  1. improve the classifier by predicting the full-vs-low-res delta directly from the low-res
+     background/horizon neighborhood instead of raw edge magnitude, or
+  2. generate a true full-res sparse oracle mask at low cadence and reuse it, proving cost before
+     repair. The old edge threshold (`0.30`) is correct but likely too broad; the existing geometric
+     horizon is too narrow/wrong-place.
+- If an edge-classifier repair prototype is built anyway, start with 4px tiles around threshold `0.28`
+  rather than 8px/`0.30`; it has better verified pixel upper bound, though tile-list overhead still
+  needs measurement.
+
+## Loop 88 (Codex) -- 4px tile repair prototype is hole-free but not visually green
+
+Purpose: attach the verified 4px/0.28 runtime tile mask to the existing background-pass repair path
+and measure actual output, not just simulated tile replacement. This remained a fullscreen/scissored
+repair draw with shader discard outside selected tiles, so it was a prototype for correctness/cost,
+not the final sparse dispatch architecture.
+
+Change:
+- Added a GPU `R32_UINT` `m_backgroundHorizonTileMask` texture, generated by
+  `CS_BackgroundHorizonTileMask.hlsl` and bound as `t21` for the experimental repair PSO.
+- Default tile selector changed to 4px / threshold `0.28`.
+- The repair PSO defines `RAYMARCH_BACKGROUND_TILE_REPAIR=1` and discards pixels whose full-res tile
+  is not set in the tile mask.
+- Fixed an initial bug where the tile-repair branch discarded the low-res background pass itself.
+
+Build:
+- `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat"" -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel --target VENPOD"`
+  exited `0`.
+
+Rejected first run:
+- `tile_repair4_260` was invalid because the low-res background pass was discarded by a shader
+  branch bug. It left `farTerrainCallsP50=0` and failed the visual gate. No performance conclusion
+  should be drawn from that run.
+
+Verifier after bug fix:
+- Command:
+  `scripts/statbench.ps1 -Temporal 0 -Frames 260 -Label tile_repair4_fix_260 -ShaderUnsafeBlocks 0`
+  with background pass `0.25`, aggressive sky minY `0.15`, depth prepass off,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_MASK=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_SIZE=4`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_THRESHOLD=0.28`, and
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_REPAIR=1`.
+- Run exited `0`; capture written at
+  `build/bin/captures/vis_bg025_tile_repair4_fix/engine_frame_0220.bmp`.
+- Parse frame > 130:
+  `gpuFrameMsP50=22.22`, `gpuFrameMsP90=23.30`,
+  `raymarchMsP50=17.09`, `raymarchMsP90=17.98`,
+  `backgroundCoreMsP50=4.66`, `renderTailMsP50=12.27`,
+  `backgroundPixelsP50=287347`, `horizonTileMaskTilesP50=2491`,
+  `horizonTileMaskPixelUpperPctP50=1.9221`,
+  `farTerrainCallsP50=34524`, `farTerrainHeightEvalP50=445520`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Visual checker against `vis_full_aggr015/engine_frame_0220.bmp` exited `1`:
+  `horizon_sky maxDelta=135 > 96` and `far_horizon_band maxDelta=135 > 96`.
+
+Conclusion:
+- The prototype is hole-free and does repair a large fraction of the low-res horizon error, but it is
+  not visually green and is not fast enough. The fullscreen repair draw plus discard lands around
+  `22ms`, close to the full-res reference path, not the `~16ms` low-res path.
+- This rejects the current scissored/fullscreen repair implementation as a production fix. It does
+  not reject the broader residual-band idea; it says the repair must become a true sparse
+  tile/indirect path or use a different cached/classified product.
+
+## Loop 89 (Codex) -- top-of-shader tile discard experiment rejected
+
+Purpose: determine whether the Loop 88 visual miss was caused by the tile-repair branch perturbing the
+hot far-field shader path. The experiment moved the tile-mask discard to the top of
+`PS_Raymarch.main()` so selected repair pixels would run the normal background branch with less
+repair-specific control flow in the far-field section.
+
+Verifier setup:
+- First established that the full-res visual reference is deterministic:
+  `scripts/statbench.ps1 -Temporal 0 -Frames 260 -Label vis_full_aggr015_repeat_260 -ShaderUnsafeBlocks 0`
+  with background-only PSO, aggressive sky minY `0.15`, and depth prepass off exited `0`.
+- `check_far_horizon_visual.ps1` comparing
+  `build/bin/captures/vis_full_aggr015/engine_frame_0220.bmp` to
+  `build/bin/captures/vis_full_aggr015_repeat/engine_frame_0220.bmp` exited `0` with
+  `maxDelta=0` in all reported regions. The repair visual failure is not run-to-run jitter.
+- Full-res repeat parse frame > 130:
+  `gpuFrameMsP50=22.21`, `raymarchMsP50=17.09`,
+  `backgroundPixelsP50=799776`, `visibleMissingNonzero=0`,
+  `residentMissingNonzero=0`.
+
+Experiment:
+- Temporarily moved the `RAYMARCH_BACKGROUND_TILE_REPAIR` discard to the top of
+  `PS_Raymarch.main()`, copied the shader to `build/bin/assets/shaders`, and ran:
+  `scripts/statbench.ps1 -Temporal 0 -Frames 260 -Label tile_repair4_topmask_260 -ShaderUnsafeBlocks 0`
+  with the same 0.25 background pass, 4px/0.28 mask, aggressive sky, and horizon repair flags.
+- Run exited `0`; shader recompiled in `36.44s`.
+- Parse frame > 130:
+  `gpuFrameMsP50=22.99`, `gpuFrameMsP90=26.09`,
+  `raymarchMsP50=17.50`, `backgroundPixelsP50=157600`,
+  `horizonTileMaskTilesP50=2491`, `horizonTileMaskPixelUpperPctP50=1.9221`,
+  `farTerrainCallsP50=34610`, `visibleMissingNonzero=0`,
+  `residentMissingNonzero=0`.
+- Visual checker against the deterministic full-res repeat exited `1`:
+  `horizon_sky maxDelta=135 > 96` and `far_horizon_band maxDelta=135 > 96`.
+
+Decision:
+- The top-of-shader discard change was reverted in both source and staged runtime shader. It made the
+  frame slower and did not fix the visual gate.
+- The failure mode is not a simple branch-placement bug. The next aligned loop should stop spending
+  iterations on fullscreen repair-with-discard and instead build a true sparse residual-band repair
+  path or a stronger full-vs-low-res delta predictor, then gate it across multiple poses/motion with
+  `visibleMissing=0`, `residentMissingSurface=0`, visual green, and total GPU A/B.
+
+## Loop 90 (Codex + tandem) -- inert compact horizon tile-list foundation
+
+Purpose: add the missing GPU data product behind the existing
+`VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_MASK` selector without changing rendered output. The
+previous repair path still paid fullscreen pixel-shader cost and discarded non-selected pixels in
+`PS_Raymarch`; this loop makes the selector produce a compact tile list plus non-indexed indirect draw
+words so a later residual-band pass can draw only selected tiles.
+
+Implementation:
+- `CS_BackgroundHorizonTileMask.hlsl` now writes selected tile coordinates to `u2`
+  (`RWStructuredBuffer<uint2>`) and a 4-word non-indexed draw-args buffer to `u3`
+  (`vertexCount=6`, `instanceCount=selectedTileCount`, `startVertex=0`, `startInstance=0`).
+- `Renderer` now allocates `BackgroundHorizonTileList` and `BackgroundHorizonTileDrawArgs` when the
+  horizon tile-mask feature is enabled, clears draw args before dispatch, binds `u2/u3`, and transitions
+  the outputs to SRV/indirect states after compute.
+- PERF telemetry keeps the old `horizonTileMask=...` token intact and appends
+  `horizonTileList=count/instances:{}/{}`; `parse_farfield_perf.ps1` now reports
+  `horizonTileListCountP50` and `horizonTileDrawInstancesP50`.
+
+Verifier:
+- Release build through VS env:
+  `cmd.exe /d /s /c 'call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" && cmake --build build --config Release --parallel'`
+  exited `0`. Only observed compiler diagnostics were pre-existing `rayDir` shadowing warnings in
+  `main_launcher.cpp`.
+- Attempted stationary runtime verifier:
+  `scripts/statbench.ps1 -Temporal 0 -Frames 220 -Label tile_list_foundation_active_220 -ShaderUnsafeBlocks 0`
+  with background pass `0.25`, horizon tile mask `4px/0.28`, `Y=320..480`.
+  The log reached `RAYMARCH_BACKGROUND_PASS_CONFIG enableRequested=1 active=1 ... horizonTileMask=1`
+  but did not progress past shader-path initialization after several minutes. The process was stopped.
+  This run produced no settled `PERF_GPU` or tile-list samples and should not be used as a perf result.
+  This matches the known runtime DXC/session-pressure failure mode documented in the handoff.
+
+Tandem critique:
+- Claude independently argued the next performance loop should be predictor-first, not infrastructure-first:
+  current edge predictors select roughly `740` to `2491` tiles while the useful budget is closer to the
+  oracle's `~80` tiles. A compact indirect path can only make the selected set cheaper to draw; it cannot
+  turn an over-broad selector into a production win. Treat this loop as necessary plumbing, not proof that
+  the residual repair approach is ready.
+
+Decision:
+- Keep the inert tile-list foundation default-off behind the existing horizon tile-mask flag.
+- Do not add an instanced repair draw yet. The next high-leverage loop is a full-vs-low-res delta
+  predictor/offline classifier that can shrink selected tiles toward oracle scale, then validate with
+  `visibleMissing=0`, `residentMissingSurface=0`, visual green, and A/B `PERF_GPU`.
+
+## Loop 91 (Codex) -- offline low-res delta-predictor verifier
+
+Purpose: build a verifier for the predictor-first path before touching runtime shaders. The verifier
+must use full-res reference data only to define/score the oracle; predictor scores must be computed
+from data plausibly available to the low-res background pass.
+
+Implementation:
+- Added `tools/horizon_delta_predictor_sweep.js`.
+- The tool reads a full-res reference BMP and a low-res-background candidate BMP, reconstructs a
+  virtual low-res texture from the candidate, computes per-tile low-res-only scores, ranks horizon
+  tiles, and reports:
+  - oracle tile count from full-vs-candidate max-channel delta,
+  - `minTilesForFullOracle`,
+  - false-positive tiles at full oracle coverage,
+  - missed oracle tiles and repaired max delta at fixed tile budgets.
+- Added fixed composite scores after the initial simple-feature sweep showed the same over-selection
+  shape as the old edge threshold. The best current score is
+  `normVarianceTimesEdge = normalized(lumaVariance) * normalized(edge)`.
+- Added `scripts/check_horizon_delta_predictor.ps1`, a repeatable gate over the existing
+  `vis_bg025_aggr015`, `vis_bg050_aggr015`, and `vis_bg075_aggr015` captures.
+
+Verifier red/green:
+- Red control before composite scores:
+  `node tools/horizon_delta_predictor_sweep.js ... --tile-size 8 --bg-scale 0.25 --budgets 640,645,669 --require-cover-budget 645`
+  exited `1`; best simple feature was `lumaVariance minTilesForFullOracle=669`, with
+  `640:1/100` and `645:1/100` missed/maxDelta.
+- Green after fixed normalized composites:
+  `node --check tools/horizon_delta_predictor_sweep.js` exited `0`.
+- `scripts/check_horizon_delta_predictor.ps1 -TileSize 8 -CoverBudget 645` exited `0`:
+  - `bg025`: best `normVarianceTimesEdge minTilesForFullOracle=624`, `640:0/92`, `645:0/92`.
+  - `bg050`: best `normVariancePlusVertical minTilesForFullOracle=396`; `normVarianceTimesEdge`
+    also covered within `454`, `640:0/72`, `645:0/72`.
+  - `bg075`: best `normVarianceTimesEdge minTilesForFullOracle=435`, `640:0/68`, `645:0/68`.
+
+Decision:
+- This is the first evidence that a low-res-only selector can hit the estimated `~645` 8px-tile
+  budget on the available captures. Raw edge thresholding did not do that.
+- Treat the result as `PARTIAL-RISK`, not production proof: the capture set is one camera/frame at
+  three scales, and the normalized composite was discovered during analysis of that frame. The next
+  loop should either:
+  1. run the same verifier across additional poses/motion captures before shader work, or
+  2. implement the selector default-off in `CS_BackgroundHorizonTileMask` and validate with the same
+     no-hole/visual/perf gates once runtime DXC is healthy.
+- Tandem note: Claude was asked for an independent verifier-design critique during this loop, but
+  the turn was still running when this evidence was recorded. Reconcile its verdict before promoting
+  this selector beyond experimental.
+
+## Loop 92 (Codex + tandem) -- shader-realistic predictor gate with ms cost model
+
+Purpose: harden Loop 91 so the offline predictor verifier cannot pass on an implementation-shape
+that is awkward or irrelevant for shader work. In particular, the Loop 91 winner used normalized
+features, which imply a global reduction or per-frame normalization. This loop asks whether a fixed,
+unnormalized low-res feature can pass the same no-hole tile budget and the measured ms budget.
+
+Changes:
+- Added unnormalized feature scores to `tools/horizon_delta_predictor_sweep.js`:
+  `varianceTimesEdge`, `varianceTimesVertical`, and `varianceTimesCurvature`.
+- The sweep now reports `cutoffScoreForFullOracle`, `estimatedMsAtFullOracle`, and `targetMarginMs`.
+  The cutoff score is the shader-threshold candidate for the selected feature.
+- Added `--require-feature`, `--lowres-base-ms`, `--per-tile-ms`, and `--target-ms` gates.
+- Fixed `scripts/check_horizon_delta_predictor.ps1` to propagate native `node` failures with
+  `$LASTEXITCODE`; before this fix, the wrapper printed failures but could still exit `0`.
+- The wrapper now defaults to the shader-realistic feature `varianceTimesEdge`, with
+  `LowresBaseMs=15.95`, `PerTileMs=0.0057`, and `TargetMs=19.63`.
+
+Verifier red/green:
+- Syntax:
+  `node --check tools/horizon_delta_predictor_sweep.js` exited `0`.
+- Red control for the wrapper:
+  `scripts/check_horizon_delta_predictor.ps1 -TileSize 8 -CoverBudget 645 -Feature lumaVariance`
+  exited `1`; `bg025` failed because `lumaVariance minTilesForFullOracle=669`, with
+  `HORIZON_DELTA_PREDICTOR ok=false requireCoverBudget=645 requireFeature=lumaVariance`.
+- Cost-model red control:
+  `scripts/check_horizon_delta_predictor.ps1 -TileSize 8 -CoverBudget 645 -Feature varianceTimesEdge -TargetMs 18.0`
+  exited `1`; `bg025 varianceTimesEdge minTilesForFullOracle=625 estimatedMs=19.512 targetMarginMs=-1.512`.
+- Green gate:
+  `scripts/check_horizon_delta_predictor.ps1 -TileSize 8 -CoverBudget 645 -Feature varianceTimesEdge -TargetMs 19.63`
+  exited `0`:
+  - `bg025`: `varianceTimesEdge minTilesForFullOracle=625`, `cutoffScore=0.002256124950187529`,
+    `estimatedMs=19.512`, `targetMarginMs=0.117`.
+  - `bg050`: `varianceTimesEdge minTilesForFullOracle=454`, `cutoffScore=0.0031604361199518522`,
+    `estimatedMs=18.538`, `targetMarginMs=1.092`.
+  - `bg075`: `varianceTimesEdge minTilesForFullOracle=435`, `cutoffScore=0.002284619863130102`,
+    `estimatedMs=18.430`, `targetMarginMs=1.200`.
+
+Tandem verdict:
+- Claude independently reviewed the verifier direction and converged on predictor-first, but warned
+  against shader promotion from the current corpus. Its main points:
+  - The entire capture corpus is still effectively one frame (`engine_frame_0220.bmp`) at multiple
+    scales, so any green result is overfit-prone.
+  - The next hardening step should use paired multi-pose captures and the real pre-composite low-res
+    background texture, not a synthesized low-res texture from the candidate composite.
+  - Color-only low-res features may have an information ceiling on thin horizon silhouettes; an
+    auxiliary geometric buffer may be needed if the multi-pose gate fails.
+
+Decision:
+- `varianceTimesEdge` is now the current shader-realistic candidate: it is fixed, unnormalized, passes
+  the available three-scale verifier, and has a direct score threshold to test.
+- Do not make it default and do not claim production readiness. The next aligned loop is either:
+  1. add a default-off runtime mode in `CS_BackgroundHorizonTileMask` that computes
+     `varianceTimesEdge` and validates list count/visual/perf once runtime DXC is healthy, or
+  2. harden the corpus first by capturing multiple poses plus the actual low-res pre-composite texture
+     and rerunning this gate as train/test.
+
+## Loop 93 (Codex) -- fixed-threshold verifier + default-off runtime selector
+
+Purpose: close the gap between the Loop 92 offline ranking result and the runtime implementation
+shape. The shader does not have a top-k sort; it has a per-tile threshold. This loop adds a fixed
+score-threshold verifier and wires a default-off runtime selector mode that computes the same
+`varianceTimesEdge` score as the offline tool.
+
+Verifier hardening:
+- Added `--score-threshold` and `--require-score-threshold` to
+  `tools/horizon_delta_predictor_sweep.js`.
+- `scripts/check_horizon_delta_predictor.ps1` now defaults to the shader-realistic fixed threshold:
+  `Feature=varianceTimesEdge`, `ScoreThreshold=0.00225`, `RequireScoreThreshold=true`,
+  `LowresBaseMs=15.95`, `PerTileMs=0.0057`, `TargetMs=19.63`.
+- Red control:
+  `scripts/check_horizon_delta_predictor.ps1 -TileSize 8 -CoverBudget 645 -Feature varianceTimesEdge -TargetMs 19.63 -ScoreThreshold 0.0025 -RequireScoreThreshold`
+  exited `1`; `bg025` missed one oracle tile at the stricter threshold:
+  `selectedTiles=608 missed=1 estimatedMs=19.416 repairedMaxDelta=100`.
+- Green gate:
+  `scripts/check_horizon_delta_predictor.ps1 -TileSize 8 -CoverBudget 645 -Feature varianceTimesEdge -TargetMs 19.63`
+  exited `0`:
+  - `bg025`: fixed threshold `0.00225`, `selectedTiles=626`, `missed=0`,
+    `estimatedMs=19.518`, `targetMarginMs=0.112`, `repairedMaxDelta=92`.
+  - `bg050`: `selectedTiles=490`, `missed=0`, `estimatedMs=18.743`,
+    `targetMarginMs=0.887`, `repairedMaxDelta=72`.
+  - `bg075`: `selectedTiles=437`, `missed=0`, `estimatedMs=18.441`,
+    `targetMarginMs=1.189`, `repairedMaxDelta=91`.
+
+Runtime change:
+- Added `RendererConfig::backgroundPassHorizonTileSelector`.
+- Added env `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_SELECTOR`:
+  - `0`: existing edge score selector (default, no behavior change).
+  - `1`: `varianceTimesEdge = lumaVariance * edge`.
+- In selector mode `1`, the default threshold is `0.00225` unless
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_THRESHOLD` is explicitly supplied.
+- `CS_BackgroundHorizonTileMask.hlsl` now computes low-res neighborhood luma variance and selects
+  with `selectorScore >= threshold`, while still logging `maxEdge255` from the old edge score for
+  compatibility.
+
+Build:
+- `cmd.exe /d /s /c 'call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" && cmake --build build --config Release --parallel'`
+  exited `0`.
+- Only observed diagnostics were the pre-existing `rayDir` shadowing warnings in `main_launcher.cpp`.
+
+Decision:
+- The runtime selector is now available for validation but remains default-off.
+- This is not production proof: the fixed threshold still comes from one pose at three scales and
+  uses synthesized low-res candidate features, not a captured pre-composite low-res background.
+- Next aligned validation is a runtime run with:
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_SELECTOR=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_MASK=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_SIZE=8`,
+  and the normal no-hole / visual / `PERF_GPU` gates once runtime DXC/session health permits.
+
+## Loop 94 (Codex + tandem) -- first selector=1 runtime validation attempt
+
+Purpose: exercise the default-off `varianceTimesEdge` runtime selector enough to verify env/config
+plumbing and, if the runtime reaches frames, compare telemetry against the offline fixed-threshold
+gate.
+
+Tandem:
+- Compacted the Claude partner with a handoff covering Loops 90-93 and the remaining risks.
+- Asked fresh Claude to independently review `CS_BackgroundHorizonTileMask.hlsl` and
+  `horizon_delta_predictor_sweep.js` for selector math / tile mapping / threshold mismatches.
+  The review was still running when this loop evidence was recorded.
+
+Verifier setup:
+- Command:
+  `scripts/statbench.ps1 -Temporal 0 -Frames 220 -Label selector_vte_mask_t8_220 -ShaderUnsafeBlocks 0`
+  with:
+  - `VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE=1`
+  - `VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE=0.25`
+  - `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_MASK=1`
+  - `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_SIZE=8`
+  - `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_SELECTOR=1`
+  - `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_THRESHOLD=0.00225`
+  - horizon tile band `Y=320..480`.
+
+Result:
+- The run did not reach frame execution. It stalled at the same known runtime shader-path/DXC
+  initialization point as prior selector/tile-list attempts and was stopped.
+- `statbench` reported `exit=-1`, no settled `PERF_GPU` samples, and `visibleMissingNonzero=0`
+  only because no frame telemetry ran.
+- Useful evidence from the log:
+  `RAYMARCH_BACKGROUND_PASS_CONFIG enableRequested=1 active=1 scale=0.250 ... horizonTileMask=1 horizonTileSize=8 horizonTileY=320..480 horizonTileSelector=1 horizonTileThreshold=0.002250 ... background=480x270`.
+  This confirms the runtime env/config path selects the intended mode and threshold.
+
+Decision:
+- Runtime validation remains inconclusive due the recurring initialization stall, not because of a
+  selector result.
+- Do not promote selector mode `1`; keep it default-off.
+- Next useful work should avoid repeated full-engine launches until runtime DXC/session health is
+  restored. Either:
+  1. add a small shader-compiler smoke test/tool for `CS_BackgroundHorizonTileMask.hlsl`, or
+  2. capture/run after a machine restart and immediately parse `horizonTileMaskTilesP50`,
+     `horizonTileListCountP50`, `horizonTileDrawInstancesP50`, `visibleMissing=0`, and `PERF_GPU`.
+
+## Loop 95 (Codex + tandem) -- shader compile smoke for horizon tile selector
+
+Purpose: remove one uncertainty from the stalled runtime selector validation without repeatedly
+launching the full engine. Loop 94 never reached frame execution, so it could not prove whether
+`CS_BackgroundHorizonTileMask.hlsl` itself compiled cleanly through the runtime DXC wrapper. This
+loop adds a narrow compile-only tool and proves it red/green.
+
+Change:
+- Added `tools/shader_compile_smoke.cpp`.
+- Added CMake target `shader_compile_smoke`, linked only against `ShaderCompiler.cpp`, `spdlog`,
+  and DXC/D3D system libraries.
+- The tool accepts `--shader`, `--shader-root`, `--entry`, `--target`, and repeated `--define`.
+  It uses `ShaderCompiler::CompileFromFile`, so include handling, cache hashing, and DXC invocation
+  match the engine's runtime compiler path. It exits nonzero when DXC returns invalid bytecode.
+
+Verifier red/green:
+- Build helper:
+  `cmd.exe /d /s /c 'call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" && cmake --build build --config Release --parallel --target shader_compile_smoke'`
+  exited `0` after the warning-clean rebuild.
+- Red control:
+  `build/bin/shader_compile_smoke.exe --shader assets/shaders/Compute/CS_BackgroundHorizonTileMask.hlsl --shader-root assets/shaders --target cs_6_0 --entry definitely_missing`
+  exited nonzero. DXC reported `error: missing entry point definition`, proving the helper fails for
+  real shader-compile errors.
+- Green:
+  `build/bin/shader_compile_smoke.exe --shader assets/shaders/Compute/CS_BackgroundHorizonTileMask.hlsl --shader-root assets/shaders --target cs_6_0 --entry main`
+  exited `0`: `SHADER_COMPILE_SMOKE ok=true ... bytes=6944`.
+- Regression:
+  full Release build command
+  `cmd.exe /d /s /c 'call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat" && cmake --build build --config Release --parallel'`
+  exited `0` (`ninja: no work to do` after the helper target was current).
+- Existing offline fixed-threshold gate remained green:
+  `scripts/check_horizon_delta_predictor.ps1 -TileSize 8 -CoverBudget 645 -Feature varianceTimesEdge -TargetMs 19.63`
+  exited `0`; the fixed `0.00225` threshold still reports `missed=0` for `bg025`, `bg050`, and
+  `bg075`.
+
+Tandem:
+- Asked Claude to challenge whether this compile-only verifier is the right next loop versus another
+  runtime or classifier verifier. The background review was still running when this evidence was
+  recorded; reconcile it before deciding the next implementation loop.
+
+Decision:
+- `CS_BackgroundHorizonTileMask.hlsl` is compile-green through the same DXC wrapper used by runtime.
+- This does not prove runtime telemetry, selector transfer, visual correctness, or performance. It
+  only rules out HLSL compile failure as the cause of the Loop 94 frame-less runtime stall.
+- Next runtime validation, once the DXC/session stall is cleared, should immediately compare:
+  `horizonTileMaskTilesP50`, `horizonTileListCountP50`, `horizonTileDrawInstancesP50`,
+  `visibleMissing=0`, `residentMissingSurface=0`, `PERF_GPU`, and horizon visual max-delta. If runtime
+  remains unhealthy, the next non-runtime loop should harden the corpus with real pre-composite
+  low-res captures rather than tuning the current one-pose threshold.
+
+## Loop 96 (Codex + tandem) -- real pre-composite low-res verifier input
+
+Purpose: test whether the Loop 91-93 offline selector survives transfer from synthesized low-res
+features to the actual pre-composite low-res background buffer used by the renderer. This is a
+verifier/corpus loop, not a runtime-default change.
+
+Change:
+- Extended `tools/horizon_delta_predictor_sweep.js` with `--lowres-source <bmp>`.
+- When supplied, the tool computes selector features directly from that low-res BMP and still uses the
+  full-resolution reference/candidate pair only for oracle scoring and visual-delta accounting.
+- Existing synthesized-low-res behavior remains the default.
+
+Runtime capture:
+- A focused current-engine capture reached frames successfully with:
+  `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE=0.25`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_PSO=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_MIN_Y=0.15`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_CAPTURE=1`,
+  `VENPOD_CAPTURE_DIR=build/bin/captures/precomp_bg025_aggr015`,
+  `VENPOD_CAPTURE_START_FRAME=220`,
+  `VENPOD_CAPTURE_COUNT=1`,
+  then `scripts/statbench.ps1 -Temporal 0 -Frames 240 -Label precomp_bg025_capture_240 -ShaderUnsafeBlocks 0`.
+- Run exited `0`: settled `gpuFrameMs p50=16.24 p90=21.89 max=28.35 n=119`,
+  `visibleMissingNonzero=0`.
+- Captures written:
+  `build/bin/captures/precomp_bg025_aggr015/background_pass_frame_0220.bmp` and
+  `build/bin/captures/precomp_bg025_aggr015/engine_frame_0220.bmp`.
+
+Verifier evidence:
+- `node --check tools/horizon_delta_predictor_sweep.js` exited `0`.
+- Existing synthesized-input wrapper remained green:
+  `scripts/check_horizon_delta_predictor.ps1 -TileSize 8 -CoverBudget 645 -Feature varianceTimesEdge -TargetMs 19.63`
+  exited `0`.
+- Direct-source transfer check against the existing old full-reference fixture exited `1`:
+  `oracleTiles=2660`, `oraclePixels=156708`, `candidateBandTiles=4800`; the required
+  `varianceTimesEdge` fixed-threshold gate did not pass.
+- Visual comparison showed the old fixture set and the new current pre-composite capture are not a
+  trustworthy pair: `scripts/check_far_horizon_visual.ps1` reported full-frame MAE about `8.6` and
+  upper-sky MAE about `28.7`, with large max deltas. The mid-terrain control was near zero, so the
+  mismatch is concentrated in sky/horizon brightness rather than general frame corruption.
+
+Tandem:
+- Claude independently converged that the highest-leverage next loop is a same-session pre-composite
+  capture/verifier corpus. Its reasoning: the no-hit mask, horizon selector, and far-owner decision are
+  all blocked by the same missing ground truth: paired real low-res/pre-composite input plus full-res
+  reference across multiple poses and motion.
+
+Decision:
+- The tool now supports the right input shape, but the first transfer run is inconclusive because it
+  mixes old full-reference fixtures with a new current-engine capture.
+- Do not tune the threshold against this mixed fixture and do not promote the runtime selector.
+- Next aligned loop: generate same-session full-res reference and pre-composite candidate captures,
+  then rerun `--lowres-source` over that paired corpus before making any performance or visual claim.
+
+## Loop 97 (Codex + tandem) -- same-session pre-composite transfer gate
+
+Purpose: remove the Loop 96 fixture-drift ambiguity by pairing the current pre-composite low-res
+capture with a same-current-engine full-resolution reference, then make the direct-source verifier
+represent the selectable repair band rather than the whole frame.
+
+Changes:
+- Added optional `--oracle-y0` / `--oracle-y1` to `tools/horizon_delta_predictor_sweep.js`.
+  Default behavior remains full-frame oracle scoring, preserving the existing synthesized-fixture gate.
+- Added `scripts/check_horizon_delta_predictor_precomp.ps1`, a focused wrapper for the real
+  pre-composite case. It defaults to:
+  - reference `build/bin/captures/vis_full_aggr015_current/engine_frame_0220.bmp`
+  - candidate `build/bin/captures/precomp_bg025_aggr015/engine_frame_0220.bmp`
+  - low-res source `build/bin/captures/precomp_bg025_aggr015/background_pass_frame_0220.bmp`
+  - repair/oracle band `Y=320..480`
+  - `varianceTimesEdge`, threshold `0.00388`, tile budget `645`, target `19.63ms`.
+
+Same-current capture:
+- Full-res reference command used:
+  `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_PSO=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_MIN_Y=0.15`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`,
+  `VENPOD_CAPTURE_DIR=build/bin/captures/vis_full_aggr015_current`,
+  `VENPOD_CAPTURE_START_FRAME=220`,
+  `VENPOD_CAPTURE_COUNT=1`,
+  then `scripts/statbench.ps1 -Temporal 0 -Frames 240 -Label vis_full_aggr015_current_240 -ShaderUnsafeBlocks 0`.
+- Run exited `0`: settled `gpuFrameMs p50=20.62 p90=23.87 max=28.11 n=119`,
+  `visibleMissingNonzero=0`.
+- Capture written:
+  `build/bin/captures/vis_full_aggr015_current/engine_frame_0220.bmp`.
+
+Visual sanity:
+- Same-current full-res reference vs current pre-composite candidate no longer shows the old fixture
+  drift. `scripts/check_far_horizon_visual.ps1 -Json` still exits `1` because isolated max-delta
+  pixels exceed the strict `96` threshold, but MAE is tiny:
+  - full frame `mae=0.196`
+  - upper sky `mae=0.119`
+  - horizon sky `mae=0.536`
+  - far horizon band `mae=0.606`
+  This confirms the Loop 96 `mae~8.6 / upper-sky mae~28.7` problem was a mixed-fixture mismatch.
+
+Verifier red/green:
+- Syntax: `node --check tools/horizon_delta_predictor_sweep.js` exited `0`.
+- Existing synthesized-input regression gate still exited `0`:
+  `scripts/check_horizon_delta_predictor.ps1 -TileSize 8 -CoverBudget 645 -Feature varianceTimesEdge -TargetMs 19.63`.
+- Full-frame oracle with real pre-composite input remained invalid for the repair verifier because
+  it includes out-of-band pixels the repair selector cannot choose: even selecting all `4800` candidate
+  band tiles missed `33` oracle tiles.
+- Band-limited real pre-composite gate with old threshold `0.00225` exited `1`:
+  `varianceTimesEdge` selected `714` tiles, `missed=0`, estimated `20.020ms`,
+  `targetMarginMs=-0.390`. The old synthesized-input threshold over-selects on the actual
+  pre-composite buffer.
+- Band-limited real pre-composite green:
+  `scripts/check_horizon_delta_predictor_precomp.ps1` exited `0`:
+  `varianceTimesEdge minTilesForFullOracle=613`, `cutoffScore=0.0038893334559060447`,
+  fixed threshold `0.00388`, `selectedTiles=613`, `missed=0`,
+  `estimatedMs=19.444`, `targetMarginMs=0.186`, `repairedMaxDelta=88`.
+- Red control:
+  `scripts/check_horizon_delta_predictor_precomp.ps1 -ScoreThreshold 0.0039` exited `1` for the
+  expected reason: `varianceTimesEdge selectedTiles=611 missed=1 repairedMaxDelta=112`.
+
+Tandem:
+- Claude independently critiqued the verifier and converged that same-session full/pre-composite is
+  necessary but not sufficient. It identified three gaps:
+  - single-pose train==test can still produce a misleading green;
+  - the cleanest oracle triple should use two background-pass runs of the same frame:
+    scale `1.0` `engine_frame` as reference, scale `0.25` `engine_frame` as candidate, and the
+    scale `0.25` `background_pass_frame` as `--lowres-source`;
+  - the offline `estimatedMs` gate is circular until replaced or bounded by measured runtime
+    scale `1.0` vs `0.25` background-only perf.
+  It recommended running that measured perf ceiling first, then a held-out multi-pose/motion corpus
+  before any runtime default promotion.
+
+Decision:
+- Real pre-composite input is viable on the current stationary frame: the same shader-realistic
+  `varianceTimesEdge` feature covers the band oracle inside the tile/ms budget when the fixed
+  threshold is calibrated to the actual pre-composite signal.
+- This is not production proof. The threshold changed from `0.00225` to `0.00388`, the corpus is still
+  one stationary pose, and strict max-delta visual checks still flag isolated pixels even though MAE is
+  tiny. Do not change runtime defaults.
+- Next aligned loop: first measure the background-pass scale `1.0` vs `0.25` perf ceiling and build the
+  stricter two-run oracle triple, then extend that same-session pre-composite corpus to multiple
+  stationary poses and motion frames. Only if the threshold survives held-out poses, run the
+  default-off runtime selector with
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_HORIZON_TILE_THRESHOLD=0.00388` and validate
+  `visibleMissing=0`, `residentMissingSurface=0`, visual parity, tile counts, and `PERF_GPU`.
+
+## Loop 98 (Codex + tandem) -- background-pass scale ceiling rejects immediate repair shader work
+
+Purpose: measure the runtime headroom for the low-res background + full-res repair path before spending
+another shader/runtime loop on the selector. This follows the Loop 97 tandem critique: the offline
+`estimatedMs` gate is circular unless bounded by real scale `1.0` vs `0.25` measurements.
+
+Runtime A/B setup:
+- Both runs used:
+  `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_CAPTURE=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_PSO=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_MIN_Y=0.15`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`,
+  `VENPOD_CAPTURE_START_FRAME=220`,
+  `VENPOD_CAPTURE_COUNT=1`,
+  then `scripts/statbench.ps1 -Temporal 0 -Frames 240 -ShaderUnsafeBlocks 0`.
+- Scale `1.0`: label `precomp_scale100_current_240`, capture dir
+  `build/bin/captures/precomp_scale100_current`.
+- Scale `0.25`: label `precomp_scale025_current_240`, capture dir
+  `build/bin/captures/precomp_scale025_current`.
+
+Measured perf ceiling:
+- Scale `1.0` statbench exited `0`: settled `gpuFrameMs p50=20.78 p90=23.89 max=40.8`,
+  `visibleMissingNonzero=0`.
+- Scale `0.25` statbench exited `0`: settled `gpuFrameMs p50=18.42 p90=24.40 max=29.21`,
+  `visibleMissingNonzero=0`.
+- Parsed with `scripts/parse_farfield_perf.ps1 -MinFrame 120`:
+  - scale `1.0`: `gpuFrameMsP50=20.78`, `raymarchMsP50=15.55`,
+    `backgroundCoreMsP50=15.55`, `sparseSurfaceMsP50=3.71`,
+    `backgroundPixelsP50=799776`, missing counters zero.
+  - scale `0.25`: `gpuFrameMsP50=18.42`, `raymarchMsP50=9.20`,
+    `backgroundCoreMsP50=7.42`, `renderTailMsP50=1.35`,
+    `sparseSurfaceMsP50=8.19`, `backgroundPixelsP50=129600`, missing counters zero.
+- Total measured p50 headroom from scale `1.0` to `0.25` is only `2.36ms`.
+  The ray/background bucket improves by about `6.35ms`, but the sparse-surface bucket rises by
+  about `4.48ms`, consuming most of the gain. Drained-only samples are still only about `2.86ms`
+  better (`20.94 -> 18.08`), while backlogged samples are worse for scale `0.25`.
+
+Two-run oracle triple:
+- Visual sanity:
+  `scripts/check_far_horizon_visual.ps1 -Reference build/bin/captures/precomp_scale100_current/engine_frame_0220.bmp -Candidate build/bin/captures/precomp_scale025_current/engine_frame_0220.bmp -Json`
+  exits `1` only on strict isolated max-delta pixels, while MAE stays tiny:
+  full-frame `0.229`, upper-sky `0.292`, horizon-sky `0.530`, far-horizon band `0.652`.
+- Corrected predictor:
+  `scripts/check_horizon_delta_predictor_precomp.ps1 -Reference build/bin/captures/precomp_scale100_current/engine_frame_0220.bmp -Candidate build/bin/captures/precomp_scale025_current/engine_frame_0220.bmp -LowresSource build/bin/captures/precomp_scale025_current/background_pass_frame_0220.bmp -ScoreThreshold 0.00388`
+  exited `0`.
+- Predictor details: `varianceTimesEdge minTilesForFullOracle=612`, fixed threshold `0.00388`,
+  `selectedTiles=612`, `missed=0`, old model `estimatedMs=19.438`, `targetMarginMs=0.192`,
+  `repairedMaxDelta=88`.
+
+Decision:
+- Correctness remains plausible for this stationary frame, but the measured runtime ceiling rejects
+  immediate full-res repair shader work as the next production optimization. With `~612` selected
+  tiles, the prior `0.0057ms/tile` repair model implies about `3.49ms` of repair work before any
+  selector/list/dispatch overhead, already larger than the measured total p50 headroom of `2.36ms`.
+- Do not promote or implement the full-res tile repair runtime path next. It would need either:
+  1. an actual repair path below about `0.0038ms/tile` with near-zero overhead, or
+  2. a fix for the scale `0.25` sparse-surface/tail inflation, or
+  3. a different cached far-background product that removes far ray work without causing the
+     low-res pass composition/surface-cost tradeoff.
+- Next aligned optimization loop should pivot away from polishing the color-only tile selector and
+  investigate why reducing background invocations inflates the sparse surface/tail buckets, or pursue
+  a cached far visual/horizon product whose measured A/B can beat the scale-ceiling gate.
+
+Tandem:
+- Claude independently reviewed the measurement interpretation and converged with one correction:
+  background-only scale `1.0 -> 0.25` is a kill-only gross ceiling, not a go signal, because foreground
+  work is absent. It recommended killing the path if this inflated gross ceiling is `<= ~5ms`; otherwise
+  a foreground-present A/B and direct repair-cost probe would still be required before promotion.
+- The measured gross ceiling here is only `2.36ms` p50, so the kill/deprioritize decision is valid
+  without spending another runtime loop on foreground-present repair validation. A large gross ceiling
+  would have been inconclusive; this small one is decisive enough to stop polishing the selector.
+
+## Loop 99 (Codex + tandem) -- split-path attribution probe: ray work drops, surface/residency dominates
+
+Purpose: explain why the Loop 98 low-res background pass saved raymarch time but did not translate into
+a large frame win. This is a diagnostic loop, not a renderer-default change.
+
+Re-orientation:
+- Source check confirmed an important A/B caveat: `Renderer::UseBackgroundPassSplit()` returns true for
+  temporal or `backgroundPassScale < 0.999f`; therefore the Loop 98 scale `1.0` control was the direct
+  full-res path, not the same split path at native scale.
+- Existing Loop 98 logs re-parsed with the stricter `MinFrame 200` window:
+  - `precomp_scale100_current_240`: `gpuFrameMsP50=20.73`, `raymarchMsP50=15.62`,
+    `sparseSurfaceMsP50=3.97`, missing counters zero.
+  - `precomp_scale025_current_240`: `gpuFrameMsP50=21.68`, `raymarchMsP50=10.57`,
+    `backgroundCoreMsP50=8.71`, `renderTailMsP50=1.32`, `sparseSurfaceMsP50=9.12`,
+    missing counters zero.
+  This shows the earlier `18.42ms` p50 was partly a too-early window; the 240-frame split run was not
+  a settled production win.
+
+Probe 1: split `0.25` with background raymarch skipped but split clear/composite retained.
+- Command: `scripts/statbench.ps1 -Temporal 0 -Frames 240 -Label loop99_bg025_forcecolor_240`
+  with `VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE=0.25`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_FORCE_COLOR=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_PSO=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_MIN_Y=0.15`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`, and capture disabled.
+- Run exited `0`; statbench settled p50 was `14.43ms`, `visibleMissingNonzero=0`.
+- Parsed with `MinFrame 120`: `raymarchMsP50=0.18`, `renderTailMsP50=0.16`,
+  but `sparseSurfaceMsP50=12.80` (`near=5.50`, `mid=6.95`).
+- Parsed with `MinFrame 200`: `gpuFrameMsP50=17.98`, `raymarchMsP50=0.18`,
+  `sparseSurfaceMsP50=15.86`, missing counters zero.
+- Surface telemetry also grew materially: median `gpuFaces=458942`, `draws=1699` for `MinFrame 120`,
+  higher than the Loop 98 0.25 run. So force-color removes the shader whale but does not remove the
+  surface/mid-mesh growth; by late frames it is dominated by raster surface cost.
+
+Probe 2: longer settled split `0.25` run without capture.
+- Command: `scripts/statbench.ps1 -Temporal 0 -Frames 400 -Label loop99_bg025_nocap_400` with the same
+  0.25 split/aggressive-sky/depth-prepass-off flags and capture disabled.
+- Run exited `0`; statbench settled p50 was `16.59ms`, p90 `27.85ms`, `visibleMissingNonzero=0`.
+- Parsed:
+  - `MinFrame 120`: `gpuFrameMsP50=17.23`, `raymarchMsP50=9.29`,
+    `backgroundCoreMsP50=7.96`, `renderTailMsP50=1.27`, `sparseSurfaceMsP50=7.47`.
+  - `MinFrame 200`: `gpuFrameMsP50=16.59`, `raymarchMsP50=9.46`,
+    `backgroundCoreMsP50=8.25`, `renderTailMsP50=0.99`, `sparseSurfaceMsP50=6.38`.
+  - `MinFrame 300`: `gpuFrameMsP50=16.77`, `raymarchMsP50=9.85`,
+    `backgroundCoreMsP50=8.69`, `renderTailMsP50=0.99`, `sparseSurfaceMsP50=6.48`.
+- The longer run is a real p50 improvement over the old direct control, but it is not a clean
+  architectural victory: by `MinFrame 300`, median surface geometry had grown to about
+  `1.20M` GPU faces and `4313` draws, with last observed surface telemetry around `1.34M` faces.
+
+Failed control:
+- Tried a no-capture 400-frame direct/scale `1.0` control (`loop99_scale100_nocap_400`), but the engine
+  exited around frame `66` with exit code `0`, leaving no settled `PERF_GPU` samples. It is not used as
+  evidence except to note the harness/run instability.
+
+Decision:
+- The far/background raymarch is still a real bottleneck, but the low-res split path is not the
+  production architecture. It trades raymarch time for surface/mid-mesh work and pass overhead, with
+  late-frame geometry growth large enough that the p90 remains poor.
+- Force-color proves the split path can eliminate raymarch cost, but also proves that once the shader is
+  gone the frame is dominated by raster surface/mid work. The next production lever should not be
+  full-res tile repair on the color path; it should either:
+  1. produce a true additive far owner/cache that sharply reduces `backgroundPixels` without inflating
+     near/mid surface ownership work, or
+  2. first fix why split/background diagnostics cause large surface residency/draw growth, then rerun the
+     400-frame direct-vs-split A/B.
+- A clean direct 400-frame control is still needed before claiming an exact ms delta. Current evidence is
+  enough to reject polishing the horizon repair selector as the next optimization.
+
+Tandem:
+- Claude returned after this entry was drafted and converged on the main skepticism, with one important
+  accounting correction: `backgroundCoreMs` and `renderTailMs` are sub-intervals of `raymarchMs`, not
+  additive siblings. Likewise `sparseSurfaceMs` is an umbrella over near/mid surface spans. Therefore
+  future comparisons must use top-level `gpuFrameMs` plus controlled work counts, not a sum of nested
+  timer buckets.
+- Claude's independent ranking: the `sparseSurfaceMs` inflation is most likely either de-hidden surface
+  work previously overlapped/hidden by the heavy direct raymarch, or a split-depth/barrier/pass-structure
+  stall. Its recommended next probe is to hold sparse surface workload fixed between direct and split
+  runs (clamp/disable mid-promotion or otherwise submit the same face/draw set) and compare only total
+  `gpuFrameMs`. If total still stays high with identical geometry, target the split depth/barrier path;
+  if total falls, target mid-field geometry/LOD/decimation rather than far color repair.
+
+## Loop 100 (Codex) -- fixed mid-range A/B: no intrinsic split ceiling under matched geometry
+
+Purpose: test the Loop 99 attribution directly by constraining the CPU mid-height mesh range so native
+and low-res background split submit approximately the same sparse-surface/mid-mesh geometry. This is a
+diagnostic configuration only, not a production default.
+
+Common setup:
+- Both arms used capture enabled at frame 220 to avoid the early-exit behavior seen in the prior
+  no-capture native control, and parsed `PERF_GPU` with `MinFrame=200`.
+- Common env:
+  `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_PSO=1`,
+  `VENPOD_RAYMARCH_AGGRESSIVE_SKY_MIN_Y=0.15`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`,
+  `VENPOD_SPARSE_MID_MESH_MAX_DISTANCE=1024`,
+  `VENPOD_SPARSE_MID_MESH_MAX_FACES=3145728`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_CAPTURE=1`,
+  `VENPOD_CAPTURE_START_FRAME=220`,
+  `VENPOD_CAPTURE_INTERVAL_FRAMES=1`,
+  `VENPOD_CAPTURE_COUNT=1`.
+- Native/direct arm:
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE=1.0`,
+  `scripts/statbench.ps1 -Temporal 0 -Frames 320 -Label loop100_scale100_midmax1024_320 -ShaderUnsafeBlocks 0`.
+- Split arm:
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE=0.25`,
+  `scripts/statbench.ps1 -Temporal 0 -Frames 320 -Label loop100_bg025_midmax1024_320 -ShaderUnsafeBlocks 0`.
+
+Results:
+- Native/direct statbench exited `0`: settled second-half `gpuFrameMs p50=23.61 p90=30.30 max=36.86`,
+  `visibleMissingNonzero=0`.
+- Split `0.25` statbench exited `0`: settled second-half `gpuFrameMs p50=16.90 p90=22.26 max=29.86`,
+  `visibleMissingNonzero=0`.
+- Detailed parse, `MinFrame=200`:
+  - Native/direct: `gpuFrameMsP50=24.38`, `raymarchMsP50=20.08`,
+    `sparseSurfaceMsP50=2.84`, `sparseNearSurfaceMsP50=1.87`, `sparseMidMeshMsP50=0.89`,
+    `backgroundPixelsP50=1004601`, `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+  - Split `0.25`: `gpuFrameMsP50=15.60`, `raymarchMsP50=9.56`,
+    `backgroundCoreMsP50=8.35`, `renderTailMsP50=1.28`,
+    `sparseSurfaceMsP50=5.27`, `sparseNearSurfaceMsP50=3.35`, `sparseMidMeshMsP50=1.97`,
+    `backgroundPixelsP50=129600`, `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Geometry counts from `PERF_SPARSE_SURFACE` after frame 200 were closely matched:
+  - Native/direct: `gpuFacesP50=847784`, `gpuFacesP90=1061311`, `gpuDrawCmdsP50=3051`,
+    last sample `gpuFaces=1121572`, `gpuDrawCmds=4024`.
+  - Split `0.25`: `gpuFacesP50=852355`, `gpuFacesP90=1081564`, `gpuDrawCmdsP50=3072`,
+    last sample `gpuFaces=1121572`, `gpuDrawCmds=4024`.
+
+Decision:
+- This controlled A/B weakens the claim that the split/background-pass path is intrinsically capped at
+  roughly 50-70 FPS. With approximately matched submitted geometry and zero missing counters, the split
+  path is about `8.78ms` faster by the stricter `MinFrame=200` parser (`24.38 -> 15.60ms`) even though
+  its sparse-surface bucket remains about `2.43ms` higher.
+- The remaining split `sparseSurfaceMs` inflation is real, but it is not enough to erase the raymarch
+  reduction once geometry is held stable. Treat it as a secondary pass/barrier/de-hidden-work problem,
+  not as proof that the renderer has reached an architectural ceiling.
+- The stronger conclusion is unchanged from the original diagnosis: native full-res far/background
+  raymarch is still the whale. Under the narrowed mid-mesh range, native background ownership rises to
+  about `1.0M` pixels and raymarch hits `20.08ms`; split reduces actual far-terrain calls from about
+  `165k` to `10.6k` and height evals from about `2.06M` to `131k`.
+- The production architecture should still be a cached/additive far owner that removes far pixels from
+  the expensive march without expanding the CPU mid mesh. The prior far-mesh attempt that only removed
+  about `18k` pixels was not enough coverage; it does not falsify the architecture, it falsifies that
+  implementation's coverage/product shape.
+- Next probe: repeat the fixed-workload A/B with a production-range cached far owner candidate once it
+  exists, and separately investigate why split raises `sparseNearSurfaceMs`/`sparseMidMeshMs` under
+  otherwise matched face/draw counts.
+
+## Loop 101 (Codex) -- matched short-run horizon/sky-owner diagnostic
+
+Purpose: answer whether the existing far max-height / horizon-owner path is the right performance
+direction, and whether it is currently production-safe. This is a diagnostic run, not a default-setting
+proposal.
+
+Setup:
+- Both valid arms used `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE=0`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`,
+  `VENPOD_SPARSE_MID_MESH_MAX_DISTANCE=1024`, capture at frame 104, and
+  `scripts/statbench.ps1 -Temporal 0 -Frames 130 -ShaderUnsafeBlocks 0`.
+- Direct/reference label: `loop101_direct_midmax1024_130`.
+- Horizon-owner label: `loop101_horizononly_midmax1024_130`, additionally enabled
+  `VENPOD_FAR_MAX_HEIGHT_CACHE=1`,
+  `VENPOD_FAR_MAX_HEIGHT_NO_HIT_MASK=1`,
+  `VENPOD_RAYMARCH_FAR_MAX_HEIGHT_DDA=0`,
+  `VENPOD_FAR_SKY_OWNER=1`,
+  `VENPOD_FAR_SKY_OWNER_MIN_Y=0.006`,
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_MIP=3`, and
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_DILATION=4.0`.
+- An earlier unbounded `loop101_horizononly_nodda_360` run showed very low live background ownership
+  around frame 104 but was killed while still catching up; do not treat it as settled evidence.
+
+Results, `parse_farfield_perf.ps1 -MinFrame 90`:
+- Direct/reference: `gpuFrameMsP50=17.82`, `gpuFrameMsP90=29.14`,
+  `raymarchMsP50=16.98`, `sparseSurfaceMsP50=0.75`,
+  `backgroundPixelsP50=1006223`, `farTerrainCallsP50=320647`,
+  `farTerrainHeightEvalP50=3375577`, `visibleMissingNonzero=0`,
+  `residentMissingNonzero=0`.
+- Horizon-owner: `gpuFrameMsP50=18.87`, `gpuFrameMsP90=23.74`,
+  `raymarchMsP50=7.16`, `sparseSurfaceMsP50=8.23`,
+  `backgroundPixelsP50=53637`, `farTerrainCallsP50=3651`,
+  `farTerrainHeightEvalP50=23643`, `visibleMissingNonzero=0`,
+  `residentMissingNonzero=0`.
+- Same-frame visual check:
+  `scripts/check_far_horizon_visual.ps1 -Reference build/bin/captures/loop101_direct_midmax1024/engine_frame_0104.bmp -Candidate build/bin/captures/loop101_horizononly_midmax1024/engine_frame_0104.bmp -Json`
+  exited `1`. Key failures: full-frame `mae=7.731 > 4`,
+  horizon-sky `mae=8.28 > 8`, far-horizon-band `mae=16.184 > 8`,
+  and far-horizon-band average channel bias `19.698 > 12`.
+
+Decision:
+- The horizon/sky owner proves the important architectural mechanism: it can remove almost all
+  expensive background pixels from the heavy raymarch (`1006223 -> 53637`) and collapse far-height
+  evaluations by roughly two orders of magnitude (`3.38M -> 23.6k`) with missing counters still zero.
+- It is not yet shippable. Total `gpuFrameMsP50` did not improve in this short bounded run because
+  the saved raymarch work is replaced by `sparseSurfaceMs` inflation, and the same-frame visual gate
+  fails with a bright/blue horizon and terrain-control bias.
+- The older "more far terrain faces" framing is incomplete. The measured dominant cohort is the
+  no-hit sky/miss proof work, not terrain-hit shading. A far terrain face owner that only captures
+  hit pixels has capped ROI; the promising cached product is a conservative sky/empty-space
+  classifier plus visually matched background shading, with the raymarch retained as the gap fallback.
+- Next work should first prove the classification/stencil mechanism in the clean full-res production
+  harness, then fix visual parity/conservative ownership. Do not make this path default until
+  `visibleMissing=0`, `residentMissingSurface=0`, the visual gate, and motion replay all pass.
+
+## Loop 102 (Codex) -- horizon-only far-sky owner mode isolates the overclaiming arm
+
+Purpose: test whether the Loop 101 visual failure came from the flat minY sky-owner arm or from the
+projected far max-height horizon arm. The change is default-off and only activates with
+`VENPOD_FAR_SKY_OWNER_HORIZON_ONLY=1`.
+
+Code change:
+- Added `RendererConfig::farSkyOwnerHorizonOnly` and env parsing/logging for
+  `VENPOD_FAR_SKY_OWNER_HORIZON_ONLY`.
+- Encoded horizon state in `farMaxHeightCacheParams2.w`: `0=off`, `1=horizon ready`,
+  `2=horizon ready + far-sky owner horizon-only`. Existing raymarch checks still use `> 0.5`.
+- Updated `PS_FarSkyOwner.hlsl` so horizon-only mode disables the flat
+  `FarSkyOwnerClassifies(rayDir)` minY owner and only owns pixels proven by
+  `FarSkyOwnerClassifiesHorizon`.
+
+Build:
+- `cmd.exe /d /s /c "call ""C:\Program Files\Microsoft Visual Studio\18\Community\Common7\Tools\VsDevCmd.bat"" -arch=amd64 -host_arch=amd64 >nul && cmake --build build --config Release --parallel"`
+  exited `0`. The usual `vswhere.exe` warning appeared; compile also emitted pre-existing
+  `main_launcher.cpp` `rayDir` shadow warnings at lines `19944` and `20208`.
+- `git diff --check` exited `0` with only LF/CRLF working-copy warnings.
+
+Bounded verifier:
+- Env matched Loop 101's bounded diagnostic:
+  `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE=0`,
+  `VENPOD_FAR_MAX_HEIGHT_CACHE=1`,
+  `VENPOD_FAR_MAX_HEIGHT_NO_HIT_MASK=1`,
+  `VENPOD_RAYMARCH_FAR_MAX_HEIGHT_DDA=0`,
+  `VENPOD_FAR_SKY_OWNER=1`,
+  `VENPOD_FAR_SKY_OWNER_MIN_Y=0.006`,
+  `VENPOD_FAR_SKY_OWNER_HORIZON_ONLY=1`,
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_MIP=3`,
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_DILATION=4.0`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`,
+  `VENPOD_SPARSE_MID_MESH_MAX_DISTANCE=1024`, capture at frame `104`.
+- Command:
+  `scripts/statbench.ps1 -Temporal 0 -Frames 130 -Label loop102_horizononly_mode_midmax1024_130 -ShaderUnsafeBlocks 0`.
+- Statbench exited `0`: second-half settled `gpuFrameMs p50=19.13 p90=37.36 max=195.88`,
+  `visibleMissingNonzero=0`.
+- Detailed parser, `MinFrame=90`:
+  `gpuFrameMsP50=14.34`, `gpuFrameMsP90=30.94`,
+  `raymarchMsP50=13.43`, `sparseSurfaceMsP50=0.75`,
+  `backgroundPixelsP50=710447`, `surfaceOwnedPixelsP50=1363153`,
+  `farTerrainCallsP50=283265`, `farTerrainHeightEvalP50=3040181`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`.
+- Same-frame visual gate against Loop 101 direct frame 104 exited `0`:
+  `ok=true`, no band failures. Key bands were exact or near exact:
+  upper-sky `mae=0`, horizon-sky `mae=0`, far-horizon-band `mae=0`,
+  mid-terrain-control `mae=0`, full-frame `mae=0.012`.
+
+Attempted clean production-shaped probe:
+- Ran `loop102_horizononly_prod_260` without `BACKGROUND_ONLY_PSO`, without
+  `BACKGROUND_PASS_ENABLE`, and without `SPARSE_MID_MESH_MAX_DISTANCE`, keeping only the far
+  max-height / horizon-only owner flags.
+- Log confirmed the intended config:
+  `backgroundOnlyPso=0`, `farSkyOwner=1`, `farSkyOwnerHorizonOnly=1`,
+  `farMaxHeightCache=1`, `farMaxHeightNoHitMask=1`, `surfaceDepthPrepass=0`.
+- The engine remained in renderer initialization before any frame/perf output and was stopped
+  manually. Treat this run as inconclusive; it matches the known full `PS_Raymarch` runtime DXC /
+  session-pressure failure mode, not a performance result.
+
+Decision:
+- The Loop 101 bright/blue horizon failure is attributable to the flat raw minY owner arm. Disabling
+  that arm makes the same-frame visual gate pass while preserving hole safety.
+- Horizon-only is visually safe in the bounded spawn verifier but currently too conservative to be the
+  final production fix: it reduces background pixels only from Loop 101 direct `1006223` to `710447`,
+  far less than the union mode's `53637`.
+- Next iteration should keep horizon-only as the safety baseline and improve the projected horizon
+  classifier's coverage conservatively. A useful target is to make the far max-height horizon product
+  claim more high-sky / no-hit rows without reintroducing the Loop 101 band failures, then rerun
+  stationary and motion gates in a fresh session if full shader compilation remains unstable.
+
+Tandem:
+- Claude could not inspect the VENPOD source because its session was rooted in another repo, so its
+  file-reference request is not authoritative. Its evidence-based recommendation still aligned with
+  this loop: run flat-arm versus horizon-only attribution through the same visual/perf gate before
+  treating horizon-only as a real fix.
+
+## Loop 103 (Codex) -- horizon coverage sweep: safe flat threshold plus mip2 is the best bounded candidate
+
+Purpose: improve conservative sky/empty ownership after Loop 102 proved horizon-only visual safety but
+underclaimed (`backgroundPixelsP50=710447`). This loop first swept existing env knobs, then attempted
+and rejected a default promotion when the default-path visual gate failed.
+
+Re-orientation:
+- `CS_FarMaxHeightNoHitMask.hlsl` projects a conservative max-height shell and writes per-tile
+  `FarScreenHorizonY`.
+- `PS_FarSkyOwner.hlsl` horizon-only mode owns only pixels satisfying
+  `pixel.y + FAR_HORIZON_OWNER_BAND_PIXELS < FarScreenHorizonY[tile]`.
+- Existing knobs:
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_MIP`, `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_DILATION`,
+  `VENPOD_FAR_SKY_OWNER_MIN_Y`, and `VENPOD_FAR_SKY_OWNER_HORIZON_ONLY`.
+
+Common bounded verifier:
+- `scripts/statbench.ps1 -Temporal 0 -Frames 130 -ShaderUnsafeBlocks 0`
+- Common env:
+  `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE=0`,
+  `VENPOD_FAR_MAX_HEIGHT_CACHE=1`,
+  `VENPOD_FAR_MAX_HEIGHT_NO_HIT_MASK=1`,
+  `VENPOD_RAYMARCH_FAR_MAX_HEIGHT_DDA=0`,
+  `VENPOD_FAR_SKY_OWNER=1`,
+  `VENPOD_SPARSE_SURFACE_DEPTH_PREPASS=0`,
+  `VENPOD_SPARSE_MID_MESH_MAX_DISTANCE=1024`, capture at frame `104`.
+- All parses below use `parse_farfield_perf.ps1 -MinFrame 90`; visual checks compare against
+  `build/bin/captures/loop101_direct_midmax1024/engine_frame_0104.bmp`.
+
+Sweep results:
+- Horizon-only mip `3`, dilation `0`, label `loop103_horizononly_mip3_dil0_midmax1024_130`:
+  `backgroundPixelsP50=699503`, `gpuFrameMsP50=31.79`, `raymarchMsP50=28.46`,
+  missing counters zero, but visual gate failed (`upper_sky maxDelta 212 > 96`).
+  Decision: reject. Removing dilation buys only about `11k` pixels and breaks the hard visual gate.
+- Horizon-only mip `2`, dilation `4`, label `loop103_horizononly_mip2_dil4_midmax1024_130`:
+  `backgroundPixelsP50=684767`, `gpuFrameMsP50=25.71`, `raymarchMsP50=24.08`,
+  `farTerrainCallsP50=281693`, `farTerrainHeightEvalP50=3026871`, missing counters zero.
+  Visual gate passed (`ok=true`, no failures). Decision: safe as an env experiment; modest coverage
+  improvement over Loop 102 (`710447 -> 684767`).
+- Horizon-only mip `1`, dilation `4`, label `loop103_horizononly_mip1_dil4_midmax1024_130`:
+  `backgroundPixelsP50=885575`, `gpuFrameMsP50=26.04`, `raymarchMsP50=24.74`,
+  missing counters zero, but visual gate failed (`upper_sky maxDelta 212 > 96`).
+  Decision: reject. It underclaims relative to mip 2 and fails the gate.
+- Safe flat threshold union, `VENPOD_FAR_SKY_OWNER_MIN_Y=0.15`,
+  `VENPOD_FAR_SKY_OWNER_HORIZON_ONLY` unset, mip `2`, dilation `4`,
+  label `loop103_union_min015_mip2_dil4_midmax1024_130`:
+  `backgroundPixelsP50=353066`, `gpuFrameMsP50=24.89`, `raymarchMsP50=21.19`,
+  `sparseSurfaceMsP50=2.72`, `farTerrainCallsP50=160320`,
+  `farTerrainHeightEvalP50=1999174`, missing counters zero.
+  Visual gate passed (`ok=true`, no band failures).
+
+Default-promotion attempt and rejection:
+- Based on Claude's independent recommendation and the explicit mip-2 pass, changed default
+  `farMaxHeightScreenMaskMipLevel` from `3` to `2` in `Renderer.h`, `Renderer.cpp`, and
+  `main_launcher.cpp`, then built successfully.
+- Default-path verifier removed `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_MIP` and confirmed the log used
+  `farMaxHeightMaskMip=2`. It matched the mip-2 ownership counts
+  (`backgroundPixelsP50=684767`, missing counters zero), but visual gate failed with
+  `upper_sky maxDelta 212 > 96`.
+- The default change was reverted to mip `3` and rebuilt successfully. Do not promote mip `2` to
+  default until the visual max-delta instability is understood or the verifier is made pose-stable
+  without weakening the hard seam/hole gates.
+
+Build / hygiene:
+- Both builds exited `0` with the known `vswhere.exe` warning and pre-existing
+  `main_launcher.cpp` `rayDir` shadow warnings.
+- `git diff --check` exited `0` with only LF/CRLF working-copy warnings.
+
+Decision:
+- The strongest bounded candidate so far is not pure horizon-only. It is the union of:
+  a previously safe high-sky flat owner (`farSkyOwnerMinY=0.15`) plus projected horizon ownership
+  at mip `2`, dilation `4`.
+- This candidate cuts background ownership much more than horizon-only (`710447 -> 353066`) while
+  passing the same-frame visual and missing-counter gates in the bounded spawn harness.
+- It is not default-ready. Next loop should validate this exact candidate in a longer stationary run
+  and motion replay, preferably in a fresh runtime session to avoid the full `PS_Raymarch` DXC
+  initialization stall seen in Loop 102.
+
+Tandem:
+- Claude inspected the correct VENPOD path in this loop and independently ranked projection mip
+  `3 -> 2` as the safest coverage knob, while warning to keep dilation, owner band, tile width, and
+  height pad unchanged. The measurements agreed that mip 2 can be useful, but the failed default-path
+  visual check kept it as an env probe rather than a promoted default.
+
+## Loop 104 (Codex) -- specialized-PSO far-owner win, production full-PSO compile still blocks final gate
+
+Purpose: answer the user's challenge that the prior far-owner work had not produced a tangible win.
+This loop re-ran the candidate after freeing disk space and rebooting, then separated two facts:
+the current monolithic production `PS_Raymarch` path still cannot be validated because runtime DXC
+hangs compiling a new full-PSO cache key, while the smaller background-only specialization shows a
+large, visually checked far-owner win.
+
+Production full-PSO attempt:
+- Command shape: `scripts/statbench.ps1 -Temporal 0 -Frames 80 -Label loop104_prod_direct_profile_80
+  -ShaderUnsafeBlocks 0` with all far-owner/background-only/mid-distance override envs cleared and
+  `VENPOD_LOG_FLUSH_INFO=1`.
+- Result: initialization reached `RENDERER_INIT_STAGE begin fullscreen PS compile backgroundOnly=0
+  temporal=0 debugShaders=0`, then logged
+  `Shader cache miss: compiling PS_Raymarch.hlsl ... PS_Raymarch_hlsl_ps_6_0_main_002a7c80cb348613.cso`
+  and did not produce frame/perf output. The process was killed after repeated waits.
+- Decision: this is not a performance result. It is a real validation blocker: the full monolithic
+  `PS_Raymarch` variant is still too fragile for production gating when a new cache key is needed.
+
+Specialized verifier used after the full-PSO block:
+- Common env:
+  `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=1`,
+  `VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE` unset,
+  `VENPOD_SPARSE_MID_MESH_MAX_DISTANCE` unset,
+  `VENPOD_LOG_FLUSH_INFO=1`.
+- Baseline label: `loop104_bopso_direct_220`.
+- Candidate label: `loop104_bopso_union_min015_mip2_220`, additionally:
+  `VENPOD_FAR_MAX_HEIGHT_CACHE=1`,
+  `VENPOD_FAR_MAX_HEIGHT_NO_HIT_MASK=1`,
+  `VENPOD_RAYMARCH_FAR_MAX_HEIGHT_DDA=0`,
+  `VENPOD_FAR_SKY_OWNER=1`,
+  `VENPOD_FAR_SKY_OWNER_MIN_Y=0.15`,
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_MIP=2`,
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_DILATION=4.0`,
+  with `VENPOD_FAR_SKY_OWNER_HORIZON_ONLY` unset.
+
+Results, `parse_farfield_perf.ps1 -MinFrame 120`:
+- Baseline: `gpuFrameMsP50=18.53`, `raymarchMsP50=17.05`,
+  `sparseSurfaceMsP50=0.97`, `backgroundPixelsP50=799776`,
+  `surfaceOwnedPixelsP50=1273824`, `farTerrainCallsP50=296330`,
+  `farTerrainHeightEvalP50=3139078`, `visibleMissingNonzero=0`,
+  `residentMissingNonzero=0`, `ok=True`.
+- Candidate: `gpuFrameMsP50=7.14`, `raymarchMsP50=5.74`,
+  `sparseSurfaceMsP50=1.04`, `backgroundPixelsP50=146619`,
+  `surfaceOwnedPixelsP50=1926981`, `farTerrainCallsP50=136003`,
+  `farTerrainHeightEvalP50=1762675`, `visibleMissingNonzero=0`,
+  `residentMissingNonzero=0`, `ok=True`.
+- Delta: background pixels down `653157` (`799776 -> 146619`), raymarch down
+  `11.31ms`, total GPU down `11.39ms`, with sparse-surface cost essentially flat
+  (`+0.07ms`). This is the first large same-harness far-owner win in the current loop.
+
+Same-frame visual check:
+- Captures:
+  `build/bin/captures/loop104_bopso_direct_cap180/engine_frame_0180.bmp`
+  and
+  `build/bin/captures/loop104_bopso_union_min015_mip2_cap180/engine_frame_0180.bmp`.
+- `scripts/check_far_horizon_visual.ps1 -Json` exited `0`, `ok=true`.
+  Key bands: `upper_sky mae=0 maxDelta=0`, `horizon_sky mae=0 maxDelta=0`,
+  `far_horizon_band mae=0 maxDelta=5`, `mid_terrain_control mae=0.003 maxDelta=62`,
+  full frame `mae=0.007`.
+
+Decision:
+- This is a tangible win, but not yet a shippable/default win. It is validated only in the
+  background-only specialized PSO, stationary spawn, same-frame visual check.
+- Next required gates: (1) solve or bypass the full `PS_Raymarch` compile fragility so the actual
+  production path can be measured, or make the smaller background-only specialization the intentional
+  production path; (2) run motion replay with the candidate and visual/seam checks; (3) investigate
+  the prior env/default mip-2 visual divergence before any default promotion.
+
+## Loop 105 (Codex) -- default background-only PSO plus env-gated far-owner A/B
+
+Purpose: convert the Loop 104 env-only win into a default-path result and answer the user's
+"no tangible wins" challenge with hard A/B numbers.
+
+Code change:
+- `src/main_launcher.cpp`: `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO` now defaults to `1` only when the
+  sparse/raster-owner path is active (`VENPOD_RENDER_BACKEND=sparse`, sparse surface raster default-on).
+  Explicit `VENPOD_RAYMARCH_BACKGROUND_ONLY_PSO=0` still opts back into the old monolithic PSO.
+- The far-owner/cache remains env-gated. It was not promoted to default in this loop.
+
+Build:
+- Release build passed after loading the VS environment:
+  `cmake --build build --config Release --parallel`.
+  Existing `rayDir` shadow warnings remain.
+
+Stationary default/direct gate:
+- Command shape: cleared background-only and far-owner envs, then
+  `scripts/statbench.ps1 -Temporal 0 -Frames 220 -Label loop105_default_bopso_direct_220 -ShaderUnsafeBlocks 0`.
+- Startup log confirmed `backgroundOnlyPso=1`, `farSkyOwner=0`, `farMaxHeightCache=0`.
+- Parsed frame > 120:
+  `gpuFrameMsP50=15.03`, `raymarchMsP50=14.15`, `sparseSurfaceMsP50=0.81`,
+  `backgroundPixelsP50=799776`, `surfaceOwnedPixelsP50=1273824`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`, `ok=True`.
+
+Stationary far-owner/cache candidate:
+- Flags:
+  `VENPOD_FAR_MAX_HEIGHT_CACHE=1`,
+  `VENPOD_FAR_MAX_HEIGHT_NO_HIT_MASK=1`,
+  `VENPOD_RAYMARCH_FAR_MAX_HEIGHT_DDA=0`,
+  `VENPOD_FAR_SKY_OWNER=1`,
+  `VENPOD_FAR_SKY_OWNER_MIN_Y=0.15`,
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_MIP=2`,
+  `VENPOD_FAR_MAX_HEIGHT_SCREEN_MASK_DILATION=4.0`.
+- Command:
+  `scripts/statbench.ps1 -Temporal 0 -Frames 220 -Label loop105_default_union_min015_mip2_220 -ShaderUnsafeBlocks 0`.
+- Startup log confirmed `backgroundOnlyPso=1`, candidate far-owner/cache flags active.
+- Parsed frame > 120:
+  `gpuFrameMsP50=7.12`, `raymarchMsP50=5.72`, `renderPreOwnerMsP50=0.04`,
+  `farSkyOwnerMsP50=0.01`, `backgroundCoreMsP50=5.67`, `sparseSurfaceMsP50=1.04`,
+  `backgroundPixelsP50=146619`, `surfaceOwnedPixelsP50=1926981`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`, `ok=True`.
+- Stationary delta vs default/direct:
+  background pixels down `653157` (`799776 -> 146619`), raymarch down `8.43ms`,
+  total GPU down `7.91ms`. This is now a default-path stationary win, not just an env-only
+  background-only-PSO verifier.
+
+Motion replay A/B:
+- Replay reports `[REPLAY] driving the camera from a recording: 600 frames`; `ExitAfterFrames=900`
+  is longer than the recording, so frame > 300 yields 300 samples.
+- Direct/default, `loop105_motion_default_direct_900`, parsed frame > 300:
+  `gpuFrameMsP50=13.06`, `raymarchMsP50=11.86`, `backgroundCoreMsP50=11.86`,
+  `sparseSurfaceMsP50=0.73`, `backgroundPixelsP50=465183`,
+  `surfaceOwnedPixelsP50=1608480`, `visibleMissingNonzero=0`,
+  `residentMissingNonzero=0`, `ok=True`.
+- Candidate, `loop105_motion_union_min015_mip2_900`, same flags as stationary candidate,
+  parsed frame > 300:
+  `gpuFrameMsP50=9.08`, `raymarchMsP50=7.57`, `renderPreOwnerMsP50=5.07`,
+  `backgroundCoreMsP50=2.48`, `sparseSurfaceMsP50=0.99`,
+  `backgroundPixelsP50=72504`, `surfaceOwnedPixelsP50=2001142`,
+  `visibleMissingNonzero=0`, `residentMissingNonzero=0`, `ok=True`.
+- Motion delta vs direct/default:
+  background pixels down `392679` (`465183 -> 72504`), raymarch down `4.29ms`,
+  total GPU down `3.98ms`.
+
+Visual status:
+- Stationary same-frame visual remains green from Loop 104 for this candidate:
+  `check_far_horizon_visual.ps1 -Json` exited `0`, `ok=true`, full-frame `mae=0.007`.
+- Motion capture attempts at frame 580 enabled capture in logs but wrote no BMPs under the requested
+  `build/bin/buildbench/.../cap` directories, so motion visual/seam proof is still not counted.
+
+Decision:
+- Promote the background-only PSO default for sparse/raster-owner rendering: verified build,
+  default startup, stationary, and motion missing counters.
+- Keep the far-owner/cache candidate env-gated. It is a real measurable win in stationary and motion,
+  but not default-safe until motion visual capture/check is made reliable and passes.

@@ -340,3 +340,62 @@ if(MSVC)
 endif()
 
 add_test(NAME VENPODSparseCore COMMAND VENPODTests)
+
+add_executable(far_owner_gpu_dump
+    tools/far_owner_gpu_dump.cpp
+    src/Graphics/RHI/DX12CommandQueue.cpp
+    src/Graphics/RHI/DX12ComputePipeline.cpp
+    src/Graphics/RHI/DX12Device.cpp
+    src/Graphics/RHI/DescriptorHeap.cpp
+    src/Graphics/RHI/GPUBuffer.cpp
+    src/Graphics/RHI/ShaderCompiler.cpp
+)
+
+target_include_directories(far_owner_gpu_dump PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/vendor
+)
+
+target_link_libraries(far_owner_gpu_dump PRIVATE
+    spdlog::spdlog
+    Microsoft::DirectX-Headers
+    Microsoft::DirectX-Guids
+    d3d12.lib
+    dxgi.lib
+    dxguid.lib
+    dxcompiler.lib
+)
+
+if(MSVC)
+    target_compile_options(far_owner_gpu_dump PRIVATE /W4 /WX- /permissive- /Zc:__cplusplus /utf-8)
+    target_compile_definitions(far_owner_gpu_dump PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+    )
+endif()
+
+add_executable(shader_compile_smoke
+    tools/shader_compile_smoke.cpp
+    src/Graphics/RHI/ShaderCompiler.cpp
+)
+
+target_include_directories(shader_compile_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(shader_compile_smoke PRIVATE
+    spdlog::spdlog
+    d3d12.lib
+    dxguid.lib
+    dxcompiler.lib
+)
+
+if(MSVC)
+    target_compile_options(shader_compile_smoke PRIVATE /W4 /WX- /permissive- /Zc:__cplusplus /utf-8)
+    target_compile_definitions(shader_compile_smoke PRIVATE
+        _CRT_SECURE_NO_WARNINGS
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+    )
+endif()

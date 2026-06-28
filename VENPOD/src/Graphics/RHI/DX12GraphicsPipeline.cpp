@@ -275,6 +275,10 @@ Result<void> DX12GraphicsPipeline::CreatePSO(ID3D12Device* device, const Graphic
     }
     psoDesc.DSVFormat = desc.dsvFormat;
 
+    spdlog::info(
+        "DX12GraphicsPipeline creating PSO: {}",
+        desc.debugName.empty() ? "unnamed" : desc.debugName);
+
     // Create PSO
     HRESULT hr = device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&m_pso));
     if (FAILED(hr)) {
