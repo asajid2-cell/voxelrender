@@ -208,9 +208,12 @@ bool IsRenderableSurfaceFaceMaterials(
     }
 
     if (material == VENPOD::Utils::Material::Water) {
-        return (direction == SparseFaceDirection::PosY ||
-                direction == SparseFaceDirection::NegY) &&
-            neighborMaterial == VENPOD::Utils::Material::Air;
+        // ALL water-vs-air boundaries emit (not just top/bottom). Top/bottom-only
+        // was correct for flat sea sheets but rendered painted/sloped water (a
+        // stream down a hillside) as scattered horizontal specks -- every side
+        // boundary was invisible. Water-vs-water stays suppressed (no interior
+        // faces), water-vs-solid stays suppressed (banks own those pixels).
+        return neighborMaterial == VENPOD::Utils::Material::Air;
     }
 
     return false;
@@ -232,9 +235,8 @@ bool IsRenderableSurfaceFace(
     }
 
     if (IsWater(voxel)) {
-        return (direction == SparseFaceDirection::PosY ||
-                direction == SparseFaceDirection::NegY) &&
-            IsAir(neighborVoxel);
+        // All water-vs-air boundaries (see IsRenderableSurfaceFaceMaterials).
+        return IsAir(neighborVoxel);
     }
 
     return false;
@@ -363,8 +365,7 @@ SparseSurfaceExtractionResult SparseSurfaceExtractor::ExtractRegion(
                     const uint32_t voxel = LocalVoxelAt(brick, x, y, z);
                     const uint8_t material = VENPOD::Utils::UnpackMaterial(voxel);
                     if (!IsSolidMaterial(material) &&
-                        !(material == VENPOD::Utils::Material::Water &&
-                          dir.direction == SparseFaceDirection::PosY)) {
+                        material != VENPOD::Utils::Material::Water) {
                         continue;
                     }
 

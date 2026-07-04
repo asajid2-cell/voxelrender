@@ -132,38 +132,46 @@ SparseCharacterMoveResult ResolveSparseCharacterHorizontalMove(
 
     result.blocked = true;
 
-    if (request.allowStepUp && verticalVelocity <= 0.0f) {
-        SparseCharacterBody elevatedTarget = targetBody;
-        elevatedTarget.eyeY += targetBody.stepHeight;
-        const SparseCollisionVolumeResult elevatedBody =
-            world.TestCollisionAabb(MakeSparseCharacterBodyAabb(elevatedTarget));
-        result.sampledVoxels += elevatedBody.sampledVoxels;
-        result.solidVoxels += elevatedBody.solidVoxels;
-        result.liquidVoxels += elevatedBody.liquidVoxels;
+    // AUTO-HOP (Loop 91): step-up must fire reliably on small bumps instead of
+    // full-stopping. Two old failure modes fixed: (1) the clearance test raised
+    // the whole body by the FULL stepHeight even for a 1-voxel bump, so any low
+    // ceiling or the NEXT terrace riser within that head-space vetoed the step;
+    // now the bump height is probed FIRST and clearance is tested at the EXACT
+    // stepped height. (2) a tiny positive vertical velocity (landing bounce)
+    // disabled stepping entirely; allow a small upward epsilon.
+    if (request.allowStepUp && verticalVelocity <= 2.0f) {
+        const float currentFeetY = targetBody.eyeY - targetBody.height;
+        SparseCharacterBody probeTarget = targetBody;
+        probeTarget.eyeY += targetBody.stepHeight;
+        const SparseCollisionAabb stepFootProbe = MakeSparseCharacterFootprintAabb(
+            probeTarget,
+            currentFeetY + targetBody.stepHeight);
+        const SparseCollisionSupportResult stepSupport =
+            world.FindCollisionSupportBelow(
+                stepFootProbe,
+                targetBody.stepHeight + 0.75f,
+                request.liquidsSupport);
+        result.sampledVoxels += stepSupport.sampledVoxels;
+        result.solidVoxels += stepSupport.solidVoxels;
+        result.liquidVoxels += stepSupport.liquidVoxels;
 
-        if (!elevatedBody.blocked) {
-            const float currentFeetY = targetBody.eyeY - targetBody.height;
-            const SparseCollisionAabb stepFootProbe = MakeSparseCharacterFootprintAabb(
-                elevatedTarget,
-                currentFeetY + targetBody.stepHeight);
-            const SparseCollisionSupportResult stepSupport =
-                world.FindCollisionSupportBelow(
-                    stepFootProbe,
-                    targetBody.stepHeight + 0.75f,
-                    request.liquidsSupport);
-            result.sampledVoxels += stepSupport.sampledVoxels;
-            result.solidVoxels += stepSupport.solidVoxels;
-            result.liquidVoxels += stepSupport.liquidVoxels;
-
-            if (stepSupport.found) {
-                const float supportFeetY = static_cast<float>(stepSupport.supportY) + 1.0f;
-                const bool withinStep =
-                    supportFeetY >= currentFeetY - 0.1f &&
-                    supportFeetY <= currentFeetY + targetBody.stepHeight + 0.35f;
-                if (withinStep) {
-                    result.eyeX = targetBody.eyeX;
-                    result.eyeY = supportFeetY + targetBody.height;
-                    result.eyeZ = targetBody.eyeZ;
+        if (stepSupport.found) {
+            const float supportFeetY = static_cast<float>(stepSupport.supportY) + 1.0f;
+            const bool withinStep =
+                supportFeetY >= currentFeetY - 0.1f &&
+                supportFeetY <= currentFeetY + targetBody.stepHeight + 0.35f;
+            if (withinStep) {
+                SparseCharacterBody steppedTarget = targetBody;
+                steppedTarget.eyeY = supportFeetY + targetBody.height;
+                const SparseCollisionVolumeResult steppedBody =
+                    world.TestCollisionAabb(MakeSparseCharacterBodyAabb(steppedTarget));
+                result.sampledVoxels += steppedBody.sampledVoxels;
+                result.solidVoxels += steppedBody.solidVoxels;
+                result.liquidVoxels += steppedBody.liquidVoxels;
+                if (!steppedBody.blocked) {
+                    result.eyeX = steppedTarget.eyeX;
+                    result.eyeY = steppedTarget.eyeY;
+                    result.eyeZ = steppedTarget.eyeZ;
                     result.steppedUp = true;
                     return result;
                 }

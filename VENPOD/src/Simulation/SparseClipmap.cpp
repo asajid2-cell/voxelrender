@@ -590,11 +590,20 @@ bool SparseClipmapTileCache::Initialize(const SparseClipmapConfig& config) {
     m_asyncNoncriticalGenerationApplyMsLastFrame = 0.0f;
     m_persistentVoxelPumpWaitMsLastFrame = 0.0f;
     m_asyncNoncriticalGenerationWaitMsLastFrame = 0.0f;
+    m_heightPumpQueueMsLastFrame = 0.0f;
+    m_heightPumpDispatchMsLastFrame = 0.0f;
+    m_heightPumpJoinMsLastFrame = 0.0f;
+    m_heightPumpWorkerMaxMsLastFrame = 0.0f;
+    m_heightPumpGenerateMsLastFrame = 0.0f;
+    m_heightPumpCommitMsLastFrame = 0.0f;
+    m_heightPumpPendingTilesLastFrame = 0;
+    m_heightPumpWorkersLastFrame = 0;
     m_predictedVisibleAdmissionStatsFrame = 0u;
     m_lastStatsFrame = 0;
     m_pumpBudgetHitLastFrame = 0;
     m_prunedVoxelBacklogLastFrame = 0;
     m_effectivePumpBudgetMsLastFrame = 0.0f;
+    m_heightPumpLastNonzeroMsPerTile = 0.0f;
     m_dirtySerial = 1;
     m_heightDirtySerial = 1;
     m_voxelDirtySerial = 1;
@@ -953,7 +962,14 @@ bool SparseClipmapTileCache::TryQueueAsyncVoxelGeneration(
         (!visibleCritical && !config.asyncNoncriticalGeneration) ||
         policy.Config().asyncNoncriticalGenerationQueueMax == 0u ||
         policy.Config().sharedVoxelColumnCache ||
-        (m_edits && m_edits->EditedBrickCount() != 0u) ||
+        // Per-coord edit gate: the async worker generates pristine bricks (its
+        // generator has no edit store), so only bricks whose world AABB overlaps
+        // an edit overlay must stay on the edit-aware sync path. The old global
+        // "any edit anywhere" veto meant one brush stroke permanently disabled
+        // async generation world-wide — every ring recenter after that streamed
+        // at inline serial rates, and the raymarch showed miss-fallback pixels
+        // (blue valley-atmosphere low / black high) until bricks caught up.
+        VoxelBrickCoordIntersectsEditOverlays(coord, policy) ||
         (visibleCritical
             ? (!coordIsVisibleCritical && !(allowVisibleReservation && coordIsVisibleReservation))
             : coordIsVisibleCritical || coordIsVisibleReservation) ||
@@ -1020,8 +1036,9 @@ uint32_t SparseClipmapTileCache::QueueAsyncVoxelGenerationMatchingPriority(
             : config.asyncNoncriticalGeneration;
     if (!asyncAllowed ||
         config.asyncNoncriticalGenerationQueueMax == 0u ||
-        m_voxelGenerationQueue.empty() ||
-        (m_edits && m_edits->EditedBrickCount() != 0u)) {
+        m_voxelGenerationQueue.empty()) {
+        // No global edit veto here: TryQueueAsyncVoxelGeneration filters
+        // edit-overlapping coords per brick.
         return 0u;
     }
 
@@ -1397,9 +1414,14 @@ uint32_t SparseClipmapTileCache::ApplyAsyncNoncriticalVoxelGenerationCompletions
         }
         m_asyncNoncriticalGenerationWorkerMsLastFrame += result.workerMs;
 
-        const uint64_t currentEditRevision = m_edits ? m_edits->RevisionSerial() : 0ull;
-        const bool staleEditRevision = result.editRevision != currentEditRevision;
-        const bool editsActive = m_edits && m_edits->EditedBrickCount() != 0u;
+        // A pristine async result is correct for any brick that does not overlap
+        // an edit overlay NOW — edits elsewhere (or revision churn from physics
+        // settling) don't change this brick's content. Only overlapping bricks
+        // are discarded (they regen through the edit-aware path). The old
+        // `staleEditRevision || editsActive` blanket threw away every in-flight
+        // result once any edit existed, so post-edit streaming never recovered.
+        const bool overlapsEditsNow =
+            VoxelBrickCoordIntersectsEditOverlays(result.coord, policy);
         const bool stillVisibleCritical =
             m_visiblePriorityVoxelSet.find(result.coord) != m_visiblePriorityVoxelSet.end() ||
             m_asyncVisibleReservations.find(result.coord) !=
@@ -1408,8 +1430,7 @@ uint32_t SparseClipmapTileCache::ApplyAsyncNoncriticalVoxelGenerationCompletions
             !m_voxelInterestSet.empty() &&
             m_voxelInterestSet.find(result.coord) == m_voxelInterestSet.end() &&
             !(visibleCriticalResult && stillVisibleCritical);
-        if (staleEditRevision ||
-            editsActive ||
+        if (overlapsEditsNow ||
             noLongerInterested ||
             (visibleCriticalResult && !stillVisibleCritical)) {
             RemoveQueuedVoxelCoord(result.coord);
@@ -1680,6 +1701,35 @@ bool SparseClipmapTileCache::BrickIntersectsEditOverlays(
     return false;
 }
 
+bool SparseClipmapTileCache::VoxelBrickCoordIntersectsEditOverlays(
+    const SparseVoxelClipmapCoord& coord,
+    const SparseClipmapPolicy& policy) const
+{
+    if (!m_edits || m_edits->EditedBrickCount() == 0u) {
+        return false;
+    }
+    const auto rings = policy.BuildRings();
+    if (coord.ring < 0 || static_cast<uint32_t>(coord.ring) >= rings.size()) {
+        // Can't resolve the world AABB — treat as edited so it stays on the
+        // safe edit-aware sync path.
+        return true;
+    }
+    // Mirror GenerateVoxelBrickPayload's origin math exactly so the enqueue/apply
+    // gate and the generator agree on which bricks are edit-adjacent.
+    const SparseClipmapRing& ring = rings[static_cast<uint32_t>(coord.ring)];
+    const int32_t brickWorldSize = std::max(1, RoundToInt32Clamped(
+        static_cast<double>(ring.cellSize) * static_cast<double>(SPARSE_BRICK_SIZE)));
+    const int32_t originX = FloorToInt32Clamped(
+        static_cast<double>(coord.x) * static_cast<double>(brickWorldSize));
+    const int32_t originY = FloorToInt32Clamped(
+        static_cast<double>(coord.y) * static_cast<double>(brickWorldSize));
+    const int32_t originZ = FloorToInt32Clamped(
+        static_cast<double>(coord.z) * static_cast<double>(brickWorldSize));
+    return BrickIntersectsEditOverlays(
+        originX, originY, originZ, brickWorldSize,
+        std::max(1, RoundToInt32Clamped(ring.cellSize)));
+}
+
 uint32_t SparseClipmapTileCache::InvalidateEditedOverlays(
     const SparseEditStore& edits,
     const SparseClipmapPolicy& policy,
@@ -1742,6 +1792,23 @@ uint32_t SparseClipmapTileCache::InvalidateEditedOverlays(
                         const auto it = m_voxelSlotByCoord.find(coord);
                         if (it == m_voxelSlotByCoord.end() ||
                             it->second >= m_voxelBricks.size()) {
+                            // NEVER-RESIDENT brick in the edit footprint: a carve
+                            // can EXPOSE fully-interior bricks that were never
+                            // surface-bearing, so nothing ever requested them. The
+                            // raymarch then tunnels through the non-resident pages
+                            // to sky (blue/black void) and heals only as slow as
+                            // per-frame ray feedback DISCOVERS the missing bricks
+                            // layer by layer. We know the carve volume right here —
+                            // queue them proactively (front of queue, same shape as
+                            // QueueVoxelRenderFeedbackCoord) so the pump fills them
+                            // ahead of ray discovery.
+                            m_voxelInterestSet.insert(coord);
+                            if (m_queuedVoxelSet.insert(coord).second) {
+                                m_voxelGenerationQueue.push_front(coord);
+                                if (m_config.backlogAwarePump) {
+                                    m_voxelBacklogFirstFrame.emplace(coord, 0u);
+                                }
+                            }
                             continue;
                         }
                         const VoxelBrickPayload& brick = m_voxelBricks[it->second];
@@ -1899,6 +1966,13 @@ uint32_t SparseClipmapTileCache::PumpEditedHeightTileRegens(
         ++m_dirtySerial;
         ++m_heightDirtySerial;
         m_editHeightFramesSinceSerialBump = 0;
+        // Oscillator trace (Loop 110): edit-refresh cadence bump (global).
+        static const bool s_heightSerialTraceE =
+            std::getenv("VENPOD_HEIGHT_SERIAL_TRACE") != nullptr;
+        if (s_heightSerialTraceE) {
+            spdlog::info(
+                "HEIGHT_SERIAL_TRACE site=editRefresh drained={}", drained ? 1 : 0);
+        }
     }
     return regenerated;
 }
@@ -2034,7 +2108,38 @@ void SparseClipmapTileCache::UpdateInterest(
         m_lastInterestSignatureValid &&
         policy.Config().interestUpdateIntervalFrames > 1u &&
         frameIndex - m_lastInterestUpdateFrame < policy.Config().interestUpdateIntervalFrames;
-    if (m_lastInterestSignatureValid && (signature == m_lastInterestSignature || intervalReuse)) {
+    // Signature-churn hysteresis (Loop 101): under an edit-walk the quantized
+    // camera/velocity signature flip-flops across quantum boundaries, firing
+    // full rebuilds every 2-3 frames (~0.85ms/frame average, measured). Require
+    // a CHANGED signature to hold for one extra frame before it forces a
+    // rebuild — genuine motion still rebuilds (one frame later, under the
+    // 2-frame interval anyway); boundary oscillation reuses instead.
+    bool signatureChurnReuse = false;
+    if (m_lastInterestSignatureValid &&
+        !(signature == m_lastInterestSignature) &&
+        !intervalReuse) {
+        // Oscillation is sub-quantum by definition; a genuine fast move or
+        // teleport must rebuild NOW (the stale-origin-skip contract).
+        const float rebuildDx = cameraX - m_lastInterestRebuildCameraX;
+        const float rebuildDy = cameraY - m_lastInterestRebuildCameraY;
+        const float rebuildDz = cameraZ - m_lastInterestRebuildCameraZ;
+        const float rebuildDistSq =
+            rebuildDx * rebuildDx + rebuildDy * rebuildDy + rebuildDz * rebuildDz;
+        const bool smallMove = rebuildDistSq < (18.0f * 18.0f);
+        if (!smallMove) {
+            m_pendingInterestSignatureValid = false;
+        } else if (m_pendingInterestSignatureValid &&
+            signature == m_pendingInterestSignature) {
+            // Held for a second frame — let the rebuild proceed.
+            m_pendingInterestSignatureValid = false;
+        } else {
+            m_pendingInterestSignature = signature;
+            m_pendingInterestSignatureValid = true;
+            signatureChurnReuse = true;
+        }
+    }
+    if (m_lastInterestSignatureValid &&
+        (signature == m_lastInterestSignature || intervalReuse || signatureChurnReuse)) {
         m_interestReusedLastFrame = 1;
         const bool ciSigMatch = (signature == m_lastInterestSignature);
         const auto ciRefreshT0 = std::chrono::steady_clock::now();
@@ -2293,6 +2398,9 @@ void SparseClipmapTileCache::UpdateInterest(
     m_lastInterestSignature = signature;
     m_lastInterestSignatureValid = true;
     m_lastInterestUpdateFrame = frameIndex;
+    m_lastInterestRebuildCameraX = cameraX;
+    m_lastInterestRebuildCameraY = cameraY;
+    m_lastInterestRebuildCameraZ = cameraZ;
     if (ciProfile) {
         spdlog::info(
             "CLIPINTEREST frame={} reuse=none fullRebuild=1 interval={} setSize={}->{} voxelSize={}->{} "
@@ -2344,6 +2452,14 @@ uint32_t SparseClipmapTileCache::AllocateSlot(
     ++m_dirtySerial;
     ++m_heightDirtySerial;
     MarkHeightSlotDirty(bestSlot);
+    // Oscillator trace (Loop 110): slot reallocation churn.
+    static const bool s_heightSerialTraceA =
+        std::getenv("VENPOD_HEIGHT_SERIAL_TRACE") != nullptr;
+    if (s_heightSerialTraceA) {
+        spdlog::info(
+            "HEIGHT_SERIAL_TRACE site=allocSerial coord=({},{},{}) slot={}",
+            coord.ring, coord.x, coord.z, bestSlot);
+    }
     return bestSlot;
 }
 
@@ -2383,6 +2499,14 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
     m_parallelVoxelPumpWallMsLastFrame = 0.0f;
     m_persistentVoxelPumpWaitMsLastFrame = 0.0f;
     m_asyncNoncriticalGenerationWaitMsLastFrame = 0.0f;
+    m_heightPumpQueueMsLastFrame = 0.0f;
+    m_heightPumpDispatchMsLastFrame = 0.0f;
+    m_heightPumpJoinMsLastFrame = 0.0f;
+    m_heightPumpWorkerMaxMsLastFrame = 0.0f;
+    m_heightPumpGenerateMsLastFrame = 0.0f;
+    m_heightPumpCommitMsLastFrame = 0.0f;
+    m_heightPumpPendingTilesLastFrame = 0;
+    m_heightPumpWorkersLastFrame = 0;
     if (policy.Config().sharedVoxelColumnCache) {
         m_sharedVoxelColumnCache.clear();
         m_sharedVoxelColumnCache.reserve(std::max<size_t>(
@@ -2397,8 +2521,8 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
         policy.Config().backlogAwarePump ? policy.Config().pumpBudgetMs : 0.0f;
     // Phase 1 hard pump time budget: always enforced, cannot be bypassed by the
     // coverage-emergency path that zeroes pumpBudgetMs.
-    const float voxelPumpHardBudgetMs = policy.Config().voxelPumpHardBudgetMs;
-    const bool voxelPumpHardBudgetActive = voxelPumpHardBudgetMs > 0.0f;
+    const float pumpHardBudgetMs = policy.Config().voxelPumpHardBudgetMs;
+    const bool pumpHardBudgetActive = pumpHardBudgetMs > 0.0f;
     if (!policy.IsEnabled() || (maxHeightTiles == 0 && maxVoxelBricks == 0)) {
         RefreshStats();
         m_stats.pumpHeightMsLastFrame = 0.0f;
@@ -2409,6 +2533,28 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
     const auto heightPumpStart = std::chrono::steady_clock::now();
     uint32_t generated = 0;
     uint32_t evicted = 0;
+    const bool parallelHeightPumpAllowed =
+        policy.Config().heightClipmapEnabled &&
+        policy.Config().parallelHeightPump &&
+        policy.Config().parallelVoxelPumpMaxWorkers > 1u;
+    uint32_t effectiveMaxHeightTiles = maxHeightTiles;
+    if (pumpHardBudgetActive) {
+        const uint32_t previousGeneratedHeight = m_stats.generatedTilesLastFrame;
+        const float previousHeightPumpMs = m_stats.pumpHeightMsLastFrame;
+        float heightMsPerTileEstimate = 0.0f;
+        if (previousGeneratedHeight != 0u && previousHeightPumpMs > 0.0f) {
+            heightMsPerTileEstimate =
+                previousHeightPumpMs / static_cast<float>(previousGeneratedHeight);
+        } else if (m_heightPumpLastNonzeroMsPerTile > 0.0f) {
+            heightMsPerTileEstimate = m_heightPumpLastNonzeroMsPerTile;
+        }
+        if (std::isfinite(heightMsPerTileEstimate) && heightMsPerTileEstimate > 0.0f) {
+            const uint32_t budgetTiles = std::max(
+                1u,
+                static_cast<uint32_t>(pumpHardBudgetMs / heightMsPerTileEstimate));
+            effectiveMaxHeightTiles = std::min(effectiveMaxHeightTiles, budgetTiles);
+        }
+    }
     // Height tile generation is the dominant clip-section pump cost on a moving camera:
     // GenerateTile runs tileSampleSide^2 (33x33 = ~1089) heavy SparseTerrainGenerator
     // HeightAt evaluations per tile, and a cell-cross enqueues a burst of tiles that
@@ -2419,18 +2565,15 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
     // (they mutate shared maps); only the per-tile HeightAt work parallelizes. This is
     // coverage-neutral by construction: identical tiles, identical maxHeightTiles budget,
     // just off the single-thread critical path -- it cannot change which tiles stream.
-    const bool parallelHeightPumpAllowed =
-        policy.Config().heightClipmapEnabled &&
-        policy.Config().parallelHeightPump &&
-        policy.Config().parallelVoxelPumpMaxWorkers > 1u;
     if (parallelHeightPumpAllowed) {
         struct PendingHeightGeneration {
             SparseClipmapTileCoord coord;
             uint32_t slot = UINT32_MAX;
         };
         std::vector<PendingHeightGeneration> pendingHeight;
-        pendingHeight.reserve(maxHeightTiles);
-        while (!m_generationQueue.empty() && generated < maxHeightTiles) {
+        pendingHeight.reserve(effectiveMaxHeightTiles);
+        const auto heightQueueStart = std::chrono::steady_clock::now();
+        while (!m_generationQueue.empty() && generated < effectiveMaxHeightTiles) {
             const SparseClipmapTileCoord coord = m_generationQueue.front();
             m_generationQueue.pop_front();
             m_queuedSet.erase(coord);
@@ -2454,6 +2597,12 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
             pendingHeight.push_back({coord, slot});
             ++generated;
         }
+        m_heightPumpQueueMsLastFrame =
+            ElapsedMs(heightQueueStart, std::chrono::steady_clock::now());
+        m_heightPumpPendingTilesLastFrame = static_cast<uint32_t>(
+            std::min<size_t>(
+                pendingHeight.size(),
+                static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
         if (!pendingHeight.empty()) {
             const bool useHeightWorkers =
                 pendingHeight.size() >=
@@ -2463,45 +2612,96 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
                       static_cast<uint32_t>(pendingHeight.size()),
                       policy.Config().parallelVoxelPumpMaxWorkers)
                 : 1u;
+            m_heightPumpWorkersLastFrame = heightWorkerCount;
+            const auto heightGenerateStart = std::chrono::steady_clock::now();
             if (heightWorkerCount <= 1u) {
+                const auto workerStart = std::chrono::steady_clock::now();
                 for (const PendingHeightGeneration& item : pendingHeight) {
                     GenerateTile(item.slot, policy);
                 }
+                const float workerMs =
+                    ElapsedMs(workerStart, std::chrono::steady_clock::now());
+                m_heightPumpWorkerMaxMsLastFrame = workerMs;
             } else {
                 std::vector<std::thread> heightWorkers;
+                std::vector<float> heightWorkerElapsedMs(heightWorkerCount, 0.0f);
                 heightWorkers.reserve(heightWorkerCount);
+                // WORK-STEALING distribution (atomic cursor), not contiguous
+                // count-chunks: per-tile cost skews ~50x across rings, so a
+                // static partition made the join wait on the unluckiest worker
+                // (the measured pumpHeight join wall) while the rest sat idle.
+                // Same fix the mid-mesh extractor's workStealExtract proved.
+                std::atomic<size_t> heightWorkCursor{0};
+                const auto dispatchStart = std::chrono::steady_clock::now();
                 for (uint32_t worker = 0u; worker < heightWorkerCount; ++worker) {
-                    heightWorkers.emplace_back([this, &pendingHeight, &policy, worker, heightWorkerCount]() {
-                        const size_t begin =
-                            (pendingHeight.size() * static_cast<size_t>(worker)) /
-                            static_cast<size_t>(heightWorkerCount);
-                        const size_t end =
-                            (pendingHeight.size() * static_cast<size_t>(worker + 1u)) /
-                            static_cast<size_t>(heightWorkerCount);
-                        for (size_t index = begin; index < end; ++index) {
+                    heightWorkers.emplace_back([this,
+                                                &pendingHeight,
+                                                &policy,
+                                                &heightWorkerElapsedMs,
+                                                &heightWorkCursor,
+                                                worker]() {
+                        const auto workerStart = std::chrono::steady_clock::now();
+                        for (;;) {
+                            const size_t index =
+                                heightWorkCursor.fetch_add(1, std::memory_order_relaxed);
+                            if (index >= pendingHeight.size()) {
+                                break;
+                            }
                             GenerateTile(pendingHeight[index].slot, policy);
                         }
+                        heightWorkerElapsedMs[worker] =
+                            ElapsedMs(workerStart, std::chrono::steady_clock::now());
                     });
                 }
+                m_heightPumpDispatchMsLastFrame =
+                    ElapsedMs(dispatchStart, std::chrono::steady_clock::now());
                 const uint64_t waitStartTicks = SDL_GetPerformanceCounter();
+                const auto joinStart = std::chrono::steady_clock::now();
                 for (std::thread& worker : heightWorkers) {
                     worker.join();
                 }
+                const float joinMs = ElapsedMs(joinStart, std::chrono::steady_clock::now());
+                m_heightPumpJoinMsLastFrame = joinMs;
                 m_persistentVoxelPumpWaitMsLastFrame += WaitTicksToMs(waitStartTicks);
+                for (float workerMs : heightWorkerElapsedMs) {
+                    m_heightPumpWorkerMaxMsLastFrame =
+                        std::max(m_heightPumpWorkerMaxMsLastFrame, workerMs);
+                }
             }
+            m_heightPumpGenerateMsLastFrame =
+                ElapsedMs(heightGenerateStart, std::chrono::steady_clock::now());
             // Single-threaded commit: publish slots + dirty marks in queue order.
+            const auto heightCommitStart = std::chrono::steady_clock::now();
             for (const PendingHeightGeneration& item : pendingHeight) {
                 m_slotByCoord[item.coord] = item.slot;
                 ++m_midMeshResidencyEpoch;  // residency changed -> invalidate per-tile LOD cache
                 ++m_dirtySerial;
                 ++m_heightDirtySerial;
                 MarkHeightSlotDirty(item.slot);
+                // Oscillator trace (Loop 110).
+                static const bool s_heightSerialTraceP =
+                    std::getenv("VENPOD_HEIGHT_SERIAL_TRACE") != nullptr;
+                if (s_heightSerialTraceP) {
+                    spdlog::info(
+                        "HEIGHT_SERIAL_TRACE site=parallelSerial coord=({},{},{}) slot={}",
+                        item.coord.ring, item.coord.x, item.coord.z, item.slot);
+                }
+            }
+            m_heightPumpCommitMsLastFrame =
+                ElapsedMs(heightCommitStart, std::chrono::steady_clock::now());
+            if (pumpHardBudgetActive && !m_generationQueue.empty()) {
+                const float elapsedMs =
+                    ElapsedMs(heightPumpStart, std::chrono::steady_clock::now());
+                if (elapsedMs >= pumpHardBudgetMs) {
+                    m_pumpBudgetHitLastFrame = 1;
+                }
             }
         }
     } else {
+        auto heightQueueStart = std::chrono::steady_clock::now();
         while (policy.Config().heightClipmapEnabled &&
                !m_generationQueue.empty() &&
-               generated < maxHeightTiles) {
+               generated < effectiveMaxHeightTiles) {
             const SparseClipmapTileCoord coord = m_generationQueue.front();
             m_generationQueue.pop_front();
             m_queuedSet.erase(coord);
@@ -2517,22 +2717,71 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
             const bool wasFull = m_slotByCoord.size() >= m_tiles.size() && m_freeSlots.empty();
             const uint32_t slot = AllocateSlot(coord, frameIndex);
             if (slot == UINT32_MAX) {
+                m_heightPumpQueueMsLastFrame +=
+                    ElapsedMs(heightQueueStart, std::chrono::steady_clock::now());
                 break;
             }
             evicted += wasFull ? 1u : 0u;
             m_tiles[slot].record.coord = coord;
             m_tiles[slot].record.slot = slot;
             m_tiles[slot].record.lastTouchedFrame = frameIndex;
+            const auto beforeGenerate = std::chrono::steady_clock::now();
+            m_heightPumpQueueMsLastFrame +=
+                ElapsedMs(heightQueueStart, beforeGenerate);
+            ++m_heightPumpPendingTilesLastFrame;
+            m_heightPumpWorkersLastFrame = 1u;
+            const auto heightGenerateStart = std::chrono::steady_clock::now();
             GenerateTile(slot, policy);
+            const float generatedTileMs =
+                ElapsedMs(heightGenerateStart, std::chrono::steady_clock::now());
+            m_heightPumpGenerateMsLastFrame += generatedTileMs;
+            m_heightPumpWorkerMaxMsLastFrame =
+                std::max(m_heightPumpWorkerMaxMsLastFrame, generatedTileMs);
+            const auto heightCommitStart = std::chrono::steady_clock::now();
             m_slotByCoord[coord] = slot;
             ++m_midMeshResidencyEpoch;  // residency changed -> invalidate per-tile LOD cache
             ++generated;
             ++m_dirtySerial;
             ++m_heightDirtySerial;
             MarkHeightSlotDirty(slot);
+            // Oscillator trace (Loop 110): name the tiles that keep regenerating.
+            static const bool s_heightSerialTrace =
+                std::getenv("VENPOD_HEIGHT_SERIAL_TRACE") != nullptr;
+            if (s_heightSerialTrace) {
+                spdlog::info(
+                    "HEIGHT_SERIAL_TRACE site=pumpSerial coord=({},{},{}) slot={}",
+                    coord.ring, coord.x, coord.z, slot);
+            }
+            m_heightPumpCommitMsLastFrame +=
+                ElapsedMs(heightCommitStart, std::chrono::steady_clock::now());
+            if (pumpHardBudgetActive && !m_generationQueue.empty()) {
+                const float elapsedMs =
+                    ElapsedMs(heightPumpStart, std::chrono::steady_clock::now());
+                if (elapsedMs >= pumpHardBudgetMs) {
+                    m_pumpBudgetHitLastFrame = 1;
+                    break;
+                }
+            }
+            heightQueueStart = std::chrono::steady_clock::now();
+        }
+        if (generated == 0u) {
+            m_heightPumpQueueMsLastFrame +=
+                ElapsedMs(heightQueueStart, std::chrono::steady_clock::now());
         }
     }
     const auto heightPumpEnd = std::chrono::steady_clock::now();
+    const float heightPumpMsLastFrame = ElapsedMs(heightPumpStart, heightPumpEnd);
+    if (generated != 0u &&
+        std::isfinite(heightPumpMsLastFrame) &&
+        heightPumpMsLastFrame > 0.0f) {
+        m_heightPumpLastNonzeroMsPerTile =
+            heightPumpMsLastFrame / static_cast<float>(generated);
+    }
+    if (pumpHardBudgetActive &&
+        effectiveMaxHeightTiles < maxHeightTiles &&
+        !m_generationQueue.empty()) {
+        m_pumpBudgetHitLastFrame = 1;
+    }
 
     const auto voxelPumpStart = std::chrono::steady_clock::now();
     uint32_t generatedVoxel = 0;
@@ -2765,10 +3014,10 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
         ++m_dirtySerial;
         ++m_voxelDirtySerial;
         MarkVoxelSlotDirty(slot);
-        if (voxelPumpHardBudgetActive && !m_voxelGenerationQueue.empty()) {
+        if (pumpHardBudgetActive && !m_voxelGenerationQueue.empty()) {
             const float elapsedMs =
                 ElapsedMs(voxelPumpStart, std::chrono::steady_clock::now());
-            if (elapsedMs >= voxelPumpHardBudgetMs) {
+            if (elapsedMs >= pumpHardBudgetMs) {
                 m_pumpBudgetHitLastFrame = 1;
                 break;
             }
@@ -2788,7 +3037,7 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
     const auto voxelPumpEnd = std::chrono::steady_clock::now();
 
     RefreshStats(generated, evicted, generatedVoxel, evictedVoxel);
-    m_stats.pumpHeightMsLastFrame = ElapsedMs(heightPumpStart, heightPumpEnd);
+    m_stats.pumpHeightMsLastFrame = heightPumpMsLastFrame;
     m_stats.pumpVoxelMsLastFrame = ElapsedMs(voxelPumpStart, voxelPumpEnd);
     return generated + generatedVoxel;
 }
@@ -2868,7 +3117,10 @@ uint32_t SparseClipmapTileCache::PumpVoxelGenerationMatchingPriority(
     };
 
     const bool editOverlaysActive = m_edits && m_edits->EditedBrickCount() != 0u;
-    if (asyncQueueAllowed && !requireVisiblePriority && !editOverlaysActive) {
+    // Async queueing runs even with edits active: TryQueueAsyncVoxelGeneration
+    // filters edit-overlapping coords per brick, so pristine streaming continues
+    // world-wide while only the edited neighborhood stays sync.
+    if (asyncQueueAllowed && !requireVisiblePriority) {
         QueueAsyncVoxelGenerationMatchingPriority(false, frameIndex, policy);
         if (maxVoxelBricks == 0u) {
             return 0u;
@@ -4163,8 +4415,7 @@ uint32_t SparseClipmapTileCache::QueueAsyncVisibleReservationVoxelCoords(
     PruneAsyncVisibleReservations(frameIndex, staleFrames);
     if (reservationCoords.empty() ||
         !policy.Config().asyncVisibleCriticalGeneration ||
-        policy.Config().asyncNoncriticalGenerationQueueMax == 0u ||
-        (m_edits && m_edits->EditedBrickCount() != 0u)) {
+        policy.Config().asyncNoncriticalGenerationQueueMax == 0u) {
         return 0u;
     }
 
@@ -4175,6 +4426,11 @@ uint32_t SparseClipmapTileCache::QueueAsyncVisibleReservationVoxelCoords(
     for (const SparseVoxelClipmapCoord& coord : reservationCoords) {
         if (!m_voxelInterestSet.empty() &&
             m_voxelInterestSet.find(coord) == m_voxelInterestSet.end()) {
+            continue;
+        }
+        // Edit-overlapping bricks stay on the edit-aware sync path (per-coord
+        // gate, matching TryQueueAsyncVoxelGeneration).
+        if (VoxelBrickCoordIntersectsEditOverlays(coord, policy)) {
             continue;
         }
         if (m_voxelSlotByCoord.find(coord) != m_voxelSlotByCoord.end()) {
@@ -4632,22 +4888,6 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
         !m_voxelInterestSet.empty() &&
         ringCount > voxelInterestRebuildRingsPerFrame;
 
-    std::deque<SparseVoxelClipmapCoord> previousVoxelQueue;
-    std::unordered_set<SparseVoxelClipmapCoord, SparseVoxelClipmapCoordHash> previousVoxelInterestSet;
-    if (policy.Config().drainReuseDiagnostics || budgetedVoxelInterestRebuild) {
-        previousVoxelInterestSet = m_voxelInterestSet;
-    }
-    if (backlogAwarePump) {
-        previousVoxelQueue.swap(m_voxelGenerationQueue);
-        m_queuedVoxelSet.clear();
-    }
-    m_voxelInterestSet.clear();
-    if (!backlogAwarePump) {
-        m_voxelGenerationQueue.clear();
-        m_queuedVoxelSet.clear();
-        m_voxelBacklogFirstFrame.clear();
-    }
-
     // Pick the contiguous (wrapping) block of rings to rebuild this frame. The cursor
     // persists across frames so successive crosses sweep every ring in turn; while the
     // cursor has not yet covered the whole clipmap the rebuild is "in progress" and the
@@ -4676,10 +4916,54 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
     }
     m_voxelInterestRingsRebuiltLastFrame = ringsRebuiltThisFrame;
 
+    std::deque<SparseVoxelClipmapCoord> previousVoxelQueue;
+    std::unordered_set<SparseVoxelClipmapCoord, SparseVoxelClipmapCoordHash> previousVoxelInterestSet;
+    if (policy.Config().drainReuseDiagnostics) {
+        previousVoxelInterestSet = m_voxelInterestSet;
+    }
+    if (backlogAwarePump) {
+        previousVoxelQueue.swap(m_voxelGenerationQueue);
+        m_queuedVoxelSet.clear();
+    }
+    if (budgetedVoxelInterestRebuild) {
+        for (auto it = m_voxelInterestSet.begin(); it != m_voxelInterestSet.end();) {
+            const uint32_t coordRing =
+                it->ring >= 0 ? static_cast<uint32_t>(it->ring) : 0u;
+            if (coordRing < rebuildThisRing.size() && rebuildThisRing[coordRing] != 0u) {
+                it = m_voxelInterestSet.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    } else {
+        m_voxelInterestSet.clear();
+    }
+    if (!backlogAwarePump) {
+        m_voxelGenerationQueue.clear();
+        m_queuedVoxelSet.clear();
+        m_voxelBacklogFirstFrame.clear();
+    }
+    if (budgetedVoxelInterestRebuild) {
+        for (const SparseVoxelClipmapCoord& coord : m_voxelInterestSet) {
+            auto existing = m_voxelSlotByCoord.find(coord);
+            if (existing != m_voxelSlotByCoord.end()) {
+                m_voxelBricks[existing->second].lastTouchedFrame = frameIndex;
+                continue;
+            }
+            if (m_queuedVoxelSet.insert(coord).second) {
+                m_voxelGenerationQueue.push_back(coord);
+                ++m_backlogVoxelEnqueuedLastFrame;
+                if (backlogAwarePump) {
+                    m_voxelBacklogFirstFrame.emplace(coord, frameIndex);
+                }
+            }
+        }
+    }
+
     for (uint32_t ring = 0; ring < rings.size(); ++ring) {
         if (ring < rebuildThisRing.size() && rebuildThisRing[ring] == 0u) {
-            // Carried ring: its coords are re-emitted below from the prior interest
-            // set. Skip the (expensive) candidate scan entirely.
+            // Carried ring: its coords stayed in m_voxelInterestSet above. Skip the
+            // expensive candidate scan entirely.
             continue;
         }
         const float brickWorldSize = std::max(1.0f, rings[ring].cellSize * static_cast<float>(SPARSE_BRICK_SIZE));
@@ -5225,37 +5509,6 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
             m_voxelInterestCandidateMaxRingAttemptsLastFrame = std::max(
                 m_voxelInterestCandidateMaxRingAttemptsLastFrame,
                 ringCandidateAttempts);
-        }
-    }
-
-    // Carried rings (budgeted rebuild): re-emit the prior interest coords for every
-    // ring we deliberately skipped this frame. This is pure hash work -- no terrain
-    // scan, no candidate sort -- so it is cheap, and it keeps those rings fully
-    // covered with their last-known (>= correct) coords until their turn to refresh.
-    if (budgetedVoxelInterestRebuild) {
-        for (const SparseVoxelClipmapCoord& coord : previousVoxelInterestSet) {
-            const uint32_t coordRing =
-                coord.ring >= 0 ? static_cast<uint32_t>(coord.ring) : 0u;
-            if (coordRing < rebuildThisRing.size() && rebuildThisRing[coordRing] != 0u) {
-                // This ring was freshly rebuilt above; its coords are already emitted
-                // (and may legitimately differ from the prior set).
-                continue;
-            }
-            if (!m_voxelInterestSet.insert(coord).second) {
-                continue;
-            }
-            auto existing = m_voxelSlotByCoord.find(coord);
-            if (existing != m_voxelSlotByCoord.end()) {
-                m_voxelBricks[existing->second].lastTouchedFrame = frameIndex;
-                continue;
-            }
-            if (m_queuedVoxelSet.insert(coord).second) {
-                m_voxelGenerationQueue.push_back(coord);
-                ++m_backlogVoxelEnqueuedLastFrame;
-                if (backlogAwarePump) {
-                    m_voxelBacklogFirstFrame.emplace(coord, frameIndex);
-                }
-            }
         }
     }
 
@@ -6072,12 +6325,33 @@ void SparseClipmapTileCache::GenerateVoxelBrickPayload(
                 std::min(posZColumn.height, negZColumn.height));
             ColumnSample* maxFootprintColumn = &centerColumn;
             float maxFootprintColumnHeight = centerColumn.height;
+            // MIN column + submerged fraction (Loop 96): backs the LOD-consistent
+            // water rule below. Same candidate array/order as max; strict '<'
+            // keeps the first on ties (GPU port mirrors this exactly).
+            ColumnSample* minFootprintColumn = &centerColumn;
+            float minFootprintColumnHeight = centerColumn.height;
+            uint32_t footprintColumnCount = 0u;
+            uint32_t footprintSubmergedCount = 0u;
             for (ColumnSample* candidate : footprintColumns) {
-                if (candidate && candidate->height > maxFootprintColumnHeight) {
+                if (!candidate) {
+                    continue;
+                }
+                ++footprintColumnCount;
+                if (candidate->height < static_cast<float>(SEA_LEVEL_Y)) {
+                    ++footprintSubmergedCount;
+                }
+                if (candidate->height > maxFootprintColumnHeight) {
                     maxFootprintColumn = candidate;
                     maxFootprintColumnHeight = candidate->height;
                 }
+                if (candidate->height < minFootprintColumnHeight) {
+                    minFootprintColumn = candidate;
+                    minFootprintColumnHeight = candidate->height;
+                }
             }
+            const bool footprintMajoritySubmerged =
+                footprintSubmergedCount != 0u &&
+                footprintSubmergedCount * 2u >= footprintColumnCount;
 
             for (uint8_t y = 0; y < SPARSE_BRICK_SIZE; ++y) {
                 const int32_t worldY = worldYByLocal[y];
@@ -6152,12 +6426,44 @@ void SparseClipmapTileCache::GenerateVoxelBrickPayload(
                         material = Utils::UnpackMaterial(voxel);
                     }
                 }
+                // LOD-consistent water EXISTENCE (Loop 96): pools narrower than a
+                // coarse cell render water at fine rings but the coarse center
+                // sample misses the pit -> water pops in/out at ring transitions
+                // during motion (user-visible blue flickers). Resample from the
+                // MINIMUM footprint column, but ONLY when submerged columns are
+                // the MAJORITY of the footprint — that bound is what separates
+                // this from the rejected any-neighbor-dip rule (see below): a
+                // majority-submerged cell is mostly water at fine resolution, so
+                // coarse water is the more faithful LOD, and the worst-case
+                // water-over-land error is under half a cell.
+                if (!clusteredCoarseAirEditForCell &&
+                    ring.cellSize > 1.5f &&
+                    material != Utils::Material::Water &&
+                    footprintMajoritySubmerged &&
+                    cellMinWorldY <= SEA_LEVEL_Y &&
+                    cellMaxWorldY > FloorToInt32Clamped(minFootprintColumnHeight)) {
+                    voxel = sampleColumnCellVoxel(
+                        *minFootprintColumn,
+                        worldXMinByLocal[x],
+                        worldXMaxByLocal[x],
+                        cellMinWorldY,
+                        cellMaxWorldY,
+                        worldZMinByLocal[z],
+                        worldZMaxByLocal[z],
+                        std::clamp(
+                            worldY,
+                            SaturatingAddInt32(
+                                FloorToInt32Clamped(minFootprintColumnHeight), 1),
+                            static_cast<int32_t>(SEA_LEVEL_Y)));
+                    material = Utils::UnpackMaterial(voxel);
+                }
                 // Preserve generated shoreline land in mixed coarse cells.
                 // The water volume case is already handled in sampleColumnCellVoxel()
                 // when the sampled column is actually submerged. Converting sand to
                 // water just because a neighboring footprint column dips below sea
                 // level makes the lower LOD draw water over land until exact sparse
-                // surface pages stream in.
+                // surface pages stream in. (The majority-submerged rule above is
+                // the deliberate, bounded exception to this.)
                 if (!hasEditedCells &&
                     ring.cellSize > 1.5f &&
                     material == Utils::Material::Stone) {
@@ -6995,7 +7301,7 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     // XZ regions we therefore emit NO mesh cells, so the raymarch owns them and the
     // edit renders crisply from the same voxel data the brush wrote (the legacy
     // clean-edit invariant), instead of the mesh drawing torn/stale surface on top.
-    struct EditXzBox { int32_t minX, minZ, maxX, maxZ; };
+    struct EditXzBox { int32_t minX, minZ, maxX, maxZ; int32_t minY, maxY; };
     std::vector<EditXzBox> editXzBoxes;
     if (m_edits && m_edits->EditedBrickCount() != 0u) {
         editXzBoxes.reserve(m_edits->EditedBrickCount());
@@ -7008,8 +7314,11 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             // only its real footprint, so the mesh hole hugs the carve and the
             // raymarch/mesh seam sits at the carve rim instead of a brick edge
             // (which left ragged slivers of stale terrain around the carve).
+            // The Y bounds are tracked too: suppression must be Y-AWARE (an edit
+            // floating in the air must not delete the terrain mesh below it).
             uint8_t minLocalX = SPARSE_BRICK_SIZE - 1u, minLocalZ = SPARSE_BRICK_SIZE - 1u;
             uint8_t maxLocalX = 0u, maxLocalZ = 0u;
+            uint8_t minLocalY = SPARSE_BRICK_SIZE - 1u, maxLocalY = 0u;
             for (const auto& [localIndex, packedVoxel] : overlay.voxels) {
                 (void)packedVoxel;
                 const LocalVoxelCoord local = LocalVoxelFromIndex(localIndex);
@@ -7017,21 +7326,31 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
                 maxLocalX = std::max(maxLocalX, local.x);
                 minLocalZ = std::min(minLocalZ, local.z);
                 maxLocalZ = std::max(maxLocalZ, local.z);
+                minLocalY = std::min(minLocalY, local.y);
+                maxLocalY = std::max(maxLocalY, local.y);
             }
             EditXzBox box{};
-            int32_t y = 0;
             if (TryWorldVoxelFromBrickLocal(overlay.coord.x, minLocalX, &box.minX) &&
                 TryWorldVoxelFromBrickLocal(overlay.coord.z, minLocalZ, &box.minZ) &&
                 TryWorldVoxelFromBrickLocal(overlay.coord.x, maxLocalX, &box.maxX) &&
                 TryWorldVoxelFromBrickLocal(overlay.coord.z, maxLocalZ, &box.maxZ) &&
-                TryWorldVoxelFromBrickLocal(overlay.coord.y, 0, &y)) {
+                TryWorldVoxelFromBrickLocal(overlay.coord.y, minLocalY, &box.minY) &&
+                TryWorldVoxelFromBrickLocal(overlay.coord.y, maxLocalY, &box.maxY)) {
                 editXzBoxes.push_back(box);
             }
         });
     }
-    auto cellInEditFootprint = [&](int32_t x0, int32_t z0, int32_t x1, int32_t z1) -> bool {
+    // Y-AWARE footprint test: an edit suppresses a mesh cell only when its Y range
+    // intersects the cell's SURFACE band [surfY0, surfY1]. XZ-only suppression
+    // (the old rule) punched permanent holes in the ground mesh below mid-air
+    // brush strokes -- holes the voxel layers never backfill beyond the mid-voxel
+    // ring, which rendered as corrupted/broken terrain under every air edit.
+    auto cellInEditFootprint = [&](
+        int32_t x0, int32_t z0, int32_t x1, int32_t z1,
+        int32_t surfY0, int32_t surfY1) -> bool {
         for (const EditXzBox& b : editXzBoxes) {
-            if (b.minX <= x1 && b.maxX >= x0 && b.minZ <= z1 && b.maxZ >= z0) {
+            if (b.minX <= x1 && b.maxX >= x0 && b.minZ <= z1 && b.maxZ >= z0 &&
+                b.minY <= surfY1 && b.maxY >= surfY0) {
                 return true;
             }
         }
@@ -7188,15 +7507,57 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
                      z >= emRegionZ1 || zEnd <= emRegionZ0)) {
                     continue;
                 }
+                SurfaceBlock block = aggregateSamples(x, z, xEnd, zEnd);
                 // Skip mid-mesh cells over brush edits: emit no top, no riser, no
                 // all-air fill, so the voxel raymarch renders the live edit there.
+                // Y-AWARE: only cells whose SURFACE band the edit actually touches
+                // are suppressed; an edit floating above (or buried far below) the
+                // surface leaves the terrain mesh intact. The band widens with the
+                // ring cell size (a coarse cell aggregates sloped terrain) plus the
+                // terrace quantization step. All-air cells (no surface) keep the
+                // old any-XZ-overlap rule -- there is no terrain there to protect.
+                // Backfill bound: only yield cells to the raymarch where an
+                // edit-aware renderer exists to own them (near-exact + mid-
+                // voxel reach). Beyond it, keep the procedural mesh -- a
+                // stale-solid surface at range beats a ghost hole showing
+                // the far fallback (the "translucent ribbon" artifact).
+                bool cellWithinBackfillReach = true;
                 if (!editXzBoxes.empty() &&
-                    cellInEditFootprint(
-                        cellWorldX(x), cellWorldZ(z),
-                        cellWorldX(xEnd), cellWorldZ(zEnd))) {
-                    continue;
+                    buildConfig.editSuppressMaxDistance > 0.0f) {
+                    const float cellCenterX =
+                        0.5f * (static_cast<float>(cellWorldX(x)) +
+                                static_cast<float>(cellWorldX(xEnd)));
+                    const float cellCenterZ =
+                        0.5f * (static_cast<float>(cellWorldZ(z)) +
+                                static_cast<float>(cellWorldZ(zEnd)));
+                    const float dx = cellCenterX - buildConfig.cameraX;
+                    const float dz = cellCenterZ - buildConfig.cameraZ;
+                    const float maxD = buildConfig.editSuppressMaxDistance;
+                    cellWithinBackfillReach = dx * dx + dz * dz <= maxD * maxD;
                 }
-                SurfaceBlock block = aggregateSamples(x, z, xEnd, zEnd);
+                if (!editXzBoxes.empty() && cellWithinBackfillReach) {
+                    // Live stroke window: while the brush is active, suppress the
+                    // whole column (permissive) so the raymarch shows the live
+                    // stroke; the Y-aware rule heals the mesh after the window.
+                    const bool yAware = buildConfig.editSuppressYAware &&
+                        !buildConfig.editStrokeLiveWindow &&
+                        block.present;
+                    const int32_t editSurfBand =
+                        static_cast<int32_t>(terraceStep) +
+                        std::max(4, static_cast<int32_t>(cellSize));
+                    const int32_t surfY0 = yAware
+                        ? SaturatingAddInt32(block.height, -editSurfBand)
+                        : std::numeric_limits<int32_t>::min() / 2;
+                    const int32_t surfY1 = yAware
+                        ? SaturatingAddInt32(block.height, editSurfBand)
+                        : std::numeric_limits<int32_t>::max() / 2;
+                    if (cellInEditFootprint(
+                            cellWorldX(x), cellWorldZ(z),
+                            cellWorldX(xEnd), cellWorldZ(zEnd),
+                            surfY0, surfY1)) {
+                        continue;
+                    }
+                }
                 if (!block.present) {
                     // ALL-AIR FOOTPRINT FILL (Codex-traced #1 hole mechanism): a merged
                     // footprint whose samples are all Air used to emit NOTHING — no top,
@@ -8166,9 +8527,13 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
                                     const bool loBX = (cellX <= 0), hiBX = (cellX >= static_cast<int32_t>(cellCount) - 1);
                                     const bool loBZ = (cellZ <= 0), hiBZ = (cellZ >= static_cast<int32_t>(cellCount) - 1);
                                     // Does full-extract SKIP this cell as edit-footprint? (cellWorldX/Z = tileO + idx*cs)
+                                    // Diagnostic uses the permissive (XZ-only) band.
                                     const int32_t cwx0 = tileOX + cellX * cellSize, cwx1 = tileOX + (cellX + 1) * cellSize;
                                     const int32_t cwz0 = tileOZ + cellZ * cellSize, cwz1 = tileOZ + (cellZ + 1) * cellSize;
-                                    const bool inFoot = cellInEditFootprint(cwx0, cwz0, cwx1, cwz1);
+                                    const bool inFoot = cellInEditFootprint(
+                                        cwx0, cwz0, cwx1, cwz1,
+                                        std::numeric_limits<int32_t>::min() / 2,
+                                        std::numeric_limits<int32_t>::max() / 2);
                                     spdlog::error(
                                         "  {} dir={} w({},{},{}) wh={}x{} vox={} cell=({},{}) inRect={} inFoot={} "
                                         "edge[loX={} hiX={} loZ={} hiZ={}] corner={}",
@@ -9013,6 +9378,14 @@ void SparseClipmapTileCache::RefreshStats(
     m_stats.voxelRingCount = std::min<uint32_t>(
         static_cast<uint32_t>(m_config.ringCount),
         SPARSE_CLIPMAP_MAX_STATS_RINGS);
+    m_stats.heightPumpQueueMsLastFrame = m_heightPumpQueueMsLastFrame;
+    m_stats.heightPumpDispatchMsLastFrame = m_heightPumpDispatchMsLastFrame;
+    m_stats.heightPumpJoinMsLastFrame = m_heightPumpJoinMsLastFrame;
+    m_stats.heightPumpWorkerMaxMsLastFrame = m_heightPumpWorkerMaxMsLastFrame;
+    m_stats.heightPumpGenerateMsLastFrame = m_heightPumpGenerateMsLastFrame;
+    m_stats.heightPumpCommitMsLastFrame = m_heightPumpCommitMsLastFrame;
+    m_stats.heightPumpPendingTilesLastFrame = m_heightPumpPendingTilesLastFrame;
+    m_stats.heightPumpWorkersLastFrame = m_heightPumpWorkersLastFrame;
     // Always-on coverage and maintenance. This block owns gameplay-visible stats
     // and the prune side effects, so it must stay before the heavy telemetry gate.
     if (m_lastCoverageStatsFrame != m_lastStatsFrame) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 
 namespace VENPOD::Simulation {
 
@@ -24,6 +25,135 @@ struct SparseRuntimeBudgetInput {
     uint32_t pagePublishMaxReadyFrameLag = 0;
     bool visibleMissPressure = false;
     uint32_t ownershipPressureLevel = 0;
+};
+
+struct SparseReadyPublishPressureInput {
+    bool enabled = false;
+    uint64_t pending = 0;
+    uint32_t oldestAge = 0;
+};
+
+struct SparsePrePublishSurfaceBudgetInput {
+    bool pageTableSurfaceReadyGateEnabled = false;
+    uint32_t pagePublishesEligible = 0;
+    bool pagePublishQueueEmpty = true;
+
+    uint32_t baseExtractBudget = 0;
+    uint32_t terrainCriticalExtractBudget = 0;
+    uint32_t startupExtractBudget = 0;
+    uint32_t postOpenExtractBudget = 0;
+
+    uint32_t baseHiddenCriticalBudget = 0;
+    uint32_t startupHiddenCriticalBudget = 0;
+    uint32_t postOpenHiddenCriticalBudget = 0;
+    uint32_t hiddenTrackedBudget = 0;
+    uint32_t generalBudget = std::numeric_limits<uint32_t>::max();
+    uint32_t editGeneralBudget = std::numeric_limits<uint32_t>::max();
+
+    float baseMaxMs = 0.0f;
+    float startupMaxMs = 0.0f;
+    float postOpenMaxMs = 0.0f;
+
+    uint64_t frameIndex = 0;
+    uint64_t lastEditFrame = 0;
+    uint32_t editIdleFrames = 0;
+    uint32_t postEditGeneralSpillFrames = 0;
+    uint32_t postEditGeneralBudget = std::numeric_limits<uint32_t>::max();
+    float postEditGeneralSpillPressureMs = 0.0f;
+    float lastRawFrameMs = 0.0f;
+    float combinedSchedulerPressureMs = 0.0f;
+    float sameFrameClipmapPrepMs = 0.0f;
+    float stackedWorkClipmapPrepThresholdMs = 0.0f;
+    uint32_t stackedWorkGeneralBudget = std::numeric_limits<uint32_t>::max();
+
+    bool terrainCriticalPublishOvertime = false;
+    bool hiddenExactStartupPublishOvertime = false;
+    bool hiddenExactRuntimePublishPriority = false;
+    bool startupSurfaceCatchup = false;
+    bool postOpenSurfaceCatchup = false;
+};
+
+struct SparsePrePublishSurfaceBudgetDecision {
+    bool enabled = false;
+    bool editActive = false;
+    bool postEditGeneralSpillActive = false;
+    bool splitGeneralByOwnership = false;
+    bool skipGeneralSurfaceStage = false;
+    bool stackedWorkGeneralCapActive = false;
+    uint32_t totalBudget = 0;
+    uint32_t hiddenCriticalBudget = 0;
+    uint32_t hiddenTrackedBudget = 0;
+    uint32_t generalBudget = 0;
+    uint32_t generalCriticalBudget = 0;
+    uint32_t generalNonCriticalBudget = 0;
+    float maxMs = 0.0f;
+};
+
+struct SparseSurfaceWorkRouteInput {
+    bool routingEnabled = false;
+    bool asyncExtractionEnabled = false;
+    bool editActive = false;
+    // Per-coord edit gate: async extraction rejects only bricks whose local edit
+    // dependency overlaps an edit. With it on, edit-window routing is safe (the
+    // stroke floods hundreds of ordinary visible bricks whose meshing is not
+    // edit-dependent; only blob bricks stay inline).
+    bool asyncPerCoordEditGate = false;
+    bool previousRouteGeneralToAsync = false;
+    uint32_t asyncQueueDepth = 0;
+    uint32_t asyncResultDepth = 0;
+    uint32_t asyncBacklogLimit = 0;
+    uint64_t surfaceReadyPublishPending = 0;
+    uint32_t surfaceReadyPublishOldestAge = 0;
+    uint64_t surfaceReadyPublishPendingLimit = 0;
+    uint32_t surfaceReadyPublishOldestAgeLimit = 0;
+    // Main page-table publish queue depth (SparsePagePublishQueue). This is the
+    // counter that actually blew up in the Loop 84 Probe A failure (553 vs ~61).
+    uint64_t pagePublishBacklog = 0;
+    uint32_t pagePublishBacklogLimit = 0;
+};
+
+struct SparseSurfaceWorkRouteDecision {
+    bool routeGeneralToAsync = false;
+    bool asyncBacklogSaturated = false;
+    bool publishBacklogSaturated = false;
+};
+
+struct SparseRuntimeWorkloadSnapshot {
+    float lastRawFrameMs = 16.67f;
+    float combinedSchedulerPressureMs = 16.67f;
+    bool pagePublishQueueEmpty = true;
+    bool missFeedbackPending = false;
+    bool uploadRingOverflowLastFrame = false;
+    uint32_t uploadRingBudgetDefersLastFrame = 0;
+    uint64_t stagedBytesLastFrame = 0;
+    uint64_t uploadRingBytes = 0;
+    uint32_t maxBrickPages = 1;
+    uint64_t clipmapQueuedHeightTiles = 0;
+    uint64_t clipmapQueuedVoxelBricks = 0;
+    uint64_t generationQueuedBricks = 0;
+    uint64_t generationQueuedSpeculativeBricks = 0;
+    uint64_t generationQueuedVisibleBricks = 0;
+    uint64_t generationQueuedCollisionBricks = 0;
+    uint64_t generationQueuedEditedBricks = 0;
+    uint64_t uploadQueuedBricks = 0;
+    uint64_t uploadQueuedSpeculativeBricks = 0;
+    uint64_t uploadQueuedVisibleBricks = 0;
+    uint64_t uploadQueuedCollisionBricks = 0;
+    uint64_t uploadQueuedEditedBricks = 0;
+    uint64_t surfaceQueuedSpeculativeBricks = 0;
+    uint64_t surfaceQueuedVisibleBricks = 0;
+    uint64_t surfaceQueuedCollisionBricks = 0;
+    uint64_t surfaceQueuedEditedBricks = 0;
+    uint64_t surfaceExtractionQueuedBricks = 0;
+    uint64_t physicsHotCandidateBricks = 0;
+    uint64_t pagePublishReadyQueued = 0;
+    uint64_t pagePublishWaitingFrame = 0;
+    uint64_t pagePublishWaitingFence = 0;
+    uint64_t pagePublishEditedQueued = 0;
+    uint32_t pagePublishMaxReadyFrameLag = 0;
+    bool residencyCatchupActive = false;
+    uint32_t ownershipPressureLevel = 0;
+    SparseReadyPublishPressureInput readySurfacePublish{};
 };
 
 enum class SparseRuntimePressureClass : uint8_t {
@@ -241,6 +371,12 @@ public:
     static SparseFramePrediction BuildFramePrediction(const SparseFramePredictionInput& input);
     static SparseOwnershipPressure BuildOwnershipPressure(const SparseOwnershipPressureInput& input);
     static SparseMissFeedbackPlan BuildMissFeedbackPlan(const SparseMissFeedbackPlanInput& input);
+    static SparseRuntimeBudgetInput BuildRuntimeBudgetInput(
+        const SparseRuntimeWorkloadSnapshot& snapshot);
+    static SparsePrePublishSurfaceBudgetDecision BuildPrePublishSurfaceBudget(
+        const SparsePrePublishSurfaceBudgetInput& input);
+    static SparseSurfaceWorkRouteDecision BuildSurfaceWorkRoute(
+        const SparseSurfaceWorkRouteInput& input);
     static SparseRuntimeBudgetDecision Evaluate(const SparseRuntimeBudgetInput& input);
     static uint32_t ScaleBudget(uint32_t budget, float scale, uint32_t minIfNonZero = 0u);
     static uint32_t BuildProcessingBudget(

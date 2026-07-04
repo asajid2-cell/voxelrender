@@ -303,6 +303,25 @@ struct SparseMidHeightSurfaceBuildConfig {
     // parallelism on the editing burst. Behavior-identical. OFF => contiguous chunks.
     bool workStealExtract = false;
     bool emitWater = true;
+    // Y-AWARE edit suppression: skip a mesh cell for a brush edit only when the
+    // edit's Y range intersects the cell's surface band. OFF => old XZ-only rule
+    // (any edit suppresses the whole column below it -- reference/A/B only; it
+    // punched permanent ground holes below mid-air strokes).
+    bool editSuppressYAware = true;
+    // LIVE STROKE WINDOW: while a brush stroke is active (edit window open), fall
+    // back to the permissive XZ-only suppression so the raymarch renders the
+    // in-progress stroke live (the mesh stencil-blocks the raymarch; without the
+    // window, painted air blobs are invisible until their exact-surface meshes
+    // publish). When the window closes the caller re-queues the edited height
+    // tiles and the Y-aware rule heals the mesh over air-stroke columns.
+    bool editStrokeLiveWindow = false;
+    // BACKFILL BOUND: suppress mesh cells for edits only within this camera
+    // distance (the near-exact + mid-voxel layers' reach, i.e. where an
+    // edit-aware renderer exists to own the yielded pixels). Beyond it the
+    // procedural mesh stays -- a stale-solid surface at range beats a ghost
+    // hole showing the far fallback (edits there render once bricks stream
+    // in and a later rebuild re-yields). 0 = unlimited (old behavior).
+    float editSuppressMaxDistance = 0.0f;
     bool distanceCull = true;
     bool frustumCull = false;
     float cameraX = 0.0f;
@@ -356,6 +375,14 @@ struct SparseClipmapCacheStats {
     uint32_t voxelInterestBudgetedRebuildsLastFrame = 0;
     float pumpHeightMsLastFrame = 0.0f;
     float pumpVoxelMsLastFrame = 0.0f;
+    float heightPumpQueueMsLastFrame = 0.0f;
+    float heightPumpDispatchMsLastFrame = 0.0f;
+    float heightPumpJoinMsLastFrame = 0.0f;
+    float heightPumpWorkerMaxMsLastFrame = 0.0f;
+    float heightPumpGenerateMsLastFrame = 0.0f;
+    float heightPumpCommitMsLastFrame = 0.0f;
+    uint32_t heightPumpPendingTilesLastFrame = 0;
+    uint32_t heightPumpWorkersLastFrame = 0;
     uint32_t backlogAwarePumpActive = 0;
     float pumpBudgetMs = 0.0f;
     uint32_t pumpBudgetHitLastFrame = 0;
@@ -1301,6 +1328,14 @@ private:
     std::unordered_map<uint64_t, VoxelColumnSample> m_sharedVoxelColumnCache;
     InterestSignature m_lastInterestSignature;
     bool m_lastInterestSignatureValid = false;
+    // Churn hysteresis (Loop 101): a changed signature must repeat for one
+    // extra frame before it forces a full rebuild (quantum-boundary oscillation
+    // under edit-walks fired rebuilds every 2-3 frames otherwise).
+    InterestSignature m_pendingInterestSignature;
+    bool m_pendingInterestSignatureValid = false;
+    float m_lastInterestRebuildCameraX = 0.0f;
+    float m_lastInterestRebuildCameraY = 0.0f;
+    float m_lastInterestRebuildCameraZ = 0.0f;
     InterestSignature m_lastVoxelInterestSignature;
     bool m_lastVoxelInterestSignatureValid = false;
     uint32_t m_lastVoxelInterestBuildFrame = 0;
@@ -1403,6 +1438,14 @@ private:
     uint32_t m_parallelVoxelPumpBricksLastFrame = 0;
     uint32_t m_parallelVoxelPumpWorkersLastFrame = 0;
     float m_parallelVoxelPumpWallMsLastFrame = 0.0f;
+    float m_heightPumpQueueMsLastFrame = 0.0f;
+    float m_heightPumpDispatchMsLastFrame = 0.0f;
+    float m_heightPumpJoinMsLastFrame = 0.0f;
+    float m_heightPumpWorkerMaxMsLastFrame = 0.0f;
+    float m_heightPumpGenerateMsLastFrame = 0.0f;
+    float m_heightPumpCommitMsLastFrame = 0.0f;
+    uint32_t m_heightPumpPendingTilesLastFrame = 0;
+    uint32_t m_heightPumpWorkersLastFrame = 0;
     uint32_t m_asyncNoncriticalGenerationEnqueuedLastFrame = 0;
     uint32_t m_asyncNoncriticalGenerationCompletedLastFrame = 0;
     uint32_t m_asyncNoncriticalGenerationAppliedLastFrame = 0;
@@ -1452,6 +1495,7 @@ private:
     uint32_t m_visiblePriorityTaggedLastFrame = 0;
     uint32_t m_visiblePriorityPrioritizedLastFrame = 0;
     float m_effectivePumpBudgetMsLastFrame = 0.0f;
+    float m_heightPumpLastNonzeroMsPerTile = 0.0f;
     SparseClipmapCacheStats m_stats;
     uint32_t m_dirtySerial = 0;
     uint32_t m_heightDirtySerial = 0;
@@ -1489,6 +1533,13 @@ private:
     bool BrickIntersectsEditOverlays(
         int32_t originX, int32_t originY, int32_t originZ,
         int32_t worldSize, int32_t halo) const;
+    // Per-coord form: resolves the brick's world AABB from its clipmap coord
+    // (same math as GenerateVoxelBrickPayload) and tests overlay overlap. Gates
+    // async voxel generation enqueue/apply so only edit-overlapping bricks stay
+    // on the edit-aware sync path.
+    bool VoxelBrickCoordIntersectsEditOverlays(
+        const SparseVoxelClipmapCoord& coord,
+        const SparseClipmapPolicy& policy) const;
 };
 
 } // namespace VENPOD::Simulation

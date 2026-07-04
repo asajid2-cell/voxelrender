@@ -85,6 +85,7 @@ private:
     bool m_frameLatencyWaitableEnabled = false;
     HANDLE m_frameLatencyWaitable = nullptr;
     HWND m_hwnd = nullptr;
+    bool m_swapChainAllowsTearing = false;
 
     // Stored for resize operations
     Graphics::DX12Device* m_device = nullptr;

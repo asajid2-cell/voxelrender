@@ -440,7 +440,8 @@ public:
     void BeginFrame(
         uint32_t frameIndex,
         uint64_t completedFenceValue = 0,
-        uint64_t currentFrameFenceValue = 0);
+        uint64_t currentFrameFenceValue = 0,
+        uint64_t telemetryFrameIndex = 0);
     bool StageSnapshot(
         const Simulation::SparseSurfaceGpuSnapshot& snapshot,
         SparseSurfaceUploadTicket* outTicket = nullptr);
@@ -569,6 +570,7 @@ private:
         Simulation::BrickCoordHash> m_payloadFaceMirrorByCoord;
     std::vector<uint8_t> m_drawSlotOccupied;
     std::vector<uint32_t> m_freeDrawSlots;
+    uint64_t m_currentTelemetryFrameIndex = 0;
     uint32_t m_activeUploadSlot = 0;
     uint64_t m_uploadWriteOffset = 0;
 };

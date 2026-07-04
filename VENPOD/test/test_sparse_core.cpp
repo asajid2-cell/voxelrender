@@ -2876,6 +2876,12 @@ void TestSparseLocalPhysics() {
     Check(blocked.Initialize({8, 64, 12345u}), "blocked sparse physics world initialize");
     blocked.SetEditedVoxel(-33, 850, 65, sand);
     blocked.SetEditedVoxel(-33, 849, 65, stone);
+    // Loop 92: granular material SLUMPS diagonally, so a fully blocked case must
+    // enclose the side cells too.
+    blocked.SetEditedVoxel(-32, 850, 65, stone);
+    blocked.SetEditedVoxel(-34, 850, 65, stone);
+    blocked.SetEditedVoxel(-33, 850, 66, stone);
+    blocked.SetEditedVoxel(-33, 850, 64, stone);
     Check(blocked.StepLocalPhysics(4, 4, false) == 0,
         "sparse physics does not move into occupied voxel");
     Check(blocked.SampleCollisionStatus(-33, 850, 65) == CollisionSampleStatus::KnownSolid,
@@ -2893,6 +2899,45 @@ void TestSparseLocalPhysics() {
         "support-wake sparse physics drops voxel onto erased support position");
     Check(blocked.GetStats().physicsDirtyRegionVoxelsLastFrame < SPARSE_BRICK_VOXEL_COUNT,
         "support-wake sparse physics stays region-local instead of scanning full bricks");
+
+    // Loop 92: granular slump -- sand on a solid pillar with open diagonals moves
+    // down-and-sideways instead of resting as a floating column.
+    SparseVoxelWorld slump;
+    Check(slump.Initialize({8, 64, 12345u}), "slump sparse physics world initialize");
+    slump.SetEditedVoxel(10, 900, 10, sand);
+    slump.SetEditedVoxel(10, 899, 10, stone);
+    Check(slump.StepLocalPhysics(4, 4, false) == 1,
+        "sparse physics slumps granular voxel off a pillar");
+    Check(slump.SampleCollisionStatus(10, 900, 10) == CollisionSampleStatus::KnownAir,
+        "slumped voxel leaves the pillar top");
+
+    // Loop 92: liquid levelling -- a 2-stack of water flattens (top voxel, which
+    // sits on its own liquid, spreads to a supported neighbor); a LONE surface
+    // water voxel on solid stays put (anti-oscillation rule).
+    const uint32_t waterDyn = VENPOD::Utils::PackVoxel(VENPOD::Utils::Material::Water, 0, 0, 0);
+    SparseVoxelWorld level;
+    Check(level.Initialize({8, 64, 12345u}), "level sparse physics world initialize");
+    level.SetEditedVoxel(20, 901, 20, waterDyn);
+    level.SetEditedVoxel(20, 900, 20, waterDyn);
+    level.SetEditedVoxel(20, 899, 20, stone);
+    level.SetEditedVoxel(21, 899, 20, stone);
+    level.SetEditedVoxel(19, 899, 20, stone);
+    level.SetEditedVoxel(20, 899, 21, stone);
+    level.SetEditedVoxel(20, 899, 19, stone);
+    Check(level.StepLocalPhysics(4, 8, false) >= 1,
+        "sparse physics levels a liquid stack sideways");
+    Check(level.SampleCollisionStatus(20, 901, 20) == CollisionSampleStatus::KnownAir,
+        "levelled liquid stack loses its top voxel");
+    SparseVoxelWorld puddle;
+    Check(puddle.Initialize({8, 64, 12345u}), "puddle sparse physics world initialize");
+    puddle.SetEditedVoxel(30, 900, 30, waterDyn);
+    puddle.SetEditedVoxel(30, 899, 30, stone);
+    puddle.SetEditedVoxel(31, 899, 30, stone);
+    puddle.SetEditedVoxel(29, 899, 30, stone);
+    puddle.SetEditedVoxel(30, 899, 31, stone);
+    puddle.SetEditedVoxel(30, 899, 29, stone);
+    Check(puddle.StepLocalPhysics(4, 4, false) == 0,
+        "a lone surface liquid voxel does not oscillate sideways");
 
     SparseVoxelWorld priority;
     Check(priority.Initialize({8, 64, 12345u}), "priority sparse physics world initialize");
@@ -3096,8 +3141,12 @@ void TestSparseSurfaceExtraction() {
     auto liquidOnlyResult = SparseSurfaceExtractor::Extract(liquidOnly);
     Check(liquidOnlyResult.stats.solidVoxels == 0,
         "surface extractor does not count liquid as solid terrain");
-    Check(liquidOnlyResult.stats.exposedFaces == 2 && liquidOnlyResult.faces.size() == 2,
-        "surface extractor emits exposed liquid top and underwater underside faces");
+    // Loop 90: water emits ALL water-vs-air boundaries (6 natural faces for an
+    // isolated voxel) plus the synthetic underwater underside of the top sheet
+    // (which also counts toward exposedFaces). Top/bottom-only rendered painted/
+    // sloped water as scattered specks.
+    Check(liquidOnlyResult.stats.exposedFaces == 7 && liquidOnlyResult.faces.size() == 7,
+        "surface extractor emits all liquid-vs-air faces plus the underwater underside");
     bool foundWaterTop = false;
     bool foundWaterUnderside = false;
     for (const SparseSurfaceFace& face : liquidOnlyResult.faces) {
@@ -4955,6 +5004,25 @@ void TestSparseVoxelWorldEviction() {
             "reused physical page increments generation after eviction");
     }
 
+    // Loop 90: edited bricks are EVICTABLE outside the keep radius (edits are
+    // durable in the edit store and re-apply on regeneration). The old permanent
+    // pin made every ever-edited brick resident forever, ballooning the raster
+    // load across an editing session.
+    const uint32_t evictedRest = world.TrimResidentBricks(nearCoord, 1, 1, 3);
+    Check(evictedRest >= 1, "trim evicts remaining out-of-radius bricks with budget");
+    Check(!world.GetPool().IsResident(editedCoord),
+        "edited brick evicts outside the keep radius (no permanent pin)");
+    uint32_t rematVoxel = 0;
+    Check(world.GetEdits().TryGetVoxel(
+              editedCoord.x * SPARSE_BRICK_SIZE,
+              editedCoord.y * SPARSE_BRICK_SIZE,
+              editedCoord.z * SPARSE_BRICK_SIZE,
+              &rematVoxel) &&
+          rematVoxel == stone,
+        "edit store still holds the edit after its brick evicts");
+    Check(world.RequestBrick(editedCoord), "evicted edited brick re-requests");
+    Check(world.PumpGeneration(1) == 1, "evicted edited brick regenerates");
+
     SparseVoxelWorld backgroundWorld;
     Check(backgroundWorld.Initialize({6, 64, 12345u}), "background trim world initialize");
     const BrickCoord bgCenter{0, 0, 0};
@@ -6483,6 +6551,441 @@ void TestSparseRuntimeBudgetScheduler() {
     Check(missPlan.dispatch && missPlan.urgent,
         "miss feedback plan immediately retries after feedback overflow");
 
+    SparseRuntimeWorkloadSnapshot workloadSnapshot{};
+    workloadSnapshot.lastRawFrameMs = 14.0f;
+    workloadSnapshot.combinedSchedulerPressureMs = 13.5f;
+    workloadSnapshot.pagePublishQueueEmpty = false;
+    workloadSnapshot.missFeedbackPending = true;
+    workloadSnapshot.uploadRingBudgetDefersLastFrame = 2;
+    workloadSnapshot.stagedBytesLastFrame = 4096;
+    workloadSnapshot.uploadRingBytes = 65536;
+    workloadSnapshot.maxBrickPages = 2048;
+    workloadSnapshot.generationQueuedCollisionBricks = 2;
+    workloadSnapshot.generationQueuedEditedBricks = 3;
+    workloadSnapshot.uploadQueuedCollisionBricks = 5;
+    workloadSnapshot.uploadQueuedEditedBricks = 7;
+    workloadSnapshot.surfaceQueuedCollisionBricks = 11;
+    workloadSnapshot.surfaceQueuedEditedBricks = 13;
+    workloadSnapshot.generationQueuedVisibleBricks = 17;
+    workloadSnapshot.uploadQueuedVisibleBricks = 19;
+    workloadSnapshot.surfaceQueuedVisibleBricks = 23;
+    workloadSnapshot.generationQueuedSpeculativeBricks = 31;
+    workloadSnapshot.uploadQueuedSpeculativeBricks = 37;
+    workloadSnapshot.surfaceQueuedSpeculativeBricks = 41;
+    workloadSnapshot.surfaceExtractionQueuedBricks = 43;
+    workloadSnapshot.physicsHotCandidateBricks = 47;
+    workloadSnapshot.pagePublishReadyQueued = 53;
+    workloadSnapshot.pagePublishWaitingFrame = 59;
+    workloadSnapshot.pagePublishWaitingFence = 61;
+    workloadSnapshot.pagePublishEditedQueued = 67;
+    workloadSnapshot.pagePublishMaxReadyFrameLag = 5;
+    workloadSnapshot.residencyCatchupActive = true;
+    workloadSnapshot.ownershipPressureLevel = 2;
+    workloadSnapshot.readySurfacePublish.enabled = true;
+    workloadSnapshot.readySurfacePublish.pending = 29;
+    workloadSnapshot.readySurfacePublish.oldestAge = 9;
+    SparseRuntimeBudgetInput builtInput =
+        SparseRuntimeBudgetScheduler::BuildRuntimeBudgetInput(workloadSnapshot);
+    Check(builtInput.lastRawFrameMs == 14.0f &&
+          builtInput.combinedSchedulerPressureMs == 13.5f,
+        "runtime workload builder preserves frame pressure inputs");
+    Check(builtInput.hasQueueBacklog,
+        "runtime workload builder detects page, feedback, and ready-surface backlog");
+    Check(builtInput.uploadRingOverflow &&
+          builtInput.stagedBytesLastFrame == 4096 &&
+          builtInput.uploadRingBytes == 65536 &&
+          builtInput.maxBrickPages == 2048,
+        "runtime workload builder carries upload pressure inputs");
+    Check(builtInput.urgentQueuedBricks == 41,
+        "runtime workload builder aggregates collision/edit protected queues");
+    Check(builtInput.visibleQueuedBricks == 88,
+        "runtime workload builder aggregates visible queues plus ready-surface publishes");
+    Check(builtInput.speculativeQueuedBricks == 109,
+        "runtime workload builder aggregates speculative queues");
+    Check(builtInput.surfaceQueuedBricks == 43 &&
+          builtInput.physicsHotCandidateBricks == 47,
+        "runtime workload builder carries surface and physics pressure");
+    Check(builtInput.pagePublishReadyQueued == 82 &&
+          builtInput.pagePublishWaitingFrame == 59 &&
+          builtInput.pagePublishWaitingFence == 61 &&
+          builtInput.pagePublishEditedQueued == 67 &&
+          builtInput.pagePublishMaxReadyFrameLag == 9,
+        "runtime workload builder merges ready-surface pressure into publish pressure");
+    Check(builtInput.visibleMissPressure && builtInput.ownershipPressureLevel == 2,
+        "runtime workload builder turns residency catch-up into visible miss pressure");
+
+    SparseRuntimeWorkloadSnapshot saturatingSnapshot{};
+    saturatingSnapshot.generationQueuedVisibleBricks =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    saturatingSnapshot.uploadQueuedVisibleBricks = 10;
+    saturatingSnapshot.pagePublishReadyQueued =
+        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max());
+    saturatingSnapshot.readySurfacePublish.enabled = true;
+    saturatingSnapshot.readySurfacePublish.pending = 10;
+    builtInput =
+        SparseRuntimeBudgetScheduler::BuildRuntimeBudgetInput(saturatingSnapshot);
+    Check(builtInput.visibleQueuedBricks == std::numeric_limits<uint32_t>::max() &&
+          builtInput.pagePublishReadyQueued == std::numeric_limits<uint32_t>::max(),
+        "runtime workload builder saturates queued-count aggregation");
+
+    SparseRuntimeWorkloadSnapshot quietSnapshot{};
+    builtInput =
+        SparseRuntimeBudgetScheduler::BuildRuntimeBudgetInput(quietSnapshot);
+    Check(!builtInput.hasQueueBacklog &&
+          !builtInput.uploadRingOverflow &&
+          !builtInput.visibleMissPressure,
+        "runtime workload builder keeps quiet frames pressure-free");
+
+    SparseRuntimeWorkloadSnapshot disabledReadySurfaceSnapshot{};
+    disabledReadySurfaceSnapshot.readySurfacePublish.enabled = false;
+    disabledReadySurfaceSnapshot.readySurfacePublish.pending = 12;
+    disabledReadySurfaceSnapshot.readySurfacePublish.oldestAge = 14;
+    builtInput =
+        SparseRuntimeBudgetScheduler::BuildRuntimeBudgetInput(
+            disabledReadySurfaceSnapshot);
+    Check(!builtInput.hasQueueBacklog &&
+          builtInput.visibleQueuedBricks == 0 &&
+          builtInput.pagePublishReadyQueued == 0 &&
+          builtInput.pagePublishMaxReadyFrameLag == 0,
+        "runtime workload builder ignores ready-surface pressure while its gate is disabled");
+
+    auto checkRuntimeBacklogTrigger = [](SparseRuntimeWorkloadSnapshot snapshot,
+                                         const char* message) {
+        const SparseRuntimeBudgetInput triggeredInput =
+            SparseRuntimeBudgetScheduler::BuildRuntimeBudgetInput(snapshot);
+        Check(triggeredInput.hasQueueBacklog, message);
+    };
+    SparseRuntimeWorkloadSnapshot backlogTrigger{};
+    backlogTrigger.generationQueuedBricks = 1;
+    checkRuntimeBacklogTrigger(
+        backlogTrigger,
+        "runtime workload builder treats generation queue as backlog");
+    backlogTrigger = {};
+    backlogTrigger.uploadQueuedBricks = 1;
+    checkRuntimeBacklogTrigger(
+        backlogTrigger,
+        "runtime workload builder treats upload queue as backlog");
+    backlogTrigger = {};
+    backlogTrigger.pagePublishQueueEmpty = false;
+    checkRuntimeBacklogTrigger(
+        backlogTrigger,
+        "runtime workload builder treats page publish queue as backlog");
+    backlogTrigger = {};
+    backlogTrigger.missFeedbackPending = true;
+    checkRuntimeBacklogTrigger(
+        backlogTrigger,
+        "runtime workload builder treats miss feedback queue as backlog");
+    backlogTrigger = {};
+    backlogTrigger.clipmapQueuedHeightTiles = 1;
+    checkRuntimeBacklogTrigger(
+        backlogTrigger,
+        "runtime workload builder treats height clipmap queue as backlog");
+    backlogTrigger = {};
+    backlogTrigger.clipmapQueuedVoxelBricks = 1;
+    checkRuntimeBacklogTrigger(
+        backlogTrigger,
+        "runtime workload builder treats voxel clipmap queue as backlog");
+
+    SparsePrePublishSurfaceBudgetInput prePublishSurfaceInput{};
+    prePublishSurfaceInput.pageTableSurfaceReadyGateEnabled = true;
+    prePublishSurfaceInput.pagePublishesEligible = 10;
+    prePublishSurfaceInput.pagePublishQueueEmpty = false;
+    prePublishSurfaceInput.baseExtractBudget = 24;
+    prePublishSurfaceInput.terrainCriticalExtractBudget = 48;
+    prePublishSurfaceInput.startupExtractBudget = 96;
+    prePublishSurfaceInput.postOpenExtractBudget = 64;
+    prePublishSurfaceInput.baseHiddenCriticalBudget = 8;
+    prePublishSurfaceInput.startupHiddenCriticalBudget = 80;
+    prePublishSurfaceInput.postOpenHiddenCriticalBudget = 32;
+    prePublishSurfaceInput.hiddenTrackedBudget = 7;
+    prePublishSurfaceInput.generalBudget = 44;
+    prePublishSurfaceInput.editGeneralBudget = 6;
+    prePublishSurfaceInput.baseMaxMs = 2.5f;
+    prePublishSurfaceInput.startupMaxMs = 12.0f;
+    prePublishSurfaceInput.postOpenMaxMs = 5.0f;
+    prePublishSurfaceInput.frameIndex = 105;
+    prePublishSurfaceInput.lastEditFrame = 100;
+    prePublishSurfaceInput.editIdleFrames = 10;
+    SparsePrePublishSurfaceBudgetDecision prePublishSurfaceDecision =
+        SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(prePublishSurfaceInput);
+    Check(prePublishSurfaceDecision.enabled &&
+          prePublishSurfaceDecision.totalBudget == 24 &&
+          prePublishSurfaceDecision.hiddenCriticalBudget == 8 &&
+          prePublishSurfaceDecision.hiddenTrackedBudget == 7 &&
+          !prePublishSurfaceDecision.splitGeneralByOwnership &&
+          prePublishSurfaceDecision.generalCriticalBudget == 6 &&
+          prePublishSurfaceDecision.generalNonCriticalBudget == 6,
+        "pre-publish surface scheduler preserves base ready-gate budgets");
+    Check(prePublishSurfaceDecision.editActive &&
+          prePublishSurfaceDecision.generalBudget == 6,
+        "pre-publish surface scheduler applies edit-window general-surface cap");
+    Check(prePublishSurfaceDecision.maxMs == 2.5f,
+        "pre-publish surface scheduler uses base time limit outside catchup windows");
+
+    prePublishSurfaceInput.terrainCriticalPublishOvertime = true;
+    prePublishSurfaceDecision =
+        SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(prePublishSurfaceInput);
+    Check(prePublishSurfaceDecision.totalBudget == 48,
+        "pre-publish surface scheduler boosts total budget for terrain-critical publish overtime");
+
+    prePublishSurfaceInput.hiddenExactStartupPublishOvertime = true;
+    prePublishSurfaceInput.startupSurfaceCatchup = true;
+    prePublishSurfaceDecision =
+        SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(prePublishSurfaceInput);
+    Check(prePublishSurfaceDecision.totalBudget == 96 &&
+          prePublishSurfaceDecision.hiddenCriticalBudget == 80 &&
+          prePublishSurfaceDecision.maxMs == 12.0f,
+        "pre-publish surface scheduler uses startup hidden-exact catchup policy");
+
+    prePublishSurfaceInput.hiddenExactStartupPublishOvertime = false;
+    prePublishSurfaceInput.startupSurfaceCatchup = false;
+    prePublishSurfaceInput.hiddenExactRuntimePublishPriority = true;
+    prePublishSurfaceInput.postOpenSurfaceCatchup = true;
+    prePublishSurfaceDecision =
+        SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(prePublishSurfaceInput);
+    Check(prePublishSurfaceDecision.totalBudget == 64 &&
+          prePublishSurfaceDecision.hiddenCriticalBudget == 32 &&
+          prePublishSurfaceDecision.maxMs == 5.0f,
+        "pre-publish surface scheduler uses post-open hidden-exact catchup policy");
+
+    prePublishSurfaceInput.frameIndex = 120;
+    prePublishSurfaceDecision =
+        SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(prePublishSurfaceInput);
+    Check(!prePublishSurfaceDecision.editActive &&
+          prePublishSurfaceDecision.generalBudget == 44,
+        "pre-publish surface scheduler restores general budget after edit idle window");
+
+    prePublishSurfaceInput.sameFrameClipmapPrepMs = 5.0f;
+    prePublishSurfaceInput.stackedWorkClipmapPrepThresholdMs = 3.0f;
+    prePublishSurfaceInput.stackedWorkGeneralBudget = 8;
+    prePublishSurfaceDecision =
+        SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(prePublishSurfaceInput);
+    Check(!prePublishSurfaceDecision.editActive &&
+          prePublishSurfaceDecision.stackedWorkGeneralCapActive &&
+          prePublishSurfaceDecision.generalBudget == 8 &&
+          prePublishSurfaceDecision.hiddenCriticalBudget == 32 &&
+          prePublishSurfaceDecision.skipGeneralSurfaceStage,
+        "pre-publish surface scheduler caps broad general work when clipmap prep already spent the frame budget");
+
+    prePublishSurfaceInput.sameFrameClipmapPrepMs = 2.5f;
+    prePublishSurfaceDecision =
+        SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(prePublishSurfaceInput);
+    Check(!prePublishSurfaceDecision.stackedWorkGeneralCapActive &&
+          prePublishSurfaceDecision.generalBudget == 44,
+        "pre-publish surface scheduler leaves general work uncapped below the stacked-work threshold");
+
+    prePublishSurfaceInput.sameFrameClipmapPrepMs = 0.0f;
+    prePublishSurfaceInput.stackedWorkClipmapPrepThresholdMs = 0.0f;
+    prePublishSurfaceInput.stackedWorkGeneralBudget = std::numeric_limits<uint32_t>::max();
+    prePublishSurfaceInput.frameIndex = 135;
+    prePublishSurfaceInput.postEditGeneralSpillFrames = 60;
+    prePublishSurfaceInput.postEditGeneralBudget = 8;
+    prePublishSurfaceInput.postEditGeneralSpillPressureMs = 16.0f;
+    prePublishSurfaceInput.lastRawFrameMs = 12.0f;
+    prePublishSurfaceInput.combinedSchedulerPressureMs = 13.0f;
+    prePublishSurfaceDecision =
+        SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(prePublishSurfaceInput);
+    Check(!prePublishSurfaceDecision.editActive &&
+          !prePublishSurfaceDecision.postEditGeneralSpillActive &&
+          prePublishSurfaceDecision.generalBudget == 44,
+        "pre-publish surface scheduler lets post-edit general work catch up under frame headroom");
+
+    prePublishSurfaceInput.pagePublishesEligible = 96;
+    prePublishSurfaceDecision =
+        SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(prePublishSurfaceInput);
+    Check(!prePublishSurfaceDecision.editActive &&
+          prePublishSurfaceDecision.postEditGeneralSpillActive &&
+          prePublishSurfaceDecision.splitGeneralByOwnership &&
+          prePublishSurfaceDecision.generalBudget == 44 &&
+          prePublishSurfaceDecision.generalCriticalBudget == 44 &&
+          prePublishSurfaceDecision.generalNonCriticalBudget == 8 &&
+          prePublishSurfaceDecision.skipGeneralSurfaceStage,
+        "pre-publish surface scheduler preserves critical general surface work while capping non-critical post-edit overflow");
+
+    prePublishSurfaceInput.pagePublishesEligible = 10;
+    prePublishSurfaceInput.combinedSchedulerPressureMs = 18.0f;
+    prePublishSurfaceDecision =
+        SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(prePublishSurfaceInput);
+    Check(!prePublishSurfaceDecision.editActive &&
+          prePublishSurfaceDecision.postEditGeneralSpillActive &&
+          prePublishSurfaceDecision.splitGeneralByOwnership &&
+          prePublishSurfaceDecision.generalBudget == 44 &&
+          prePublishSurfaceDecision.generalCriticalBudget == 44 &&
+          prePublishSurfaceDecision.generalNonCriticalBudget == 8 &&
+          prePublishSurfaceDecision.hiddenCriticalBudget == 32,
+        "pre-publish surface scheduler caps only non-critical post-edit general work under frame pressure without changing hidden-critical budget");
+
+    prePublishSurfaceInput.postEditGeneralBudget = 0;
+    prePublishSurfaceDecision =
+        SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(prePublishSurfaceInput);
+    Check(prePublishSurfaceDecision.postEditGeneralSpillActive &&
+          prePublishSurfaceDecision.splitGeneralByOwnership &&
+          prePublishSurfaceDecision.generalBudget == 44 &&
+          prePublishSurfaceDecision.generalCriticalBudget == 44 &&
+          prePublishSurfaceDecision.generalNonCriticalBudget == 0 &&
+          prePublishSurfaceDecision.skipGeneralSurfaceStage,
+        "pre-publish surface scheduler carries post-edit zero-noncritical spill into the surface-stage skip without starving critical work");
+
+    prePublishSurfaceInput.frameIndex = 170;
+    prePublishSurfaceInput.postEditGeneralBudget = 8;
+    prePublishSurfaceInput.combinedSchedulerPressureMs = 22.0f;
+    prePublishSurfaceDecision =
+        SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(prePublishSurfaceInput);
+    Check(!prePublishSurfaceDecision.postEditGeneralSpillActive &&
+          !prePublishSurfaceDecision.splitGeneralByOwnership &&
+          prePublishSurfaceDecision.generalBudget == 44,
+        "pre-publish surface scheduler restores general budget after post-edit spill window");
+
+    prePublishSurfaceInput.frameIndex = 105;
+    prePublishSurfaceInput.editGeneralBudget = 0;
+    prePublishSurfaceInput.hiddenExactRuntimePublishPriority = false;
+    prePublishSurfaceInput.postOpenSurfaceCatchup = false;
+    prePublishSurfaceDecision =
+        SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(prePublishSurfaceInput);
+    Check(prePublishSurfaceDecision.enabled &&
+          prePublishSurfaceDecision.editActive &&
+          !prePublishSurfaceDecision.splitGeneralByOwnership &&
+          prePublishSurfaceDecision.generalBudget == 0 &&
+          prePublishSurfaceDecision.skipGeneralSurfaceStage,
+        "pre-publish surface scheduler carries explicit zero-general budget into surface-stage spill");
+
+    prePublishSurfaceInput.pageTableSurfaceReadyGateEnabled = false;
+    prePublishSurfaceDecision =
+        SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(prePublishSurfaceInput);
+    Check(!prePublishSurfaceDecision.enabled &&
+          !prePublishSurfaceDecision.skipGeneralSurfaceStage,
+        "pre-publish surface scheduler disables work when ready-gate is off");
+    prePublishSurfaceInput.pageTableSurfaceReadyGateEnabled = true;
+    prePublishSurfaceInput.pagePublishesEligible = 0;
+    prePublishSurfaceDecision =
+        SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(prePublishSurfaceInput);
+    Check(!prePublishSurfaceDecision.enabled,
+        "pre-publish surface scheduler disables work without eligible publishes");
+    prePublishSurfaceInput.pagePublishesEligible = 10;
+    prePublishSurfaceInput.pagePublishQueueEmpty = true;
+    prePublishSurfaceDecision =
+        SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(prePublishSurfaceInput);
+    Check(!prePublishSurfaceDecision.enabled,
+        "pre-publish surface scheduler disables work while publish queue is empty");
+
+    SparseSurfaceWorkRouteInput surfaceRouteInput{};
+    surfaceRouteInput.routingEnabled = true;
+    surfaceRouteInput.asyncExtractionEnabled = true;
+    surfaceRouteInput.previousRouteGeneralToAsync = true;
+    surfaceRouteInput.asyncQueueDepth = 40;
+    surfaceRouteInput.asyncResultDepth = 24;
+    surfaceRouteInput.asyncBacklogLimit = 512;
+    surfaceRouteInput.surfaceReadyPublishPending = 60;
+    surfaceRouteInput.surfaceReadyPublishOldestAge = 3;
+    surfaceRouteInput.surfaceReadyPublishPendingLimit = 192;
+    surfaceRouteInput.surfaceReadyPublishOldestAgeLimit = 8;
+    SparseSurfaceWorkRouteDecision surfaceRouteDecision =
+        SparseRuntimeBudgetScheduler::BuildSurfaceWorkRoute(surfaceRouteInput);
+    Check(surfaceRouteDecision.routeGeneralToAsync &&
+          !surfaceRouteDecision.asyncBacklogSaturated &&
+          !surfaceRouteDecision.publishBacklogSaturated,
+        "surface work router prefers async for general catch-up under low backlog");
+
+    surfaceRouteInput.editActive = true;
+    surfaceRouteDecision = SparseRuntimeBudgetScheduler::BuildSurfaceWorkRoute(surfaceRouteInput);
+    Check(!surfaceRouteDecision.routeGeneralToAsync &&
+          !surfaceRouteDecision.asyncBacklogSaturated &&
+          !surfaceRouteDecision.publishBacklogSaturated,
+        "surface work router keeps edit-window surface work synchronous");
+    surfaceRouteInput.asyncPerCoordEditGate = true;
+    surfaceRouteDecision = SparseRuntimeBudgetScheduler::BuildSurfaceWorkRoute(surfaceRouteInput);
+    Check(surfaceRouteDecision.routeGeneralToAsync,
+        "surface work router allows edit-window async routing when the per-coord edit gate is on");
+    // Publish saturation during a stroke is CAUSED by extraction starvation --
+    // async routing is the cure, so it must not be blocked by it (the Loop 88
+    // circular deadlock: starved surfaces -> deep publish queue -> router off).
+    surfaceRouteInput.pagePublishBacklog = 400;
+    surfaceRouteInput.pagePublishBacklogLimit = 256;
+    surfaceRouteDecision = SparseRuntimeBudgetScheduler::BuildSurfaceWorkRoute(surfaceRouteInput);
+    Check(surfaceRouteDecision.routeGeneralToAsync &&
+          surfaceRouteDecision.publishBacklogSaturated,
+        "surface work router keeps edit-window async routing under publish saturation (per-coord gate on)");
+    surfaceRouteInput.pagePublishBacklog = 0;
+    surfaceRouteInput.pagePublishBacklogLimit = 0;
+    surfaceRouteInput.asyncPerCoordEditGate = false;
+    surfaceRouteInput.editActive = false;
+
+    surfaceRouteInput.asyncQueueDepth = 400;
+    surfaceRouteInput.asyncResultDepth = 200;
+    surfaceRouteDecision = SparseRuntimeBudgetScheduler::BuildSurfaceWorkRoute(surfaceRouteInput);
+    Check(!surfaceRouteDecision.routeGeneralToAsync &&
+          surfaceRouteDecision.asyncBacklogSaturated,
+        "surface work router falls back to bounded fork-join when async backlog saturates");
+    surfaceRouteInput.asyncQueueDepth = 40;
+    surfaceRouteInput.asyncResultDepth = 24;
+
+    surfaceRouteInput.surfaceReadyPublishPending = 300;
+    surfaceRouteDecision = SparseRuntimeBudgetScheduler::BuildSurfaceWorkRoute(surfaceRouteInput);
+    Check(!surfaceRouteDecision.routeGeneralToAsync &&
+          surfaceRouteDecision.publishBacklogSaturated,
+        "surface work router falls back when surface-ready publish backlog saturates");
+    surfaceRouteInput.surfaceReadyPublishPending = 60;
+
+    surfaceRouteInput.surfaceReadyPublishOldestAge = 20;
+    surfaceRouteDecision = SparseRuntimeBudgetScheduler::BuildSurfaceWorkRoute(surfaceRouteInput);
+    Check(!surfaceRouteDecision.routeGeneralToAsync &&
+          surfaceRouteDecision.publishBacklogSaturated,
+        "surface work router falls back when deferred publishes age past the limit");
+    surfaceRouteInput.surfaceReadyPublishOldestAge = 3;
+
+    surfaceRouteInput.pagePublishBacklog = 300;
+    surfaceRouteInput.pagePublishBacklogLimit = 256;
+    surfaceRouteDecision = SparseRuntimeBudgetScheduler::BuildSurfaceWorkRoute(surfaceRouteInput);
+    Check(!surfaceRouteDecision.routeGeneralToAsync &&
+          surfaceRouteDecision.publishBacklogSaturated,
+        "surface work router falls back when the page publish queue backs up");
+    surfaceRouteInput.pagePublishBacklog = 60;
+    surfaceRouteDecision = SparseRuntimeBudgetScheduler::BuildSurfaceWorkRoute(surfaceRouteInput);
+    Check(surfaceRouteDecision.routeGeneralToAsync,
+        "surface work router allows async routing while the page publish queue is shallow");
+
+    surfaceRouteInput.previousRouteGeneralToAsync = false;
+    surfaceRouteInput.asyncQueueDepth = 300;
+    surfaceRouteInput.asyncResultDepth = 0;
+    surfaceRouteDecision = SparseRuntimeBudgetScheduler::BuildSurfaceWorkRoute(surfaceRouteInput);
+    Check(!surfaceRouteDecision.routeGeneralToAsync &&
+          surfaceRouteDecision.asyncBacklogSaturated,
+        "surface work router requires half-limit headroom before resuming async routing");
+
+    surfaceRouteInput.asyncQueueDepth = 200;
+    surfaceRouteInput.asyncResultDepth = 40;
+    surfaceRouteDecision = SparseRuntimeBudgetScheduler::BuildSurfaceWorkRoute(surfaceRouteInput);
+    Check(surfaceRouteDecision.routeGeneralToAsync,
+        "surface work router resumes async routing once backlog clears half the limit");
+    surfaceRouteInput.previousRouteGeneralToAsync = true;
+    surfaceRouteInput.asyncQueueDepth = 40;
+    surfaceRouteInput.asyncResultDepth = 24;
+
+    surfaceRouteInput.routingEnabled = false;
+    surfaceRouteDecision = SparseRuntimeBudgetScheduler::BuildSurfaceWorkRoute(surfaceRouteInput);
+    Check(!surfaceRouteDecision.routeGeneralToAsync,
+        "surface work router stays inactive when the routing knob is off");
+    surfaceRouteInput.routingEnabled = true;
+
+    surfaceRouteInput.asyncExtractionEnabled = false;
+    surfaceRouteDecision = SparseRuntimeBudgetScheduler::BuildSurfaceWorkRoute(surfaceRouteInput);
+    Check(!surfaceRouteDecision.routeGeneralToAsync,
+        "surface work router requires the async extraction pool");
+    surfaceRouteInput.asyncExtractionEnabled = true;
+
+    surfaceRouteInput.asyncBacklogLimit = 0;
+    surfaceRouteInput.surfaceReadyPublishPendingLimit = 0;
+    surfaceRouteInput.surfaceReadyPublishOldestAgeLimit = 0;
+    surfaceRouteInput.asyncQueueDepth = 4000;
+    surfaceRouteInput.asyncResultDepth = 4000;
+    surfaceRouteInput.surfaceReadyPublishPending = 5000;
+    surfaceRouteInput.surfaceReadyPublishOldestAge = 500;
+    surfaceRouteDecision = SparseRuntimeBudgetScheduler::BuildSurfaceWorkRoute(surfaceRouteInput);
+    Check(surfaceRouteDecision.routeGeneralToAsync &&
+          !surfaceRouteDecision.asyncBacklogSaturated &&
+          !surfaceRouteDecision.publishBacklogSaturated,
+        "surface work router treats zero limits as unlimited");
+
     SparseRuntimeBudgetInput input{};
     input.lastRawFrameMs = 16.0f;
     input.combinedSchedulerPressureMs = 13.0f;
@@ -7194,6 +7697,159 @@ void TestSparseClipmapPolicy() {
         "clipmap residency metadata preserves resident counts");
 }
 
+void TestSparseClipmapHeightPumpHardBudget() {
+    SparseClipmapConfig hardBudgetConfig;
+    hardBudgetConfig.enabled = true;
+    hardBudgetConfig.startDistance = 64.0f;
+    hardBudgetConfig.endDistance = 512.0f;
+    hardBudgetConfig.minCellSize = 16.0f;
+    hardBudgetConfig.nearExitPadding = 8.0f;
+    hardBudgetConfig.ringCount = 2;
+    hardBudgetConfig.maxTiles = 96;
+    hardBudgetConfig.tileRadius = 2;
+    hardBudgetConfig.tileSampleSide = 129;
+    hardBudgetConfig.voxelPumpHardBudgetMs = 0.0001f;
+    SparseClipmapPolicy hardBudgetPolicy(hardBudgetConfig);
+    SparseClipmapTileCache hardBudgetCache;
+    Check(hardBudgetCache.Initialize(hardBudgetPolicy.Config()),
+        "clipmap height hard-budget cache initializes");
+    hardBudgetCache.UpdateInterest(0.0f, 128.0f, 0.0f, 10u, hardBudgetPolicy);
+    Check(hardBudgetCache.PumpGeneration(1u, 0u, 10u, hardBudgetPolicy) == 1u,
+        "clipmap height hard budget seeds a per-tile cost estimate");
+    Check(hardBudgetCache.GetStats().generatedTilesLastFrame == 1u &&
+          hardBudgetCache.GetStats().pumpHeightMsLastFrame > 0.0f,
+        "clipmap height hard budget records a nonzero per-tile cost sample");
+    Check(hardBudgetCache.GetStats().heightPumpPendingTilesLastFrame == 1u &&
+          hardBudgetCache.GetStats().heightPumpWorkersLastFrame >= 1u &&
+          hardBudgetCache.GetStats().heightPumpGenerateMsLastFrame > 0.0f,
+        "clipmap height pump records split timing for generated height work");
+    Check(hardBudgetCache.PumpGeneration(0u, 0u, 11u, hardBudgetPolicy) == 0u,
+        "clipmap height hard budget survives a no-height pump frame");
+    Check(hardBudgetCache.GetStats().heightPumpPendingTilesLastFrame == 0u &&
+          hardBudgetCache.GetStats().heightPumpGenerateMsLastFrame == 0.0f,
+        "clipmap height pump clears split timing on no-height pump frames");
+    hardBudgetCache.UpdateInterest(4096.0f, 128.0f, 4096.0f, 12u, hardBudgetPolicy);
+    Check(hardBudgetCache.PumpGeneration(16u, 0u, 12u, hardBudgetPolicy) == 1u,
+        "clipmap height hard budget caps a burst after an idle height frame");
+    Check(hardBudgetCache.GetStats().queuedTiles > 0u &&
+          hardBudgetCache.GetStats().pumpBudgetHitLastFrame == 1u,
+        "clipmap height hard budget leaves deferred burst tiles queued");
+}
+
+void TestSparseMidMeshEditSuppression() {
+    // The mid-height mesh masks itself out over brush-edit footprints so the voxel
+    // raymarch renders the live edit. That suppression must be Y-AWARE: an edit
+    // floating in the air must NOT delete the terrain mesh in the column below it
+    // (the old XZ-only rule punched permanent ground holes under mid-air strokes,
+    // which rendered as corrupted terrain wherever the voxel layers could not
+    // backfill). A carve at the surface must still suppress its cells.
+    SparseClipmapConfig config;
+    config.enabled = true;
+    config.startDistance = 64.0f;
+    config.endDistance = 512.0f;
+    config.minCellSize = 16.0f;
+    config.nearExitPadding = 8.0f;
+    config.ringCount = 2;
+    config.tileRadius = 1;
+    config.tileSampleSide = 9;
+    config.maxTiles = 64;
+    config.seed = 12345u;
+
+    auto buildFaceCount = [&](
+        const SparseEditStore* edits,
+        bool yAware,
+        size_t* outFaces,
+        bool strokeLiveWindow = false,
+        float suppressMaxDistance = 0.0f) -> bool {
+        SparseClipmapPolicy policy(config);
+        SparseClipmapTileCache cache;
+        if (!cache.Initialize(policy.Config())) {
+            return false;
+        }
+        if (edits) {
+            cache.SetEditStore(edits);
+        }
+        cache.UpdateInterest(0.0f, 128.0f, 0.0f, 1u, policy);
+        for (uint32_t pump = 0;
+             pump < 32u && cache.GetStats().missingInterestedTiles != 0u;
+             ++pump) {
+            cache.PumpGeneration(16u, 0u, 1u + pump, policy);
+        }
+        if (cache.GetStats().residentTiles == 0u) {
+            return false;
+        }
+        SparseSurfaceGpuSnapshot snapshot;
+        SparseMidHeightSurfaceBuildConfig buildConfig;
+        buildConfig.maxFaces = 1000000u;
+        buildConfig.maxTiles = 256u;
+        buildConfig.editSuppressYAware = yAware;
+        buildConfig.editStrokeLiveWindow = strokeLiveWindow;
+        buildConfig.editSuppressMaxDistance = suppressMaxDistance;
+        buildConfig.cameraX = 0.0f;
+        buildConfig.cameraZ = 0.0f;
+        if (!cache.BuildMidHeightSurfaceSnapshot(snapshot, buildConfig)) {
+            return false;
+        }
+        *outFaces = snapshot.faces.size();
+        return true;
+    };
+
+    SparseTerrainGenerator suppressionTerrain(config.seed);
+    const int32_t editX = 40;
+    const int32_t editZ = 40;
+    const int32_t surfaceY = static_cast<int32_t>(
+        suppressionTerrain.HeightAt(editX, editZ));
+    const uint32_t suppressionStone = VENPOD::Utils::PackVoxel(
+        VENPOD::Utils::Material::Stone, 1, 0, VENPOD::Utils::StateFlags::IsStatic);
+    const uint32_t suppressionAir =
+        VENPOD::Utils::PackVoxel(VENPOD::Utils::Material::Air, 0, 0, 0);
+
+    // Floating blob well above the surface band (band = terraceStep + cellSize).
+    SparseEditStore airEdits;
+    for (int32_t i = 0; i < 3; ++i) {
+        airEdits.SetVoxel(editX + i, surfaceY + 160, editZ, suppressionStone);
+    }
+    // Carve at the surface itself.
+    SparseEditStore carveEdits;
+    for (int32_t i = 0; i < 3; ++i) {
+        carveEdits.SetVoxel(editX + i, surfaceY, editZ, suppressionAir);
+    }
+
+    size_t baseFaces = 0, airAwareFaces = 0, airLegacyFaces = 0, carveAwareFaces = 0;
+    Check(buildFaceCount(nullptr, true, &baseFaces) && baseFaces > 0u,
+        "mid-mesh edit suppression baseline build produces faces");
+    Check(buildFaceCount(&airEdits, true, &airAwareFaces),
+        "mid-mesh edit suppression air-edit y-aware build succeeds");
+    Check(buildFaceCount(&airEdits, false, &airLegacyFaces),
+        "mid-mesh edit suppression air-edit legacy build succeeds");
+    Check(buildFaceCount(&carveEdits, true, &carveAwareFaces),
+        "mid-mesh edit suppression surface-carve build succeeds");
+
+    Check(airAwareFaces == baseFaces,
+        "mid-mesh edit suppression is Y-aware: a floating air edit leaves the ground mesh intact");
+    Check(airLegacyFaces != baseFaces,
+        "mid-mesh legacy XZ-only rule suppresses ground under a floating edit (regression witness)");
+    Check(carveAwareFaces != baseFaces,
+        "mid-mesh edit suppression still yields surface carves to the voxel raymarch");
+
+    // Live stroke window: while a stroke is active the permissive rule applies so
+    // the raymarch renders the in-progress edit (the mesh would otherwise stencil-
+    // block the live stroke); the Y-aware rule heals the mesh after the window.
+    size_t airLiveFaces = 0;
+    Check(buildFaceCount(&airEdits, true, &airLiveFaces, true),
+        "mid-mesh edit suppression live-window build succeeds");
+    Check(airLiveFaces != baseFaces && airLiveFaces == airLegacyFaces,
+        "mid-mesh live stroke window suppresses air-edit columns for live raymarch rendering");
+
+    // Backfill bound: with a tiny suppress distance, even a surface carve keeps
+    // the mesh (no edit-aware backfill exists at range -- a ghost hole would show).
+    size_t carveBoundedFaces = 0;
+    Check(buildFaceCount(&carveEdits, true, &carveBoundedFaces, false, 4.0f),
+        "mid-mesh edit suppression backfill-bounded build succeeds");
+    Check(carveBoundedFaces == baseFaces,
+        "mid-mesh edit suppression keeps the mesh beyond the backfill reach");
+}
+
 void TestSparseClipmapTileCache() {
     SparseClipmapConfig config;
     config.enabled = true;
@@ -7596,6 +8252,74 @@ void TestSparseClipmapTileCache() {
                 return lhs.z < rhs.z;
             });
     };
+
+    SparseClipmapConfig budgetedVoxelConfig = config;
+    budgetedVoxelConfig.ringCount = 3;
+    budgetedVoxelConfig.maxVoxelBricks = 512;
+    budgetedVoxelConfig.voxelBrickRadiusXz = 2;
+    budgetedVoxelConfig.voxelBrickRadiusY = 1;
+    budgetedVoxelConfig.interestUpdateIntervalFrames = 1;
+    budgetedVoxelConfig.footprintInterestSignature = true;
+    budgetedVoxelConfig.voxelInterestSignatureReuse = true;
+    budgetedVoxelConfig.voxelInterestRebuildRingsPerFrame = 1;
+    budgetedVoxelConfig.backlogAwarePump = false;
+    SparseClipmapPolicy budgetedVoxelPolicy(budgetedVoxelConfig);
+    SparseClipmapTileCache budgetedVoxelCache;
+    Check(budgetedVoxelCache.Initialize(budgetedVoxelPolicy.Config()),
+        "budgeted voxel interest cache initializes");
+    budgetedVoxelCache.UpdateInterest(
+        0.0f,
+        128.0f,
+        0.0f,
+        10u,
+        budgetedVoxelPolicy,
+        0.0f,
+        0.0f,
+        1.0f,
+        128.0f,
+        0.0f,
+        0.0f,
+        0.5f);
+    std::vector<SparseVoxelClipmapCoord> budgetedInitialMissing;
+    budgetedVoxelCache.CollectMissingVoxelInterest(budgetedInitialMissing);
+    budgetedVoxelCache.UpdateInterest(
+        512.0f,
+        128.0f,
+        0.0f,
+        11u,
+        budgetedVoxelPolicy,
+        0.0f,
+        0.0f,
+        1.0f,
+        128.0f,
+        0.0f,
+        0.0f,
+        0.5f);
+    Check(budgetedVoxelCache.GetStats().voxelInterestBudgetedRebuildsLastFrame == 1u &&
+          budgetedVoxelCache.GetStats().voxelInterestRingsRebuiltLastFrame == 1u,
+        "budgeted voxel interest refreshes exactly one ring after a footprint change");
+    std::vector<SparseVoxelClipmapCoord> budgetedAfterMoveMissing;
+    budgetedVoxelCache.CollectMissingVoxelInterest(budgetedAfterMoveMissing);
+    const std::unordered_set<SparseVoxelClipmapCoord, SparseVoxelClipmapCoordHash>
+        budgetedAfterMoveSet(
+            budgetedAfterMoveMissing.begin(),
+            budgetedAfterMoveMissing.end());
+    uint32_t carriedRingCoords = 0;
+    uint32_t retainedCarriedRingCoords = 0;
+    for (const SparseVoxelClipmapCoord& coord : budgetedInitialMissing) {
+        if (coord.ring <= 0) {
+            continue;
+        }
+        ++carriedRingCoords;
+        if (budgetedAfterMoveSet.find(coord) != budgetedAfterMoveSet.end()) {
+            ++retainedCarriedRingCoords;
+        }
+    }
+    Check(carriedRingCoords > 0u,
+        "budgeted voxel interest test observes carried-ring coords");
+    Check(retainedCarriedRingCoords == carriedRingCoords,
+        "budgeted voxel interest preserves carried-ring coverage during incremental rebuild");
+
     std::vector<SparseVoxelClipmapCoord> debugMissingBeforeCollection;
     lookAheadCache.CollectMissingVoxelInterest(debugMissingBeforeCollection);
     sortVoxelCoords(debugMissingBeforeCollection);
@@ -8383,46 +9107,64 @@ void TestSparseClipmapViewCorridorCoversFrame300Skyline() {
 
 } // namespace
 
-int main() {
-    TestBackendParsing();
-    TestVoxelWorldRaycastReadbackLifecycle();
-    TestFarVoxelOctreeResidencyMetadata();
-    TestSparseSurfaceIaStreamSizing();
-    TestSparseSurfaceGpuConfigValidation();
-    TestSparseSurfaceGpuCopyRangeValidation();
-    TestSparseSurfaceGpuAbiLayout();
-    TestSparseVoxelGpuConfigValidation();
-    TestSparseVoxelGpuCopyRangeValidation();
-    TestCoordinateConversion();
-    TestGpuPageEntryLayout();
-    TestPageTable();
-    TestBrickPool();
-    TestTerrainGeneration();
-    TestSparseSurfaceExtraction();
-    TestSparseSurfaceCache();
-    TestSparseSurfaceClusterRecords();
-    TestSparseSurfaceRangeAllocator();
-    TestSparsePagePublishQueue();
-    TestEditStoreAndCollision();
-    TestSparseCollisionVolumesAndSweeps();
-    TestSparseCharacterController();
-    TestSparseEditDeltaBatching();
-    TestSparseCollisionSupportRequests();
-    TestSparseGpuPhysicsProposalApply();
-    TestSparseVoxelWorldLifecycle();
-    TestSparseFixedGridReadiness();
-    TestSparseRenderDirtyRegions();
-    TestSparseLocalPhysics();
-    TestSparseBrushEditSemantics();
-    TestSparseRaycast();
-    TestSparseVoxelWorldEviction();
-    TestSparsePriorityReplacement();
-    TestSparsePriorityQueues();
-    TestSparseBrickRequestPlanner();
-    TestSparseRuntimeBudgetScheduler();
-    TestSparseClipmapPolicy();
-    TestSparseClipmapTileCache();
-    TestSparseClipmapViewCorridorCoversFrame300Skyline();
+int main(int argc, char** argv) {
+    const bool runRuntimeBudgetOnly =
+        argc == 2 && std::string(argv[1]) == "--case=runtime-budget";
+    const bool runClipmapPumpOnly =
+        argc == 2 && std::string(argv[1]) == "--case=clipmap-pump";
+
+    if (argc > 2 || (argc == 2 && !runRuntimeBudgetOnly && !runClipmapPumpOnly)) {
+        std::cerr << "Usage: VENPODTests [--case=runtime-budget|--case=clipmap-pump]\n";
+        return EXIT_FAILURE;
+    }
+
+    if (runRuntimeBudgetOnly) {
+        TestSparseRuntimeBudgetScheduler();
+    } else if (runClipmapPumpOnly) {
+        TestSparseClipmapHeightPumpHardBudget();
+        TestSparseMidMeshEditSuppression();
+    } else {
+        TestBackendParsing();
+        TestVoxelWorldRaycastReadbackLifecycle();
+        TestFarVoxelOctreeResidencyMetadata();
+        TestSparseSurfaceIaStreamSizing();
+        TestSparseSurfaceGpuConfigValidation();
+        TestSparseSurfaceGpuCopyRangeValidation();
+        TestSparseSurfaceGpuAbiLayout();
+        TestSparseVoxelGpuConfigValidation();
+        TestSparseVoxelGpuCopyRangeValidation();
+        TestCoordinateConversion();
+        TestGpuPageEntryLayout();
+        TestPageTable();
+        TestBrickPool();
+        TestTerrainGeneration();
+        TestSparseSurfaceExtraction();
+        TestSparseSurfaceCache();
+        TestSparseSurfaceClusterRecords();
+        TestSparseSurfaceRangeAllocator();
+        TestSparsePagePublishQueue();
+        TestEditStoreAndCollision();
+        TestSparseCollisionVolumesAndSweeps();
+        TestSparseCharacterController();
+        TestSparseEditDeltaBatching();
+        TestSparseCollisionSupportRequests();
+        TestSparseGpuPhysicsProposalApply();
+        TestSparseVoxelWorldLifecycle();
+        TestSparseFixedGridReadiness();
+        TestSparseRenderDirtyRegions();
+        TestSparseLocalPhysics();
+        TestSparseBrushEditSemantics();
+        TestSparseRaycast();
+        TestSparseVoxelWorldEviction();
+        TestSparsePriorityReplacement();
+        TestSparsePriorityQueues();
+        TestSparseBrickRequestPlanner();
+        TestSparseRuntimeBudgetScheduler();
+        TestSparseClipmapPolicy();
+        TestSparseClipmapHeightPumpHardBudget();
+        TestSparseClipmapTileCache();
+        TestSparseClipmapViewCorridorCoversFrame300Skyline();
+    }
 
     if (failures != 0) {
         std::cerr << failures << " sparse core test failure(s)\n";

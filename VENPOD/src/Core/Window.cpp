@@ -2,8 +2,21 @@
 #include "Graphics/RHI/DX12Device.h"
 #include "Graphics/RHI/DX12CommandQueue.h"
 #include <spdlog/spdlog.h>
+#include <iomanip>
+#include <sstream>
 
 namespace VENPOD {
+
+namespace {
+
+std::string FormatHResult(HRESULT hr) {
+    std::ostringstream out;
+    out << "0x" << std::uppercase << std::hex << std::setw(8) << std::setfill('0')
+        << static_cast<unsigned long>(hr);
+    return out.str();
+}
+
+} // namespace
 
 Window::~Window() {
     Shutdown();
@@ -105,9 +118,32 @@ Result<void> Window::CreateSwapChain(Graphics::DX12Device* device, Graphics::DX1
         &swapChain1
     );
 
-    if (FAILED(hr)) {
-        return Result<void>::Err("Failed to create swap chain");
+    if (FAILED(hr) && (swapChainDesc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)) {
+        const HRESULT tearingHr = hr;
+        const UINT tearingFlags = swapChainDesc.Flags;
+        swapChainDesc.Flags &= ~DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+        spdlog::warn(
+            "CreateSwapChainForHwnd failed with tearing enabled (HRESULT={} flags={}); retrying without tearing",
+            FormatHResult(tearingHr), tearingFlags);
+        hr = device->GetFactory()->CreateSwapChainForHwnd(
+            commandQueue->GetCommandQueue(),
+            hwnd,
+            &swapChainDesc,
+            nullptr,
+            nullptr,
+            &swapChain1
+        );
     }
+
+    if (FAILED(hr)) {
+        return Result<void>::Err(
+            "Failed to create swap chain HRESULT=" + FormatHResult(hr) +
+            " flags=" + std::to_string(swapChainDesc.Flags) +
+            " size=" + std::to_string(swapChainDesc.Width) + "x" +
+            std::to_string(swapChainDesc.Height));
+    }
+
+    m_swapChainAllowsTearing = (swapChainDesc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
 
     // Disable Alt+Enter fullscreen toggle (we'll handle it ourselves)
     device->GetFactory()->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
@@ -121,7 +157,8 @@ Result<void> Window::CreateSwapChain(Graphics::DX12Device* device, Graphics::DX1
     RefreshFrameLatencyWaitableObject();
     m_currentBackBufferIndex = m_swapChain->GetCurrentBackBufferIndex();
 
-    spdlog::info("Swap chain created with {} buffers (triple buffering)", BUFFER_COUNT);
+    spdlog::info("Swap chain created with {} buffers (triple buffering, tearing={})",
+                 BUFFER_COUNT, m_swapChainAllowsTearing ? "enabled" : "disabled");
 
     // Create render target views
     return CreateRenderTargetViews(device);
@@ -212,7 +249,7 @@ void Window::Present() {
     UINT presentFlags = 0;
 
     // Allow tearing for lower latency when vsync is off
-    if (!m_vsync && m_device && m_device->SupportsTearing()) {
+    if (!m_vsync && m_swapChainAllowsTearing) {
         presentFlags |= DXGI_PRESENT_ALLOW_TEARING;
     }
 

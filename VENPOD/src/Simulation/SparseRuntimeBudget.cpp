@@ -29,6 +29,13 @@ uint64_t SaturatingMul(uint64_t a, uint64_t b)
         : a * b;
 }
 
+uint32_t ClampToUint32(uint64_t value)
+{
+    return value > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())
+        ? std::numeric_limits<uint32_t>::max()
+        : static_cast<uint32_t>(value);
+}
+
 uint32_t SaturatingScaleBudget(uint32_t budget, float scale)
 {
     const long double scaled =
@@ -228,6 +235,240 @@ SparseMissFeedbackPlan SparseRuntimeBudgetScheduler::BuildMissFeedbackPlan(
     }
 
     return plan;
+}
+
+SparseRuntimeBudgetInput SparseRuntimeBudgetScheduler::BuildRuntimeBudgetInput(
+    const SparseRuntimeWorkloadSnapshot& snapshot)
+{
+    SparseRuntimeBudgetInput input;
+    input.lastRawFrameMs = snapshot.lastRawFrameMs;
+    input.combinedSchedulerPressureMs = snapshot.combinedSchedulerPressureMs;
+    input.hasQueueBacklog =
+        snapshot.generationQueuedBricks > 0 ||
+        snapshot.uploadQueuedBricks > 0 ||
+        !snapshot.pagePublishQueueEmpty ||
+        snapshot.missFeedbackPending ||
+        snapshot.clipmapQueuedHeightTiles > 0 ||
+        snapshot.clipmapQueuedVoxelBricks > 0;
+    input.uploadRingOverflow =
+        snapshot.uploadRingOverflowLastFrame ||
+        snapshot.uploadRingBudgetDefersLastFrame > 0;
+    input.stagedBytesLastFrame = snapshot.stagedBytesLastFrame;
+    input.uploadRingBytes = snapshot.uploadRingBytes;
+    input.maxBrickPages = snapshot.maxBrickPages;
+    input.urgentQueuedBricks = ClampToUint32(
+        snapshot.generationQueuedCollisionBricks +
+        snapshot.generationQueuedEditedBricks +
+        snapshot.uploadQueuedCollisionBricks +
+        snapshot.uploadQueuedEditedBricks +
+        snapshot.surfaceQueuedCollisionBricks +
+        snapshot.surfaceQueuedEditedBricks);
+    input.visibleQueuedBricks = ClampToUint32(
+        snapshot.generationQueuedVisibleBricks +
+        snapshot.uploadQueuedVisibleBricks +
+        snapshot.surfaceQueuedVisibleBricks);
+    input.speculativeQueuedBricks = ClampToUint32(
+        snapshot.generationQueuedSpeculativeBricks +
+        snapshot.uploadQueuedSpeculativeBricks +
+        snapshot.surfaceQueuedSpeculativeBricks);
+    input.surfaceQueuedBricks =
+        ClampToUint32(snapshot.surfaceExtractionQueuedBricks);
+    input.physicsHotCandidateBricks =
+        ClampToUint32(snapshot.physicsHotCandidateBricks);
+    input.pagePublishReadyQueued =
+        ClampToUint32(snapshot.pagePublishReadyQueued);
+    input.pagePublishWaitingFrame =
+        ClampToUint32(snapshot.pagePublishWaitingFrame);
+    input.pagePublishWaitingFence =
+        ClampToUint32(snapshot.pagePublishWaitingFence);
+    input.pagePublishEditedQueued =
+        ClampToUint32(snapshot.pagePublishEditedQueued);
+    input.pagePublishMaxReadyFrameLag = snapshot.pagePublishMaxReadyFrameLag;
+
+    if (snapshot.readySurfacePublish.enabled &&
+        snapshot.readySurfacePublish.pending > 0) {
+        const uint32_t pending =
+            ClampToUint32(snapshot.readySurfacePublish.pending);
+        input.hasQueueBacklog = true;
+        input.visibleQueuedBricks =
+            SaturatingAdd(input.visibleQueuedBricks, pending);
+        input.pagePublishReadyQueued =
+            SaturatingAdd(input.pagePublishReadyQueued, pending);
+        input.pagePublishMaxReadyFrameLag =
+            std::max(input.pagePublishMaxReadyFrameLag,
+                     snapshot.readySurfacePublish.oldestAge);
+    }
+
+    input.visibleMissPressure =
+        snapshot.residencyCatchupActive ||
+        snapshot.ownershipPressureLevel > 0;
+    input.ownershipPressureLevel = snapshot.ownershipPressureLevel;
+    return input;
+}
+
+SparsePrePublishSurfaceBudgetDecision SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(
+    const SparsePrePublishSurfaceBudgetInput& input)
+{
+    SparsePrePublishSurfaceBudgetDecision decision;
+    decision.totalBudget = input.baseExtractBudget;
+    if (input.terrainCriticalPublishOvertime) {
+        decision.totalBudget = std::max(
+            decision.totalBudget,
+            input.terrainCriticalExtractBudget);
+    }
+    if (input.hiddenExactStartupPublishOvertime) {
+        decision.totalBudget = std::max(
+            decision.totalBudget,
+            input.startupExtractBudget);
+    } else if (input.hiddenExactRuntimePublishPriority) {
+        decision.totalBudget = std::max(
+            decision.totalBudget,
+            input.postOpenExtractBudget);
+    }
+
+    const uint64_t editWindowEnd =
+        input.lastEditFrame >
+                std::numeric_limits<uint64_t>::max() -
+                    static_cast<uint64_t>(input.editIdleFrames)
+            ? std::numeric_limits<uint64_t>::max()
+            : input.lastEditFrame + static_cast<uint64_t>(input.editIdleFrames);
+    const uint64_t postEditWindowEnd =
+        editWindowEnd >
+                std::numeric_limits<uint64_t>::max() -
+                    static_cast<uint64_t>(input.postEditGeneralSpillFrames)
+            ? std::numeric_limits<uint64_t>::max()
+            : editWindowEnd + static_cast<uint64_t>(input.postEditGeneralSpillFrames);
+    decision.editActive =
+        input.editIdleFrames != 0u &&
+        input.frameIndex < editWindowEnd;
+    const float rawFrameMs =
+        std::isfinite(input.lastRawFrameMs) ? std::max(0.0f, input.lastRawFrameMs) : 0.0f;
+    const float schedulerPressureMs =
+        std::isfinite(input.combinedSchedulerPressureMs)
+            ? std::max(0.0f, input.combinedSchedulerPressureMs)
+            : 0.0f;
+    const float framePressureMs = std::max(rawFrameMs, schedulerPressureMs);
+    const bool postEditFramePressureActive =
+        input.postEditGeneralSpillPressureMs <= 0.0f ||
+        framePressureMs >= input.postEditGeneralSpillPressureMs;
+    const bool postEditBacklogPressureActive =
+        decision.totalBudget > 0u &&
+        input.pagePublishesEligible > decision.totalBudget;
+    decision.postEditGeneralSpillActive =
+        input.lastEditFrame != 0ull &&
+        !decision.editActive &&
+        input.postEditGeneralSpillFrames != 0u &&
+        input.frameIndex >= editWindowEnd &&
+        input.frameIndex < postEditWindowEnd &&
+        (postEditFramePressureActive || postEditBacklogPressureActive);
+    if (decision.editActive) {
+        decision.generalBudget =
+            std::min(input.generalBudget, input.editGeneralBudget);
+    } else if (decision.postEditGeneralSpillActive) {
+        decision.generalBudget = input.generalBudget;
+        decision.splitGeneralByOwnership =
+            input.postEditGeneralBudget < input.generalBudget;
+    } else {
+        decision.generalBudget = input.generalBudget;
+    }
+    const float sameFrameClipmapPrepMs =
+        std::isfinite(input.sameFrameClipmapPrepMs)
+            ? std::max(0.0f, input.sameFrameClipmapPrepMs)
+            : 0.0f;
+    const float stackedWorkClipmapPrepThresholdMs =
+        std::isfinite(input.stackedWorkClipmapPrepThresholdMs)
+            ? std::max(0.0f, input.stackedWorkClipmapPrepThresholdMs)
+            : 0.0f;
+    decision.stackedWorkGeneralCapActive =
+        stackedWorkClipmapPrepThresholdMs > 0.0f &&
+        sameFrameClipmapPrepMs >= stackedWorkClipmapPrepThresholdMs &&
+        input.stackedWorkGeneralBudget < decision.generalBudget;
+    if (decision.stackedWorkGeneralCapActive) {
+        decision.generalBudget = input.stackedWorkGeneralBudget;
+    }
+    decision.generalCriticalBudget = decision.generalBudget;
+    decision.generalNonCriticalBudget = decision.splitGeneralByOwnership
+        ? std::min(decision.generalBudget, input.postEditGeneralBudget)
+        : decision.generalBudget;
+
+    decision.maxMs = input.startupSurfaceCatchup
+        ? input.startupMaxMs
+        : (input.postOpenSurfaceCatchup ? input.postOpenMaxMs : input.baseMaxMs);
+    decision.hiddenCriticalBudget = input.startupSurfaceCatchup
+        ? input.startupHiddenCriticalBudget
+        : (input.postOpenSurfaceCatchup
+            ? input.postOpenHiddenCriticalBudget
+            : input.baseHiddenCriticalBudget);
+    decision.hiddenTrackedBudget = input.hiddenTrackedBudget;
+    decision.enabled =
+        input.pageTableSurfaceReadyGateEnabled &&
+        decision.totalBudget > 0u &&
+        input.pagePublishesEligible > 0u &&
+        !input.pagePublishQueueEmpty;
+    decision.skipGeneralSurfaceStage =
+        decision.enabled &&
+        (decision.generalBudget == 0u ||
+         (decision.splitGeneralByOwnership &&
+          decision.generalNonCriticalBudget < decision.generalBudget) ||
+         decision.stackedWorkGeneralCapActive);
+    return decision;
+}
+
+SparseSurfaceWorkRouteDecision SparseRuntimeBudgetScheduler::BuildSurfaceWorkRoute(
+    const SparseSurfaceWorkRouteInput& input)
+{
+    SparseSurfaceWorkRouteDecision decision;
+
+    // Hysteresis: while routing is active, saturation trips at the full limit; once
+    // saturated (or otherwise not routing), backlog must clear half the limit before
+    // async routing resumes, so the route cannot flap batch<->async around the limit.
+    const bool recovering = !input.previousRouteGeneralToAsync;
+    const uint64_t asyncBacklog =
+        static_cast<uint64_t>(input.asyncQueueDepth) + input.asyncResultDepth;
+    if (input.asyncBacklogLimit > 0u) {
+        const uint64_t asyncTrip = recovering
+            ? input.asyncBacklogLimit / 2u
+            : input.asyncBacklogLimit;
+        decision.asyncBacklogSaturated = asyncBacklog > asyncTrip;
+    }
+    if (input.surfaceReadyPublishPendingLimit > 0u) {
+        const uint64_t pendingTrip = recovering
+            ? input.surfaceReadyPublishPendingLimit / 2u
+            : input.surfaceReadyPublishPendingLimit;
+        decision.publishBacklogSaturated =
+            decision.publishBacklogSaturated ||
+            input.surfaceReadyPublishPending > pendingTrip;
+    }
+    if (input.surfaceReadyPublishOldestAgeLimit > 0u) {
+        const uint32_t ageTrip = recovering
+            ? input.surfaceReadyPublishOldestAgeLimit / 2u
+            : input.surfaceReadyPublishOldestAgeLimit;
+        decision.publishBacklogSaturated =
+            decision.publishBacklogSaturated ||
+            input.surfaceReadyPublishOldestAge > ageTrip;
+    }
+    if (input.pagePublishBacklogLimit > 0u) {
+        const uint64_t pageTrip = recovering
+            ? input.pagePublishBacklogLimit / 2u
+            : input.pagePublishBacklogLimit;
+        decision.publishBacklogSaturated =
+            decision.publishBacklogSaturated ||
+            input.pagePublishBacklog > pageTrip;
+    }
+
+    // During an edit window with the per-coord gate, a deep publish queue is the
+    // SYMPTOM of extraction starvation (unmeshed surfaces held by the surface-
+    // ready gate) -- async routing is the cure, so publish saturation must not
+    // veto it there. The async backlog guard still applies unconditionally.
+    const bool editWindowAsyncSafe =
+        input.editActive && input.asyncPerCoordEditGate;
+    decision.routeGeneralToAsync =
+        input.routingEnabled &&
+        input.asyncExtractionEnabled &&
+        (!input.editActive || input.asyncPerCoordEditGate) &&
+        !decision.asyncBacklogSaturated &&
+        (!decision.publishBacklogSaturated || editWindowAsyncSafe);
+    return decision;
 }
 
 SparseRuntimeBudgetDecision SparseRuntimeBudgetScheduler::Evaluate(

@@ -602,6 +602,12 @@ float3 UnderwaterVolumeTint(float3 worldPos, float distanceFromCamera, float bas
 
 float3 DistantLodShadeNormal(float3 normal, float distanceFromCamera, float strength) {
     const float distanceBlend = saturate((distanceFromCamera - 900.0f) / 6200.0f);
+    // Loop 96 NOTE: a stronger far flatten (extra farFlatten^2*0.55 term) was
+    // A/B-measured and REFUTED — per-region novel-pixel counts were flat/noise
+    // (midLeft 1072->886, topRight 5811->6541, center 311->422). The motion
+    // crawl on distant cliffs is ALBEDO/silhouette boundary aliasing (material
+    // step-lines + disocclusion), which lighting cannot fix; the real cure is
+    // temporal accumulation (TAA-style) for the raymarched bands.
     return normalize(lerp(normal, float3(0.0f, 1.0f, 0.0f), saturate(strength * (0.35f + distanceBlend * 0.55f))));
 }
 
@@ -2068,6 +2074,30 @@ bool RaymarchMidVoxelClipmap(float3 rayOrigin, float3 rayDir, float startDist, o
                     // instead of a mid/far patchwork. Chunkier parents still
                     // fall through to the far layers.
                     if (actualCellSize > max(12.0f, t * 0.014f)) {
+                        previousMidVoxelWasAir = false;
+                        t = min(nextCellT, t + max(actualCellSize, 4.0f));
+                        continue;
+                    }
+                }
+                // FLOATING-ISLAND FIX (Loop 106): under pool-cap eviction the
+                // OUTERMOST ring's coverage goes patchy — an isolated summit
+                // brick survives while its column below evicts, and the far
+                // backdrop draws the same mountain LOWER (analytic reshape vs
+                // exact heights), so the surviving fragment floats over sky.
+                // Require resident SUPPORT one brick below for outermost-ring
+                // hits; unsupported fragments fall through to the far layers
+                // (terrain is heightfield-generated — no legitimate floating
+                // landmasses at outer rings).
+                const uint islandFixRingCount =
+                    min(header.w >> 24u, MID_CLIPMAP_MAX_SHADER_RINGS);
+                if (actualRing + 1u >= islandFixRingCount) {
+                    const float supportBrickWorld =
+                        max(actualCellSize, 1.0f) * (float)SPARSE_BRICK_SIZE;
+                    uint supportVoxel;
+                    if (!SampleResidentMidVoxel(
+                            pos - float3(0.0f, supportBrickWorld, 0.0f),
+                            actualRing,
+                            supportVoxel)) {
                         previousMidVoxelWasAir = false;
                         t = min(nextCellT, t + max(actualCellSize, 4.0f));
                         continue;

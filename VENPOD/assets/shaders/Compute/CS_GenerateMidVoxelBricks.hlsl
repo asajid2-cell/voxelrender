@@ -248,6 +248,17 @@ void main(uint3 dtid : SV_DispatchThreadID,
     int   maxFpWX = centerWX;
     int   maxFpWZ = centerWZ;
     float maxFpRelief = centerRelief;
+    // MIN column + submerged fraction (Loop 96): backs the LOD-consistent
+    // water rule. PARITY: same candidate set/order as the CPU footprintColumns
+    // array (center, +X, -X, +Z, -Z, 4 corners, then 25 coarse footprint
+    // columns); strict '<' keeps the first on ties, exactly like the CPU scan.
+    float minFootprintColumnHeight = centerHeight;
+    int   minFpWX = centerWX;
+    int   minFpWZ = centerWZ;
+    float minFpRelief = centerRelief;
+    uint  footprintColumnCount = 1u;
+    uint  footprintSubmergedCount =
+        centerHeight < (float)TH_SEA_LEVEL_Y ? 1u : 0u;
 
     // World XZ of the 9 halo columns used as footprint entries.
     // centerColumn = columns[z+1][x+1] -> world (worldXByHalo[x+1], worldZByHalo[z+1])
@@ -264,8 +275,12 @@ void main(uint3 dtid : SV_DispatchThreadID,
     int wxC22 = wxPX; int wzC22 = wzPZ;   // columns[z+2][x+2]
 
     #define FP(H, WX, WZ, R) \
+        ++footprintColumnCount; \
+        if ((H) < (float)TH_SEA_LEVEL_Y) { ++footprintSubmergedCount; } \
         if ((H) > maxFootprintColumnHeight) { \
-            maxFootprintColumnHeight = (H); maxFpWX = (WX); maxFpWZ = (WZ); maxFpRelief = (R); }
+            maxFootprintColumnHeight = (H); maxFpWX = (WX); maxFpWZ = (WZ); maxFpRelief = (R); } \
+        if ((H) < minFootprintColumnHeight) { \
+            minFootprintColumnHeight = (H); minFpWX = (WX); minFpWZ = (WZ); minFpRelief = (R); }
 
     FP(posXHeight,            wxPX, wzPX, g_relief[ipx]);
     FP(negXHeight,            wxNX, wzNX, g_relief[inx]);
@@ -285,11 +300,21 @@ void main(uint3 dtid : SV_DispatchThreadID,
                 int sampleX = cxMin +
                     (int)(((int)(cxMax - cxMin) * (int)sampleXIndex + 2) / 4);
                 float fh = TH_HeightAt(sampleX, sampleZ, seed);
+                ++footprintColumnCount;
+                if (fh < (float)TH_SEA_LEVEL_Y) { ++footprintSubmergedCount; }
                 if (fh > maxFootprintColumnHeight) {
                     maxFootprintColumnHeight = fh;
                     maxFpWX = sampleX; maxFpWZ = sampleZ;
                     // relief computed lazily on CPU; eager here is identical.
                     maxFpRelief = TH_SurfaceRelief(sampleX, sampleZ, fh, 4, seed);
+                }
+                if (fh < minFootprintColumnHeight) {
+                    minFootprintColumnHeight = fh;
+                    minFpWX = sampleX; minFpWZ = sampleZ;
+                    // The min column only feeds the water branch of
+                    // TH_SampleColumnCellVoxelHR, which never reads relief
+                    // (hash-variant only, CPU identical) — skip the eval.
+                    minFpRelief = 0.0f;
                 }
             }
         }
@@ -327,6 +352,32 @@ void main(uint3 dtid : SV_DispatchThreadID,
                 int prefY = min(worldY, (int)floor(maxFootprintColumnHeight));
                 voxel = TH_SampleColumnCellVoxelHR(
                     maxFpWX, maxFpWZ, maxFootprintColumnHeight, maxFpRelief,
+                    cellMinWorldY, cellMaxWorldY, prefY, seed);
+                material = TH_UnpackMaterial(voxel);
+            }
+        }
+
+        // (2b) LOD-consistent water EXISTENCE (Loop 96): pools narrower than a
+        // coarse cell render water at fine rings but the coarse center sample
+        // misses the pit -> water pops in/out at ring transitions during
+        // motion. Resample from the MINIMUM footprint column, but ONLY when
+        // submerged columns are the MAJORITY of the footprint — the bound that
+        // separates this from the rejected any-neighbor-dip rule (CPU shoreline
+        // comment): worst-case water-over-land error is under half a cell.
+        // PARITY: mirrors the CPU rule in GenerateVoxelBrickPayload exactly.
+        if (coarse && material != TH_MAT_WATER) {
+            bool footprintMajoritySubmerged =
+                footprintSubmergedCount != 0u &&
+                footprintSubmergedCount * 2u >= footprintColumnCount;
+            int minColTopY = (int)floor(minFootprintColumnHeight);
+            bool applyLodWater =
+                footprintMajoritySubmerged &&
+                cellMinWorldY <= TH_SEA_LEVEL_Y &&
+                cellMaxWorldY > minColTopY;
+            if (applyLodWater) {
+                int prefY = clamp(worldY, minColTopY + 1, TH_SEA_LEVEL_Y);
+                voxel = TH_SampleColumnCellVoxelHR(
+                    minFpWX, minFpWZ, minFootprintColumnHeight, minFpRelief,
                     cellMinWorldY, cellMaxWorldY, prefY, seed);
                 material = TH_UnpackMaterial(voxel);
             }

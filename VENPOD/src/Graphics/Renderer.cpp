@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <type_traits>
 
@@ -334,6 +335,10 @@ Result<void> Renderer::Initialize(
         if (!result) {
             return Error("Failed to create background composite pipeline: {}", result.error());
         }
+        result = CreateBackgroundTemporalPipeline(device.GetDevice());
+        if (!result) {
+            return Error("Failed to create background temporal pipeline: {}", result.error());
+        }
     }
     if (m_config.midPassEnabled) {
         result = CreateMidCompositePipeline(device.GetDevice());
@@ -412,6 +417,7 @@ Renderer::BackgroundPassInfo Renderer::GetBackgroundPassInfo() const {
     info.forceColor = m_config.backgroundPassForceColor;
     info.compositeDebug = m_config.backgroundPassCompositeDebug;
     info.compositeForceColor = m_config.backgroundPassCompositeForceColor;
+    info.foregroundMask = m_config.backgroundPassForegroundMask;
     return info;
 }
 
@@ -505,6 +511,17 @@ void Renderer::BeginFrame(ID3D12GraphicsCommandList* cmdList, uint32_t frameInde
             0,
             nullptr);
     }
+    if (m_config.backgroundPassForegroundMask &&
+        UseBackgroundPassSplit() &&
+        m_backgroundPassDsv.IsValid()) {
+        cmdList->ClearDepthStencilView(
+            m_backgroundPassDsv.cpu,
+            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+            1.0f,
+            0,
+            0,
+            nullptr);
+    }
 
     // Set descriptor heaps
     ID3D12DescriptorHeap* heaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
@@ -576,6 +593,10 @@ void Renderer::RenderVoxels(
     const bool backgroundPassSurfaceRaymarchFillThisFrame =
         useBackgroundPassSplit &&
         (m_config.backgroundPassSurfaceRaymarchFill || camera.backgroundPassSurfaceRaymarchFill);
+    const bool backgroundPassForegroundMaskThisFrame =
+        useBackgroundPassSplit &&
+        m_config.backgroundPassForegroundMask &&
+        m_sparseSurfaceDepthPrepassPipeline.GetPSO() != nullptr;
     m_backgroundPassSurfaceRaymarchFillLastFrame = backgroundPassSurfaceRaymarchFillThisFrame;
     if (useBackgroundPassSplit) {
         if (m_backgroundPassColorState != D3D12_RESOURCE_STATE_RENDER_TARGET) {
@@ -598,13 +619,23 @@ void Renderer::RenderVoxels(
             ? forceClearColor
             : (m_config.backgroundPassClearProbe ? probeClearColor : defaultClearColor);
         cmdList->ClearRenderTargetView(backgroundRtv, clearColor, 0, nullptr);
-        cmdList->ClearDepthStencilView(
-            backgroundDsv,
-            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-            1.0f,
-            0,
-            0,
-            nullptr);
+        if (backgroundPassForegroundMaskThisFrame) {
+            cmdList->ClearDepthStencilView(
+                backgroundDsv,
+                D3D12_CLEAR_FLAG_DEPTH,
+                1.0f,
+                0,
+                0,
+                nullptr);
+        } else {
+            cmdList->ClearDepthStencilView(
+                backgroundDsv,
+                D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                1.0f,
+                0,
+                0,
+                nullptr);
+        }
     }
 
     // Bind fullscreen pipeline
@@ -918,12 +949,78 @@ void Renderer::RenderVoxels(
     }
 
     if (useBackgroundPassSplit) {
+        // TAA lane increment 2 (env VENPOD_BG_TEMPORAL, default off): while the
+        // low-res background is still the bound render target, alpha-blend last
+        // frame's accumulated background over it, reprojected through the
+        // previous camera basis (rotation-exact; background treated as distant).
+        // The history copy below then snapshots the blended result, closing the
+        // accumulation loop. Skipped until one frame of history exists.
+        if (m_backgroundTemporalEnabled &&
+            m_backgroundPassHistory.Get() &&
+            m_backgroundTemporalPipeline.GetPSO() != nullptr &&
+            m_backgroundHistoryValid &&
+            m_backgroundPrevCameraValid &&
+            !forceBackgroundPassColor) {
+            m_backgroundTemporalPipeline.Bind(cmdList);
+            float temporalConstants[36];
+            std::memcpy(temporalConstants + 0, constants.cameraPosition, 4 * sizeof(float));
+            std::memcpy(temporalConstants + 4, constants.cameraForward, 4 * sizeof(float));
+            std::memcpy(temporalConstants + 8, constants.cameraRight, 4 * sizeof(float));
+            std::memcpy(temporalConstants + 12, constants.cameraUp, 4 * sizeof(float));
+            std::memcpy(temporalConstants + 16, m_backgroundPrevCamera, 16 * sizeof(float));
+            temporalConstants[32] = m_backgroundTemporalBlend;
+            temporalConstants[33] = 0.0f;
+            temporalConstants[34] = 0.0f;
+            temporalConstants[35] = 0.0f;
+            cmdList->SetGraphicsRootDescriptorTable(0, m_backgroundPassHistorySrv.gpu);
+            cmdList->SetGraphicsRoot32BitConstants(1, 36, temporalConstants, 0);
+            cmdList->DrawInstanced(3, 1, 0, 0);
+        }
+
         D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
             m_backgroundPassColor.Get(),
             D3D12_RESOURCE_STATE_RENDER_TARGET,
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         cmdList->ResourceBarrier(1, &barrier);
         m_backgroundPassColorState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+
+        // Snapshot the (blended) background into the history buffer for next
+        // frame's reprojection.
+        if (m_backgroundTemporalEnabled && m_backgroundPassHistory.Get()) {
+            D3D12_RESOURCE_BARRIER toCopy[2];
+            toCopy[0] = CD3DX12_RESOURCE_BARRIER::Transition(
+                m_backgroundPassHistory.Get(),
+                m_backgroundPassHistoryState,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+            toCopy[1] = CD3DX12_RESOURCE_BARRIER::Transition(
+                m_backgroundPassColor.Get(),
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_SOURCE);
+            cmdList->ResourceBarrier(2, toCopy);
+            cmdList->CopyResource(m_backgroundPassHistory.Get(), m_backgroundPassColor.Get());
+            D3D12_RESOURCE_BARRIER toRead[2];
+            toRead[0] = CD3DX12_RESOURCE_BARRIER::Transition(
+                m_backgroundPassHistory.Get(),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            toRead[1] = CD3DX12_RESOURCE_BARRIER::Transition(
+                m_backgroundPassColor.Get(),
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            cmdList->ResourceBarrier(2, toRead);
+            m_backgroundPassHistoryState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            m_backgroundHistoryValid = true;
+        }
+
+        // Cache this frame's camera basis (same packing the shader consumed)
+        // for next frame's reprojection.
+        if (m_backgroundTemporalEnabled) {
+            std::memcpy(m_backgroundPrevCamera + 0, constants.cameraPosition, 4 * sizeof(float));
+            std::memcpy(m_backgroundPrevCamera + 4, constants.cameraForward, 4 * sizeof(float));
+            std::memcpy(m_backgroundPrevCamera + 8, constants.cameraRight, 4 * sizeof(float));
+            std::memcpy(m_backgroundPrevCamera + 12, constants.cameraUp, 4 * sizeof(float));
+            m_backgroundPrevCameraValid = true;
+        }
 
         SetMainRenderTarget(cmdList);
         m_backgroundCompositePipeline.Bind(cmdList);
@@ -1061,6 +1158,14 @@ void Renderer::RenderSparseSurfaceFaces(
     if (drawableFaceCount == 0u) {
         return;
     }
+    const bool drawBackgroundForegroundMask =
+        m_config.backgroundPassForegroundMask &&
+        UseBackgroundPassSplit() &&
+        m_backgroundPassDepth.Get() != nullptr &&
+        m_backgroundPassDsv.IsValid() &&
+        m_backgroundPassWidth > 0u &&
+        m_backgroundPassHeight > 0u &&
+        m_sparseSurfaceDepthPrepassPipeline.GetPSO() != nullptr;
 
     ID3D12DescriptorHeap* heaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
     cmdList->SetDescriptorHeaps(1, heaps);
@@ -1244,6 +1349,17 @@ void Renderer::RenderSparseSurfaceFaces(
             0);
     } else {
         cmdList->DrawIndexedInstanced(drawableFaceCount * 6u, 1u, 0u, 0, 0u);
+    }
+
+    if (drawBackgroundForegroundMask) {
+        D3D12_CPU_DESCRIPTOR_HANDLE backgroundDsv = m_backgroundPassDsv.cpu;
+        cmdList->OMSetRenderTargets(0, nullptr, FALSE, &backgroundDsv);
+        SetViewportAndScissor(cmdList, m_backgroundPassWidth, m_backgroundPassHeight);
+        m_sparseSurfaceDepthPrepassPipeline.Bind(cmdList);
+        cmdList->OMSetStencilRef(1);
+        bindSurfaceDescriptors();
+        drawSurfaceStreams();
+        SetMainRenderTarget(cmdList);
     }
 }
 
@@ -2179,6 +2295,100 @@ Result<void> Renderer::CreateBackgroundCompositePipeline(ID3D12Device* device) {
     return {};
 }
 
+Result<void> Renderer::CreateBackgroundTemporalPipeline(ID3D12Device* device) {
+    // TAA lane increment 2 (env VENPOD_BG_TEMPORAL, default off): reprojected
+    // history blend over the fresh background. Env is read here directly so the
+    // pipeline exists regardless of Create*Resources ordering.
+    const char* bgTemporalEnv = std::getenv("VENPOD_BG_TEMPORAL");
+    const bool temporalEnabled =
+        bgTemporalEnv != nullptr && bgTemporalEnv[0] != '0' && bgTemporalEnv[0] != '\0';
+    if (!UseBackgroundPassSplit() || !temporalEnabled) {
+        return {};
+    }
+
+    if (const char* blendEnv = std::getenv("VENPOD_BG_TEMPORAL_BLEND")) {
+        const float parsed = static_cast<float>(std::atof(blendEnv));
+        if (parsed > 0.0f && parsed <= 0.95f) {
+            m_backgroundTemporalBlend = parsed;
+        }
+    }
+
+    std::filesystem::path psPath = m_config.shaderPath / "Graphics" / "PS_BackgroundTemporal.hlsl";
+
+    CompiledShader temporalVS = m_fullscreenVS;
+    if (!temporalVS.IsValid()) {
+        std::filesystem::path vsPath = m_config.shaderPath / "Graphics" / "VS_Fullscreen.hlsl";
+        auto vsResult = m_shaderCompiler.CompileVertexShader(vsPath, L"main", m_config.debugShaders);
+        if (!vsResult) {
+            return Error("Failed to compile background temporal vertex shader: {}", vsResult.error());
+        }
+        temporalVS = vsResult.value();
+    }
+
+    ShaderCompileOptions psOptions;
+    psOptions.entryPoint = L"main";
+    psOptions.target = L"ps_6_0";
+    psOptions.debugInfo = m_config.debugShaders;
+    psOptions.optimizationLevel3 = true;
+    auto psResult = m_shaderCompiler.CompileFromFile(psPath, psOptions);
+    if (!psResult) {
+        return Error("Failed to compile background temporal pixel shader: {}", psResult.error());
+    }
+    m_backgroundTemporalPS = psResult.value();
+    if (!m_backgroundTemporalPS.IsValid()) {
+        return Error("Background temporal pixel shader compilation failed: {}", m_backgroundTemporalPS.errors);
+    }
+
+    GraphicsPipelineDesc pipelineDesc;
+    pipelineDesc.vertexShader = temporalVS;
+    pipelineDesc.pixelShader = m_backgroundTemporalPS;
+    pipelineDesc.debugName = "BackgroundTemporalPipeline";
+    pipelineDesc.rootParams.push_back({
+        RootParamType::DescriptorTable,
+        0,
+        0,
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        1,
+        D3D12_DESCRIPTOR_RANGE_TYPE_SRV
+    });
+    RootParameter temporalConstants{};
+    temporalConstants.type = RootParamType::Constants32Bit;
+    temporalConstants.shaderRegister = 0;
+    temporalConstants.visibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    temporalConstants.num32BitValues = 36;
+    pipelineDesc.rootParams.push_back(temporalConstants);
+    pipelineDesc.staticSamplers.push_back({
+        0,
+        0,
+        D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        D3D12_SHADER_VISIBILITY_PIXEL
+    });
+    pipelineDesc.rtvFormats.push_back(DXGI_FORMAT_R8G8B8A8_UNORM);
+    pipelineDesc.inputLayout.clear();
+    // Blends into the background color target while its DSV is still bound:
+    // depth/stencil fully disabled, but the DSV format must match.
+    pipelineDesc.blendEnable = true;
+    pipelineDesc.depthEnable = false;
+    pipelineDesc.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pipelineDesc.depthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    pipelineDesc.stencilEnable = false;
+    pipelineDesc.dsvFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    pipelineDesc.cullMode = D3D12_CULL_MODE_NONE;
+
+    auto result = m_backgroundTemporalPipeline.Initialize(device, pipelineDesc);
+    if (!result) {
+        return Error("Failed to create background temporal pipeline: {}", result.error());
+    }
+
+    spdlog::info(
+        "Background temporal pipeline created successfully blend={:.2f}",
+        m_backgroundTemporalBlend);
+    return {};
+}
+
 Result<void> Renderer::CreateMidCompositePipeline(ID3D12Device* device) {
     if (!m_config.midPassEnabled) {
         return {};
@@ -2382,6 +2592,16 @@ void Renderer::DestroyBackgroundPassResources() {
     if (m_backgroundPassDsv.IsValid()) {
         m_heapManager.FreeDsv(m_backgroundPassDsv);
     }
+    if (m_backgroundPassHistorySrv.IsValid()) {
+        m_heapManager.FreeShaderVisibleCbvSrvUav(m_backgroundPassHistorySrv);
+    }
+    if (m_backgroundPassHistoryStagingSrv.IsValid()) {
+        m_heapManager.FreeStagingCbvSrvUav(m_backgroundPassHistoryStagingSrv);
+    }
+    m_backgroundPassHistory.Reset();
+    m_backgroundPassHistoryState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_backgroundHistoryValid = false;
+    m_backgroundPrevCameraValid = false;
     m_backgroundPassColor.Reset();
     m_backgroundPassDepth.Reset();
     m_backgroundPassColorState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -2469,6 +2689,43 @@ Result<void> Renderer::CreateBackgroundPassResources() {
         return Error("Failed to allocate background pass shader-visible SRV");
     }
     device->CreateShaderResourceView(m_backgroundPassColor.Get(), &srvDesc, m_backgroundPassSrv.cpu);
+
+    // Temporal history (TAA lane increment 1, env-gated, default off): same
+    // desc as the color target so CopyResource is legal; the increment-2 blend
+    // pass renders into it, so keep the RENDER_TARGET flag.
+    const char* bgTemporalEnv = std::getenv("VENPOD_BG_TEMPORAL");
+    m_backgroundTemporalEnabled =
+        bgTemporalEnv != nullptr && bgTemporalEnv[0] != '0' && bgTemporalEnv[0] != '\0';
+    if (m_backgroundTemporalEnabled) {
+        hr = device->CreateCommittedResource(
+            &heapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &colorDesc,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            &colorClear,
+            IID_PPV_ARGS(&m_backgroundPassHistory));
+        if (FAILED(hr)) {
+            DestroyBackgroundPassResources();
+            return Error("Failed to create background temporal history: 0x{:08X}", hr);
+        }
+        m_backgroundPassHistory->SetName(L"BackgroundPassHistory");
+        m_backgroundPassHistoryState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        m_backgroundPassHistoryStagingSrv = m_heapManager.AllocateStagingCbvSrvUav();
+        if (!m_backgroundPassHistoryStagingSrv.IsValid()) {
+            DestroyBackgroundPassResources();
+            return Error("Failed to allocate background history staging SRV");
+        }
+        device->CreateShaderResourceView(
+            m_backgroundPassHistory.Get(), &srvDesc, m_backgroundPassHistoryStagingSrv.cpu);
+        m_backgroundPassHistorySrv =
+            m_heapManager.CopyToShaderVisible(device, m_backgroundPassHistoryStagingSrv);
+        if (!m_backgroundPassHistorySrv.IsValid()) {
+            DestroyBackgroundPassResources();
+            return Error("Failed to allocate background history shader-visible SRV");
+        }
+        device->CreateShaderResourceView(
+            m_backgroundPassHistory.Get(), &srvDesc, m_backgroundPassHistorySrv.cpu);
+    }
 
     D3D12_CLEAR_VALUE depthClear = {};
     depthClear.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;

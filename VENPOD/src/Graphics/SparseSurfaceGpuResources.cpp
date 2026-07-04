@@ -940,8 +940,10 @@ Result<void> SparseSurfaceGpuResources::CreateVertexIdStream(ID3D12Device* devic
 void SparseSurfaceGpuResources::BeginFrame(
     uint32_t frameIndex,
     uint64_t completedFenceValue,
-    uint64_t currentFrameFenceValue)
+    uint64_t currentFrameFenceValue,
+    uint64_t telemetryFrameIndex)
 {
+    m_currentTelemetryFrameIndex = telemetryFrameIndex;
     m_currentFrameFenceValue = currentFrameFenceValue;
     if (m_staticIaUploadComplete &&
         !m_staticIaUploadPending &&
@@ -2387,12 +2389,13 @@ bool SparseSurfaceGpuResources::StageDirtyPayloadSnapshot(
         m_stats.stagedBytesLastFrame >= 256u * 1024u ||
         copiedPayloadFaceCount >= 8192u) {
         spdlog::info(
-            "PERF_SPARSE_DIRTY_STAGE serial={} dirty={} removed={} zeroFace={} allocChanged={} "
+            "PERF_SPARSE_DIRTY_STAGE frame={} serial={} dirty={} removed={} zeroFace={} allocChanged={} "
             "copyBricks={} copyFaces={} fullCopyBricks={} fullCopyFaces={} patchBricks={} "
             "patchFaces={} patchRegions={} mirrorCmpBricks={} cleanMirrorBricks={} changedRuns={} "
             "changedRunFaces={} mirrorUpdateBricks={} mirrorUpdateFaces={} newBricks={} deferred={} "
             "rangeCopies={} drawCopies={} recordCopies={} clusterCopies={} metadataFull={} metadataIncr={} "
             "stagedMB={:.2f} setupMs={:.2f} removedMs={:.2f} dirtyLoopMs={:.2f} finalMs={:.2f} totalMs={:.2f}",
+            m_currentTelemetryFrameIndex,
             snapshot.serial,
             static_cast<uint32_t>(snapshot.dirtyBricks.size()),
             static_cast<uint32_t>(snapshot.removedBricks.size()),

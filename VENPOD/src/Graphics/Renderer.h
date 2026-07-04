@@ -38,6 +38,7 @@ struct RendererConfig {
     bool backgroundPassForceColor = false;
     bool backgroundPassCompositeDebug = false;
     bool backgroundPassCompositeForceColor = false;
+    bool backgroundPassForegroundMask = false;
     bool midPassEnabled = false;
     float midPassScale = 0.5f;
     bool sparseSurfaceDepthPrepass = false;
@@ -80,6 +81,7 @@ public:
         bool forceColor = false;
         bool compositeDebug = false;
         bool compositeForceColor = false;
+        bool foregroundMask = false;
     };
 
     BackgroundPassInfo GetBackgroundPassInfo() const;
@@ -285,6 +287,7 @@ private:
     Result<void> CreateSparseSurfacePipeline(ID3D12Device* device);
     Result<void> CreateOverlayPipeline(ID3D12Device* device);
     Result<void> CreateBackgroundCompositePipeline(ID3D12Device* device);
+    Result<void> CreateBackgroundTemporalPipeline(ID3D12Device* device);
     Result<void> CreateSparseSurfaceDrawCommandSignature(ID3D12Device* device);
     Result<void> CreateRTVsForSwapchain();
     Result<void> CreateDepthBuffer();
@@ -351,6 +354,24 @@ private:
     uint32_t m_backgroundPassWidth = 0;
     uint32_t m_backgroundPassHeight = 0;
     bool m_backgroundPassSurfaceRaymarchFillLastFrame = false;
+    // Temporal accumulation history for the background pass (TAA lane, env
+    // VENPOD_BG_TEMPORAL, default off). Increment 1: history buffer + per-frame
+    // copy of the fresh background (plumbing only — the reprojected blend pass
+    // replaces the copy in increment 2).
+    ComPtr<ID3D12Resource> m_backgroundPassHistory;
+    D3D12_RESOURCE_STATES m_backgroundPassHistoryState = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    DescriptorHandle m_backgroundPassHistoryStagingSrv;
+    DescriptorHandle m_backgroundPassHistorySrv;
+    bool m_backgroundTemporalEnabled = false;
+    // Increment 2: reprojected history blend pass over the fresh background.
+    DX12GraphicsPipeline m_backgroundTemporalPipeline;
+    CompiledShader m_backgroundTemporalPS;
+    float m_backgroundTemporalBlend = 0.85f;
+    // Previous frame's camera basis (pos+fov, fwd+aspect, right, up — same
+    // packing as the frame constants) for the reprojection root constants.
+    float m_backgroundPrevCamera[16] = {};
+    bool m_backgroundPrevCameraValid = false;
+    bool m_backgroundHistoryValid = false;
 
     // Low-resolution "mid" raymarch pass: rendered into a smaller color target
     // (alpha = mid coverage) then bilinear-upscale composited over the main RT,

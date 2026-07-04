@@ -82,7 +82,60 @@ param(
     # Raymarch render scale (the dominant FPS lever, since the frame is GPU-raymarch
     # bound). <1.0 renders the voxel raymarch at lower res then upscales: lower =
     # faster but softer. 0 = use the perf-mode default. e.g. -RenderScale 0.4
-    [double]$RenderScale = 0
+    [double]$RenderScale = 0,
+    # Isolated profiling knob: force the far/background split pass inside quality
+    # mode without changing the foreground raymarch render scale. This is not a
+    # default quality policy; use it to measure/visual-audit far-field products.
+    [double]$ExperimentalBackgroundPassScale = 0,
+    # Isolated profiling knob for the experimental background split: skip the
+    # near/surface fill path inside the low-res background pass. Defaults keep
+    # the existing perf-mode behavior unchanged.
+    [switch]$ExperimentalBackgroundPassNoSurfaceFill,
+    # Isolated profiling knob for the experimental background split: draw the
+    # foreground surface depth/stencil into the low-res background target so the
+    # background raymarch skips pixels already owned by raster surfaces.
+    [switch]$ExperimentalBackgroundPassForegroundMask,
+    # Isolated profiling knob for surface-tail work: cap only the broad/general
+    # pre-publish surface extraction pass. Terrain-critical and hidden-critical
+    # repair coordinates still run first under their existing budgets.
+    [int]$ExperimentalPrePublishGeneralSurfaceBudget = -1,
+    # Isolated profiling knob for edit/brush surface-tail work: while edits are
+    # active, cap only the broad/general pre-publish surface extraction pass.
+    [int]$ExperimentalPrePublishEditGeneralSurfaceBudget = -1,
+    # Isolated profiling knob for post-edit surface-tail work: after the edit
+    # active window, cap non-critical pre-publish surface extraction only when
+    # the frame-pressure threshold is exceeded. Ownership-critical visible/edit/
+    # collision surface work remains protected.
+    [int]$ExperimentalPrePublishPostEditGeneralSurfaceBudget = -1,
+    [int]$ExperimentalPrePublishPostEditGeneralSpillFrames = -1,
+    [double]$ExperimentalPrePublishPostEditGeneralSpillPressureMs = -1,
+    # Isolated profiling knob for edit/brush hidden-exact repair: cap the
+    # post-open screen probe time without changing startup proof.
+    [int]$ExperimentalHiddenExactPostOpenProbeMaxMsTenths = -1,
+    # Isolated profiling knob for edit/brush hidden-exact repair: cap post-open
+    # hidden-exact forced generation without changing startup safety.
+    [int]$ExperimentalHiddenExactPostOpenGenerationBudget = -1,
+    # Isolated profiling knob for edit/brush hidden-exact repair: cap post-open
+    # hidden-critical pre-publish surface work without changing startup safety.
+    [int]$ExperimentalHiddenExactPostOpenSurfaceBudget = -1,
+    # Isolated profiling knob for edit/brush hidden-exact tracked catchup: cap
+    # non-critical tracked pre-publish surface work after critical repair.
+    [int]$ExperimentalPrePublishHiddenTrackedSurfaceBudget = -1,
+    # Isolated profiling knob for mid-clipmap generation: override the
+    # perf-mode hard pump budget without changing the rest of the quality preset.
+    [double]$ExperimentalMidClipmapPumpHardBudgetMs = -1,
+    # Isolated profiling knob: allow async surface meshing during edits for coords
+    # whose local edit dependency neighborhood has no overlay.
+    [switch]$ExperimentalSurfaceAsyncPerCoordEditGate,
+    # Loop 86 surface work route: general (Visible/Speculative) surface catch-up
+    # prefers per-coord async enqueue over the blocking fork-join batch, gated per
+    # frame on async backlog + surface-ready publish backlog + page publish backlog.
+    # -1 = leave default (off), 0 = force off, 1 = force on.
+    [int]$ExperimentalSurfaceRouteGeneralAsync = -1,
+    [int]$ExperimentalSurfaceRouteAsyncBacklogLimit = -1,
+    [int]$ExperimentalSurfaceRoutePublishPendingLimit = -1,
+    [int]$ExperimentalSurfaceRoutePublishAgeLimit = -1,
+    [int]$ExperimentalSurfaceRoutePagePublishLimit = -1
 )
 
 $ErrorActionPreference = "Stop"
@@ -162,6 +215,10 @@ $savedEnv = @{
     VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_HIDDEN_EXACT_CLEAN_FRAMES = $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_HIDDEN_EXACT_CLEAN_FRAMES
     VENPOD_SPARSE_STARTUP_HIDDEN_EXACT_REPAIR_BLOCKS = $env:VENPOD_SPARSE_STARTUP_HIDDEN_EXACT_REPAIR_BLOCKS
     VENPOD_SPARSE_HIDDEN_EXACT_MISS_DURING_STARTUP = $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_DURING_STARTUP
+    VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_PROBE_MAX_MS_TENTHS = $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_PROBE_MAX_MS_TENTHS
+    VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_GENERATION_BUDGET = $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_GENERATION_BUDGET
+    VENPOD_SPARSE_REQUEST_EXPLICIT_SOURCE_LANES = $env:VENPOD_SPARSE_REQUEST_EXPLICIT_SOURCE_LANES
+    VENPOD_SPARSE_HIDDEN_EXACT_DEFER_PROACTIVE = $env:VENPOD_SPARSE_HIDDEN_EXACT_DEFER_PROACTIVE
     VENPOD_SPARSE_GPU_RAYCAST = $env:VENPOD_SPARSE_GPU_RAYCAST
     VENPOD_SPARSE_MISS_FEEDBACK = $env:VENPOD_SPARSE_MISS_FEEDBACK
     VENPOD_SPARSE_BRUSH_FEEDBACK = $env:VENPOD_SPARSE_BRUSH_FEEDBACK
@@ -214,20 +271,37 @@ $savedEnv = @{
     VENPOD_EXIT_AFTER_FRAMES = $env:VENPOD_EXIT_AFTER_FRAMES
     VENPOD_STREAMING_V2 = $env:VENPOD_STREAMING_V2
     VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS = $env:VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS
+    VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_REBUILD_RINGS_PER_FRAME = $env:VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_REBUILD_RINGS_PER_FRAME
     VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH = $env:VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH
     VENPOD_RAYMARCH_RENDER_SCALE = $env:VENPOD_RAYMARCH_RENDER_SCALE
     VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET = $env:VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET
     VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS = $env:VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS
     VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $env:VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS
     VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $env:VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS
+    VENPOD_SPARSE_PRE_PUBLISH_GENERAL_SURFACE_BUDGET = $env:VENPOD_SPARSE_PRE_PUBLISH_GENERAL_SURFACE_BUDGET
+    VENPOD_SPARSE_PRE_PUBLISH_EDIT_GENERAL_SURFACE_BUDGET = $env:VENPOD_SPARSE_PRE_PUBLISH_EDIT_GENERAL_SURFACE_BUDGET
+    VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SURFACE_BUDGET = $env:VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SURFACE_BUDGET
+    VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SPILL_FRAMES = $env:VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SPILL_FRAMES
+    VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SPILL_PRESSURE_MS = $env:VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SPILL_PRESSURE_MS
+    VENPOD_SPARSE_PRE_PUBLISH_STACKED_CLIPMAP_PREP_THRESHOLD_MS = $env:VENPOD_SPARSE_PRE_PUBLISH_STACKED_CLIPMAP_PREP_THRESHOLD_MS
+    VENPOD_SPARSE_PRE_PUBLISH_STACKED_GENERAL_SURFACE_BUDGET = $env:VENPOD_SPARSE_PRE_PUBLISH_STACKED_GENERAL_SURFACE_BUDGET
+    VENPOD_SPARSE_PRE_PUBLISH_HIDDEN_TRACKED_SURFACE_BUDGET = $env:VENPOD_SPARSE_PRE_PUBLISH_HIDDEN_TRACKED_SURFACE_BUDGET
+    VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_SURFACE_BUDGET = $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_SURFACE_BUDGET
+    VENPOD_SPARSE_SURFACE_ASYNC_PERCOORD_EDIT_GATE = $env:VENPOD_SPARSE_SURFACE_ASYNC_PERCOORD_EDIT_GATE
     VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE = $env:VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE
     VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE = $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE
     VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL = $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL
+    VENPOD_RAYMARCH_BACKGROUND_PASS_FOREGROUND_MASK = $env:VENPOD_RAYMARCH_BACKGROUND_PASS_FOREGROUND_MASK
     VENPOD_SPARSE_SURFACE_PARALLEL_EXTRACTION = $env:VENPOD_SPARSE_SURFACE_PARALLEL_EXTRACTION
     VENPOD_SPARSE_SURFACE_PARALLEL_TIME_BUDGETED = $env:VENPOD_SPARSE_SURFACE_PARALLEL_TIME_BUDGETED
     VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS = $env:VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS
     VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION = $env:VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION
     VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS = $env:VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS
+    VENPOD_SPARSE_SURFACE_ROUTE_GENERAL_ASYNC = $env:VENPOD_SPARSE_SURFACE_ROUTE_GENERAL_ASYNC
+    VENPOD_SPARSE_SURFACE_ROUTE_ASYNC_BACKLOG_LIMIT = $env:VENPOD_SPARSE_SURFACE_ROUTE_ASYNC_BACKLOG_LIMIT
+    VENPOD_SPARSE_SURFACE_ROUTE_PUBLISH_PENDING_LIMIT = $env:VENPOD_SPARSE_SURFACE_ROUTE_PUBLISH_PENDING_LIMIT
+    VENPOD_SPARSE_SURFACE_ROUTE_PUBLISH_AGE_LIMIT = $env:VENPOD_SPARSE_SURFACE_ROUTE_PUBLISH_AGE_LIMIT
+    VENPOD_SPARSE_SURFACE_ROUTE_PAGE_PUBLISH_LIMIT = $env:VENPOD_SPARSE_SURFACE_ROUTE_PAGE_PUBLISH_LIMIT
     VENPOD_SPARSE_EXACT_ASYNC_GENERATION = $env:VENPOD_SPARSE_EXACT_ASYNC_GENERATION
     VENPOD_SPARSE_EXACT_ASYNC_VISIBLE = $env:VENPOD_SPARSE_EXACT_ASYNC_VISIBLE
     VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE = $env:VENPOD_SPARSE_EXACT_ASYNC_PREFETCH_LANE
@@ -393,6 +467,10 @@ try {
     Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_HIDDEN_EXACT_BLOCKS -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_HIDDEN_EXACT_CLEAN_FRAMES -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_DURING_STARTUP -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_PROBE_MAX_MS_TENTHS -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_GENERATION_BUDGET -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_REQUEST_EXPLICIT_SOURCE_LANES -ErrorAction SilentlyContinue
+    Remove-Item env:VENPOD_SPARSE_HIDDEN_EXACT_DEFER_PROACTIVE -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_GPU_RAYCAST -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_MISS_FEEDBACK -ErrorAction SilentlyContinue
     Remove-Item env:VENPOD_SPARSE_BRUSH_FEEDBACK -ErrorAction SilentlyContinue
@@ -613,21 +691,41 @@ try {
     foreach ($pvName in @(
         "VENPOD_STREAMING_V2",
         "VENPOD_SPARSE_MID_CLIPMAP_PUMP_HARD_BUDGET_MS",
+        "VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_REBUILD_RINGS_PER_FRAME",
         "VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH",
+        "VENPOD_SPARSE_REQUEST_EXPLICIT_SOURCE_LANES",
+        "VENPOD_SPARSE_HIDDEN_EXACT_DEFER_PROACTIVE",
         "VENPOD_SPARSE_SURFACE_STRICT_TIME_BUDGET",
         "VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS",
         "VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS",
         "VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS",
+        "VENPOD_SPARSE_PRE_PUBLISH_GENERAL_SURFACE_BUDGET",
+        "VENPOD_SPARSE_PRE_PUBLISH_EDIT_GENERAL_SURFACE_BUDGET",
+        "VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SURFACE_BUDGET",
+        "VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SPILL_FRAMES",
+        "VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SPILL_PRESSURE_MS",
+        "VENPOD_SPARSE_PRE_PUBLISH_STACKED_CLIPMAP_PREP_THRESHOLD_MS",
+        "VENPOD_SPARSE_PRE_PUBLISH_STACKED_GENERAL_SURFACE_BUDGET",
+        "VENPOD_SPARSE_PRE_PUBLISH_HIDDEN_TRACKED_SURFACE_BUDGET",
+        "VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_SURFACE_BUDGET",
+        "VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_PROBE_MAX_MS_TENTHS",
+        "VENPOD_SPARSE_SURFACE_ASYNC_PERCOORD_EDIT_GATE",
         "VENPOD_RAYMARCH_RENDER_SCALE",
         "VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE",
         "VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE",
         "VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL",
+        "VENPOD_RAYMARCH_BACKGROUND_PASS_FOREGROUND_MASK",
         "VENPOD_SPARSE_SURFACE_PARALLEL_EXTRACTION",
         "VENPOD_SPARSE_SURFACE_PARALLEL_TIME_BUDGETED",
         "VENPOD_SPARSE_SURFACE_PARALLEL_MAX_WORKERS",
         "VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION",
         "VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS",
         "VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME",
+        "VENPOD_SPARSE_SURFACE_ROUTE_GENERAL_ASYNC",
+        "VENPOD_SPARSE_SURFACE_ROUTE_ASYNC_BACKLOG_LIMIT",
+        "VENPOD_SPARSE_SURFACE_ROUTE_PUBLISH_PENDING_LIMIT",
+        "VENPOD_SPARSE_SURFACE_ROUTE_PUBLISH_AGE_LIMIT",
+        "VENPOD_SPARSE_SURFACE_ROUTE_PAGE_PUBLISH_LIMIT",
         "VENPOD_SPARSE_SURFACE_EXTRACTION_BUDGET",
         "VENPOD_SPARSE_SURFACE_UPLOAD_MIN_INTERVAL_FRAMES",
         "VENPOD_SPARSE_SURFACE_COPY_FACE_BUDGET",
@@ -651,19 +749,40 @@ try {
         "VENPOD_SPARSE_MID_INTEREST_INTERVAL",
         "VENPOD_SPARSE_MID_CLIPMAP_FOOTPRINT_INTEREST_SIGNATURE",
         "VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE",
-        "VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE_MAX_AGE")) {
+        "VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_SIGNATURE_REUSE_MAX_AGE",
+        "VENPOD_SPARSE_HIDDEN_EXACT_MISS_PROBE_INTERVAL")) {
         Remove-Item "env:$pvName" -ErrorAction SilentlyContinue
     }
     if ($PerfMode -ne "none") {
         $quality = $PerfMode -eq "quality"
-        # quality mode = VISUAL CORRECTNESS first: fill coverage, full-res near+far,
-        # no GPU bandaids (fps is secondary). Other modes trade coverage/sharpness for fps.
+        # quality mode = visual correctness first. Exact foreground surfaces stay
+        # full-res; the far/background product is foreground-masked so it does
+        # not raymarch pixels already owned by raster surfaces.
         $bgScale = if ($PerfMode -eq "60fps") { "0.3" } else { "0.5" }  # far raymarch res
-        $pumpBudget = if ($quality) { "24" } elseif ($PerfMode -eq "60fps") { "16" } else { "12" }
+        $pumpBudget =
+            if ($ExperimentalMidClipmapPumpHardBudgetMs -ge 0) {
+                "{0:0.###}" -f $ExperimentalMidClipmapPumpHardBudgetMs
+            } elseif ($quality) {
+                "4"
+            } elseif ($PerfMode -eq "60fps") {
+                "16"
+            } else {
+                "12"
+            }
         $surfBudget = if ($quality) { "24" } elseif ($PerfMode -eq "60fps") { "4" } else { "8" }
-        $useBgPass = -not $quality   # quality renders the far field full-res (no blocky distance)
+        $qualityDefaultBackgroundMask = $quality -and $ExperimentalBackgroundPassScale -le 0
+        $useBgPass = (-not $quality) -or $qualityDefaultBackgroundMask
+        if ($ExperimentalBackgroundPassScale -gt 0) {
+            $bgScale = "{0:0.###}" -f ([Math]::Min(1.0, [Math]::Max(0.25, $ExperimentalBackgroundPassScale)))
+            $useBgPass = $true
+        }
         $env:VENPOD_STREAMING_V2 = "1"
         $env:VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH = "0"   # speculative; not needed under best-available
+        # After public render opens, keep forced hidden-exact generation/upload focused on
+        # current critical feedback instead of replaying the whole tracked history.
+        # Explicit source-lane request admission remains off until surface readiness is
+        # proven stable with it.
+        $env:VENPOD_SPARSE_HIDDEN_EXACT_DEFER_PROACTIVE = "1"
         # CPU caps: when MOVING, the mid-clipmap pump + surface meshing explode
         # (real play: clip hit ~99ms unbounded). Bound them; V2 best-available renders
         # the not-yet-generated terrain coarser instead of stalling. The old downside
@@ -674,6 +793,117 @@ try {
         $env:VENPOD_SPARSE_SURFACE_EXTRACTION_MAX_MS = $surfBudget
         $env:VENPOD_SPARSE_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $surfBudget
         $env:VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS = $surfBudget
+        if ($quality) {
+            # Loop 68: masked-background quality removes the raymarch floor; the
+            # remaining edit hitches came from hidden/general surface catch-up
+            # releasing in the same frame. Keep critical repair bounded and let
+            # broad surface debt spill instead of hitching.
+            if ($ExperimentalHiddenExactPostOpenSurfaceBudget -lt 0) {
+                $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_SURFACE_BUDGET = "8"
+            }
+            if ($ExperimentalPrePublishHiddenTrackedSurfaceBudget -lt 0) {
+                $env:VENPOD_SPARSE_PRE_PUBLISH_HIDDEN_TRACKED_SURFACE_BUDGET = "0"
+            }
+            if ($ExperimentalPrePublishEditGeneralSurfaceBudget -lt 0) {
+                # Loop 88: was "0" (protect edit frames when extraction was all
+                # inline). Zero starved the stroke's OWN bricks: their surfaces
+                # never meshed, the surface-ready gate blocked their publishes,
+                # and edits only rendered after release. With the per-coord edit
+                # gate + async routing, edit-window general extraction is mostly
+                # cheap async ENQUEUE, so a real budget is frame-safe.
+                $env:VENPOD_SPARSE_PRE_PUBLISH_EDIT_GENERAL_SURFACE_BUDGET = "48"
+            }
+            if ($ExperimentalPrePublishPostEditGeneralSurfaceBudget -lt 0) {
+                $env:VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SURFACE_BUDGET = "0"
+            }
+            if ($ExperimentalPrePublishPostEditGeneralSpillFrames -lt 0) {
+                $env:VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SPILL_FRAMES = "180"
+            }
+            if ($ExperimentalPrePublishPostEditGeneralSpillPressureMs -lt 0) {
+                $env:VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SPILL_PRESSURE_MS = "15"
+            }
+            if ($ExperimentalHiddenExactPostOpenProbeMaxMsTenths -lt 0) {
+                $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_PROBE_MAX_MS_TENTHS = "8"
+            }
+            if ($ExperimentalPrePublishGeneralSurfaceBudget -lt 0) {
+                $env:VENPOD_SPARSE_PRE_PUBLISH_GENERAL_SURFACE_BUDGET = "24"
+            }
+            $env:VENPOD_SPARSE_PRE_PUBLISH_STACKED_CLIPMAP_PREP_THRESHOLD_MS = "3"
+            $env:VENPOD_SPARSE_PRE_PUBLISH_STACKED_GENERAL_SURFACE_BUDGET = "8"
+            $env:VENPOD_SPARSE_MID_CLIPMAP_VOXEL_INTEREST_REBUILD_RINGS_PER_FRAME = "1"
+            # Loop 86 promoted default: route general (Visible/Speculative) surface
+            # catch-up to the async mesher instead of the blocking fork-join batch,
+            # gated per frame on async backlog + surface-ready publish backlog +
+            # page publish backlog (limits 512/192/8/256 are code defaults).
+            # Measured: walk 11.02/15.77/17.71 -> 7.55/11.42/14.54; edit p95
+            # 13.89 -> 12.05; idle/yaw improved; correctness clean; repeats held.
+            if ($ExperimentalSurfaceRouteGeneralAsync -lt 0) {
+                $env:VENPOD_SPARSE_SURFACE_ROUTE_GENERAL_ASYNC = "1"
+            }
+        }
+        if ($ExperimentalPrePublishGeneralSurfaceBudget -ge 0) {
+            $env:VENPOD_SPARSE_PRE_PUBLISH_GENERAL_SURFACE_BUDGET = "$ExperimentalPrePublishGeneralSurfaceBudget"
+        }
+        if ($ExperimentalPrePublishEditGeneralSurfaceBudget -ge 0) {
+            $env:VENPOD_SPARSE_PRE_PUBLISH_EDIT_GENERAL_SURFACE_BUDGET = "$ExperimentalPrePublishEditGeneralSurfaceBudget"
+        }
+        if ($ExperimentalPrePublishPostEditGeneralSurfaceBudget -ge 0) {
+            $env:VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SURFACE_BUDGET = "$ExperimentalPrePublishPostEditGeneralSurfaceBudget"
+        }
+        if ($ExperimentalPrePublishPostEditGeneralSpillFrames -ge 0) {
+            $env:VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SPILL_FRAMES = "$ExperimentalPrePublishPostEditGeneralSpillFrames"
+        }
+        if ($ExperimentalPrePublishPostEditGeneralSpillPressureMs -ge 0) {
+            $env:VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SPILL_PRESSURE_MS =
+                "{0:0.###}" -f $ExperimentalPrePublishPostEditGeneralSpillPressureMs
+        }
+        if ($ExperimentalHiddenExactPostOpenProbeMaxMsTenths -ge 0) {
+            $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_PROBE_MAX_MS_TENTHS = "$ExperimentalHiddenExactPostOpenProbeMaxMsTenths"
+        }
+        if ($ExperimentalHiddenExactPostOpenGenerationBudget -ge 0) {
+            $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_GENERATION_BUDGET = "$ExperimentalHiddenExactPostOpenGenerationBudget"
+        }
+        if ($ExperimentalHiddenExactPostOpenSurfaceBudget -ge 0) {
+            $env:VENPOD_SPARSE_HIDDEN_EXACT_MISS_POST_OPEN_SURFACE_BUDGET = "$ExperimentalHiddenExactPostOpenSurfaceBudget"
+        }
+        if ($ExperimentalPrePublishHiddenTrackedSurfaceBudget -ge 0) {
+            $env:VENPOD_SPARSE_PRE_PUBLISH_HIDDEN_TRACKED_SURFACE_BUDGET = "$ExperimentalPrePublishHiddenTrackedSurfaceBudget"
+        }
+        if ($ExperimentalSurfaceAsyncPerCoordEditGate) {
+            $env:VENPOD_SPARSE_SURFACE_ASYNC_PERCOORD_EDIT_GATE = "1"
+        }
+        # Loop 91: cap per-frame surface payload copy staging. The default (1M faces)
+        # let a recenter wave stage a 222k-face upload in ONE frame (= the measured
+        # 39ms spike class at exploration speed). 96k spreads such waves over ~3
+        # frames; the copy path is budget-aware/retry-safe by design.
+        if (-not $env:VENPOD_SPARSE_SURFACE_COPY_FACE_BUDGET) {
+            $env:VENPOD_SPARSE_SURFACE_COPY_FACE_BUDGET = "98304"
+        }
+        # Loop 88 promoted default: per-coord edit gate ON in quality. During a brush
+        # stroke the global edit gate rejected ALL async meshing, so the stroke's
+        # flood of ordinary visible bricks fell to ~0-8/frame inline extraction,
+        # their publishes starved behind the surface-ready gate, and edits rendered
+        # only after release ("all appears at once"). The per-coord gate keeps only
+        # edit-overlapping bricks inline; everything else meshes on the worker pool.
+        if (-not $env:VENPOD_SPARSE_SURFACE_ASYNC_PERCOORD_EDIT_GATE) {
+            $env:VENPOD_SPARSE_SURFACE_ASYNC_PERCOORD_EDIT_GATE = "1"
+        }
+        # Loop 86 surface work route (opt-in probe; code default is OFF):
+        if ($ExperimentalSurfaceRouteGeneralAsync -ge 0) {
+            $env:VENPOD_SPARSE_SURFACE_ROUTE_GENERAL_ASYNC = "$ExperimentalSurfaceRouteGeneralAsync"
+        }
+        if ($ExperimentalSurfaceRouteAsyncBacklogLimit -ge 0) {
+            $env:VENPOD_SPARSE_SURFACE_ROUTE_ASYNC_BACKLOG_LIMIT = "$ExperimentalSurfaceRouteAsyncBacklogLimit"
+        }
+        if ($ExperimentalSurfaceRoutePublishPendingLimit -ge 0) {
+            $env:VENPOD_SPARSE_SURFACE_ROUTE_PUBLISH_PENDING_LIMIT = "$ExperimentalSurfaceRoutePublishPendingLimit"
+        }
+        if ($ExperimentalSurfaceRoutePublishAgeLimit -ge 0) {
+            $env:VENPOD_SPARSE_SURFACE_ROUTE_PUBLISH_AGE_LIMIT = "$ExperimentalSurfaceRoutePublishAgeLimit"
+        }
+        if ($ExperimentalSurfaceRoutePagePublishLimit -ge 0) {
+            $env:VENPOD_SPARSE_SURFACE_ROUTE_PAGE_PUBLISH_LIMIT = "$ExperimentalSurfaceRoutePagePublishLimit"
+        }
         # Fire-and-forget ASYNC surface meshing: surface extraction (~20ms median while
         # moving) runs on a worker pool OFF the main thread, results applied within a
         # per-frame budget. This is the clean async producer (the old fork-join parallel
@@ -763,6 +993,10 @@ try {
         if (-not $env:VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION) {
             $env:VENPOD_SPARSE_MID_CLIPMAP_GPU_GENERATION = "1"
         }
+        # Hidden-exact probe cadence: interval 3 was promoted on a real-aim A/B
+        # (Loop 102) then DEMOTED on the deterministic lane (Loop 105 — interval
+        # 1 equal-or-better in both pairs; the original win was workload luck).
+        # Engine default (1) applies; env still overridable for experiments.
         # Mid overlay pass: no longer forced here. The launcher decides the default
         # (OFF when the mesh-mid raster owns the band -- its default -- ON for the
         # legacy raymarch-mid path). An explicit VENPOD_RAYMARCH_MID_PASS_ENABLE in
@@ -794,7 +1028,13 @@ try {
         if ($useBgPass) {
             $env:VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE = "1"
             $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE = $bgScale
-            $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL = "1"
+            $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL =
+                if ($qualityDefaultBackgroundMask -or
+                    ($ExperimentalBackgroundPassNoSurfaceFill -and $ExperimentalBackgroundPassScale -gt 0)) { "0" } else { "1" }
+            if ($qualityDefaultBackgroundMask -or
+                ($ExperimentalBackgroundPassForegroundMask -and $ExperimentalBackgroundPassScale -gt 0)) {
+                $env:VENPOD_RAYMARCH_BACKGROUND_PASS_FOREGROUND_MASK = "1"
+            }
         }
         # Foreground raymarch (uncovered near/mid terrain) is the other half of the GPU
         # cost; render scale lowers it. -RenderScale overrides the per-mode default.
@@ -808,7 +1048,14 @@ try {
             $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_MAX_FRAME = "120"
             $env:VENPOD_SPARSE_STARTUP_PUBLIC_RENDER_FAIL_OPEN_AT_MAX_FRAME = "1"
         }
-        if ($quality) {
+        if ($quality -and ($qualityDefaultBackgroundMask -or $ExperimentalBackgroundPassScale -gt 0)) {
+            $surfaceFillInfo =
+                if ($qualityDefaultBackgroundMask -or $ExperimentalBackgroundPassNoSurfaceFill) { "off" } else { "on" }
+            $foregroundMaskInfo =
+                if ($qualityDefaultBackgroundMask -or $ExperimentalBackgroundPassForegroundMask) { "on" } else { "off" }
+            $bgModeInfo = if ($qualityDefaultBackgroundMask) { "foreground-masked far/background pass" } else { "experimental far/background pass" }
+            Write-Info "Perf mode: quality + $bgModeInfo scale $bgScale (foreground scale $rayScale, surface fill $surfaceFillInfo, foreground mask $foregroundMaskInfo)"
+        } elseif ($quality) {
             Write-Info "Perf mode: quality (visual-first: full coverage pump ${pumpBudget}ms, async producers, full-res near+far; fps secondary)"
         } else {
             Write-Info "Perf mode: $PerfMode (V2 best-available + low-res far background pass $bgScale + foreground render scale $rayScale)"

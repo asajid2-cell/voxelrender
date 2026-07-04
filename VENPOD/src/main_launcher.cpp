@@ -1078,6 +1078,8 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_RAYMARCH_BACKGROUND_PASS_COMPOSITE_DEBUG", 0u) != 0u;
     const bool backgroundPassCompositeForceColor =
         ReadUIntEnv("VENPOD_RAYMARCH_BACKGROUND_PASS_COMPOSITE_FORCE_COLOR", 0u) != 0u;
+    const bool backgroundPassForegroundMask =
+        ReadUIntEnv("VENPOD_RAYMARCH_BACKGROUND_PASS_FOREGROUND_MASK", 0u) != 0u;
     // The 0.5-scale mid-only overlay pass is REDUNDANT when the mesh-mid raster owns the
     // band (mesh writes ownership stencil; the mid composite's EQUAL-0 test skips those
     // pixels, so the overlay can neither show nor improve them). Default: off when the
@@ -1107,7 +1109,7 @@ int RunSandbox(int argc, char* argv[]) {
         renderQualityPreset.empty() ? "default" : renderQualityPreset.c_str(),
         explicitRaymarchRenderScale ? 1 : 0);
     spdlog::info(
-        "RAYMARCH_BACKGROUND_PASS_CONFIG enableRequested={} active={} scale={:.3f} explicitScale={} surfaceFill={} surfaceFillHighAltOnly={} surfaceFillWaterProof={} surfaceFillExactRepair={} clearProbe={} forceColor={} compositeDebug={} compositeForceColor={} foreground={}x{} background={}x{}",
+        "RAYMARCH_BACKGROUND_PASS_CONFIG enableRequested={} active={} scale={:.3f} explicitScale={} surfaceFill={} surfaceFillHighAltOnly={} surfaceFillWaterProof={} surfaceFillExactRepair={} foregroundMask={} clearProbe={} forceColor={} compositeDebug={} compositeForceColor={} foreground={}x{} background={}x{}",
         backgroundPassEnableRequested ? 1 : 0,
         backgroundPassActive ? 1 : 0,
         backgroundPassScale,
@@ -1116,6 +1118,7 @@ int RunSandbox(int argc, char* argv[]) {
         backgroundPassSurfaceRaymarchFillHighAltOnly ? 1 : 0,
         backgroundPassSurfaceFillWaterProofRequested ? 1 : 0,
         backgroundPassSurfaceFillExactRepairRequested ? 1 : 0,
+        backgroundPassForegroundMask ? 1 : 0,
         backgroundPassClearProbe ? 1 : 0,
         backgroundPassForceColor ? 1 : 0,
         backgroundPassCompositeDebug ? 1 : 0,
@@ -1158,6 +1161,7 @@ int RunSandbox(int argc, char* argv[]) {
     rendererConfig.backgroundPassForceColor = backgroundPassForceColor;
     rendererConfig.backgroundPassCompositeDebug = backgroundPassCompositeDebug;
     rendererConfig.backgroundPassCompositeForceColor = backgroundPassCompositeForceColor;
+    rendererConfig.backgroundPassForegroundMask = backgroundPassForegroundMask;
     rendererConfig.midPassEnabled = midPassEnableRequested;
     rendererConfig.midPassScale = midPassScale;
     rendererConfig.sparseSurfaceDepthPrepass = sparseSurfaceDepthPrepass;
@@ -1339,6 +1343,12 @@ int RunSandbox(int argc, char* argv[]) {
     sparseWorldConfig.asyncSurfaceExtraction =
         sparseBackendRequested &&
         ReadUIntEnv("VENPOD_SPARSE_SURFACE_ASYNC_EXTRACTION", 0u) != 0u;
+    sparseWorldConfig.asyncSurfaceExtractionPerCoordEditGate =
+        ReadUIntEnv("VENPOD_SPARSE_SURFACE_ASYNC_PERCOORD_EDIT_GATE", 0u) != 0u;
+    // Loop 90: edited bricks are evictable (durable edits re-apply on regen);
+    // 0 restores the old permanent pin for A/B.
+    sparseWorldConfig.evictPersistentEditedBricks =
+        ReadUIntEnv("VENPOD_SPARSE_EVICT_EDITED_BRICKS", 1u) != 0u;
     sparseWorldConfig.asyncSurfaceExtractionMaxWorkers =
         ReadUIntEnv(
             "VENPOD_SPARSE_SURFACE_ASYNC_MAX_WORKERS",
@@ -1351,6 +1361,20 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv(
             "VENPOD_SPARSE_SURFACE_ASYNC_MAX_APPLY_PER_FRAME",
             sparseWorldConfig.asyncSurfaceExtractionMaxApplyPerFrame);
+    // Surface work route (Loop 86): prefer per-coord async enqueue over the blocking
+    // fork-join batch for general surface catch-up, gated per frame on async backlog
+    // and the surface-ready publish deferral backlog (the Loop 84 Probe A failure).
+    const bool sparseSurfaceRouteGeneralAsync =
+        sparseBackendRequested &&
+        ReadUIntEnv("VENPOD_SPARSE_SURFACE_ROUTE_GENERAL_ASYNC", 0u) != 0u;
+    const uint32_t sparseSurfaceRouteAsyncBacklogLimit =
+        ReadUIntEnv("VENPOD_SPARSE_SURFACE_ROUTE_ASYNC_BACKLOG_LIMIT", 512u);
+    const uint32_t sparseSurfaceRoutePublishPendingLimit =
+        ReadUIntEnv("VENPOD_SPARSE_SURFACE_ROUTE_PUBLISH_PENDING_LIMIT", 192u);
+    const uint32_t sparseSurfaceRoutePublishAgeLimit =
+        ReadUIntEnv("VENPOD_SPARSE_SURFACE_ROUTE_PUBLISH_AGE_LIMIT", 8u);
+    const uint32_t sparseSurfaceRoutePagePublishLimit =
+        ReadUIntEnv("VENPOD_SPARSE_SURFACE_ROUTE_PAGE_PUBLISH_LIMIT", 256u);
     sparseWorldConfig.persistentTerrainColumnCache =
         sparseBackendRequested &&
         ReadUIntEnv("VENPOD_SPARSE_TERRAIN_COLUMN_CACHE_PERSISTENT", 0u) != 0u;
@@ -1507,6 +1531,16 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_SPARSE_VIEW_FOLLOW_TRIM_BUDGET", 256u);
     const uint32_t sparseViewFollowTrimScanBudget =
         ReadUIntEnv("VENPOD_SPARSE_VIEW_FOLLOW_TRIM_SCAN_BUDGET", 8192u);
+    // SIEGE3 ROOT-CAUSE FIX (proven causal): the view-follow stale trim sheds resident
+    // bricks by pure recency (lastTouchedFrame < frame-staleFrames). At a STATIONARY camera
+    // the per-frame request replay does not re-touch fully-resident visible terrain, so it
+    // ages past the window and is evicted with a near-empty pool -> re-requested -> regenerated
+    // a slightly different surface = the visible "terrain keeps regenerating at rest" bug.
+    // With a stationary camera there is NO flown-past terrain, so the trim has no useful job;
+    // skip it while stationary (proven: VENPOD_SPARSE_VIEW_FOLLOW_TRIM=0 eliminates the churn,
+    // and stationary is a strict subset of that). Set =1 to restore the old always-trim behavior.
+    const bool sparseViewFollowTrimWhileStationary =
+        ReadUIntEnv("VENPOD_SPARSE_VIEW_FOLLOW_TRIM_WHILE_STATIONARY", 0u) != 0u;
     const uint32_t sparsePressureTrimBudget =
         ReadUIntEnv("VENPOD_SPARSE_PRESSURE_TRIM_BUDGET", sparseTrimBudget);
     const bool sparsePressureTrimFreePageGuard =
@@ -1900,6 +1934,10 @@ int RunSandbox(int argc, char* argv[]) {
         3.1415926535f / 180.0f;
     const float sparseWalkTestFixedDt = static_cast<float>(
         ReadUIntEnv("VENPOD_SPARSE_WALK_TEST_FIXED_DT_MS", 0u)) / 1000.0f;
+    const bool sparseWalkTestAbsoluteYawFrame =
+        enableSparseWalkTest &&
+        sparseWalkTestFixedDt > 0.0f &&
+        ReadUIntEnv("VENPOD_SPARSE_WALK_TEST_ABSOLUTE_YAW_FRAME", 0u) != 0u;
     const bool enableSparseWalkAutoSteer =
         enableSparseWalkTest && ReadUIntEnv("VENPOD_SPARSE_WALK_AUTO_STEER", 0u) != 0u;
     const float sparseWalkAutoSteerLookahead =
@@ -2483,6 +2521,38 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_SPARSE_STARTUP_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS", 40u));
     const float sparsePostOpenPrePublishSurfaceExtractionMaxMs = static_cast<float>(
         ReadUIntEnv("VENPOD_SPARSE_POST_OPEN_PRE_PUBLISH_SURFACE_EXTRACTION_MAX_MS", 40u));
+    const uint32_t sparsePrePublishGeneralSurfaceBudget =
+        ReadUIntEnv(
+            "VENPOD_SPARSE_PRE_PUBLISH_GENERAL_SURFACE_BUDGET",
+            std::numeric_limits<uint32_t>::max());
+    const uint32_t sparsePrePublishEditGeneralSurfaceBudget =
+        ReadUIntEnv(
+            "VENPOD_SPARSE_PRE_PUBLISH_EDIT_GENERAL_SURFACE_BUDGET",
+            std::numeric_limits<uint32_t>::max());
+    const uint32_t sparsePrePublishPostEditGeneralSurfaceBudget =
+        ReadUIntEnv(
+            "VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SURFACE_BUDGET",
+            std::numeric_limits<uint32_t>::max());
+    const uint32_t sparsePrePublishPostEditGeneralSpillFrames =
+        ReadUIntEnv(
+            "VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SPILL_FRAMES",
+            0u);
+    const float sparsePrePublishPostEditGeneralSpillPressureMs =
+        ReadFloatEnv(
+            "VENPOD_SPARSE_PRE_PUBLISH_POST_EDIT_GENERAL_SPILL_PRESSURE_MS",
+            16.0f);
+    const float sparsePrePublishStackedClipmapPrepThresholdMs =
+        ReadFloatEnv(
+            "VENPOD_SPARSE_PRE_PUBLISH_STACKED_CLIPMAP_PREP_THRESHOLD_MS",
+            0.0f);
+    const uint32_t sparsePrePublishStackedGeneralSurfaceBudget =
+        ReadUIntEnv(
+            "VENPOD_SPARSE_PRE_PUBLISH_STACKED_GENERAL_SURFACE_BUDGET",
+            std::numeric_limits<uint32_t>::max());
+    const uint32_t sparsePrePublishHiddenTrackedSurfaceBudget =
+        ReadUIntEnv(
+            "VENPOD_SPARSE_PRE_PUBLISH_HIDDEN_TRACKED_SURFACE_BUDGET",
+            std::numeric_limits<uint32_t>::max());
     const uint32_t sparsePhysicsBrickBudget =
         ReadUIntEnv("VENPOD_SPARSE_PHYSICS_BRICK_BUDGET", 8u);
     const uint32_t sparsePhysicsMoveBudget =
@@ -2652,6 +2722,11 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_SPARSE_SURFACE_FULL_CATCHUP_EDIT_IDLE_FRAMES", 30u);
     uint64_t sparseSurfaceCatchupLastEditRevision = 0;
     uint64_t sparseSurfaceCatchupLastEditFrame = 0;
+    // Live stroke window for the mid-mesh edit suppression (Loop 87 addendum):
+    // while a stroke is active the mesh suppresses whole edit columns so the
+    // raymarch renders the live stroke; on window close the edited height tiles
+    // are re-queued so the Y-aware rule heals the mesh over air-stroke columns.
+    bool sparseMidMeshEditStrokeLive = false;
     uint32_t sparseSurfaceUploadedSerial = 0;
     bool sparseSurfaceUploadedCullValid = false;
     uint64_t sparseSurfaceLastCullFrame = 0;
@@ -2876,6 +2951,13 @@ int RunSandbox(int argc, char* argv[]) {
     sparseClipmapConfig.enableGpuMidEditBake =
         sparseClipmapConfig.enableGpuMidVoxelGeneration &&
         ReadUIntEnv("VENPOD_MID_EDIT_BAKE", 1u) != 0u;
+    // Edit-invalidated mid-brick regen budget (PumpEditedBrickRegens). Default 2:
+    // on the CPU path a regen is ~2.5ms (2/frame caps the hitch); under the GPU
+    // bake the pump CLEARS the brick's samples and the refill lands only when the
+    // gen pass runs, so pumping MORE per frame WIDENS the mid-stroke miss window
+    // (measured: budget 16 -> frame300 carve void 17,633 blue px vs 5,078 at 2).
+    const uint32_t sparseMidEditRegenBudget = ReadUIntEnv(
+        "VENPOD_SPARSE_EDIT_MID_REGEN_BUDGET", 2u);
     // Phase 2: GROW the detailed mid-voxel render-distance bubble when GPU sample
     // generation is on. The CPU pump no longer pays the per-voxel fill (skip in
     // GenerateVoxelBrickPayload), so the bottleneck is no longer generation — it's
@@ -3302,7 +3384,7 @@ int RunSandbox(int argc, char* argv[]) {
         // Same for the voxel world's RefreshStats (fired ~84x/frame from bookkeeping).
         sparseVoxelWorld.SetStatsRefreshOncePerFrame(true);
         spdlog::info(
-            "Sparse mid clipmap {}: start={:.0f} end={:.0f} cell={:.0f} rings={} tileRadius={} tileSide={} maxTiles={} voxelSlots={} voxelInterest={}pct motion={}x@{:.0f} interestInterval={} footprintSignature={} voxelInterestReuse={}/{} backlogAware={} pumpBudgetMs={:.2f} drainDiag={} fallbackClassifier={} fallbackContractDiag={} farSvoFallbackProof={} asyncNoncritical={} asyncVisibleCritical={} parallelPump={} persistentParallelPump={} parallelPumpWorkers={} parallelPumpMin={} sharedColumnCache={} directFootprint={} parallelWorkerColumnCache={} budget={}",
+            "Sparse mid clipmap {}: start={:.0f} end={:.0f} cell={:.0f} rings={} tileRadius={} tileSide={} maxTiles={} voxelSlots={} voxelInterest={}pct motion={}x@{:.0f} interestInterval={} footprintSignature={} voxelInterestReuse={}/{} backlogAware={} pumpBudgetMs={:.2f} hardBudgetMs={:.2f} drainDiag={} fallbackClassifier={} fallbackContractDiag={} farSvoFallbackProof={} asyncNoncritical={} asyncVisibleCritical={} parallelPump={} persistentParallelPump={} parallelPumpWorkers={} parallelPumpMin={} sharedColumnCache={} directFootprint={} parallelWorkerColumnCache={} budget={}",
             sparseClipmapPolicy.IsEnabled() ? "enabled" : "disabled",
             sparseClipmapPolicy.Config().startDistance,
             sparseClipmapPolicy.Config().endDistance,
@@ -3321,6 +3403,7 @@ int RunSandbox(int argc, char* argv[]) {
             sparseClipmapPolicy.Config().voxelInterestSignatureReuseMaxAgeFrames,
             sparseClipmapPolicy.Config().backlogAwarePump ? 1 : 0,
             sparseClipmapPolicy.Config().pumpBudgetMs,
+            sparseClipmapPolicy.Config().voxelPumpHardBudgetMs,
             sparseClipmapPolicy.Config().drainReuseDiagnostics ? 1 : 0,
             sparseClipmapPolicy.Config().fallbackValidityClassifier ? 1 : 0,
             sparseClipmapPolicy.Config().fallbackContractDiagnostics ? 1 : 0,
@@ -3336,6 +3419,15 @@ int RunSandbox(int argc, char* argv[]) {
             sparseClipmapPolicy.Config().parallelWorkerColumnCache ? 1 : 0,
             sparseMidClipmapTileBudget);
     }
+    spdlog::info(
+        "Sparse surface work route config: routeGeneralAsync={} asyncBacklogLimit={} "
+        "publishPendingLimit={} publishAgeLimit={} pagePublishLimit={} asyncExtraction={}",
+        sparseSurfaceRouteGeneralAsync ? 1 : 0,
+        sparseSurfaceRouteAsyncBacklogLimit,
+        sparseSurfaceRoutePublishPendingLimit,
+        sparseSurfaceRoutePublishAgeLimit,
+        sparseSurfaceRoutePagePublishLimit,
+        sparseWorldConfig.asyncSurfaceExtraction ? 1 : 0);
 
     // DEV-ONLY (VENPOD_GPU_MIDGEN_POC): Phase-0 proof-of-concept that a compute
     // shader can generate a mid-voxel LOD brick byte-identically to the CPU
@@ -4340,10 +4432,15 @@ int RunSandbox(int argc, char* argv[]) {
     // world directions (degrees; 0 = +X "north").
     float cameraYaw = static_cast<float>(ReadIntEnv("VENPOD_CAMERA_INITIAL_YAW_DEG", 0)) *
                       3.1415926535f / 180.0f;
+    float sparseWalkTestInitialYaw = cameraYaw;
 
     // Player physics for walking on terrain
     float cameraVelocityY = 0.0f;  // Vertical velocity for gravity
     const float gravity = -50.0f;  // Gravity acceleration (units/s^2)
+    // Jump feel (Loop 91): coyote window + press buffer so terrace-edge grounding
+    // flicker cannot eat jump inputs.
+    float sparseJumpCoyoteAgeSeconds = 999.0f;
+    float sparseJumpBufferAgeSeconds = 999.0f;
     const float playerHeight = 6.0f;  // Player eye height above ground (voxels)
     const float stepHeight = 2.5f;  // Max step height for climbing (voxels)
     const float playerRadius =
@@ -4435,6 +4532,7 @@ int RunSandbox(int argc, char* argv[]) {
                     scenicSpawn.groundY);
             }
         }
+        sparseWalkTestInitialYaw = cameraYaw;
 
         if (enableSparseTerrainScreenCriticalPrefetch &&
             ReadUIntEnv("VENPOD_SPARSE_STARTUP_SCREEN_CRITICAL_PREWARM", 1u) != 0u &&
@@ -5223,7 +5321,17 @@ int RunSandbox(int argc, char* argv[]) {
     float perfSparseRequestDiagnosticSeedMs = 0.0f;
     float perfSparseRequestMissFeedbackMs = 0.0f;
     float perfSparseRequestHiddenExactMs = 0.0f;
+    float perfSparseRequestHiddenExactWaterProbeMs = 0.0f;
+    float perfSparseRequestHiddenExactGeneralProbeMs = 0.0f;
+    float perfSparseRequestHiddenExactCandidatesMs = 0.0f;
+    float perfSparseRequestHiddenExactAuditMs = 0.0f;
     float perfSparseGenerationPrepMs = 0.0f;
+    float perfSparseGenerationLoopsMs = 0.0f;
+    float perfSparseGenerationPumpMs = 0.0f;
+    float perfSparseGenerationFlushMs = 0.0f;
+    uint32_t perfSparseGenerationTerrainCriticalGenerated = 0u;
+    uint32_t perfSparseGenerationHiddenExactGenerated = 0u;
+    uint32_t perfSparseGenerationHiddenExactTracked = 0u;
     float perfSparseClipmapPrepMs = 0.0f;
     float perfSparseClipmapInterestMs = 0.0f;
     float perfSparseClipmapBudgetMs = 0.0f;
@@ -5304,6 +5412,7 @@ int RunSandbox(int argc, char* argv[]) {
     float perfPostGenerationMsLastFrame = 0.0f;
     float perfInputEndMsLastFrame = 0.0f;
     float perfFrameBodyMsLastFrame = 0.0f;
+    float perfFrameBodyMsForRaw = 0.0f;
     float schedulerPredictedFrameMs = 16.67f;
     float schedulerFrameDebtMs = 0.0f;
     float schedulerBudgetPressureMs = 16.67f;
@@ -5805,6 +5914,13 @@ int RunSandbox(int argc, char* argv[]) {
     uint32_t sparseSurfaceReadyPublishScannedLastFrame = 0;
     uint32_t sparseSurfaceReadyPublishPendingLastFrame = 0;
     uint32_t sparseSurfaceReadyPublishOldestAgeLastFrame = 0;
+    // Surface work route (Loop 86): per-frame scheduler decision + last-frame state
+    // for hysteresis and PERF_WAITSPLIT telemetry.
+    bool sparseSurfaceRoutePreferAsyncLastFrame = false;
+    bool sparseSurfaceRouteAsyncSaturatedLastFrame = false;
+    bool sparseSurfaceRoutePublishSaturatedLastFrame = false;
+    uint32_t sparseSurfaceRouteAsyncQueueDepthLastFrame = 0;
+    uint32_t sparseSurfaceRouteAsyncResultDepthLastFrame = 0;
     uint32_t sparseBrushFeedbackLastAppliedFrame = 0;
     std::deque<Simulation::BrickCoord> sparseBrushFeedbackMissingResidentRequestQueue;
     std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash>
@@ -6166,26 +6282,6 @@ int RunSandbox(int argc, char* argv[]) {
             }
             return snapshot;
         };
-    auto applySparseSurfaceReadyPublishPressure =
-        [&](Simulation::SparseRuntimeBudgetInput& input,
-            const SparseSurfaceReadyPublishPressureSnapshot& snapshot) {
-            if (!enableSparseSurfaceReadyPublishQueue ||
-                !enableSparseSurfaceReadyPublishPressure ||
-                snapshot.pending == 0u) {
-                return;
-            }
-            input.hasQueueBacklog = true;
-            input.visibleQueuedBricks =
-                input.visibleQueuedBricks > UINT32_MAX - snapshot.pending
-                    ? UINT32_MAX
-                    : input.visibleQueuedBricks + snapshot.pending;
-            input.pagePublishReadyQueued =
-                input.pagePublishReadyQueued > UINT32_MAX - snapshot.pending
-                    ? UINT32_MAX
-                    : input.pagePublishReadyQueued + snapshot.pending;
-            input.pagePublishMaxReadyFrameLag =
-                std::max(input.pagePublishMaxReadyFrameLag, snapshot.oldestAge);
-        };
     float boundaryTestElapsedSeconds = 0.0f;
     float sparseStressCameraElapsedSeconds = 0.0f;
     glm::vec3 sparseStressCameraOrigin = cameraPos;
@@ -6410,6 +6506,53 @@ int RunSandbox(int argc, char* argv[]) {
             perfLoopTailMsLastFrame =
                 ticksToMs(currentFrameCounter - perfBodyEndCounter);
         }
+        perfFrameBodyMsForRaw = perfFrameBodyMsLastFrame;
+        if (enableRuntimeLog && frameCount > 0u) {
+            const uint64_t rawAlignFrame = frameCount - 1u;
+            const float rawAlignGapMs =
+                std::max(0.0f, lastRawFrameMs - perfFrameBodyMsLastFrame);
+            const float rawAlignKnownAfterBodyMs =
+                perfLoopTailMsLastFrame + perfFrameEndLogMsLastFrame;
+            const float rawAlignGapTailDeltaMs =
+                rawAlignGapMs - rawAlignKnownAfterBodyMs;
+            const bool rawAlignIntervalDue =
+                perfFrameEndLogIntervalOverride &&
+                (rawAlignFrame % static_cast<uint64_t>(perfFrameEndLogInterval) == 0u);
+            if (lastRawFrameMs > 40.0f ||
+                perfFrameBodyMsLastFrame > 40.0f ||
+                rawAlignIntervalDue) {
+                spdlog::info(
+                    "PERF_RAWALIGN frame={} rawMs={:.2f} body={:.2f} gapAligned={:.2f} loopTail={:.2f} frameEndLog={:.2f} knownAfterBody={:.2f} gapTailDelta={:.2f} present={:.2f} fenceWait={:.2f} gaps=postWait/prePhys/preRender/postRender:{:.2f}/{:.2f}/{:.2f}/{:.2f} sparsePost=feedback/cmd/begin/midSnap/plan/upload/publish/midUpload/stats/surfExtract/surfPlan/surfSnap/surfStage/surfEmit:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}",
+                    rawAlignFrame,
+                    lastRawFrameMs,
+                    perfFrameBodyMsLastFrame,
+                    rawAlignGapMs,
+                    perfLoopTailMsLastFrame,
+                    perfFrameEndLogMsLastFrame,
+                    rawAlignKnownAfterBodyMs,
+                    rawAlignGapTailDeltaMs,
+                    perfPresentMs,
+                    perfFenceWaitMs,
+                    perfPostWaitGapMs,
+                    perfPrePhysicsGapMs,
+                    perfPreRenderGapMs,
+                    perfPostRenderGapMs,
+                    perfSparsePostFeedbackMs,
+                    perfSparseCommandBeginMs,
+                    perfSparseBeginFrameMs,
+                    perfSparseMidSnapshotMs,
+                    perfSparseUploadPlanMs,
+                    perfSparseBrickUploadMs,
+                    perfSparsePublishMs,
+                    perfSparseMidUploadMs,
+                    perfSparseStatsFlushMs,
+                    perfSparseSurfaceExtractMs,
+                    perfSparseSurfacePlanMs,
+                    perfSparseSurfaceSnapshotMs,
+                    perfSparseSurfaceStageMs,
+                    perfSparseSurfaceEmitMs);
+            }
+        }
         sparseWalkTerrainParityCorrectionsLastFrame = 0;
         sparseWalkTerrainHeightLastFrame = 0.0f;
         sparseWalkCameraAboveTerrainLastFrame = 0.0f;
@@ -6428,7 +6571,17 @@ int RunSandbox(int argc, char* argv[]) {
         perfSparseRequestDiagnosticSeedMs = 0.0f;
         perfSparseRequestMissFeedbackMs = 0.0f;
         perfSparseRequestHiddenExactMs = 0.0f;
+        perfSparseRequestHiddenExactWaterProbeMs = 0.0f;
+        perfSparseRequestHiddenExactGeneralProbeMs = 0.0f;
+        perfSparseRequestHiddenExactCandidatesMs = 0.0f;
+        perfSparseRequestHiddenExactAuditMs = 0.0f;
         perfSparseGenerationPrepMs = 0.0f;
+        perfSparseGenerationLoopsMs = 0.0f;
+        perfSparseGenerationPumpMs = 0.0f;
+        perfSparseGenerationFlushMs = 0.0f;
+        perfSparseGenerationTerrainCriticalGenerated = 0u;
+        perfSparseGenerationHiddenExactGenerated = 0u;
+        perfSparseGenerationHiddenExactTracked = 0u;
         perfSparseClipmapPrepMs = 0.0f;
         perfSparseClipmapInterestMs = 0.0f;
         perfSparseClipmapBudgetMs = 0.0f;
@@ -6855,93 +7008,7 @@ int RunSandbox(int argc, char* argv[]) {
         sparseRuntimePressureClass = Simulation::SparseRuntimePressureClass::Idle;
         sparseProtectedBacklogLastFrame = 0;
         sparseTrimSpeculativeFirstLastFrame = 0;
-        if (sparseBackendRequested && sparseVoxelWorldReady) {
-            const auto& sparseStatsForScheduler = sparseVoxelWorld.GetStats();
-            const auto& sparseGpuStatsForScheduler = sparseGpuResources.GetStats();
-            const uint32_t sparseSchedulerFrameIndex = static_cast<uint32_t>(std::min<uint64_t>(
-                frameCount,
-                static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())));
-            const uint64_t sparseSchedulerCompletedFence =
-                commandQueue ? commandQueue->GetLastCompletedFenceValue() : 0u;
-            const Simulation::SparsePagePublishQueueStats sparsePublishStatsForScheduler =
-                sparsePagePublishQueue.GetStats(
-                    sparseSchedulerFrameIndex,
-                    sparseSchedulerCompletedFence);
-            const SparseSurfaceReadyPublishPressureSnapshot
-                sparseSurfaceReadyPressureForScheduler =
-                    buildSparseSurfaceReadyPublishPressureSnapshot();
-            Simulation::SparseRuntimeBudgetInput sparseBudgetInput;
-            sparseBudgetInput.lastRawFrameMs = lastRawFrameMs;
-            sparseBudgetInput.combinedSchedulerPressureMs = schedulerBudgetPressureMs;
-            sparseBudgetInput.hasQueueBacklog =
-                sparseStatsForScheduler.generationQueuedBricks > 0 ||
-                sparseStatsForScheduler.uploadQueuedBricks > 0 ||
-                !sparsePagePublishQueue.Empty() ||
-                !sparseMissFeedbackPending.empty() ||
-                sparseClipmapTileCache.GetStats().queuedTiles > 0 ||
-                sparseClipmapTileCache.GetStats().queuedVoxelBricks > 0;
-            sparseBudgetInput.uploadRingOverflow =
-                sparseGpuStatsForScheduler.uploadRingOverflowLastFrame ||
-                sparseUploadRingBudgetDefersLastFrame > 0;
-            sparseBudgetInput.stagedBytesLastFrame = sparseGpuStatsForScheduler.stagedBytesLastFrame;
-            sparseBudgetInput.uploadRingBytes = sparseGpuStatsForScheduler.uploadRingBytes;
-            sparseBudgetInput.maxBrickPages = sparseWorldConfig.maxBrickPages;
-            sparseBudgetInput.urgentQueuedBricks =
-                sparseStatsForScheduler.generationQueuedCollisionBricks +
-                sparseStatsForScheduler.generationQueuedEditedBricks +
-                sparseStatsForScheduler.uploadQueuedCollisionBricks +
-                sparseStatsForScheduler.uploadQueuedEditedBricks +
-                sparseStatsForScheduler.surfaceQueuedCollisionBricks +
-                sparseStatsForScheduler.surfaceQueuedEditedBricks;
-            sparseBudgetInput.visibleQueuedBricks =
-                sparseStatsForScheduler.generationQueuedVisibleBricks +
-                sparseStatsForScheduler.uploadQueuedVisibleBricks +
-                sparseStatsForScheduler.surfaceQueuedVisibleBricks;
-            sparseBudgetInput.speculativeQueuedBricks =
-                sparseStatsForScheduler.generationQueuedSpeculativeBricks +
-                sparseStatsForScheduler.uploadQueuedSpeculativeBricks +
-                sparseStatsForScheduler.surfaceQueuedSpeculativeBricks;
-            sparseBudgetInput.surfaceQueuedBricks =
-                sparseStatsForScheduler.surfaceExtractionQueuedBricks;
-            sparseBudgetInput.physicsHotCandidateBricks =
-                sparseStatsForScheduler.physicsHotCandidateBricks;
-            sparseBudgetInput.pagePublishReadyQueued =
-                static_cast<uint32_t>(std::min<size_t>(
-                    sparsePublishStatsForScheduler.ready,
-                    static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
-            sparseBudgetInput.pagePublishWaitingFrame =
-                static_cast<uint32_t>(std::min<size_t>(
-                    sparsePublishStatsForScheduler.waitingFrame,
-                    static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
-            sparseBudgetInput.pagePublishWaitingFence =
-                static_cast<uint32_t>(std::min<size_t>(
-                    sparsePublishStatsForScheduler.waitingFence,
-                    static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
-            sparseBudgetInput.pagePublishEditedQueued =
-                static_cast<uint32_t>(std::min<size_t>(
-                    sparsePublishStatsForScheduler.edited,
-                    static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
-            sparseBudgetInput.pagePublishMaxReadyFrameLag =
-                sparsePublishStatsForScheduler.maxReadyFrameLag;
-            applySparseSurfaceReadyPublishPressure(
-                sparseBudgetInput,
-                sparseSurfaceReadyPressureForScheduler);
-            sparseBudgetInput.visibleMissPressure =
-                sparseResidencyCatchupFramesRemaining > 0 ||
-                computeSparseEffectiveOwnershipPressureLevel() > 0;
-            sparseBudgetInput.ownershipPressureLevel =
-                computeSparseEffectiveOwnershipPressureLevel();
-            const Simulation::SparseRuntimeBudgetDecision sparseBudgetDecision =
-                Simulation::SparseRuntimeBudgetScheduler::Evaluate(sparseBudgetInput);
-            sparseRuntimeBudgetScale = sparseBudgetDecision.scale;
-            sparseProtectedRuntimeBudgetScale = sparseBudgetDecision.protectedScale;
-            sparseBackgroundRuntimeBudgetScale = sparseBudgetDecision.backgroundScale;
-            sparseRuntimePressureClass = sparseBudgetDecision.pressureClass;
-            sparseProtectedBacklogLastFrame = sparseBudgetDecision.hasProtectedBacklog ? 1u : 0u;
-            sparseTrimSpeculativeFirstLastFrame = sparseBudgetDecision.trimSpeculativeFirst ? 1u : 0u;
-        }
-
-        auto evaluateSparseBudgetFromStats =
+        auto buildSparseRuntimeBudgetInputFromStats =
             [&](const Simulation::SparseVoxelWorldStats& sparseStatsForScheduler) {
                 const auto& sparseGpuStatsForScheduler = sparseGpuResources.GetStats();
                 const uint32_t sparseSchedulerFrameIndex = static_cast<uint32_t>(std::min<uint64_t>(
@@ -6956,67 +7023,99 @@ int RunSandbox(int argc, char* argv[]) {
                 const SparseSurfaceReadyPublishPressureSnapshot
                     sparseSurfaceReadyPressureForScheduler =
                         buildSparseSurfaceReadyPublishPressureSnapshot();
-                Simulation::SparseRuntimeBudgetInput sparseBudgetInput;
-                sparseBudgetInput.lastRawFrameMs = lastRawFrameMs;
-                sparseBudgetInput.combinedSchedulerPressureMs = schedulerBudgetPressureMs;
-                sparseBudgetInput.hasQueueBacklog =
-                    sparseStatsForScheduler.generationQueuedBricks > 0 ||
-                    sparseStatsForScheduler.uploadQueuedBricks > 0 ||
-                    !sparsePagePublishQueue.Empty() ||
-                    !sparseMissFeedbackPending.empty() ||
-                    sparseClipmapTileCache.GetStats().queuedTiles > 0 ||
-                    sparseClipmapTileCache.GetStats().queuedVoxelBricks > 0;
-                sparseBudgetInput.uploadRingOverflow =
-                    sparseGpuStatsForScheduler.uploadRingOverflowLastFrame ||
-                    sparseUploadRingBudgetDefersLastFrame > 0;
-                sparseBudgetInput.stagedBytesLastFrame = sparseGpuStatsForScheduler.stagedBytesLastFrame;
-                sparseBudgetInput.uploadRingBytes = sparseGpuStatsForScheduler.uploadRingBytes;
-                sparseBudgetInput.maxBrickPages = sparseWorldConfig.maxBrickPages;
-                sparseBudgetInput.urgentQueuedBricks =
-                    sparseStatsForScheduler.generationQueuedCollisionBricks +
-                    sparseStatsForScheduler.generationQueuedEditedBricks +
-                    sparseStatsForScheduler.uploadQueuedCollisionBricks +
-                    sparseStatsForScheduler.uploadQueuedEditedBricks +
-                    sparseStatsForScheduler.surfaceQueuedCollisionBricks +
-                    sparseStatsForScheduler.surfaceQueuedEditedBricks;
-                sparseBudgetInput.visibleQueuedBricks =
-                    sparseStatsForScheduler.generationQueuedVisibleBricks +
-                    sparseStatsForScheduler.uploadQueuedVisibleBricks +
-                    sparseStatsForScheduler.surfaceQueuedVisibleBricks;
-                sparseBudgetInput.speculativeQueuedBricks =
-                    sparseStatsForScheduler.generationQueuedSpeculativeBricks +
-                    sparseStatsForScheduler.uploadQueuedSpeculativeBricks +
-                    sparseStatsForScheduler.surfaceQueuedSpeculativeBricks;
-                sparseBudgetInput.surfaceQueuedBricks =
-                    sparseStatsForScheduler.surfaceExtractionQueuedBricks;
-                sparseBudgetInput.physicsHotCandidateBricks =
-                    sparseStatsForScheduler.physicsHotCandidateBricks;
-                sparseBudgetInput.pagePublishReadyQueued =
-                    static_cast<uint32_t>(std::min<size_t>(
-                        sparsePublishStatsForScheduler.ready,
-                        static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
-                sparseBudgetInput.pagePublishWaitingFrame =
-                    static_cast<uint32_t>(std::min<size_t>(
-                        sparsePublishStatsForScheduler.waitingFrame,
-                        static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
-                sparseBudgetInput.pagePublishWaitingFence =
-                    static_cast<uint32_t>(std::min<size_t>(
-                        sparsePublishStatsForScheduler.waitingFence,
-                        static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
-                sparseBudgetInput.pagePublishEditedQueued =
-                    static_cast<uint32_t>(std::min<size_t>(
-                        sparsePublishStatsForScheduler.edited,
-                        static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
-                sparseBudgetInput.pagePublishMaxReadyFrameLag =
-                    sparsePublishStatsForScheduler.maxReadyFrameLag;
-                applySparseSurfaceReadyPublishPressure(
-                    sparseBudgetInput,
-                    sparseSurfaceReadyPressureForScheduler);
-                sparseBudgetInput.visibleMissPressure =
-                    sparseResidencyCatchupFramesRemaining > 0 ||
-                    computeSparseEffectiveOwnershipPressureLevel() > 0;
-                sparseBudgetInput.ownershipPressureLevel =
+                const auto sparseClipmapStatsForScheduler = sparseClipmapTileCache.GetStats();
+                const uint32_t effectiveOwnershipPressureLevel =
                     computeSparseEffectiveOwnershipPressureLevel();
+
+                Simulation::SparseRuntimeWorkloadSnapshot snapshot;
+                snapshot.lastRawFrameMs = lastRawFrameMs;
+                snapshot.combinedSchedulerPressureMs = schedulerBudgetPressureMs;
+                snapshot.pagePublishQueueEmpty = sparsePagePublishQueue.Empty();
+                snapshot.missFeedbackPending = !sparseMissFeedbackPending.empty();
+                snapshot.uploadRingOverflowLastFrame =
+                    sparseGpuStatsForScheduler.uploadRingOverflowLastFrame;
+                snapshot.uploadRingBudgetDefersLastFrame =
+                    sparseUploadRingBudgetDefersLastFrame;
+                snapshot.stagedBytesLastFrame =
+                    sparseGpuStatsForScheduler.stagedBytesLastFrame;
+                snapshot.uploadRingBytes = sparseGpuStatsForScheduler.uploadRingBytes;
+                snapshot.maxBrickPages = sparseWorldConfig.maxBrickPages;
+                snapshot.clipmapQueuedHeightTiles = sparseClipmapStatsForScheduler.queuedTiles;
+                snapshot.clipmapQueuedVoxelBricks =
+                    sparseClipmapStatsForScheduler.queuedVoxelBricks;
+                snapshot.generationQueuedBricks =
+                    sparseStatsForScheduler.generationQueuedBricks;
+                snapshot.generationQueuedSpeculativeBricks =
+                    sparseStatsForScheduler.generationQueuedSpeculativeBricks;
+                snapshot.generationQueuedVisibleBricks =
+                    sparseStatsForScheduler.generationQueuedVisibleBricks;
+                snapshot.generationQueuedCollisionBricks =
+                    sparseStatsForScheduler.generationQueuedCollisionBricks;
+                snapshot.generationQueuedEditedBricks =
+                    sparseStatsForScheduler.generationQueuedEditedBricks;
+                snapshot.uploadQueuedBricks =
+                    sparseStatsForScheduler.uploadQueuedBricks;
+                snapshot.uploadQueuedSpeculativeBricks =
+                    sparseStatsForScheduler.uploadQueuedSpeculativeBricks;
+                snapshot.uploadQueuedVisibleBricks =
+                    sparseStatsForScheduler.uploadQueuedVisibleBricks;
+                snapshot.uploadQueuedCollisionBricks =
+                    sparseStatsForScheduler.uploadQueuedCollisionBricks;
+                snapshot.uploadQueuedEditedBricks =
+                    sparseStatsForScheduler.uploadQueuedEditedBricks;
+                snapshot.surfaceQueuedSpeculativeBricks =
+                    sparseStatsForScheduler.surfaceQueuedSpeculativeBricks;
+                snapshot.surfaceQueuedVisibleBricks =
+                    sparseStatsForScheduler.surfaceQueuedVisibleBricks;
+                snapshot.surfaceQueuedCollisionBricks =
+                    sparseStatsForScheduler.surfaceQueuedCollisionBricks;
+                snapshot.surfaceQueuedEditedBricks =
+                    sparseStatsForScheduler.surfaceQueuedEditedBricks;
+                snapshot.surfaceExtractionQueuedBricks =
+                    sparseStatsForScheduler.surfaceExtractionQueuedBricks;
+                snapshot.physicsHotCandidateBricks =
+                    sparseStatsForScheduler.physicsHotCandidateBricks;
+                snapshot.pagePublishReadyQueued =
+                    static_cast<uint64_t>(sparsePublishStatsForScheduler.ready);
+                snapshot.pagePublishWaitingFrame =
+                    static_cast<uint64_t>(sparsePublishStatsForScheduler.waitingFrame);
+                snapshot.pagePublishWaitingFence =
+                    static_cast<uint64_t>(sparsePublishStatsForScheduler.waitingFence);
+                snapshot.pagePublishEditedQueued =
+                    static_cast<uint64_t>(sparsePublishStatsForScheduler.edited);
+                snapshot.pagePublishMaxReadyFrameLag =
+                    sparsePublishStatsForScheduler.maxReadyFrameLag;
+                snapshot.residencyCatchupActive =
+                    sparseResidencyCatchupFramesRemaining > 0;
+                snapshot.ownershipPressureLevel = effectiveOwnershipPressureLevel;
+                snapshot.readySurfacePublish.enabled =
+                    enableSparseSurfaceReadyPublishQueue &&
+                    enableSparseSurfaceReadyPublishPressure;
+                snapshot.readySurfacePublish.pending =
+                    sparseSurfaceReadyPressureForScheduler.pending;
+                snapshot.readySurfacePublish.oldestAge =
+                    sparseSurfaceReadyPressureForScheduler.oldestAge;
+                return Simulation::SparseRuntimeBudgetScheduler::BuildRuntimeBudgetInput(
+                    snapshot);
+            };
+        if (sparseBackendRequested && sparseVoxelWorldReady) {
+            const auto& sparseStatsForScheduler = sparseVoxelWorld.GetStats();
+            const Simulation::SparseRuntimeBudgetInput sparseBudgetInput =
+                buildSparseRuntimeBudgetInputFromStats(sparseStatsForScheduler);
+            const Simulation::SparseRuntimeBudgetDecision sparseBudgetDecision =
+                Simulation::SparseRuntimeBudgetScheduler::Evaluate(sparseBudgetInput);
+            sparseRuntimeBudgetScale = sparseBudgetDecision.scale;
+            sparseProtectedRuntimeBudgetScale = sparseBudgetDecision.protectedScale;
+            sparseBackgroundRuntimeBudgetScale = sparseBudgetDecision.backgroundScale;
+            sparseRuntimePressureClass = sparseBudgetDecision.pressureClass;
+            sparseProtectedBacklogLastFrame = sparseBudgetDecision.hasProtectedBacklog ? 1u : 0u;
+            sparseTrimSpeculativeFirstLastFrame = sparseBudgetDecision.trimSpeculativeFirst ? 1u : 0u;
+        }
+
+        auto evaluateSparseBudgetFromStats =
+            [&](const Simulation::SparseVoxelWorldStats& sparseStatsForScheduler) {
+                const Simulation::SparseRuntimeBudgetInput sparseBudgetInput =
+                    buildSparseRuntimeBudgetInputFromStats(sparseStatsForScheduler);
                 return Simulation::SparseRuntimeBudgetScheduler::Evaluate(sparseBudgetInput);
             };
 
@@ -7463,7 +7562,14 @@ int RunSandbox(int argc, char* argv[]) {
             flightMode = ReadUIntEnv("VENPOD_SPARSE_WALK_TEST_FLY", 0u) != 0u;
             terrainReady = true;
             const float scriptedWalkDt = sparseWalkTestFixedDt > 0.0f ? sparseWalkTestFixedDt : dt;
-            float baseScriptedYaw = cameraYaw + sparseWalkTestYawRate * scriptedWalkDt;
+            const float scriptedWalkYawTime =
+                sparseWalkTestAbsoluteYawFrame
+                    ? static_cast<float>(frameCount + 1u) * sparseWalkTestFixedDt
+                    : scriptedWalkDt;
+            float baseScriptedYaw =
+                sparseWalkTestAbsoluteYawFrame
+                    ? sparseWalkTestInitialYaw + sparseWalkTestYawRate * scriptedWalkYawTime
+                    : cameraYaw + sparseWalkTestYawRate * scriptedWalkDt;
             // Test-only: inject a per-frame alternating yaw JERK to emulate real
             // hand jitter (mouse sensor noise / micro-corrections) so the brush
             // aim-lock can be exercised the way a held human hand exercises it.
@@ -8033,15 +8139,32 @@ int RunSandbox(int argc, char* argv[]) {
             // trimmed (free ~1441 < 4096) and regenerated forever. When stationary,
             // only treat near-true-exhaustion as free-page pressure so the stable
             // surround is retained and the generation queue drains.
+            // The 256 cap still left ~10 evictions/frame of VISIBLE resident bricks
+            // at a static camera (pool near-full → free-page pressure trims the
+            // surround → it regenerates). When stationary NOTHING new streams, so the
+            // free reserve can go near-zero safely; drop it to stop the residual
+            // carousel. Env-tunable / A/B via VENPOD_SPARSE_STATIONARY_MIN_FREE_PAGES.
+            const uint32_t sparseStationaryMinFreePages =
+                ReadUIntEnv("VENPOD_SPARSE_STATIONARY_MIN_FREE_PAGES", 16u);
             const uint32_t sparseEffectiveMinFreePages = sparseTrimCameraStationary
-                ? std::min(sparseMinFreePages, 256u)
+                ? std::min(sparseMinFreePages, sparseStationaryMinFreePages)
                 : sparseMinFreePages;
             const bool sparsePressureTrimFreePagePressure =
                 sparseVoxelWorld.GetStats().freePages <= sparseEffectiveMinFreePages;
             const bool sparsePressureTrimGenerationPressure =
                 !sparseTrimCameraStationary &&
                 sparseVoxelWorld.GenerationQueueSize() >= sparseSpeculativeBackpressureGenQueue;
+            // FIX (rest-time terrace regeneration): the free-page and generation
+            // pressures above are BOTH gated on !stationary, but miss-feedback
+            // pressure was not — so at a static camera the persistent LOD-edge
+            // false-misses tripped this every frame, trimming (evicting) the stable
+            // resident surround which then regenerated forever (the terrace-edge
+            // "small portions regenerating" bug, user-confirmed via screen capture).
+            // Gate it on !stationary like the others. Env restores the old behavior.
+            const bool sparseTrimStationaryOnMissFeedback =
+                ReadUIntEnv("VENPOD_SPARSE_TRIM_STATIONARY_ON_MISS_FEEDBACK", 0u) != 0u;
             const bool sparsePressureTrimMissFeedbackPressure =
+                (sparseTrimStationaryOnMissFeedback || !sparseTrimCameraStationary) &&
                 !sparseMissFeedbackPending.empty() && !sparsePressureTrimFreePageGuard;
             sparsePressureTrimFreePagePressureLastFrame =
                 sparsePressureTrimFreePagePressure ? 1u : 0u;
@@ -8060,8 +8183,21 @@ int RunSandbox(int argc, char* argv[]) {
                     sparsePressureTrimBudget,
                     sparseResidencyFrame);
                 if (sparseVoxelWorld.GetStats().freePages <= sparseEffectiveMinFreePages ||
-                    (!sparsePressureTrimFreePageGuard && !sparseMissFeedbackPending.empty())) {
-                    sparsePressureTrimLastFrame += sparseTrimSpeculativeFirstLastFrame
+                    ((sparseTrimStationaryOnMissFeedback || !sparseTrimCameraStationary) &&
+                     !sparsePressureTrimFreePageGuard && !sparseMissFeedbackPending.empty())) {
+                    // When STATIONARY, trim ONLY speculative/background resident bricks
+                    // (TrimBackgroundResidentBricks), NEVER TrimResidentBricks (which can
+                    // evict currently-VISIBLE bricks → they get re-requested → regenerated →
+                    // surface re-extracted → the visible terrace regeneration). Not freeing
+                    // enough is harmless at rest (nothing new streams in). This closes the
+                    // residual carousel that feeds mid-voxel surface re-extraction.
+                    // Env VENPOD_SPARSE_TRIM_STATIONARY_VISIBLE=1 restores old (A/B).
+                    const bool sparseTrimStationaryVisible =
+                        ReadUIntEnv("VENPOD_SPARSE_TRIM_STATIONARY_VISIBLE", 0u) != 0u;
+                    const bool sparseTrimBackgroundOnly =
+                        sparseTrimSpeculativeFirstLastFrame ||
+                        (sparseTrimCameraStationary && !sparseTrimStationaryVisible);
+                    sparsePressureTrimLastFrame += sparseTrimBackgroundOnly
                         ? sparseVoxelWorld.TrimBackgroundResidentBricks(
                         sparseCenter,
                         sparseTrimRadiusXz,
@@ -9923,6 +10059,7 @@ int RunSandbox(int argc, char* argv[]) {
                 bool hiddenExactStartupRequestSaturated = false;
                 if (hiddenExactProbeThisFrame) {
                     if (hiddenExactWaterProbeThisFrame) {
+                        const uint64_t hiddenExactWaterProbeStartTicks = SDL_GetPerformanceCounter();
                         const float waterJitterX =
                             (hiddenExactStartupProofMode || hiddenExactPostReleaseWarmupActive)
                                 ? ((static_cast<float>(hiddenExactStartupPhase & 3u) + 0.5f) * 0.25f)
@@ -9954,8 +10091,11 @@ int RunSandbox(int argc, char* argv[]) {
                             ++hiddenExactWaterProbeRaysLastFrame;
                             queueHiddenExactWaterForRay(waterRayDir);
                         }
+                        perfSparseRequestHiddenExactWaterProbeMs =
+                            ticksToMs(SDL_GetPerformanceCounter() - hiddenExactWaterProbeStartTicks);
                     }
                     if (hiddenExactGeneralProbeThisFrame) {
+                        const uint64_t hiddenExactGeneralProbeStartTicks = SDL_GetPerformanceCounter();
                         const uint32_t hiddenExactIterations =
                             hiddenExactUseRayBudget ? hiddenExactRayBudgetThisFrame : hiddenExactTotalRayCount;
                         for (uint32_t hiddenExactSequence = 0;
@@ -10079,7 +10219,10 @@ int RunSandbox(int argc, char* argv[]) {
                             break;
                         }
                     }
+                    perfSparseRequestHiddenExactGeneralProbeMs =
+                        ticksToMs(SDL_GetPerformanceCounter() - hiddenExactGeneralProbeStartTicks);
                     }
+                    const uint64_t hiddenExactCandidateRequestStartTicks = SDL_GetPerformanceCounter();
                     std::sort(
                         hiddenExactCandidates.begin(),
                         hiddenExactCandidates.end(),
@@ -10108,6 +10251,8 @@ int RunSandbox(int argc, char* argv[]) {
                         }
                         requestHiddenExactCoord(candidate.coord, candidate.startupProof, candidate.waterSurface);
                     }
+                    perfSparseRequestHiddenExactCandidatesMs =
+                        ticksToMs(SDL_GetPerformanceCounter() - hiddenExactCandidateRequestStartTicks);
                     if (hiddenExactStartupFullSweep) {
                         sparseStartupHiddenExactProofRaysScanned = std::min(
                             hiddenExactTotalRayCount,
@@ -10122,6 +10267,7 @@ int RunSandbox(int argc, char* argv[]) {
                             static_cast<uint64_t>(hiddenExactTotalRayCount));
                     }
                 }
+                const uint64_t hiddenExactAuditStartTicks = SDL_GetPerformanceCounter();
                 uint32_t hiddenExactRenderReady = 0u;
                 uint32_t hiddenExactNotDrawable = 0u;
                 uint32_t hiddenExactStateMissing = 0u;
@@ -10309,6 +10455,8 @@ int RunSandbox(int argc, char* argv[]) {
                         }
                     }
                 }
+                perfSparseRequestHiddenExactAuditMs =
+                    ticksToMs(SDL_GetPerformanceCounter() - hiddenExactAuditStartTicks);
                 sparseHiddenExactMissResidentAfterLastFrame = hiddenExactRenderReady;
                 sparseHiddenExactMissStillMissingLastFrame = hiddenExactNotDrawable;
                 sparseStartupHiddenExactFeedbackLastFrame = startupProofGateAuditActive
@@ -12082,8 +12230,17 @@ int RunSandbox(int argc, char* argv[]) {
             // set so the engine recovers after a long flight. Recency-keyed (not the
             // sticky class, not a radius); paused during active editing to avoid churn
             // against edit/stream work (the brief accumulation is shed once editing stops).
+            // SIEGE3: skip the stale trim while the camera is effectively stationary — no
+            // terrain is being flown past, and trimming still-visible terrain by recency is
+            // exactly what regenerates the surface at rest (proven cause->effect). Still trims
+            // while moving to bound the working set. VENPOD_SPARSE_VIEW_FOLLOW_TRIM_WHILE_STATIONARY=1
+            // restores the old always-trim behavior for A/B.
+            const bool sparseViewFollowTrimCameraStationary =
+                sparseCameraSpeedLastFrame <
+                    sparseClipmapPolicy.Config().motionLookaheadMinSpeed;
             if (sparseViewFollowTrimEnabled && sparseViewFollowTrimBudget > 0 &&
-                !brushController.IsPainting() && !brushController.IsErasing()) {
+                !brushController.IsPainting() && !brushController.IsErasing() &&
+                (sparseViewFollowTrimWhileStationary || !sparseViewFollowTrimCameraStationary)) {
                 sparseVoxelWorld.TrimStaleResidentBricks(
                     sparseResidencyFrame,
                     sparseViewFollowTrimStaleFrames,
@@ -12499,6 +12656,13 @@ int RunSandbox(int argc, char* argv[]) {
                 sparseVoxelWorld.FlushStats();
             }
             const uint64_t genSplitEnd = SDL_GetPerformanceCounter();
+            perfSparseGenerationLoopsMs = ticksToMs(genSplitPumpT0 - genLoopsT0);
+            perfSparseGenerationPumpMs = ticksToMs(genSplitFlushT0 - genSplitPumpT0);
+            perfSparseGenerationFlushMs = ticksToMs(genSplitEnd - genSplitFlushT0);
+            perfSparseGenerationTerrainCriticalGenerated = sparseTerrainCriticalProtectedGeneratedLastFrame;
+            perfSparseGenerationHiddenExactGenerated = sparseHiddenExactMissGeneratedLastFrame;
+            perfSparseGenerationHiddenExactTracked =
+                static_cast<uint32_t>(sparseHiddenExactMissTrackedCoords.size());
             // DIAGNOSTIC: genPrep on dip frames is ~17ms with generated=0 and all gen sub-timers
             // zero -> the cost is NOT generation. Split the pump vs the deferred-stats-flush to find
             // where it goes (Codex flagged FlushStats/RefreshStats walking dirty queues).
@@ -12507,12 +12671,12 @@ int RunSandbox(int argc, char* argv[]) {
                 spdlog::info("GENPREP_SPLIT frame={} loopsMs={:.2f} pumpMs={:.2f} flushMs={:.2f} "
                     "terrainCritGen={} hiddenExactGen={} hiddenExactTracked={}",
                     frameCount,
-                    ticksToMs(genSplitPumpT0 - genLoopsT0),
-                    ticksToMs(genSplitFlushT0 - genSplitPumpT0),
-                    ticksToMs(genSplitEnd - genSplitFlushT0),
-                    sparseTerrainCriticalProtectedGeneratedLastFrame,
-                    sparseHiddenExactMissGeneratedLastFrame,
-                    static_cast<uint32_t>(sparseHiddenExactMissTrackedCoords.size()));
+                    perfSparseGenerationLoopsMs,
+                    perfSparseGenerationPumpMs,
+                    perfSparseGenerationFlushMs,
+                    perfSparseGenerationTerrainCriticalGenerated,
+                    perfSparseGenerationHiddenExactGenerated,
+                    perfSparseGenerationHiddenExactTracked);
             }
             if (enableSparseStreamingLaneDiagnostics && enableSparseCpuDetailLog) {
                 const auto& sparseLaneStatsAfterGeneration = sparseVoxelWorld.GetStats();
@@ -12560,6 +12724,55 @@ int RunSandbox(int argc, char* argv[]) {
                 }
             }
             perfSparseGenerationPrepMs = ticksToMs(SDL_GetPerformanceCounter() - perfSparseSectionStart);
+            static const float sparseRequestDetailSpikeMs =
+                std::max(0.0f, ReadFloatEnv("VENPOD_SPARSE_REQUEST_DETAIL_SPIKE_MS", 5.0f));
+            static const float sparseGenPrepDetailSpikeMs =
+                std::max(0.0f, ReadFloatEnv("VENPOD_SPARSE_GENPREP_DETAIL_SPIKE_MS", 0.0f));
+            if (enableRuntimeLog &&
+                sparseRequestDetailSpikeMs > 0.0f &&
+                perfSparseRequestPrepMs >= sparseRequestDetailSpikeMs) {
+                spdlog::info(
+                    "PERF_SPARSE_REQ frame={} reqPrep={:.1f} = terrainCrit={:.1f} hierarchy={:.1f} statsFlush={:.1f} pressureTrim={:.1f} brushRetry={:.1f} ownerFeedback={:.1f} missFeedback={:.1f} hiddenExact={:.1f} hiddenExactSplit=water/general/candidates/audit:{:.2f}/{:.2f}/{:.2f}/{:.2f} || genPrep={:.1f}",
+                    frameCount,
+                    perfSparseRequestPrepMs,
+                    perfSparseRequestTerrainCriticalMs,
+                    perfSparseRequestHierarchyMs,
+                    perfSparseRequestStatsFlushMs,
+                    perfSparseRequestPressureTrimMs,
+                    perfSparseRequestBrushRetryMs,
+                    perfSparseRequestOwnershipFeedbackMs,
+                    perfSparseRequestMissFeedbackMs,
+                    perfSparseRequestHiddenExactMs,
+                    perfSparseRequestHiddenExactWaterProbeMs,
+                    perfSparseRequestHiddenExactGeneralProbeMs,
+                    perfSparseRequestHiddenExactCandidatesMs,
+                    perfSparseRequestHiddenExactAuditMs,
+                    perfSparseGenerationPrepMs);
+            }
+            if (enableRuntimeLog &&
+                sparseGenPrepDetailSpikeMs > 0.0f &&
+                perfSparseGenerationPrepMs >= sparseGenPrepDetailSpikeMs) {
+                const auto& gpStats = sparseVoxelWorld.GetStats();
+                spdlog::info(
+                    "PERF_GENPREP frame={} genPrep={:.1f} = asyncExactApplyMs={:.2f} asyncExactWorkerMs={:.2f} "
+                    "parallelWallMs={:.2f} parallelActive={} parallelBricks={} appliedVisible={} appliedPublicCrit={} "
+                    "split=loops/pump/flush:{:.2f}/{:.2f}/{:.2f} terrainCritGen={} hiddenExactGen={} hiddenExactTracked={}",
+                    frameCount,
+                    perfSparseGenerationPrepMs,
+                    gpStats.asyncExactGenerationApplyMsLastFrame,
+                    gpStats.asyncExactGenerationWorkerMsLastFrame,
+                    gpStats.parallelExactGenerationWallMsLastFrame,
+                    gpStats.parallelExactGenerationActive,
+                    gpStats.parallelExactGenerationBricksLastFrame,
+                    gpStats.asyncExactGenerationAppliedVisibleLaneLastFrame,
+                    gpStats.asyncExactGenerationAppliedPublicCriticalLaneLastFrame,
+                    perfSparseGenerationLoopsMs,
+                    perfSparseGenerationPumpMs,
+                    perfSparseGenerationFlushMs,
+                    perfSparseGenerationTerrainCriticalGenerated,
+                    perfSparseGenerationHiddenExactGenerated,
+                    perfSparseGenerationHiddenExactTracked);
+            }
             perfSparseSectionStart = SDL_GetPerformanceCounter();
             if (sparseClipmapTileCacheReady && sparseClipmapPolicy.IsEnabled()) {
                 Simulation::SparseClipmapPolicy sparseClipmapFramePolicy = sparseClipmapPolicy;
@@ -12817,11 +13030,13 @@ int RunSandbox(int argc, char* argv[]) {
                             sparseOwnershipUnsafeNearMissPctLastRetire);
                     }
                 }
-                // Drain a couple of edit-invalidated mid bricks per frame (budgeted;
-                // a full CPU brick regen is ~2.5ms — inline regeneration of a whole
-                // stroke's bricks was the measured 17ms/frame edit hitch).
+                // Drain edit-invalidated mid bricks per frame (budgeted; bake-aware
+                // default — see sparseMidEditRegenBudget. The CPU path stays at 2:
+                // a full CPU brick regen is ~2.5ms and inline regeneration of a
+                // whole stroke's bricks was the measured 17ms/frame edit hitch).
                 editTelem.propMidRegen =
-                    sparseClipmapTileCache.PumpEditedBrickRegens(sparseClipmapFramePolicy, 2u);
+                    sparseClipmapTileCache.PumpEditedBrickRegens(
+                        sparseClipmapFramePolicy, sparseMidEditRegenBudget);
                 // Drain edited height tiles too: this bumps the height-dirty serial
                 // (coalesced) so the mid-MESH rebuilds and re-applies its edit-
                 // footprint SUPPRESSION (punch-through holes over edits), letting the
@@ -12846,6 +13061,37 @@ int RunSandbox(int argc, char* argv[]) {
                         sparseClipmapTileCache.PumpEditedHeightTileRegens(sparseClipmapFramePolicy, 2u);
                 }
                 editTelem.propRegenUploads = sparseVoxelWorld.PumpRegeneratedEditUploads(3u);
+                // Live stroke window state for the mid-mesh edit suppression: open
+                // while edits are recent (same window as the pre-publish edit
+                // policy). On CLOSE, re-queue every edited height tile so the mesh
+                // rebuilds under the Y-aware rule and heals over air-stroke columns
+                // (the live window suppressed whole columns for live rendering).
+                {
+                    const bool strokeLiveNow =
+                        sparseSurfaceCatchupLastEditFrame != 0ull &&
+                        frameCount <= sparseSurfaceCatchupLastEditFrame +
+                            static_cast<uint64_t>(sparseSurfaceFullCatchupEditIdleFrames);
+                    // Loop 110 oscillator fix: this close-edge heal exists to undo
+                    // the LIVE-WINDOW column suppression — which is default OFF
+                    // (Loop 88). With the feature off, the heal re-queued EVERY
+                    // edited height tile (sinceRevision=0) on each window close,
+                    // and any single physics micro-settle re-opened+re-closed the
+                    // window -> full tile-regen cycle -> drained serial bump ->
+                    // whole-mesh rebuild, repeating indefinitely (the measured
+                    // 20-frame 2-tile rebuild train + ~22k-px visible swaps at a
+                    // static camera). Gate the heal on the feature that needs it.
+                    static const bool sparseMidMeshEditLiveWindowHealEnabled =
+                        ReadUIntEnv("VENPOD_SPARSE_MID_MESH_EDIT_LIVE_WINDOW", 0u) != 0u;
+                    if (sparseMidMeshEditLiveWindowHealEnabled &&
+                        sparseMidMeshEditStrokeLive && !strokeLiveNow &&
+                        sparseEditTriggersMeshRebuild) {
+                        sparseClipmapTileCache.InvalidateEditedHeightTiles(
+                            sparseVoxelWorld.GetEdits(),
+                            sparseClipmapFramePolicy,
+                            0ull);
+                    }
+                    sparseMidMeshEditStrokeLive = strokeLiveNow;
+                }
                 const uint64_t sparseEditRevision = sparseVoxelWorld.GetEdits().RevisionSerial();
                 if (sparseEditRevision != sparseMidClipmapEditRevisionSeen) {
                     const uint32_t invalidatedMidVoxelBricks =
@@ -13890,8 +14136,17 @@ int RunSandbox(int argc, char* argv[]) {
                                 sparseMidClipmapStatsForBudget.queuedVoxelBricks));
                     }
                 }
-                if (sparseMidClipmapFarHeightCoverageFailure &&
-                    sparseMidVoxelRenderFeedbackPendingLastFrame != 0u) {
+                if (sparseMidVoxelRenderFeedbackPendingLastFrame != 0u) {
+                    // Render feedback = the raymarch REPORTED visible missing mid
+                    // bricks (they queue at the FRONT of the gen queue). Lift the
+                    // pump budget to at least cover them regardless of which
+                    // throttle clamp is active. This was previously gated on
+                    // far-height coverage failure only — but carve-exposed interior
+                    // bricks classify as SKY (coverage stays 1.00, no failure
+                    // trips), so the soft-deficit clamp (12) held while erase voids
+                    // waited: measured budgetMid=12/midVoxelGen=1 in a 51k-px void
+                    // run vs 64/64 in a 5k-px run of the same scenario. The lift is
+                    // bounded by actual pending feedback (typically 1-20).
                     const uint32_t feedbackBudget =
                         ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_RENDER_FEEDBACK_BUDGET", 128u);
                     sparseMidClipmapCpuBudgetThisFrame = std::max<uint32_t>(
@@ -14279,9 +14534,19 @@ int RunSandbox(int argc, char* argv[]) {
             perfSparseClipmapPrepMs = ticksToMs(SDL_GetPerformanceCounter() - perfSparseSectionStart);
             perfSparseSectionStart = SDL_GetPerformanceCounter();
             const auto& sparseStatsBeforeDistanceTrim = sparseVoxelWorld.GetStats();
+            // The distance trim fires whenever residentBricks >= threshold (always true at
+            // a dense spot). Un-gated on stationary, it evicts VISIBLE resident bricks every
+            // frame → they are re-requested (still interested) → re-resident → above threshold
+            // again → trim → the eviction carousel that regenerates + re-extracts the visible
+            // surface at rest. When STATIONARY the resident set is stable (it already fit
+            // during the approach), so force speculative-only trimming (never TrimResidentBricks).
+            const bool sparseDistanceTrimStationary =
+                sparseCameraSpeedLastFrame <
+                    sparseClipmapPolicy.Config().motionLookaheadMinSpeed &&
+                ReadUIntEnv("VENPOD_SPARSE_TRIM_STATIONARY_VISIBLE", 0u) == 0u;
             if (sparseStatsBeforeDistanceTrim.residentBricks >= sparseTrimStartResident ||
                 sparseStatsBeforeDistanceTrim.freePages <= sparseMinFreePages) {
-                if (sparseTrimSpeculativeFirstLastFrame) {
+                if (sparseTrimSpeculativeFirstLastFrame || sparseDistanceTrimStationary) {
                     sparseVoxelWorld.TrimBackgroundResidentBricks(
                         sparseCenter,
                         sparseTrimRadiusXz,
@@ -14462,37 +14727,72 @@ int RunSandbox(int argc, char* argv[]) {
                 cameraVelocityY <= 0.0f &&
                 (std::abs(cameraPos.x - cameraPosBeforeInputMovement.x) > 0.001f ||
                  std::abs(cameraPos.z - cameraPosBeforeInputMovement.z) > 0.001f)) {
-                const Simulation::SparseCharacterBody supportBody{
-                    cameraPos.x,
-                    cameraPos.y,
-                    cameraPos.z,
+                // CLIFF-EDGE GUARD, grounded-only (Loop 90 traversal fix). This
+                // rule reverts a horizontal move whose target has no support so
+                // walking cannot step off a cliff. It used to apply MID-AIR too
+                // and ZERO the vertical velocity: any horizontal input while
+                // airborne (e.g. after leaving flight) re-froze the fall every
+                // frame -- holding W hovered the player in place, and taps made
+                // descent a slow creep. Guard: only applies when the START
+                // position is itself supported (standing on something), and the
+                // revert never touches vertical velocity.
+                const Simulation::SparseCharacterBody startSupportBody{
+                    cameraPosBeforeInputMovement.x,
+                    cameraPosBeforeInputMovement.y,
+                    cameraPosBeforeInputMovement.z,
                     playerHeight,
                     playerRadius,
                     stepHeight
                 };
-                const float feetY = supportBody.eyeY - supportBody.height;
-                const Simulation::SparseCollisionAabb supportProbe =
+                const float startFeetY = startSupportBody.eyeY - startSupportBody.height;
+                const Simulation::SparseCollisionAabb startSupportProbe =
                     Simulation::MakeSparseCharacterFootprintAabb(
-                        supportBody,
-                        feetY + stepHeight + 0.25f);
-                const Simulation::SparseCollisionSupportResult targetSupport =
+                        startSupportBody,
+                        startFeetY + stepHeight + 0.25f);
+                const Simulation::SparseCollisionSupportResult startSupport =
                     sparseVoxelWorld.FindCollisionSupportBelow(
-                        supportProbe,
-                        std::max(stepHeight + 1.0f, sparseWalkSupportDrop),
+                        startSupportProbe,
+                        stepHeight + 1.0f,
                         enableSparseLiquidWalkSupport);
-                sparseBodyCollisionSampledLastFrame += targetSupport.sampledVoxels;
-                sparseBodyCollisionSolidLastFrame += targetSupport.solidVoxels;
-                sparseBodyCollisionLiquidLastFrame += targetSupport.liquidVoxels;
-                const float previousFeetY = cameraPosBeforeInputMovement.y - playerHeight;
-                const float supportTopY = static_cast<float>(targetSupport.supportY) + 1.0f;
-                const bool dropsTooFar =
-                    targetSupport.found &&
-                    previousFeetY - supportTopY > std::max(stepHeight, sparseWalkMaxSupportDrop);
-                if (!targetSupport.found || dropsTooFar) {
-                    cameraPos.x = cameraPosBeforeInputMovement.x;
-                    cameraPos.z = cameraPosBeforeInputMovement.z;
-                    cameraVelocityY = 0.0f;
-                    sparseBodyCollisionBlockedLastFrame = 1u;
+                sparseBodyCollisionSampledLastFrame += startSupport.sampledVoxels;
+                sparseBodyCollisionSolidLastFrame += startSupport.solidVoxels;
+                sparseBodyCollisionLiquidLastFrame += startSupport.liquidVoxels;
+                const bool startGrounded =
+                    startSupport.found &&
+                    startFeetY - (static_cast<float>(startSupport.supportY) + 1.0f) <=
+                        stepHeight + 0.5f;
+                if (startGrounded) {
+                    const Simulation::SparseCharacterBody supportBody{
+                        cameraPos.x,
+                        cameraPos.y,
+                        cameraPos.z,
+                        playerHeight,
+                        playerRadius,
+                        stepHeight
+                    };
+                    const float feetY = supportBody.eyeY - supportBody.height;
+                    const Simulation::SparseCollisionAabb supportProbe =
+                        Simulation::MakeSparseCharacterFootprintAabb(
+                            supportBody,
+                            feetY + stepHeight + 0.25f);
+                    const Simulation::SparseCollisionSupportResult targetSupport =
+                        sparseVoxelWorld.FindCollisionSupportBelow(
+                            supportProbe,
+                            std::max(stepHeight + 1.0f, sparseWalkSupportDrop),
+                            enableSparseLiquidWalkSupport);
+                    sparseBodyCollisionSampledLastFrame += targetSupport.sampledVoxels;
+                    sparseBodyCollisionSolidLastFrame += targetSupport.solidVoxels;
+                    sparseBodyCollisionLiquidLastFrame += targetSupport.liquidVoxels;
+                    const float previousFeetY = cameraPosBeforeInputMovement.y - playerHeight;
+                    const float supportTopY = static_cast<float>(targetSupport.supportY) + 1.0f;
+                    const bool dropsTooFar =
+                        targetSupport.found &&
+                        previousFeetY - supportTopY > std::max(stepHeight, sparseWalkMaxSupportDrop);
+                    if (!targetSupport.found || dropsTooFar) {
+                        cameraPos.x = cameraPosBeforeInputMovement.x;
+                        cameraPos.z = cameraPosBeforeInputMovement.z;
+                        sparseBodyCollisionBlockedLastFrame = 1u;
+                    }
                 }
             }
 
@@ -14525,9 +14825,26 @@ int RunSandbox(int argc, char* argv[]) {
             if (groundResult.grounded && cameraVelocityY <= 0.0f) {
                 cameraPos.y = groundResult.eyeY;
                 cameraVelocityY = groundResult.verticalVelocity;
-                if (jumpPressed && !flightTogglePressed) {
-                    cameraVelocityY = 20.0f;
-                }
+            }
+            // JUMP FEEL (Loop 91): coyote time + input buffering. Grounding
+            // flickers for a frame or two while running across terrace edges,
+            // which used to EAT jump presses (jump only fired on an exact
+            // grounded frame). A press is remembered briefly and fires as soon
+            // as the player was grounded within the coyote window.
+            sparseJumpCoyoteAgeSeconds += dt;
+            sparseJumpBufferAgeSeconds += dt;
+            if (groundResult.grounded && cameraVelocityY <= 0.0f) {
+                sparseJumpCoyoteAgeSeconds = 0.0f;
+            }
+            if (jumpPressed && !flightTogglePressed) {
+                sparseJumpBufferAgeSeconds = 0.0f;
+            }
+            if (sparseJumpBufferAgeSeconds <= 0.15f &&
+                sparseJumpCoyoteAgeSeconds <= 0.12f &&
+                cameraVelocityY <= 0.5f) {
+                cameraVelocityY = 20.0f;
+                sparseJumpBufferAgeSeconds = 999.0f;
+                sparseJumpCoyoteAgeSeconds = 999.0f;
             }
 
         }
@@ -15504,13 +15821,15 @@ int RunSandbox(int argc, char* argv[]) {
                 sparseSurfaceGpuResources.BeginFrame(
                     frameIndex,
                     commandQueue->GetLastCompletedFenceValue(),
-                    commandQueue->GetNextFenceValue());
+                    commandQueue->GetNextFenceValue(),
+                    frameCount);
             }
             if (sparseMidMeshGpuResources.IsInitialized()) {
                 sparseMidMeshGpuResources.BeginFrame(
                     frameIndex,
                     commandQueue->GetLastCompletedFenceValue(),
-                    commandQueue->GetNextFenceValue());
+                    commandQueue->GetNextFenceValue(),
+                    frameCount);
             }
             if (midMeshGpuExtractResources.IsInitialized()) {
                 midMeshGpuExtractResources.BeginFrame(
@@ -16376,61 +16695,206 @@ int RunSandbox(int argc, char* argv[]) {
                         sparsePagePublishBudgetThisFrame,
                         std::min(sparseHiddenExactMissPostOpenPublishBudget, sparsePagePublishesEligibleThisFrame));
             }
+            // EDIT-WINDOW PUBLISH PRIORITY (Loop 88): during a brush stroke the
+            // frame is busy, the 4ms publish time cap trips after a handful of
+            // publishes, and the time-exceeded path then pops ONLY Edited-class
+            // publishes -- but brush-created bricks stream in as Visible class.
+            // Their READY publishes starved all stroke (measured: ready backlog
+            // grew 157->371 while generation/upload queues stayed empty) and
+            // drained only on release ("nothing appears, then all at once").
+            // While the edit window is open, guarantee a minimum publish count
+            // per frame ahead of the time cap so brush bricks render live.
+            static const uint32_t sparseEditPublishMinPerFrame =
+                ReadUIntEnv("VENPOD_SPARSE_EDIT_PUBLISH_MIN_PER_FRAME", 128u);
             const double sparsePageTablePublishMaxMsThisFrame =
                 sparseHiddenExactStartupPublishOvertime
                     ? std::max(sparsePageTablePublishMaxMs, sparseStartupPageTablePublishMaxMs)
                     : sparseHiddenExactRuntimePublishPriority
                     ? std::max(sparsePageTablePublishMaxMs, 12.0)
+                    : sparseMidMeshEditStrokeLive
+                    ? std::max(sparsePageTablePublishMaxMs, 8.0)
                     : sparsePageTablePublishMaxMs;
             const uint32_t sparsePageTablePublishMinPerFrameThisFrame =
                 sparseHiddenExactStartupPublishOvertime
                     ? std::max(sparsePageTablePublishMinPerFrame, sparseStartupPageTablePublishMinPerFrame)
                     : sparseHiddenExactRuntimePublishPriority
                     ? std::max(sparsePageTablePublishMinPerFrame, std::min(128u, sparseHiddenExactMissPostOpenPublishBudget))
+                    : sparseMidMeshEditStrokeLive
+                    ? std::max(sparsePageTablePublishMinPerFrame, sparseEditPublishMinPerFrame)
                     : sparsePageTablePublishMinPerFrame;
-            uint32_t sparsePageTableSurfaceReadyGateExtractBudgetThisFrame =
-                sparsePageTableSurfaceReadyGateExtractBudget;
-            if (sparseTerrainCriticalPublishOvertime) {
-                sparsePageTableSurfaceReadyGateExtractBudgetThisFrame = std::max(
-                    sparsePageTableSurfaceReadyGateExtractBudgetThisFrame,
-                    sparseTerrainScreenCriticalProtectedSurfaceBudget);
-            }
-            if (sparseHiddenExactStartupPublishOvertime) {
-                sparsePageTableSurfaceReadyGateExtractBudgetThisFrame = std::max(
-                    sparsePageTableSurfaceReadyGateExtractBudgetThisFrame,
-                    sparseStartupPageTableSurfaceReadyGateExtractBudget);
-            } else if (sparseHiddenExactRuntimePublishPriority) {
-                sparsePageTableSurfaceReadyGateExtractBudgetThisFrame = std::max(
-                    sparsePageTableSurfaceReadyGateExtractBudgetThisFrame,
-                    sparseHiddenExactMissPostOpenSurfaceBudget);
-            }
             const bool hiddenExactPostOpenCriticalOnlyForForcedWork =
                 (enableSparseHiddenExactPostOpenRepairLane ||
                  enableSparseHiddenExactDeferProactive) &&
                 enableSparseStartupPublicRenderGate &&
                 sparseStartupPublicRenderGateOpened;
-            if (enableSparsePageTableSurfaceReadyGate &&
-                sparsePageTableSurfaceReadyGateExtractBudgetThisFrame > 0u &&
-                sparsePagePublishesEligibleThisFrame > 0u &&
-                !sparsePagePublishQueue.Empty()) {
-                const bool startupSurfaceCatchup =
-                    enableSparseStartupPublicRenderGate &&
-                    !sparseStartupPublicRenderGateOpened &&
-                    sparseStartupPublicRenderHeldThisFrame;
-                const bool postOpenSurfaceCatchup =
-                    enableSparseStartupPublicRenderGate &&
-                    sparseStartupPublicRenderGateOpened &&
-                    sparseStartupPublicRenderOpenedFrame != std::numeric_limits<uint64_t>::max() &&
-                    frameCount <= sparseStartupPublicRenderOpenedFrame +
-                        static_cast<uint64_t>(sparseHiddenExactMissPostOpenCatchupFrames) &&
-                    sparseHiddenExactRuntimeCleanFrames < sparseHiddenExactMissCleanIdleFrames &&
-                    (!hiddenExactPostOpenCriticalOnlyForForcedWork ||
-                     !sparseHiddenExactMissCriticalCoordsLastFrame.empty());
-                const float prePublishSurfaceMaxMs = startupSurfaceCatchup
-                    ? sparseStartupPrePublishSurfaceExtractionMaxMs
-                    : postOpenSurfaceCatchup
-                    ? sparsePostOpenPrePublishSurfaceExtractionMaxMs
-                    : sparsePrePublishSurfaceExtractionMaxMs;
+            const bool hiddenExactPostOpenCriticalOnlyForSurfaceWork =
+                enableSparseHiddenExactPostOpenRepairLane &&
+                enableSparseStartupPublicRenderGate &&
+                sparseStartupPublicRenderGateOpened;
+            {
+                const uint64_t currentEditRevision =
+                    sparseVoxelWorld.GetEdits().RevisionSerial();
+                if (currentEditRevision != sparseSurfaceCatchupLastEditRevision) {
+                    sparseSurfaceCatchupLastEditRevision = currentEditRevision;
+                    sparseSurfaceCatchupLastEditFrame = frameCount;
+                }
+            }
+            const bool startupSurfaceCatchup =
+                enableSparseStartupPublicRenderGate &&
+                !sparseStartupPublicRenderGateOpened &&
+                sparseStartupPublicRenderHeldThisFrame;
+            const bool postOpenSurfaceCatchup =
+                enableSparseStartupPublicRenderGate &&
+                sparseStartupPublicRenderGateOpened &&
+                sparseStartupPublicRenderOpenedFrame != std::numeric_limits<uint64_t>::max() &&
+                frameCount <= sparseStartupPublicRenderOpenedFrame +
+                    static_cast<uint64_t>(sparseHiddenExactMissPostOpenCatchupFrames) &&
+                sparseHiddenExactRuntimeCleanFrames < sparseHiddenExactMissCleanIdleFrames &&
+                (!hiddenExactPostOpenCriticalOnlyForSurfaceWork ||
+                 !sparseHiddenExactMissCriticalCoordsLastFrame.empty());
+            Simulation::SparsePrePublishSurfaceBudgetInput prePublishSurfaceBudgetInput;
+            prePublishSurfaceBudgetInput.pageTableSurfaceReadyGateEnabled =
+                enableSparsePageTableSurfaceReadyGate;
+            prePublishSurfaceBudgetInput.pagePublishesEligible =
+                sparsePagePublishesEligibleThisFrame;
+            prePublishSurfaceBudgetInput.pagePublishQueueEmpty =
+                sparsePagePublishQueue.Empty();
+            prePublishSurfaceBudgetInput.baseExtractBudget =
+                sparsePageTableSurfaceReadyGateExtractBudget;
+            prePublishSurfaceBudgetInput.terrainCriticalExtractBudget =
+                sparseTerrainScreenCriticalProtectedSurfaceBudget;
+            prePublishSurfaceBudgetInput.startupExtractBudget =
+                sparseStartupPageTableSurfaceReadyGateExtractBudget;
+            prePublishSurfaceBudgetInput.postOpenExtractBudget =
+                sparseHiddenExactMissPostOpenSurfaceBudget;
+            prePublishSurfaceBudgetInput.baseHiddenCriticalBudget =
+                sparseHiddenExactMissSurfaceBudget;
+            prePublishSurfaceBudgetInput.startupHiddenCriticalBudget =
+                sparseStartupHiddenExactMissSurfaceBudget;
+            prePublishSurfaceBudgetInput.postOpenHiddenCriticalBudget =
+                sparseHiddenExactMissPostOpenSurfaceBudget;
+            prePublishSurfaceBudgetInput.hiddenTrackedBudget =
+                sparsePrePublishHiddenTrackedSurfaceBudget;
+            prePublishSurfaceBudgetInput.generalBudget =
+                sparsePrePublishGeneralSurfaceBudget;
+            prePublishSurfaceBudgetInput.editGeneralBudget =
+                sparsePrePublishEditGeneralSurfaceBudget;
+            prePublishSurfaceBudgetInput.baseMaxMs =
+                sparsePrePublishSurfaceExtractionMaxMs;
+            prePublishSurfaceBudgetInput.startupMaxMs =
+                sparseStartupPrePublishSurfaceExtractionMaxMs;
+            prePublishSurfaceBudgetInput.postOpenMaxMs =
+                sparsePostOpenPrePublishSurfaceExtractionMaxMs;
+            prePublishSurfaceBudgetInput.frameIndex = frameCount;
+            prePublishSurfaceBudgetInput.lastEditFrame =
+                sparseSurfaceCatchupLastEditFrame;
+            prePublishSurfaceBudgetInput.editIdleFrames =
+                sparseSurfaceFullCatchupEditIdleFrames;
+            prePublishSurfaceBudgetInput.postEditGeneralSpillFrames =
+                sparsePrePublishPostEditGeneralSpillFrames;
+            prePublishSurfaceBudgetInput.postEditGeneralBudget =
+                sparsePrePublishPostEditGeneralSurfaceBudget;
+            prePublishSurfaceBudgetInput.postEditGeneralSpillPressureMs =
+                sparsePrePublishPostEditGeneralSpillPressureMs;
+            prePublishSurfaceBudgetInput.lastRawFrameMs = lastRawFrameMs;
+            prePublishSurfaceBudgetInput.combinedSchedulerPressureMs =
+                schedulerBudgetPressureMs;
+            prePublishSurfaceBudgetInput.sameFrameClipmapPrepMs =
+                perfSparseClipmapPrepMs;
+            prePublishSurfaceBudgetInput.stackedWorkClipmapPrepThresholdMs =
+                sparsePrePublishStackedClipmapPrepThresholdMs;
+            prePublishSurfaceBudgetInput.stackedWorkGeneralBudget =
+                sparsePrePublishStackedGeneralSurfaceBudget;
+            prePublishSurfaceBudgetInput.terrainCriticalPublishOvertime =
+                sparseTerrainCriticalPublishOvertime;
+            prePublishSurfaceBudgetInput.hiddenExactStartupPublishOvertime =
+                sparseHiddenExactStartupPublishOvertime;
+            prePublishSurfaceBudgetInput.hiddenExactRuntimePublishPriority =
+                sparseHiddenExactRuntimePublishPriority;
+            prePublishSurfaceBudgetInput.startupSurfaceCatchup =
+                startupSurfaceCatchup;
+            prePublishSurfaceBudgetInput.postOpenSurfaceCatchup =
+                postOpenSurfaceCatchup;
+            const Simulation::SparsePrePublishSurfaceBudgetDecision
+                prePublishSurfaceBudgetDecision =
+                    Simulation::SparseRuntimeBudgetScheduler::BuildPrePublishSurfaceBudget(
+                        prePublishSurfaceBudgetInput);
+            bool sparsePrePublishGeneralSurfaceBudgetHitThisFrame =
+                prePublishSurfaceBudgetDecision.skipGeneralSurfaceStage;
+            // Loop 88 diagnosis: the pre-publish gate went dark during strokes.
+            // Log the decision every 30 frames while the edit window is open.
+            if (enableRuntimeLog && sparseMidMeshEditStrokeLive && (frameCount % 30u) == 0u) {
+                spdlog::info(
+                    "PERF_SPARSE_PRE_PUBLISH_EDIT frame={} enabled={} editActive={} total={} general={} genCrit={} genNonCrit={} hiddenCrit={} maxMs={:.2f} eligible={} queueEmpty={} gateOn={} stackedCap={} skipStage={}",
+                    frameCount,
+                    prePublishSurfaceBudgetDecision.enabled ? 1 : 0,
+                    prePublishSurfaceBudgetDecision.editActive ? 1 : 0,
+                    prePublishSurfaceBudgetDecision.totalBudget,
+                    prePublishSurfaceBudgetDecision.generalBudget,
+                    prePublishSurfaceBudgetDecision.generalCriticalBudget,
+                    prePublishSurfaceBudgetDecision.generalNonCriticalBudget,
+                    prePublishSurfaceBudgetDecision.hiddenCriticalBudget,
+                    prePublishSurfaceBudgetDecision.maxMs,
+                    prePublishSurfaceBudgetInput.pagePublishesEligible,
+                    prePublishSurfaceBudgetInput.pagePublishQueueEmpty ? 1 : 0,
+                    prePublishSurfaceBudgetInput.pageTableSurfaceReadyGateEnabled ? 1 : 0,
+                    prePublishSurfaceBudgetDecision.stackedWorkGeneralCapActive ? 1 : 0,
+                    prePublishSurfaceBudgetDecision.skipGeneralSurfaceStage ? 1 : 0);
+            }
+            // Surface work route (Loop 86): decide once per frame whether general
+            // surface catch-up prefers async enqueue over the blocking fork-join
+            // batch. Applies to the pre-publish general pumps AND the later surface
+            // stage (both consult the world flag). Ownership-critical work is exempt
+            // inside the world pumps.
+            {
+                Simulation::SparseSurfaceWorkRouteInput surfaceWorkRouteInput{};
+                surfaceWorkRouteInput.routingEnabled = sparseSurfaceRouteGeneralAsync;
+                surfaceWorkRouteInput.asyncExtractionEnabled =
+                    sparseWorldConfig.asyncSurfaceExtraction;
+                surfaceWorkRouteInput.editActive =
+                    prePublishSurfaceBudgetDecision.editActive;
+                surfaceWorkRouteInput.asyncPerCoordEditGate =
+                    sparseWorldConfig.asyncSurfaceExtractionPerCoordEditGate;
+                surfaceWorkRouteInput.previousRouteGeneralToAsync =
+                    sparseSurfaceRoutePreferAsyncLastFrame;
+                const auto& surfaceRouteStats = sparseVoxelWorld.GetStats();
+                surfaceWorkRouteInput.asyncQueueDepth =
+                    surfaceRouteStats.asyncSurfaceExtractionQueueDepth;
+                surfaceWorkRouteInput.asyncResultDepth =
+                    surfaceRouteStats.asyncSurfaceExtractionResultDepth;
+                surfaceWorkRouteInput.asyncBacklogLimit =
+                    sparseSurfaceRouteAsyncBacklogLimit;
+                surfaceWorkRouteInput.surfaceReadyPublishPending =
+                    sparseSurfaceReadyPublishPendingLastFrame;
+                surfaceWorkRouteInput.surfaceReadyPublishOldestAge =
+                    sparseSurfaceReadyPublishOldestAgeLastFrame;
+                surfaceWorkRouteInput.surfaceReadyPublishPendingLimit =
+                    sparseSurfaceRoutePublishPendingLimit;
+                surfaceWorkRouteInput.surfaceReadyPublishOldestAgeLimit =
+                    sparseSurfaceRoutePublishAgeLimit;
+                surfaceWorkRouteInput.pagePublishBacklog =
+                    static_cast<uint64_t>(sparsePagePublishQueue.Size());
+                surfaceWorkRouteInput.pagePublishBacklogLimit =
+                    sparseSurfaceRoutePagePublishLimit;
+                const Simulation::SparseSurfaceWorkRouteDecision surfaceWorkRouteDecision =
+                    Simulation::SparseRuntimeBudgetScheduler::BuildSurfaceWorkRoute(
+                        surfaceWorkRouteInput);
+                sparseSurfaceRoutePreferAsyncLastFrame =
+                    surfaceWorkRouteDecision.routeGeneralToAsync;
+                sparseSurfaceRouteAsyncSaturatedLastFrame =
+                    surfaceWorkRouteDecision.asyncBacklogSaturated;
+                sparseSurfaceRoutePublishSaturatedLastFrame =
+                    surfaceWorkRouteDecision.publishBacklogSaturated;
+                sparseSurfaceRouteAsyncQueueDepthLastFrame =
+                    surfaceWorkRouteInput.asyncQueueDepth;
+                sparseSurfaceRouteAsyncResultDepthLastFrame =
+                    surfaceWorkRouteInput.asyncResultDepth;
+                sparseVoxelWorld.SetSurfaceWorkRoutePreferAsync(
+                    surfaceWorkRouteDecision.routeGeneralToAsync);
+            }
+            if (prePublishSurfaceBudgetDecision.enabled) {
+                const float prePublishSurfaceMaxMs =
+                    prePublishSurfaceBudgetDecision.maxMs;
                 const bool prePublishSurfaceTimeLimited = prePublishSurfaceMaxMs > 0.0f;
                 const uint64_t prePublishSurfaceStart = SDL_GetPerformanceCounter();
                 const auto prePublishSurfaceElapsedMs = [&]() {
@@ -16441,12 +16905,22 @@ int RunSandbox(int argc, char* argv[]) {
                         prePublishSurfaceElapsedMs() >= prePublishSurfaceMaxMs;
                 };
                 const uint32_t prePublishSurfaceBudget =
-                    sparsePageTableSurfaceReadyGateExtractBudgetThisFrame;
+                    prePublishSurfaceBudgetDecision.totalBudget;
                 uint32_t prePublishSurfaceExtracted = 0;
                 uint32_t prePublishSurfaceTerrainCriticalExtracted = 0;
                 uint32_t prePublishSurfaceHiddenCriticalExtracted = 0;
                 uint32_t prePublishSurfaceHiddenTrackedExtracted = 0;
                 uint32_t prePublishSurfaceGeneralExtracted = 0;
+                uint32_t prePublishSurfaceGeneralOwnershipCriticalExtracted = 0;
+                uint32_t prePublishSurfaceGeneralOwnershipNonCriticalExtracted = 0;
+                uint32_t prePublishSurfaceGeneralEditedExtracted = 0;
+                uint32_t prePublishSurfaceGeneralCollisionExtracted = 0;
+                uint32_t prePublishSurfaceGeneralVisibleExtracted = 0;
+                uint32_t prePublishSurfaceGeneralSpeculativeExtracted = 0;
+                uint32_t prePublishSurfaceGeneralTimedExtracted = 0;
+                uint32_t prePublishSurfaceGeneralBudget = 0;
+                uint32_t prePublishSurfaceHiddenCriticalBudget = 0;
+                uint32_t prePublishSurfaceHiddenTrackedBudget = 0;
                 auto pumpPrePublishSurfaceCoord = [&](const Simulation::BrickCoord& coord) {
                     if (prePublishSurfaceExtracted >= prePublishSurfaceBudget ||
                         prePublishSurfaceTimeExpired() ||
@@ -16460,14 +16934,19 @@ int RunSandbox(int argc, char* argv[]) {
                     }
                     return false;
                 };
-                auto pumpPrePublishSurfaceCoords = [&](const std::vector<Simulation::BrickCoord>& coords) {
+                auto pumpPrePublishSurfaceCoords = [&](
+                    const std::vector<Simulation::BrickCoord>& coords,
+                    uint32_t coordBudget) {
                     if (prePublishSurfaceExtracted >= prePublishSurfaceBudget ||
                         prePublishSurfaceTimeExpired() ||
-                        coords.empty()) {
+                        coords.empty() ||
+                        coordBudget == 0u) {
                         return 0u;
                     }
                     const uint32_t remainingBudget =
-                        prePublishSurfaceBudget - prePublishSurfaceExtracted;
+                        std::min(
+                            prePublishSurfaceBudget - prePublishSurfaceExtracted,
+                            coordBudget);
                     const uint32_t extracted =
                         sparseVoxelWorld.PumpSurfaceExtractionForCoords(coords, remainingBudget);
                     prePublishSurfaceExtracted += extracted;
@@ -16480,23 +16959,35 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseTerrainCriticalActiveLastFrame != 0u &&
                     !sparseTerrainCriticalCoordsLastFrame.empty()) {
                     const uint32_t terrainExtracted =
-                        pumpPrePublishSurfaceCoords(sparseTerrainCriticalCoordsLastFrame);
+                        pumpPrePublishSurfaceCoords(
+                            sparseTerrainCriticalCoordsLastFrame,
+                            prePublishSurfaceBudget);
                     prePublishSurfaceTerrainCriticalExtracted += terrainExtracted;
                     perfSparseTerrainCriticalPrePublishSurfaceExtracted += terrainExtracted;
                     sparseTerrainCriticalProtectedSurfacedLastFrame += terrainExtracted;
                 }
                 if (enableSparseHiddenExactMissFeedback &&
                     !sparseHiddenExactMissCriticalCoordsLastFrame.empty()) {
+                    const uint32_t hiddenCriticalSurfaceBudgetThisFrame =
+                        prePublishSurfaceBudgetDecision.hiddenCriticalBudget;
+                    prePublishSurfaceHiddenCriticalBudget =
+                        hiddenCriticalSurfaceBudgetThisFrame;
                     prePublishSurfaceHiddenCriticalExtracted +=
-                        pumpPrePublishSurfaceCoords(sparseHiddenExactMissCriticalCoordsLastFrame);
+                        pumpPrePublishSurfaceCoords(
+                            sparseHiddenExactMissCriticalCoordsLastFrame,
+                            hiddenCriticalSurfaceBudgetThisFrame);
                 }
                 const bool hiddenExactPostOpenRepairLaneCriticalOnlyForPrePublish =
-                    hiddenExactPostOpenCriticalOnlyForForcedWork;
+                    hiddenExactPostOpenCriticalOnlyForSurfaceWork;
                 if (enableSparseHiddenExactMissFeedback &&
                     prePublishSurfaceExtracted < prePublishSurfaceBudget &&
                     !prePublishSurfaceTimeExpired() &&
+                    prePublishSurfaceBudgetDecision.hiddenTrackedBudget > 0u &&
                     !hiddenExactPostOpenRepairLaneCriticalOnlyForPrePublish &&
                     !sparseHiddenExactMissTrackedCoords.empty()) {
+                    prePublishSurfaceHiddenTrackedBudget = std::min(
+                        prePublishSurfaceBudget - prePublishSurfaceExtracted,
+                        prePublishSurfaceBudgetDecision.hiddenTrackedBudget);
                     const bool budgetHiddenTrackedScan =
                         enableSparseHiddenExactTrackedScanBudget &&
                         (!enableSparseStartupPublicRenderGate || sparseStartupPublicRenderGateOpened) &&
@@ -16521,6 +17012,7 @@ int RunSandbox(int argc, char* argv[]) {
                             ++prePublishSurfaceHiddenTrackedExtracted;
                         }
                         if (prePublishSurfaceExtracted >= prePublishSurfaceBudget ||
+                            prePublishSurfaceHiddenTrackedExtracted >= prePublishSurfaceHiddenTrackedBudget ||
                             prePublishSurfaceTimeExpired()) {
                             ++scanned;
                             break;
@@ -16535,14 +17027,20 @@ int RunSandbox(int argc, char* argv[]) {
                 }
                 if (prePublishSurfaceExtracted < prePublishSurfaceBudget &&
                     !prePublishSurfaceTimeExpired()) {
+                    prePublishSurfaceGeneralBudget = std::min(
+                        prePublishSurfaceBudget - prePublishSurfaceExtracted,
+                        prePublishSurfaceBudgetDecision.generalBudget);
+                }
+                if (prePublishSurfaceGeneralBudget > 0u &&
+                    !prePublishSurfaceTimeExpired()) {
                     const double remainingMs = prePublishSurfaceTimeLimited
                         ? std::max(0.0, static_cast<double>(prePublishSurfaceMaxMs) -
                             static_cast<double>(prePublishSurfaceElapsedMs()))
                         : 0.0;
                     uint32_t generalExtracted = 0;
-                    if (sparseOwnershipStageBudgetsActiveThisFrame) {
-                        uint32_t remainingBudget =
-                            prePublishSurfaceBudget - prePublishSurfaceExtracted;
+                    if (sparseOwnershipStageBudgetsActiveThisFrame ||
+                        prePublishSurfaceBudgetDecision.splitGeneralByOwnership) {
+                        uint32_t remainingBudget = prePublishSurfaceGeneralBudget;
                         const auto pumpPrePublishSurfaceOwnership = [&](
                             bool ownershipCritical,
                             uint32_t ownershipBudget) {
@@ -16565,23 +17063,36 @@ int RunSandbox(int argc, char* argv[]) {
                             remainingBudget -= std::min(remainingBudget, extracted);
                             return extracted;
                         };
+                        const uint32_t criticalBudget =
+                            prePublishSurfaceBudgetDecision.splitGeneralByOwnership
+                                ? std::min(
+                                    remainingBudget,
+                                    prePublishSurfaceBudgetDecision.generalCriticalBudget)
+                                : remainingBudget;
                         const uint32_t criticalExtracted = pumpPrePublishSurfaceOwnership(
                             true,
-                            remainingBudget);
+                            criticalBudget);
                         const uint32_t nonCriticalBudget =
-                            std::min(
-                                remainingBudget,
-                                sparseOwnershipStageSurfaceNonCriticalBudgetThisFrame);
+                            prePublishSurfaceBudgetDecision.splitGeneralByOwnership
+                                ? std::min(
+                                    remainingBudget,
+                                    prePublishSurfaceBudgetDecision.generalNonCriticalBudget)
+                                : std::min(
+                                    remainingBudget,
+                                    sparseOwnershipStageSurfaceNonCriticalBudgetThisFrame);
                         const uint32_t nonCriticalExtracted = pumpPrePublishSurfaceOwnership(
                             false,
                             nonCriticalBudget);
-                        sparseOwnershipStagePrePublishSurfaceCriticalLastFrame += criticalExtracted;
-                        sparseOwnershipStagePrePublishSurfaceNonCriticalBudgetLastFrame += nonCriticalBudget;
-                        sparseOwnershipStagePrePublishSurfaceNonCriticalLastFrame += nonCriticalExtracted;
+                        if (sparseOwnershipStageBudgetsActiveThisFrame) {
+                            sparseOwnershipStagePrePublishSurfaceCriticalLastFrame += criticalExtracted;
+                            sparseOwnershipStagePrePublishSurfaceNonCriticalBudgetLastFrame += nonCriticalBudget;
+                            sparseOwnershipStagePrePublishSurfaceNonCriticalLastFrame += nonCriticalExtracted;
+                        }
+                        prePublishSurfaceGeneralOwnershipCriticalExtracted = criticalExtracted;
+                        prePublishSurfaceGeneralOwnershipNonCriticalExtracted = nonCriticalExtracted;
                         generalExtracted = criticalExtracted + nonCriticalExtracted;
                     } else if (sparsePrefetchStageBudgetsActiveThisFrame) {
-                        uint32_t remainingBudget =
-                            prePublishSurfaceBudget - prePublishSurfaceExtracted;
+                        uint32_t remainingBudget = prePublishSurfaceGeneralBudget;
                         const auto pumpPrePublishSurfaceClass = [&](
                             Simulation::SparseResidencyClass residencyClass,
                             uint32_t classBudget) {
@@ -16623,20 +17134,41 @@ int RunSandbox(int argc, char* argv[]) {
                         sparseStageBudgetPrePublishSurfaceCriticalLastFrame += criticalExtracted;
                         sparseStageBudgetPrePublishSurfaceSpeculativeBudgetLastFrame += speculativeBudget;
                         sparseStageBudgetPrePublishSurfaceSpeculativeLastFrame += speculativeExtracted;
+                        prePublishSurfaceGeneralEditedExtracted = editedExtracted;
+                        prePublishSurfaceGeneralCollisionExtracted = collisionExtracted;
+                        prePublishSurfaceGeneralVisibleExtracted = visibleExtracted;
+                        prePublishSurfaceGeneralSpeculativeExtracted = speculativeExtracted;
                         generalExtracted = criticalExtracted + speculativeExtracted;
                     } else {
+                        Simulation::SparseSurfaceExtractionClassCounts timedClassCounts;
                         generalExtracted =
                             sparseVoxelWorld.PumpSurfaceExtractionAroundTimed(
-                                prePublishSurfaceBudget - prePublishSurfaceExtracted,
+                                prePublishSurfaceGeneralBudget,
                                 sparseUploadFocus,
                                 static_cast<uint32_t>(frameCount),
-                                remainingMs);
+                                remainingMs,
+                                &timedClassCounts);
+                        prePublishSurfaceGeneralEditedExtracted = timedClassCounts.edited;
+                        prePublishSurfaceGeneralCollisionExtracted = timedClassCounts.collision;
+                        prePublishSurfaceGeneralVisibleExtracted = timedClassCounts.visible;
+                        prePublishSurfaceGeneralSpeculativeExtracted = timedClassCounts.speculative;
+                        prePublishSurfaceGeneralTimedExtracted = generalExtracted;
                     }
                     prePublishSurfaceExtracted += generalExtracted;
                     prePublishSurfaceGeneralExtracted += generalExtracted;
                     sparsePageTableSurfaceGateExtractsLastFrame += generalExtracted;
+                    if (prePublishSurfaceBudgetDecision.generalBudget !=
+                            std::numeric_limits<uint32_t>::max() &&
+                        prePublishSurfaceGeneralBudget > 0u &&
+                        generalExtracted >= prePublishSurfaceGeneralBudget) {
+                        sparsePrePublishGeneralSurfaceBudgetHitThisFrame = true;
+                    }
+                    if (prePublishSurfaceExtracted >= prePublishSurfaceBudget) {
+                        sparsePrePublishGeneralSurfaceBudgetHitThisFrame = true;
+                    }
                 }
                 sparseVoxelWorld.SetStatsRefreshDeferred(false);
+                const auto& prePublishSurfaceStats = sparseVoxelWorld.GetStats();
                 const float prePublishSurfaceElapsedMsFinal =
                     static_cast<float>(prePublishSurfaceElapsedMs());
                 perfSparseSurfaceExtractMs += prePublishSurfaceElapsedMsFinal;
@@ -16644,7 +17176,7 @@ int RunSandbox(int argc, char* argv[]) {
                 if (prePublishSurfaceExtracted != 0u &&
                     (startupSurfaceCatchup || postOpenSurfaceCatchup)) {
                     spdlog::info(
-                        "PERF_SPARSE_PRE_PUBLISH_SURFACE frame={} extracted={} terrainCritical={} hiddenCritical={} hiddenTracked={} general={} budget={} elapsedMs={:.2f} maxMs={} startup={} postOpen={} openedFrame={} catchupFrames={} queuedPublishes={}",
+                        "PERF_SPARSE_PRE_PUBLISH_SURFACE frame={} extracted={} terrainCritical={} hiddenCritical={} hiddenTracked={} general={} budget={} elapsedMs={:.2f} maxMs={} startup={} postOpen={} openedFrame={} catchupFrames={} queuedPublishes={} generalBudget={} hiddenCriticalBudget={} hiddenTrackedBudget={} editActive={} editGeneralBudget={} postEditSpill={} postEditGeneralBudget={} postEditSpillFrames={} postEditSpillPressureMs={:.2f} splitByOwnership={} generalCriticalBudget={} generalNonCriticalBudget={} stackedCap={} stackedClipMs={:.2f} stackedClipThresholdMs={:.2f} stackedGeneralBudget={} generalSplit=ownCrit/ownNon/edit/coll/vis/spec/timed:{}/{}/{}/{}/{}/{}/{} frameSurface=inlineBricks/inlineMs/parallelBricks/parallelWorkers/parallelWallMs/asyncEnqueued/asyncRejected/asyncEnqueueMs/asyncWorkerMs:{}/{:.2f}/{}/{}/{:.2f}/{}/{}/{:.2f}/{:.2f}",
                         frameCount,
                         prePublishSurfaceExtracted,
                         prePublishSurfaceTerrainCriticalExtracted,
@@ -16660,7 +17192,39 @@ int RunSandbox(int argc, char* argv[]) {
                             ? 0ull
                             : sparseStartupPublicRenderOpenedFrame,
                         sparseHiddenExactMissPostOpenCatchupFrames,
-                        sparsePagePublishQueue.Size());
+                        sparsePagePublishQueue.Size(),
+                        prePublishSurfaceGeneralBudget,
+                        prePublishSurfaceHiddenCriticalBudget,
+                        prePublishSurfaceHiddenTrackedBudget,
+                        prePublishSurfaceBudgetDecision.editActive ? 1u : 0u,
+                        sparsePrePublishEditGeneralSurfaceBudget,
+                        prePublishSurfaceBudgetDecision.postEditGeneralSpillActive ? 1u : 0u,
+                        sparsePrePublishPostEditGeneralSurfaceBudget,
+                        sparsePrePublishPostEditGeneralSpillFrames,
+                        sparsePrePublishPostEditGeneralSpillPressureMs,
+                        prePublishSurfaceBudgetDecision.splitGeneralByOwnership ? 1u : 0u,
+                        prePublishSurfaceBudgetDecision.generalCriticalBudget,
+                        prePublishSurfaceBudgetDecision.generalNonCriticalBudget,
+                        prePublishSurfaceBudgetDecision.stackedWorkGeneralCapActive ? 1u : 0u,
+                        perfSparseClipmapPrepMs,
+                        sparsePrePublishStackedClipmapPrepThresholdMs,
+                        sparsePrePublishStackedGeneralSurfaceBudget,
+                        prePublishSurfaceGeneralOwnershipCriticalExtracted,
+                        prePublishSurfaceGeneralOwnershipNonCriticalExtracted,
+                        prePublishSurfaceGeneralEditedExtracted,
+                        prePublishSurfaceGeneralCollisionExtracted,
+                        prePublishSurfaceGeneralVisibleExtracted,
+                        prePublishSurfaceGeneralSpeculativeExtracted,
+                        prePublishSurfaceGeneralTimedExtracted,
+                        prePublishSurfaceStats.surfaceInlineExtractionBricksLastFrame,
+                        prePublishSurfaceStats.surfaceInlineExtractionMsLastFrame,
+                        prePublishSurfaceStats.parallelSurfaceExtractionBricksLastFrame,
+                        prePublishSurfaceStats.parallelSurfaceExtractionWorkersLastFrame,
+                        prePublishSurfaceStats.parallelSurfaceExtractionWallMsLastFrame,
+                        prePublishSurfaceStats.asyncSurfaceExtractionEnqueuedLastFrame,
+                        prePublishSurfaceStats.asyncSurfaceExtractionRejectedLastFrame,
+                        prePublishSurfaceStats.asyncSurfaceExtractionEnqueueMsLastFrame,
+                        prePublishSurfaceStats.asyncSurfaceExtractionWorkerMsLastFrame);
                 }
             }
             promoteSparseSurfaceReadyPublishes(sparseSurfaceReadyPublishScanBudget);
@@ -16811,7 +17375,8 @@ int RunSandbox(int argc, char* argv[]) {
                             sparseCompletedFenceForUpload,
                             Simulation::SparseResidencyClass::Edited,
                             &pendingPublish) &&
-                        !(sparseTerrainCriticalPublishOvertime &&
+                        !((sparseTerrainCriticalPublishOvertime ||
+                           sparseMidMeshEditStrokeLive) &&
                           (sparsePagePublishQueue.PopReadyOfClass(
                                sparseFrameIndexU32,
                                sparseCompletedFenceForUpload,
@@ -16888,6 +17453,17 @@ int RunSandbox(int argc, char* argv[]) {
                 }
                 if (pendingPublish.residencyClass == Simulation::SparseResidencyClass::Edited) {
                     ++sparseEditedPageTablePublishesPublishedLastFrame;
+                    // Stroke-brick trace (Loop 108 staircase): pairs with
+                    // EDIT_TELEM_BRICKS dab coords — the per-coord dab->publish
+                    // frame delta IS the user-visible stroke catch-up latency.
+                    if (editTelemetryEnabled) {
+                        spdlog::info(
+                            "EDIT_TELEM_PUBLISH frame={} coord=({},{},{})",
+                            frameCount,
+                            pendingPublish.coord.x,
+                            pendingPublish.coord.y,
+                            pendingPublish.coord.z);
+                    }
                 }
                 if (pendingPublish.readyFrame == sparseFrameIndexU32 &&
                     pendingPublish.readyFenceValue == 0u &&
@@ -17252,6 +17828,30 @@ int RunSandbox(int argc, char* argv[]) {
                 midMeshBuildConfig.forceMergeCells =
                     ReadUIntEnv("VENPOD_SPARSE_MID_MESH_FORCE_MERGE", 0u);
                 midMeshBuildConfig.emitWater = sparseMidMeshEmitWater;
+                // Y-aware edit suppression (default ON): an edit only masks mesh
+                // cells whose surface band it touches. 0 => old XZ-only rule for
+                // A/B (punched permanent ground holes below mid-air strokes).
+                static const bool sparseMidMeshEditSuppressYAware =
+                    ReadUIntEnv("VENPOD_SPARSE_MID_MESH_EDIT_SUPPRESS_Y_AWARE", 1u) != 0u;
+                midMeshBuildConfig.editSuppressYAware = sparseMidMeshEditSuppressYAware;
+                // Live stroke window (default OFF since Loop 88): the edit-window
+                // publish priority makes brush bricks render live via the exact
+                // surface + near raymarch, so the permissive column suppression
+                // (which showed the raymarch fallback "gash" during strokes) is
+                // no longer needed. Env re-enables it for A/B.
+                static const bool sparseMidMeshEditLiveWindowEnabled =
+                    ReadUIntEnv("VENPOD_SPARSE_MID_MESH_EDIT_LIVE_WINDOW", 0u) != 0u;
+                midMeshBuildConfig.editStrokeLiveWindow =
+                    sparseMidMeshEditLiveWindowEnabled && sparseMidMeshEditStrokeLive;
+                // Backfill bound (Loop 89): yield edited columns to the raymarch
+                // only within the edit-aware layers' reach; beyond it keep the
+                // procedural mesh (kills the translucent ghost-ribbon artifact
+                // over edits made at range/altitude).
+                static const float sparseMidMeshEditSuppressMaxDistance =
+                    static_cast<float>(ReadUIntEnv(
+                        "VENPOD_SPARSE_MID_MESH_EDIT_SUPPRESS_MAX_DISTANCE", 384u));
+                midMeshBuildConfig.editSuppressMaxDistance =
+                    sparseMidMeshEditSuppressMaxDistance;
                 midMeshBuildConfig.distanceCull = sparseMidMeshDistanceCull;
                 midMeshBuildConfig.frustumCull = sparseMidMeshFrustumCull;
                 midMeshBuildConfig.cameraX = cameraPos.x;
@@ -18662,6 +19262,11 @@ int RunSandbox(int argc, char* argv[]) {
             const auto sparseSurfaceExtractionElapsedMs = [&]() {
                 return ticksToMs(SDL_GetPerformanceCounter() - sparseSurfaceExtractionStartCounter);
             };
+            uint32_t surfaceStageTerrainCriticalExtracted = 0;
+            uint32_t surfaceStageHiddenCriticalExtracted = 0;
+            uint32_t surfaceStageCriticalExtracted = 0;
+            uint32_t surfaceStageNonCriticalExtracted = 0;
+            uint32_t surfaceStageGeneralExtracted = 0;
             sparseVoxelWorld.SetStatsRefreshDeferred(true);
             if (enableSparseTerrainScreenCriticalPrefetch &&
                 sparseSurfaceExtractionHasPending &&
@@ -18683,8 +19288,10 @@ int RunSandbox(int argc, char* argv[]) {
                     if (readiness != Simulation::SparseRenderReadinessState::ResidentMissingSurface) {
                         continue;
                     }
-                    sparseTerrainCriticalProtectedSurfacedLastFrame +=
+                    const uint32_t extracted =
                         sparseVoxelWorld.PumpSurfaceExtractionForCoord(coord) ? 1u : 0u;
+                    sparseTerrainCriticalProtectedSurfacedLastFrame += extracted;
+                    surfaceStageTerrainCriticalExtracted += extracted;
                 }
             }
             if (enableSparseHiddenExactMissFeedback &&
@@ -18694,8 +19301,7 @@ int RunSandbox(int argc, char* argv[]) {
                 (!sparseHiddenExactMissTrackedCoords.empty() ||
                  !sparseHiddenExactMissCriticalCoordsLastFrame.empty())) {
                 const bool hiddenExactPostOpenRepairLaneCriticalOnly =
-                    (enableSparseHiddenExactPostOpenRepairLane ||
-                     enableSparseHiddenExactDeferProactive) &&
+                    enableSparseHiddenExactPostOpenRepairLane &&
                     enableSparseStartupPublicRenderGate &&
                     sparseStartupPublicRenderGateOpened;
                 const std::vector<Simulation::BrickCoord>& hiddenExactForcedSurfaceCoords =
@@ -18756,8 +19362,10 @@ int RunSandbox(int argc, char* argv[]) {
                     if (readiness != Simulation::SparseRenderReadinessState::ResidentMissingSurface) {
                         continue;
                     }
-                    sparseHiddenExactMissSurfacedLastFrame +=
+                    const uint32_t extracted =
                         sparseVoxelWorld.PumpSurfaceExtractionForCoord(coord) ? 1u : 0u;
+                    sparseHiddenExactMissSurfacedLastFrame += extracted;
+                    surfaceStageHiddenCriticalExtracted += extracted;
                 }
                 if (budgetHiddenTrackedScan && trackedCount > 0u) {
                     sparseHiddenExactTrackedSurfaceCursor = (cursor + scanned) % trackedCount;
@@ -18785,10 +19393,15 @@ int RunSandbox(int argc, char* argv[]) {
                 sparseSurfaceExtractionHasPending &&
                 sparseSurfaceExtractionTimeLimited &&
                 sparseSurfaceExtractionRemainingMs < sparseSurfaceGeneralMinBudgetMs;
+            const bool skipGeneralSurfaceForPrePublishBudget =
+                sparsePrePublishGeneralSurfaceBudgetHitThisFrame &&
+                surfaceExtractionBudgetThisFrame > 0u &&
+                sparseSurfaceExtractionHasPending;
             if (surfaceExtractionBudgetThisFrame > 0u &&
                 sparseSurfaceExtractionHasPending &&
                 (!sparseSurfaceExtractionTimeLimited || sparseSurfaceExtractionRemainingMs > 0.0f) &&
-                !skipGeneralSurfaceForStrictBudget) {
+                !skipGeneralSurfaceForStrictBudget &&
+                !skipGeneralSurfaceForPrePublishBudget) {
                 if (sparseOwnershipStageBudgetsActiveThisFrame) {
                     uint32_t remainingSurfaceBudget = surfaceExtractionBudgetThisFrame;
                     const auto pumpGeneralSurfaceOwnership = [&](
@@ -18815,17 +19428,23 @@ int RunSandbox(int argc, char* argv[]) {
                         remainingSurfaceBudget -= std::min(remainingSurfaceBudget, extracted);
                         return extracted;
                     };
-                    sparseOwnershipStageSurfaceCriticalLastFrame += pumpGeneralSurfaceOwnership(
+                    const uint32_t criticalSurfaceExtracted = pumpGeneralSurfaceOwnership(
                         true,
                         remainingSurfaceBudget);
+                    sparseOwnershipStageSurfaceCriticalLastFrame += criticalSurfaceExtracted;
+                    surfaceStageCriticalExtracted += criticalSurfaceExtracted;
                     const uint32_t nonCriticalSurfaceBudget =
                         std::min(
                             remainingSurfaceBudget,
                             sparseOwnershipStageSurfaceNonCriticalBudgetThisFrame);
                     sparseOwnershipStageSurfaceNonCriticalBudgetLastFrame += nonCriticalSurfaceBudget;
-                    sparseOwnershipStageSurfaceNonCriticalLastFrame += pumpGeneralSurfaceOwnership(
+                    const uint32_t nonCriticalSurfaceExtracted = pumpGeneralSurfaceOwnership(
                         false,
                         nonCriticalSurfaceBudget);
+                    sparseOwnershipStageSurfaceNonCriticalLastFrame += nonCriticalSurfaceExtracted;
+                    surfaceStageNonCriticalExtracted += nonCriticalSurfaceExtracted;
+                    surfaceStageGeneralExtracted +=
+                        criticalSurfaceExtracted + nonCriticalSurfaceExtracted;
                 } else if (sparsePrefetchStageBudgetsActiveThisFrame) {
                     uint32_t remainingSurfaceBudget = surfaceExtractionBudgetThisFrame;
                     const auto pumpGeneralSurfaceClass = [&](
@@ -18863,14 +19482,22 @@ int RunSandbox(int argc, char* argv[]) {
                         remainingSurfaceBudget);
                     sparseStageBudgetSurfaceCriticalLastFrame +=
                         editedExtracted + collisionExtracted + visibleExtracted;
+                    surfaceStageCriticalExtracted +=
+                        editedExtracted + collisionExtracted + visibleExtracted;
                     const uint32_t speculativeBudget =
                         std::min(remainingSurfaceBudget, sparsePrefetchStageSurfaceBudget);
                     sparseStageBudgetSurfaceSpeculativeBudgetLastFrame += speculativeBudget;
-                    sparseStageBudgetSurfaceSpeculativeLastFrame += pumpGeneralSurfaceClass(
+                    const uint32_t speculativeExtracted = pumpGeneralSurfaceClass(
                         Simulation::SparseResidencyClass::Speculative,
                         speculativeBudget);
+                    sparseStageBudgetSurfaceSpeculativeLastFrame += speculativeExtracted;
+                    surfaceStageNonCriticalExtracted += speculativeExtracted;
+                    surfaceStageGeneralExtracted +=
+                        editedExtracted + collisionExtracted + visibleExtracted +
+                        speculativeExtracted;
                 } else {
-                    sparseVoxelWorld.PumpSurfaceExtractionAroundTimed(
+                    surfaceStageGeneralExtracted +=
+                        sparseVoxelWorld.PumpSurfaceExtractionAroundTimed(
                         surfaceExtractionBudgetThisFrame,
                         sparseUploadFocus,
                         static_cast<uint32_t>(frameCount),
@@ -19104,7 +19731,45 @@ int RunSandbox(int argc, char* argv[]) {
                     (!enableSparseStartupPublicRenderGate || sparseStartupPublicRenderGateOpened) ? 1u : 0u);
             }
             sparseVoxelWorld.SetStatsRefreshDeferred(false);
-            perfSparseSurfaceExtractMs += ticksToMs(SDL_GetPerformanceCounter() - perfSparseStepStart);
+            const auto& sparseStatsAfterSurface = sparseVoxelWorld.GetStats();
+            const float sparseSurfaceStageElapsedMs =
+                ticksToMs(SDL_GetPerformanceCounter() - perfSparseStepStart);
+            const uint32_t surfaceStageExtracted =
+                surfaceStageTerrainCriticalExtracted +
+                surfaceStageHiddenCriticalExtracted +
+                surfaceStageGeneralExtracted;
+            if (enableRuntimeLog &&
+                (surfaceStageExtracted != 0u ||
+                 perfSparseSurfaceGeneralStrictSkipped != 0u ||
+                 skipGeneralSurfaceForPrePublishBudget)) {
+                spdlog::info(
+                    "PERF_SPARSE_SURFACE_STAGE frame={} extracted={} terrainCritical={} hiddenCritical={} general={} critical={} nonCritical={} budget={} elapsedMs={:.2f} maxMs={:.2f} queued={} protected={} catchup={} skipGeneral={} skipPrePublishBudget={} frameSurface=inlineBricks/inlineMs/parallelBricks/parallelWorkers/parallelWallMs/asyncEnqueued/asyncRejected/asyncEnqueueMs/asyncWorkerMs:{}/{:.2f}/{}/{}/{:.2f}/{}/{}/{:.2f}/{:.2f}",
+                    frameCount,
+                    surfaceStageExtracted,
+                    surfaceStageTerrainCriticalExtracted,
+                    surfaceStageHiddenCriticalExtracted,
+                    surfaceStageGeneralExtracted,
+                    surfaceStageCriticalExtracted,
+                    surfaceStageNonCriticalExtracted,
+                    surfaceExtractionBudgetThisFrame,
+                    sparseSurfaceStageElapsedMs,
+                    sparseSurfaceExtractionMaxMs,
+                    sparseStatsBeforeSurface.surfaceExtractionQueuedBricks,
+                    sparseProtectedSurfaceBacklog ? 1u : 0u,
+                    sparseSurfaceCatchupActive ? 1u : 0u,
+                    perfSparseSurfaceGeneralStrictSkipped,
+                    skipGeneralSurfaceForPrePublishBudget ? 1u : 0u,
+                    sparseStatsAfterSurface.surfaceInlineExtractionBricksLastFrame,
+                    sparseStatsAfterSurface.surfaceInlineExtractionMsLastFrame,
+                    sparseStatsAfterSurface.parallelSurfaceExtractionBricksLastFrame,
+                    sparseStatsAfterSurface.parallelSurfaceExtractionWorkersLastFrame,
+                    sparseStatsAfterSurface.parallelSurfaceExtractionWallMsLastFrame,
+                    sparseStatsAfterSurface.asyncSurfaceExtractionEnqueuedLastFrame,
+                    sparseStatsAfterSurface.asyncSurfaceExtractionRejectedLastFrame,
+                    sparseStatsAfterSurface.asyncSurfaceExtractionEnqueueMsLastFrame,
+                    sparseStatsAfterSurface.asyncSurfaceExtractionWorkerMsLastFrame);
+            }
+            perfSparseSurfaceExtractMs += sparseSurfaceStageElapsedMs;
             perfSparseStepStart = SDL_GetPerformanceCounter();
 
             if (sparseSurfaceGpuResources.IsInitialized()) {
@@ -19367,6 +20032,7 @@ int RunSandbox(int argc, char* argv[]) {
                                 sparseSurfaceDeferredPayloadsLastUpload = surfaceTicket.deferredPayloadBricks;
                                 sparseSurfaceLookaheadVisibleLastUpload =
                                     surfaceSnapshot.lookaheadVisibleBricks;
+                                surfaceUploadCompleted = true;
                             } else {
                                 ++sparseSurfaceUploadRetriesLastFrame;
                             }
@@ -19376,6 +20042,61 @@ int RunSandbox(int argc, char* argv[]) {
                             ++sparseSurfaceUploadRetriesLastFrame;
                             spdlog::warn("Sparse surface GPU snapshot build failed");
                         }
+                    }
+                    const bool surfaceUploadLogDue =
+                        enableRuntimeLog &&
+                        (perfSparseSurfaceSnapshotMs >= 1.0f ||
+                          perfSparseSurfaceStageMs >= 2.0f ||
+                          perfSparseSurfaceEmitMs >= 0.5f);
+                    if (surfaceUploadLogDue) {
+                        const SparseSurfaceGpuStats surfaceGpuStatsAfterUpload =
+                            sparseSurfaceGpuResources.GetStats();
+                        const Simulation::SparseSurfaceCacheStats surfaceCacheStatsAfterUpload =
+                            sparseVoxelWorld.GetSurfaceCache().GetStats();
+                        spdlog::info(
+                            "PERF_SPARSE_SURFACE_UPLOAD frame={} needs={} intervalReady={} completed={} dirtyAttempt={} fullCatchup={} overflow={} editing={} pendingDirty={} pendingRemoved={} stagedFaces={} stagedRanges={} stagedDraws={} activeDraws={} stagedRecords={} stagedClusters={} copyRegions={} dirtyCopied={} cleanSkipped={} deferred={} patch={}/{}/{} stagedMB={:.2f} metaRange={}{} metaDraw={}{} metaRec={}{} metaCluster={}{} copyBudget={}/{} residentPayload={} retry={} overflowLast={} timings=surfSnap/surfStage/surfEmit/surfExtract:{:.2f}/{:.2f}/{:.2f}/{:.2f}",
+                            frameCount,
+                            needsSurfaceUpload ? 1u : 0u,
+                            surfaceUploadIntervalReady ? 1u : 0u,
+                            surfaceUploadCompleted ? 1u : 0u,
+                            dirtyPayloadFastPathAttempted ? 1u : 0u,
+                            forceSparseSurfaceFullCatchup ? 1u : 0u,
+                            surfaceOverflowNeedsFullCatchup ? 1u : 0u,
+                            surfaceEditingActive ? 1u : 0u,
+                            surfaceCacheStatsAfterUpload.pendingGpuDirtyBricks,
+                            surfaceCacheStatsAfterUpload.pendingGpuRemovedBricks,
+                            surfaceGpuStatsAfterUpload.stagedFacesLastFrame,
+                            surfaceGpuStatsAfterUpload.stagedRangesLastFrame,
+                            surfaceGpuStatsAfterUpload.stagedDrawCommandsLastFrame,
+                            surfaceGpuStatsAfterUpload.activeDrawCommandsLastFrame,
+                            surfaceGpuStatsAfterUpload.stagedSurfaceRecordsLastFrame,
+                            surfaceGpuStatsAfterUpload.stagedSurfaceClustersLastFrame,
+                            surfaceGpuStatsAfterUpload.stagedFaceCopyRegionsLastFrame,
+                            surfaceGpuStatsAfterUpload.stagedDirtyPayloadBricksLastFrame,
+                            surfaceGpuStatsAfterUpload.skippedCleanPayloadBricksLastFrame,
+                            surfaceGpuStatsAfterUpload.deferredPayloadBricksLastFrame,
+                            surfaceGpuStatsAfterUpload.stagedPayloadPatchBricksLastFrame,
+                            surfaceGpuStatsAfterUpload.stagedPayloadPatchFacesLastFrame,
+                            surfaceGpuStatsAfterUpload.stagedPayloadPatchRegionsLastFrame,
+                            static_cast<double>(surfaceGpuStatsAfterUpload.stagedBytesLastFrame) /
+                                (1024.0 * 1024.0),
+                            surfaceGpuStatsAfterUpload.stagedRangeCopyRegionsLastFrame,
+                            surfaceGpuStatsAfterUpload.fullRangeTableUploadLastFrame ? "F" : "I",
+                            surfaceGpuStatsAfterUpload.stagedDrawCopyRegionsLastFrame,
+                            surfaceGpuStatsAfterUpload.fullDrawArgsUploadLastFrame ? "F" : "I",
+                            surfaceGpuStatsAfterUpload.stagedSurfaceRecordCopyRegionsLastFrame,
+                            surfaceGpuStatsAfterUpload.fullSurfaceRecordUploadLastFrame ? "F" : "I",
+                            surfaceGpuStatsAfterUpload.stagedSurfaceClusterCopyRegionsLastFrame,
+                            surfaceGpuStatsAfterUpload.fullSurfaceClusterUploadLastFrame ? "F" : "I",
+                            surfaceGpuStatsAfterUpload.payloadCopyRegionBudget,
+                            surfaceGpuStatsAfterUpload.payloadCopyFaceBudget,
+                            surfaceGpuStatsAfterUpload.residentPayloadBricks,
+                            sparseSurfaceUploadRetriesLastFrame,
+                            surfaceGpuStatsAfterUpload.uploadOverflowLastFrame ? 1u : 0u,
+                            perfSparseSurfaceSnapshotMs,
+                            perfSparseSurfaceStageMs,
+                            perfSparseSurfaceEmitMs,
+                            perfSparseSurfaceExtractMs);
                     }
                 }
             }
@@ -20812,6 +21533,20 @@ int RunSandbox(int argc, char* argv[]) {
                     sparsePhysicsRuntimeDecision);
             sparsePhysicsFrameBrickBudget = sparsePhysicsBudgets.brickBudget;
             sparsePhysicsFrameMoveBudget = sparsePhysicsBudgets.moveBudget;
+            // PHYSICS FLOOR (Loop 92): the frame-pressure scaler cut the physics
+            // budget to ~2 bricks/frame exactly while the player paints (strokes
+            // raise pressure), starving the falling sand/water sim of the very
+            // work the brush creates -- painted material looked inert (measured:
+            // 6 total moved frames in a full sand-painting capture). The sim is
+            // microseconds per brick; guarantee the base budget whenever hot
+            // (edit-driven) physics work is queued.
+            if (preSparsePhysicsStats.physicsHotCandidateBricks > 0u ||
+                preSparsePhysicsStats.physicsCandidateBricks > 0u) {
+                sparsePhysicsFrameBrickBudget = std::max(
+                    sparsePhysicsFrameBrickBudget, sparsePhysicsBrickBudget);
+                sparsePhysicsFrameMoveBudget = std::max(
+                    sparsePhysicsFrameMoveBudget, sparsePhysicsMoveBudget);
+            }
         }
         sparsePhysicsBrickBudgetLastFrame = sparsePhysicsFrameBrickBudget;
         sparsePhysicsMoveBudgetLastFrame = sparsePhysicsFrameMoveBudget;
@@ -21411,7 +22146,17 @@ int RunSandbox(int argc, char* argv[]) {
             std::array<glm::vec3, 192> stampWorldPositions = {};
             uint32_t stampCount = 0;
             const float brushRadius = std::max(brushController.GetRadius(), 1.0f);
-            const float stampSpacing = std::max(1.0f, brushRadius * 0.45f);
+            // Loop 103 addendum: wider large-radius spacing (65 vs 45 pct) was
+            // A/B-REFUTED (control won both pairs). The 10.87/11.69 fast runs
+            // appear in ANY config — the heavy-edit lane is BIMODAL across
+            // identical-config runs (regime bifurcation, under investigation).
+            // Env knob kept at the old default for future experiments.
+            static const float sparseBrushStampSpacingLargeFactor =
+                static_cast<float>(ReadUIntEnv(
+                    "VENPOD_SPARSE_BRUSH_STAMP_SPACING_LARGE_PCT", 45u)) * 0.01f;
+            const float stampSpacingFactor =
+                brushRadius >= 10.0f ? sparseBrushStampSpacingLargeFactor : 0.45f;
+            const float stampSpacing = std::max(1.0f, brushRadius * stampSpacingFactor);
             if (buildStrokeState.hasLastBrushWorldPosition) {
                 const glm::vec3 segment = brushPlacementWorld - buildStrokeState.lastBrushWorldPosition;
                 const float segmentLength = glm::length(segment);
@@ -21445,6 +22190,30 @@ int RunSandbox(int argc, char* argv[]) {
             if (strictResidentGpuBrushFrame && stampCount > 1u) {
                 stampWorldPositions[0] = stampWorldPositions[stampCount - 1u];
                 stampCount = 1u;
+            }
+            // Apply-cadence throttle (Loop 103): at large radii the per-frame
+            // stamp churn is the measured heavy-edit p50 driver — every
+            // downstream lane (extract/upload/publish/invalidate/physics wake)
+            // reprocesses the same ~60 bricks each frame. Commit big-brush
+            // strokes every Nth frame instead: skipped frames leave
+            // buildStrokeState.lastBrushWorldPosition untouched (the post-loop
+            // update only fires on accepted stamps), so the next applied frame
+            // path-steps stamps across the WHOLE gap — the stroke stays
+            // continuous, it just lands in N-frame segments (~20ms at 100fps).
+            // DEFAULT 1 (off): cadence 2 A/B'd BIMODAL — best-ever 10.87/7 when
+            // the doubled apply batch fits the budget windows, worst-ever
+            // 16.2/270 when it crosses them (Loop 103). The potential is proven;
+            // a SMOOTH churn cut (stamp-rate cap / spacing scaling) is the
+            // shippable variant. Env opt-in kept for experiments.
+            static const uint32_t sparseBrushApplyCadence =
+                std::max(1u, ReadUIntEnv("VENPOD_SPARSE_BRUSH_APPLY_CADENCE", 1u));
+            static const float sparseBrushApplyCadenceMinRadius =
+                static_cast<float>(ReadUIntEnv(
+                    "VENPOD_SPARSE_BRUSH_APPLY_CADENCE_RADIUS_TENTHS", 100u)) * 0.1f;
+            if (sparseBrushApplyCadence > 1u &&
+                brushRadius >= sparseBrushApplyCadenceMinRadius &&
+                (frameCount % static_cast<uint64_t>(sparseBrushApplyCadence)) != 0ull) {
+                stampCount = 0u;
             }
 
             uint32_t submittedBrushStamps = 0;
@@ -21827,8 +22596,11 @@ int RunSandbox(int argc, char* argv[]) {
             if (smokeInputActive) {
                 ++sparseBrushPaintSmokeActiveFrames;
                 const uint64_t paintFrame = frameCount - sparseBrushPaintSmokeStartFrame;
-                const uint32_t paintCase =
+                uint32_t paintCase =
                     static_cast<uint32_t>((paintFrame / 45ull) % kSparseBrushPaintSmokeCaseCount);
+                if (sparseBrushPaintSmokeForcedCase < kSparseBrushPaintSmokeCaseCount) {
+                    paintCase = sparseBrushPaintSmokeForcedCase;
+                }
                 sparseBrushPaintSmokeCaseFrames[paintCase]++;
                 sparseBrushPaintSmokeCaseQueued[paintCase] += sparseBrushFeedbackQueuedLastFrame;
                 if (enableSparseBrushPaintMovingSmoke && sparseBrushFeedbackQueuedLastFrame > 0u) {
@@ -21858,6 +22630,10 @@ int RunSandbox(int argc, char* argv[]) {
             sparseBrushPaintSmokeResidencyRequests += sparseBrushStrictResidentRequestsThisFrame;
             const uint32_t settleFrame = sparseBrushPaintSmokeEndFrame + 180u;
             if (!sparseBrushPaintSmokePassed && frameCount >= settleFrame) {
+                const uint32_t requiredPaintCases =
+                    sparseBrushPaintSmokeForcedCase < kSparseBrushPaintSmokeCaseCount
+                        ? 1u
+                        : kSparseBrushPaintSmokeCaseCount;
                 uint32_t coveredPaintCases = 0;
                 for (uint32_t caseIndex = 0; caseIndex < kSparseBrushPaintSmokeCaseCount; ++caseIndex) {
                     if (sparseBrushPaintSmokeCaseFrames[caseIndex] > 0u &&
@@ -21874,7 +22650,7 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseBrushPaintSmokeMissingHints == 0u &&
                     sparseBrushPaintSmokeOverflow == 0u &&
                     sparseBrushPaintSmokeDeltaMismatches == 0u &&
-                    coveredPaintCases == kSparseBrushPaintSmokeCaseCount &&
+                    coveredPaintCases >= requiredPaintCases &&
                     (!enableSparseBrushPaintMovingSmoke ||
                         sparseBrushPaintSmokePathCells.size() >= sparseBrushPaintSmokeMinPathCells) &&
                     (!enableSparseBrushPaintNonresidentSmoke ||
@@ -21895,7 +22671,7 @@ int RunSandbox(int argc, char* argv[]) {
                         sparseBrushPaintSmokeOverflow,
                         sparseBrushPaintSmokeDeltaMismatches,
                         coveredPaintCases,
-                        kSparseBrushPaintSmokeCaseCount,
+                        requiredPaintCases,
                         sparseBrushPaintSmokeCaseQueued[0],
                         sparseBrushPaintSmokeCaseQueued[1],
                         sparseBrushPaintSmokeCaseQueued[2],
@@ -21920,7 +22696,7 @@ int RunSandbox(int argc, char* argv[]) {
                         sparseBrushPaintSmokeOverflow,
                         sparseBrushPaintSmokeDeltaMismatches,
                         coveredPaintCases,
-                        kSparseBrushPaintSmokeCaseCount,
+                        requiredPaintCases,
                         sparseBrushPaintSmokeCaseQueued[0],
                         sparseBrushPaintSmokeCaseQueued[1],
                         sparseBrushPaintSmokeCaseQueued[2],
@@ -24867,15 +25643,20 @@ int RunSandbox(int argc, char* argv[]) {
                 (perfEndFrameMsLastFrame + perfCmdFinalizeMsLastFrame +
                  perfSwapBuffersMsLastFrame + perfSignalGenMsLastFrame +
                  perfLoggingMsLastFrame));
-            // residualUntracked = frame time NOT explained by accounted phases NOR
-            // by the four gap timers. If near 0, the gaps fully explain untracked.
+            const float rawAlignedGapMs = std::max(0.0f,
+                lastRawFrameMs - perfFrameBodyMsLastFrame);
+            const float knownAfterBodyTailMs =
+                perfLoopTailMsLastFrame + perfFrameEndLogMsLastFrame;
+            const float gapTailDeltaMs = rawAlignedGapMs - knownAfterBodyTailMs;
+            // residualUntracked is aligned to the raw frame interval: rawMs covers
+            // previous body + after-body tail, not the current in-progress body.
             const float residualUntrackedMs = std::max(0.0f,
-                lastRawFrameMs - (perfAccountedCpuMs + untrackedGapSumMs));
+                gapTailDeltaMs);
             spdlog::info(
-                "PERF_UNTRACKED frame={} fps={:.1f} rawMs={:.2f} bodyPrev={:.2f} accounted={:.2f} untrackedOrig={:.2f} "
+                "PERF_UNTRACKED frame={} fps={:.1f} rawMs={:.2f} bodyPrev={:.2f} gapAligned={:.2f} accounted={:.2f} untrackedOrig={:.2f} "
                 "gapSum={:.2f} gaps=postWait/prePhys/preRender/postRender:{:.2f}/{:.2f}/{:.2f}/{:.2f} "
                 "sliverSum={:.2f} slivers=gpuRead/endFrame/cmdFinalize/swap/signalGen/logging:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} "
-                "loopTail={:.2f} frameEndLog={:.2f} "
+                "loopTail={:.2f} frameEndLog={:.2f} knownAfterBody={:.2f} gapTailDelta={:.2f} "
                 "postRenderResidual={:.2f} residualUntracked={:.2f} "
                 "namedPhases=prep/fence/chunk/phys/brush/render/present/postGen/inputEnd:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} "
                 "fenceWait={:.2f} gpuFrameMs={:.2f} gpuValid={}",
@@ -24883,6 +25664,7 @@ int RunSandbox(int argc, char* argv[]) {
                 instantFps,
                 lastRawFrameMs,
                 perfFrameBodyMsLastFrame,
+                rawAlignedGapMs,
                 perfAccountedCpuMs,
                 perfUntrackedMs,
                 untrackedGapSumMs,
@@ -24899,6 +25681,8 @@ int RunSandbox(int argc, char* argv[]) {
                 perfLoggingMsLastFrame,
                 perfLoopTailMsLastFrame,
                 perfFrameEndLogMsLastFrame,
+                knownAfterBodyTailMs,
+                gapTailDeltaMs,
                 postRenderResidualMs,
                 residualUntrackedMs,
                 perfFramePrepMs,
@@ -24987,7 +25771,7 @@ int RunSandbox(int argc, char* argv[]) {
                     return ring < values.size() ? values[ring] : 0u;
                 };
                 spdlog::info(
-                    "PERF_SPARSE_CLIPMAP frame={} prep={:.2f} interest={:.2f} reuse={} budget={:.2f} pump={:.2f} pumpHeight={:.2f} pumpVoxel={:.2f} budgetMid={} genHeight={} genVoxel={} evictHeight={} evictVoxel={} queuedHeight={} queuedVoxel={} missingHeight={} missingVoxel={} interestedHeight={} interestedVoxel={} anchors={}/{} voxelSurface={}/{} catchup=coverage/visible/protected/visual/ring:{}/{}/{}/{}/{} coveragePct={} worstRing={}/{}/{} parentHeld={}/{} voxelRings={} res={}/{}/{}/{} q={}/{}/{}/{} miss={}/{}/{}/{} int={}/{}/{}/{}",
+                    "PERF_SPARSE_CLIPMAP frame={} prep={:.2f} interest={:.2f} reuse={} budget={:.2f} pump={:.2f} pumpHeight={:.2f} pumpVoxel={:.2f} heightQueueMs={:.2f} heightDispatchMs={:.2f} heightJoinMs={:.2f} heightWorkerMaxMs={:.2f} heightGenerateMs={:.2f} heightCommitMs={:.2f} heightPending={} heightWorkers={} budgetMid={} genHeight={} genVoxel={} evictHeight={} evictVoxel={} queuedHeight={} queuedVoxel={} missingHeight={} missingVoxel={} interestedHeight={} interestedVoxel={} anchors={}/{} voxelSurface={}/{} catchup=coverage/visible/protected/visual/ring:{}/{}/{}/{}/{} coveragePct={} worstRing={}/{}/{} parentHeld={}/{} voxelRings={} res={}/{}/{}/{} q={}/{}/{}/{} miss={}/{}/{}/{} int={}/{}/{}/{}",
                     frameCount,
                     perfSparseClipmapPrepMs,
                     perfSparseClipmapInterestMs,
@@ -24996,6 +25780,14 @@ int RunSandbox(int argc, char* argv[]) {
                     perfSparseClipmapPumpMs,
                     midStats.pumpHeightMsLastFrame,
                     midStats.pumpVoxelMsLastFrame,
+                    midStats.heightPumpQueueMsLastFrame,
+                    midStats.heightPumpDispatchMsLastFrame,
+                    midStats.heightPumpJoinMsLastFrame,
+                    midStats.heightPumpWorkerMaxMsLastFrame,
+                    midStats.heightPumpGenerateMsLastFrame,
+                    midStats.heightPumpCommitMsLastFrame,
+                    midStats.heightPumpPendingTilesLastFrame,
+                    midStats.heightPumpWorkersLastFrame,
                     sparseMidClipmapBudgetLastFrame,
                     midStats.generatedTilesLastFrame,
                     midStats.generatedVoxelBricksLastFrame,
@@ -25484,7 +26276,7 @@ int RunSandbox(int argc, char* argv[]) {
                             projectedVisibleMissing);
                     }
                     spdlog::info(
-                            "PERF_SPARSE_CPU_DETAIL frame={} reqMs={:.2f} genMs={:.2f} clipMs={:.2f} trimMs={:.2f} request=attempt/unique/dup/resident/nonresident/allocated/spec/vis/coll:{}/{}/{}/{}/{}/{}/{}/{}/{} reqBudget={}/{}/{}/{} reqSkip=free/class/total/reject/knownEmpty/buried/specBackpressure:{}/{}/{}/{}/{}/{}/{} centerDelta={}/{}/{} fullRebuild={} terrainPrefetch=ms/rays/budget/seen/new/cleanThrottle:{:.2f}/{}/{}/{}/{}/{} terrainPrefetchMidCacheThrottle={} trimScan=calls/records/candidates/evicted:{}/{}/{}/{} replacementScan=calls/records/candidates/evicted/scansBudget:{}/{}/{}/{}/{} pool=resident/free/trimStart:{}/{}/{} clip=interest/reuse/pump/genHeight/genVoxel/missingHeight/missingVoxel/cap/active:{:.2f}/{}/{:.2f}/{}/{}/{}/{}/{}/{} clipBudget=ringsRebuilt/budgetCross:{}/{} surface=extractMs/stageMs/extractQueued/extracted/buriedFast/sort/sortHit/strictPops/generalSkip/generalRemainingMs:{:.2f}/{:.2f}/{}/{}/{}/{}/{}/{}/{}/{:.2f} surfaceParallel=active/bricks/workers/wallMs:{}/{}/{}/{:.2f}",
+                            "PERF_SPARSE_CPU_DETAIL frame={} reqMs={:.2f} genMs={:.2f} clipMs={:.2f} trimMs={:.2f} request=attempt/unique/dup/resident/nonresident/allocated/spec/vis/coll:{}/{}/{}/{}/{}/{}/{}/{}/{} reqBudget={}/{}/{}/{} reqSkip=free/class/total/reject/knownEmpty/buried/specBackpressure:{}/{}/{}/{}/{}/{}/{} centerDelta={}/{}/{} fullRebuild={} terrainPrefetch=ms/rays/budget/seen/new/cleanThrottle:{:.2f}/{}/{}/{}/{}/{} terrainPrefetchMidCacheThrottle={} trimScan=calls/records/candidates/evicted:{}/{}/{}/{} replacementScan=calls/records/candidates/evicted/scansBudget:{}/{}/{}/{}/{} pool=resident/free/trimStart:{}/{}/{} clip=interest/reuse/pump/genHeight/genVoxel/missingHeight/missingVoxel/cap/active:{:.2f}/{}/{:.2f}/{}/{}/{}/{}/{}/{} clipBudget=ringsRebuilt/budgetCross:{}/{} surface=extractMs/stageMs/extractQueued/extracted/buriedFast/sort/sortHit/strictPops/generalSkip/generalRemainingMs:{:.2f}/{:.2f}/{}/{}/{}/{}/{}/{}/{}/{:.2f} surfaceInline=bricks/ms:{}/{:.2f} surfaceParallel=active/bricks/workers/wallMs:{}/{}/{}/{:.2f} surfaceAsync=enabled/queue/result/pending/enqueued/applied/discarded/requeued/rejected/workerMs/enqueueMs:{}/{}/{}/{}/{}/{}/{}/{}/{}/{:.2f}/{:.2f}",
                         frameCount,
                         perfSparseRequestPrepMs,
                         perfSparseGenerationPrepMs,
@@ -25554,10 +26346,23 @@ int RunSandbox(int argc, char* argv[]) {
                         sparseWorldStats.surfaceStrictTimeBudgetUnsortedPopsLastFrame,
                         perfSparseSurfaceGeneralStrictSkipped,
                         perfSparseSurfaceGeneralRemainingMs,
+                        sparseWorldStats.surfaceInlineExtractionBricksLastFrame,
+                        sparseWorldStats.surfaceInlineExtractionMsLastFrame,
                         sparseWorldStats.parallelSurfaceExtractionActive,
                         sparseWorldStats.parallelSurfaceExtractionBricksLastFrame,
                         sparseWorldStats.parallelSurfaceExtractionWorkersLastFrame,
-                        sparseWorldStats.parallelSurfaceExtractionWallMsLastFrame);
+                        sparseWorldStats.parallelSurfaceExtractionWallMsLastFrame,
+                        sparseWorldStats.asyncSurfaceExtractionEnabled,
+                        sparseWorldStats.asyncSurfaceExtractionQueueDepth,
+                        sparseWorldStats.asyncSurfaceExtractionResultDepth,
+                        sparseWorldStats.asyncSurfaceExtractionPending,
+                        sparseWorldStats.asyncSurfaceExtractionEnqueuedLastFrame,
+                        sparseWorldStats.asyncSurfaceExtractionAppliedLastFrame,
+                        sparseWorldStats.asyncSurfaceExtractionDiscardedLastFrame,
+                        sparseWorldStats.asyncSurfaceExtractionRequeuedLastFrame,
+                        sparseWorldStats.asyncSurfaceExtractionRejectedLastFrame,
+                        sparseWorldStats.asyncSurfaceExtractionWorkerMsLastFrame,
+                        sparseWorldStats.asyncSurfaceExtractionEnqueueMsLastFrame);
                     if (sparseWorldStats.terrainColumnCachePersistentActive != 0u) {
                         spdlog::info(
                             "PERF_SPARSE_TERRAIN_COLUMN_CACHE frame={} enabled={} entries={} maxEntries={} cleared={} height=hit/miss:{}/{} relief=hit/miss:{}/{} missScreenPct={} unsafeNearMissPct={}",
@@ -25690,7 +26495,7 @@ int RunSandbox(int argc, char* argv[]) {
                             sparseRequestFastResidentTouchFallbacksLastFrame);
                 }
                 spdlog::info(
-                    "PERF_SPARSE frame={} runtimeTest={} surfaceAuth={} resident={} tracked={} class={}/{}/{}/{} qgen={}/{}/{}/{} genQueued={} pgen={}/{}/{}/{} staged={} qup={}/{}/{}/{} uploadQueued={} pup={}/{}/{}/{} qsurf={}/{}/{}/{} psurf={}/{}/{}/{} free={} evictLast={} invalidQueued={} emptyReqSkip={} knownEmpty={} edits={}/{} rDirty={}/{} rDirtyQ={} rDirtyUpload={}/{}/{} surface={}/{} unitFaces={} renderable={}/{} surfUpd={} surfPartial={}/{} surfRm={} surfGen={}/{} surfExtract={}/{}/{} surfEmptySkip={} surfEmptyFast={} surfSerial={} brushEval={} brushEdit={} brushBricks={} brushUploads={} brushDelta={}/{} brushDeltaMismatch={} brushGpuFb={}/{}/{}/{}/{} brushGpuFbMiss={} brushGpuFbHint={} brushGpuFbFallback={} gpuStaged={} gpuPartial={}/{}/{:.2f}KB pageEntries={} uploadMB={:.2f} uploadRingMB={:.2f}/{:.2f} uploadByteDefers={} overflow={} missRetired={} missPending={} missConsumed={} missFbStale={} missFbOverflow={} reqSpec={} reqVis={} reqColl={} reqBudget={}/{}/{}/{} protOver={} reqSkip={}/{}/{}/{}/{} buriedSolidSkip={} bodyColl={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{:.2f} stress={}/{} scale={:.2f}/{:.2f}/{:.2f} protQ={} trimSpec={} rayScale={:.2f} bgQuality={:.2f} bgTier={} rayBudget={:.0f}/{} budgetGen={} budgetUpload={} budgetMid={} specSkip={} pressureTrim={} distTrimSkip={} trimStart={} replaceEvict={} retryUpload={} retryInvalid={} publishPending={} publishReady={} publishWait={}/{} publishEdited={} publishLag={} publishRetry={} publishStale={} publishSurfGate={}/{} publishTimeDefers={} midClip={} midStart={} midEnd={} midCov={:.2f}/{:.2f} midTiles={}/{} midInterest={}/{} midAnchors={}/{} midGen={} midUpload={} midRetry={} midVoxels={}/{} midVoxInterest={}/{} midVoxelGen={} midVoxelUpload={} midVoxelEvict={} midBytesMB={:.2f} midSerial={}",
+                    "PERF_SPARSE frame={} runtimeTest={} surfaceAuth={} resident={} tracked={} class={}/{}/{}/{} qgen={}/{}/{}/{} genQueued={} pgen={}/{}/{}/{} staged={} qup={}/{}/{}/{} uploadQueued={} pup={}/{}/{}/{} qsurf={}/{}/{}/{} psurf={}/{}/{}/{} free={} evictLast={} invalidQueued={} emptyReqSkip={} knownEmpty={} edits={}/{} rDirty={}/{} rDirtyQ={} rDirtyUpload={}/{}/{} surface={}/{} unitFaces={} renderable={}/{} surfUpd={} surfPartial={}/{} surfRm={} surfGen={}/{} surfExtract={}/{}/{} surfInline=bricks/ms:{}/{:.2f} surfParallel=active/bricks/workers/wallMs:{}/{}/{}/{:.2f} surfAsync=queue/result/pending/enqueued/applied/discarded/requeued:{}/{}/{}/{}/{}/{}/{} surfAsyncDetail=rejected/workerMs/enqueueMs:{}/{:.2f}/{:.2f} surfEmptySkip={} surfEmptyFast={} surfSerial={} brushEval={} brushEdit={} brushBricks={} brushUploads={} brushDelta={}/{} brushDeltaMismatch={} brushGpuFb={}/{}/{}/{}/{} brushGpuFbMiss={} brushGpuFbHint={} brushGpuFbFallback={} gpuStaged={} gpuPartial={}/{}/{:.2f}KB pageEntries={} uploadMB={:.2f} uploadRingMB={:.2f}/{:.2f} uploadByteDefers={} overflow={} missRetired={} missPending={} missConsumed={} missFbStale={} missFbOverflow={} reqSpec={} reqVis={} reqColl={} reqBudget={}/{}/{}/{} protOver={} reqSkip={}/{}/{}/{}/{} buriedSolidSkip={} bodyColl={}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{:.2f} stress={}/{} scale={:.2f}/{:.2f}/{:.2f} protQ={} trimSpec={} rayScale={:.2f} bgQuality={:.2f} bgTier={} rayBudget={:.0f}/{} budgetGen={} budgetUpload={} budgetMid={} specSkip={} pressureTrim={} distTrimSkip={} trimStart={} replaceEvict={} retryUpload={} retryInvalid={} publishPending={} publishReady={} publishWait={}/{} publishEdited={} publishLag={} publishRetry={} publishStale={} publishSurfGate={}/{} publishTimeDefers={} midClip={} midStart={} midEnd={} midCov={:.2f}/{:.2f} midTiles={}/{} midInterest={}/{} midAnchors={}/{} midGen={} midUpload={} midRetry={} midVoxels={}/{} midVoxInterest={}/{} midVoxelGen={} midVoxelUpload={} midVoxelEvict={} midBytesMB={:.2f} midSerial={}",
                     frameCount,
                     sparseRuntimeTestMode ? 1 : 0,
                     enableSparseSurfaceAuthoritative ? 1 : 0,
@@ -25754,6 +26559,22 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseWorldStats.surfaceBricksExtractedLastFrame,
                     sparseWorldStats.surfaceExtractionQueuedBricks,
                     sparseSurfaceExtractionBudgetLastFrame,
+                    sparseWorldStats.surfaceInlineExtractionBricksLastFrame,
+                    sparseWorldStats.surfaceInlineExtractionMsLastFrame,
+                    sparseWorldStats.parallelSurfaceExtractionActive,
+                    sparseWorldStats.parallelSurfaceExtractionBricksLastFrame,
+                    sparseWorldStats.parallelSurfaceExtractionWorkersLastFrame,
+                    sparseWorldStats.parallelSurfaceExtractionWallMsLastFrame,
+                    sparseWorldStats.asyncSurfaceExtractionQueueDepth,
+                    sparseWorldStats.asyncSurfaceExtractionResultDepth,
+                    sparseWorldStats.asyncSurfaceExtractionPending,
+                    sparseWorldStats.asyncSurfaceExtractionEnqueuedLastFrame,
+                    sparseWorldStats.asyncSurfaceExtractionAppliedLastFrame,
+                    sparseWorldStats.asyncSurfaceExtractionDiscardedLastFrame,
+                    sparseWorldStats.asyncSurfaceExtractionRequeuedLastFrame,
+                    sparseWorldStats.asyncSurfaceExtractionRejectedLastFrame,
+                    sparseWorldStats.asyncSurfaceExtractionWorkerMsLastFrame,
+                    sparseWorldStats.asyncSurfaceExtractionEnqueueMsLastFrame,
                     sparseWorldStats.surfaceEmptyUploadsSkippedLastFrame,
                     sparseWorldStats.surfaceEmptyFastPathBricksLastFrame,
                     sparseWorldStats.surfaceSerial,
@@ -26521,7 +27342,7 @@ int RunSandbox(int argc, char* argv[]) {
             backgroundPassInfo.active &&
             ((frameCount % 60u) == 0u || backbufferCaptureDueThisFrame)) {
             spdlog::info(
-                "PERF_BACKGROUND_SPLIT frame={} enabled=1 scale={:.3f} lowRes={}x{} fullRes={}x{} surfaceFill={} clearProbe={} forceColor={} compositeDebug={} compositeForceColor={} capture={} foregroundStencilPct=-1 compositePct=-1 notes=final_composite_counters_from_bmp_audit",
+                "PERF_BACKGROUND_SPLIT frame={} enabled=1 scale={:.3f} lowRes={}x{} fullRes={}x{} surfaceFill={} foregroundMask={} clearProbe={} forceColor={} compositeDebug={} compositeForceColor={} capture={} foregroundStencilPct=-1 compositePct=-1 notes=final_composite_counters_from_bmp_audit",
                 frameCount,
                 backgroundPassInfo.scale,
                 backgroundPassInfo.backgroundWidth,
@@ -26529,6 +27350,7 @@ int RunSandbox(int argc, char* argv[]) {
                 backgroundPassInfo.fullWidth,
                 backgroundPassInfo.fullHeight,
                 backgroundPassInfo.surfaceRaymarchFill ? 1 : 0,
+                backgroundPassInfo.foregroundMask ? 1 : 0,
                 backgroundPassInfo.clearProbe ? 1 : 0,
                 backgroundPassInfo.forceColor ? 1 : 0,
                 backgroundPassInfo.compositeDebug ? 1 : 0,
@@ -26770,15 +27592,17 @@ int RunSandbox(int argc, char* argv[]) {
                 gpuTiming.valid ? gpuTiming.overlayMs : 0.0,
                 gpuTiming.valid ? 1 : 0);
         }
+        const bool slowFrameEndThisFrame =
+            perfFrameBodyMsLastFrame > 40.0f || lastRawFrameMs > 40.0f;
         if (enableRuntimeLog &&
-            (perfFrameBodyMsLastFrame > 40.0f || (frameCount % 120 == 0) || perfFrameEndIntervalDue)) {
+            (slowFrameEndThisFrame || (frameCount % 120 == 0) || perfFrameEndIntervalDue)) {
             static uint32_t slowFrameEndLogs = 0;
             const bool allowSlowFrameLog =
-                perfFrameBodyMsLastFrame <= 40.0f ||
+                !slowFrameEndThisFrame ||
                 slowFrameEndLogs < 96u ||
                 (frameCount % 60 == 0) ||
                 perfFrameEndIntervalDue;
-            if (perfFrameBodyMsLastFrame > 40.0f) {
+            if (slowFrameEndThisFrame) {
                 ++slowFrameEndLogs;
             }
             if (allowSlowFrameLog) {
@@ -26793,16 +27617,75 @@ int RunSandbox(int argc, char* argv[]) {
                 perfNoncritWaitMs =
                     waitSplitClipmapStats.asyncNoncriticalGenerationWaitMsLastFrame;
                 spdlog::info(
-                    "PERF_WAITSPLIT frame={} pumpWaitMs={:.2f} exactGenWaitMs={:.2f} surfaceWaitMs={:.2f} noncritWaitMs={:.2f} fenceWaitMs={:.2f}",
+                    "PERF_WAITSPLIT frame={} pumpWaitMs={:.2f} exactGenWaitMs={:.2f} surfaceWaitMs={:.2f} noncritWaitMs={:.2f} fenceWaitMs={:.2f} "
+                    "clipPumpHeightMs={:.2f} clipPumpVoxelMs={:.2f} heightQueueMs={:.2f} heightDispatchMs={:.2f} heightJoinMs={:.2f} heightWorkerMaxMs={:.2f} heightGenerateMs={:.2f} heightCommitMs={:.2f} heightPending={} heightWorkers={} clipGenHeight={} clipGenVoxel={} clipQueuedHeight={} clipQueuedVoxel={} "
+                    "clipMissingHeight={} clipMissingVoxel={} clipBudgetHit={} clipParallelBricks={} clipParallelWorkers={} clipParallelWallMs={:.2f} "
+                    "clipAsyncPending={} clipAsyncApplied={} clipAsyncWorkerMs={:.2f} clipInterestRings={} clipInterestBudgeted={} "
+                    "clipInterestLineMs={:.2f} clipInterestAnchorMs={:.2f} clipInterestSortEmitMs={:.2f} clipInterestBacklogMs={:.2f} clipInterestDiagMs={:.2f} "
+                    "surfaceInlineBricks={} surfaceInlineMs={:.2f} surfaceParallelBricks={} surfaceParallelWorkers={} surfaceParallelWallMs={:.2f} surfaceAsyncRejected={} surfaceAsyncEnqueueMs={:.2f} surfaceAsyncWorkerMs={:.2f} "
+                    "surfaceRouteAsync={} surfaceRouteAsyncSat={} surfaceRoutePubSat={} surfaceRouteAsyncQueue={} surfaceRouteAsyncResults={} surfaceReadyPubPending={} surfaceReadyPubOldestAge={}",
                     frameCount,
                     perfPumpWaitMs,
                     perfExactGenWaitMs,
                     perfSurfaceWaitMs,
                     perfNoncritWaitMs,
-                    perfFenceWaitMs);
+                    perfFenceWaitMs,
+                    waitSplitClipmapStats.pumpHeightMsLastFrame,
+                    waitSplitClipmapStats.pumpVoxelMsLastFrame,
+                    waitSplitClipmapStats.heightPumpQueueMsLastFrame,
+                    waitSplitClipmapStats.heightPumpDispatchMsLastFrame,
+                    waitSplitClipmapStats.heightPumpJoinMsLastFrame,
+                    waitSplitClipmapStats.heightPumpWorkerMaxMsLastFrame,
+                    waitSplitClipmapStats.heightPumpGenerateMsLastFrame,
+                    waitSplitClipmapStats.heightPumpCommitMsLastFrame,
+                    waitSplitClipmapStats.heightPumpPendingTilesLastFrame,
+                    waitSplitClipmapStats.heightPumpWorkersLastFrame,
+                    waitSplitClipmapStats.generatedTilesLastFrame,
+                    waitSplitClipmapStats.generatedVoxelBricksLastFrame,
+                    waitSplitClipmapStats.queuedTiles,
+                    waitSplitClipmapStats.queuedVoxelBricks,
+                    waitSplitClipmapStats.missingInterestedTiles,
+                    waitSplitClipmapStats.missingInterestedVoxelBricks,
+                    waitSplitClipmapStats.pumpBudgetHitLastFrame,
+                    waitSplitClipmapStats.parallelVoxelPumpBricksLastFrame,
+                    waitSplitClipmapStats.parallelVoxelPumpWorkersLastFrame,
+                    waitSplitClipmapStats.parallelVoxelPumpWallMsLastFrame,
+                    waitSplitClipmapStats.asyncNoncriticalGenerationPending,
+                    waitSplitClipmapStats.asyncNoncriticalGenerationAppliedLastFrame,
+                    waitSplitClipmapStats.asyncNoncriticalGenerationWorkerMsLastFrame,
+                    waitSplitClipmapStats.voxelInterestRingsRebuiltLastFrame,
+                    waitSplitClipmapStats.voxelInterestBudgetedRebuildsLastFrame,
+                    waitSplitClipmapStats.voxelInterestLineMsLastFrame,
+                    waitSplitClipmapStats.voxelInterestAnchorMsLastFrame,
+                    waitSplitClipmapStats.voxelInterestSortEmitMsLastFrame,
+                    waitSplitClipmapStats.voxelInterestBacklogMsLastFrame,
+                    waitSplitClipmapStats.voxelInterestDiagnosticsMsLastFrame,
+                    waitSplitWorldStats.surfaceInlineExtractionBricksLastFrame,
+                    waitSplitWorldStats.surfaceInlineExtractionMsLastFrame,
+                    waitSplitWorldStats.parallelSurfaceExtractionBricksLastFrame,
+                    waitSplitWorldStats.parallelSurfaceExtractionWorkersLastFrame,
+                    waitSplitWorldStats.parallelSurfaceExtractionWallMsLastFrame,
+                    waitSplitWorldStats.asyncSurfaceExtractionRejectedLastFrame,
+                    waitSplitWorldStats.asyncSurfaceExtractionEnqueueMsLastFrame,
+                    waitSplitWorldStats.asyncSurfaceExtractionWorkerMsLastFrame,
+                    sparseSurfaceRoutePreferAsyncLastFrame ? 1u : 0u,
+                    sparseSurfaceRouteAsyncSaturatedLastFrame ? 1u : 0u,
+                    sparseSurfaceRoutePublishSaturatedLastFrame ? 1u : 0u,
+                    sparseSurfaceRouteAsyncQueueDepthLastFrame,
+                    sparseSurfaceRouteAsyncResultDepthLastFrame,
+                    sparseSurfaceReadyPublishPendingLastFrame,
+                    sparseSurfaceReadyPublishOldestAgeLastFrame);
             }
+            const float perfGapPrevUnalignedMs =
+                std::max(0.0f, lastRawFrameMs - perfFrameBodyMsLastFrame);
+            const float perfGapAlignedMs =
+                std::max(0.0f, lastRawFrameMs - perfFrameBodyMsForRaw);
+            const float perfKnownAfterBodyTailMs =
+                perfLoopTailMsLastFrame + perfFrameEndLogMsLastFrame;
+            const float perfGapTailDeltaMs =
+                perfGapAlignedMs - perfKnownAfterBodyTailMs;
             spdlog::info(
-                "PERF_FRAME_END frame={} present={:.2f} postGen={:.2f} inputEnd={:.2f} gaps=postWait/prePhys/preRender/postRender:{:.2f}/{:.2f}/{:.2f}/{:.2f} sparsePost=feedback/cmd/begin/midSnap/plan/upload/publish/midUpload/stats/surfExtract/surfPlan/surfSnap/surfStage/surfEmit:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} midUploadSplit=hostPrep/recordSubmit/producerWait:{:.2f}/{:.2f}/{:.2f} feedbackSplit=legacy/raycast/miss/brush/own/phys:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} body={:.2f} gapPrev={:.2f} vsync={} rawMs={:.2f}",
+                "PERF_FRAME_END frame={} present={:.2f} postGen={:.2f} inputEnd={:.2f} gaps=postWait/prePhys/preRender/postRender:{:.2f}/{:.2f}/{:.2f}/{:.2f} sparsePost=feedback/cmd/begin/midSnap/plan/upload/publish/midUpload/stats/surfExtract/surfPlan/surfSnap/surfStage/surfEmit:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} midUploadSplit=hostPrep/recordSubmit/producerWait:{:.2f}/{:.2f}/{:.2f} feedbackSplit=legacy/raycast/miss/brush/own/phys:{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} body={:.2f} gapPrev={:.2f} bodyForRaw={:.2f} gapAligned={:.2f} loopTail={:.2f} frameEndLog={:.2f} knownAfterBody={:.2f} gapTailDelta={:.2f} vsync={} rawMs={:.2f}",
                 frameCount,
                 perfPresentMs,
                 perfPostGenerationMsLastFrame,
@@ -26835,7 +27718,13 @@ int RunSandbox(int argc, char* argv[]) {
                 perfSparsePostOwnershipMs,
                 perfSparsePostPhysicsRetireMs,
                 perfFrameBodyMsLastFrame,
-                std::max(0.0f, lastRawFrameMs - perfFrameBodyMsLastFrame),
+                perfGapPrevUnalignedMs,
+                perfFrameBodyMsForRaw,
+                perfGapAlignedMs,
+                perfLoopTailMsLastFrame,
+                perfFrameEndLogMsLastFrame,
+                perfKnownAfterBodyTailMs,
+                perfGapTailDeltaMs,
                 window->IsVSyncEnabled() ? 1 : 0,
                 lastRawFrameMs);
             }
@@ -26945,13 +27834,18 @@ int RunSandbox(int argc, char* argv[]) {
                 // real look-around lag is here, not the mesh).
                 spdlog::info(
                     "PERF_SPARSE_REQ frame={} reqPrep={:.1f} = terrainCrit={:.1f} hierarchy={:.1f} statsFlush={:.1f} "
-                    "pressureTrim={:.1f} brushRetry={:.1f} ownerFeedback={:.1f} missFeedback={:.1f} hiddenExact={:.1f} || "
+                    "pressureTrim={:.1f} brushRetry={:.1f} ownerFeedback={:.1f} missFeedback={:.1f} hiddenExact={:.1f} "
+                    "hiddenExactSplit=water/general/candidates/audit:{:.2f}/{:.2f}/{:.2f}/{:.2f} || "
                     "genPrep={:.1f}",
                     frameCount, perfSparseRequestPrepMs,
                     perfSparseRequestTerrainCriticalMs, perfSparseRequestHierarchyMs,
                     perfSparseRequestStatsFlushMs, perfSparseRequestPressureTrimMs,
                     perfSparseRequestBrushRetryMs, perfSparseRequestOwnershipFeedbackMs,
                     perfSparseRequestMissFeedbackMs, perfSparseRequestHiddenExactMs,
+                    perfSparseRequestHiddenExactWaterProbeMs,
+                    perfSparseRequestHiddenExactGeneralProbeMs,
+                    perfSparseRequestHiddenExactCandidatesMs,
+                    perfSparseRequestHiddenExactAuditMs,
                     perfSparseGenerationPrepMs);
                 // genPrep internal split: prove whether the 20+ms genPrep on edit/move
                 // frames (where generated=0) is the async-completion APPLY (writing
@@ -26960,7 +27854,8 @@ int RunSandbox(int argc, char* argv[]) {
                     const auto& gpStats = sparseVoxelWorld.GetStats();
                     spdlog::info(
                         "PERF_GENPREP frame={} genPrep={:.1f} = asyncExactApplyMs={:.2f} asyncExactWorkerMs={:.2f} "
-                        "parallelWallMs={:.2f} parallelActive={} parallelBricks={} appliedVisible={} appliedPublicCrit={}",
+                        "parallelWallMs={:.2f} parallelActive={} parallelBricks={} appliedVisible={} appliedPublicCrit={} "
+                        "split=loops/pump/flush:{:.2f}/{:.2f}/{:.2f} terrainCritGen={} hiddenExactGen={} hiddenExactTracked={}",
                         frameCount, perfSparseGenerationPrepMs,
                         gpStats.asyncExactGenerationApplyMsLastFrame,
                         gpStats.asyncExactGenerationWorkerMsLastFrame,
@@ -26968,7 +27863,13 @@ int RunSandbox(int argc, char* argv[]) {
                         gpStats.parallelExactGenerationActive,
                         gpStats.parallelExactGenerationBricksLastFrame,
                         gpStats.asyncExactGenerationAppliedVisibleLaneLastFrame,
-                        gpStats.asyncExactGenerationAppliedPublicCriticalLaneLastFrame);
+                        gpStats.asyncExactGenerationAppliedPublicCriticalLaneLastFrame,
+                        perfSparseGenerationLoopsMs,
+                        perfSparseGenerationPumpMs,
+                        perfSparseGenerationFlushMs,
+                        perfSparseGenerationTerrainCriticalGenerated,
+                        perfSparseGenerationHiddenExactGenerated,
+                        perfSparseGenerationHiddenExactTracked);
                 }
             }
         }
@@ -27269,8 +28170,20 @@ int RunSandbox(int argc, char* argv[]) {
         return 9;
     }
     if (enableSparseBrushPaintSmoke && !sparseBrushPaintSmokePassed) {
+        const uint32_t sparseBrushPaintSmokeSettleFrame = sparseBrushPaintSmokeEndFrame + 180u;
+        const uint32_t requiredPaintCases =
+            sparseBrushPaintSmokeForcedCase < kSparseBrushPaintSmokeCaseCount
+                ? 1u
+                : kSparseBrushPaintSmokeCaseCount;
+        uint32_t coveredPaintCases = 0;
+        for (uint32_t caseIndex = 0; caseIndex < kSparseBrushPaintSmokeCaseCount; ++caseIndex) {
+            if (sparseBrushPaintSmokeCaseFrames[caseIndex] > 0u &&
+                sparseBrushPaintSmokeCaseQueued[caseIndex] > 0u) {
+                ++coveredPaintCases;
+            }
+        }
         spdlog::critical(
-            "VENPOD sparse brush paint smoke failed. frames={}/{} queued={}/{} retired={} applied={}/{} deltas={} fallback={} missingResident={} hints={} overflow={} deltaMismatch={} deferred={} requests={}",
+            "VENPOD sparse brush paint smoke failed. frames={}/{} queued={}/{} retired={} applied={}/{} deltas={} fallback={} missingResident={} hints={} overflow={} deltaMismatch={} cases={}/{} caseQueued={}/{}/{}/{} moving={} pathCells={} nonresident={} deferred={} requests={} settleFrame={}/{}",
             sparseBrushPaintSmokeActiveFrames,
             sparseBrushPaintSmokeMinFrames,
             sparseBrushPaintSmokeQueued,
@@ -27284,8 +28197,19 @@ int RunSandbox(int argc, char* argv[]) {
             sparseBrushPaintSmokeMissingHints,
             sparseBrushPaintSmokeOverflow,
             sparseBrushPaintSmokeDeltaMismatches,
+            coveredPaintCases,
+            requiredPaintCases,
+            sparseBrushPaintSmokeCaseQueued[0],
+            sparseBrushPaintSmokeCaseQueued[1],
+            sparseBrushPaintSmokeCaseQueued[2],
+            sparseBrushPaintSmokeCaseQueued[3],
+            enableSparseBrushPaintMovingSmoke ? 1 : 0,
+            sparseBrushPaintSmokePathCells.size(),
+            enableSparseBrushPaintNonresidentSmoke ? 1 : 0,
             sparseBrushPaintSmokeDeferred,
-            sparseBrushPaintSmokeResidencyRequests);
+            sparseBrushPaintSmokeResidencyRequests,
+            frameCount,
+            sparseBrushPaintSmokeSettleFrame);
         return 14;
     }
     if (sparseWalkTerrainParityFailed) {

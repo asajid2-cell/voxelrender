@@ -54,6 +54,12 @@ struct SparseVoxelWorldConfig {
     bool parallelExactGenerationEditAware = true;
     bool incrementalPressureTrim = false;
     uint32_t incrementalPressureTrimScanBudget = 32768;
+    // Allow eviction/trim of bricks with persistent edits (outside keep radii /
+    // under pressure, same rules as any brick). Edits are DURABLE in the edit
+    // store and re-apply on regeneration, so this is safe; the old unconditional
+    // pin made every ever-edited brick resident forever (an editing session
+    // ballooned near residency 5x -> 2.7M raster faces -> ~30fps dips).
+    bool evictPersistentEditedBricks = true;
     bool surfaceBuriedSolidFastPath = false;
     bool surfaceClassValueSortCache = false;
     bool surfaceClassPartialValueSort = false;
@@ -77,6 +83,7 @@ struct SparseVoxelWorldConfig {
     // so the frame never waits on meshing. Best-available render shows coarser terrain
     // until a coord's mesh lands.
     bool asyncSurfaceExtraction = false;
+    bool asyncSurfaceExtractionPerCoordEditGate = false;
     // Default worker count for the async surface mesher. Raised 2->8: the exact-surface
     // near-detail extraction is the moving-into-fresh-terrain throughput producer and runs
     // entirely off the render thread, so more workers raise meshing throughput during the
@@ -270,11 +277,24 @@ struct SparseVoxelWorldStats {
     uint32_t surfaceClassValueSortCallsLastFrame = 0;
     uint32_t surfaceClassValueSortCacheHitsLastFrame = 0;
     uint32_t surfaceStrictTimeBudgetUnsortedPopsLastFrame = 0;
+    uint32_t surfaceInlineExtractionBricksLastFrame = 0;
+    float surfaceInlineExtractionMsLastFrame = 0.0f;
     uint32_t parallelSurfaceExtractionActive = 0;
     uint32_t parallelSurfaceExtractionBricksLastFrame = 0;
     uint32_t parallelSurfaceExtractionWorkersLastFrame = 0;
     float parallelSurfaceExtractionWallMsLastFrame = 0.0f;
     float surfaceExtractionWaitMsLastFrame = 0.0f;
+    uint32_t asyncSurfaceExtractionEnabled = 0;
+    uint32_t asyncSurfaceExtractionQueueDepth = 0;
+    uint32_t asyncSurfaceExtractionResultDepth = 0;
+    uint32_t asyncSurfaceExtractionPending = 0;
+    uint32_t asyncSurfaceExtractionEnqueuedLastFrame = 0;
+    uint32_t asyncSurfaceExtractionAppliedLastFrame = 0;
+    uint32_t asyncSurfaceExtractionDiscardedLastFrame = 0;
+    uint32_t asyncSurfaceExtractionRequeuedLastFrame = 0;
+    float asyncSurfaceExtractionWorkerMsLastFrame = 0.0f;
+    float asyncSurfaceExtractionEnqueueMsLastFrame = 0.0f;
+    uint32_t asyncSurfaceExtractionRejectedLastFrame = 0;
     uint32_t terrainColumnCachePersistentActive = 0;
     uint32_t terrainColumnCacheEntries = 0;
     uint32_t terrainColumnCacheMaxEntries = 0;
@@ -329,6 +349,13 @@ struct SparsePageInvalidationPacket {
     uint32_t entryIndex = UINT32_MAX;
     uint32_t pageIndex = INVALID_BRICK_PAGE;
     uint32_t generation = 0;
+};
+
+struct SparseSurfaceExtractionClassCounts {
+    uint32_t edited = 0;
+    uint32_t collision = 0;
+    uint32_t visible = 0;
+    uint32_t speculative = 0;
 };
 
 struct SparseRaycastHit {
@@ -433,6 +460,13 @@ public:
     // at most once per stats frame; OFF for tests/isolated use (every call refreshes).
     void SetStatsRefreshOncePerFrame(bool enable) { m_statsRefreshOncePerFrame = enable; }
     void SetStatsFrame(uint64_t frame) { m_statsFrameHint = frame; }
+    // Per-frame surface work route (scheduler BuildSurfaceWorkRoute): when set, the
+    // general AroundTimed surface pumps prefer per-coord async enqueue over the
+    // blocking fork-join batch. Ownership-critical pumps ignore this.
+    void SetSurfaceWorkRoutePreferAsync(bool preferAsync) {
+        m_surfaceWorkRoutePreferAsync = preferAsync;
+    }
+    bool SurfaceWorkRoutePreferAsync() const { return m_surfaceWorkRoutePreferAsync; }
 
     bool RequestBrick(const BrickCoord& coord);
     SparseBrickRequestResult RequestBrickDetailed(const BrickCoord& coord, bool allowEmptyFastPath = true);
@@ -480,7 +514,8 @@ public:
         uint32_t maxBricks,
         const BrickCoord& focus,
         uint32_t currentFrame,
-        double maxMilliseconds);
+        double maxMilliseconds,
+        SparseSurfaceExtractionClassCounts* outClassCounts = nullptr);
     uint32_t PumpSurfaceExtractionAroundTimedForClass(
         uint32_t maxBricks,
         const BrickCoord& focus,
@@ -811,12 +846,18 @@ private:
     struct AsyncSurfaceExtractionRequest {
         BrickCoord coord;
         SparseResidencyClass residencyClass = SparseResidencyClass::Speculative;
+        uint32_t pageIndex = INVALID_BRICK_PAGE;
+        uint32_t generation = 0;
+        uint64_t editDependencyRevision = 0;
         GeneratedSparseBrick brick;
     };
 
     struct AsyncSurfaceExtractionResult {
         BrickCoord coord;
         SparseResidencyClass residencyClass = SparseResidencyClass::Speculative;
+        uint32_t pageIndex = INVALID_BRICK_PAGE;
+        uint32_t generation = 0;
+        uint64_t editDependencyRevision = 0;
         GeneratedSparseBrick brick;
         SparseSurfaceExtractionResult faces;
         float workerMs = 0.0f;
@@ -949,7 +990,12 @@ private:
         GeneratedSparseBrick brick;
     };
     bool CanUseParallelSurfaceExtractionBatch(uint32_t maxBricks) const;
-    uint32_t ExtractSurfaceBatchNoEdit(std::vector<SurfaceExtractionBatchItem>& pending);
+    bool SurfaceWorkRoutePreferAsyncActive() const {
+        return m_surfaceWorkRoutePreferAsync && m_config.asyncSurfaceExtraction;
+    }
+    uint32_t ExtractSurfaceBatchNoEdit(
+        std::vector<SurfaceExtractionBatchItem>& pending,
+        SparseSurfaceExtractionClassCounts* outClassCounts = nullptr);
     StreamingTicketOwnership ClassifyStreamingTicketOwnership(const BrickResidentRecord& record) const;
     bool IsStreamingOwnershipCritical(const BrickResidentRecord& record) const;
     void TouchStreamingTicket(
@@ -1110,6 +1156,8 @@ private:
     uint32_t m_surfaceClassValueSortCallsLastFrame = 0;
     uint32_t m_surfaceClassValueSortCacheHitsLastFrame = 0;
     uint32_t m_surfaceStrictTimeBudgetUnsortedPopsLastFrame = 0;
+    uint32_t m_surfaceInlineExtractionBricksLastFrame = 0;
+    float m_surfaceInlineExtractionMsLastFrame = 0.0f;
     uint32_t m_parallelSurfaceExtractionBricksLastFrame = 0;
     uint32_t m_parallelSurfaceExtractionWorkersLastFrame = 0;
     float m_parallelSurfaceExtractionWallMsLastFrame = 0.0f;
@@ -1148,6 +1196,7 @@ private:
     bool m_statsRefreshPending = false;
     bool m_statsRefreshOncePerFrame = false;
     uint64_t m_statsFrameHint = 0;
+    bool m_surfaceWorkRoutePreferAsync = false;
     uint64_t m_lastFullStatsFrame = 0xFFFFFFFFFFFFFFFFull;
     std::thread m_asyncExactGenerationThread;
     std::mutex m_asyncExactGenerationMutex;
@@ -1168,7 +1217,10 @@ private:
     uint32_t m_asyncSurfaceExtractionEnqueuedLastFrame = 0;
     uint32_t m_asyncSurfaceExtractionAppliedLastFrame = 0;
     uint32_t m_asyncSurfaceExtractionDiscardedLastFrame = 0;
+    uint32_t m_asyncSurfaceExtractionRequeuedLastFrame = 0;
     float m_asyncSurfaceExtractionWorkerMsLastFrame = 0.0f;
+    float m_asyncSurfaceExtractionEnqueueMsLastFrame = 0.0f;
+    uint32_t m_asyncSurfaceExtractionRejectedLastFrame = 0;
     std::vector<std::thread> m_persistentExactGenerationThreads;
     std::mutex m_persistentExactGenerationMutex;
     std::condition_variable m_persistentExactGenerationCv;
