@@ -2479,6 +2479,14 @@ int RunSandbox(int argc, char* argv[]) {
             std::max<uint32_t>(1024u, sparseHiddenExactMissSurfaceBudget));
     const bool enableSparseMidVoxelRender =
         sparseBackendRequested && ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_RENDER", 1u) != 0u;
+    const bool debugFreezeMidMovementSystems =
+        sparseBackendRequested && ReadUIntEnv("VENPOD_DEBUG_FREEZE_MID_MOVEMENT", 0u) != 0u;
+    const bool debugFreezeMidClipmapInterest =
+        sparseBackendRequested && ReadUIntEnv("VENPOD_DEBUG_FREEZE_MID_CLIPMAP_INTEREST", 0u) != 0u;
+    const bool debugFreezeMidMeshRebuild =
+        sparseBackendRequested && ReadUIntEnv("VENPOD_DEBUG_FREEZE_MID_MESH_REBUILD", 0u) != 0u;
+    const uint32_t debugFreezeMidAfterFrame =
+        ReadUIntEnv("VENPOD_DEBUG_FREEZE_MID_AFTER_FRAME", 240u);
     // Stable default: keep raster surfaces to a world-space near ownership
     // radius. Camera-shaped snapshots caused yaw-dependent holes/flicker, but
     // drawing every cached resident surface lets stale/off-axis near geometry
@@ -12835,23 +12843,29 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseFarField.rootMinY,
                     sparseFarField.pageCoverageRatio
                 });
-                sparseClipmapTileCache.UpdateInterest(
-                    cameraPos.x,
-                    cameraPos.y,
-                    cameraPos.z,
-                    sparseResidencyFrame,
-                    sparseClipmapFramePolicy,
-                    cameraForward.x,
-                    cameraForward.y,
-                    cameraForward.z,
-                    sparseClipmapVelocity.x,
-                    sparseClipmapVelocity.y,
-                    sparseClipmapVelocity.z,
-                    sparseClipmapPredictionSeconds);
+                const bool debugFreezeMidClipmapInterestThisFrame =
+                    (debugFreezeMidMovementSystems || debugFreezeMidClipmapInterest) &&
+                    frameCount >= debugFreezeMidAfterFrame;
+                if (!debugFreezeMidClipmapInterestThisFrame) {
+                    sparseClipmapTileCache.UpdateInterest(
+                        cameraPos.x,
+                        cameraPos.y,
+                        cameraPos.z,
+                        sparseResidencyFrame,
+                        sparseClipmapFramePolicy,
+                        cameraForward.x,
+                        cameraForward.y,
+                        cameraForward.z,
+                        sparseClipmapVelocity.x,
+                        sparseClipmapVelocity.y,
+                        sparseClipmapVelocity.z,
+                        sparseClipmapPredictionSeconds);
+                }
                 uint32_t sparseMidClipmapPredictedVisibleQueuedLastFrame = 0;
                 uint32_t sparseMidClipmapPredictedVisibleSamplesRunLastFrame = 0;
                 float sparseMidClipmapPredictedVisibleMsLastFrame = 0.0f;
                 if (enableSparseMidClipmapPredictedVisibleAdmission &&
+                    !debugFreezeMidClipmapInterestThisFrame &&
                     sparseMidClipmapPredictedVisibleAdmissionMaxCoords > 0u &&
                     sparseClipmapFramePolicy.Config().asyncVisibleCriticalGeneration &&
                     (!enableSparseStartupPublicRenderGate || sparseStartupPublicRenderGateOpened) &&
@@ -17793,7 +17807,12 @@ int RunSandbox(int argc, char* argv[]) {
                 // bound per-frame cost; keep firing (camera still) until they all upload.
                 const bool midMeshUploadCatchup =
                     sparseMidMeshIncrementalUpload && sparseClipmapTileCache.HasMidMeshDirtyPayload();
-                if (midMeshRetryFutile ||
+                const bool debugFreezeMidMeshRebuildThisFrame =
+                    (debugFreezeMidMovementSystems || debugFreezeMidMeshRebuild) &&
+                    frameCount >= debugFreezeMidAfterFrame &&
+                    sparseMidMeshUploadedCullValid;
+                if (debugFreezeMidMeshRebuildThisFrame ||
+                    midMeshRetryFutile ||
                     (!midMeshContentChangeDue && !midMeshCullMoved &&
                      !midMeshCullTurned && !midMeshDeferredCatchup && !midMeshUploadCatchup)) {
                     // Current mesh still matches resident height tiles and the conservative
