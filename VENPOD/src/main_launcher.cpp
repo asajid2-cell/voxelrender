@@ -2487,6 +2487,10 @@ int RunSandbox(int argc, char* argv[]) {
         sparseBackendRequested && ReadUIntEnv("VENPOD_DEBUG_FREEZE_MID_MESH_REBUILD", 0u) != 0u;
     const bool debugFreezeMidCpuRebuild =
         sparseBackendRequested && ReadUIntEnv("VENPOD_DEBUG_FREEZE_MID_CPU_REBUILD", 0u) != 0u;
+    const bool debugRedrawTrace =
+        sparseBackendRequested && ReadUIntEnv("VENPOD_DEBUG_REDRAW_TRACE", 0u) != 0u;
+    const uint32_t debugRedrawTraceAfterFrame =
+        ReadUIntEnv("VENPOD_DEBUG_REDRAW_TRACE_AFTER_FRAME", 0u);
     const uint32_t debugFreezeMidAfterFrame =
         ReadUIntEnv("VENPOD_DEBUG_FREEZE_MID_AFTER_FRAME", 240u);
     // Stable default: keep raster surfaces to a world-space near ownership
@@ -13139,6 +13143,10 @@ int RunSandbox(int argc, char* argv[]) {
                 }
                 perfSparseClipmapInterestMs =
                     ticksToMs(SDL_GetPerformanceCounter() - sparseClipmapInterestStart);
+#if 0
+                // DEBUG moving-shimmer isolation: remove the CPU parent-held mid-voxel
+                // feedback producer from the build. If render-feedback queueing remains,
+                // it is coming from the shader ownership sample path below instead.
                 const bool sparseMidClipmapParentHeldFeedbackActive =
                     (sparseMotionStreamBurstMinSpeed > 0u &&
                      sparseCameraSpeedLastFrame >=
@@ -13339,6 +13347,7 @@ int RunSandbox(int argc, char* argv[]) {
                             hasFirstAccepted ? firstAccepted.z : 0);
                     }
                 }
+#endif
                 sparseMidVoxelRenderFeedbackQueuedLastFrame = 0;
                 sparseMidVoxelRenderFeedbackAcceptedLastFrame = 0;
                 if (!debugFreezeMidCpuRebuildThisFrame) {
@@ -13975,6 +13984,9 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseClipmapAsyncApplyPolicy =
                         Simulation::SparseClipmapPolicy(sparseClipmapAsyncApplyConfig);
                 }
+#if 0
+                // DEBUG moving-shimmer isolation: hard-disable mid-voxel CPU
+                // result publication. Height clipmap work remains active.
                 if (!debugFreezeMidCpuRebuildThisFrame) {
                     sparseClipmapTileCache.ApplyAsyncNoncriticalVoxelGenerationCompletions(
                         sparseResidencyFrame,
@@ -13989,6 +14001,7 @@ int RunSandbox(int argc, char* argv[]) {
                             ? sparseMidClipmapAsyncVisibleReservationMaxApply
                             : 0u);
                 }
+#endif
                 if (enableSparseStartupPublicRenderMidVoxelVisibleProof &&
                     enableSparseStartupPublicRenderGate &&
                     !sparseStartupPublicRenderGateOpened) {
@@ -14503,16 +14516,18 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseMidClipmapBudgetLastFrame =
                         sparseMidClipmapSplitVisibleBudgetThisFrame +
                         sparseMidClipmapSplitCacheBudgetThisFrame;
+                    // DEBUG moving-shimmer isolation: keep height pumping, but
+                    // cut all mid-voxel generation/mutation in this path.
                     sparseClipmapTileCache.PumpGenerationSplitVisiblePriority(
                         sparseMidClipmapHeightCpuBudgetThisFrame,
-                        sparseMidClipmapSplitVisibleBudgetThisFrame,
-                        sparseMidClipmapSplitCacheBudgetThisFrame,
+                        0u,
+                        0u,
                         sparseResidencyFrame,
                         sparseClipmapPumpPolicy);
                 } else {
                     sparseClipmapTileCache.PumpGeneration(
                         sparseMidClipmapHeightCpuBudgetThisFrame,
-                        sparseMidClipmapCpuBudgetThisFrame,
+                        0u,
                         sparseResidencyFrame,
                         sparseClipmapPumpPolicy);
                 }
@@ -14538,7 +14553,8 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseMidVoxelWorstRingForBudget != UINT32_MAX &&
                     sparseMidClipmapOuterRingTailInnerReady &&
                     sparseOwnershipLodParentHeldPixelsLastRetire == 0u;
-                if (!debugFreezeMidCpuRebuildThisFrame &&
+                if (false &&
+                    !debugFreezeMidCpuRebuildThisFrame &&
                     sparseMidClipmapOuterRingTailEligible) {
                     const uint32_t sparseMidClipmapOuterRingTailBudgetThisFrame =
                         std::min<uint32_t>(
@@ -15914,6 +15930,19 @@ int RunSandbox(int argc, char* argv[]) {
                 sparseClipmapTileCache.VoxelDirtySerial() != sparseMidClipmapUploadedVoxelSerial;
             const bool sparseMidClipmapUploadPending =
                 uploadHeightClipmapPending || uploadVoxelClipmapPending;
+            const bool debugRedrawTraceThisFrame =
+                debugRedrawTrace && frameCount >= debugRedrawTraceAfterFrame;
+            if (debugRedrawTraceThisFrame && sparseMidClipmapUploadPending) {
+                spdlog::info(
+                    "REDRAW_TRACE frame={} system=midClipmap layer=upload site=main.midClipmapUploadRequest pendingHeight={} pendingVoxel={} heightSerial=cpu/gpu:{}/{} voxelSerial=cpu/gpu:{}/{}",
+                    frameCount,
+                    uploadHeightClipmapPending ? 1u : 0u,
+                    uploadVoxelClipmapPending ? 1u : 0u,
+                    sparseClipmapTileCache.HeightDirtySerial(),
+                    sparseMidClipmapUploadedHeightSerial,
+                    sparseClipmapTileCache.VoxelDirtySerial(),
+                    sparseMidClipmapUploadedVoxelSerial);
+            }
             Simulation::SparseClipmapGpuSnapshot sparseMidClipmapSnapshotForUpload;
             bool sparseMidClipmapSnapshotReadyForUpload = false;
             if (sparseMidClipmapUploadPending) {
@@ -17827,10 +17856,31 @@ int RunSandbox(int argc, char* argv[]) {
                      ((debugFreezeMidMovementSystems || debugFreezeMidMeshRebuild) &&
                       frameCount >= debugFreezeMidAfterFrame)) &&
                     sparseMidMeshUploadedCullValid;
-                if (debugFreezeMidMeshRebuildThisFrame ||
-                    midMeshRetryFutile ||
-                    (!midMeshContentChangeDue && !midMeshCullMoved &&
-                     !midMeshCullTurned && !midMeshDeferredCatchup && !midMeshUploadCatchup)) {
+                const bool midMeshRebuildRequested =
+                    !debugFreezeMidMeshRebuildThisFrame &&
+                    !midMeshRetryFutile &&
+                    (midMeshContentChangeDue ||
+                     midMeshCullMoved ||
+                     midMeshCullTurned ||
+                     midMeshDeferredCatchup ||
+                     midMeshUploadCatchup);
+                if (debugRedrawTraceThisFrame && midMeshRebuildRequested) {
+                    spdlog::info(
+                        "REDRAW_TRACE frame={} system=midMesh layer=surface site=main.midMeshRebuildRequest reasons=content/cullMove/cullTurn/deferred/uploadCatchup:{}/{}/{}/{}/{} heightSerial=cpu/gpu:{}/{} cullValid={} cameraDelta={:.1f}",
+                        frameCount,
+                        midMeshContentChangeDue ? 1u : 0u,
+                        midMeshCullMoved ? 1u : 0u,
+                        midMeshCullTurned ? 1u : 0u,
+                        midMeshDeferredCatchup ? 1u : 0u,
+                        midMeshUploadCatchup ? 1u : 0u,
+                        sparseClipmapTileCache.HeightDirtySerial(),
+                        sparseMidMeshUploadedHeightSerial,
+                        sparseMidMeshUploadedCullValid ? 1u : 0u,
+                        sparseMidMeshUploadedCullValid
+                            ? glm::length(cameraPos - sparseMidMeshUploadedCullCamera)
+                            : 0.0f);
+                }
+                if (!midMeshRebuildRequested) {
                     // Current mesh still matches resident height tiles and the conservative
                     // cull window, or a just-failed build would fail again unchanged.
                 } else {

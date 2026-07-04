@@ -10,6 +10,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <atomic>
 #include <chrono>
@@ -123,6 +124,34 @@ bool StationaryViewIndependentInterestEnabled() {
         return env == nullptr || std::atoi(env) != 0;
     }();
     return enabled;
+}
+
+bool RedrawTraceEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("VENPOD_DEBUG_REDRAW_TRACE");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+uint32_t RedrawTraceAfterFrame() {
+    static const uint32_t frame = [] {
+        const char* env = std::getenv("VENPOD_DEBUG_REDRAW_TRACE_AFTER_FRAME");
+        return env != nullptr
+            ? static_cast<uint32_t>(std::max(0, std::atoi(env)))
+            : 0u;
+    }();
+    return frame;
+}
+
+bool ShouldRedrawTrace(uint32_t frameIndex) {
+    return RedrawTraceEnabled() && frameIndex >= RedrawTraceAfterFrame();
+}
+
+uint32_t TraceCount(size_t value) {
+    return static_cast<uint32_t>(std::min<size_t>(
+        value,
+        std::numeric_limits<uint32_t>::max()));
 }
 
 uint32_t QuantizeFloatToUint(float value, float scale) {
@@ -454,6 +483,8 @@ bool SparseClipmapPolicy::OwnsRaySegment(
     return segmentEndDistance >= transitionStart && segmentStartDistance <= m_config.endDistance;
 }
 
+//Cpu clipmap that decided the hard distance to ring
+
 float SparseClipmapPolicy::CellSizeForDistance(float distanceFromCamera) const {
     if (!IsEnabled() || !std::isfinite(distanceFromCamera)) {
         return m_config.minCellSize;
@@ -548,6 +579,109 @@ size_t SparseVoxelClipmapCoordHash::operator()(const SparseVoxelClipmapCoord& co
 SparseClipmapTileCache::~SparseClipmapTileCache() {
     StopAsyncNoncriticalVoxelGenerationWorker();
     StopPersistentVoxelPumpWorkers();
+}
+
+void SparseClipmapTileCache::TraceInterestRedrawRequest(
+    const char* site,
+    uint32_t frameIndex,
+    size_t heightInterestBefore,
+    size_t heightQueueBefore,
+    size_t voxelInterestBefore,
+    size_t voxelQueueBefore,
+    uint32_t detail0,
+    uint32_t detail1) const
+{
+    if (!ShouldRedrawTrace(frameIndex)) {
+        return;
+    }
+    spdlog::info(
+        "REDRAW_TRACE frame={} system=midClipmap layer=interest site={} interest=h/v:{}->{}/{}->{} queued=h/v:{}->{}/{}->{} serials=dirty/height/voxel:{}/{}/{} detail={}/{} resident=h/v:{}->{}",
+        frameIndex,
+        site ? site : "unknown",
+        TraceCount(heightInterestBefore),
+        TraceCount(m_interestSet.size()),
+        TraceCount(voxelInterestBefore),
+        TraceCount(m_voxelInterestSet.size()),
+        TraceCount(heightQueueBefore),
+        TraceCount(m_generationQueue.size()),
+        TraceCount(voxelQueueBefore),
+        TraceCount(m_voxelGenerationQueue.size()),
+        m_dirtySerial,
+        m_heightDirtySerial,
+        m_voxelDirtySerial,
+        detail0,
+        detail1,
+        TraceCount(m_slotByCoord.size()),
+        TraceCount(m_voxelSlotByCoord.size()));
+}
+
+void SparseClipmapTileCache::TraceHeightRedrawRequest(
+    const char* site,
+    uint32_t frameIndex,
+    uint32_t slot) const
+{
+    if (!ShouldRedrawTrace(frameIndex)) {
+        return;
+    }
+    SparseClipmapTileCoord coord{};
+    bool coordValid = false;
+    if (slot < m_tiles.size() && m_tiles[slot].record.slot != UINT32_MAX) {
+        coord = m_tiles[slot].record.coord;
+        coordValid = true;
+    }
+    spdlog::info(
+        "REDRAW_TRACE frame={} system=midClipmap layer=height site={} slot={} coordValid={} coord=({},{},{}) serials=dirty/height/voxel:{}/{}/{} dirtySlots=h/v:{}/{} resident=h/v:{}/{} queued=h/v:{}/{}",
+        frameIndex,
+        site ? site : "unknown",
+        slot,
+        coordValid ? 1u : 0u,
+        coord.ring,
+        coord.x,
+        coord.z,
+        m_dirtySerial,
+        m_heightDirtySerial,
+        m_voxelDirtySerial,
+        TraceCount(m_dirtyHeightSlots.size()),
+        TraceCount(m_dirtyVoxelSlots.size()),
+        TraceCount(m_slotByCoord.size()),
+        TraceCount(m_voxelSlotByCoord.size()),
+        TraceCount(m_generationQueue.size()),
+        TraceCount(m_voxelGenerationQueue.size()));
+}
+
+void SparseClipmapTileCache::TraceVoxelRedrawRequest(
+    const char* site,
+    uint32_t frameIndex,
+    uint32_t slot) const
+{
+    if (!ShouldRedrawTrace(frameIndex)) {
+        return;
+    }
+    SparseVoxelClipmapCoord coord{};
+    bool coordValid = false;
+    if (slot < m_voxelBricks.size() && m_voxelBricks[slot].slot != UINT32_MAX) {
+        coord = m_voxelBricks[slot].coord;
+        coordValid = true;
+    }
+    spdlog::info(
+        "REDRAW_TRACE frame={} system=midClipmap layer=voxel site={} slot={} coordValid={} coord=({},{},{},{}) serials=dirty/height/voxel:{}/{}/{} dirtySlots=h/v:{}/{} resident=h/v:{}/{} queued=h/v:{}/{}",
+        frameIndex,
+        site ? site : "unknown",
+        slot,
+        coordValid ? 1u : 0u,
+        coord.ring,
+        coord.x,
+        coord.y,
+        coord.z,
+        m_dirtySerial,
+        m_heightDirtySerial,
+        m_voxelDirtySerial,
+        TraceCount(m_dirtyHeightSlots.size()),
+        TraceCount(m_dirtyVoxelSlots.size()),
+        TraceCount(m_slotByCoord.size()),
+        TraceCount(m_voxelSlotByCoord.size()),
+        TraceCount(m_generationQueue.size()),
+        TraceCount(m_voxelGenerationQueue.size()));
 }
 
 bool SparseClipmapTileCache::Initialize(const SparseClipmapConfig& config) {
@@ -1042,6 +1176,10 @@ uint32_t SparseClipmapTileCache::QueueAsyncVoxelGenerationMatchingPriority(
         return 0u;
     }
 
+    const size_t heightInterestBefore = m_interestSet.size();
+    const size_t heightQueueBefore = m_generationQueue.size();
+    const size_t voxelInterestBefore = m_voxelInterestSet.size();
+    const size_t voxelQueueBefore = m_voxelGenerationQueue.size();
     uint32_t queuedAsync = 0u;
     const uint32_t asyncEnqueueLimit = requireVisiblePriority
         ? config.asyncVisibleCriticalGenerationMaxEnqueuePerFrame
@@ -1149,6 +1287,17 @@ uint32_t SparseClipmapTileCache::QueueAsyncVoxelGenerationMatchingPriority(
                 ++queuedAsync;
             }
         }
+        if (queuedAsync != 0u) {
+            TraceInterestRedrawRequest(
+                "QueueAsyncVoxelGenerationMatchingPriority.visible",
+                frameIndex,
+                heightInterestBefore,
+                heightQueueBefore,
+                voxelInterestBefore,
+                voxelQueueBefore,
+                queuedAsync,
+                asyncEnqueueLimit);
+        }
         return queuedAsync;
     }
     // Bound the scan: while moving, the queue holds a large persistent missing-voxel
@@ -1188,6 +1337,19 @@ uint32_t SparseClipmapTileCache::QueueAsyncVoxelGenerationMatchingPriority(
                 requireVisiblePriority)) {
             ++queuedAsync;
         }
+    }
+    if (queuedAsync != 0u) {
+        TraceInterestRedrawRequest(
+            requireVisiblePriority
+                ? "QueueAsyncVoxelGenerationMatchingPriority.visible"
+                : "QueueAsyncVoxelGenerationMatchingPriority.cache",
+            frameIndex,
+            heightInterestBefore,
+            heightQueueBefore,
+            voxelInterestBefore,
+            voxelQueueBefore,
+            queuedAsync,
+            asyncEnqueueLimit);
     }
     return queuedAsync;
 }
@@ -1476,6 +1638,7 @@ uint32_t SparseClipmapTileCache::ApplyAsyncNoncriticalVoxelGenerationCompletions
         ++m_dirtySerial;
         ++m_voxelDirtySerial;
         MarkVoxelSlotDirty(slot);
+        TraceVoxelRedrawRequest("ApplyAsyncVoxelGenerationCompletions", frameIndex, slot);
         ++applied;
         if (visibleCriticalResult) {
             ++appliedVisibleCritical;
@@ -1858,11 +2021,13 @@ uint32_t SparseClipmapTileCache::PumpEditedBrickRegens(
         }
         GenerateVoxelBrick(slot, policy);
         MarkVoxelSlotDirty(slot);
+        TraceVoxelRedrawRequest("PumpEditedBrickRegens.slotDirty", m_lastStatsFrame, slot);
         ++regenerated;
     }
     if (regenerated != 0) {
         ++m_dirtySerial;
         ++m_voxelDirtySerial;
+        TraceVoxelRedrawRequest("PumpEditedBrickRegens.serialBump", m_lastStatsFrame, UINT32_MAX);
         RefreshStats(0, 0, regenerated, 0);
     }
     return regenerated;
@@ -1944,6 +2109,7 @@ uint32_t SparseClipmapTileCache::PumpEditedHeightTileRegens(
         }
         GenerateTile(slot, policy);
         MarkHeightSlotDirty(slot);
+        TraceHeightRedrawRequest("PumpEditedHeightTileRegens.slotDirty", m_lastStatsFrame, slot);
         ++regenerated;
     }
     if (regenerated == 0) {
@@ -1966,6 +2132,7 @@ uint32_t SparseClipmapTileCache::PumpEditedHeightTileRegens(
         ++m_dirtySerial;
         ++m_heightDirtySerial;
         m_editHeightFramesSinceSerialBump = 0;
+        TraceHeightRedrawRequest("PumpEditedHeightTileRegens.serialBump", m_lastStatsFrame, UINT32_MAX);
         // Oscillator trace (Loop 110): edit-refresh cadence bump (global).
         static const bool s_heightSerialTraceE =
             std::getenv("VENPOD_HEIGHT_SERIAL_TRACE") != nullptr;
@@ -2089,6 +2256,8 @@ void SparseClipmapTileCache::UpdateInterest(
     const auto ciEntryT = std::chrono::steady_clock::now();
     const size_t ciSetSizeBefore = m_interestSet.size();
     const size_t ciVoxelSizeBefore = m_voxelInterestSet.size();
+    const size_t ciHeightQueueBefore = m_generationQueue.size();
+    const size_t ciVoxelQueueBefore = m_voxelGenerationQueue.size();
     const auto ciSigT0 = std::chrono::steady_clock::now();
     const InterestSignature signature = BuildInterestSignature(
         cameraX,
@@ -2401,6 +2570,15 @@ void SparseClipmapTileCache::UpdateInterest(
     m_lastInterestRebuildCameraX = cameraX;
     m_lastInterestRebuildCameraY = cameraY;
     m_lastInterestRebuildCameraZ = cameraZ;
+    TraceInterestRedrawRequest(
+        "UpdateInterest.fullRebuild",
+        frameIndex,
+        ciSetSizeBefore,
+        ciHeightQueueBefore,
+        ciVoxelSizeBefore,
+        ciVoxelQueueBefore,
+        useMotionLookahead ? 1u : 0u,
+        applyLookBias ? 1u : 0u);
     if (ciProfile) {
         spdlog::info(
             "CLIPINTEREST frame={} reuse=none fullRebuild=1 interval={} setSize={}->{} voxelSize={}->{} "
@@ -2452,6 +2630,7 @@ uint32_t SparseClipmapTileCache::AllocateSlot(
     ++m_dirtySerial;
     ++m_heightDirtySerial;
     MarkHeightSlotDirty(bestSlot);
+    TraceHeightRedrawRequest("AllocateSlot.evictReuse", frameIndex, bestSlot);
     // Oscillator trace (Loop 110): slot reallocation churn.
     static const bool s_heightSerialTraceA =
         std::getenv("VENPOD_HEIGHT_SERIAL_TRACE") != nullptr;
@@ -2678,6 +2857,7 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
                 ++m_dirtySerial;
                 ++m_heightDirtySerial;
                 MarkHeightSlotDirty(item.slot);
+                TraceHeightRedrawRequest("PumpGeneration.heightParallel", frameIndex, item.slot);
                 // Oscillator trace (Loop 110).
                 static const bool s_heightSerialTraceP =
                     std::getenv("VENPOD_HEIGHT_SERIAL_TRACE") != nullptr;
@@ -2744,6 +2924,7 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
             ++m_dirtySerial;
             ++m_heightDirtySerial;
             MarkHeightSlotDirty(slot);
+            TraceHeightRedrawRequest("PumpGeneration.heightSync", frameIndex, slot);
             // Oscillator trace (Loop 110): name the tiles that keep regenerating.
             static const bool s_heightSerialTrace =
                 std::getenv("VENPOD_HEIGHT_SERIAL_TRACE") != nullptr;
@@ -2977,6 +3158,7 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
                 ++m_dirtySerial;
                 ++m_voxelDirtySerial;
                 MarkVoxelSlotDirty(item.slot);
+                TraceVoxelRedrawRequest("PumpGeneration.voxelParallel", frameIndex, item.slot);
             }
         }
     }
@@ -3014,6 +3196,7 @@ uint32_t SparseClipmapTileCache::PumpGeneration(
         ++m_dirtySerial;
         ++m_voxelDirtySerial;
         MarkVoxelSlotDirty(slot);
+        TraceVoxelRedrawRequest("PumpGeneration.voxelSync", frameIndex, slot);
         if (pumpHardBudgetActive && !m_voxelGenerationQueue.empty()) {
             const float elapsedMs =
                 ElapsedMs(voxelPumpStart, std::chrono::steady_clock::now());
@@ -3327,6 +3510,12 @@ uint32_t SparseClipmapTileCache::PumpVoxelGenerationMatchingPriority(
                 ++m_dirtySerial;
                 ++m_voxelDirtySerial;
                 MarkVoxelSlotDirty(item.slot);
+                TraceVoxelRedrawRequest(
+                    requireVisiblePriority
+                        ? "PumpVoxelGenerationMatchingPriority.visibleParallel"
+                        : "PumpVoxelGenerationMatchingPriority.cacheParallel",
+                    frameIndex,
+                    item.slot);
             }
             if (requireVisiblePriority) {
                 QueueAsyncVoxelGenerationMatchingPriority(true, frameIndex, policy);
@@ -3395,6 +3584,12 @@ uint32_t SparseClipmapTileCache::PumpVoxelGenerationMatchingPriority(
         ++m_dirtySerial;
         ++m_voxelDirtySerial;
         MarkVoxelSlotDirty(slot);
+        TraceVoxelRedrawRequest(
+            requireVisiblePriority
+                ? "PumpVoxelGenerationMatchingPriority.visibleSync"
+                : "PumpVoxelGenerationMatchingPriority.cacheSync",
+            frameIndex,
+            slot);
     }
 
     if (requireVisiblePriority) {
@@ -3466,6 +3661,7 @@ uint32_t SparseClipmapTileCache::PumpVoxelGenerationForRing(
         ++m_dirtySerial;
         ++m_voxelDirtySerial;
         MarkVoxelSlotDirty(slot);
+        TraceVoxelRedrawRequest("PumpVoxelGenerationForRing", frameIndex, slot);
     }
     const auto voxelPumpEnd = std::chrono::steady_clock::now();
 
@@ -3490,6 +3686,10 @@ bool SparseClipmapTileCache::QueueVoxelRenderFeedbackCoord(
         return false;
     }
 
+    const size_t heightInterestBefore = m_interestSet.size();
+    const size_t heightQueueBefore = m_generationQueue.size();
+    const size_t voxelInterestBefore = m_voxelInterestSet.size();
+    const size_t voxelQueueBefore = m_voxelGenerationQueue.size();
     m_voxelInterestSet.insert(coord);
 
     const auto resident = m_voxelSlotByCoord.find(coord);
@@ -3507,6 +3707,15 @@ bool SparseClipmapTileCache::QueueVoxelRenderFeedbackCoord(
             m_voxelBacklogFirstFrame.emplace(coord, frameIndex);
         }
         RefreshStats();
+        TraceInterestRedrawRequest(
+            "QueueVoxelRenderFeedbackCoord.queued",
+            frameIndex,
+            heightInterestBefore,
+            heightQueueBefore,
+            voxelInterestBefore,
+            voxelQueueBefore,
+            static_cast<uint32_t>(coord.ring),
+            1u);
         return true;
     }
 
@@ -3731,6 +3940,10 @@ uint32_t SparseClipmapTileCache::QueuePredictedVisibleVoxelInterest(
             ElapsedMs(restoreStart, std::chrono::steady_clock::now());
     }
 
+    const size_t heightInterestBefore = m_interestSet.size();
+    const size_t heightQueueBefore = m_generationQueue.size();
+    const size_t voxelInterestBefore = m_voxelInterestSet.size();
+    const size_t voxelQueueBefore = m_voxelGenerationQueue.size();
     const auto queueStart = phaseDetail
         ? std::chrono::steady_clock::now()
         : std::chrono::steady_clock::time_point{};
@@ -3800,6 +4013,17 @@ uint32_t SparseClipmapTileCache::QueuePredictedVisibleVoxelInterest(
         PrioritizeAsyncVoxelGenerationQueue();
     }
     RefreshStats();
+    if (queued != 0u) {
+        TraceInterestRedrawRequest(
+            "QueuePredictedVisibleVoxelInterest.queued",
+            frameIndex,
+            heightInterestBefore,
+            heightQueueBefore,
+            voxelInterestBefore,
+            voxelQueueBefore,
+            queued,
+            sampleIndex);
+    }
     return queued;
 }
 
@@ -4419,6 +4643,10 @@ uint32_t SparseClipmapTileCache::QueueAsyncVisibleReservationVoxelCoords(
         return 0u;
     }
 
+    const size_t heightInterestBefore = m_interestSet.size();
+    const size_t heightQueueBefore = m_generationQueue.size();
+    const size_t voxelInterestBefore = m_voxelInterestSet.size();
+    const size_t voxelQueueBefore = m_voxelGenerationQueue.size();
     const uint32_t effectiveDeadlineFrame =
         deadlineFrame != 0u ? deadlineFrame : frameIndex;
     m_asyncVisibleReservations.reserve(
@@ -4511,6 +4739,17 @@ uint32_t SparseClipmapTileCache::QueueAsyncVisibleReservationVoxelCoords(
     }
     if (!reservationCoords.empty()) {
         PrioritizeAsyncVoxelGenerationQueue();
+    }
+    if (queued != 0u) {
+        TraceInterestRedrawRequest(
+            "QueueAsyncVisibleReservationVoxelCoords.queued",
+            frameIndex,
+            heightInterestBefore,
+            heightQueueBefore,
+            voxelInterestBefore,
+            voxelQueueBefore,
+            queued,
+            sampleIndex);
     }
     return queued;
 }
@@ -4689,6 +4928,10 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
     const int32_t radiusXz = static_cast<int32_t>(policy.Config().voxelBrickRadiusXz);
     const int32_t radiusY = static_cast<int32_t>(policy.Config().voxelBrickRadiusY);
     const uint32_t ringCount = std::max(1u, static_cast<uint32_t>(rings.size()));
+    const size_t voxelHeightInterestBefore = m_interestSet.size();
+    const size_t voxelHeightQueueBefore = m_generationQueue.size();
+    const size_t voxelInterestBefore = m_voxelInterestSet.size();
+    const size_t voxelQueueBefore = m_voxelGenerationQueue.size();
     const uint32_t maxResidentInterest = std::max<uint32_t>(
         ringCount,
         static_cast<uint32_t>(
@@ -4866,6 +5109,19 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
         m_queuedVoxelSet = std::move(retainedQueuedSet);
         RefreshStats();
         m_stats.voxelInterestAnchors = 0u;
+        if (allowSignatureReuse &&
+            (m_voxelInterestSet.size() != voxelInterestBefore ||
+             m_voxelGenerationQueue.size() != voxelQueueBefore)) {
+            TraceInterestRedrawRequest(
+                "UpdateVoxelInterest.reuseQueueCarry",
+                frameIndex,
+                voxelHeightInterestBefore,
+                voxelHeightQueueBefore,
+                voxelInterestBefore,
+                voxelQueueBefore,
+                voxelInterestReuseAge,
+                m_backlogVoxelCarriedLastFrame);
+        }
         return;
     }
 
@@ -5567,6 +5823,17 @@ void SparseClipmapTileCache::UpdateVoxelInterest(
     RefreshStats();
     m_stats.voxelInterestAnchors = voxelAnchorCount;
     if (allowSignatureReuse) {
+        TraceInterestRedrawRequest(
+            "UpdateVoxelInterest.fullRebuild",
+            frameIndex,
+            voxelHeightInterestBefore,
+            voxelHeightQueueBefore,
+            voxelInterestBefore,
+            voxelQueueBefore,
+            budgetedVoxelInterestRebuild ? 1u : 0u,
+            ringsRebuiltThisFrame);
+    }
+    if (allowSignatureReuse) {
         // While a budgeted rebuild is still sweeping the remaining rings we must NOT
         // commit the new footprint signature: leaving the prior (now-stale) signature
         // in place forces the next frame back onto the rebuild path so the sweep
@@ -5622,6 +5889,7 @@ uint32_t SparseClipmapTileCache::AllocateVoxelSlot(
     ++m_dirtySerial;
     ++m_voxelDirtySerial;
     MarkVoxelSlotDirty(bestSlot);
+    TraceVoxelRedrawRequest("AllocateVoxelSlot.evictReuse", frameIndex, bestSlot);
     return bestSlot;
 }
 
@@ -5670,6 +5938,7 @@ uint32_t SparseClipmapTileCache::AllocateVoxelSlotForMinRing(
     ++m_dirtySerial;
     ++m_voxelDirtySerial;
     MarkVoxelSlotDirty(bestSlot);
+    TraceVoxelRedrawRequest("AllocateVoxelSlotForMinRing.evictReuse", frameIndex, bestSlot);
     return bestSlot;
 }
 

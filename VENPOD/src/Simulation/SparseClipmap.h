@@ -1231,6 +1231,17 @@ private:
     void RefreshInterestTouchFrames(uint32_t frameIndex);
     void MarkVoxelSlotDirty(uint32_t slot);
     void MarkHeightSlotDirty(uint32_t slot);
+    void TraceInterestRedrawRequest(
+        const char* site,
+        uint32_t frameIndex,
+        size_t heightInterestBefore,
+        size_t heightQueueBefore,
+        size_t voxelInterestBefore,
+        size_t voxelQueueBefore,
+        uint32_t detail0 = 0,
+        uint32_t detail1 = 0) const;
+    void TraceHeightRedrawRequest(const char* site, uint32_t frameIndex, uint32_t slot) const;
+    void TraceVoxelRedrawRequest(const char* site, uint32_t frameIndex, uint32_t slot) const;
     void RefreshStats(
         uint32_t generatedLastFrame = 0,
         uint32_t evictedLastFrame = 0,
