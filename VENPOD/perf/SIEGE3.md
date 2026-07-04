@@ -118,3 +118,55 @@ Then A/B env still works (VENPOD_SPARSE_VIEW_FOLLOW_TRIM=1 restores). HUMAN-GATE
       visibleMissing=0. Moving path unchanged; only at-rest behavior changed.
 - [ ] HUMAN-GATE: user runs `rebrun -NoBuild` (exe already rebuilt 17:29) at rest and confirms.
 ## CLOSURE GATE — CLEARED (all automated boxes; human-gate pending). Fix shipped, proven both directions.
+Committed 1e950d0 (wip-edit-latency). USER CONFIRMED rest regen GONE.
+
+## ============ FRONT 2: MOVING regeneration/shimmer (user: "still very bad when we move") ============
+## WIN: moving around, surface does not abnormally regenerate/shimmer (genuine motion-compensated
+## novelty near zero beyond legitimate streaming/parallax + LOD refine). PROVEN by telemetry (cpuSerial
+## re-extraction rate isolated from legit streaming via same-trajectory A/B) + a causal toggle + user gate.
+## INSTRUMENT AUDIT: raw pixel-diff LIES on motion (parallax saturates). TRUSTED = cpuSerial/surfEmit
+## re-extraction rate (camera-independent). Walk path is DETERMINISTIC → same-trajectory A/B isolates
+## a mechanism's contribution cleanly. Walk bot verified moving (cam -208→-157, yaw 0.34→0.76 in window).
+## HYPOTHESES:
+##  H1 same root as rest: recency trim evicts STILL-VISIBLE terrain while moving (side/persistent terrain
+##     not re-requested → ages out → evict+regen). Probe: walk VIEW_FOLLOW_TRIM=0 vs default, same path;
+##     if cpuSerial climb rate DROPS → trim is (part of) the moving cause. General fix = don't evict
+##     bricks within the camera interest/render footprint (spatial, not pure recency).
+##  H2 LOD coverage-handoff pop (childMask cache-key cascades, computeTileLod) as camera crosses bands.
+##  H3 subpixel edge crawl / temporal aliasing (jittered-TAA feature territory; memory Loop 96/115).
+## STATUS: running walk VIEW_FOLLOW_TRIM=0 A/B (siege3_walk_vftoff) to test H1 via cpuSerial rate.
+
+## MOVING FINDINGS (2026-07-03)
+## H1 (trim) PARTIAL: same-path A/B cpuSerial 5.5/fr (trim on) vs 3.6/fr (off) = trim adds ~1.9/fr
+##   spurious (turn-around re-request). BUT motion-compensated pixel novelty identical (~31000 both)
+##   AND saturated by parallax → trim is NOT the dominant VISIBLE moving cause. Pixels CANNOT measure
+##   moving regen (motion saturates even block-matched mc-novelty) → telemetry-only + motion-FREE probes.
+## H2 (LOD pop) LIKELY DOMINANT: NO geomorph/fade/blend/hysteresis anywhere (grep empty). mergeCells
+##   flips at hard distance thresholds 2200u/5000u (SparseClipmap.cpp:7852, no dead-band). Mid-voxel
+##   ring residency shifts as camera moves (res 3893/4214→3339/5460). computeTileLod @7798.
+## ★KEY (memory Loop 110-111): re-tessellation is NON-IDEMPOTENT — a mesh rebuild re-tessellates
+##   UNCHANGED regions to slightly different geometry (stitching/LOD reads neighbor context). This is
+##   the moving crawl AND is testable MOTION-FREE: force a tile rebuild twice at a fixed camera, diff →
+##   nonzero = the bug. Fix = make tessellation deterministic in tile-local+interest terms (double-
+##   rebuild diff = 0). Also: LOD threshold HYSTERESIS (cheap) if tiles flip merge/LOD at band edges.
+## NEXT: motion-free idempotency probe (double-rebuild diff); Codex independent LOD/handoff read.
+
+## MOVING ROOT CAUSE — IDENTIFIED (Codex CONVERGED 2026-07-03)
+Moving artifact = HARD LOD HANDOFFS (no hysteresis/geomorph/blend anywhere — grep empty), NOT surface
+regeneration (that was the rest bug). Two independent hard-pop systems:
+  1. Mid-HEIGHT mesh: mergeCells flips at hard dist thresholds 2200u/5000u (SparseClipmap.cpp:7852);
+     parent block SKIPPED when finer child resident (7587) = binary ownership, no blend. LOD cache
+     (7811) is memoization NOT hysteresis.
+  2. Mid-VOXEL raymarch: ring select = hard floor(saturate()*ringCount) (PS_Raymarch.hlsl:2026) →
+     SampleResidentMidVoxelFallback preferred/finer/coarser (1764). No inter-ring blend.
+Trim EXONERATED for moving: its cpuSerial residual = legit exact streaming/repair, computeTileLod/
+childMask never queues surface extraction (Codex). mc-novelty can't measure (motion saturates).
+FIX = geomorph/fade/blend at the handoff (a rendering FEATURE, memory task #14 "DO FIRST"); the two
+systems need separate treatment. NO cheap gate: smooth movement crosses each threshold ONCE →
+single hard pop → hysteresis won't help (only helps jitter); needs a true morph/blend.
+ISOLATION TOGGLES (which system's pop dominates — needs the USER's EYES, pixels saturate on motion):
+  VENPOD_SPARSE_MID_MESH_LOD=0      → freezes mid-height mesh mergeCells pop
+  VENPOD_SPARSE_MID_VOXEL_RENDER=0  → removes mid-voxel ring/fallback pop
+  (debug modes 59/65/70 = ring/parent-held/chunk ownership viz)
+STATUS: root cause found; fix is a geomorph/blend FEATURE + unmeasurable-by-pixels → need user to run
+the 2 toggles and report which kills the moving shimmer, then build the targeted blend WITH their gate.
