@@ -2485,6 +2485,8 @@ int RunSandbox(int argc, char* argv[]) {
         sparseBackendRequested && ReadUIntEnv("VENPOD_DEBUG_FREEZE_MID_CLIPMAP_INTEREST", 0u) != 0u;
     const bool debugFreezeMidMeshRebuild =
         sparseBackendRequested && ReadUIntEnv("VENPOD_DEBUG_FREEZE_MID_MESH_REBUILD", 0u) != 0u;
+    const bool debugFreezeMidCpuRebuild =
+        sparseBackendRequested && ReadUIntEnv("VENPOD_DEBUG_FREEZE_MID_CPU_REBUILD", 0u) != 0u;
     const uint32_t debugFreezeMidAfterFrame =
         ReadUIntEnv("VENPOD_DEBUG_FREEZE_MID_AFTER_FRAME", 240u);
     // Stable default: keep raster surfaces to a world-space near ownership
@@ -12782,6 +12784,8 @@ int RunSandbox(int argc, char* argv[]) {
                     perfSparseGenerationHiddenExactTracked);
             }
             perfSparseSectionStart = SDL_GetPerformanceCounter();
+            const bool debugFreezeMidCpuRebuildThisFrame =
+                debugFreezeMidCpuRebuild && frameCount >= debugFreezeMidAfterFrame;
             if (sparseClipmapTileCacheReady && sparseClipmapPolicy.IsEnabled()) {
                 Simulation::SparseClipmapPolicy sparseClipmapFramePolicy = sparseClipmapPolicy;
                 const bool sparseFarSvoCleanHighAltitude =
@@ -12844,8 +12848,9 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseFarField.pageCoverageRatio
                 });
                 const bool debugFreezeMidClipmapInterestThisFrame =
-                    (debugFreezeMidMovementSystems || debugFreezeMidClipmapInterest) &&
-                    frameCount >= debugFreezeMidAfterFrame;
+                    debugFreezeMidCpuRebuildThisFrame ||
+                    ((debugFreezeMidMovementSystems || debugFreezeMidClipmapInterest) &&
+                     frameCount >= debugFreezeMidAfterFrame);
                 if (!debugFreezeMidClipmapInterestThisFrame) {
                     sparseClipmapTileCache.UpdateInterest(
                         cameraPos.x,
@@ -13141,7 +13146,8 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseOwnershipFarHeightMidMissingPixelsLastRetire != 0u ||
                     sparseOwnershipFarHeightFarPageMissingPixelsLastRetire != 0u ||
                     sparseMidVoxelRenderFeedbackPendingLastFrame != 0u;
-                if (enableSparseMidClipmapParentHeldFeedback &&
+                if (!debugFreezeMidCpuRebuildThisFrame &&
+                    enableSparseMidClipmapParentHeldFeedback &&
                     sparseMidClipmapParentHeldFeedbackActive &&
                     sparseOwnershipLodParentHeldPixelsLastRetire >= sparseMidVoxelParentHeldCatchupPixels) {
                     const uint64_t parentHeldFeedbackStart = SDL_GetPerformanceCounter();
@@ -13335,27 +13341,29 @@ int RunSandbox(int argc, char* argv[]) {
                 }
                 sparseMidVoxelRenderFeedbackQueuedLastFrame = 0;
                 sparseMidVoxelRenderFeedbackAcceptedLastFrame = 0;
-                const uint32_t maxRenderFeedbackCoordsThisFrame =
-                    ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_RENDER_FEEDBACK_MAX_COORDS", 256u);
-                for (auto it = sparseMidVoxelRenderFeedbackQueue.begin();
-                     it != sparseMidVoxelRenderFeedbackQueue.end();) {
-                    const Simulation::SparseVoxelClipmapCoord coord = *it;
-                    if (sparseClipmapTileCache.IsVoxelCoordResident(coord)) {
-                        sparseMidVoxelRenderFeedbackSet.erase(coord);
-                        it = sparseMidVoxelRenderFeedbackQueue.erase(it);
-                        continue;
-                    }
-                    if (sparseMidVoxelRenderFeedbackQueuedLastFrame >= maxRenderFeedbackCoordsThisFrame) {
+                if (!debugFreezeMidCpuRebuildThisFrame) {
+                    const uint32_t maxRenderFeedbackCoordsThisFrame =
+                        ReadUIntEnv("VENPOD_SPARSE_MID_VOXEL_RENDER_FEEDBACK_MAX_COORDS", 256u);
+                    for (auto it = sparseMidVoxelRenderFeedbackQueue.begin();
+                         it != sparseMidVoxelRenderFeedbackQueue.end();) {
+                        const Simulation::SparseVoxelClipmapCoord coord = *it;
+                        if (sparseClipmapTileCache.IsVoxelCoordResident(coord)) {
+                            sparseMidVoxelRenderFeedbackSet.erase(coord);
+                            it = sparseMidVoxelRenderFeedbackQueue.erase(it);
+                            continue;
+                        }
+                        if (sparseMidVoxelRenderFeedbackQueuedLastFrame >= maxRenderFeedbackCoordsThisFrame) {
+                            ++it;
+                            continue;
+                        }
+                        ++sparseMidVoxelRenderFeedbackQueuedLastFrame;
+                        if (sparseClipmapTileCache.QueueVoxelRenderFeedbackCoord(
+                                coord,
+                                sparseResidencyFrame)) {
+                            ++sparseMidVoxelRenderFeedbackAcceptedLastFrame;
+                        }
                         ++it;
-                        continue;
                     }
-                    ++sparseMidVoxelRenderFeedbackQueuedLastFrame;
-                    if (sparseClipmapTileCache.QueueVoxelRenderFeedbackCoord(
-                            coord,
-                            sparseResidencyFrame)) {
-                        ++sparseMidVoxelRenderFeedbackAcceptedLastFrame;
-                    }
-                    ++it;
                 }
                 sparseMidVoxelRenderFeedbackPendingLastFrame =
                     static_cast<uint32_t>(
@@ -13967,18 +13975,20 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseClipmapAsyncApplyPolicy =
                         Simulation::SparseClipmapPolicy(sparseClipmapAsyncApplyConfig);
                 }
-                sparseClipmapTileCache.ApplyAsyncNoncriticalVoxelGenerationCompletions(
-                    sparseResidencyFrame,
-                    sparseClipmapAsyncApplyPolicy,
-                    sparseMidClipmapAsyncNoncriticalPublishSafe
-                        ? sparseClipmapAsyncApplyPolicy.Config().asyncNoncriticalGenerationMaxApplyPerFrame
-                        : 0u,
-                    sparseMidClipmapAsyncVisibleCriticalPublishSafe
-                        ? sparseClipmapAsyncApplyPolicy.Config().asyncVisibleCriticalGenerationMaxApplyPerFrame
-                        : 0u,
-                    sparseMidClipmapAsyncVisibleCriticalPublishSafe
-                        ? sparseMidClipmapAsyncVisibleReservationMaxApply
-                        : 0u);
+                if (!debugFreezeMidCpuRebuildThisFrame) {
+                    sparseClipmapTileCache.ApplyAsyncNoncriticalVoxelGenerationCompletions(
+                        sparseResidencyFrame,
+                        sparseClipmapAsyncApplyPolicy,
+                        sparseMidClipmapAsyncNoncriticalPublishSafe
+                            ? sparseClipmapAsyncApplyPolicy.Config().asyncNoncriticalGenerationMaxApplyPerFrame
+                            : 0u,
+                        sparseMidClipmapAsyncVisibleCriticalPublishSafe
+                            ? sparseClipmapAsyncApplyPolicy.Config().asyncVisibleCriticalGenerationMaxApplyPerFrame
+                            : 0u,
+                        sparseMidClipmapAsyncVisibleCriticalPublishSafe
+                            ? sparseMidClipmapAsyncVisibleReservationMaxApply
+                            : 0u);
+                }
                 if (enableSparseStartupPublicRenderMidVoxelVisibleProof &&
                     enableSparseStartupPublicRenderGate &&
                     !sparseStartupPublicRenderGateOpened) {
@@ -14437,7 +14447,9 @@ int RunSandbox(int argc, char* argv[]) {
                         sparseOwnershipMissPctLastRetire,
                         sparseOwnershipUnsafeNearMissPctLastRetire);
                 }
-                if (sparseMidClipmapSplitVisiblePumpActive &&
+                if (debugFreezeMidCpuRebuildThisFrame) {
+                    sparseMidClipmapBudgetLastFrame = 0u;
+                } else if (sparseMidClipmapSplitVisiblePumpActive &&
                     sparseMidClipmapProjectedVisibleLaneReady) {
                     const bool sparseMidClipmapVisibleCriticalSyncCatchup =
                         sparseMidClipmapPrepumpMissingVisibleCritical >
@@ -14526,7 +14538,8 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseMidVoxelWorstRingForBudget != UINT32_MAX &&
                     sparseMidClipmapOuterRingTailInnerReady &&
                     sparseOwnershipLodParentHeldPixelsLastRetire == 0u;
-                if (sparseMidClipmapOuterRingTailEligible) {
+                if (!debugFreezeMidCpuRebuildThisFrame &&
+                    sparseMidClipmapOuterRingTailEligible) {
                     const uint32_t sparseMidClipmapOuterRingTailBudgetThisFrame =
                         std::min<uint32_t>(
                             sparseMidVoxelOuterRingTailBudget,
@@ -15889,11 +15902,13 @@ int RunSandbox(int argc, char* argv[]) {
                 sparseShaderUnsafeForegroundRepairActiveLastFrame != 0u &&
                 !sparseHiddenExactMissTrackedCoords.empty();
             const bool uploadHeightClipmapPending =
+                !(debugFreezeMidCpuRebuild && frameCount >= debugFreezeMidAfterFrame) &&
                 sparseClipmapTileCacheReady &&
                 sparseClipmapPolicy.IsEnabled() &&
                 sparseClipmapPolicy.Config().heightClipmapEnabled &&
                 sparseClipmapTileCache.HeightDirtySerial() != sparseMidClipmapUploadedHeightSerial;
             const bool uploadVoxelClipmapPending =
+                !(debugFreezeMidCpuRebuild && frameCount >= debugFreezeMidAfterFrame) &&
                 sparseClipmapTileCacheReady &&
                 sparseClipmapPolicy.IsEnabled() &&
                 sparseClipmapTileCache.VoxelDirtySerial() != sparseMidClipmapUploadedVoxelSerial;
@@ -17808,8 +17823,9 @@ int RunSandbox(int argc, char* argv[]) {
                 const bool midMeshUploadCatchup =
                     sparseMidMeshIncrementalUpload && sparseClipmapTileCache.HasMidMeshDirtyPayload();
                 const bool debugFreezeMidMeshRebuildThisFrame =
-                    (debugFreezeMidMovementSystems || debugFreezeMidMeshRebuild) &&
-                    frameCount >= debugFreezeMidAfterFrame &&
+                    ((debugFreezeMidCpuRebuild && frameCount >= debugFreezeMidAfterFrame) ||
+                     ((debugFreezeMidMovementSystems || debugFreezeMidMeshRebuild) &&
+                      frameCount >= debugFreezeMidAfterFrame)) &&
                     sparseMidMeshUploadedCullValid;
                 if (debugFreezeMidMeshRebuildThisFrame ||
                     midMeshRetryFutile ||
