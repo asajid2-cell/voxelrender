@@ -45,6 +45,8 @@ VENPOD/venpod_far_svo_cache_*.bin
 VENPOD/venpod_capture.png
 VENPOD/build/bin/venpod_runtime.log
 VENPOD/build/logs/
+VENPOD/captures/
+VENPOD/logs/
 
 # Local agent/editor state
 .claude/
