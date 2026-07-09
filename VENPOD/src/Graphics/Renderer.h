@@ -116,7 +116,11 @@ public:
         float midFieldVoxelWorstRingCoverage = 0.0f;
         uint32_t midFieldResidentHeightTiles = 0;
         uint32_t midFieldResidentVoxelBricks = 0;
+        float surfaceRasterMinDistance = 0.0f;
         float surfaceRasterMaxDistance = 0.0f;
+        float publicSurfaceRasterMaxDistance = 0.0f;
+        bool surfaceRasterUseXzClip = true;
+        bool terrainOwnershipContractActive = false;
         float exactNearDistance = 0.0f;
         float farSvoStepQualityGate = 0.92f;
         // L3 motion guard: nearest missing-visible-height-tile distance this frame
@@ -244,6 +248,8 @@ public:
         const D3D12_VERTEX_BUFFER_VIEW* surfaceVertexIdView = nullptr,
         const D3D12_INDEX_BUFFER_VIEW* surfaceIndexView = nullptr,
         uint32_t surfaceVertexIdCapacityFaces = 0,
+        uint32_t surfaceRecordCount = 0,
+        uint32_t surfaceUploadedSerial = 0,
         const DescriptorHandle* surfaceRecordsSRV = nullptr,
         const DescriptorHandle* surfaceClustersSRV = nullptr,
         const DescriptorHandle* renderOwnershipUAV = nullptr,
@@ -252,7 +258,8 @@ public:
         const DescriptorHandle* sparseOccupancySRV = nullptr,
         const DescriptorHandle* sparsePageGenerationSRV = nullptr,
         uint32_t sparseMaxBrickPages = 0,
-        uint32_t sparsePageTableCapacity = 0
+        uint32_t sparsePageTableCapacity = 0,
+        uint32_t surfaceDebugPassKind = 0
     );
 
     void RenderOverlays(
@@ -316,6 +323,8 @@ private:
     DX12GraphicsPipeline m_dagRaymarchPipeline;
     DX12GraphicsPipeline m_sparseSurfacePipeline;
     DX12GraphicsPipeline m_sparseSurfaceDepthPrepassPipeline;
+    DX12GraphicsPipeline m_sparseSurfaceUnderlayPipeline;
+    DX12GraphicsPipeline m_sparseSurfaceUnderlayDepthPrepassPipeline;
     DX12GraphicsPipeline m_overlayPipeline;
     DX12GraphicsPipeline m_backgroundCompositePipeline;
     DX12GraphicsPipeline m_midCompositePipeline;
@@ -338,7 +347,11 @@ private:
     GPUBuffer m_dummyRenderOwnershipUAV;
 
     uint32_t m_currentFrameIndex = 0;
+    uint32_t m_sparseSurfaceConstantUploadCursor = 0;
     static constexpr uint64_t kFrameConstantUploadBytes = 512;
+    static constexpr uint32_t kSparseSurfaceConstantUploadSlots = 64;
+    static constexpr uint64_t kSparseSurfaceConstantUploadBytes =
+        kFrameConstantUploadBytes * kSparseSurfaceConstantUploadSlots;
 
     // RTV handles for swapchain buffers
     DescriptorHandle m_rtvHandles[VENPOD::Window::BUFFER_COUNT];

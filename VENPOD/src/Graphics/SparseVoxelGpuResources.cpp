@@ -1709,6 +1709,13 @@ bool SparseVoxelGpuResources::RetireRenderOwnership(uint32_t frameIndex) {
     m_stats.renderOwnerFarHeightFarPageMissingPixelsLastRetire = mapped[27];
     m_stats.renderOwnerFarHeightFarPageOutOfGridPixelsLastRetire = mapped[28];
     m_stats.renderOwnerFarHeightMidSampleCountLastRetire = mapped[29];
+    m_stats.renderOwnerExactSurfaceFragmentsLastRetire = mapped[30];
+    m_stats.renderOwnerMidSurfaceFragmentsLastRetire = mapped[31];
+    m_stats.renderOwnerProtectedMidSurfaceFragmentsLastRetire = mapped[32];
+    m_stats.renderOwnerProtectedExactSurfaceFragmentsLastRetire = mapped[33];
+    m_stats.renderOwnerProtectedMidVoxelPixelsLastRetire = mapped[34];
+    m_stats.renderOwnerProtectedFarSvoPixelsLastRetire = mapped[35];
+    m_stats.renderOwnerProtectedFarHeightPixelsLastRetire = mapped[36];
     m_stats.renderOwnerUnsafeMissSampleStoredLastRetire = 0;
     for (uint32_t sampleSlot = 0;
          sampleSlot < kSparseRenderOwnershipUnsafeSampleCapacity &&
@@ -1763,18 +1770,25 @@ bool SparseVoxelGpuResources::RetireRenderOwnership(uint32_t frameIndex) {
     m_stats.renderOwnerFrameLastRetire = payloadFrame;
     if (m_stats.renderOwnerTotalPixelsLastRetire > 0) {
         spdlog::info(
-            "PERF_RENDER_OWNERSHIP retireFrame={} shaderFrame={} total={} near={} surfaceFragments={} farSurface={} midVoxel={} midVoxelInteriorFallback={} midHeight={} farSvo={} farHeight={} farWater={} waterContext={} valleyAtmosphere={} sky={} miss={} unsafeNearMiss={} lodParentHeld={} parentHeldUntilChildrenReady={} unsafeSample={}/{},{},{} dist={} farHeightReason=continuity/midMissing/midAir/midSolid/farPagePresent/farPageMissing/farPageOutGrid/midSamples/stored:{}/{}/{}/{}/{}/{}/{}/{}/{}",
+            "PERF_RENDER_OWNERSHIP retireFrame={} shaderFrame={} total={} near={} surfaceFragments={} exactSurfaceFragments={} midSurfaceFragments={} protectedMidSurfaceFragments={} protectedExactSurfaceFragments={} farSurface={} midVoxel={} protectedMidVoxel={} midVoxelInteriorFallback={} midHeight={} farSvo={} protectedFarSvo={} farHeight={} protectedFarHeight={} farWater={} waterContext={} valleyAtmosphere={} sky={} miss={} unsafeNearMiss={} lodParentHeld={} parentHeldUntilChildrenReady={} unsafeSample={}/{},{},{} dist={} farHeightReason=continuity/midMissing/midAir/midSolid/farPagePresent/farPageMissing/farPageOutGrid/midSamples/stored:{}/{}/{}/{}/{}/{}/{}/{}/{}",
             frameIndex,
             m_stats.renderOwnerFrameLastRetire,
             m_stats.renderOwnerTotalPixelsLastRetire,
             m_stats.renderOwnerNearPixelsLastRetire,
             m_stats.renderOwnerSurfacePixelsLastRetire,
+            m_stats.renderOwnerExactSurfaceFragmentsLastRetire,
+            m_stats.renderOwnerMidSurfaceFragmentsLastRetire,
+            m_stats.renderOwnerProtectedMidSurfaceFragmentsLastRetire,
+            m_stats.renderOwnerProtectedExactSurfaceFragmentsLastRetire,
             m_stats.renderOwnerFarSurfacePixelsLastRetire,
             m_stats.renderOwnerMidVoxelPixelsLastRetire,
+            m_stats.renderOwnerProtectedMidVoxelPixelsLastRetire,
             m_stats.renderOwnerMidInteriorFallbackPixelsLastRetire,
             m_stats.renderOwnerMidHeightPixelsLastRetire,
             m_stats.renderOwnerFarSvoPixelsLastRetire,
+            m_stats.renderOwnerProtectedFarSvoPixelsLastRetire,
             m_stats.renderOwnerFarHeightPixelsLastRetire,
+            m_stats.renderOwnerProtectedFarHeightPixelsLastRetire,
             m_stats.renderOwnerFarWaterPixelsLastRetire,
             m_stats.renderOwnerWaterContextPixelsLastRetire,
             m_stats.renderOwnerValleyAtmospherePixelsLastRetire,

@@ -453,7 +453,10 @@ public:
         ID3D12GraphicsCommandList* commandList,
         const std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash>& excludedCoords,
         uint32_t* outExcludedDrawSlots = nullptr,
-        uint32_t* outCommandCount = nullptr);
+        uint32_t* outCommandCount = nullptr,
+        const std::unordered_map<Simulation::BrickCoord, float, Simulation::BrickCoordHash>*
+            partialDrawFractions = nullptr,
+        uint32_t* outPartialDrawSlots = nullptr);
     bool CopyFixedSlotFacesIntoCompactRanges(
         ID3D12GraphicsCommandList* commandList,
         ID3D12Resource* fixedSlotFaceBuffer,
@@ -483,6 +486,7 @@ public:
     bool RetireGpuCullStatsReadback(uint32_t frameIndex);
 
     bool IsInitialized() const { return m_stats.initialized; }
+    void SetDebugStampFaceUploads(bool enabled) { m_debugStampFaceUploads = enabled; }
     const SparseSurfaceGpuStats& GetStats() const { return m_stats; }
     // Why the last StageDirtyPayloadSnapshot rejected (or "accepted"). Lets the mid-mesh
     // caller log exactly which precondition forced a full-StageSnapshot fallback.
@@ -501,6 +505,8 @@ public:
     bool TryGetBrickDebugInfo(
         const Simulation::BrickCoord& coord,
         SparseSurfaceGpuBrickDebugInfo* outInfo = nullptr) const;
+    uint32_t CollectDrawableCoords(
+        std::vector<Simulation::BrickCoord>& outCoords) const;
     bool TryClassifyBrickGpuCull(
         const Simulation::BrickCoord& coord,
         float cameraX,
@@ -527,6 +533,7 @@ private:
 
     SparseSurfaceGpuConfig m_config;
     SparseSurfaceGpuStats m_stats;
+    bool m_debugStampFaceUploads = false;
     const char* m_lastDirtyStageRejectReason = "none";
     GPUBuffer m_faceBuffer;
     GPUBuffer m_rangeBuffer;

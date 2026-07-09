@@ -302,6 +302,31 @@ struct SparseMidHeightSurfaceBuildConfig {
     // contiguous count-chunks) to balance the ~50x-skewed per-tile cost -> higher effective
     // parallelism on the editing burst. Behavior-identical. OFF => contiguous chunks.
     bool workStealExtract = false;
+    // Parent/child mid-mesh ownership handoff:
+    //   0 = legacy: parent suppresses a quadrant as soon as child samples are resident.
+    //   1 = parent suppresses only quadrants whose child already has a render-ready CPU mesh.
+    //   2 = atomic 2x2 handoff: all four child meshes must be render-ready before parent yields.
+    // Children are held while their resident parent has not yielded their quadrant, so the switch
+    // happens as a coherent parent/child publish instead of a sample-arrival wave. Experimental;
+    // default off because the render-ready handoff probe can expose blocky underdraw in motion.
+    uint32_t childHandoffMode = 0;
+    // Debug-only spatial trace for visible mid-mesh churn. When enabled, each build bins
+    // emitted/dirty/removed/re-extracted/LOD/cull counts by camera distance so a visual
+    // propagation wave can be matched to the exact mid-mesh mechanism.
+    bool debugWaveTrace = false;
+    uint32_t debugWaveTraceBinSize = 256;
+    uint32_t debugWaveTraceMaxBins = 48;
+    bool debugDrawTrace = false;
+    uint32_t debugDrawTraceMaxRows = 256;
+    // 0 = off, 1 = mark new-to-GPU dirty uploads, 2 = mark all dirty uploads.
+    uint32_t debugWavePixelMode = 0;
+    bool debugDisableChildSuppression = false;
+    bool debugDisableDirtyRedraw = false;
+    bool debugSuppressNearDirtyUpload = false;
+    float debugSuppressNearDirtyUploadDistance = 0.0f;
+    bool suppressVisibleDirtyUpload = true;
+    bool suppressVisibleNewUpload = false;
+    float suppressVisibleDirtyUploadPadding = 128.0f;
     bool emitWater = true;
     // Y-AWARE edit suppression: skip a mesh cell for a brush edit only when the
     // edit's Y range intersects the cell's surface band. OFF => old XZ-only rule
@@ -777,6 +802,8 @@ public:
     void ForceMidMeshFullReseed() {
         m_midMeshEmittedCoords.clear();
         m_midMeshDirtyCoords.clear();
+        m_midMeshHeldChildCatchupCoords.clear();
+        m_midMeshDrawTraceByCoord.clear();
     }
     // Phase B1.1: project the dirty tiles of the last BuildMidHeightSurfaceSnapshot
     // into per-tile GPU extraction INPUT records (slot + persistent sample pointer +
@@ -1354,6 +1381,15 @@ private:
     // has populated the GPU mirrors, so dirty uploads are now valid.
     std::unordered_set<BrickCoord, BrickCoordHash> m_midMeshDirtyCoords;
     std::unordered_set<BrickCoord, BrickCoordHash> m_midMeshEmittedCoords;
+    std::unordered_map<BrickCoord, uint32_t, BrickCoordHash> m_midMeshTraceEmittedBinByCoord;
+    struct MidMeshDrawTraceState {
+        uint64_t signature = 0;
+        uint32_t faceCount = 0;
+        uint32_t mergeCells = 0;
+        uint32_t childMask = 0;
+        uint32_t directionMask = 0;
+    };
+    std::unordered_map<BrickCoord, MidMeshDrawTraceState, BrickCoordHash> m_midMeshDrawTraceByCoord;
     // No-hole budget telemetry (and the seed of a real dirty worklist): tiles whose
     // re-extraction was deferred by the time budget, keyed to the build counter at which
     // they were first deferred, so we can report how long any tile has been drawing stale
@@ -1361,6 +1397,9 @@ private:
     // re-extracts. m_midMeshBuildCounter ticks once per build that runs (during a drain the
     // catchup forces a build every frame, so build age ~= frame age = edit-lag frames).
     std::unordered_map<BrickCoord, uint64_t, BrickCoordHash> m_midMeshTileDeferredSince;
+    // Children held behind a coarser parent after their CPU mesh became ready. This is a
+    // one-shot catch-up trigger: the next build can let the parent yield and publish the child.
+    std::unordered_set<BrickCoord, BrickCoordHash> m_midMeshHeldChildCatchupCoords;
     uint64_t m_midMeshBuildCounter = 0;
     uint32_t m_lastMidMeshMaxStaleAge = 0;
     uint32_t m_lastMidMeshPendingCount = 0;

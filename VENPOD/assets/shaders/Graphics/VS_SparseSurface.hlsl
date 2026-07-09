@@ -41,6 +41,8 @@ struct VSOutput {
     float3 normal : NORMAL0;
     nointerpolation uint material : MATERIAL0;
     nointerpolation uint faceDirection : TEXCOORD2;
+    nointerpolation uint debugMarker : TEXCOORD3;
+    nointerpolation uint debugFaceExtent : TEXCOORD4;
     float distance : TEXCOORD0;
     float3 worldPos : TEXCOORD1;
     float clipDistance : SV_ClipDistance0;
@@ -49,6 +51,30 @@ struct VSOutput {
 static const float kNearPlane = 0.05f;
 static const float kFarPlane = 10000.0f;
 static const uint kClusterDrawInstanceFlag = 0x80000000u;
+static const uint kDebugWavePixelMode = 75u;
+static const uint kDebugSurfaceUploadPixelMode = 76u;
+static const uint kDebugMidMeshDirtyPixelMode = 77u;
+static const uint kDebugMidMeshDirtyRasterOnlyMode = 78u;
+static const uint kDebugSurfaceClipXzMode = 90u;
+static const uint kDebugSurfaceClipBoundary3dMode = 91u;
+static const uint kDebugSurfaceClipXzProofMode = 92u;
+static const uint kDebugWavePixelFlag = 0x80000000u;
+static const uint kDebugWavePixelPersistSerials = 8u;
+static const uint kDebugMidMeshDirtyPixelPersistSerials = 64u;
+static const uint kDebugSurfaceUploadPixelPersistSerials = 24u;
+static const uint kSparseSurfaceDebugPassExact = 1u;
+static const uint kDebugUploadStampValidBit = 0x00008000u;
+static const uint kDebugUploadStampSerialMask = 0x7Fu;
+static const uint kDebugUploadStampShift = 8u;
+
+bool UseXzSurfaceClip() {
+    if (frame.debugMode == kDebugSurfaceClipBoundary3dMode) {
+        return false;
+    }
+    return frame.nearOwnershipParams.x > 0.5f ||
+        frame.debugMode == kDebugSurfaceClipXzMode ||
+        frame.debugMode == kDebugSurfaceClipXzProofMode;
+}
 
 uint FaceDirection(SparseSurfaceFace face) {
     return (face.payload >> 29u) & 0x7u;
@@ -159,6 +185,45 @@ uint ResolveClusterFaceIndex(uint clusterIndex, uint localFaceIndex) {
     return 0u;
 }
 
+uint DebugWaveMarkerForFace(SparseSurfaceFace face, uint faceIndex) {
+    const bool midMeshDebugMode =
+        frame.debugMode == kDebugWavePixelMode ||
+        frame.debugMode == kDebugMidMeshDirtyPixelMode ||
+        frame.debugMode == kDebugMidMeshDirtyRasterOnlyMode;
+    const bool exactSurfaceUploadDebugMode =
+        frame.debugMode == kDebugSurfaceUploadPixelMode &&
+        (uint)frame.surfaceRasterParams.w == kSparseSurfaceDebugPassExact;
+    if (!midMeshDebugMode && !exactSurfaceUploadDebugMode) {
+        return 0u;
+    }
+    const bool dirtyMidMeshRasterMode =
+        frame.debugMode == kDebugMidMeshDirtyPixelMode ||
+        frame.debugMode == kDebugMidMeshDirtyRasterOnlyMode;
+    const uint persistSerials = dirtyMidMeshRasterMode
+        ? kDebugMidMeshDirtyPixelPersistSerials
+        : (exactSurfaceUploadDebugMode
+            ? kDebugSurfaceUploadPixelPersistSerials
+            : kDebugWavePixelPersistSerials);
+    const uint recordCount = (uint)frame.surfaceParams.z;
+    [loop]
+    for (uint recordIndex = 0u; recordIndex < recordCount; ++recordIndex) {
+        SparseSurfaceRecord record = SparseSurfaceRecords[recordIndex];
+        const uint recordEnd = record.firstFace + record.faceCount;
+        if (faceIndex < record.firstFace || faceIndex >= recordEnd) {
+            continue;
+        }
+        if (!exactSurfaceUploadDebugMode && (record.flags & kDebugWavePixelFlag) == 0u) {
+            return 0u;
+        }
+        const uint uploadedSerial = (uint)frame.surfaceParams.w;
+        const uint age = uploadedSerial >= record.generation
+            ? uploadedSerial - record.generation
+            : 0xFFFFFFFFu;
+        return age <= persistSerials ? 1u : 0u;
+    }
+    return 0u;
+}
+
 VSOutput main(uint faceVertex : FACEVERTEX, uint instanceId : SV_InstanceID) {
     VSOutput output;
     uint faceIndex = faceVertex / 4u;
@@ -179,8 +244,23 @@ VSOutput main(uint faceVertex : FACEVERTEX, uint instanceId : SV_InstanceID) {
     const float3 cameraToFace = faceCenter - frame.cameraPosition.xyz;
     const float frontFacing = dot(normal, -normalize(cameraToFace));
     const float surfaceMaxDistance = frame.nearOwnershipParams.w;
+    const float surfaceMinDistance = max(frame.surfaceRasterParams.y, 0.0f);
+    const uint surfaceDebugPassKind = (uint)frame.surfaceRasterParams.w;
+    const float clipMetric3d = length(cameraToFace);
+    const float clipMetricXz = length(cameraToFace.xz);
+    const float vertexClipMetric3d = length(rel);
+    const float vertexClipMetricXz = length(rel.xz);
+    const bool useXzSurfaceClip = UseXzSurfaceClip();
+    const float foregroundClipMetric = useXzSurfaceClip
+        ? clipMetricXz
+        : clipMetric3d;
+    const float foregroundVertexClipMetric = useXzSurfaceClip
+        ? vertexClipMetricXz
+        : vertexClipMetric3d;
     const float foregroundDistanceClip =
-        surfaceMaxDistance > 0.0f ? surfaceMaxDistance - length(cameraToFace) : 1.0f;
+        surfaceMaxDistance > 0.0f ? surfaceMaxDistance - foregroundClipMetric : 1.0f;
+    const float foregroundNearExclusionClip =
+        surfaceMinDistance > 0.0f ? foregroundVertexClipMetric - surfaceMinDistance : 1.0f;
 
     const float ndcDepth = (viewZ - kNearPlane) / (kFarPlane - kNearPlane);
     output.position = float4(
@@ -190,9 +270,13 @@ VSOutput main(uint faceVertex : FACEVERTEX, uint instanceId : SV_InstanceID) {
         viewZ);
     output.normal = normal;
     output.faceDirection = FaceDirection(face);
+    output.debugMarker = DebugWaveMarkerForFace(face, faceIndex);
+    output.debugFaceExtent = max(FaceWidth(face), FaceHeight(face));
     output.material = GetMaterial(FaceVoxel(face));
     output.distance = max(viewZ, 0.0f);
     output.worldPos = world;
-    output.clipDistance = min(min(viewZ - kNearPlane, frontFacing + 0.0001f), foregroundDistanceClip);
+    output.clipDistance = min(
+        min(viewZ - kNearPlane, frontFacing + 0.0001f),
+        min(foregroundDistanceClip, foregroundNearExclusionClip));
     return output;
 }

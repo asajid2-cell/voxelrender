@@ -7166,6 +7166,146 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     // measure of the extractMs reduction region delivers (the editing-tail cost). Sum per build.
     double drrRegionTimeMs = 0.0, drrFullRefTimeMs = 0.0;
 
+    struct MidMeshWaveTraceBin {
+        uint32_t resident = 0;
+        uint32_t emitted = 0;
+        uint64_t faces = 0;
+        uint32_t dirty = 0;
+        uint32_t removed = 0;
+        uint32_t culled = 0;
+        uint32_t preExtract = 0;
+        uint32_t reExtract = 0;
+        uint32_t deferred = 0;
+        uint32_t lodMerged = 0;
+        uint32_t childSuppressed = 0;
+        uint32_t missNew = 0;
+        uint32_t missRecenter = 0;
+        uint32_t missLod = 0;
+        uint32_t missContent = 0;
+        uint32_t missChild = 0;
+        uint32_t missBuildVer = 0;
+    };
+    const bool traceWave = buildConfig.debugWaveTrace;
+    const uint32_t traceBinSize = std::max(32u, buildConfig.debugWaveTraceBinSize);
+    const uint32_t traceMaxBins = std::clamp(buildConfig.debugWaveTraceMaxBins, 1u, 128u);
+    std::vector<MidMeshWaveTraceBin> traceBins(traceWave ? traceMaxBins : 0u);
+    std::unordered_map<BrickCoord, uint32_t, BrickCoordHash> traceCurrentBins;
+    if (traceWave) {
+        traceCurrentBins.reserve(m_midMeshEmittedCoords.size() + 32u);
+    }
+    auto traceDistanceBinForTile = [&](const TilePayload& tile, uint32_t cellSizeForTile) -> uint32_t {
+        if (!traceWave && !buildConfig.debugDrawTrace) {
+            return 0u;
+        }
+        const uint32_t tileWorldSize = cellSizeForTile * cellCount;
+        const float tileCenterX =
+            static_cast<float>(tile.record.originX) + static_cast<float>(tileWorldSize) * 0.5f;
+        const float tileCenterZ =
+            static_cast<float>(tile.record.originZ) + static_cast<float>(tileWorldSize) * 0.5f;
+        const float dx = tileCenterX - buildConfig.cameraX;
+        const float dz = tileCenterZ - buildConfig.cameraZ;
+        const float edgeDistance = std::max(
+            0.0f,
+            std::sqrt(dx * dx + dz * dz) - static_cast<float>(tileWorldSize) * 0.70711f);
+        return std::min(traceMaxBins - 1u, static_cast<uint32_t>(edgeDistance / static_cast<float>(traceBinSize)));
+    };
+    auto edgeDistanceForTile = [&](const TilePayload& tile, uint32_t cellSizeForTile) -> float {
+        const uint32_t tileWorldSize = cellSizeForTile * cellCount;
+        const float tileCenterX =
+            static_cast<float>(tile.record.originX) + static_cast<float>(tileWorldSize) * 0.5f;
+        const float tileCenterZ =
+            static_cast<float>(tile.record.originZ) + static_cast<float>(tileWorldSize) * 0.5f;
+        const float dx = tileCenterX - buildConfig.cameraX;
+        const float dz = tileCenterZ - buildConfig.cameraZ;
+        return std::max(
+            0.0f,
+            std::sqrt(dx * dx + dz * dz) - static_cast<float>(tileWorldSize) * 0.70711f);
+    };
+    auto tileVisibleInCameraView = [&](const TilePayload& tile, uint32_t cellSizeForTile) -> bool {
+        const uint32_t tileWorldSize = cellSizeForTile * cellCount;
+        const float centerX =
+            static_cast<float>(tile.record.originX) + static_cast<float>(tileWorldSize) * 0.5f;
+        const float centerZ =
+            static_cast<float>(tile.record.originZ) + static_cast<float>(tileWorldSize) * 0.5f;
+        const float radius =
+            std::sqrt(static_cast<float>(tileWorldSize) * static_cast<float>(tileWorldSize) * 2.0f) * 0.5f +
+            std::max(0.0f, buildConfig.suppressVisibleDirtyUploadPadding);
+        const float verticalRadius =
+            radius + std::max(256.0f, buildConfig.cameraHeightAboveTerrain + 128.0f);
+        const float relX = centerX - buildConfig.cameraX;
+        const float relY = -buildConfig.cameraY;
+        const float relZ = centerZ - buildConfig.cameraZ;
+        const float viewX =
+            relX * buildConfig.rightX + relY * buildConfig.rightY + relZ * buildConfig.rightZ;
+        const float viewY =
+            relX * buildConfig.upX + relY * buildConfig.upY + relZ * buildConfig.upZ;
+        const float viewZ =
+            relX * buildConfig.forwardX + relY * buildConfig.forwardY + relZ * buildConfig.forwardZ;
+        if (viewZ < -radius) {
+            return false;
+        }
+        const float z = std::max(viewZ, 1.0f);
+        const float xLimit = z * tanHalfFov * std::max(0.1f, buildConfig.aspectRatio) + radius;
+        const float yLimit = z * tanHalfFov + verticalRadius;
+        return std::abs(viewX) <= xLimit && std::abs(viewY) <= yLimit;
+    };
+    auto suppressDirtyRedrawForTile = [&](const TilePayload& tile, uint32_t cellSizeForTile) -> bool {
+        return buildConfig.debugDisableDirtyRedraw ||
+            (buildConfig.debugSuppressNearDirtyUpload &&
+             buildConfig.debugSuppressNearDirtyUploadDistance > 0.0f &&
+             edgeDistanceForTile(tile, cellSizeForTile) < buildConfig.debugSuppressNearDirtyUploadDistance);
+    };
+    enum MidMeshTraceCause : uint32_t {
+        kMidMeshTraceCauseNone = 0u,
+        kMidMeshTraceCauseNew = 1u,
+        kMidMeshTraceCauseRecenter = 2u,
+        kMidMeshTraceCauseContent = 3u,
+        kMidMeshTraceCauseLod = 4u,
+        kMidMeshTraceCauseChild = 5u,
+        kMidMeshTraceCauseBuildVer = 6u,
+        kMidMeshTraceCauseGpuNew = 7u,
+        kMidMeshTraceCausePending = 8u
+    };
+    auto traceCauseName = [](uint32_t cause) -> const char* {
+        switch (cause) {
+        case kMidMeshTraceCauseNew: return "new";
+        case kMidMeshTraceCauseRecenter: return "recenter";
+        case kMidMeshTraceCauseContent: return "content";
+        case kMidMeshTraceCauseLod: return "lod";
+        case kMidMeshTraceCauseChild: return "child";
+        case kMidMeshTraceCauseBuildVer: return "buildver";
+        case kMidMeshTraceCauseGpuNew: return "gpu-new";
+        case kMidMeshTraceCausePending: return "pending";
+        default: return "none";
+        }
+    };
+    const bool traceDraw = buildConfig.debugDrawTrace;
+    const uint32_t traceDrawMaxRows =
+        std::clamp(buildConfig.debugDrawTraceMaxRows, 16u, 4096u);
+    std::unordered_map<BrickCoord, uint32_t, BrickCoordHash> traceDirtyCauseByCoord;
+    if (traceDraw) {
+        traceDirtyCauseByCoord.reserve(128u);
+    }
+    std::unordered_set<BrickCoord, BrickCoordHash> visibleSuppressedDirtyCoords;
+    if (buildConfig.emitDirtyPayload && buildConfig.suppressVisibleDirtyUpload) {
+        visibleSuppressedDirtyCoords.reserve(128u);
+    }
+    uint32_t visibleSuppressedNewUploads = 0;
+    uint32_t visibleSuppressedDirtyUploads = 0;
+    struct MidMeshDrawTraceEntry {
+        BrickCoord coord{};
+        uint32_t bin = 0;
+        uint64_t signature = 0;
+        uint32_t faceCount = 0;
+        uint32_t mergeCells = 0;
+        uint32_t childMask = 0;
+        uint32_t directionMask = 0;
+    };
+    std::vector<MidMeshDrawTraceEntry> traceDrawEntries;
+    if (traceDraw) {
+        traceDrawEntries.reserve(m_tiles.size());
+    }
+
     struct SurfaceBlock {
         bool present = false;
         bool solid = false;
@@ -7361,13 +7501,139 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     // per-tile content/LOD/child-residency keys) that changes a tile's emitted
     // faces. Constant per session in practice, but keying on it keeps the cache
     // correct if water/terrace/LOD config is toggled at runtime.
+    const uint32_t childHandoffMode = std::min(2u, buildConfig.childHandoffMode);
+    const bool childHandoffGate = childHandoffMode != 0u;
     const uint32_t midMeshBuildVersion =
         (side & 0xFFu) |
         ((terraceStep & 0xFFu) << 8) |
         ((lodBaseMerge & 0x3Fu) << 16) |
         ((lodMaxMerge & 0x3Fu) << 22) |
         (buildConfig.lodEnabled ? (1u << 28) : 0u) |
-        (buildConfig.emitWater ? (1u << 29) : 0u);
+        (buildConfig.emitWater ? (1u << 29) : 0u) |
+        ((childHandoffMode & 0x3u) << 30);
+
+    const bool finerSuppressionValid =
+        std::abs(m_config.ringGrowthFactor - 2.0f) < 0.01f;
+    auto tileWouldEmitForCurrentCull = [&](const TilePayload& tile) -> bool {
+        if (tile.record.slot == UINT32_MAX ||
+            tile.packedSamples.size() < sampleCount ||
+            tile.record.cellSize <= 0.0f) {
+            return false;
+        }
+        const uint32_t tileCellSize = static_cast<uint32_t>(std::max(
+            1,
+            RoundToInt32Clamped(tile.record.cellSize)));
+        const uint32_t tileWorldSize = tileCellSize * cellCount;
+        return !blockCullBounds(
+            tile.record.originX,
+            tile.record.originZ,
+            tileWorldSize,
+            tileWorldSize);
+    };
+    auto tileHasRenderReadyMidMesh = [&](const TilePayload& tile, const SparseClipmapTileCoord& coord) -> bool {
+        return
+            tile.record.slot != UINT32_MAX &&
+            tile.record.coord == coord &&
+            tile.record.cellSize > 0.0f &&
+            tile.packedSamples.size() >= sampleCount &&
+            tile.meshCacheValid &&
+            !tile.meshCacheFaces.empty() &&
+            tile.meshCacheContentVersion == tile.meshContentVersion &&
+            tile.meshCacheBuildVersion == midMeshBuildVersion &&
+            tile.meshCacheOriginX == tile.record.originX &&
+            tile.meshCacheOriginZ == tile.record.originZ &&
+            tile.meshCacheRing == tile.record.coord.ring;
+    };
+
+    std::unordered_set<SparseClipmapTileCoord, SparseClipmapTileCoordHash> childHandoffParentOwners;
+    std::unordered_map<SparseClipmapTileCoord, uint32_t, SparseClipmapTileCoordHash> childHandoffMaskByParentCoord;
+    if (childHandoffGate && finerSuppressionValid) {
+        childHandoffParentOwners.reserve(m_tiles.size());
+        childHandoffMaskByParentCoord.reserve(m_tiles.size());
+        for (const TilePayload& parentTile : m_tiles) {
+            if (parentTile.record.coord.ring <= 0 ||
+                !tileWouldEmitForCurrentCull(parentTile)) {
+                continue;
+            }
+            const SparseClipmapTileCoord parentCoord = parentTile.record.coord;
+            childHandoffParentOwners.insert(parentCoord);
+
+            uint32_t readyMask = 0u;
+            for (int32_t dz = 0; dz <= 1; ++dz) {
+                for (int32_t dx = 0; dx <= 1; ++dx) {
+                    const SparseClipmapTileCoord childCoord{
+                        parentCoord.ring - 1,
+                        SaturatingAddInt32(parentCoord.x, parentCoord.x) + dx,
+                        SaturatingAddInt32(parentCoord.z, parentCoord.z) + dz
+                    };
+                    const auto childIt = m_slotByCoord.find(childCoord);
+                    if (childIt == m_slotByCoord.end() ||
+                        childIt->second >= m_tiles.size()) {
+                        continue;
+                    }
+                    const TilePayload& childTile = m_tiles[childIt->second];
+                    if (tileHasRenderReadyMidMesh(childTile, childCoord)) {
+                        readyMask |= 1u << static_cast<uint32_t>(dz * 2 + dx);
+                    }
+                }
+            }
+            if (childHandoffMode == 2u && readyMask != 0xFu) {
+                readyMask = 0u;
+            }
+            if (readyMask != 0u) {
+                childHandoffMaskByParentCoord.emplace(parentCoord, readyMask);
+            }
+        }
+    }
+    auto childHeldByCoarserParent = [&](const TilePayload& tile) -> bool {
+        if (!childHandoffGate ||
+            !finerSuppressionValid ||
+            tile.record.coord.ring < 0 ||
+            static_cast<uint32_t>(tile.record.coord.ring + 1) >= std::max<uint32_t>(1u, m_config.ringCount)) {
+            return false;
+        }
+        const SparseClipmapTileCoord parentCoord{
+            tile.record.coord.ring + 1,
+            FloorDiv2Int32(tile.record.coord.x),
+            FloorDiv2Int32(tile.record.coord.z)
+        };
+        if (childHandoffParentOwners.find(parentCoord) == childHandoffParentOwners.end()) {
+            return false;
+        }
+        const int32_t baseX = SaturatingAddInt32(parentCoord.x, parentCoord.x);
+        const int32_t baseZ = SaturatingAddInt32(parentCoord.z, parentCoord.z);
+        const int32_t childDx = tile.record.coord.x - baseX;
+        const int32_t childDz = tile.record.coord.z - baseZ;
+        if (childDx < 0 || childDx > 1 || childDz < 0 || childDz > 1) {
+            return false;
+        }
+        const uint32_t childBit =
+            1u << static_cast<uint32_t>(childDz * 2 + childDx);
+        const auto maskIt = childHandoffMaskByParentCoord.find(parentCoord);
+        const uint32_t yieldedMask =
+            maskIt != childHandoffMaskByParentCoord.end() ? maskIt->second : 0u;
+        return (yieldedMask & childBit) == 0u;
+    };
+    auto traceMix = [](uint64_t h, uint64_t v) -> uint64_t {
+        h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+        return h;
+    };
+    auto drawTraceSignature = [&](const TilePayload& tile, uint32_t faceCount, uint32_t directionMask) -> uint64_t {
+        uint64_t h = 1469598103934665603ull;
+        h = traceMix(h, tile.meshCacheContentVersion);
+        h = traceMix(h, tile.meshCacheMergeCells);
+        h = traceMix(h, tile.meshCacheChildMask);
+        h = traceMix(h, tile.meshCacheBuildVersion);
+        h = traceMix(h, faceCount);
+        h = traceMix(h, directionMask);
+        h = traceMix(h, static_cast<uint32_t>(tile.meshCacheMinX));
+        h = traceMix(h, static_cast<uint32_t>(tile.meshCacheMinY));
+        h = traceMix(h, static_cast<uint32_t>(tile.meshCacheMinZ));
+        h = traceMix(h, static_cast<uint32_t>(tile.meshCacheMaxX));
+        h = traceMix(h, static_cast<uint32_t>(tile.meshCacheMaxY));
+        h = traceMix(h, static_cast<uint32_t>(tile.meshCacheMaxZ));
+        return h;
+    };
 
     // Loop 2C (FPS tail): dirty-region extraction. An edit dirties a few cells but the extractor
     // re-meshes the WHOLE tile (~all cellCount^2 blocks). When emRegionOut != nullptr, the extractor
@@ -7900,45 +8166,51 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         if (buildConfig.forceMergeCells > 1u) {
             mergeCells = std::clamp(buildConfig.forceMergeCells, 1u, cellCount);
         }
-        // L7 GIANT-CUBE FIX part 2 — RESIDENT-AWARE FINER-COVERAGE SUPPRESSION: the
-        // build iterates ALL resident tiles of ALL rings with one global distance cull,
-        // so a stale coarse-ring tile legally drew its giant quantized quads (and
-        // sea-level skirts / water fills) INSIDE the band a finer ring owns — until an
-        // edit invalidated it ("turns to real voxels when we edit", the user's clue).
-        // Rule (hole-free by construction): suppress a block only where the FINER ring's
-        // child tile is RESIDENT with samples — that child renders the same footprint
-        // itself. Child coord math: ringGrowthFactor=2 + tileWorldSize=cell*(side-1)
-        // means ring r tile (x,z) covers exactly children (2x+dx, 2z+dz) at ring r-1
-        // (the voxel-brick analog HasCompleteFinerVoxelCoverage uses the same 2:1 map).
+        // L7 handoff fix: the legacy predicate treated "child samples are resident" as
+        // enough proof that the child can visually own a quadrant. That makes moving
+        // clipmap arrivals erase parent geometry before the child representation has a
+        // coherent render mesh, which shows up as the propagation wave. In handoff mode,
+        // childResident means "this child quadrant is selected to draw" from the
+        // precomputed render-ready ownership mask. Legacy mode 0 keeps the old sample
+        // residency behavior for A/B.
         childResident[0] = childResident[1] = childResident[2] = childResident[3] = false;
         anyChildResident = false;
         // The 2:1 child map is only valid when rings double (the default). With a
         // non-2 growth factor, skip suppression (correct but allows overlap again)
         // rather than suppress the wrong area (which would make holes).
-        const bool finerSuppressionValid =
-            std::abs(m_config.ringGrowthFactor - 2.0f) < 0.01f;
-        if (finerSuppressionValid && tile.record.coord.ring > 0) {
-            for (int32_t dz = 0; dz <= 1; ++dz) {
-                for (int32_t dx = 0; dx <= 1; ++dx) {
-                    const SparseClipmapTileCoord childCoord{
-                        tile.record.coord.ring - 1,
-                        SaturatingAddInt32(tile.record.coord.x, tile.record.coord.x) + dx,
-                        SaturatingAddInt32(tile.record.coord.z, tile.record.coord.z) + dz
-                    };
-                    const auto childIt = m_slotByCoord.find(childCoord);
-                    if (childIt != m_slotByCoord.end() &&
-                        childIt->second < m_tiles.size()) {
-                        const TilePayload& childTile = m_tiles[childIt->second];
-                        // Defensive slot validation: only trust the coord->slot mapping
-                        // when the slot still holds THIS coord. (Audit showed eviction
-                        // erases mappings promptly, so this is hardening, not a fix —
-                        // the round-3 band bug was the altitude annulus in the min
-                        // distance, handled above.)
-                        if (childTile.record.slot != UINT32_MAX &&
-                            childTile.record.coord == childCoord &&
-                            childTile.packedSamples.size() >= sampleCount) {
-                            childResident[dz * 2 + dx] = true;
-                            anyChildResident = true;
+        if (!buildConfig.debugDisableChildSuppression &&
+            finerSuppressionValid &&
+            tile.record.coord.ring > 0) {
+            if (childHandoffGate) {
+                const auto maskIt = childHandoffMaskByParentCoord.find(tile.record.coord);
+                const uint32_t readyMask =
+                    maskIt != childHandoffMaskByParentCoord.end() ? maskIt->second : 0u;
+                for (uint32_t i = 0; i < 4u; ++i) {
+                    if ((readyMask & (1u << i)) != 0u) {
+                        childResident[i] = true;
+                        anyChildResident = true;
+                    }
+                }
+            } else {
+                for (int32_t dz = 0; dz <= 1; ++dz) {
+                    for (int32_t dx = 0; dx <= 1; ++dx) {
+                        const SparseClipmapTileCoord childCoord{
+                            tile.record.coord.ring - 1,
+                            SaturatingAddInt32(tile.record.coord.x, tile.record.coord.x) + dx,
+                            SaturatingAddInt32(tile.record.coord.z, tile.record.coord.z) + dz
+                        };
+                        const auto childIt = m_slotByCoord.find(childCoord);
+                        if (childIt != m_slotByCoord.end() &&
+                            childIt->second < m_tiles.size()) {
+                            const TilePayload& childTile = m_tiles[childIt->second];
+                            // Defensive slot validation: only trust the coord->slot mapping
+                            // when the slot still holds THIS coord.
+                            if (childTile.record.slot != UINT32_MAX &&
+                                childTile.record.coord == childCoord &&
+                                childTile.packedSamples.size() >= sampleCount) {
+                                childResident[dz * 2 + dx] = true;
+                                anyChildResident = true;
+                            }
                         }
                     }
                 }
@@ -8080,6 +8352,8 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             uint32_t childMask;
             bool anyChildResident;
             bool childResident[4];
+            uint32_t traceBin;
+            uint32_t traceCause;
         };
         std::vector<PreExtractTile> preExtract;
         preExtract.reserve(m_tiles.size());
@@ -8153,6 +8427,54 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
                     ++asyncPreExtractCount;
                 }
             }
+            const uint32_t entryTraceBin = traceDistanceBinForTile(tile, cellSize);
+            uint32_t entryTraceCause = kMidMeshTraceCauseNone;
+            if (traceWave) {
+                MidMeshWaveTraceBin& bin = traceBins[entryTraceBin];
+                const bool preCacheSameLocation =
+                    tile.meshCacheValid &&
+                    tile.meshCacheOriginX == tile.record.originX &&
+                    tile.meshCacheOriginZ == tile.record.originZ &&
+                    tile.meshCacheRing == tile.record.coord.ring;
+                if (!tile.meshCacheValid) {
+                    ++bin.missNew;
+                    entryTraceCause = kMidMeshTraceCauseNew;
+                } else if (!preCacheSameLocation) {
+                    ++bin.missRecenter;
+                    entryTraceCause = kMidMeshTraceCauseRecenter;
+                } else if (tile.meshCacheContentVersion != tile.meshContentVersion) {
+                    ++bin.missContent;
+                    entryTraceCause = kMidMeshTraceCauseContent;
+                } else if (tile.meshCacheMergeCells != mergeCells) {
+                    ++bin.missLod;
+                    entryTraceCause = kMidMeshTraceCauseLod;
+                } else if (tile.meshCacheChildMask != childMask) {
+                    ++bin.missChild;
+                    entryTraceCause = kMidMeshTraceCauseChild;
+                } else {
+                    ++bin.missBuildVer;
+                    entryTraceCause = kMidMeshTraceCauseBuildVer;
+                }
+            } else if (traceDraw) {
+                const bool preCacheSameLocation =
+                    tile.meshCacheValid &&
+                    tile.meshCacheOriginX == tile.record.originX &&
+                    tile.meshCacheOriginZ == tile.record.originZ &&
+                    tile.meshCacheRing == tile.record.coord.ring;
+                if (!tile.meshCacheValid) {
+                    entryTraceCause = kMidMeshTraceCauseNew;
+                } else if (!preCacheSameLocation) {
+                    entryTraceCause = kMidMeshTraceCauseRecenter;
+                } else if (tile.meshCacheContentVersion != tile.meshContentVersion) {
+                    entryTraceCause = kMidMeshTraceCauseContent;
+                } else if (tile.meshCacheMergeCells != mergeCells) {
+                    entryTraceCause = kMidMeshTraceCauseLod;
+                } else if (tile.meshCacheChildMask != childMask) {
+                    entryTraceCause = kMidMeshTraceCauseChild;
+                } else {
+                    entryTraceCause = kMidMeshTraceCauseBuildVer;
+                }
+            }
             PreExtractTile entry;
             entry.slot = tileSlot;
             entry.cellSize = cellSize;
@@ -8163,6 +8485,16 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             entry.childResident[1] = childResident[1];
             entry.childResident[2] = childResident[2];
             entry.childResident[3] = childResident[3];
+            entry.traceBin = entryTraceBin;
+            entry.traceCause = entryTraceCause;
+            if (traceWave) {
+                ++traceBins[entry.traceBin].preExtract;
+            }
+            if (traceDraw) {
+                const BrickCoord coord{
+                    tile.record.coord.x, tile.record.coord.ring, tile.record.coord.z};
+                traceDirtyCauseByCoord[coord] = entryTraceCause;
+            }
             preExtract.push_back(entry);
         }
         if (!preExtract.empty()) {
@@ -8256,7 +8588,9 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
                 }
                 const BrickCoord coord{
                     tile.record.coord.x, tile.record.coord.ring, tile.record.coord.z};
-                m_midMeshDirtyCoords.insert(coord);
+                if (!suppressDirtyRedrawForTile(tile, e.cellSize)) {
+                    m_midMeshDirtyCoords.insert(coord);
+                }
                 m_midMeshTileDeferredSince.erase(coord);
             }
         }
@@ -8285,11 +8619,25 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             ++lodScanCalls;
         }
         const uint32_t tileWorldSize = cellSize * cellCount;
+        const uint32_t traceBin = traceDistanceBinForTile(tile, cellSize);
+        if (traceWave) {
+            MidMeshWaveTraceBin& bin = traceBins[traceBin];
+            ++bin.resident;
+            if (mergeCells > 1u) {
+                ++bin.lodMerged;
+            }
+            if (anyChildResident || childMask != 0u) {
+                ++bin.childSuppressed;
+            }
+        }
         if (blockCullBounds(
                 tile.record.originX,
                 tile.record.originZ,
                 tileWorldSize,
                 tileWorldSize)) {
+            if (traceWave) {
+                ++traceBins[traceBin].culled;
+            }
             continue;
         }
 
@@ -8324,20 +8672,33 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             (maxRebuildTiles != 0u && rebuiltThisBuild >= maxRebuildTiles) ||
             (buildConfig.maxRebuildMs > 0.0f &&
              extractMsAccum >= static_cast<double>(buildConfig.maxRebuildMs));
+        uint32_t traceMissCause = kMidMeshTraceCauseNone;
         if (!meshCacheHit) {
             // Categorize the miss by FIRST-priority cause (so we know what drives churn).
             if (!tile.meshCacheValid) {
                 ++missNew;
+                if (traceWave) { ++traceBins[traceBin].missNew; }
+                traceMissCause = kMidMeshTraceCauseNew;
             } else if (!cacheSameLocation) {
                 ++missRecenter;
+                if (traceWave) { ++traceBins[traceBin].missRecenter; }
+                traceMissCause = kMidMeshTraceCauseRecenter;
             } else if (tile.meshCacheContentVersion != tile.meshContentVersion) {
                 ++missContent;
+                if (traceWave) { ++traceBins[traceBin].missContent; }
+                traceMissCause = kMidMeshTraceCauseContent;
             } else if (tile.meshCacheMergeCells != mergeCells) {
                 ++missLod;
+                if (traceWave) { ++traceBins[traceBin].missLod; }
+                traceMissCause = kMidMeshTraceCauseLod;
             } else if (tile.meshCacheChildMask != childMask) {
                 ++missChild;
+                if (traceWave) { ++traceBins[traceBin].missChild; }
+                traceMissCause = kMidMeshTraceCauseChild;
             } else {
                 ++missBuildVer;
+                if (traceWave) { ++traceBins[traceBin].missBuildVer; }
+                traceMissCause = kMidMeshTraceCauseBuildVer;
             }
         }
         if (meshCacheHit) {
@@ -8357,6 +8718,9 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             // it is at most one edit/LOD step behind for a few frames. Re-fired via
             // LastMidMeshDeferredTiles until caught up.
             ++m_lastMidMeshDeferredTiles;
+            if (traceWave) {
+                ++traceBins[traceBin].deferred;
+            }
             // Track how long this tile has been drawing stale faces (stale age / edit lag).
             {
                 const BrickCoord deferCoord{
@@ -8370,6 +8734,9 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             // have a drawable version are budget-deferred (the branch above).
         ++rebuiltThisBuild;
         tileReEmitted = true;
+        if (traceWave) {
+            ++traceBins[traceBin].reExtract;
+        }
         // This tile is re-extracting now: it is no longer pending/stale.
         {
             const BrickCoord reExtractCoord{
@@ -8604,6 +8971,31 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         if (!faceBudgetOk) {
             return false;
         }
+        if (childHeldByCoarserParent(tile)) {
+            // Build/cache this child above, but do not publish it until the parent has a
+            // matching ready-handoff mask. The deferred count re-fires the builder so the
+            // next frame can atomically dirty-upload the parent yield + child draw.
+            const BrickCoord heldCoord{
+                tile.record.coord.x,
+                tile.record.coord.ring,
+                tile.record.coord.z
+            };
+            const bool hadPendingDirty =
+                m_midMeshDirtyCoords.erase(heldCoord) > 0u;
+            const bool childReadyNow =
+                tileHasRenderReadyMidMesh(tile, tile.record.coord);
+            const bool childHasPendingCpuMesh =
+                tileReEmitted ||
+                hadPendingDirty;
+            if (childReadyNow && childHasPendingCpuMesh &&
+                m_midMeshHeldChildCatchupCoords.insert(heldCoord).second) {
+                ++m_lastMidMeshDeferredTiles;
+                if (traceWave) {
+                    ++traceBins[traceBin].deferred;
+                }
+            }
+            continue;
+        }
         // emittedFaces references the tile's PERSISTENT cached faces (valid in every
         // non-continue branch above: cache-hit/deferred leave it as-is, re-emit moved the
         // fresh faces in). No per-tile copy. drawBatch.faces points at the same storage.
@@ -8617,8 +9009,42 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             tile.record.coord.ring,
             tile.record.coord.z
         };
+        m_midMeshHeldChildCatchupCoords.erase(coord);
+        const bool knownToGpu =
+            m_midMeshEmittedCoords.find(coord) != m_midMeshEmittedCoords.end();
+        const bool dirtyUploadCandidate =
+            buildConfig.emitDirtyPayload && (tileReEmitted || !knownToGpu);
+        const bool dirtyAlreadyPending =
+            buildConfig.emitDirtyPayload &&
+            m_midMeshDirtyCoords.find(coord) != m_midMeshDirtyCoords.end();
+        const bool tileVisibleForMidPublish =
+            buildConfig.suppressVisibleDirtyUpload &&
+            (dirtyUploadCandidate || dirtyAlreadyPending) &&
+            tileVisibleInCameraView(tile, cellSize);
+        const bool visibleNewUploadSuppressed =
+            buildConfig.suppressVisibleNewUpload &&
+            buildConfig.emitDirtyPayload &&
+            !m_midMeshEmittedCoords.empty() &&
+            !knownToGpu &&
+            dirtyUploadCandidate &&
+            tileVisibleForMidPublish;
+        if (visibleNewUploadSuppressed) {
+            ++visibleSuppressedNewUploads;
+            if (traceWave) {
+                ++traceBins[traceBin].deferred;
+            }
+            continue;
+        }
+        if (traceWave) {
+            traceCurrentBins[coord] = traceBin;
+        }
         const uint32_t firstFace = static_cast<uint32_t>(outSnapshot.faces.size());
         const uint32_t faceCount = static_cast<uint32_t>(emittedFaces.size());
+        if (traceWave) {
+            MidMeshWaveTraceBin& bin = traceBins[traceBin];
+            ++bin.emitted;
+            bin.faces += faceCount;
+        }
         if (!skipFullAssembly) {
             // Full path: concatenate every tile's faces for StageSnapshot. Skipped on
             // primed dirty builds (drawBatch.faces points at the persistent cache instead).
@@ -8630,12 +9056,44 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         // Reuse the mask + AABB cached when these faces were last extracted (above, or a
         // prior build). emittedFaces is unchanged since then, so they are still exact.
         const uint32_t directionMask = tile.meshCacheDirectionMask;
+        if (traceDraw) {
+            MidMeshDrawTraceEntry entry;
+            entry.coord = coord;
+            entry.bin = traceBin;
+            entry.signature = drawTraceSignature(tile, faceCount, directionMask);
+            entry.faceCount = faceCount;
+            entry.mergeCells = tile.meshCacheMergeCells;
+            entry.childMask = tile.meshCacheChildMask;
+            entry.directionMask = directionMask;
+            traceDrawEntries.push_back(entry);
+        }
+
+        const bool visibleDirtyUploadSuppressed =
+            knownToGpu &&
+            tileVisibleForMidPublish;
+        if (visibleDirtyUploadSuppressed) {
+            ++visibleSuppressedDirtyUploads;
+            visibleSuppressedDirtyCoords.insert(coord);
+        }
+        const bool dirtyUploadSuppressed =
+            dirtyUploadCandidate && suppressDirtyRedrawForTile(tile, cellSize);
+        const bool dirtyUploadsThisBuild =
+            dirtyUploadCandidate && !dirtyUploadSuppressed && !visibleDirtyUploadSuppressed;
+        const bool debugMarkWavePixel =
+            buildConfig.debugWavePixelMode != 0u &&
+            dirtyUploadsThisBuild &&
+            (buildConfig.debugWavePixelMode >= 2u || (!tileReEmitted && !knownToGpu));
+        uint32_t recordFlags =
+            SparseSurfacePackRecordFlags(kSparseSurfaceRangeValid, directionMask);
+        if (debugMarkWavePixel) {
+            recordFlags |= kSparseSurfaceDebugWavePixel;
+        }
 
         SparseSurfaceBrickRange range;
         range.coord = coord;
         range.firstFace = firstFace;
         range.faceCount = faceCount;
-        range.flags = SparseSurfacePackRecordFlags(kSparseSurfaceRangeValid, directionMask);
+        range.flags = recordFlags;
         outSnapshot.brickFaceCounts.push_back({coord, faceCount});
 
         SparseSurfaceRecord record;
@@ -8643,7 +9101,7 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         record.firstFace = firstFace;
         record.faceCount = faceCount;
         record.flags = range.flags;
-        record.generation = m_heightDirtySerial;
+        record.generation = debugMarkWavePixel ? m_lastStatsFrame : m_heightDirtySerial;
         record.minX = tile.meshCacheMinX;
         record.minY = tile.meshCacheMinY;
         record.minZ = tile.meshCacheMinZ;
@@ -8672,8 +9130,14 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             // Dirty if the tile re-extracted (faces changed) or is new to the GPU (not in
             // the previous build's emitted set). Accumulates until a successful upload
             // calls AckMidMeshDirtyUpload(); retry-safe across throttled/failed frames.
-            if (tileReEmitted || m_midMeshEmittedCoords.find(coord) == m_midMeshEmittedCoords.end()) {
-                m_midMeshDirtyCoords.insert(coord);
+            if (dirtyUploadCandidate) {
+                if (!dirtyUploadSuppressed) {
+                    m_midMeshDirtyCoords.insert(coord);
+                    if (traceDraw) {
+                        traceDirtyCauseByCoord[coord] =
+                            tileReEmitted ? traceMissCause : kMidMeshTraceCauseGpuNew;
+                    }
+                }
             }
         }
         ++emittedTiles;
@@ -8725,16 +9189,135 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
         for (const BrickCoord& prev : m_midMeshEmittedCoords) {
             if (emittedThisBuild.find(prev) == emittedThisBuild.end()) {
                 outSnapshot.removedBricks.push_back({prev, m_heightDirtySerial});
+                if (traceWave) {
+                    const auto binIt = m_midMeshTraceEmittedBinByCoord.find(prev);
+                    const uint32_t bin =
+                        binIt != m_midMeshTraceEmittedBinByCoord.end()
+                            ? std::min(binIt->second, traceMaxBins - 1u)
+                            : traceMaxBins - 1u;
+                    ++traceBins[bin].removed;
+                }
             }
         }
         outSnapshot.dirtyBricks.clear();
         outSnapshot.dirtyBricks.reserve(m_midMeshDirtyCoords.size());
         for (const BrickCoord& dirty : m_midMeshDirtyCoords) {
             if (emittedThisBuild.find(dirty) != emittedThisBuild.end()) {
+                if (visibleSuppressedDirtyCoords.find(dirty) != visibleSuppressedDirtyCoords.end()) {
+                    continue;
+                }
                 outSnapshot.dirtyBricks.push_back({dirty, m_heightDirtySerial});
+                if (traceWave) {
+                    const auto binIt = traceCurrentBins.find(dirty);
+                    const uint32_t bin =
+                        binIt != traceCurrentBins.end()
+                            ? std::min(binIt->second, traceMaxBins - 1u)
+                            : traceMaxBins - 1u;
+                    ++traceBins[bin].dirty;
+                }
             }
         }
+        if (traceDraw) {
+            std::unordered_set<BrickCoord, BrickCoordHash> dirtyThisBuild;
+            dirtyThisBuild.reserve(outSnapshot.dirtyBricks.size());
+            for (const SparseSurfaceDirtyBrick& dirty : outSnapshot.dirtyBricks) {
+                dirtyThisBuild.insert(dirty.coord);
+            }
+
+            uint32_t rows = 0;
+            uint32_t dropped = 0;
+            uint32_t changed = 0;
+            uint32_t newRows = 0;
+            uint32_t signatureRows = 0;
+            uint32_t dirtyOnlyRows = 0;
+            uint32_t removedRows = 0;
+
+            auto logDrawRow = [&](const char* change, const BrickCoord& coord, uint32_t bin,
+                                  uint32_t cause, uint32_t faceCount, uint32_t oldFaceCount,
+                                  uint32_t mergeCells, uint32_t childMask,
+                                  uint64_t signature, uint64_t oldSignature) {
+                ++changed;
+                if (rows < traceDrawMaxRows) {
+                    spdlog::info(
+                        "MIDMESH_DRAW_CHANGE frame={} change={} cause={} coord=({}, {}, {}) bin={} "
+                        "faces={}->{} merge={} childMask={} sig={:016x}->{:016x}",
+                        m_lastStatsFrame, change, traceCauseName(cause),
+                        coord.x, coord.y, coord.z, bin,
+                        oldFaceCount, faceCount, mergeCells, childMask,
+                        oldSignature, signature);
+                    ++rows;
+                } else {
+                    ++dropped;
+                }
+            };
+
+            for (const BrickCoord& prev : m_midMeshEmittedCoords) {
+                if (emittedThisBuild.find(prev) != emittedThisBuild.end()) {
+                    continue;
+                }
+                const auto oldIt = m_midMeshDrawTraceByCoord.find(prev);
+                const uint32_t oldFaceCount =
+                    oldIt != m_midMeshDrawTraceByCoord.end() ? oldIt->second.faceCount : 0u;
+                const uint64_t oldSig =
+                    oldIt != m_midMeshDrawTraceByCoord.end() ? oldIt->second.signature : 0u;
+                logDrawRow(
+                    "removed", prev, traceMaxBins - 1u, kMidMeshTraceCauseNone,
+                    0u, oldFaceCount, 0u, 0u, 0u, oldSig);
+                ++removedRows;
+                m_midMeshDrawTraceByCoord.erase(prev);
+            }
+
+            for (const MidMeshDrawTraceEntry& entry : traceDrawEntries) {
+                const bool isDirty =
+                    dirtyThisBuild.find(entry.coord) != dirtyThisBuild.end();
+                const auto oldIt = m_midMeshDrawTraceByCoord.find(entry.coord);
+                const bool isNew = oldIt == m_midMeshDrawTraceByCoord.end();
+                const bool signatureChanged =
+                    !isNew && oldIt->second.signature != entry.signature;
+                if (!isNew && !signatureChanged && !isDirty) {
+                    continue;
+                }
+
+                const auto causeIt = traceDirtyCauseByCoord.find(entry.coord);
+                const uint32_t cause =
+                    causeIt != traceDirtyCauseByCoord.end()
+                        ? causeIt->second
+                        : (isDirty ? kMidMeshTraceCausePending : kMidMeshTraceCauseNone);
+                const uint32_t oldFaceCount =
+                    oldIt != m_midMeshDrawTraceByCoord.end() ? oldIt->second.faceCount : 0u;
+                const uint64_t oldSig =
+                    oldIt != m_midMeshDrawTraceByCoord.end() ? oldIt->second.signature : 0u;
+                const char* change = isNew ? "new" : (signatureChanged ? "signature" : "dirty");
+                if (isNew) {
+                    ++newRows;
+                } else if (signatureChanged) {
+                    ++signatureRows;
+                } else {
+                    ++dirtyOnlyRows;
+                }
+                logDrawRow(
+                    change, entry.coord, entry.bin, cause, entry.faceCount, oldFaceCount,
+                    entry.mergeCells, entry.childMask, entry.signature, oldSig);
+                m_midMeshDrawTraceByCoord[entry.coord] = {
+                    entry.signature,
+                    entry.faceCount,
+                    entry.mergeCells,
+                    entry.childMask,
+                    entry.directionMask
+                };
+            }
+            spdlog::info(
+                "MIDMESH_DRAW_TRACE frame={} emitted={} dirty={} removed={} changes={} "
+                "new={} signature={} dirtyOnly={} rows={} dropped={}",
+                m_lastStatsFrame, static_cast<uint32_t>(traceDrawEntries.size()),
+                static_cast<uint32_t>(outSnapshot.dirtyBricks.size()),
+                static_cast<uint32_t>(outSnapshot.removedBricks.size()),
+                changed, newRows, signatureRows, dirtyOnlyRows, rows, dropped);
+        }
         m_midMeshEmittedCoords = std::move(emittedThisBuild);
+        if (traceWave) {
+            m_midMeshTraceEmittedBinByCoord = std::move(traceCurrentBins);
+        }
     }
     // Stale-tile age + pending count (no-hole budget telemetry). A pending tile is one whose
     // re-extract was deferred and is still drawing stale faces; its age is builds since it was
@@ -8757,11 +9340,12 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
     // Loop 1 attribution (unconditional, one line per actual build): split buildMs into the
     // computeTileLod scan vs extraction vs assembly, so the dominant cost is MEASURED not inferred.
     spdlog::info(
-        "MIDMESH_BUILDSPLIT frame={} lodScanMs={:.2f} lodCalls={} preExtractMs={:.2f} preExtractTiles={} extractMs={:.2f} assemblyMs={:.2f} emitted={} reExtract={} lodCache={} "
+        "MIDMESH_BUILDSPLIT frame={} lodScanMs={:.2f} lodCalls={} preExtractMs={:.2f} preExtractTiles={} extractMs={:.2f} assemblyMs={:.2f} emitted={} reExtract={} lodCache={} visibleHold=new/dirty:{}/{} "
         "drr=used/keyMis/cullMis/noBox/noInt/bound/large:{}/{}/{}/{}/{}/{}/{} drrMs=used/full:{:.2f}/{:.2f} "
         "drrTime=region/fullRef:{:.3f}/{:.3f}",
         m_lastStatsFrame, lodScanMsAccum, lodScanCalls, preExtractMsAccum, preExtractTileCount, extractMsAccum, assemblyMsAccum,
         emittedTiles, rebuiltThisBuild, buildConfig.lodCache ? 1 : 0,
+        visibleSuppressedNewUploads, visibleSuppressedDirtyUploads,
         drrUsed, drrKeyMismatch, drrCullMiss, drrNoEditBox, drrNoIntersect, drrBoundary, drrTooLarge, drrUsedMs, drrFullMs,
         drrRegionTimeMs, drrFullRefTimeMs);
     if (rebuiltThisBuild > 0u || missNew + missRecenter + missLod + missContent + missChild + missBuildVer > 0u) {
@@ -8770,6 +9354,88 @@ bool SparseClipmapTileCache::BuildMidHeightSurfaceSnapshot(
             m_lastStatsFrame, emittedTiles, rebuiltThisBuild, extractMsAccum, assemblyMsAccum, skipFullAssembly ? 1 : 0,
             m_lastMidMeshPendingCount, m_lastMidMeshMaxStaleAge,
             missNew, missRecenter, missLod, missContent, missChild, missBuildVer);
+    }
+    if (traceWave) {
+        uint32_t totalResident = 0;
+        uint32_t totalEmitted = 0;
+        uint64_t totalFaces = 0;
+        uint32_t totalDirty = 0;
+        uint32_t totalRemoved = 0;
+        uint32_t totalCulled = 0;
+        uint32_t totalPreExtract = 0;
+        uint32_t totalReExtract = 0;
+        uint32_t totalDeferred = 0;
+        uint32_t totalLodMerged = 0;
+        uint32_t totalChildSuppressed = 0;
+        uint32_t firstHotBin = UINT32_MAX;
+        uint32_t lastHotBin = 0;
+        for (uint32_t binIndex = 0; binIndex < static_cast<uint32_t>(traceBins.size()); ++binIndex) {
+            const MidMeshWaveTraceBin& bin = traceBins[binIndex];
+            totalResident += bin.resident;
+            totalEmitted += bin.emitted;
+            totalFaces += bin.faces;
+            totalDirty += bin.dirty;
+            totalRemoved += bin.removed;
+            totalCulled += bin.culled;
+            totalPreExtract += bin.preExtract;
+            totalReExtract += bin.reExtract;
+            totalDeferred += bin.deferred;
+            totalLodMerged += bin.lodMerged;
+            totalChildSuppressed += bin.childSuppressed;
+            const bool hot =
+                bin.dirty != 0u ||
+                bin.removed != 0u ||
+                bin.preExtract != 0u ||
+                bin.reExtract != 0u ||
+                bin.deferred != 0u ||
+                bin.missNew != 0u ||
+                bin.missRecenter != 0u ||
+                bin.missLod != 0u ||
+                bin.missContent != 0u ||
+                bin.missChild != 0u ||
+                bin.missBuildVer != 0u;
+            if (hot) {
+                firstHotBin = std::min(firstHotBin, binIndex);
+                lastHotBin = std::max(lastHotBin, binIndex);
+            }
+        }
+        spdlog::info(
+            "MIDMESH_WAVE_TRACE frame={} build={} cam=({:.1f},{:.1f},{:.1f}) binSize={} bins={} minD={:.1f} maxD={:.1f} cull={} skipAssembly={} "
+            "resident={} emitted={} faces={} dirty={} removed={} culled={} preExtract={} reExtract={} deferred={} lodMerged={} childSuppressed={} hotBin={}..{}",
+            m_lastStatsFrame, m_midMeshBuildCounter,
+            buildConfig.cameraX, buildConfig.cameraY, buildConfig.cameraZ,
+            traceBinSize, traceMaxBins, minDistance, maxDistance,
+            buildConfig.distanceCull ? 1 : 0, skipFullAssembly ? 1 : 0,
+            totalResident, totalEmitted, totalFaces, totalDirty, totalRemoved, totalCulled,
+            totalPreExtract, totalReExtract, totalDeferred, totalLodMerged, totalChildSuppressed,
+            firstHotBin == UINT32_MAX ? 0u : firstHotBin,
+            firstHotBin == UINT32_MAX ? 0u : lastHotBin);
+        for (uint32_t binIndex = 0; binIndex < static_cast<uint32_t>(traceBins.size()); ++binIndex) {
+            const MidMeshWaveTraceBin& bin = traceBins[binIndex];
+            const bool hot =
+                bin.dirty != 0u ||
+                bin.removed != 0u ||
+                bin.preExtract != 0u ||
+                bin.reExtract != 0u ||
+                bin.deferred != 0u ||
+                bin.missNew != 0u ||
+                bin.missRecenter != 0u ||
+                bin.missLod != 0u ||
+                bin.missContent != 0u ||
+                bin.missChild != 0u ||
+                bin.missBuildVer != 0u;
+            if (!hot) {
+                continue;
+            }
+            spdlog::info(
+                "MIDMESH_WAVE_BIN frame={} bin={} range=[{},{}] resident={} emitted={} faces={} dirty={} removed={} culled={} "
+                "preExtract={} reExtract={} deferred={} lodMerged={} childSuppressed={} miss=new/recenter/lod/content/child/buildver:{}/{}/{}/{}/{}/{}",
+                m_lastStatsFrame, binIndex,
+                binIndex * traceBinSize, (binIndex + 1u) * traceBinSize,
+                bin.resident, bin.emitted, bin.faces, bin.dirty, bin.removed, bin.culled,
+                bin.preExtract, bin.reExtract, bin.deferred, bin.lodMerged, bin.childSuppressed,
+                bin.missNew, bin.missRecenter, bin.missLod, bin.missContent, bin.missChild, bin.missBuildVer);
+        }
     }
     return true;
 }

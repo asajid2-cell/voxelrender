@@ -24,9 +24,21 @@ StructuredBuffer<uint2> SparseBrickOccupancy : register(t8);
 StructuredBuffer<uint> SparseBrickPageGenerations : register(t9);
 
 static const uint RENDER_OWNER_SURFACE = 9u;
+static const uint RENDER_OWNER_UNSAFE_NEAR_MISS = 10u;
 static const uint RENDER_OWNER_FRAME = 8u;
 static const uint RENDER_OWNER_WATER_CONTEXT = 12u;
 static const uint RENDER_OWNER_FAR_SURFACE = 21u;
+static const uint RENDER_OWNER_EXACT_SURFACE = 30u;
+static const uint RENDER_OWNER_MID_SURFACE = 31u;
+static const uint RENDER_OWNER_PROTECTED_MID_SURFACE = 32u;
+static const uint RENDER_OWNER_PROTECTED_EXACT_SURFACE = 33u;
+static const uint RENDER_OWNER_UNSAFE_SAMPLE_COUNT = 15u;
+static const uint RENDER_OWNER_UNSAFE_SAMPLE_BRICK_X = 16u;
+static const uint RENDER_OWNER_UNSAFE_SAMPLE_BRICK_Y = 17u;
+static const uint RENDER_OWNER_UNSAFE_SAMPLE_BRICK_Z = 18u;
+static const uint RENDER_OWNER_UNSAFE_SAMPLE_DIST = 19u;
+static const uint RENDER_OWNER_UNSAFE_SAMPLE_LIST_BASE = 40u;
+static const uint RENDER_OWNER_UNSAFE_SAMPLE_LIST_CAPACITY = 256u;
 static const float FAR_SEA_LEVEL = -48.0f;
 static const float FAR_WATER_SURFACE_Y = FAR_SEA_LEVEL + 1.0f;
 static const uint SPARSE_BRICK_SIZE = 16u;
@@ -40,6 +52,8 @@ struct PSInput {
     float3 normal : NORMAL0;
     nointerpolation uint material : MATERIAL0;
     nointerpolation uint faceDirection : TEXCOORD2;
+    nointerpolation uint debugMarker : TEXCOORD3;
+    nointerpolation uint debugFaceExtent : TEXCOORD4;
     float distance : TEXCOORD0;
     float3 worldPos : TEXCOORD1;
 };
@@ -240,14 +254,76 @@ float3 DebugSurfaceOwnerMaterialColor(uint material) {
     return saturate(materialColor * 0.86f + exactSurfaceTint * 0.14f);
 }
 
+bool UseXzSurfaceClipMetric() {
+    if (frame.debugMode == 91u) {
+        return false;
+    }
+    return frame.nearOwnershipParams.x > 0.5f ||
+        frame.debugMode == 90u ||
+        frame.debugMode == 92u;
+}
+
+float SurfaceClipMetricForDebug(float3 worldPos) {
+    const float3 cameraToPixel = worldPos - frame.cameraPosition.xyz;
+    return UseXzSurfaceClipMetric()
+        ? length(cameraToPixel.xz)
+        : length(cameraToPixel);
+}
+
+bool RenderOwnershipEnabled() {
+    return frame.farFieldGridParams.w > 0.5f;
+}
+
+void RecordUnsafeSparseMissSample(int3 brickCoord, float distanceFromCamera) {
+    if (!RenderOwnershipEnabled()) {
+        return;
+    }
+
+    uint writeIndex = 0u;
+    InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_UNSAFE_SAMPLE_COUNT], 1u, writeIndex);
+    if (writeIndex == 0u) {
+        RenderOwnershipStats[RENDER_OWNER_UNSAFE_SAMPLE_BRICK_X] = (uint)brickCoord.x;
+        RenderOwnershipStats[RENDER_OWNER_UNSAFE_SAMPLE_BRICK_Y] = (uint)brickCoord.y;
+        RenderOwnershipStats[RENDER_OWNER_UNSAFE_SAMPLE_BRICK_Z] = (uint)brickCoord.z;
+        RenderOwnershipStats[RENDER_OWNER_UNSAFE_SAMPLE_DIST] =
+            (uint)min(max(distanceFromCamera, 0.0f), 1000000.0f);
+    }
+
+    uint h = (uint)brickCoord.x * 73856093u;
+    h ^= (uint)brickCoord.y * 19349663u;
+    h ^= (uint)brickCoord.z * 83492791u;
+    h ^= (uint)frame.frameIndex * 2654435761u;
+    const uint sampleSlot = h % RENDER_OWNER_UNSAFE_SAMPLE_LIST_CAPACITY;
+    const uint base = RENDER_OWNER_UNSAFE_SAMPLE_LIST_BASE + sampleSlot * 4u;
+    RenderOwnershipStats[base + 0u] = (uint)brickCoord.x;
+    RenderOwnershipStats[base + 1u] = (uint)brickCoord.y;
+    RenderOwnershipStats[base + 2u] = (uint)brickCoord.z;
+    RenderOwnershipStats[base + 3u] =
+        (uint)min(max(distanceFromCamera, 0.0f), 1000000.0f);
+    RenderOwnershipStats[RENDER_OWNER_FRAME] = frame.frameIndex;
+}
+
 #if defined(VENPOD_SPARSE_SURFACE_EARLY_DEPTH) && VENPOD_SPARSE_SURFACE_EARLY_DEPTH
 [earlydepthstencil]
 #endif
 float4 main(PSInput input) : SV_Target {
     const float surfaceDistance = distance(input.worldPos, frame.cameraPosition.xyz);
     const float exactNearDistance = max(frame.exactNearParams.x, 0.0f);
+    const uint surfaceDebugPassKind = (uint)frame.surfaceRasterParams.w;
+    const bool exactSurfacePass = surfaceDebugPassKind == 1u;
+    const bool midSurfacePass = surfaceDebugPassKind == 2u;
+    const float publicExactSurfaceDistance =
+        max(max(frame.exactNearParams.z, frame.exactNearParams.x), 1.0f);
+    const bool protectedExactSurfaceZone =
+        SurfaceClipMetricForDebug(input.worldPos) <= publicExactSurfaceDistance;
+    const bool terrainOwnershipContractActive = frame.exactNearParams.w > 0.5f;
+    const bool debugBakedSurfaceMaterialOnly = frame.debugMode == 72u;
+    const bool debugLiveSurfaceMaterialDelta = frame.debugMode == 73u;
+    const bool debugKeepLiveErasedSurfaceFaces = frame.debugMode == 74u;
     bool liveErased = false;
-    const uint material = ResolveSparseSurfaceMaterial(input.material, input.worldPos, input.normal, liveErased);
+    const uint material = (!debugBakedSurfaceMaterialOnly && exactSurfacePass)
+        ? ResolveSparseSurfaceMaterial(input.material, input.worldPos, input.normal, liveErased)
+        : input.material;
     // Only honour the erase-discard within the EXACT near-surface range. There the
     // baked faces align with single voxels, so a live-air sample reliably means
     // "this voxel was carved" -> drop the fragment and let the voxel raymarch show
@@ -258,7 +334,9 @@ float4 main(PSInput input) : SV_Target {
     const float eraseDiscardRange = exactNearDistance > 0.0f
         ? exactNearDistance
         : 192.0f;
-    if (liveErased && surfaceDistance <= eraseDiscardRange) {
+    if (!debugBakedSurfaceMaterialOnly && !debugLiveSurfaceMaterialDelta &&
+        !debugKeepLiveErasedSurfaceFaces &&
+        liveErased && surfaceDistance <= eraseDiscardRange) {
         discard;
     }
     const float protectedSurfaceDistance = max(exactNearDistance + 768.0f, 1536.0f);
@@ -285,8 +363,19 @@ float4 main(PSInput input) : SV_Target {
         aboveWaterView &&
         (input.worldPos.y < FAR_WATER_SURFACE_Y - 0.05f ||
          deterministicWaterBeforeSurface);
-    if (frame.farFieldGridParams.w > 0.5f) {
+    if (RenderOwnershipEnabled()) {
         InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_SURFACE], 1u);
+        if (exactSurfacePass) {
+            InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_EXACT_SURFACE], 1u);
+            if (protectedExactSurfaceZone) {
+                InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_PROTECTED_EXACT_SURFACE], 1u);
+            }
+        } else if (midSurfacePass) {
+            InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_MID_SURFACE], 1u);
+            if (protectedExactSurfaceZone && !terrainOwnershipContractActive) {
+                InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_PROTECTED_MID_SURFACE], 1u);
+            }
+        }
         if (exactNearDistance > 0.0f && surfaceDistance > protectedSurfaceDistance) {
             InterlockedAdd(RenderOwnershipStats[RENDER_OWNER_FAR_SURFACE], 1u);
         }
@@ -299,7 +388,68 @@ float4 main(PSInput input) : SV_Target {
         // when resident. Only discard terrain that is actually below the
         // deterministic water surface; the analytic plane is the fallback for
         // missing/far water, not a replacement for exact water drawables.
+        if (frame.debugMode == 97u) {
+            // Debug 97: show what the submerged discard removes (coverage-void probe).
+            return float4(0.0f, 1.0f, 1.0f, 1.0f);
+        }
         discard;
+    }
+
+    if (surfaceDebugPassKind == 2u &&
+        input.debugFaceExtent >= 4u &&
+        SurfaceClipMetricForDebug(input.worldPos) <= publicExactSurfaceDistance) {
+        const int3 worldVoxel =
+            int3(floor(input.worldPos - normalize(input.normal) * 0.5f));
+        const int3 brickCoord = int3(
+            FloorDiv16(worldVoxel.x),
+            FloorDiv16(worldVoxel.y),
+            FloorDiv16(worldVoxel.z));
+        RecordUnsafeSparseMissSample(
+            brickCoord,
+            max(SurfaceClipMetricForDebug(input.worldPos), 1.0f));
+    }
+
+    if (frame.debugMode == 75u && input.debugMarker != 0u) {
+        return float4(1.0f, 0.0f, 1.0f, 1.0f);
+    }
+    if (frame.debugMode == 76u && input.debugMarker != 0u) {
+        return float4(1.0f, 0.0f, 1.0f, 1.0f);
+    }
+    if (frame.debugMode == 77u || frame.debugMode == 78u) {
+        if (surfaceDebugPassKind == 2u && input.debugMarker != 0u) {
+            return float4(1.0f, 0.0f, 1.0f, 1.0f);
+        }
+    }
+    if (frame.debugMode == 79u && surfaceDebugPassKind == 2u) {
+        return float4(0.0f, 0.85f, 1.0f, 1.0f);
+    }
+    if (frame.debugMode == 80u && surfaceDebugPassKind == 1u) {
+        return float4(1.0f, 0.95f, 0.05f, 1.0f);
+    }
+    if (frame.debugMode == 81u) {
+        if (surfaceDebugPassKind == 1u) {
+            return float4(1.0f, 0.95f, 0.05f, 1.0f);
+        }
+        if (surfaceDebugPassKind == 2u) {
+            return float4(0.0f, 0.85f, 1.0f, 1.0f);
+        }
+        return float4(1.0f, 0.35f, 0.05f, 1.0f);
+    }
+    if (frame.debugMode == 82u) {
+        const uint extent = input.debugFaceExtent;
+        if (extent <= 4u) {
+            return float4(0.08f, 0.95f, 0.18f, 1.0f);
+        }
+        if (extent <= 8u) {
+            return float4(0.0f, 0.85f, 1.0f, 1.0f);
+        }
+        if (extent <= 16u) {
+            return float4(1.0f, 0.95f, 0.05f, 1.0f);
+        }
+        if (extent <= 32u) {
+            return float4(1.0f, 0.45f, 0.02f, 1.0f);
+        }
+        return float4(1.0f, 0.0f, 1.0f, 1.0f);
     }
 
     if (frame.debugMode == 50u) {
@@ -350,6 +500,30 @@ float4 main(PSInput input) : SV_Target {
             return float4(1.0f, 0.46f, 0.05f, 1.0f);
         }
         return float4(1.0f, 0.95f, 0.05f, 1.0f);
+    }
+    if (frame.debugMode == 71u) {
+        const float drawMaxDistance = max(frame.surfaceRasterParams.x, 1.0f);
+        const bool midMeshDraw =
+            drawMaxDistance > max(frame.exactNearParams.x + 2048.0f, 5000.0f);
+        const float clipT = saturate(surfaceDistance / drawMaxDistance);
+        const float boundaryBand =
+            1.0f - smoothstep(0.0f, 0.025f, abs(clipT - 0.985f));
+        if (midMeshDraw) {
+            return float4(lerp(float3(0.03f, 0.55f, 1.0f), float3(1.0f, 1.0f, 1.0f), boundaryBand), 1.0f);
+        }
+        const float3 nearColor = surfaceDistance <= frame.exactNearParams.x
+            ? float3(1.0f, 0.95f, 0.05f)
+            : float3(1.0f, 0.42f, 0.05f);
+        return float4(lerp(nearColor, float3(1.0f, 1.0f, 1.0f), boundaryBand), 1.0f);
+    }
+    if (frame.debugMode == 73u) {
+        if (liveErased) {
+            return float4(1.0f, 0.05f, 0.95f, 1.0f);
+        }
+        if (material != input.material) {
+            return float4(1.0f, 0.92f, 0.05f, 1.0f);
+        }
+        return float4(DebugMaterialColor(input.material) * 0.12f, 1.0f);
     }
     if (frame.debugMode == 58u) {
         return float4(1.0f, 0.95f, 0.05f, 1.0f);
@@ -629,5 +803,83 @@ float4 main(PSInput input) : SV_Target {
     const float fog = saturate((input.distance - 1500.0f) / 4500.0f);
     const float3 sky = float3(0.62f, 0.70f, 0.78f);
     color = lerp(color, sky, fog * 0.35f);
+
+    if (frame.debugMode == 96u) {
+        const float3 exactOwnerColor = float3(0.05f, 0.86f, 0.20f);
+        const bool illegalMidOwner =
+            protectedExactSurfaceZone && !terrainOwnershipContractActive;
+        const float3 midOwnerColor = illegalMidOwner
+            ? float3(1.0f, 0.0f, 1.0f)
+            : float3(0.04f, 0.32f, 1.0f);
+        color = lerp(color,
+            exactSurfacePass ? exactOwnerColor : midOwnerColor,
+            exactSurfacePass ? 0.88f : (illegalMidOwner ? 0.94f : 0.78f));
+    }
+
+    if (frame.debugMode == 91u || frame.debugMode == 92u) {
+        const float surfaceMaxDistance = max(frame.nearOwnershipParams.w, 0.0f);
+        if (surfaceMaxDistance > 0.0f) {
+            const float3 cameraToPixel = input.worldPos - frame.cameraPosition.xyz;
+            const float clipMetric3d = length(cameraToPixel);
+            const float clipMetricXz = length(cameraToPixel.xz);
+            const float bandWidth = max(12.0f, surfaceMaxDistance * 0.003f);
+            const float stockBoundary =
+                1.0f - smoothstep(0.0f, bandWidth, abs(clipMetric3d - surfaceMaxDistance));
+            if (frame.debugMode == 91u) {
+                color = lerp(color, float3(1.0f, 0.0f, 1.0f), stockBoundary * 0.82f);
+            } else {
+                const bool rescuedByXzClip =
+                    clipMetricXz <= surfaceMaxDistance &&
+                    clipMetric3d > surfaceMaxDistance;
+                const float xzOnlyShell = rescuedByXzClip ? 1.0f : 0.0f;
+                const float proof = max(xzOnlyShell, stockBoundary * 0.55f);
+                color = lerp(color, float3(1.0f, 0.0f, 1.0f), proof * 0.82f);
+            }
+        }
+    }
+    if (frame.debugMode == 93u) {
+        const bool midSurfacePass = surfaceDebugPassKind == 2u;
+        if (midSurfacePass) {
+            const uint extent = input.debugFaceExtent;
+            const float3 extentColor =
+                extent >= 16u ? float3(1.0f, 0.0f, 1.0f) :
+                extent >= 8u ? float3(1.0f, 0.45f, 0.02f) :
+                extent >= 4u ? float3(1.0f, 0.95f, 0.05f) :
+                                float3(0.0f, 0.85f, 1.0f);
+            color = lerp(color, extentColor, 0.78f);
+        } else if (exactSurfacePass && input.debugFaceExtent >= 8u) {
+            color = lerp(color, float3(0.15f, 0.45f, 1.0f), 0.35f);
+        }
+    }
+    if (frame.debugMode == 94u && surfaceDebugPassKind == 2u && input.debugFaceExtent >= 4u) {
+        const float3 absNormal = abs(normalize(input.normal));
+        float2 faceUv = input.worldPos.xy;
+        if (absNormal.x > absNormal.y && absNormal.x > absNormal.z) {
+            faceUv = input.worldPos.zy;
+        } else if (absNormal.y > absNormal.z) {
+            faceUv = input.worldPos.xz;
+        }
+        const float extent = max((float)input.debugFaceExtent, 1.0f);
+        const float2 cell = abs(frac(faceUv / extent) - 0.5f);
+        const float edge = smoothstep(0.455f, 0.495f, max(cell.x, cell.y));
+        color = lerp(color, float3(1.0f, 0.0f, 1.0f), edge * 0.86f);
+    }
+    if (frame.debugMode == 95u && surfaceDebugPassKind == 2u && input.debugFaceExtent >= 4u) {
+        const float publicExactMaxDistance =
+            max(max(frame.exactNearParams.z, frame.exactNearParams.x), 1.0f);
+        if (SurfaceClipMetricForDebug(input.worldPos) <= publicExactMaxDistance) {
+            const float3 absNormal = abs(normalize(input.normal));
+            float2 faceUv = input.worldPos.xy;
+            if (absNormal.x > absNormal.y && absNormal.x > absNormal.z) {
+                faceUv = input.worldPos.zy;
+            } else if (absNormal.y > absNormal.z) {
+                faceUv = input.worldPos.xz;
+            }
+            const float extent = max((float)input.debugFaceExtent, 1.0f);
+            const float2 cell = abs(frac(faceUv / extent) - 0.5f);
+            const float edge = smoothstep(0.455f, 0.495f, max(cell.x, cell.y));
+            color = lerp(color, float3(1.0f, 0.0f, 1.0f), edge * 0.92f);
+        }
+    }
     return float4(color, 1.0f);
 }

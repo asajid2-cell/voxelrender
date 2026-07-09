@@ -14,6 +14,9 @@ namespace VENPOD::Graphics {
 
 namespace {
 
+constexpr UINT kSparseSurfaceMidStencilRef = 1u;
+constexpr UINT kSparseSurfaceExactStencilRef = 1u;
+
 // Must match SharedTypes.hlsli FrameConstants exactly. Keeping the CPU mirror
 // in one place avoids the renderer and sparse-surface paths drifting as the
 // sparse backend adds ownership metadata.
@@ -276,7 +279,7 @@ Result<void> Renderer::Initialize(
         std::snprintf(name, sizeof(name), "SparseSurfaceFrameConstants_%u", i);
         result = m_sparseSurfaceConstantUploads[i].Initialize(
             device.GetDevice(),
-            kFrameConstantUploadBytes,
+            kSparseSurfaceConstantUploadBytes,
             name);
         if (!result) {
             return Error("Failed to create sparse surface frame constants upload buffer: {}", result.error());
@@ -382,6 +385,8 @@ void Renderer::Shutdown() {
     m_fullscreenPipeline.Shutdown();
     m_sparseSurfacePipeline.Shutdown();
     m_sparseSurfaceDepthPrepassPipeline.Shutdown();
+    m_sparseSurfaceUnderlayPipeline.Shutdown();
+    m_sparseSurfaceUnderlayDepthPrepassPipeline.Shutdown();
     m_overlayPipeline.Shutdown();
     m_backgroundCompositePipeline.Shutdown();
     m_midCompositePipeline.Shutdown();
@@ -482,6 +487,7 @@ void Renderer::SetMainRenderTarget(ID3D12GraphicsCommandList* cmdList) {
 void Renderer::BeginFrame(ID3D12GraphicsCommandList* cmdList, uint32_t frameIndex) {
     if (!cmdList || !m_window) return;
     m_currentFrameIndex = frameIndex % VENPOD::Window::BUFFER_COUNT;
+    m_sparseSurfaceConstantUploadCursor = 0;
 
     // Get current back buffer
     ID3D12Resource* backBuffer = m_window->GetBackBuffer(frameIndex);
@@ -1103,8 +1109,8 @@ void Renderer::RenderVoxels(
 
         // (ii) Upscale-composite the low-res mid target over the MAIN render
         // target with bilinear filtering and alpha-over blending. The composite
-        // PSO's stencil EQUAL ref 0 test restricts writes to pixels the near
-        // surface did not own, mirroring the background composite.
+        // PSO's stencil EQUAL ref 0 test restricts writes to pixels the surface
+        // raster did not own, mirroring the background composite.
         D3D12_RESOURCE_BARRIER midBarrier = CD3DX12_RESOURCE_BARRIER::Transition(
             m_midPassColor.Get(),
             D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -1134,6 +1140,8 @@ void Renderer::RenderSparseSurfaceFaces(
     const D3D12_VERTEX_BUFFER_VIEW* surfaceVertexIdView,
     const D3D12_INDEX_BUFFER_VIEW* surfaceIndexView,
     uint32_t surfaceVertexIdCapacityFaces,
+    uint32_t surfaceRecordCount,
+    uint32_t surfaceUploadedSerial,
     const DescriptorHandle* surfaceRecordsSRV,
     const DescriptorHandle* surfaceClustersSRV,
     const DescriptorHandle* renderOwnershipUAV,
@@ -1142,7 +1150,8 @@ void Renderer::RenderSparseSurfaceFaces(
     const DescriptorHandle* sparseOccupancySRV,
     const DescriptorHandle* sparsePageGenerationSRV,
     uint32_t sparseMaxBrickPages,
-    uint32_t sparsePageTableCapacity)
+    uint32_t sparsePageTableCapacity,
+    uint32_t surfaceDebugPassKind)
 {
     if (!cmdList || surfaceFaceCount == 0 || !surfaceFacesSRV.IsValid() || !materialPaletteSRV.IsValid()) {
         return;
@@ -1169,8 +1178,20 @@ void Renderer::RenderSparseSurfaceFaces(
 
     ID3D12DescriptorHeap* heaps[] = { m_heapManager.GetShaderVisibleCbvSrvUavHeap() };
     cmdList->SetDescriptorHeaps(1, heaps);
-    m_sparseSurfacePipeline.Bind(cmdList);
-    cmdList->OMSetStencilRef(1);
+    const bool underlaySurfacePass =
+        surfaceDebugPassKind == 2u &&
+        m_sparseSurfaceUnderlayPipeline.GetPSO() != nullptr;
+    DX12GraphicsPipeline* shadedPipeline =
+        underlaySurfacePass ? &m_sparseSurfaceUnderlayPipeline : &m_sparseSurfacePipeline;
+    DX12GraphicsPipeline* depthPrepassPipeline =
+        underlaySurfacePass
+            ? &m_sparseSurfaceUnderlayDepthPrepassPipeline
+            : &m_sparseSurfaceDepthPrepassPipeline;
+    const UINT surfaceStencilRef =
+        underlaySurfacePass ? kSparseSurfaceMidStencilRef : kSparseSurfaceExactStencilRef;
+
+    shadedPipeline->Bind(cmdList);
+    cmdList->OMSetStencilRef(surfaceStencilRef);
     cmdList->IASetVertexBuffers(0, 1, surfaceVertexIdView);
     cmdList->IASetIndexBuffer(surfaceIndexView);
 
@@ -1208,11 +1229,28 @@ void Renderer::RenderSparseSurfaceFaces(
             : 0.0f;
     constants.surfaceParams[0] = 1.0f;
     constants.surfaceParams[1] = static_cast<float>(drawableFaceCount);
+    constants.surfaceParams[2] = static_cast<float>(surfaceRecordCount);
+    constants.surfaceParams[3] = static_cast<float>(surfaceUploadedSerial);
+    const float safeMidStartDistance = NonNegativeFiniteOr(camera.midFieldStartDistance, 0.0f);
+    const float safeMidEndDistance =
+        std::max(safeMidStartDistance + 1.0f, FiniteOr(camera.midFieldEndDistance, safeMidStartDistance + 1.0f));
+    const float safeMidCellSize = std::max(4.0f, FiniteOr(camera.midFieldCellSize, 16.0f));
+    const bool midClipmapEnabled = safeMidStartDistance > 0.0f && safeMidEndDistance > safeMidStartDistance;
+    constants.midFieldParams[0] = midClipmapEnabled ? 1.0f : 0.0f;
+    constants.midFieldParams[1] = midClipmapEnabled ? safeMidStartDistance : 0.0f;
+    constants.midFieldParams[2] = midClipmapEnabled ? safeMidEndDistance : 0.0f;
+    constants.midFieldParams[3] = midClipmapEnabled ? safeMidCellSize : 0.0f;
     constants.exactNearParams[0] = NonNegativeFiniteOr(camera.exactNearDistance, 0.0f);
+    constants.exactNearParams[2] = NonNegativeFiniteOr(
+        camera.publicSurfaceRasterMaxDistance,
+        camera.surfaceRasterMaxDistance);
+    constants.exactNearParams[3] = camera.terrainOwnershipContractActive ? 1.0f : 0.0f;
+    constants.nearOwnershipParams[0] = camera.surfaceRasterUseXzClip ? 1.0f : 0.0f;
     constants.nearOwnershipParams[3] = camera.surfaceRasterMaxDistance;
     constants.surfaceRasterParams[0] = NonNegativeFiniteOr(camera.surfaceRasterMaxDistance, 0.0f);
-    constants.surfaceRasterParams[1] = 0.0f;
+    constants.surfaceRasterParams[1] = NonNegativeFiniteOr(camera.surfaceRasterMinDistance, 0.0f);
     constants.surfaceRasterParams[2] = FiniteOr(camera.farSvoStepQualityGate, 0.92f);
+    constants.surfaceRasterParams[3] = static_cast<float>(surfaceDebugPassKind);
     const bool sparseMaterialLookupEnabled =
         sparseBrickPoolSRV && sparseBrickPoolSRV->IsValid() &&
         sparsePageTableSRV && sparsePageTableSRV->IsValid() &&
@@ -1226,11 +1264,25 @@ void Renderer::RenderSparseSurfaceFaces(
 
     static_assert(sizeof(constants) <= kFrameConstantUploadBytes);
     UploadBuffer& frameConstantsUpload = m_sparseSurfaceConstantUploads[m_currentFrameIndex];
-    if (void* mapped = frameConstantsUpload.GetMappedData()) {
-        std::memcpy(mapped, &constants, sizeof(constants));
+    if (m_sparseSurfaceConstantUploadCursor >= kSparseSurfaceConstantUploadSlots) {
+        static bool s_loggedSparseSurfaceConstantOverflow = false;
+        if (!s_loggedSparseSurfaceConstantOverflow) {
+            s_loggedSparseSurfaceConstantOverflow = true;
+            spdlog::error(
+                "Sparse surface constants upload slots exhausted; dropping draw after {} slots",
+                kSparseSurfaceConstantUploadSlots);
+        }
+        return;
     }
+    const uint64_t constantsOffset =
+        kFrameConstantUploadBytes * static_cast<uint64_t>(m_sparseSurfaceConstantUploadCursor++);
+    if (void* mapped = frameConstantsUpload.GetMappedData()) {
+        std::memcpy(static_cast<uint8_t*>(mapped) + constantsOffset, &constants, sizeof(constants));
+    }
+    const D3D12_GPU_VIRTUAL_ADDRESS constantsGpuAddress =
+        frameConstantsUpload.GetGPUVirtualAddress() + constantsOffset;
 
-    cmdList->SetGraphicsRootConstantBufferView(0, frameConstantsUpload.GetGPUVirtualAddress());
+    cmdList->SetGraphicsRootConstantBufferView(0, constantsGpuAddress);
     cmdList->SetGraphicsRootDescriptorTable(1, surfaceFacesSRV.gpu);
     cmdList->SetGraphicsRootDescriptorTable(2, materialPaletteSRV.gpu);
     cmdList->SetGraphicsRootDescriptorTable(
@@ -1283,7 +1335,7 @@ void Renderer::RenderSparseSurfaceFaces(
         }
     };
     auto bindSurfaceDescriptors = [&]() {
-        cmdList->SetGraphicsRootConstantBufferView(0, frameConstantsUpload.GetGPUVirtualAddress());
+        cmdList->SetGraphicsRootConstantBufferView(0, constantsGpuAddress);
         cmdList->SetGraphicsRootDescriptorTable(1, surfaceFacesSRV.gpu);
         cmdList->SetGraphicsRootDescriptorTable(2, materialPaletteSRV.gpu);
         cmdList->SetGraphicsRootDescriptorTable(
@@ -1323,20 +1375,23 @@ void Renderer::RenderSparseSurfaceFaces(
                 : surfaceFacesSRV.gpu);
     };
 
-    if (m_config.sparseSurfaceDepthPrepass &&
-        m_sparseSurfaceDepthPrepassPipeline.GetPSO() != nullptr &&
+    if (!underlaySurfacePass &&
+        m_config.sparseSurfaceDepthPrepass &&
+        depthPrepassPipeline->GetPSO() != nullptr &&
         m_dsvHandle.IsValid()) {
         D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = m_dsvHandle.cpu;
         cmdList->OMSetRenderTargets(0, nullptr, FALSE, &dsvHandle);
-        m_sparseSurfaceDepthPrepassPipeline.Bind(cmdList);
-        // Safe to draw the shaded pass after this because stencil writes are REPLACE->1.
-        cmdList->OMSetStencilRef(1);
+        depthPrepassPipeline->Bind(cmdList);
+        // Exact surfaces claim the normal surface-owned stencil value. The mid
+        // underlay path skips this prepass so it cannot put coarse depth in
+        // front of exact terrain that draws immediately afterward.
+        cmdList->OMSetStencilRef(surfaceStencilRef);
         bindSurfaceDescriptors();
         drawSurfaceStreams();
 
         SetMainRenderTarget(cmdList);
-        m_sparseSurfacePipeline.Bind(cmdList);
-        cmdList->OMSetStencilRef(1);
+        shadedPipeline->Bind(cmdList);
+        cmdList->OMSetStencilRef(surfaceStencilRef);
         bindSurfaceDescriptors();
     }
     if (indirectDrawArgs && indirectDrawCommandCount > 0 && m_sparseSurfaceDrawSignature) {
@@ -1355,8 +1410,8 @@ void Renderer::RenderSparseSurfaceFaces(
         D3D12_CPU_DESCRIPTOR_HANDLE backgroundDsv = m_backgroundPassDsv.cpu;
         cmdList->OMSetRenderTargets(0, nullptr, FALSE, &backgroundDsv);
         SetViewportAndScissor(cmdList, m_backgroundPassWidth, m_backgroundPassHeight);
-        m_sparseSurfaceDepthPrepassPipeline.Bind(cmdList);
-        cmdList->OMSetStencilRef(1);
+        depthPrepassPipeline->Bind(cmdList);
+        cmdList->OMSetStencilRef(surfaceStencilRef);
         bindSurfaceDescriptors();
         drawSurfaceStreams();
         SetMainRenderTarget(cmdList);
@@ -2135,10 +2190,45 @@ Result<void> Renderer::CreateSparseSurfacePipeline(ID3D12Device* device) {
         }
         spdlog::info("Sparse surface depth pre-pass pipeline created successfully");
 
+        GraphicsPipelineDesc underlayDepthPrepassDesc = depthPrepassDesc;
+        underlayDepthPrepassDesc.debugName = "SparseSurfaceUnderlayDepthPrepassPipeline";
+        underlayDepthPrepassDesc.stencilWriteMask = 0x00u;
+        underlayDepthPrepassDesc.frontStencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
+        underlayDepthPrepassDesc.frontStencilPassOp = D3D12_STENCIL_OP_KEEP;
+        underlayDepthPrepassDesc.frontStencilFailOp = D3D12_STENCIL_OP_KEEP;
+        underlayDepthPrepassDesc.frontStencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+        auto underlayDepthPrepassResult =
+            m_sparseSurfaceUnderlayDepthPrepassPipeline.Initialize(device, underlayDepthPrepassDesc);
+        if (!underlayDepthPrepassResult) {
+            return Error(
+                "Failed to create sparse surface underlay depth-prepass pipeline: {}",
+                underlayDepthPrepassResult.error());
+        }
+        spdlog::info("Sparse surface underlay depth pre-pass pipeline created successfully");
+
         pipelineDesc.pixelShader = m_sparseSurfaceEarlyDepthPS;
         pipelineDesc.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
         pipelineDesc.depthFunc = D3D12_COMPARISON_FUNC_EQUAL;
     }
+
+    GraphicsPipelineDesc underlayDesc = pipelineDesc;
+    underlayDesc.debugName = "SparseSurfaceUnderlayPipeline";
+    // The mid pass is a fallback owner. Exact sparse surfaces draw first and
+    // write stencil=1; mid may claim only pixels still unowned. It then writes
+    // stencil=1 for the pixels it owns so fullscreen background cannot overpaint
+    // valid mid geometry.
+    underlayDesc.pixelShader = m_sparseSurfacePS;
+    underlayDesc.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    underlayDesc.depthFunc = D3D12_COMPARISON_FUNC_LESS;
+    underlayDesc.frontStencilFunc = D3D12_COMPARISON_FUNC_NOT_EQUAL;
+    underlayDesc.frontStencilPassOp = D3D12_STENCIL_OP_REPLACE;
+    underlayDesc.frontStencilFailOp = D3D12_STENCIL_OP_KEEP;
+    underlayDesc.frontStencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+    auto underlayResult = m_sparseSurfaceUnderlayPipeline.Initialize(device, underlayDesc);
+    if (!underlayResult) {
+        return Error("Failed to create sparse surface underlay pipeline: {}", underlayResult.error());
+    }
+    spdlog::info("Sparse surface underlay pipeline created successfully");
 
     auto result = m_sparseSurfacePipeline.Initialize(device, pipelineDesc);
     if (!result) {
@@ -2442,9 +2532,9 @@ Result<void> Renderer::CreateMidCompositePipeline(ID3D12Device* device) {
     });
     pipelineDesc.rtvFormats.push_back(DXGI_FORMAT_R8G8B8A8_UNORM);
     pipelineDesc.inputLayout.clear();
-    // The upscaled mid composite only writes where the near surface did not own
-    // the pixel (stencil == 0), mirroring the fullscreen/background composite,
-    // and alpha-over blends so mid coverage (alpha) composites over the full
+    // The upscaled mid composite only writes where the surface raster did not
+    // own the pixel (stencil == 0), mirroring the fullscreen/background
+    // composite, and alpha-over blends so mid coverage composites over the full
     // pass already in the main RT.
     pipelineDesc.depthEnable = true;
     pipelineDesc.depthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;

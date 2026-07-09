@@ -38,6 +38,7 @@ constexpr uint32_t kSparseSurfaceRangeValid = 1u;
 constexpr uint32_t kSparseSurfaceRangeTombstone = 2u;
 constexpr uint32_t kSparseSurfaceDirectionMaskShift = 8u;
 constexpr uint32_t kSparseSurfaceDirectionMaskBits = 0x3Fu;
+constexpr uint32_t kSparseSurfaceDebugWavePixel = 0x80000000u;
 
 inline uint32_t SparseSurfaceDirectionBit(uint32_t direction) {
     return direction < 6u ? (1u << direction) : 0u;

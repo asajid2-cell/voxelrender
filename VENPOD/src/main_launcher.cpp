@@ -105,6 +105,11 @@ struct ExactSurfaceNonCoverageAuditSample {
     glm::vec3 midWorld{0.0f};
 };
 
+struct MidUnderlayAuditPixel {
+    int32_t pixelX = 0;
+    int32_t pixelY = 0;
+};
+
 struct ExactRequestLifecycleAuditSample {
     uint32_t frame = 0;
     std::string region;
@@ -214,6 +219,49 @@ static int32_t ParseIntOr(const std::string& value, int32_t fallback) {
     errno = 0;
     const long parsed = std::strtol(value.c_str(), &end, 10);
     return end != value.c_str() && errno != ERANGE ? static_cast<int32_t>(parsed) : fallback;
+}
+
+static std::vector<MidUnderlayAuditPixel> LoadMidUnderlayAuditPixels(
+    const std::filesystem::path& inputPath,
+    uint32_t maxPixels)
+{
+    std::vector<MidUnderlayAuditPixel> pixels;
+    std::ifstream input(inputPath);
+    if (!input) {
+        spdlog::warn("Mid underlay audit could not open pixel input {}", inputPath.string());
+        return pixels;
+    }
+    std::string headerLine;
+    if (!std::getline(input, headerLine)) {
+        return pixels;
+    }
+    const std::vector<std::string> header = SplitCsvLine(headerLine);
+    std::unordered_map<std::string, size_t> column;
+    for (size_t i = 0; i < header.size(); ++i) {
+        column[header[i]] = i;
+    }
+    auto get = [&](const std::vector<std::string>& row, const char* name) -> std::string {
+        const auto it = column.find(name);
+        return it != column.end() && it->second < row.size() ? row[it->second] : std::string();
+    };
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        const std::vector<std::string> row = SplitCsvLine(line);
+        MidUnderlayAuditPixel pixel;
+        pixel.pixelX = ParseIntOr(get(row, "pixelX"), -1);
+        pixel.pixelY = ParseIntOr(get(row, "pixelY"), -1);
+        if (pixel.pixelX < 0 || pixel.pixelY < 0) {
+            continue;
+        }
+        pixels.push_back(pixel);
+        if (maxPixels != 0u && pixels.size() >= maxPixels) {
+            break;
+        }
+    }
+    return pixels;
 }
 
 static std::vector<ExactSurfaceNonCoverageAuditSample> LoadExactSurfaceNonCoverageAuditSamples(
@@ -450,6 +498,1198 @@ static bool RayIntersectsSparseSurfaceFace(
     if (outT) *outT = t;
     if (outHit) *outHit = hit;
     return true;
+}
+
+static uint32_t AppendMidUnderlayExactContractAuditSamples(
+    const Simulation::SparseClipmapTileCache& midClipmap,
+    std::vector<ExactSurfaceNonCoverageAuditSample>& outSamples,
+    uint32_t frameIndex,
+    const glm::vec3& cameraPos,
+    const glm::vec3& cameraForward,
+    const glm::vec3& cameraRight,
+    const glm::vec3& cameraUp,
+    float fovYRadians,
+    float aspectRatio,
+    uint32_t viewportWidth,
+    uint32_t viewportHeight,
+    float publicExactMaxDistance,
+    bool useXzSurfaceClip,
+    float midMinDistance,
+    float midMaxDistance,
+    uint32_t maxSamples,
+    uint32_t candidateStride)
+{
+    if (maxSamples == 0u ||
+        publicExactMaxDistance <= 0.0f ||
+        viewportWidth == 0u ||
+        viewportHeight == 0u ||
+        aspectRatio <= 0.0f) {
+        return 0u;
+    }
+
+    std::vector<Simulation::MidMeshGpuExtractDirtyTile> tiles;
+    midClipmap.CollectAllResidentMidMeshGpuExtractTiles(tiles);
+    if (tiles.empty()) {
+        return 0u;
+    }
+
+    const float tanHalfFov = std::tan(fovYRadians * 0.5f);
+    if (!std::isfinite(tanHalfFov) || tanHalfFov <= 0.0f) {
+        return 0u;
+    }
+
+    const uint32_t stride = std::max(1u, candidateStride);
+    uint32_t candidateIndex = 0u;
+    uint32_t appended = 0u;
+    std::unordered_set<uint64_t> occupiedScreenCells;
+    std::vector<Simulation::SparseSurfaceFace> faces;
+
+    auto clipMetric = [&](const glm::vec3& world) -> float {
+        const glm::vec3 cameraToWorld = world - cameraPos;
+        return useXzSurfaceClip
+            ? glm::length(glm::vec2(cameraToWorld.x, cameraToWorld.z))
+            : glm::length(cameraToWorld);
+    };
+
+    for (const Simulation::MidMeshGpuExtractDirtyTile& tile : tiles) {
+        if (appended >= maxSamples) {
+            break;
+        }
+        if (!midClipmap.GetMidMeshTileCacheFacesBySlot(tile.slot, faces)) {
+            continue;
+        }
+        for (const Simulation::SparseSurfaceFace& face : faces) {
+            if (appended >= maxSamples) {
+                break;
+            }
+            const uint32_t extent = std::max(
+                Simulation::SparseSurfacePayloadWidth(face.payload),
+                Simulation::SparseSurfacePayloadHeight(face.payload));
+            if (extent < 4u) {
+                continue;
+            }
+
+            const glm::vec3 center = SparseSurfaceFaceCenter(face);
+            const float publicMetric = clipMetric(center);
+            if (publicMetric > publicExactMaxDistance) {
+                continue;
+            }
+            if (midMaxDistance > 0.0f && publicMetric > midMaxDistance) {
+                continue;
+            }
+            if (midMinDistance > 0.0f && publicMetric < midMinDistance) {
+                continue;
+            }
+
+            const glm::vec3 cameraToFace = center - cameraPos;
+            const float distance = glm::length(cameraToFace);
+            if (!std::isfinite(distance) || distance <= 0.001f) {
+                continue;
+            }
+            const uint32_t direction = Simulation::SparseSurfacePayloadDirection(face.payload);
+            const glm::vec3 normal = SparseSurfaceFaceNormal(direction);
+            const float frontFacing = glm::dot(normal, -cameraToFace / distance);
+            if (frontFacing < -0.0001f) {
+                continue;
+            }
+
+            const float viewZ = glm::dot(cameraToFace, cameraForward);
+            if (viewZ <= 0.05f) {
+                continue;
+            }
+            const float viewX = glm::dot(cameraToFace, cameraRight);
+            const float viewY = glm::dot(cameraToFace, cameraUp);
+            const float ndcX = viewX / std::max(viewZ * tanHalfFov * aspectRatio, 0.001f);
+            const float ndcY = viewY / std::max(viewZ * tanHalfFov, 0.001f);
+            if (std::abs(ndcX) > 1.0f || std::abs(ndcY) > 1.0f) {
+                continue;
+            }
+
+            if ((candidateIndex++ % stride) != 0u) {
+                continue;
+            }
+
+            const int32_t pixelX = static_cast<int32_t>(
+                std::clamp((ndcX * 0.5f + 0.5f) * static_cast<float>(viewportWidth), 0.0f,
+                    static_cast<float>(viewportWidth - 1u)));
+            const int32_t pixelY = static_cast<int32_t>(
+                std::clamp((1.0f - (ndcY * 0.5f + 0.5f)) * static_cast<float>(viewportHeight), 0.0f,
+                    static_cast<float>(viewportHeight - 1u)));
+            const uint32_t cellX = static_cast<uint32_t>(std::max(pixelX, 0)) / 32u;
+            const uint32_t cellY = static_cast<uint32_t>(std::max(pixelY, 0)) / 32u;
+            const uint64_t cellKey =
+                (static_cast<uint64_t>(cellY) << 32u) | static_cast<uint64_t>(cellX);
+            if (!occupiedScreenCells.insert(cellKey).second) {
+                continue;
+            }
+
+            ExactSurfaceNonCoverageAuditSample sample;
+            sample.frame = frameIndex;
+            sample.region = "mid_underlay_exact_contract";
+            sample.pixelX = pixelX;
+            sample.pixelY = pixelY;
+            sample.midDistance = distance;
+            sample.midWorld = center;
+            outSamples.push_back(sample);
+            ++appended;
+        }
+    }
+
+    return appended;
+}
+
+static uint32_t AppendMidUnderlayExactContractAuditSamplesForPixels(
+    const Simulation::SparseClipmapTileCache& midClipmap,
+    const std::vector<MidUnderlayAuditPixel>& pixels,
+    std::vector<ExactSurfaceNonCoverageAuditSample>& outSamples,
+    uint32_t frameIndex,
+    const glm::vec3& cameraPos,
+    const glm::vec3& cameraForward,
+    const glm::vec3& cameraRight,
+    const glm::vec3& cameraUp,
+    float fovYRadians,
+    float aspectRatio,
+    uint32_t viewportWidth,
+    uint32_t viewportHeight,
+    float publicExactMaxDistance,
+    bool useXzSurfaceClip,
+    float midMinDistance,
+    float midMaxDistance,
+    uint32_t maxSamples)
+{
+    if (maxSamples == 0u ||
+        pixels.empty() ||
+        publicExactMaxDistance <= 0.0f ||
+        viewportWidth == 0u ||
+        viewportHeight == 0u ||
+        aspectRatio <= 0.0f) {
+        return 0u;
+    }
+
+    std::vector<Simulation::MidMeshGpuExtractDirtyTile> tiles;
+    midClipmap.CollectAllResidentMidMeshGpuExtractTiles(tiles);
+    if (tiles.empty()) {
+        return 0u;
+    }
+
+    const float tanHalfFov = std::tan(fovYRadians * 0.5f);
+    if (!std::isfinite(tanHalfFov) || tanHalfFov <= 0.0f) {
+        return 0u;
+    }
+
+    auto clipMetric = [&](const glm::vec3& world) -> float {
+        const glm::vec3 cameraToWorld = world - cameraPos;
+        return useXzSurfaceClip
+            ? glm::length(glm::vec2(cameraToWorld.x, cameraToWorld.z))
+            : glm::length(cameraToWorld);
+    };
+
+    uint32_t appended = 0u;
+    std::vector<Simulation::SparseSurfaceFace> faces;
+    for (const MidUnderlayAuditPixel& pixel : pixels) {
+        if (appended >= maxSamples) {
+            break;
+        }
+        if (pixel.pixelX < 0 || pixel.pixelY < 0 ||
+            static_cast<uint32_t>(pixel.pixelX) >= viewportWidth ||
+            static_cast<uint32_t>(pixel.pixelY) >= viewportHeight) {
+            continue;
+        }
+
+        const float ndcX =
+            ((static_cast<float>(pixel.pixelX) + 0.5f) / static_cast<float>(viewportWidth)) *
+                2.0f - 1.0f;
+        const float ndcY =
+            1.0f -
+            ((static_cast<float>(pixel.pixelY) + 0.5f) / static_cast<float>(viewportHeight)) *
+                2.0f;
+        glm::vec3 rayDir =
+            cameraForward +
+            cameraRight * (ndcX * tanHalfFov * aspectRatio) +
+            cameraUp * (ndcY * tanHalfFov);
+        const float rayLength = glm::length(rayDir);
+        if (!std::isfinite(rayLength) || rayLength <= 0.0001f) {
+            continue;
+        }
+        rayDir /= rayLength;
+
+        bool midFound = false;
+        float nearestMidT = std::numeric_limits<float>::max();
+        glm::vec3 nearestMidHit(0.0f);
+        for (const Simulation::MidMeshGpuExtractDirtyTile& tile : tiles) {
+            if (!midClipmap.GetMidMeshTileCacheFacesBySlot(tile.slot, faces)) {
+                continue;
+            }
+            for (const Simulation::SparseSurfaceFace& face : faces) {
+                const uint32_t extent = std::max(
+                    Simulation::SparseSurfacePayloadWidth(face.payload),
+                    Simulation::SparseSurfacePayloadHeight(face.payload));
+                if (extent < 4u) {
+                    continue;
+                }
+                const glm::vec3 center = SparseSurfaceFaceCenter(face);
+                const glm::vec3 cameraToFace = center - cameraPos;
+                const float distance = glm::length(cameraToFace);
+                if (!std::isfinite(distance) || distance <= 0.001f) {
+                    continue;
+                }
+                const uint32_t direction = Simulation::SparseSurfacePayloadDirection(face.payload);
+                const glm::vec3 normal = SparseSurfaceFaceNormal(direction);
+                const float frontFacing = glm::dot(normal, -cameraToFace / distance);
+                if (frontFacing < -0.0001f) {
+                    continue;
+                }
+
+                float t = 0.0f;
+                glm::vec3 hit(0.0f);
+                if (!RayIntersectsSparseSurfaceFace(cameraPos, rayDir, face, &t, &hit) ||
+                    t >= nearestMidT) {
+                    continue;
+                }
+                const float metric = clipMetric(hit);
+                if (metric > publicExactMaxDistance) {
+                    continue;
+                }
+                if (midMaxDistance > 0.0f && metric > midMaxDistance) {
+                    continue;
+                }
+                if (midMinDistance > 0.0f && metric < midMinDistance) {
+                    continue;
+                }
+                midFound = true;
+                nearestMidT = t;
+                nearestMidHit = hit;
+            }
+        }
+
+        if (!midFound) {
+            continue;
+        }
+
+        ExactSurfaceNonCoverageAuditSample sample;
+        sample.frame = frameIndex;
+        sample.region = "mid_underlay_exact_contract_pixel";
+        sample.pixelX = pixel.pixelX;
+        sample.pixelY = pixel.pixelY;
+        sample.midDistance = nearestMidT;
+        sample.midWorld = nearestMidHit;
+        outSamples.push_back(sample);
+        ++appended;
+    }
+
+    return appended;
+}
+
+struct ExactCoverageAuditStats {
+    uint32_t tilesTotal = 0;
+    uint32_t tilesReady = 0;
+    uint32_t tilesSkipped = 0;
+    uint32_t tilesCapped = 0;
+    uint32_t exactBricksTotal = 0;
+    uint32_t exactBricksReady = 0;
+    uint32_t notSurfaceKnown = 0;
+    uint32_t cpuNoFaces = 0;
+    uint32_t gpuNotPresent = 0;
+    uint32_t gpuPayloadMissing = 0;
+    uint32_t gpuRecordMissing = 0;
+    uint32_t gpuDrawMissing = 0;
+    uint32_t gpuRangeMissing = 0;
+    uint32_t gpuFaceCountMismatch = 0;
+    float nearestHoleDistance = std::numeric_limits<float>::max();
+    Simulation::BrickCoord nearestHoleTile{};
+    Simulation::BrickCoord nearestHoleExact{};
+};
+
+struct TerrainOwnershipState {
+    bool exactOwner = false;
+    uint64_t heldSinceFrame = 0;
+    uint64_t lastSeenFrame = 0;
+};
+
+struct ExactBrickOwnershipState {
+    bool exactOwner = false;
+    uint64_t heldSinceFrame = 0;
+    uint64_t dissolveStartFrame = 0;
+    uint64_t lastExactFrame = 0;
+    uint64_t lastSeenFrame = 0;
+};
+
+struct TerrainOwnershipResolveStats {
+    uint32_t tilesConsidered = 0;
+    uint32_t tilesReady = 0;
+    uint32_t tilesExactOwned = 0;
+    uint32_t tilesHeldMid = 0;
+    uint32_t tilesVisible = 0;
+    uint32_t tilesSafeCommit = 0;
+    uint32_t inViewMidToExactBlocked = 0;
+    uint32_t midToExactCommits = 0;
+    uint32_t exactToMidDemotes = 0;
+    uint32_t exactBricksBlocked = 0;
+    uint32_t exactBricksAllowed = 0;
+    uint32_t prunedStates = 0;
+};
+
+struct ExactBrickOwnershipResolveStats {
+    uint32_t bricksConsidered = 0;
+    uint32_t bricksReady = 0;
+    uint32_t exactOwned = 0;
+    uint32_t heldMid = 0;
+    uint32_t visible = 0;
+    uint32_t safe = 0;
+    uint32_t dissolving = 0;
+    uint32_t dissolveStarted = 0;
+    uint32_t dissolveCommits = 0;
+    uint32_t instantRecommits = 0;
+    uint32_t inViewExactBlocked = 0;
+    uint32_t midToExactCommits = 0;
+    uint32_t exactToMidDemotes = 0;
+    uint32_t blockedDraws = 0;
+    uint32_t prunedStates = 0;
+};
+
+enum class ExactCoverageBrickStatus : uint8_t {
+    Ready,
+    NotSurfaceKnown,
+    CpuNoFaces,
+    GpuNotPresent,
+    GpuPayloadMissing,
+    GpuRecordMissing,
+    GpuDrawMissing,
+    GpuRangeMissing,
+    GpuFaceCountMismatch
+};
+
+static bool CollectExactCoverageCoordsForMidTile(
+    const Simulation::MidMeshGpuExtractDirtyTile& tile,
+    std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash>& outExactCoords,
+    uint32_t maxExactBricksPerTile,
+    bool* outCapped = nullptr)
+{
+    outExactCoords.clear();
+    if (outCapped) {
+        *outCapped = false;
+    }
+    if (tile.faceCount == 0u || tile.sampleCount < 4u || tile.cellSize <= 0.0f) {
+        return false;
+    }
+
+    const uint32_t side = static_cast<uint32_t>(
+        std::round(std::sqrt(static_cast<float>(tile.sampleCount))));
+    if (side < 2u || side * side != tile.sampleCount) {
+        return false;
+    }
+
+    const uint32_t cellCount = side - 1u;
+    const double tileWorldSizeD =
+        static_cast<double>(std::max(tile.cellSize, 1.0f)) *
+        static_cast<double>(cellCount);
+    if (!std::isfinite(tileWorldSizeD) || tileWorldSizeD <= 0.0) {
+        return false;
+    }
+
+    const int64_t maxX64 =
+        static_cast<int64_t>(tile.originX) +
+        static_cast<int64_t>(std::ceil(tileWorldSizeD)) - 1;
+    const int64_t maxZ64 =
+        static_cast<int64_t>(tile.originZ) +
+        static_cast<int64_t>(std::ceil(tileWorldSizeD)) - 1;
+    const int32_t maxX = static_cast<int32_t>(std::clamp<int64_t>(
+        maxX64,
+        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
+    const int32_t maxZ = static_cast<int32_t>(std::clamp<int64_t>(
+        maxZ64,
+        static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+        static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
+    const int32_t minY = std::min(tile.minY, tile.maxY);
+    const int32_t maxY = std::max(tile.minY, tile.maxY);
+
+    const Simulation::BrickCoord minCoord =
+        Simulation::BrickCoord::FromWorldVoxel(tile.originX, minY, tile.originZ);
+    const Simulation::BrickCoord maxCoord =
+        Simulation::BrickCoord::FromWorldVoxel(maxX, maxY, maxZ);
+    const uint32_t brickLimit =
+        maxExactBricksPerTile == 0u ? UINT32_MAX : maxExactBricksPerTile;
+    bool capped = false;
+    for (int32_t z = minCoord.z; z <= maxCoord.z && !capped; ++z) {
+        for (int32_t y = minCoord.y; y <= maxCoord.y && !capped; ++y) {
+            for (int32_t x = minCoord.x; x <= maxCoord.x; ++x) {
+                outExactCoords.insert(Simulation::BrickCoord{x, y, z});
+                if (outExactCoords.size() >= brickLimit) {
+                    capped = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (outCapped) {
+        *outCapped = capped;
+    }
+    return !outExactCoords.empty();
+}
+
+static float MidTileEdgeDistanceToCamera(
+    const Simulation::MidMeshGpuExtractDirtyTile& tile,
+    const glm::vec3& cameraPos,
+    bool useXzSurfaceClip)
+{
+    const uint32_t side = static_cast<uint32_t>(
+        std::round(std::sqrt(static_cast<float>(std::max(1u, tile.sampleCount)))));
+    const float tileWorldSize =
+        std::max(1.0f, tile.cellSize) * static_cast<float>(std::max(1u, side) - 1u);
+    const glm::vec3 center(
+        static_cast<float>(tile.originX) + tileWorldSize * 0.5f,
+        static_cast<float>(tile.minY + tile.maxY) * 0.5f,
+        static_cast<float>(tile.originZ) + tileWorldSize * 0.5f);
+    const glm::vec3 cameraToTile = center - cameraPos;
+    const float halfDiagonalXz = tileWorldSize * 0.70710678f;
+    return useXzSurfaceClip
+        ? std::max(0.0f, glm::length(glm::vec2(cameraToTile.x, cameraToTile.z)) - halfDiagonalXz)
+        : std::max(0.0f, glm::length(cameraToTile) - halfDiagonalXz);
+}
+
+static bool MidTileVisibleInCameraView(
+    const Simulation::MidMeshGpuExtractDirtyTile& tile,
+    const glm::vec3& cameraPos,
+    const glm::vec3& cameraForward,
+    const glm::vec3& cameraRight,
+    const glm::vec3& cameraUp,
+    float fovYRadians,
+    float aspectRatio,
+    float padding)
+{
+    if (tile.sampleCount < 4u || tile.cellSize <= 0.0f || aspectRatio <= 0.0f) {
+        return false;
+    }
+    const uint32_t side = static_cast<uint32_t>(
+        std::round(std::sqrt(static_cast<float>(tile.sampleCount))));
+    if (side < 2u || side * side != tile.sampleCount) {
+        return false;
+    }
+    const uint32_t cellCount = side - 1u;
+    const float tileWorldSize = std::max(1.0f, tile.cellSize) * static_cast<float>(cellCount);
+    const float centerX = static_cast<float>(tile.originX) + tileWorldSize * 0.5f;
+    const float centerZ = static_cast<float>(tile.originZ) + tileWorldSize * 0.5f;
+    const float radius = tileWorldSize * 0.70710678f + std::max(0.0f, padding);
+    const float verticalRadius =
+        radius + std::max(256.0f, std::abs(cameraPos.y - static_cast<float>(tile.maxY)) + 128.0f);
+    const float relX = centerX - cameraPos.x;
+    const float relY = (static_cast<float>(tile.minY + tile.maxY) * 0.5f) - cameraPos.y;
+    const float relZ = centerZ - cameraPos.z;
+    const float viewX = relX * cameraRight.x + relY * cameraRight.y + relZ * cameraRight.z;
+    const float viewY = relX * cameraUp.x + relY * cameraUp.y + relZ * cameraUp.z;
+    const float viewZ = relX * cameraForward.x + relY * cameraForward.y + relZ * cameraForward.z;
+    if (viewZ < -radius) {
+        return false;
+    }
+    const float tanHalfFov = std::tan(fovYRadians * 0.5f);
+    if (!std::isfinite(tanHalfFov) || tanHalfFov <= 0.0f) {
+        return false;
+    }
+    const float z = std::max(viewZ, 1.0f);
+    const float xLimit = z * tanHalfFov * std::max(0.1f, aspectRatio) + radius;
+    const float yLimit = z * tanHalfFov + verticalRadius;
+    return std::abs(viewX) <= xLimit && std::abs(viewY) <= yLimit;
+}
+
+static bool MidTileSwapSubpixel(
+    const Simulation::MidMeshGpuExtractDirtyTile& tile,
+    const glm::vec3& cameraPos,
+    uint32_t viewportHeight,
+    float fovYRadians,
+    float thresholdPixels)
+{
+    if (thresholdPixels <= 0.0f || viewportHeight == 0u || tile.cellSize <= 0.0f) {
+        return false;
+    }
+    const uint32_t side = static_cast<uint32_t>(
+        std::round(std::sqrt(static_cast<float>(std::max(1u, tile.sampleCount)))));
+    const float tileWorldSize =
+        std::max(1.0f, tile.cellSize) * static_cast<float>(std::max(1u, side) - 1u);
+    const glm::vec3 center(
+        static_cast<float>(tile.originX) + tileWorldSize * 0.5f,
+        static_cast<float>(tile.minY + tile.maxY) * 0.5f,
+        static_cast<float>(tile.originZ) + tileWorldSize * 0.5f);
+    const float distance = std::max(1.0f, glm::length(center - cameraPos));
+    const float tanHalfFov = std::tan(fovYRadians * 0.5f);
+    if (!std::isfinite(tanHalfFov) || tanHalfFov <= 0.0f) {
+        return false;
+    }
+    const float projectionScale =
+        static_cast<float>(viewportHeight) / (2.0f * tanHalfFov);
+    const float projectedCellPixels =
+        std::max(1.0f, tile.cellSize) * projectionScale / distance;
+    return projectedCellPixels <= thresholdPixels;
+}
+
+static glm::vec3 ExactBrickCenter(const Simulation::BrickCoord& coord)
+{
+    return glm::vec3(
+        static_cast<float>(coord.x * Simulation::SPARSE_BRICK_SIZE) +
+            static_cast<float>(Simulation::SPARSE_BRICK_SIZE) * 0.5f,
+        static_cast<float>(coord.y * Simulation::SPARSE_BRICK_SIZE) +
+            static_cast<float>(Simulation::SPARSE_BRICK_SIZE) * 0.5f,
+        static_cast<float>(coord.z * Simulation::SPARSE_BRICK_SIZE) +
+            static_cast<float>(Simulation::SPARSE_BRICK_SIZE) * 0.5f);
+}
+
+static float ExactBrickEdgeDistanceToCamera(
+    const Simulation::BrickCoord& coord,
+    const glm::vec3& cameraPos,
+    bool useXzSurfaceClip)
+{
+    const glm::vec3 center = ExactBrickCenter(coord);
+    const glm::vec3 cameraToBrick = center - cameraPos;
+    constexpr float kHalfDiagonalXz =
+        static_cast<float>(Simulation::SPARSE_BRICK_SIZE) * 0.70710678f;
+    constexpr float kHalfDiagonal3d =
+        static_cast<float>(Simulation::SPARSE_BRICK_SIZE) * 0.86602540f;
+    return useXzSurfaceClip
+        ? std::max(0.0f, glm::length(glm::vec2(cameraToBrick.x, cameraToBrick.z)) - kHalfDiagonalXz)
+        : std::max(0.0f, glm::length(cameraToBrick) - kHalfDiagonal3d);
+}
+
+static bool ExactBrickVisibleInCameraView(
+    const Simulation::BrickCoord& coord,
+    const glm::vec3& cameraPos,
+    const glm::vec3& cameraForward,
+    const glm::vec3& cameraRight,
+    const glm::vec3& cameraUp,
+    float fovYRadians,
+    float aspectRatio,
+    float padding)
+{
+    if (aspectRatio <= 0.0f) {
+        return false;
+    }
+    const glm::vec3 center = ExactBrickCenter(coord);
+    const glm::vec3 rel = center - cameraPos;
+    constexpr float kBrickRadius =
+        static_cast<float>(Simulation::SPARSE_BRICK_SIZE) * 0.86602540f;
+    const float radius = kBrickRadius + std::max(0.0f, padding);
+    const float viewX = glm::dot(rel, cameraRight);
+    const float viewY = glm::dot(rel, cameraUp);
+    const float viewZ = glm::dot(rel, cameraForward);
+    if (viewZ < -radius) {
+        return false;
+    }
+    const float tanHalfFov = std::tan(fovYRadians * 0.5f);
+    if (!std::isfinite(tanHalfFov) || tanHalfFov <= 0.0f) {
+        return false;
+    }
+    const float z = std::max(viewZ, 1.0f);
+    const float xLimit = z * tanHalfFov * std::max(0.1f, aspectRatio) + radius;
+    const float yLimit = z * tanHalfFov + radius;
+    return std::abs(viewX) <= xLimit && std::abs(viewY) <= yLimit;
+}
+
+static bool ExactBrickSwapSubpixel(
+    const Simulation::BrickCoord& coord,
+    const glm::vec3& cameraPos,
+    uint32_t viewportHeight,
+    float fovYRadians,
+    float thresholdPixels)
+{
+    if (thresholdPixels <= 0.0f || viewportHeight == 0u) {
+        return false;
+    }
+    const glm::vec3 center = ExactBrickCenter(coord);
+    const float distance = std::max(1.0f, glm::length(center - cameraPos));
+    const float tanHalfFov = std::tan(fovYRadians * 0.5f);
+    if (!std::isfinite(tanHalfFov) || tanHalfFov <= 0.0f) {
+        return false;
+    }
+    const float projectionScale =
+        static_cast<float>(viewportHeight) / (2.0f * tanHalfFov);
+    const float projectedBrickPixels =
+        static_cast<float>(Simulation::SPARSE_BRICK_SIZE) * projectionScale / distance;
+    return projectedBrickPixels <= thresholdPixels;
+}
+
+static ExactCoverageBrickStatus CheckExactCoverageBrickReady(
+    const Simulation::SparseSurfaceCache& surfaceCache,
+    const SparseSurfaceGpuResources& surfaceGpuResources,
+    const Simulation::BrickCoord& coord)
+{
+    if (!surfaceCache.IsSurfaceKnown(coord)) {
+        return ExactCoverageBrickStatus::NotSurfaceKnown;
+    }
+    const std::vector<Simulation::SparseSurfaceFace>* faces = surfaceCache.FindFaces(coord);
+    if (!faces || faces->empty()) {
+        return ExactCoverageBrickStatus::CpuNoFaces;
+    }
+
+    SparseSurfaceGpuBrickDebugInfo gpuInfo;
+    if (!surfaceGpuResources.TryGetBrickDebugInfo(coord, &gpuInfo)) {
+        return ExactCoverageBrickStatus::GpuNotPresent;
+    }
+    if (!gpuInfo.payloadResident || gpuInfo.payloadFaceCount == 0u) {
+        return ExactCoverageBrickStatus::GpuPayloadMissing;
+    }
+    if (!gpuInfo.surfaceRecordPresent || gpuInfo.surfaceRecordFaceCount == 0u) {
+        return ExactCoverageBrickStatus::GpuRecordMissing;
+    }
+    if (!gpuInfo.drawSlotPresent) {
+        return ExactCoverageBrickStatus::GpuDrawMissing;
+    }
+    if (!gpuInfo.rangePresent || gpuInfo.rangeFaceCount == 0u) {
+        return ExactCoverageBrickStatus::GpuRangeMissing;
+    }
+    if (gpuInfo.payloadFaceCount != faces->size() ||
+        gpuInfo.surfaceRecordFaceCount != faces->size() ||
+        gpuInfo.rangeFaceCount != faces->size()) {
+        return ExactCoverageBrickStatus::GpuFaceCountMismatch;
+    }
+    return ExactCoverageBrickStatus::Ready;
+}
+
+static void CountExactCoverageFailure(
+    ExactCoverageAuditStats& stats,
+    ExactCoverageBrickStatus status)
+{
+    switch (status) {
+    case ExactCoverageBrickStatus::Ready:
+        ++stats.exactBricksReady;
+        break;
+    case ExactCoverageBrickStatus::NotSurfaceKnown:
+        ++stats.notSurfaceKnown;
+        break;
+    case ExactCoverageBrickStatus::CpuNoFaces:
+        ++stats.cpuNoFaces;
+        break;
+    case ExactCoverageBrickStatus::GpuNotPresent:
+        ++stats.gpuNotPresent;
+        break;
+    case ExactCoverageBrickStatus::GpuPayloadMissing:
+        ++stats.gpuPayloadMissing;
+        break;
+    case ExactCoverageBrickStatus::GpuRecordMissing:
+        ++stats.gpuRecordMissing;
+        break;
+    case ExactCoverageBrickStatus::GpuDrawMissing:
+        ++stats.gpuDrawMissing;
+        break;
+    case ExactCoverageBrickStatus::GpuRangeMissing:
+        ++stats.gpuRangeMissing;
+        break;
+    case ExactCoverageBrickStatus::GpuFaceCountMismatch:
+        ++stats.gpuFaceCountMismatch;
+        break;
+    }
+}
+
+static void ResolveExactBrickOwnership(
+    const Simulation::SparseSurfaceCache& surfaceCache,
+    const SparseSurfaceGpuResources& surfaceGpuResources,
+    const glm::vec3& cameraPos,
+    const glm::vec3& cameraForward,
+    const glm::vec3& cameraRight,
+    const glm::vec3& cameraUp,
+    float fovYRadians,
+    float aspectRatio,
+    uint32_t viewportHeight,
+    float displayRadius,
+    bool useXzSurfaceClip,
+    float visibilityPadding,
+    float farSafeSwapDistance,
+    float subpixelThreshold,
+    uint32_t maxHoldFrames,
+    uint32_t ditherFrames,
+    uint32_t dissolveFrames,
+    uint32_t instantRecommitWindowFrames,
+    uint64_t frameIndex,
+    std::unordered_map<Simulation::BrickCoord, ExactBrickOwnershipState, Simulation::BrickCoordHash>& states,
+    std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash>& outExactBricksBlockedByMid,
+    std::unordered_map<Simulation::BrickCoord, float, Simulation::BrickCoordHash>& outExactBrickDrawFraction,
+    ExactBrickOwnershipResolveStats& outStats)
+{
+    outExactBricksBlockedByMid.clear();
+    outExactBrickDrawFraction.clear();
+    outStats = {};
+    if (displayRadius <= 0.0f || !surfaceGpuResources.IsInitialized()) {
+        return;
+    }
+
+    std::vector<Simulation::BrickCoord> drawableCoords;
+    surfaceGpuResources.CollectDrawableCoords(drawableCoords);
+    if (drawableCoords.empty()) {
+        return;
+    }
+    std::sort(drawableCoords.begin(), drawableCoords.end(), [&](const auto& a, const auto& b) {
+        return ExactBrickEdgeDistanceToCamera(a, cameraPos, useXzSurfaceClip) <
+            ExactBrickEdgeDistanceToCamera(b, cameraPos, useXzSurfaceClip);
+    });
+
+    std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash> liveCoords;
+    liveCoords.reserve(drawableCoords.size());
+    for (const Simulation::BrickCoord& coord : drawableCoords) {
+        const float brickDistance =
+            ExactBrickEdgeDistanceToCamera(coord, cameraPos, useXzSurfaceClip);
+        if (brickDistance > displayRadius) {
+            continue;
+        }
+        ++outStats.bricksConsidered;
+        liveCoords.insert(coord);
+
+        const bool exactReady =
+            CheckExactCoverageBrickReady(surfaceCache, surfaceGpuResources, coord) ==
+            ExactCoverageBrickStatus::Ready;
+        if (exactReady) {
+            ++outStats.bricksReady;
+        }
+
+        ExactBrickOwnershipState& state = states[coord];
+        state.lastSeenFrame = frameIndex;
+        const bool wasExact = state.exactOwner;
+        const bool visible = ExactBrickVisibleInCameraView(
+            coord,
+            cameraPos,
+            cameraForward,
+            cameraRight,
+            cameraUp,
+            fovYRadians,
+            aspectRatio,
+            visibilityPadding);
+        if (visible) {
+            ++outStats.visible;
+        }
+        const bool subpixel = ExactBrickSwapSubpixel(
+            coord,
+            cameraPos,
+            viewportHeight,
+            fovYRadians,
+            subpixelThreshold);
+        const bool farSafe =
+            farSafeSwapDistance > 0.0f && brickDistance >= farSafeSwapDistance;
+        // A brick that owned exact very recently (edit/dirty re-upload flap)
+        // re-commits instantly: showing coarse mid over a fresh edit is worse
+        // than the (already-seen-as-exact) swap.
+        const bool recentExactFlap =
+            instantRecommitWindowFrames > 0u &&
+            state.lastExactFrame != 0u &&
+            frameIndex >= state.lastExactFrame &&
+            (frameIndex - state.lastExactFrame) <=
+                static_cast<uint64_t>(instantRecommitWindowFrames);
+        // Imperceptible commits are safe immediately. There is NO timeout that
+        // instantly flips a visible brick: visible commits only ever happen
+        // through the gradual per-face dissolve below.
+        const bool safeCommit = !visible || subpixel || farSafe || recentExactFlap;
+        if (safeCommit) {
+            ++outStats.safe;
+        }
+
+        bool nextExact = wasExact;
+        float drawFraction = wasExact ? 1.0f : 0.0f;
+        if (wasExact) {
+            if (!exactReady) {
+                nextExact = false;
+                state.dissolveStartFrame = 0u;
+                ++outStats.exactToMidDemotes;
+            }
+        } else if (exactReady) {
+            if (safeCommit) {
+                nextExact = true;
+                ++outStats.midToExactCommits;
+                if (recentExactFlap && visible && !subpixel && !farSafe) {
+                    ++outStats.instantRecommits;
+                }
+            } else {
+                // Visible upgrade: stabilize, then dissolve in face-by-face.
+                if (state.heldSinceFrame == 0u) {
+                    state.heldSinceFrame = frameIndex;
+                }
+                if (state.dissolveStartFrame == 0u) {
+                    const uint32_t holdJitterFrames =
+                        ditherFrames == 0u
+                            ? 0u
+                            : (Simulation::HashBrickCoord32(coord) % (ditherFrames + 1u));
+                    const uint64_t holdLimitFrames =
+                        static_cast<uint64_t>(maxHoldFrames) +
+                        static_cast<uint64_t>(holdJitterFrames);
+                    if (maxHoldFrames > 0u &&
+                        frameIndex >= state.heldSinceFrame &&
+                        (frameIndex - state.heldSinceFrame) >= holdLimitFrames) {
+                        state.dissolveStartFrame = frameIndex;
+                        ++outStats.dissolveStarted;
+                    } else {
+                        ++outStats.inViewExactBlocked;
+                    }
+                }
+                if (state.dissolveStartFrame != 0u) {
+                    const uint64_t dissolveElapsed =
+                        frameIndex - state.dissolveStartFrame;
+                    if (dissolveFrames == 0u ||
+                        dissolveElapsed >= static_cast<uint64_t>(dissolveFrames)) {
+                        nextExact = true;
+                        ++outStats.midToExactCommits;
+                        ++outStats.dissolveCommits;
+                    } else {
+                        drawFraction =
+                            static_cast<float>(dissolveElapsed + 1u) /
+                            static_cast<float>(dissolveFrames + 1u);
+                        ++outStats.dissolving;
+                    }
+                }
+            }
+        }
+        if (!exactReady || nextExact) {
+            state.heldSinceFrame = 0u;
+        }
+        if (nextExact) {
+            state.dissolveStartFrame = 0u;
+            state.lastExactFrame = frameIndex;
+            drawFraction = 1.0f;
+        }
+        state.exactOwner = nextExact;
+
+        if (nextExact) {
+            ++outStats.exactOwned;
+        } else {
+            ++outStats.heldMid;
+            if (drawFraction > 0.0f) {
+                outExactBrickDrawFraction.emplace(coord, drawFraction);
+            } else {
+                outExactBricksBlockedByMid.insert(coord);
+            }
+        }
+    }
+    outStats.blockedDraws = static_cast<uint32_t>(std::min<size_t>(
+        outExactBricksBlockedByMid.size(),
+        static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+
+    for (auto it = states.begin(); it != states.end();) {
+        if (liveCoords.find(it->first) == liveCoords.end() &&
+            frameIndex > it->second.lastSeenFrame + 120u) {
+            it = states.erase(it);
+            ++outStats.prunedStates;
+        } else {
+            ++it;
+        }
+    }
+}
+
+static void ResolveTerrainOwnershipForMidTiles(
+    const Simulation::SparseClipmapTileCache& midClipmap,
+    const Simulation::SparseSurfaceCache& surfaceCache,
+    const SparseSurfaceGpuResources& surfaceGpuResources,
+    const glm::vec3& cameraPos,
+    const glm::vec3& cameraForward,
+    const glm::vec3& cameraRight,
+    const glm::vec3& cameraUp,
+    float fovYRadians,
+    float aspectRatio,
+    uint32_t viewportHeight,
+    float displayRadius,
+    bool useXzSurfaceClip,
+    float visibilityPadding,
+    float farSafeSwapDistance,
+    float subpixelThreshold,
+    uint32_t maxHoldFrames,
+    uint64_t frameIndex,
+    uint32_t maxTiles,
+    uint32_t maxExactBricksPerTile,
+    std::unordered_map<Simulation::BrickCoord, TerrainOwnershipState, Simulation::BrickCoordHash>& states,
+    std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash>& outMidTilesOwnedByExact,
+    std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash>& outExactBricksBlockedByMid,
+    TerrainOwnershipResolveStats& outStats)
+{
+    outMidTilesOwnedByExact.clear();
+    outExactBricksBlockedByMid.clear();
+    outStats = {};
+    if (displayRadius <= 0.0f || !surfaceGpuResources.IsInitialized()) {
+        return;
+    }
+
+    std::vector<Simulation::MidMeshGpuExtractDirtyTile> tiles;
+    midClipmap.CollectAllResidentMidMeshGpuExtractTiles(tiles);
+    if (tiles.empty()) {
+        return;
+    }
+
+    std::sort(tiles.begin(), tiles.end(), [&](const auto& a, const auto& b) {
+        return MidTileEdgeDistanceToCamera(a, cameraPos, useXzSurfaceClip) <
+            MidTileEdgeDistanceToCamera(b, cameraPos, useXzSurfaceClip);
+    });
+
+    const uint32_t tileLimit = maxTiles == 0u ? UINT32_MAX : maxTiles;
+    std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash> liveTiles;
+    liveTiles.reserve(std::min<size_t>(tiles.size(), tileLimit));
+    std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash> exactCoords;
+
+    for (const Simulation::MidMeshGpuExtractDirtyTile& tile : tiles) {
+        if (outStats.tilesConsidered >= tileLimit) {
+            break;
+        }
+        const float tileDistance =
+            MidTileEdgeDistanceToCamera(tile, cameraPos, useXzSurfaceClip);
+        if (tileDistance > displayRadius) {
+            continue;
+        }
+        bool capped = false;
+        if (!CollectExactCoverageCoordsForMidTile(
+                tile,
+                exactCoords,
+                maxExactBricksPerTile,
+                &capped)) {
+            continue;
+        }
+        ++outStats.tilesConsidered;
+        liveTiles.insert(tile.coord);
+
+        bool exactReady = !capped;
+        for (const Simulation::BrickCoord& coord : exactCoords) {
+            if (CheckExactCoverageBrickReady(surfaceCache, surfaceGpuResources, coord) !=
+                ExactCoverageBrickStatus::Ready) {
+                exactReady = false;
+                break;
+            }
+        }
+        if (exactReady) {
+            ++outStats.tilesReady;
+        }
+
+        TerrainOwnershipState& state = states[tile.coord];
+        state.lastSeenFrame = frameIndex;
+        const bool wasExact = state.exactOwner;
+        const bool visible = MidTileVisibleInCameraView(
+            tile,
+            cameraPos,
+            cameraForward,
+            cameraRight,
+            cameraUp,
+            fovYRadians,
+            aspectRatio,
+            visibilityPadding);
+        if (visible) {
+            ++outStats.tilesVisible;
+        }
+
+        const bool subpixel = MidTileSwapSubpixel(
+            tile,
+            cameraPos,
+            viewportHeight,
+            fovYRadians,
+            subpixelThreshold);
+        const bool farSafe =
+            farSafeSwapDistance > 0.0f && tileDistance >= farSafeSwapDistance;
+        const bool timedOut =
+            maxHoldFrames > 0u &&
+            state.heldSinceFrame != 0u &&
+            frameIndex >= state.heldSinceFrame &&
+            (frameIndex - state.heldSinceFrame) >= maxHoldFrames;
+        const bool safeCommit = !visible || subpixel || farSafe || timedOut;
+        if (safeCommit) {
+            ++outStats.tilesSafeCommit;
+        }
+
+        bool nextExact = wasExact;
+        if (wasExact) {
+            if (!exactReady) {
+                nextExact = false;
+                ++outStats.exactToMidDemotes;
+            }
+        } else if (exactReady) {
+            nextExact = safeCommit;
+            if (nextExact) {
+                ++outStats.midToExactCommits;
+            } else {
+                ++outStats.inViewMidToExactBlocked;
+                if (state.heldSinceFrame == 0u) {
+                    state.heldSinceFrame = frameIndex;
+                }
+            }
+        }
+        if (!exactReady || nextExact) {
+            state.heldSinceFrame = 0u;
+        }
+        state.exactOwner = nextExact;
+
+        if (nextExact) {
+            outMidTilesOwnedByExact.insert(tile.coord);
+            outStats.exactBricksAllowed += static_cast<uint32_t>(
+                std::min<size_t>(exactCoords.size(), std::numeric_limits<uint32_t>::max()));
+            ++outStats.tilesExactOwned;
+        } else {
+            for (const Simulation::BrickCoord& coord : exactCoords) {
+                outExactBricksBlockedByMid.insert(coord);
+            }
+            ++outStats.tilesHeldMid;
+        }
+    }
+
+    outStats.exactBricksBlocked = static_cast<uint32_t>(
+        std::min<size_t>(
+            outExactBricksBlockedByMid.size(),
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+
+    for (auto it = states.begin(); it != states.end();) {
+        if (liveTiles.find(it->first) == liveTiles.end() &&
+            frameIndex > it->second.lastSeenFrame + 120u) {
+            it = states.erase(it);
+            ++outStats.prunedStates;
+        } else {
+            ++it;
+        }
+    }
+}
+
+static ExactCoverageAuditStats AuditExactCoverageForMidTiles(
+    const Simulation::SparseClipmapTileCache& midClipmap,
+    const Simulation::SparseSurfaceCache& surfaceCache,
+    const SparseSurfaceGpuResources& surfaceGpuResources,
+    const glm::vec3& cameraPos,
+    float advertisedExactRadius,
+    float actualRenderExactRadius,
+    bool useXzSurfaceClip,
+    uint32_t maxTiles,
+    uint32_t maxExactBricksPerTile)
+{
+    ExactCoverageAuditStats stats;
+    const float auditRadius = std::max(advertisedExactRadius, actualRenderExactRadius);
+    if (auditRadius <= 0.0f || !surfaceGpuResources.IsInitialized()) {
+        return stats;
+    }
+
+    std::vector<Simulation::MidMeshGpuExtractDirtyTile> tiles;
+    midClipmap.CollectAllResidentMidMeshGpuExtractTiles(tiles);
+    if (tiles.empty()) {
+        return stats;
+    }
+
+    std::sort(tiles.begin(), tiles.end(), [&](const auto& a, const auto& b) {
+        const uint32_t aSide =
+            static_cast<uint32_t>(std::round(std::sqrt(static_cast<float>(std::max(1u, a.sampleCount)))));
+        const uint32_t bSide =
+            static_cast<uint32_t>(std::round(std::sqrt(static_cast<float>(std::max(1u, b.sampleCount)))));
+        const float aWorldSize = std::max(1.0f, a.cellSize) * static_cast<float>(std::max(1u, aSide) - 1u);
+        const float bWorldSize = std::max(1.0f, b.cellSize) * static_cast<float>(std::max(1u, bSide) - 1u);
+        const glm::vec3 aCenter(
+            static_cast<float>(a.originX) + aWorldSize * 0.5f,
+            static_cast<float>(a.minY + a.maxY) * 0.5f,
+            static_cast<float>(a.originZ) + aWorldSize * 0.5f);
+        const glm::vec3 bCenter(
+            static_cast<float>(b.originX) + bWorldSize * 0.5f,
+            static_cast<float>(b.minY + b.maxY) * 0.5f,
+            static_cast<float>(b.originZ) + bWorldSize * 0.5f);
+        const float aDx = aCenter.x - cameraPos.x;
+        const float aDz = aCenter.z - cameraPos.z;
+        const float bDx = bCenter.x - cameraPos.x;
+        const float bDz = bCenter.z - cameraPos.z;
+        return (aDx * aDx + aDz * aDz) < (bDx * bDx + bDz * bDz);
+    });
+
+    const uint32_t tileLimit = maxTiles == 0u ? UINT32_MAX : maxTiles;
+    const uint32_t brickLimitPerTile =
+        maxExactBricksPerTile == 0u ? UINT32_MAX : maxExactBricksPerTile;
+    std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash> exactCoords;
+
+    for (const Simulation::MidMeshGpuExtractDirtyTile& tile : tiles) {
+        if (stats.tilesTotal >= tileLimit) {
+            break;
+        }
+        if (tile.faceCount == 0u || tile.sampleCount < 4u || tile.cellSize <= 0.0f) {
+            ++stats.tilesSkipped;
+            continue;
+        }
+
+        const uint32_t side = static_cast<uint32_t>(
+            std::round(std::sqrt(static_cast<float>(tile.sampleCount))));
+        if (side < 2u || side * side != tile.sampleCount) {
+            ++stats.tilesSkipped;
+            continue;
+        }
+
+        const uint32_t cellCount = side - 1u;
+        const double tileWorldSizeD =
+            static_cast<double>(std::max(tile.cellSize, 1.0f)) *
+            static_cast<double>(cellCount);
+        if (!std::isfinite(tileWorldSizeD) || tileWorldSizeD <= 0.0) {
+            ++stats.tilesSkipped;
+            continue;
+        }
+        const float tileWorldSize = static_cast<float>(tileWorldSizeD);
+        const glm::vec3 center(
+            static_cast<float>(tile.originX) + tileWorldSize * 0.5f,
+            static_cast<float>(tile.minY + tile.maxY) * 0.5f,
+            static_cast<float>(tile.originZ) + tileWorldSize * 0.5f);
+        const glm::vec3 cameraToTile = center - cameraPos;
+        const float halfDiagonalXz = tileWorldSize * 0.70710678f;
+        const float tileDistance = useXzSurfaceClip
+            ? std::max(0.0f, glm::length(glm::vec2(cameraToTile.x, cameraToTile.z)) - halfDiagonalXz)
+            : std::max(0.0f, glm::length(cameraToTile) - halfDiagonalXz);
+        if (tileDistance > auditRadius) {
+            continue;
+        }
+
+        const int64_t maxX64 =
+            static_cast<int64_t>(tile.originX) +
+            static_cast<int64_t>(std::ceil(tileWorldSizeD)) - 1;
+        const int64_t maxZ64 =
+            static_cast<int64_t>(tile.originZ) +
+            static_cast<int64_t>(std::ceil(tileWorldSizeD)) - 1;
+        const int32_t minX = tile.originX;
+        const int32_t minZ = tile.originZ;
+        const int32_t maxX = static_cast<int32_t>(std::clamp<int64_t>(
+            maxX64,
+            static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+            static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
+        const int32_t maxZ = static_cast<int32_t>(std::clamp<int64_t>(
+            maxZ64,
+            static_cast<int64_t>(std::numeric_limits<int32_t>::min()),
+            static_cast<int64_t>(std::numeric_limits<int32_t>::max())));
+        const int32_t minY = std::min(tile.minY, tile.maxY);
+        const int32_t maxY = std::max(tile.minY, tile.maxY);
+
+        const Simulation::BrickCoord minCoord =
+            Simulation::BrickCoord::FromWorldVoxel(minX, minY, minZ);
+        const Simulation::BrickCoord maxCoord =
+            Simulation::BrickCoord::FromWorldVoxel(maxX, maxY, maxZ);
+
+        exactCoords.clear();
+        bool capped = false;
+        for (int32_t z = minCoord.z; z <= maxCoord.z && !capped; ++z) {
+            for (int32_t y = minCoord.y; y <= maxCoord.y && !capped; ++y) {
+                for (int32_t x = minCoord.x; x <= maxCoord.x; ++x) {
+                    exactCoords.insert(Simulation::BrickCoord{x, y, z});
+                    if (exactCoords.size() >= brickLimitPerTile) {
+                        capped = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (exactCoords.empty()) {
+            ++stats.tilesSkipped;
+            continue;
+        }
+
+        ++stats.tilesTotal;
+        if (capped) {
+            ++stats.tilesCapped;
+        }
+        bool tileReady = !capped;
+        Simulation::BrickCoord firstFail{};
+        for (const Simulation::BrickCoord& coord : exactCoords) {
+            ++stats.exactBricksTotal;
+            const ExactCoverageBrickStatus status =
+                CheckExactCoverageBrickReady(surfaceCache, surfaceGpuResources, coord);
+            CountExactCoverageFailure(stats, status);
+            if (status != ExactCoverageBrickStatus::Ready && tileReady) {
+                tileReady = false;
+                firstFail = coord;
+            }
+        }
+
+        if (tileReady) {
+            ++stats.tilesReady;
+        } else if (tileDistance < stats.nearestHoleDistance) {
+            stats.nearestHoleDistance = tileDistance;
+            stats.nearestHoleTile = tile.coord;
+            stats.nearestHoleExact = firstFail;
+        }
+    }
+
+    return stats;
 }
 
 static bool ReadGpuTiming(
@@ -870,9 +2110,58 @@ int RunSandbox(int argc, char* argv[]) {
     const bool enableSparseEditUiSmoke =
         sparseBackendRequested && ReadUIntEnv("VENPOD_SPARSE_EDIT_UI_SMOKE", 0u) != 0u;
     const char* sparseEditUiSmokePathEnv = std::getenv("VENPOD_SPARSE_EDIT_UI_SMOKE_PATH");
+    const uint32_t debugMidMeshWavePixelMode =
+        std::clamp(ReadUIntEnv("VENPOD_DEBUG_MIDMESH_WAVE_PIXELS", 0u), 0u, 2u);
+    const bool debugSurfaceUploadPixels =
+        ReadUIntEnv("VENPOD_DEBUG_SURFACE_UPLOAD_PIXELS", 0u) != 0u;
+    const bool debugSurfaceHandoffPixels =
+        ReadUIntEnv("VENPOD_DEBUG_SURFACE_HANDOFF_PIXELS", 0u) != 0u;
     uint32_t sparseRaymarchDebugMode = enableSparseRaymarch
         ? ReadUIntEnv("VENPOD_SPARSE_DEBUG_MODE", 0u)
         : 0u;
+    if (debugSurfaceUploadPixels && sparseRaymarchDebugMode == 0u) {
+        sparseRaymarchDebugMode = 76u;
+    }
+    if (debugSurfaceHandoffPixels && sparseRaymarchDebugMode == 0u) {
+        sparseRaymarchDebugMode = 77u;
+    }
+    constexpr uint32_t kDebugSurfaceHandoffOverlayModeCount = 9u;
+    uint32_t debugSurfaceHandoffOverlayMode = debugSurfaceHandoffPixels
+        ? std::clamp(
+            ReadUIntEnv("VENPOD_DEBUG_SURFACE_HANDOFF_OVERLAY_MODE", 1u),
+            0u,
+            kDebugSurfaceHandoffOverlayModeCount - 1u)
+        : 0u;
+    const auto debugSurfaceHandoffOverlayLabel = [](uint32_t mode) -> const char* {
+        switch (mode) {
+            case 0u: return "off";
+            case 1u: return "dirty mid raster";
+            case 2u: return "all mid raster";
+            case 3u: return "exact raster";
+            case 4u: return "raster pass owner";
+            case 5u: return "raymarch/background owner";
+            case 6u: return "raymarch LOD ring";
+            case 7u: return "raster face size";
+            case 8u: return "recent exact publish";
+            default: return "unknown";
+        }
+    };
+    const auto debugSurfaceHandoffOverlayDebugMode = [](uint32_t mode) -> uint32_t {
+        switch (mode) {
+            case 1u: return 78u;
+            case 2u: return 79u;
+            case 3u: return 80u;
+            case 4u: return 81u;
+            case 5u: return 58u;
+            case 6u: return 59u;
+            case 7u: return 82u;
+            case 8u: return 76u;
+            default: return 0u;
+        }
+    };
+    if (debugMidMeshWavePixelMode != 0u && sparseRaymarchDebugMode == 0u) {
+        sparseRaymarchDebugMode = 75u;
+    }
     if (enableSparseOnlyRaymarch &&
         !enableSparseSurfaceAuthoritative &&
         !enableUnsafeSparseFullRaymarch &&
@@ -1080,12 +2369,9 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_RAYMARCH_BACKGROUND_PASS_COMPOSITE_FORCE_COLOR", 0u) != 0u;
     const bool backgroundPassForegroundMask =
         ReadUIntEnv("VENPOD_RAYMARCH_BACKGROUND_PASS_FOREGROUND_MASK", 0u) != 0u;
-    // The 0.5-scale mid-only overlay pass is REDUNDANT when the mesh-mid raster owns the
-    // band (mesh writes ownership stencil; the mid composite's EQUAL-0 test skips those
-    // pixels, so the overlay can neither show nor improve them). Default: off when the
-    // mesh-mid is on (its default), on otherwise (legacy raymarch-mid path). Explicit
-    // VENPOD_RAYMARCH_MID_PASS_ENABLE always wins. (Mirrors enableSparseMidMesh's gating,
-    // which is computed later; the env reads are identical.)
+    // The 0.5-scale mid-only overlay pass is redundant when the mesh-mid raster
+    // owns the band. Default: off when the mesh-mid is on, on otherwise. Explicit
+    // VENPOD_RAYMARCH_MID_PASS_ENABLE always wins.
     const bool sparseMidMeshDefaultOnForMidPass =
         sparseBackendRequested &&
         ReadUIntEnv("VENPOD_SPARSE_SURFACE_RASTER", 1u) != 0u &&
@@ -1212,6 +2498,14 @@ int RunSandbox(int argc, char* argv[]) {
     std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash> sparseMidMeshGpuDrawCommittedCoords;
     uint64_t sparseMidMeshGpuDrawLastDirectRenderFenceValue = 0u;
     Simulation::SparseVoxelWorld sparseVoxelWorld;
+    std::unordered_map<
+        Simulation::BrickCoord,
+        TerrainOwnershipState,
+        Simulation::BrickCoordHash> terrainOwnershipByMidTile;
+    std::unordered_map<
+        Simulation::BrickCoord,
+        ExactBrickOwnershipState,
+        Simulation::BrickCoordHash> terrainOwnershipByExactBrick;
     bool sparseVoxelWorldReady = false;
     enum class SurfaceFillWaterProofResult : uint8_t {
         ProvenWater = 1,
@@ -1541,6 +2835,16 @@ int RunSandbox(int argc, char* argv[]) {
     // and stationary is a strict subset of that). Set =1 to restore the old always-trim behavior.
     const bool sparseViewFollowTrimWhileStationary =
         ReadUIntEnv("VENPOD_SPARSE_VIEW_FOLLOW_TRIM_WHILE_STATIONARY", 0u) != 0u;
+    // Terrain residency follows world-XZ motion. Camera/player Y bob changes
+    // projected distance, but it should not recenter terrain interest or make
+    // the exact foreground contract churn while the player is stationary in XZ.
+    const bool sparseTerrainStreamingXzOnlyMotionDefault =
+        ReadUIntEnv("VENPOD_DEBUG_TERRAIN_STREAMING_XZ_STATIONARY", 1u) != 0u;
+    const bool sparseTerrainStreamingXzOnlyMotion =
+        sparseBackendRequested &&
+        ReadUIntEnv(
+            "VENPOD_SPARSE_TERRAIN_STREAMING_XZ_ONLY_MOTION",
+            sparseTerrainStreamingXzOnlyMotionDefault ? 1u : 0u) != 0u;
     const uint32_t sparsePressureTrimBudget =
         ReadUIntEnv("VENPOD_SPARSE_PRESSURE_TRIM_BUDGET", sparseTrimBudget);
     const bool sparsePressureTrimFreePageGuard =
@@ -1642,12 +2946,26 @@ int RunSandbox(int argc, char* argv[]) {
     const bool enableSparseTerrainSurfacePrefetchCleanThrottle =
         sparseBackendRequested &&
         ReadUIntEnv("VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH_CLEAN_THROTTLE", 0u) != 0u;
+    const bool terrainOwnershipContractRequested =
+        sparseBackendRequested &&
+        ReadUIntEnv("VENPOD_TERRAIN_OWNERSHIP_CONTRACT", 0u) != 0u;
+    const float sparseExactRequestRadiusScale =
+        std::max(1.0f, ReadFloatEnv("VENPOD_SPARSE_EXACT_REQUEST_RADIUS_SCALE", 1.4f));
+    const uint32_t sparseTerrainSurfacePrefetchDefaultDistance =
+        terrainOwnershipContractRequested
+            ? std::max(
+                3072u,
+                static_cast<uint32_t>(std::round(
+                    2560.0f * sparseExactRequestRadiusScale)))
+            : 3072u;
     const uint32_t sparseTerrainSurfacePrefetchMaxRequests =
         ReadUIntEnv("VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH_MAX_REQUESTS", 512u);
     const uint32_t sparseTerrainSurfacePrefetchReserveRequests =
         ReadUIntEnv("VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH_RESERVE_REQUESTS", 512u);
     const uint32_t sparseTerrainSurfacePrefetchDistance =
-        ReadUIntEnv("VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH_DISTANCE", 3072u);
+        ReadUIntEnv(
+            "VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH_DISTANCE",
+            sparseTerrainSurfacePrefetchDefaultDistance);
     const uint32_t sparseTerrainSurfacePrefetchStride =
         std::max(4u, ReadUIntEnv("VENPOD_SPARSE_TERRAIN_SURFACE_PREFETCH_STRIDE", 8u));
     const uint32_t sparseTerrainVisibleGenerationDrainBudget =
@@ -1689,8 +3007,12 @@ int RunSandbox(int argc, char* argv[]) {
     const bool enableSparseTerrainScreenCriticalContinuous =
         enableSparseTerrainScreenCriticalPrefetch &&
         ReadUIntEnv("VENPOD_SPARSE_TERRAIN_SCREEN_CRITICAL_CONTINUOUS", 1u) != 0u;
+    // High-altitude lower-LOD ownership is useful for true flight, but 128u was
+    // inside the normal elevated/vertical-bob gameplay envelope. At that height
+    // the active line of sight still needs exact foreground ownership; otherwise
+    // the mid raster grid visibly sharpens into exact terrain as repair catches up.
     const uint32_t sparseTerrainScreenCriticalLodThrottleMinAltitude =
-        ReadUIntEnv("VENPOD_SPARSE_TERRAIN_SCREEN_CRITICAL_LOD_THROTTLE_ALTITUDE", 128u);
+        ReadUIntEnv("VENPOD_SPARSE_TERRAIN_SCREEN_CRITICAL_LOD_THROTTLE_ALTITUDE", 384u);
     const uint32_t sparseTerrainScreenCriticalLodThrottleFarSvoPct =
         std::min(100u, ReadUIntEnv("VENPOD_SPARSE_TERRAIN_SCREEN_CRITICAL_LOD_THROTTLE_FAR_SVO_PCT", 35u));
     const uint32_t sparseTerrainScreenCriticalLodThrottleProbeMaxRequests =
@@ -2231,13 +3553,15 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_SPARSE_MIN_SURFACE_FRAGMENTS", 512u);
     const bool enableSparseSurfaceUpload =
         sparseBackendRequested && ReadUIntEnv("VENPOD_SPARSE_SURFACE_UPLOAD", 1u) != 0u;
+    const uint32_t debugFreezeSurfaceUploadAfterFrame =
+        ReadUIntEnv("VENPOD_DEBUG_FREEZE_SURFACE_UPLOAD_AFTER_FRAME", 0u);
     const bool enableSparseSurfaceRaster =
         sparseBackendRequested && ReadUIntEnv("VENPOD_SPARSE_SURFACE_RASTER", 1u) != 0u;
     // MESH-MID DEFAULT-ON (L2, two-judge verified): the mid band 1024-9000 renders as
     // REAL full-res terraced raster geometry through the near's pipeline — continuous
     // with the near surface, instead of the 0.3/0.5-scale raymarch approximations.
-    // It writes the ownership stencil (ref 1), so the fullscreen raymarch skips those
-    // pixels; GPU cost measured ~+2ms (engine is CPU-bound). Set =0 for the old path.
+    // It writes the mid/fallback stencil, so the fullscreen far/background raymarch
+    // and the optional mid-only overlay skip those pixels. Set =0 for the old path.
     const bool enableSparseMidMesh =
         sparseBackendRequested &&
         enableSparseSurfaceRaster &&
@@ -2605,7 +3929,7 @@ int RunSandbox(int argc, char* argv[]) {
         sparseBackendRequested &&
         ReadUIntEnv("VENPOD_SPARSE_SURFACE_RASTER_DYNAMIC_PROMOTION", 1u) != 0u;
     const std::string sparseSurfaceRasterPromotionPolicy =
-        ReadLowerEnvString("VENPOD_SPARSE_SURFACE_PROMOTION_POLICY", "strict");
+        ReadLowerEnvString("VENPOD_SPARSE_SURFACE_PROMOTION_POLICY", "bounded_repair");
     const bool sparseSurfaceRasterPromotionPolicyBoundedRepair =
         sparseSurfaceRasterPromotionPolicy == "bounded_repair" ||
         sparseSurfaceRasterPromotionPolicy == "bounded-repair";
@@ -2636,6 +3960,12 @@ int RunSandbox(int argc, char* argv[]) {
         static_cast<float>(ReadUIntEnv(
             "VENPOD_SPARSE_SURFACE_RASTER_MAX_DISTANCE",
             sparseSurfaceRasterDefaultDistance));
+    // The public exact surface boundary is terrain ownership, not a physical
+    // sphere around the camera. In elevated/downward views a 3D sphere cuts
+    // across visible ground and lets the mid underlay sharpen in-camera.
+    const bool sparseSurfaceRasterUseXzClip =
+        sparseBackendRequested &&
+        ReadUIntEnv("VENPOD_SPARSE_SURFACE_RASTER_XZ_CLIP", 1u) != 0u;
     const uint32_t sparseSurfaceRasterPromotionMaxShaderNonReady =
         ReadUIntEnv("VENPOD_SPARSE_SURFACE_PROMOTION_MAX_SHADER_NONREADY", 0u);
     const uint32_t sparseSurfaceRasterPromotionMaxHiddenExactMissing =
@@ -2643,7 +3973,7 @@ int RunSandbox(int argc, char* argv[]) {
     const uint32_t sparseSurfaceRasterLegacyDemotionMaxShaderNonReady =
         ReadUIntEnv(
             "VENPOD_SPARSE_SURFACE_DEMOTION_MAX_SHADER_NONREADY",
-            48u);
+            sparseSurfaceRasterPromotionPolicyBoundedRepair ? 512u : 48u);
     const uint32_t sparseSurfaceRasterDemotionMaxShaderNonReady =
         ReadUIntEnv(
             "VENPOD_SPARSE_SURFACE_PROMOTION_SHADER_NONREADY_DEMOTE_BOUND",
@@ -3328,6 +4658,66 @@ int RunSandbox(int argc, char* argv[]) {
     // Loop E: work-stealing pre-pass distribution (balance the 50x-skewed per-tile extraction cost).
     const bool sparseMidMeshWorkSteal =
         ReadUIntEnv("VENPOD_MIDMESH_WORKSTEAL", 0u) != 0u;
+    const uint32_t sparseMidMeshChildHandoffMode =
+        std::clamp(ReadUIntEnv("VENPOD_MIDMESH_CHILD_HANDOFF", 0u), 0u, 2u);
+    const bool debugMidMeshWaveTrace =
+        ReadUIntEnv("VENPOD_DEBUG_MIDMESH_WAVE_TRACE", 0u) != 0u;
+    const uint32_t debugMidMeshWaveTraceBinSize =
+        std::max(32u, ReadUIntEnv("VENPOD_DEBUG_MIDMESH_WAVE_TRACE_BIN", 256u));
+    const uint32_t debugMidMeshWaveTraceMaxBins =
+        std::clamp(ReadUIntEnv("VENPOD_DEBUG_MIDMESH_WAVE_TRACE_BINS", 48u), 1u, 128u);
+    const bool debugMidMeshDrawTrace =
+        ReadUIntEnv("VENPOD_DEBUG_MIDMESH_DRAW_TRACE", 0u) != 0u;
+    const uint32_t debugMidMeshDrawTraceMaxRows =
+        std::clamp(ReadUIntEnv("VENPOD_DEBUG_MIDMESH_DRAW_TRACE_MAX_ROWS", 256u), 16u, 4096u);
+    const bool debugExactCoverage =
+        sparseBackendRequested &&
+        ReadUIntEnv("VENPOD_DEBUG_EXACT_COVERAGE", 0u) != 0u;
+    const uint32_t debugExactCoverageInterval =
+        std::max(1u, ReadUIntEnv("VENPOD_DEBUG_EXACT_COVERAGE_INTERVAL", 20u));
+    const uint32_t debugExactCoverageMaxTiles =
+        ReadUIntEnv("VENPOD_DEBUG_EXACT_COVERAGE_MAX_TILES", 4096u);
+    const uint32_t debugExactCoverageMaxBricksPerTile =
+        ReadUIntEnv("VENPOD_DEBUG_EXACT_COVERAGE_MAX_BRICKS_PER_TILE", 8192u);
+    const bool terrainOwnershipContract =
+        sparseBackendRequested &&
+        ReadUIntEnv("VENPOD_TERRAIN_OWNERSHIP_CONTRACT", 0u) != 0u;
+    const uint32_t terrainOwnershipLogInterval =
+        std::max(1u, ReadUIntEnv("VENPOD_TERRAIN_OWNERSHIP_LOG_INTERVAL", 20u));
+    const float terrainOwnershipVisiblePadding =
+        std::max(0.0f, ReadFloatEnv("VENPOD_TERRAIN_OWNERSHIP_VISIBLE_PADDING", 192.0f));
+    const float terrainOwnershipSubpixelThreshold =
+        std::max(0.0f, ReadFloatEnv("VENPOD_TERRAIN_OWNERSHIP_SUBPIXEL_PX", 0.75f));
+    const float terrainOwnershipFarSafeSwapDistance =
+        std::max(
+            0.0f,
+            ReadFloatEnv(
+                "VENPOD_TERRAIN_OWNERSHIP_FAR_SAFE_DISTANCE",
+                sparseExactNearDistance + 1024.0f));
+    // MAX_HOLD_FRAMES is the pre-dissolve stabilization hold for a visible
+    // ready brick (0 = never dissolve while visible: hold until out-of-view).
+    // DITHER_FRAMES hash-jitters each brick's dissolve start so neighbouring
+    // bricks do not begin fading on the same frame. DISSOLVE_FRAMES is how
+    // long the per-face fade-in runs; a visible brick NEVER commits in one
+    // frame (the old timeout pop) - it either dissolves or waits.
+    const uint32_t terrainOwnershipMaxHoldFrames =
+        ReadUIntEnv("VENPOD_TERRAIN_OWNERSHIP_MAX_HOLD_FRAMES", 30u);
+    const uint32_t terrainOwnershipDitherFrames =
+        ReadUIntEnv("VENPOD_TERRAIN_OWNERSHIP_DITHER_FRAMES", 45u);
+    const uint32_t terrainOwnershipDissolveFrames =
+        ReadUIntEnv("VENPOD_TERRAIN_OWNERSHIP_DISSOLVE_FRAMES", 60u);
+    const uint32_t terrainOwnershipInstantRecommitWindow =
+        ReadUIntEnv("VENPOD_TERRAIN_OWNERSHIP_RECOMMIT_WINDOW_FRAMES", 120u);
+    const bool debugDisableMidMeshChildSuppression =
+        ReadUIntEnv("VENPOD_DEBUG_DISABLE_MIDMESH_CHILD_SUPPRESSION", 0u) != 0u;
+    const bool debugDisableMidMeshDirtyRedraw =
+        ReadUIntEnv("VENPOD_DEBUG_DISABLE_MIDMESH_DIRTY_REDRAW", 0u) != 0u;
+    const bool debugSuppressNearMidMeshDirtyUpload =
+        ReadUIntEnv("VENPOD_DEBUG_SUPPRESS_NEAR_MIDMESH_DIRTY_UPLOAD", 0u) != 0u;
+    const float debugSuppressNearMidMeshDirtyUploadDistance =
+        std::max(
+            0.0f,
+            ReadFloatEnv("VENPOD_DEBUG_SUPPRESS_NEAR_MIDMESH_DIRTY_DISTANCE", sparseExactNearDistance));
     const uint32_t sparseMidMeshLodBaseMerge =
         std::max(1u, ReadUIntEnv("VENPOD_SPARSE_MID_MESH_LOD_BASE_MERGE", 1u));
     // Default merge cap 2 (was 4): both visual judges ranked the finer distant
@@ -3341,14 +4731,21 @@ int RunSandbox(int argc, char* argv[]) {
         ReadUIntEnv("VENPOD_SPARSE_MID_MESH_DISTANCE_CULL", 1u) != 0u;
     const bool sparseMidMeshFrustumCull =
         ReadUIntEnv("VENPOD_SPARSE_MID_MESH_FRUSTUM_CULL", 0u) != 0u;
-    // Default 0: the mesh is the always-present terrain floor under and around the
-    // camera. Any positive min leaves a disc/annulus that the near raster does NOT
-    // reliably cover at altitude (its interest hugs the camera, not the ground far
-    // below) — that gap rendered as the giant dark band (user round 3). Verified both
-    // ways at min=0: high-altitude clean (V2 A/B) AND ground-level identical to the
-    // pre-mesh-floor baseline (the near surface overdraws the mesh where resident).
+    // Default 0: the mesh is the always-present terrain fallback under and around
+    // the camera. It draws only where exact raster did not already claim stencil;
+    // raising this can prove mid ownership in mode 94, but creates holes whenever
+    // exact coverage is not ready for those pixels.
+    const float sparseMidMeshNearExclusionDistance =
+        std::max(
+            0.0f,
+            ReadFloatEnv("VENPOD_SPARSE_MID_MESH_NEAR_EXCLUSION_DISTANCE", 0.0f));
+    const bool sparseMidMeshExcludePublicExact =
+        sparseBackendRequested &&
+        ReadUIntEnv("VENPOD_SPARSE_MID_MESH_EXCLUDE_PUBLIC_EXACT", 0u) != 0u;
     const float sparseMidMeshMinDistance =
-        std::max(0.0f, ReadFloatEnv("VENPOD_SPARSE_MID_MESH_MIN_DISTANCE", 0.0f));
+        std::max(
+            0.0f,
+            ReadFloatEnv("VENPOD_SPARSE_MID_MESH_MIN_DISTANCE", 0.0f));
     // QUALITY KNOB: =13900 extends the mesh over the 9000-13900 far band, replacing
     // the far field's coarse slab walls with real terraced geometry (layer-A/B
     // verified) — but ground-walk fps measured 15-24 vs 31-54 at 9000 (the per-move
@@ -3360,6 +4757,14 @@ int RunSandbox(int argc, char* argv[]) {
         ReadFloatEnv("VENPOD_SPARSE_MID_MESH_MAX_DISTANCE", sparseClipmapPolicy.Config().endDistance));
     const float sparseMidMeshCullPadding =
         std::max(0.0f, ReadFloatEnv("VENPOD_SPARSE_MID_MESH_CULL_PADDING", 192.0f));
+    const bool sparseMidMeshSuppressVisibleDirtyUpload =
+        ReadUIntEnv("VENPOD_SPARSE_MID_MESH_SUPPRESS_VISIBLE_DIRTY_UPLOAD", 1u) != 0u;
+    const bool sparseMidMeshSuppressVisibleNewUpload =
+        ReadUIntEnv("VENPOD_SPARSE_MID_MESH_SUPPRESS_VISIBLE_NEW_UPLOAD", 1u) != 0u;
+    const float sparseMidMeshSuppressVisibleDirtyPadding =
+        std::max(
+            0.0f,
+            ReadFloatEnv("VENPOD_SPARSE_MID_MESH_SUPPRESS_VISIBLE_DIRTY_PADDING", sparseMidMeshCullPadding));
     const float sparseMidMeshCullRebuildDistance =
         std::max(32.0f, ReadFloatEnv("VENPOD_SPARSE_MID_MESH_CULL_REBUILD_DISTANCE", 256.0f));
     // The mid-mesh is a full ~1.5M-face CPU snapshot rebuild (~60-86ms). Streaming
@@ -5059,10 +6464,31 @@ int RunSandbox(int argc, char* argv[]) {
     std::vector<ExactSurfaceNonCoverageAuditSample> exactSurfaceNonCoverageAuditSamples;
     std::filesystem::path exactSurfaceNonCoverageAuditOutput;
     bool exactSurfaceNonCoverageAuditWritten = false;
+    const bool exactSurfaceNonCoverageGenerateMidUnderlaySamples =
+        ReadUIntEnv("VENPOD_MID_UNDERLAY_EXACT_AUDIT", 0u) != 0u;
+    const uint32_t exactSurfaceNonCoverageMidUnderlayMaxSamples =
+        std::max(1u, ReadUIntEnv("VENPOD_MID_UNDERLAY_EXACT_AUDIT_MAX_SAMPLES", 512u));
+    const uint32_t exactSurfaceNonCoverageMidUnderlayStride =
+        std::max(1u, ReadUIntEnv("VENPOD_MID_UNDERLAY_EXACT_AUDIT_STRIDE", 8u));
+    std::vector<MidUnderlayAuditPixel> exactSurfaceNonCoverageMidUnderlayPixels;
+    if (const char* auditPixels = std::getenv("VENPOD_MID_UNDERLAY_EXACT_AUDIT_PIXELS");
+        auditPixels && auditPixels[0] != '\0') {
+        exactSurfaceNonCoverageMidUnderlayPixels =
+            LoadMidUnderlayAuditPixels(
+                auditPixels,
+                exactSurfaceNonCoverageMidUnderlayMaxSamples);
+        spdlog::info(
+            "Mid underlay exact audit loaded pixel input={} pixels={}",
+            auditPixels,
+            exactSurfaceNonCoverageMidUnderlayPixels.size());
+    }
     if (const char* auditInput = std::getenv("VENPOD_EXACT_SURFACE_NONCOVERAGE_AUDIT_INPUT");
         auditInput && auditInput[0] != '\0') {
         exactSurfaceNonCoverageAuditSamples =
             LoadExactSurfaceNonCoverageAuditSamples(auditInput);
+    }
+    if (!exactSurfaceNonCoverageAuditSamples.empty() ||
+        exactSurfaceNonCoverageGenerateMidUnderlaySamples) {
         if (const char* auditOutput = std::getenv("VENPOD_EXACT_SURFACE_NONCOVERAGE_AUDIT_OUTPUT");
             auditOutput && auditOutput[0] != '\0') {
             exactSurfaceNonCoverageAuditOutput = auditOutput;
@@ -5073,11 +6499,13 @@ int RunSandbox(int argc, char* argv[]) {
             exactSurfaceNonCoverageAuditOutput = "exact_surface_noncoverage_audit.csv";
         }
         spdlog::info(
-            "Exact surface noncoverage audit enabled: input={} output={} frame={} samples={}",
-            auditInput,
+            "Exact surface noncoverage audit enabled: output={} frame={} samples={} generateMidUnderlay={} maxSamples={} stride={}",
             exactSurfaceNonCoverageAuditOutput.string(),
             exactSurfaceNonCoverageAuditFrame,
-            exactSurfaceNonCoverageAuditSamples.size());
+            exactSurfaceNonCoverageAuditSamples.size(),
+            exactSurfaceNonCoverageGenerateMidUnderlaySamples ? 1u : 0u,
+            exactSurfaceNonCoverageMidUnderlayMaxSamples,
+            exactSurfaceNonCoverageMidUnderlayStride);
     }
     const uint32_t exactRequestLifecycleAuditFrame =
         ReadUIntEnv("VENPOD_EXACT_REQUEST_LIFECYCLE_AUDIT_FRAME", 300u);
@@ -7208,6 +8636,14 @@ int RunSandbox(int argc, char* argv[]) {
             thirdPersonMode = !thirdPersonMode;
             spdlog::info("Perspective: {}", thirdPersonMode ? "third-person" : "first-person");
         }
+        if (debugSurfaceHandoffPixels && inputManager.IsKeyPressed(SDLK_F8)) {
+            debugSurfaceHandoffOverlayMode =
+                (debugSurfaceHandoffOverlayMode + 1u) % kDebugSurfaceHandoffOverlayModeCount;
+            spdlog::info(
+                "Debug surface handoff overlay: {} (F8 mode {})",
+                debugSurfaceHandoffOverlayLabel(debugSurfaceHandoffOverlayMode),
+                debugSurfaceHandoffOverlayMode);
+        }
 
         const auto sparseStartupGateReadiness =
             (enableSparseStartupPublicRenderGate && sparseBackendRequested && sparseVoxelWorldReady)
@@ -7944,7 +9380,13 @@ int RunSandbox(int argc, char* argv[]) {
             const glm::vec3 sparseAdmissionCameraDelta = cameraPos - lastSparseResidencyCameraWorld;
             const float sparseAdmissionSpeed =
                 dt > 0.001f ? glm::length(sparseAdmissionCameraDelta) / dt : 0.0f;
-            sparseCameraSpeedLastFrame = sparseAdmissionSpeed;
+            const float sparseAdmissionHorizontalSpeed =
+                dt > 0.001f
+                    ? glm::length(glm::vec2(sparseAdmissionCameraDelta.x, sparseAdmissionCameraDelta.z)) / dt
+                    : 0.0f;
+            sparseCameraSpeedLastFrame = sparseTerrainStreamingXzOnlyMotion
+                ? sparseAdmissionHorizontalSpeed
+                : sparseAdmissionSpeed;
             // Hidden-exact STATIONARY QUIESCE (Goal 2 cost-C fix), computed once per frame so
             // both the foreground-repair gate and the wide-raster clean gate use one value.
             // Tandem-traced mechanism: with hidden-exact feedback on, the runtime "clean"
@@ -7990,7 +9432,9 @@ int RunSandbox(int argc, char* argv[]) {
                 sparseStartupPublicRenderGateOpened &&
                 sparseHiddenExactFramesSinceEdit >= sparseHiddenExactEditGraceFrames;
             const bool hiddenExactRuntimeFeedbackActive =
-                enableSparseHiddenExactMissFeedback && !hiddenExactMovingSuppressed;
+                enableSparseHiddenExactMissFeedback &&
+                !hiddenExactStationaryQuiesced &&
+                !hiddenExactMovingSuppressed;
             const bool sparseHiddenExactVisibleDeficitThisFrame =
                 sparseOwnershipMissPctLastRetire > 0u ||
                 sparseOwnershipUnsafeNearMissPctLastRetire > 0u ||
@@ -8043,6 +9487,7 @@ int RunSandbox(int argc, char* argv[]) {
                  sparseOwnershipTerrainPctLastRetire >= sparseOwnershipCatchupTerrainPct);
             const bool sparseHighAltitudeActualUnsafePressure =
                 sparseShaderUnsafeFeedbackUnsafePixelsLastFrame > 0u ||
+                sparseShaderUnsafeFeedbackContractNonReadyLastFrame > 0u ||
                 sparseOwnershipUnsafeNearMissPctLastRetire > 0u;
             const bool sparseTerrainCriticalHighAltitudeLodAllowedThisFrame =
                 !sparseTerrainCriticalAdmissionStartupActive &&
@@ -9020,12 +10465,15 @@ int RunSandbox(int argc, char* argv[]) {
                         (frameCount -
                          static_cast<uint64_t>(renderOwnershipStats.renderOwnerFrameLastRetire)) <=
                             static_cast<uint64_t>(sparseShaderUnsafeForegroundRepairMaxOwnerAge);
-                    // High-altitude LOD may legitimately carry a coherent
-                    // public frame. Do not turn ordinary exact-contract
-                    // non-readiness into foreground repair there; that creates
-                    // the same partial exact/coarse fallback mix the LOD path
-                    // is meant to avoid. Only hard unsafe near-miss feedback
-                    // stays render-critical.
+                    // Shader feedback here is from the current public frame,
+                    // not speculative hidden fill. If pixels inside the active
+                    // exact contract fell through to fallback because exact
+                    // bricks are non-ready, that repair is mandatory even when
+                    // broad hidden-exact probing is quiesced or high-altitude
+                    // LOD is otherwise allowed to carry the view.
+                    const bool shaderMissExactContractRepairRequired =
+                        shaderMissForegroundRepairEligible >=
+                        sparseShaderUnsafeForegroundRepairMinNonReady;
                     const bool shaderMissSurfaceFillRepairAllowed =
                         backgroundPassSurfaceFillExactRepairThisFrame &&
                         backgroundPassSurfaceRaymarchFillThisFrame &&
@@ -9035,15 +10483,14 @@ int RunSandbox(int argc, char* argv[]) {
                         (shaderMissIsRenderCritical || shaderMissSurfaceFillRepairAllowed) &&
                         shaderMissForegroundRepairEligible > 0u;
                     const bool shaderMissForegroundRepairAllowedThisFrame =
+                        shaderMissExactContractRepairRequired ||
                         !sparseTerrainCriticalHighAltitudeLodAllowedThisFrame ||
                         shaderMissHighAltitudeFallbackRepairAllowed;
                     const bool shaderMissForegroundRepairActive =
                         enableSparseShaderUnsafeForegroundRepair &&
-                        !hiddenExactStationaryQuiesced &&
-                        !hiddenExactMovingSuppressed &&
                         shaderMissForegroundRepairAllowedThisFrame &&
                         shaderMissFeedbackRecentForRepair &&
-                        shaderMissForegroundRepairEligible >= sparseShaderUnsafeForegroundRepairMinNonReady;
+                        shaderMissExactContractRepairRequired;
                     uint32_t shaderMissForegroundRepairRequested = 0u;
                     uint32_t shaderMissForegroundRepairCapSkips = 0u;
                     for (const ShaderUnsafeMissCoord& sample : shaderMissCoords) {
@@ -10701,6 +12148,10 @@ int RunSandbox(int argc, char* argv[]) {
                 const glm::vec3 sparseCameraDelta = cameraPos - lastSparseResidencyCameraWorld;
                 const glm::vec3 sparseCameraVelocity =
                     dt > 0.001f ? sparseCameraDelta / dt : glm::vec3(0.0f);
+                const glm::vec3 sparseTerrainStreamingVelocity =
+                    sparseTerrainStreamingXzOnlyMotion
+                        ? glm::vec3(sparseCameraVelocity.x, 0.0f, sparseCameraVelocity.z)
+                        : sparseCameraVelocity;
                 const bool sparseBrushIntentPending =
                     (brushController.IsPainting() || brushController.IsErasing()) &&
                     buildStrokeState.hasLastBrushWorldPosition;
@@ -11409,9 +12860,9 @@ int RunSandbox(int argc, char* argv[]) {
                     }
 
                     if (sparseFastRequestScaleThisFrame > 1u && sparseRequestBudgetThisFrame.speculative > 0u) {
-                        flightView.originX = cameraPos.x + sparseCameraVelocity.x * 0.35f;
-                        flightView.originY = cameraPos.y + sparseCameraVelocity.y * 0.35f;
-                        flightView.originZ = cameraPos.z + sparseCameraVelocity.z * 0.35f;
+                        flightView.originX = cameraPos.x + sparseTerrainStreamingVelocity.x * 0.35f;
+                        flightView.originY = cameraPos.y + sparseTerrainStreamingVelocity.y * 0.35f;
+                        flightView.originZ = cameraPos.z + sparseTerrainStreamingVelocity.z * 0.35f;
                         flightView.maxDistance += static_cast<float>(sparseRayPrefetchStride * 2u);
                         flightView.maxRequests = std::min<uint32_t>(16u, sparseRequestBudgetThisFrame.speculative);
                         for (const auto& request : sparseRequestPlanner.PlanViewCone(flightView)) {
@@ -11427,9 +12878,9 @@ int RunSandbox(int argc, char* argv[]) {
                 hierarchy.cameraX = cameraPos.x;
                 hierarchy.cameraY = cameraPos.y;
                 hierarchy.cameraZ = cameraPos.z;
-                hierarchy.velocityX = sparseCameraVelocity.x;
-                hierarchy.velocityY = sparseCameraVelocity.y;
-                hierarchy.velocityZ = sparseCameraVelocity.z;
+                hierarchy.velocityX = sparseTerrainStreamingVelocity.x;
+                hierarchy.velocityY = sparseTerrainStreamingVelocity.y;
+                hierarchy.velocityZ = sparseTerrainStreamingVelocity.z;
                 hierarchy.forwardX = cameraForward.x;
                 hierarchy.forwardY = cameraForward.y;
                 hierarchy.forwardZ = cameraForward.z;
@@ -11602,11 +13053,11 @@ int RunSandbox(int argc, char* argv[]) {
                 // signature flips when the predicted footprint would shift a brick,
                 // but does not thrash on micro-jitter.
                 sparseHierarchicalPlanSignatureThisFrame.velBucketX =
-                    static_cast<int32_t>(std::lround(sparseCameraVelocity.x / 8.0f));
+                    static_cast<int32_t>(std::lround(sparseTerrainStreamingVelocity.x / 8.0f));
                 sparseHierarchicalPlanSignatureThisFrame.velBucketY =
-                    static_cast<int32_t>(std::lround(sparseCameraVelocity.y / 8.0f));
+                    static_cast<int32_t>(std::lround(sparseTerrainStreamingVelocity.y / 8.0f));
                 sparseHierarchicalPlanSignatureThisFrame.velBucketZ =
-                    static_cast<int32_t>(std::lround(sparseCameraVelocity.z / 8.0f));
+                    static_cast<int32_t>(std::lround(sparseTerrainStreamingVelocity.z / 8.0f));
                 sparseHierarchicalPlanSignatureThisFrame.predictionBucket =
                     static_cast<int32_t>(std::lround(hierarchy.predictionSeconds * 100.0f));
                 sparseHierarchicalPlanSignatureThisFrame.ownershipPressureLevel =
@@ -12833,10 +14284,14 @@ int RunSandbox(int argc, char* argv[]) {
                     (sparseStressCameraActive && enableSparseMidClipmapStressCameraVelocity)
                     ? sparseAdmissionCameraDelta
                     : (cameraPos - cameraPosBeforeInputMovement);
-                const glm::vec3 sparseClipmapVelocity =
+                const glm::vec3 sparseClipmapVelocityRaw =
                     dt > 0.001f
                         ? sparseClipmapFrameDelta / dt
                         : glm::vec3(0.0f);
+                const glm::vec3 sparseClipmapVelocity =
+                    sparseTerrainStreamingXzOnlyMotion
+                        ? glm::vec3(sparseClipmapVelocityRaw.x, 0.0f, sparseClipmapVelocityRaw.z)
+                        : sparseClipmapVelocityRaw;
                 const float sparseClipmapPredictionSeconds =
                     std::max(0.25f, static_cast<float>(sparsePredictivePrefetchMs) * 0.001f);
                 const uint64_t sparseClipmapInterestStart = SDL_GetPerformanceCounter();
@@ -13337,6 +14792,191 @@ int RunSandbox(int argc, char* argv[]) {
                             hasFirstAccepted ? firstAccepted.x : 0,
                             hasFirstAccepted ? firstAccepted.y : 0,
                             hasFirstAccepted ? firstAccepted.z : 0);
+                    }
+                }
+                // VIEW COVERAGE REPAIR: march center-screen rays over the CPU
+                // heightfield; any camera-visible terrain brick whose exact
+                // surface was never extracted (not surface-known) is queued for
+                // generation on the repair lane. This closes the black no-owner
+                // voids: those bricks are invisible to every pixel-driven
+                // feedback loop (nothing draws them, so nothing samples them),
+                // so a proactive view-driven probe is the only repair that can
+                // see them. Budgeted + cooldown; VENPOD_DEBUG_VOID_PROBE=1 adds
+                // the verbose per-brick status log.
+                if (!debugFreezeMidCpuRebuildThisFrame &&
+                    ReadUIntEnv("VENPOD_SPARSE_VIEW_COVERAGE_REPAIR", 1u) != 0u &&
+                    enableSparseSurfaceRaster &&
+                    (frameCount %
+                     static_cast<uint64_t>(std::max(
+                         1u,
+                         ReadUIntEnv(
+                             "VENPOD_SPARSE_VIEW_COVERAGE_REPAIR_INTERVAL", 10u)))) == 0ull) {
+                    const bool voidProbeVerbose =
+                        ReadUIntEnv("VENPOD_DEBUG_VOID_PROBE", 0u) != 0u;
+                    const uint32_t viewCoverageMaxRequests = std::max(
+                        1u,
+                        ReadUIntEnv("VENPOD_SPARSE_VIEW_COVERAGE_REPAIR_MAX_REQUESTS", 48u));
+                    static std::unordered_map<
+                        Simulation::BrickCoord, uint64_t, Simulation::BrickCoordHash>
+                        s_viewCoverageRequestedFrame;
+                    const float vcTanHalfFov = std::tan(fov * 0.5f);
+                    const float vcAspect = std::max(0.1f, aspectRatio);
+                    const float probeStart = 16.0f;
+                    const float probeEnd = 1600.0f;
+                    const uint32_t probeSteps = 160u;
+                    const float probeStepT =
+                        (probeEnd - probeStart) / static_cast<float>(probeSteps);
+                    std::unordered_map<
+                        Simulation::BrickCoord, uint32_t, Simulation::BrickCoordHash>
+                        probeStatusByBrick;
+                    uint32_t statusCounts[9] = {};
+                    uint32_t viewCoverageRequested = 0u;
+                    std::string firstBad;
+                    for (uint32_t row = 0u; row < 14u; ++row) {
+                        const float ndcY =
+                            1.0f - ((static_cast<float>(row) + 0.5f) / 14.0f) * 2.0f;
+                        for (uint32_t col = 0u; col < 24u; ++col) {
+                            const float ndcX =
+                                ((static_cast<float>(col) + 0.5f) / 24.0f) * 2.0f - 1.0f;
+                            glm::vec3 probeDir =
+                                cameraForward +
+                                cameraRight * (ndcX * vcTanHalfFov * vcAspect) +
+                                cameraUp * (ndcY * vcTanHalfFov);
+                            const float probeLen = glm::length(probeDir);
+                            if (probeLen <= 0.0001f) {
+                                continue;
+                            }
+                            probeDir /= probeLen;
+                            float previousDelta = std::numeric_limits<float>::max();
+                            bool hadPrevious = false;
+                            for (uint32_t step = 0u; step <= probeSteps; ++step) {
+                                const float t =
+                                    probeStart + probeStepT * static_cast<float>(step);
+                                const glm::vec3 p = cameraPos + probeDir * t;
+                                const float terrainHeight =
+                                    sparseVoxelWorld.GetTerrain().HeightAt(
+                                        static_cast<int32_t>(std::floor(p.x)),
+                                        static_cast<int32_t>(std::floor(p.z)));
+                                const float delta = p.y - terrainHeight;
+                                if ((hadPrevious && previousDelta > 0.0f && delta <= 0.0f) ||
+                                    (!hadPrevious && delta <= 0.0f)) {
+                                    const Simulation::BrickCoord brick{
+                                        static_cast<int32_t>(std::floor(p.x / 16.0f)),
+                                        static_cast<int32_t>(
+                                            std::floor(terrainHeight / 16.0f)),
+                                        static_cast<int32_t>(std::floor(p.z / 16.0f))};
+                                    if (probeStatusByBrick.find(brick) ==
+                                        probeStatusByBrick.end()) {
+                                        const ExactCoverageBrickStatus status =
+                                            CheckExactCoverageBrickReady(
+                                                sparseVoxelWorld.GetSurfaceCache(),
+                                                sparseSurfaceGpuResources,
+                                                brick);
+                                        const uint32_t statusIndex =
+                                            static_cast<uint32_t>(status);
+                                        probeStatusByBrick.emplace(brick, statusIndex);
+                                        if (statusIndex < 9u) {
+                                            ++statusCounts[statusIndex];
+                                        }
+                                        if (status ==
+                                            ExactCoverageBrickStatus::NotSurfaceKnown) {
+                                            // Request the whole visible wall span, not just
+                                            // the heightfield-top brick: at a cliff the ray
+                                            // altitude (p.y) is far below the 2D terrain
+                                            // height, and the visible void is the wall
+                                            // bricks in between. Cap the stack so one probe
+                                            // hit cannot flood the request budget.
+                                            const int32_t stackLow = static_cast<int32_t>(
+                                                std::floor(p.y / 16.0f));
+                                            const int32_t stackHigh = brick.y + 1;
+                                            std::vector<Simulation::BrickCoord> stack;
+                                            stack.reserve(6);
+                                            for (int32_t sy = std::min(stackLow, brick.y);
+                                                 sy <= stackHigh &&
+                                                 stack.size() < 6u;
+                                                 ++sy) {
+                                                stack.push_back({brick.x, sy, brick.z});
+                                            }
+                                            for (const Simulation::BrickCoord& reqCoord :
+                                                 stack) {
+                                                if (viewCoverageRequested >=
+                                                    viewCoverageMaxRequests) {
+                                                    break;
+                                                }
+                                                if (reqCoord.y != brick.y &&
+                                                    CheckExactCoverageBrickReady(
+                                                        sparseVoxelWorld.GetSurfaceCache(),
+                                                        sparseSurfaceGpuResources,
+                                                        reqCoord) !=
+                                                        ExactCoverageBrickStatus::
+                                                            NotSurfaceKnown) {
+                                                    continue;
+                                                }
+                                                auto reqIt =
+                                                    s_viewCoverageRequestedFrame.find(
+                                                        reqCoord);
+                                                const bool cooledDown =
+                                                    reqIt ==
+                                                        s_viewCoverageRequestedFrame.end() ||
+                                                    frameCount > reqIt->second + 300ull;
+                                                if (cooledDown &&
+                                                    requestSparseBrick(
+                                                        reqCoord,
+                                                        false,
+                                                        Simulation::SparseResidencyClass::
+                                                            Visible,
+                                                        false,
+                                                        false,
+                                                        false,
+                                                        false,
+                                                        12000,
+                                                        Simulation::SparseStreamingLane::
+                                                            Cache)) {
+                                                    s_viewCoverageRequestedFrame[reqCoord] =
+                                                        frameCount;
+                                                    ++viewCoverageRequested;
+                                                }
+                                            }
+                                        }
+                                        if (status != ExactCoverageBrickStatus::Ready &&
+                                            voidProbeVerbose &&
+                                            firstBad.size() < 360u) {
+                                            firstBad += fmt::format(
+                                                "({},{},{}):{}; ",
+                                                brick.x, brick.y, brick.z, statusIndex);
+                                        }
+                                    }
+                                    break;
+                                }
+                                previousDelta = delta;
+                                hadPrevious = true;
+                            }
+                        }
+                    }
+                    if (s_viewCoverageRequestedFrame.size() > 4096u) {
+                        for (auto it = s_viewCoverageRequestedFrame.begin();
+                             it != s_viewCoverageRequestedFrame.end();) {
+                            if (frameCount > it->second + 600ull) {
+                                it = s_viewCoverageRequestedFrame.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
+                    }
+                    if (enableRuntimeLog) {
+                        spdlog::info(
+                            "VIEW_COVERAGE_REPAIR frame={} bricks={} ready={} notKnown={} "
+                            "cpuNoFaces={} gpuNotPresent={} gpuPayload={} gpuRecord={} "
+                            "gpuDraw={} gpuRange={} gpuFaceMismatch={} requested={} "
+                            "tracked={} bad=[{}]",
+                            frameCount,
+                            static_cast<uint32_t>(probeStatusByBrick.size()),
+                            statusCounts[0], statusCounts[1], statusCounts[2],
+                            statusCounts[3], statusCounts[4], statusCounts[5],
+                            statusCounts[6], statusCounts[7], statusCounts[8],
+                            viewCoverageRequested,
+                            static_cast<uint32_t>(s_viewCoverageRequestedFrame.size()),
+                            firstBad);
                     }
                 }
                 sparseMidVoxelRenderFeedbackQueuedLastFrame = 0;
@@ -17921,6 +19561,27 @@ int RunSandbox(int argc, char* argv[]) {
                 midMeshBuildConfig.asyncRemesh = sparseMidMeshAsyncRemesh;
                 midMeshBuildConfig.extractScratch = sparseMidMeshExtractScratch;
                 midMeshBuildConfig.workStealExtract = sparseMidMeshWorkSteal;
+                midMeshBuildConfig.childHandoffMode = sparseMidMeshChildHandoffMode;
+                midMeshBuildConfig.debugWaveTrace = debugMidMeshWaveTrace;
+                midMeshBuildConfig.debugWaveTraceBinSize = debugMidMeshWaveTraceBinSize;
+                midMeshBuildConfig.debugWaveTraceMaxBins = debugMidMeshWaveTraceMaxBins;
+                midMeshBuildConfig.debugDrawTrace = debugMidMeshDrawTrace;
+                midMeshBuildConfig.debugDrawTraceMaxRows = debugMidMeshDrawTraceMaxRows;
+                midMeshBuildConfig.debugWavePixelMode = debugMidMeshWavePixelMode;
+                midMeshBuildConfig.debugDisableChildSuppression =
+                    debugDisableMidMeshChildSuppression;
+                midMeshBuildConfig.debugDisableDirtyRedraw =
+                    debugDisableMidMeshDirtyRedraw;
+                midMeshBuildConfig.debugSuppressNearDirtyUpload =
+                    debugSuppressNearMidMeshDirtyUpload;
+                midMeshBuildConfig.debugSuppressNearDirtyUploadDistance =
+                    debugSuppressNearMidMeshDirtyUploadDistance;
+                midMeshBuildConfig.suppressVisibleDirtyUpload =
+                    sparseMidMeshSuppressVisibleDirtyUpload;
+                midMeshBuildConfig.suppressVisibleNewUpload =
+                    sparseMidMeshSuppressVisibleNewUpload;
+                midMeshBuildConfig.suppressVisibleDirtyUploadPadding =
+                    sparseMidMeshSuppressVisibleDirtyPadding;
                 // Split the chain so a failure names the stage that rejected it and the
                 // snapshot's counts-vs-caps -> the replay log pins the exact overflow cap.
                 // Throttle-robust timing split: BUILD self-time is pure CPU; STAGE+EMIT
@@ -19855,7 +21516,7 @@ int RunSandbox(int argc, char* argv[]) {
                 const bool cullIntervalExpired =
                     useCpuSurfaceSnapshotCulling &&
                     (frameCount - sparseSurfaceLastCullFrame) >= sparseSurfaceCullInterval;
-                const bool needsSurfaceUpload = useGpuSurfaceCulling
+                bool needsSurfaceUpload = useGpuSurfaceCulling
                     ? (surfaceSerial != sparseSurfaceUploadedSerial ||
                        sparseSurfaceDeferredPayloadsLastUpload > 0u)
                     : (surfaceSerial != sparseSurfaceUploadedSerial ||
@@ -19864,13 +21525,32 @@ int RunSandbox(int argc, char* argv[]) {
                        cullLookaheadChanged ||
                        cullDirectionChanged ||
                        cullIntervalExpired);
+                const bool debugFreezeSurfaceUploadThisFrame =
+                    debugFreezeSurfaceUploadAfterFrame > 0u &&
+                    frameCount >= debugFreezeSurfaceUploadAfterFrame;
+                if (debugFreezeSurfaceUploadThisFrame) {
+                    needsSurfaceUpload = false;
+                    if (enableRuntimeLog && frameCount == debugFreezeSurfaceUploadAfterFrame) {
+                        spdlog::info(
+                            "PERF_SPARSE_SURFACE_UPLOAD_FREEZE frame={} serial={} uploadedSerial={} deferred={} cullCenterChanged={} cullLookaheadChanged={} cullDirectionChanged={} cullIntervalExpired={}",
+                            frameCount,
+                            surfaceSerial,
+                            sparseSurfaceUploadedSerial,
+                            sparseSurfaceDeferredPayloadsLastUpload,
+                            cullCenterChanged ? 1u : 0u,
+                            cullLookaheadChanged ? 1u : 0u,
+                            cullDirectionChanged ? 1u : 0u,
+                            cullIntervalExpired ? 1u : 0u);
+                    }
+                }
                 const bool surfaceUploadIntervalReady =
                     sparseSurfaceUploadedSerial == 0u ||
                     sparseSurfaceDeferredPayloadsLastUpload > 0u ||
                     frameCount >= sparseSurfaceLastUploadFrame + sparseSurfaceUploadMinIntervalFrames;
-                perfSparseSurfacePlanMs += ticksToMs(SDL_GetPerformanceCounter() - perfSparseStepStart);
-                perfSparseStepStart = SDL_GetPerformanceCounter();
-                if (needsSurfaceUpload && surfaceUploadIntervalReady) {
+            perfSparseSurfacePlanMs += ticksToMs(SDL_GetPerformanceCounter() - perfSparseStepStart);
+            perfSparseStepStart = SDL_GetPerformanceCounter();
+            sparseSurfaceGpuResources.SetDebugStampFaceUploads(debugSurfaceUploadPixels);
+            if (needsSurfaceUpload && surfaceUploadIntervalReady) {
                     Simulation::SparseSurfaceGpuSnapshot surfaceSnapshot;
                     Simulation::SparseSurfaceVisibilityConfig surfaceVisibility;
                     surfaceVisibility.enabled = useCpuSurfaceSnapshotCulling;
@@ -20377,6 +22057,59 @@ int RunSandbox(int argc, char* argv[]) {
             }
 
             if (!exactSurfaceNonCoverageAuditWritten &&
+                exactSurfaceNonCoverageGenerateMidUnderlaySamples &&
+                exactSurfaceNonCoverageAuditSamples.empty() &&
+                frameCount == exactSurfaceNonCoverageAuditFrame) {
+                const uint32_t generatedSamples =
+                    !exactSurfaceNonCoverageMidUnderlayPixels.empty()
+                        ? AppendMidUnderlayExactContractAuditSamplesForPixels(
+                            sparseClipmapTileCache,
+                            exactSurfaceNonCoverageMidUnderlayPixels,
+                            exactSurfaceNonCoverageAuditSamples,
+                            static_cast<uint32_t>(frameCount),
+                            cameraPos,
+                            cameraForward,
+                            cameraRight,
+                            cameraUp,
+                            fov,
+                            aspectRatio,
+                            window->GetWidth(),
+                            window->GetHeight(),
+                            sparseSurfaceRasterMaxDistance,
+                            sparseSurfaceRasterUseXzClip,
+                            sparseMidMeshNearExclusionDistance,
+                            sparseMidMeshMaxDistance,
+                            exactSurfaceNonCoverageMidUnderlayMaxSamples)
+                        : AppendMidUnderlayExactContractAuditSamples(
+                            sparseClipmapTileCache,
+                            exactSurfaceNonCoverageAuditSamples,
+                            static_cast<uint32_t>(frameCount),
+                            cameraPos,
+                            cameraForward,
+                            cameraRight,
+                            cameraUp,
+                            fov,
+                            aspectRatio,
+                            window->GetWidth(),
+                            window->GetHeight(),
+                            sparseSurfaceRasterMaxDistance,
+                            sparseSurfaceRasterUseXzClip,
+                            sparseMidMeshNearExclusionDistance,
+                            sparseMidMeshMaxDistance,
+                            exactSurfaceNonCoverageMidUnderlayMaxSamples,
+                            exactSurfaceNonCoverageMidUnderlayStride);
+                spdlog::info(
+                    "MID_UNDERLAY_EXACT_AUDIT generated frame={} samples={} source={} publicMax={:.0f} xzClip={} midMin={:.0f} midMax={:.0f}",
+                    frameCount,
+                    generatedSamples,
+                    !exactSurfaceNonCoverageMidUnderlayPixels.empty() ? "pixels" : "face_centers",
+                    sparseSurfaceRasterMaxDistance,
+                    sparseSurfaceRasterUseXzClip ? 1u : 0u,
+                    sparseMidMeshNearExclusionDistance,
+                    sparseMidMeshMaxDistance);
+            }
+
+            if (!exactSurfaceNonCoverageAuditWritten &&
                 !exactSurfaceNonCoverageAuditSamples.empty() &&
                 frameCount == exactSurfaceNonCoverageAuditFrame) {
                 std::error_code auditDirError;
@@ -20517,11 +22250,17 @@ int RunSandbox(int argc, char* argv[]) {
                         const float frontFacing = nearestFound
                             ? glm::dot(nearestNormal, -glm::normalize(nearestCenter - cameraPos))
                             : 0.0f;
+                        const glm::vec3 nearestCenterDelta = nearestCenter - cameraPos;
                         const float nearestCenterDistance = nearestFound
-                            ? glm::length(nearestCenter - cameraPos)
+                            ? glm::length(nearestCenterDelta)
+                            : 0.0f;
+                        const float nearestCenterSurfaceMetric = nearestFound
+                            ? (sparseSurfaceRasterUseXzClip
+                                ? glm::length(glm::vec2(nearestCenterDelta.x, nearestCenterDelta.z))
+                                : nearestCenterDistance)
                             : 0.0f;
                         const bool outsideRaster =
-                            nearestFound && nearestCenterDistance > sparseSurfaceRasterMaxDistance;
+                            nearestFound && nearestCenterSurfaceMetric > sparseSurfaceRasterMaxDistance;
                         const bool backfaceRejected = nearestFound && frontFacing < -0.0001f;
                         const bool depthOrOcclusionRejected =
                             nearestFound && nearestT >= sample.midDistance - 0.25f;
@@ -22940,7 +24679,8 @@ int RunSandbox(int argc, char* argv[]) {
                     static_cast<uint64_t>(sparseSurfaceRasterPromotionFeedbackMaxAge);
             const bool highAltitudeActualUnsafeRepairPressure =
                 shaderUnsafeFeedbackRecent &&
-                sparseShaderUnsafeFeedbackUnsafePixelsLastFrame > 0u;
+                (sparseShaderUnsafeFeedbackUnsafePixelsLastFrame > 0u ||
+                 sparseShaderUnsafeFeedbackContractNonReadyLastFrame > 0u);
             const bool highAltitudeLodCarriesPublicView =
                 sparseTerrainScreenCriticalLodThrottleMinAltitude > 0u &&
                 surfacePromotionAltitudeAboveTerrain >=
@@ -23269,7 +25009,148 @@ int RunSandbox(int argc, char* argv[]) {
         }
         cameraParams.surfaceRasterMaxDistance =
             enableSparseSurfaceRaster ? sparseSurfaceRasterRenderMaxDistance : 0.0f;
-        cameraParams.debugMode = sparseRaymarchDebugMode;
+        cameraParams.publicSurfaceRasterMaxDistance = cameraParams.surfaceRasterMaxDistance;
+        cameraParams.surfaceRasterUseXzClip = sparseSurfaceRasterUseXzClip;
+        const uint32_t effectiveSparseRaymarchDebugMode = debugSurfaceHandoffPixels
+            ? debugSurfaceHandoffOverlayDebugMode(debugSurfaceHandoffOverlayMode)
+            : sparseRaymarchDebugMode;
+        cameraParams.debugMode = effectiveSparseRaymarchDebugMode;
+
+        std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash>
+            terrainOwnershipMidTilesOwnedByExact;
+        std::unordered_set<Simulation::BrickCoord, Simulation::BrickCoordHash>
+            terrainOwnershipExactBricksBlockedByMid;
+        std::unordered_map<Simulation::BrickCoord, float, Simulation::BrickCoordHash>
+            terrainOwnershipExactBrickDrawFraction;
+        ExactBrickOwnershipResolveStats terrainOwnershipStats;
+        const bool terrainOwnershipActiveThisFrame =
+            terrainOwnershipContract &&
+            enableSparseSurfaceRaster &&
+            enableSparseMidMesh &&
+            sparseClipmapTileCacheReady;
+        cameraParams.terrainOwnershipContractActive = terrainOwnershipActiveThisFrame;
+        if (terrainOwnershipActiveThisFrame) {
+            cameraParams.surfaceRasterMaxDistance =
+                std::max(cameraParams.surfaceRasterMaxDistance, sparseSurfaceRasterMaxDistance);
+            cameraParams.publicSurfaceRasterMaxDistance = cameraParams.surfaceRasterMaxDistance;
+            ResolveExactBrickOwnership(
+                sparseVoxelWorld.GetSurfaceCache(),
+                sparseSurfaceGpuResources,
+                renderCameraPos,
+                cameraForward,
+                cameraRight,
+                cameraUp,
+                fov,
+                aspectRatio,
+                window->GetHeight(),
+                cameraParams.surfaceRasterMaxDistance,
+                sparseSurfaceRasterUseXzClip,
+                terrainOwnershipVisiblePadding,
+                terrainOwnershipFarSafeSwapDistance,
+                terrainOwnershipSubpixelThreshold,
+                terrainOwnershipMaxHoldFrames,
+                terrainOwnershipDitherFrames,
+                terrainOwnershipDissolveFrames,
+                terrainOwnershipInstantRecommitWindow,
+                frameCount,
+                terrainOwnershipByExactBrick,
+                terrainOwnershipExactBricksBlockedByMid,
+                terrainOwnershipExactBrickDrawFraction,
+                terrainOwnershipStats);
+            if (enableRuntimeLog &&
+                (frameCount % static_cast<uint64_t>(terrainOwnershipLogInterval)) == 0ull) {
+                spdlog::info(
+                    "TERRAIN_OWNERSHIP frame={} active=1 displayR={:.0f} exactBricks={} ready={} "
+                    "exactOwned={} heldMid={} visible={} safe={} dissolving={} dissolveStart={} "
+                    "dissolveCommit={} instantRecommit={} inViewExactBlocked={} "
+                    "midToExact={} exactToMid={} blockedDraws={} states={} pruned={} "
+                    "filters=midExact:{} exactBlocked:{} fractions:{}",
+                    frameCount,
+                    cameraParams.surfaceRasterMaxDistance,
+                    terrainOwnershipStats.bricksConsidered,
+                    terrainOwnershipStats.bricksReady,
+                    terrainOwnershipStats.exactOwned,
+                    terrainOwnershipStats.heldMid,
+                    terrainOwnershipStats.visible,
+                    terrainOwnershipStats.safe,
+                    terrainOwnershipStats.dissolving,
+                    terrainOwnershipStats.dissolveStarted,
+                    terrainOwnershipStats.dissolveCommits,
+                    terrainOwnershipStats.instantRecommits,
+                    terrainOwnershipStats.inViewExactBlocked,
+                    terrainOwnershipStats.midToExactCommits,
+                    terrainOwnershipStats.exactToMidDemotes,
+                    terrainOwnershipStats.blockedDraws,
+                    static_cast<uint32_t>(std::min<size_t>(
+                        terrainOwnershipByExactBrick.size(),
+                        static_cast<size_t>(std::numeric_limits<uint32_t>::max()))),
+                    terrainOwnershipStats.prunedStates,
+                    static_cast<uint32_t>(terrainOwnershipMidTilesOwnedByExact.size()),
+                    static_cast<uint32_t>(terrainOwnershipExactBricksBlockedByMid.size()),
+                    static_cast<uint32_t>(terrainOwnershipExactBrickDrawFraction.size()));
+            }
+        }
+
+        if (debugExactCoverage &&
+            enableRuntimeLog &&
+            enableSparseSurfaceRaster &&
+            (frameCount % static_cast<uint64_t>(debugExactCoverageInterval)) == 0ull) {
+            const ExactCoverageAuditStats exactCoverage =
+                AuditExactCoverageForMidTiles(
+                    sparseClipmapTileCache,
+                    sparseVoxelWorld.GetSurfaceCache(),
+                    sparseSurfaceGpuResources,
+                    renderCameraPos,
+                    sparseSurfaceRasterMaxDistance,
+                    cameraParams.surfaceRasterMaxDistance,
+                    sparseSurfaceRasterUseXzClip,
+                    debugExactCoverageMaxTiles,
+                    debugExactCoverageMaxBricksPerTile);
+            const float ringComplete =
+                exactCoverage.tilesTotal > 0u
+                    ? static_cast<float>(exactCoverage.tilesReady) /
+                        static_cast<float>(exactCoverage.tilesTotal)
+                    : 1.0f;
+            const float nearestHole =
+                exactCoverage.nearestHoleDistance == std::numeric_limits<float>::max()
+                    ? -1.0f
+                    : exactCoverage.nearestHoleDistance;
+            spdlog::info(
+                "EXACT_COVERAGE frame={} advertisedR={:.0f} renderR={:.0f} xzClip={} "
+                "tilesReady={}/{} ringComplete={:.3f} nearestHole={:.0f} "
+                "nearestTile=({},{},{}) nearestExact=({},{},{}) exactBricksReady={}/{} "
+                "reasons=notKnown:{} cpuNoFaces:{} gpuNotPresent:{} gpuPayload:{} "
+                "gpuRecord:{} gpuDraw:{} gpuRange:{} gpuFaceMismatch:{} skippedTiles:{} "
+                "cappedTiles:{} maxTiles={} maxBricksPerTile={}",
+                frameCount,
+                sparseSurfaceRasterMaxDistance,
+                cameraParams.surfaceRasterMaxDistance,
+                sparseSurfaceRasterUseXzClip ? 1u : 0u,
+                exactCoverage.tilesReady,
+                exactCoverage.tilesTotal,
+                ringComplete,
+                nearestHole,
+                exactCoverage.nearestHoleTile.x,
+                exactCoverage.nearestHoleTile.y,
+                exactCoverage.nearestHoleTile.z,
+                exactCoverage.nearestHoleExact.x,
+                exactCoverage.nearestHoleExact.y,
+                exactCoverage.nearestHoleExact.z,
+                exactCoverage.exactBricksReady,
+                exactCoverage.exactBricksTotal,
+                exactCoverage.notSurfaceKnown,
+                exactCoverage.cpuNoFaces,
+                exactCoverage.gpuNotPresent,
+                exactCoverage.gpuPayloadMissing,
+                exactCoverage.gpuRecordMissing,
+                exactCoverage.gpuDrawMissing,
+                exactCoverage.gpuRangeMissing,
+                exactCoverage.gpuFaceCountMismatch,
+                exactCoverage.tilesSkipped,
+                exactCoverage.tilesCapped,
+                debugExactCoverageMaxTiles,
+                debugExactCoverageMaxBricksPerTile);
+        }
 
         // Build brush preview params from GPU raycast result (NEW!)
         Graphics::Renderer::BrushPreview brushPreview = {};
@@ -23975,6 +25856,7 @@ int RunSandbox(int argc, char* argv[]) {
             sparseBackendActiveMaskThisFrame |= kBackendPipeSurfaceRaster;
             const auto& sparseSurfaceStats = sparseSurfaceGpuResources.GetStats();
             const bool useSparseSurfaceGpuCull =
+                !terrainOwnershipActiveThisFrame &&
                 sparseSurfaceGpuResources.IsGpuCullEnabled() &&
                 sparseSurfaceStats.uploadedSurfaceRecords > 0;
             bool sparseSurfaceGpuCullReady = false;
@@ -24002,22 +25884,73 @@ int RunSandbox(int argc, char* argv[]) {
                 enableSparseSurfaceIndirect &&
                 sparseSurfaceStats.uploadedDrawCommands > 0 &&
                 sparseSurfaceGpuResources.DrawArgsResource() != nullptr;
+            ID3D12Resource* sparseSurfaceDrawArgsResource =
+                useSparseSurfaceIndirect ? sparseSurfaceGpuResources.DrawArgsResource() : nullptr;
+            uint32_t sparseSurfaceDrawArgCount =
+                useSparseSurfaceIndirect
+                    ? (sparseSurfaceGpuCullReady
+                        ? sparseSurfaceStats.maxDrawCommands
+                        : sparseSurfaceStats.uploadedDrawCommands)
+                    : 0u;
+            ID3D12Resource* sparseSurfaceDrawCountResource =
+                (useSparseSurfaceIndirect && sparseSurfaceGpuCullReady)
+                    ? sparseSurfaceGpuResources.DrawCountResource()
+                    : nullptr;
+            uint32_t terrainOwnershipExactExcluded = 0u;
+            uint32_t terrainOwnershipExactCommands = 0u;
+            uint32_t terrainOwnershipExactPartial = 0u;
+            if (terrainOwnershipActiveThisFrame &&
+                useSparseSurfaceIndirect &&
+                (!terrainOwnershipExactBricksBlockedByMid.empty() ||
+                 !terrainOwnershipExactBrickDrawFraction.empty())) {
+                if (sparseSurfaceGpuResources.BuildFallbackDrawArgsExcluding(
+                        commandList.Get(),
+                        terrainOwnershipExactBricksBlockedByMid,
+                        &terrainOwnershipExactExcluded,
+                        &terrainOwnershipExactCommands,
+                        &terrainOwnershipExactBrickDrawFraction,
+                        &terrainOwnershipExactPartial)) {
+                    sparseSurfaceDrawArgsResource =
+                        sparseSurfaceGpuResources.FallbackDrawArgsResource();
+                    sparseSurfaceDrawArgCount = terrainOwnershipExactCommands;
+                    sparseSurfaceDrawCountResource = nullptr;
+                } else if (enableRuntimeLog) {
+                    spdlog::warn(
+                        "TERRAIN_OWNERSHIP_EXACT_FILTER_FAILED frame={} blockedBricks={} dissolving={}",
+                        frameCount,
+                        static_cast<uint32_t>(
+                            terrainOwnershipExactBricksBlockedByMid.size()),
+                        static_cast<uint32_t>(
+                            terrainOwnershipExactBrickDrawFraction.size()));
+                }
+            }
+            if (terrainOwnershipActiveThisFrame &&
+                enableRuntimeLog &&
+                (frameCount % static_cast<uint64_t>(terrainOwnershipLogInterval)) == 0ull) {
+                spdlog::info(
+                    "TERRAIN_OWNERSHIP_EXACT_FILTER frame={} blockedBricks={} excludedDraws={} "
+                    "dissolvingBricks={} partialDraws={} commands={}",
+                    frameCount,
+                    static_cast<uint32_t>(terrainOwnershipExactBricksBlockedByMid.size()),
+                    terrainOwnershipExactExcluded,
+                    static_cast<uint32_t>(terrainOwnershipExactBrickDrawFraction.size()),
+                    terrainOwnershipExactPartial,
+                    terrainOwnershipExactCommands);
+            }
             renderer->RenderSparseSurfaceFaces(
                 commandList.Get(),
                 sparseNearField.surfaceFacesSRV,
                 voxelWorld->GetPaletteSRV(),
                 sparseNearField.surfaceFaceCount,
                 cameraParams,
-                useSparseSurfaceIndirect ? sparseSurfaceGpuResources.DrawArgsResource() : nullptr,
-                useSparseSurfaceIndirect
-                    ? (sparseSurfaceGpuCullReady ? sparseSurfaceStats.maxDrawCommands : sparseSurfaceStats.uploadedDrawCommands)
-                    : 0u,
-                (useSparseSurfaceIndirect && sparseSurfaceGpuCullReady)
-                    ? sparseSurfaceGpuResources.DrawCountResource()
-                    : nullptr,
+                sparseSurfaceDrawArgsResource,
+                sparseSurfaceDrawArgCount,
+                sparseSurfaceDrawCountResource,
                 &sparseSurfaceGpuResources.VertexIdBufferView(),
                 &sparseSurfaceGpuResources.IndexBufferView(),
                 sparseSurfaceGpuResources.VertexIdCapacityFaces(),
+                sparseSurfaceStats.uploadedSurfaceRecords,
+                sparseSurfaceStats.uploadedSerial,
                 &sparseSurfaceGpuResources.SurfaceRecordSRV(),
                 &sparseSurfaceGpuResources.SurfaceClusterSRV(),
                 cameraParams.renderOwnershipStatsEnabled ? &sparseNearField.renderOwnershipUAV : nullptr,
@@ -24026,7 +25959,8 @@ int RunSandbox(int argc, char* argv[]) {
                 &sparseNearField.occupancySRV,
                 &sparseNearField.pageGenerationSRV,
                 sparseNearField.maxBrickPages,
-                sparseNearField.pageTableCapacity);
+                sparseNearField.pageTableCapacity,
+                1u);
             if (sparseSurfaceGpuCullReady) {
                 sparseSurfaceGpuResources.QueueGpuCullStatsReadback(
                     commandList.Get(),
@@ -24044,7 +25978,24 @@ int RunSandbox(int argc, char* argv[]) {
                 return;
             }
             auto midMeshCamera = cameraParams;
+            const float publicExactMidExclusionDistance =
+                (sparseMidMeshExcludePublicExact &&
+                 !terrainOwnershipActiveThisFrame &&
+                 enableSparseSurfaceRaster)
+                    ? cameraParams.surfaceRasterMaxDistance
+                    : 0.0f;
+            midMeshCamera.surfaceRasterMinDistance =
+                std::max(sparseMidMeshNearExclusionDistance, publicExactMidExclusionDistance);
             midMeshCamera.surfaceRasterMaxDistance = sparseMidMeshMaxDistance;
+            if (enableRuntimeLog && (frameCount % 20ull) == 0ull) {
+                spdlog::info(
+                    "MIDMESH_HANDOFF frame={} promoted={} exactMax={:.0f} midMin={:.0f} midMax={:.0f}",
+                    frameCount,
+                    sparseSurfaceRasterPromotedForRender ? 1u : 0u,
+                    cameraParams.surfaceRasterMaxDistance,
+                    midMeshCamera.surfaceRasterMinDistance,
+                    midMeshCamera.surfaceRasterMaxDistance);
+            }
             // P1.5: with the range allocator on, faces live in non-contiguous range slots,
             // so the draw MUST be indirect (per-brick draw args) - a linear face draw would
             // read the gaps. Without it, the simple contiguous linear draw.
@@ -24052,13 +26003,55 @@ int RunSandbox(int argc, char* argv[]) {
                 sparseMidMeshIncrementalUpload &&
                 sparseMidMeshGpuResources.DrawArgsResource() != nullptr &&
                 midMeshStats.uploadedDrawCommands > 0u;
+            ID3D12Resource* midMeshDrawArgsResource =
+                useMidMeshIndirect ? sparseMidMeshGpuResources.DrawArgsResource() : nullptr;
+            uint32_t midMeshDrawArgCount =
+                useMidMeshIndirect ? midMeshStats.uploadedDrawCommands : 0u;
+            uint32_t terrainOwnershipMidExcluded = 0u;
+            uint32_t terrainOwnershipMidCommands = 0u;
+            if (terrainOwnershipActiveThisFrame &&
+                useMidMeshIndirect &&
+                !terrainOwnershipMidTilesOwnedByExact.empty()) {
+                if (sparseMidMeshGpuResources.BuildFallbackDrawArgsExcluding(
+                        commandList.Get(),
+                        terrainOwnershipMidTilesOwnedByExact,
+                        &terrainOwnershipMidExcluded,
+                        &terrainOwnershipMidCommands)) {
+                    midMeshDrawArgsResource =
+                        sparseMidMeshGpuResources.FallbackDrawArgsResource();
+                    midMeshDrawArgCount = terrainOwnershipMidCommands;
+                } else if (enableRuntimeLog) {
+                    spdlog::warn(
+                        "TERRAIN_OWNERSHIP_MID_FILTER_FAILED frame={} exactOwnedMidTiles={}",
+                        frameCount,
+                        static_cast<uint32_t>(
+                            terrainOwnershipMidTilesOwnedByExact.size()));
+                }
+            }
+            if (terrainOwnershipActiveThisFrame &&
+                enableRuntimeLog &&
+                (frameCount % static_cast<uint64_t>(terrainOwnershipLogInterval)) == 0ull) {
+                spdlog::info(
+                    "TERRAIN_OWNERSHIP_MID_FILTER frame={} exactOwnedMidTiles={} excludedDraws={} commands={}",
+                    frameCount,
+                    static_cast<uint32_t>(terrainOwnershipMidTilesOwnedByExact.size()),
+                    terrainOwnershipMidExcluded,
+                    terrainOwnershipMidCommands);
+            }
             bool useGpuMidMeshDraw = false;
             bool useGpuMidMeshDirectDraw = false;
             uint32_t gpuMidMeshFallbackExcluded = 0u;
             uint32_t gpuMidMeshFallbackCommands = 0u;
             uint32_t gpuMidMeshCopiedTiles = 0u;
             uint32_t gpuMidMeshCopiedFaces = 0u;
-            if (sparseMidMeshGpuDrawDirect &&
+            // The ownership contract never filters MID draws (mid is the
+            // unconditional fallback; only EXACT draws are gated per brick),
+            // so the GPU mid-mesh direct-draw lane stays enabled under the
+            // contract. Disabling it here made GPU-extracted tiles without a
+            // landed CPU copy vanish - transient mid gaps near the camera.
+            const bool sparseMidMeshGpuDrawForThisPass = sparseMidMeshGpuDraw;
+            if (sparseMidMeshGpuDrawForThisPass &&
+                sparseMidMeshGpuDrawDirect &&
                 !sparseMidMeshGpuDrawPendingBySlot.empty()) {
                 const uint64_t completedFence =
                     midMeshGpuExtractResources.ProductionQueueCompletedFenceValue();
@@ -24108,7 +26101,7 @@ int RunSandbox(int argc, char* argv[]) {
                     sparseMidMeshGpuDrawPendingBySlot.erase(slot);
                 }
             }
-            if (sparseMidMeshGpuDraw &&
+            if (sparseMidMeshGpuDrawForThisPass &&
                 useMidMeshIndirect &&
                 midMeshGpuExtractResources.B13aReady() &&
                 midMeshGpuExtractResources.ProductionFaceBufferResource() != nullptr &&
@@ -24231,7 +26224,7 @@ int RunSandbox(int argc, char* argv[]) {
                     }
                 }
             }
-            if (enableRuntimeLog && sparseMidMeshGpuDraw) {
+            if (enableRuntimeLog && sparseMidMeshGpuDrawForThisPass) {
                 spdlog::info(
                     "GPU_MIDMESH_DRAW frame={} enabled={} direct={} compactCopiedTiles={} "
                     "compactCopiedFaces={} committedCoords={} fallbackExcluded={} "
@@ -24258,6 +26251,8 @@ int RunSandbox(int argc, char* argv[]) {
                     &sparseMidMeshGpuResources.VertexIdBufferView(),
                     &sparseMidMeshGpuResources.IndexBufferView(),
                     sparseMidMeshGpuResources.VertexIdCapacityFaces(),
+                    0u,
+                    0u,
                     nullptr,
                     nullptr,
                     cameraParams.renderOwnershipStatsEnabled ? &sparseNearField.renderOwnershipUAV : nullptr,
@@ -24266,7 +26261,8 @@ int RunSandbox(int argc, char* argv[]) {
                     &sparseNearField.occupancySRV,
                     &sparseNearField.pageGenerationSRV,
                     sparseNearField.maxBrickPages,
-                    sparseNearField.pageTableCapacity);
+                    sparseNearField.pageTableCapacity,
+                    2u);
                 if (gpuMidMeshFallbackCommands > 0u) {
                     renderer->RenderSparseSurfaceFaces(
                         commandList.Get(),
@@ -24280,6 +26276,8 @@ int RunSandbox(int argc, char* argv[]) {
                         &sparseMidMeshGpuResources.VertexIdBufferView(),
                         &sparseMidMeshGpuResources.IndexBufferView(),
                         sparseMidMeshGpuResources.VertexIdCapacityFaces(),
+                        midMeshStats.uploadedSurfaceRecords,
+                        midMeshStats.uploadedSerial,
                         &sparseMidMeshGpuResources.SurfaceRecordSRV(),
                         &sparseMidMeshGpuResources.SurfaceClusterSRV(),
                         cameraParams.renderOwnershipStatsEnabled ? &sparseNearField.renderOwnershipUAV : nullptr,
@@ -24288,7 +26286,8 @@ int RunSandbox(int argc, char* argv[]) {
                         &sparseNearField.occupancySRV,
                         &sparseNearField.pageGenerationSRV,
                         sparseNearField.maxBrickPages,
-                        sparseNearField.pageTableCapacity);
+                        sparseNearField.pageTableCapacity,
+                        2u);
                 }
                 return;
             }
@@ -24298,12 +26297,14 @@ int RunSandbox(int argc, char* argv[]) {
                 voxelWorld->GetPaletteSRV(),
                 midMeshStats.uploadedFaces,
                 midMeshCamera,
-                useMidMeshIndirect ? sparseMidMeshGpuResources.DrawArgsResource() : nullptr,
-                useMidMeshIndirect ? midMeshStats.uploadedDrawCommands : 0u,
+                midMeshDrawArgsResource,
+                midMeshDrawArgCount,
                 nullptr,
                 &sparseMidMeshGpuResources.VertexIdBufferView(),
                 &sparseMidMeshGpuResources.IndexBufferView(),
                 sparseMidMeshGpuResources.VertexIdCapacityFaces(),
+                midMeshStats.uploadedSurfaceRecords,
+                midMeshStats.uploadedSerial,
                 &sparseMidMeshGpuResources.SurfaceRecordSRV(),
                 &sparseMidMeshGpuResources.SurfaceClusterSRV(),
                 cameraParams.renderOwnershipStatsEnabled ? &sparseNearField.renderOwnershipUAV : nullptr,
@@ -24312,12 +26313,13 @@ int RunSandbox(int argc, char* argv[]) {
                 &sparseNearField.occupancySRV,
                 &sparseNearField.pageGenerationSRV,
                 sparseNearField.maxBrickPages,
-                sparseNearField.pageTableCapacity);
+                sparseNearField.pageTableCapacity,
+                2u);
         };
 
-        // Sparse surfaces are the near-field owner. Draw them first so they
-        // write depth/stencil; the fullscreen background raymarch runs only for
-        // pixels not already owned by sparse raster surfaces.
+        // Exact sparse surfaces claim first. The mid mesh is a fallback owner:
+        // it may draw only where exact left stencil unowned, then background
+        // raymarch fills only pixels neither raster path claimed.
         if (sparseRenderWorldThisFrame) {
             // Live edit-overlay bake: write this frame's brush edits straight into
             // the resident brick voxel pool (+ occupancy) right before the raymarch
@@ -24732,8 +26734,15 @@ int RunSandbox(int argc, char* argv[]) {
                 const auto& sparseStats = sparseGpuResources.GetStats();
                 ImGui::Text("Sparse raymarch visual %s | debug %u | only %u",
                     enableSparseRaymarch ? "on" : "off",
-                    sparseRaymarchDebugMode,
+                    cameraParams.debugMode,
                     enableSparseOnlyRaymarch ? 1u : 0u);
+                if (debugSurfaceHandoffPixels) {
+                    ImGui::Text(
+                        "F8 overlay %u/%u: %s",
+                        debugSurfaceHandoffOverlayMode,
+                        kDebugSurfaceHandoffOverlayModeCount - 1u,
+                        debugSurfaceHandoffOverlayLabel(debugSurfaceHandoffOverlayMode));
+                }
                 const auto midResidencyOverlay =
                     Simulation::BuildClipmapResidencyMetadata(sparseClipmapTileCache.GetStats());
                 ImGui::Text("Sparse mid clipmap %s | %.0f..%.0f | cell %.0f | coverage h/v %.2f/%.2f",
@@ -25340,6 +27349,11 @@ int RunSandbox(int argc, char* argv[]) {
                         sparseGpuStats.renderOwnerSkyPixelsLastRetire,
                         sparseGpuStats.renderOwnerMissPixelsLastRetire,
                         sparseGpuStats.renderOwnerUnsafeNearMissPixelsLastRetire);
+                    ImGui::Text("Surface fragments exact %u mid %u | protected exact %u protected mid %u",
+                        sparseGpuStats.renderOwnerExactSurfaceFragmentsLastRetire,
+                        sparseGpuStats.renderOwnerMidSurfaceFragmentsLastRetire,
+                        sparseGpuStats.renderOwnerProtectedExactSurfaceFragmentsLastRetire,
+                        sparseGpuStats.renderOwnerProtectedMidSurfaceFragmentsLastRetire);
                     ImGui::Text("Sparse ownership mix bg %.0f%% midV %.0f%% farH %.0f%% sky %.0f%%",
                         sparseOwnershipBackgroundPixelShareLastRetire * 100.0f,
                         sparseOwnershipMidVoxelPixelShareLastRetire * 100.0f,

@@ -1029,7 +1029,8 @@ try {
             $env:VENPOD_RAYMARCH_BACKGROUND_PASS_ENABLE = "1"
             $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SCALE = $bgScale
             $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL =
-                if ($qualityDefaultBackgroundMask -or
+                if ($env:VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL) { $env:VENPOD_RAYMARCH_BACKGROUND_PASS_SURFACE_FILL }
+                elseif ($qualityDefaultBackgroundMask -or
                     ($ExperimentalBackgroundPassNoSurfaceFill -and $ExperimentalBackgroundPassScale -gt 0)) { "0" } else { "1" }
             if ($qualityDefaultBackgroundMask -or
                 ($ExperimentalBackgroundPassForegroundMask -and $ExperimentalBackgroundPassScale -gt 0)) {

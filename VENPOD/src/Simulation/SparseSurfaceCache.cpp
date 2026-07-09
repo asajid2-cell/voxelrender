@@ -975,6 +975,8 @@ bool SparseSurfaceCache::BuildGpuSnapshot(
         range.faceCount = faceCount;
         const uint32_t directionMask = BuildSparseSurfaceDirectionMask(faces);
         range.flags = SparseSurfacePackRecordFlags(kSparseSurfaceRangeValid, directionMask);
+        const auto dirtySerialIt = m_dirtyBrickSerials.find(coord);
+        const bool debugDirtySurface = dirtySerialIt != m_dirtyBrickSerials.end();
         if (includeFacePayloads) {
             outSnapshot.faces.insert(outSnapshot.faces.end(), faces.begin(), faces.end());
         }
@@ -987,7 +989,10 @@ bool SparseSurfaceCache::BuildGpuSnapshot(
             record.flags = faceCount > 0u
                 ? SparseSurfacePackRecordFlags(kSparseSurfaceRangeValid, directionMask)
                 : 0u;
-            record.generation = m_stats.serial;
+            if (debugDirtySurface && record.flags != 0u) {
+                record.flags |= kSparseSurfaceDebugWavePixel;
+            }
+            record.generation = debugDirtySurface ? dirtySerialIt->second : m_stats.serial;
             ComputeSparseSurfaceFaceBounds(
                 faces.data(),
                 faceCount,

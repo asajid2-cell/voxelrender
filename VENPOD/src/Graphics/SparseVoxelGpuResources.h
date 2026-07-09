@@ -154,6 +154,13 @@ struct SparseVoxelGpuStats {
     uint32_t renderOwnerMissPixelsLastRetire = 0;
     uint32_t renderOwnerSurfacePixelsLastRetire = 0;
     uint32_t renderOwnerFarSurfacePixelsLastRetire = 0;
+    uint32_t renderOwnerExactSurfaceFragmentsLastRetire = 0;
+    uint32_t renderOwnerMidSurfaceFragmentsLastRetire = 0;
+    uint32_t renderOwnerProtectedMidSurfaceFragmentsLastRetire = 0;
+    uint32_t renderOwnerProtectedExactSurfaceFragmentsLastRetire = 0;
+    uint32_t renderOwnerProtectedMidVoxelPixelsLastRetire = 0;
+    uint32_t renderOwnerProtectedFarSvoPixelsLastRetire = 0;
+    uint32_t renderOwnerProtectedFarHeightPixelsLastRetire = 0;
     uint32_t renderOwnerUnsafeNearMissPixelsLastRetire = 0;
     uint32_t renderOwnerWaterContextPixelsLastRetire = 0;
     uint32_t renderOwnerValleyAtmospherePixelsLastRetire = 0;

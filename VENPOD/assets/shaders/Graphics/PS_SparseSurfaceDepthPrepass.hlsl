@@ -32,6 +32,7 @@ struct PSInput {
     float3 normal : NORMAL0;
     nointerpolation uint material : MATERIAL0;
     nointerpolation uint faceDirection : TEXCOORD2;
+    nointerpolation uint debugMarker : TEXCOORD3;
     float distance : TEXCOORD0;
     float3 worldPos : TEXCOORD1;
 };
@@ -121,6 +122,22 @@ bool TrySampleSparseSurfaceVoxel(int3 worldVoxel, out uint voxel) {
     return true;
 }
 
+bool UseXzSurfaceClipMetric() {
+    if (frame.debugMode == 91u) {
+        return false;
+    }
+    return frame.nearOwnershipParams.x > 0.5f ||
+        frame.debugMode == 90u ||
+        frame.debugMode == 92u;
+}
+
+float SurfaceClipMetricForDepthPrepass(float3 worldPos) {
+    const float3 cameraToPixel = worldPos - frame.cameraPosition.xyz;
+    return UseXzSurfaceClipMetric()
+        ? length(cameraToPixel.xz)
+        : length(cameraToPixel);
+}
+
 uint ResolveSparseSurfaceMaterial(uint bakedMaterial, float3 worldPos, float3 normal,
                                   out bool liveErased) {
     liveErased = false;
@@ -139,12 +156,21 @@ uint ResolveSparseSurfaceMaterial(uint bakedMaterial, float3 worldPos, float3 no
 void main(PSInput input) {
     const float surfaceDistance = distance(input.worldPos, frame.cameraPosition.xyz);
     const float exactNearDistance = max(frame.exactNearParams.x, 0.0f);
+    const uint surfaceDebugPassKind = (uint)frame.surfaceRasterParams.w;
+    const bool exactSurfacePass = surfaceDebugPassKind == 1u;
+    const bool debugBakedSurfaceMaterialOnly = frame.debugMode == 72u;
+    const bool debugLiveSurfaceMaterialDelta = frame.debugMode == 73u;
+    const bool debugKeepLiveErasedSurfaceFaces = frame.debugMode == 74u;
     bool liveErased = false;
-    const uint material = ResolveSparseSurfaceMaterial(input.material, input.worldPos, input.normal, liveErased);
+    const uint material = (!debugBakedSurfaceMaterialOnly && exactSurfacePass)
+        ? ResolveSparseSurfaceMaterial(input.material, input.worldPos, input.normal, liveErased)
+        : input.material;
     const float eraseDiscardRange = exactNearDistance > 0.0f
         ? exactNearDistance
         : 192.0f;
-    if (liveErased && surfaceDistance <= eraseDiscardRange) {
+    if (!debugBakedSurfaceMaterialOnly && !debugLiveSurfaceMaterialDelta &&
+        !debugKeepLiveErasedSurfaceFaces &&
+        liveErased && surfaceDistance <= eraseDiscardRange) {
         discard;
     }
     const bool aboveWaterView = frame.cameraPosition.y >= FAR_WATER_SURFACE_Y - 0.5f;
@@ -173,6 +199,16 @@ void main(PSInput input) {
 
     if (sparseWaterVoxelOccludedByPlane ||
         sparseSubmergedTerrainOccludedByPlane) {
-        discard;
+        if (frame.debugMode != 97u) {
+            discard;
+        }
     }
+
+    // NOTE: the mid-underlay pass must NOT be discarded inside the public exact
+    // radius here. This prepass also feeds the background-pass foreground mask;
+    // under the terrain ownership contract, mid IS the visible foreground for
+    // held exact bricks, and discarding it let the half-res background pass
+    // composite over live mid pixels (grey/garbled holes near the camera).
+    // The exact-vs-mid pixel arbitration is owned by stencil + the per-brick
+    // draw filter, never by a radius test.
 }
