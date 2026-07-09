@@ -148,7 +148,8 @@ void Renderer::RenderVoxels(
     float regionOriginX,
     float regionOriginY,
     float regionOriginZ,
-    const BrushPreview* brushPreview)
+    const BrushPreview* brushPreview,
+    const CharacterPreview* characterPreview)
 {
     if (!cmdList) return;
 
@@ -160,7 +161,7 @@ void Renderer::RenderVoxels(
     m_fullscreenPipeline.Bind(cmdList);
 
     // Create frame constants on stack (will be passed as root constants)
-    // Must match SharedTypes.hlsli FrameConstants exactly - 40 DWORDs (added 4 for regionOrigin)
+    // Must match SharedTypes.hlsli FrameConstants exactly.
     struct FrameConstants {
         float cameraPosition[4];      // xyz = pos, w = fov
         float cameraForward[4];       // xyz = forward, w = aspectRatio
@@ -178,6 +179,7 @@ void Renderer::RenderVoxels(
         float regionOrigin[4];        // xyz = world origin, w = unused - CRITICAL FOR INFINITE WORLD!
         float brushPosition[4];       // xyz = position, w = radius
         float brushParams[4];         // x = material, y = shape, z = hasValidPosition, w = unused
+        float characterPosition[4];   // xyz = feet position, w = visible flag
     } constants = {};
 
     // Fill in camera data
@@ -243,6 +245,18 @@ void Renderer::RenderVoxels(
         constants.brushParams[1] = 0.0f;
         constants.brushParams[2] = 0.0f;  // hasValidPosition = false
         constants.brushParams[3] = 0.0f;
+    }
+
+    if (characterPreview && characterPreview->visible) {
+        constants.characterPosition[0] = characterPreview->feetX;
+        constants.characterPosition[1] = characterPreview->feetY;
+        constants.characterPosition[2] = characterPreview->feetZ;
+        constants.characterPosition[3] = 1.0f;
+    } else {
+        constants.characterPosition[0] = 0.0f;
+        constants.characterPosition[1] = 0.0f;
+        constants.characterPosition[2] = 0.0f;
+        constants.characterPosition[3] = 0.0f;
     }
 
     // Set root constants (b0)
@@ -356,13 +370,13 @@ Result<void> Renderer::CreateFullscreenPipeline(ID3D12Device* device) {
 
     // Root signature parameters (for voxel rendering)
     // b0: FrameConstants (inline 32-bit constants)
-    // Layout: camPos(4) + camFwd(4) + camRight(4) + camUp(4) + sunDir(4) + grid(4) + viewport(4) + regionOrigin(4) + brushPos(4) + brushParams(4) = 40 DWORDs
+    // Layout: camPos(4) + camFwd(4) + camRight(4) + camUp(4) + sunDir(4) + grid(4) + viewport(4) + regionOrigin(4) + brushPos(4) + brushParams(4) + character(4) = 44 DWORDs
     RootParameter frameConstantsParam;
     frameConstantsParam.type = RootParamType::Constants32Bit;
     frameConstantsParam.shaderRegister = 0;  // register b0
     frameConstantsParam.registerSpace = 0;   // space 0
     frameConstantsParam.visibility = D3D12_SHADER_VISIBILITY_ALL;
-    frameConstantsParam.num32BitValues = 40;  // sizeof(FrameConstants) / 4 - UPDATED for regionOrigin!
+    frameConstantsParam.num32BitValues = 44;
     pipelineDesc.rootParams.push_back(frameConstantsParam);
 
     // t0: VoxelGrid SRV (descriptor table for structured buffer)

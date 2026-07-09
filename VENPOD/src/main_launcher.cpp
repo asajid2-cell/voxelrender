@@ -116,7 +116,7 @@ int RunSandbox(int argc, char* argv[]) {
     windowConfig.title = "VENPOD - Voxel Physics Engine";
     windowConfig.width = 1920;
     windowConfig.height = 1080;
-    windowConfig.vsync = true;
+    windowConfig.vsync = false;
 
     auto windowResult = window->Initialize(windowConfig, device.get());
     if (windowResult.IsErr()) {
@@ -136,7 +136,7 @@ int RunSandbox(int argc, char* argv[]) {
     rendererConfig.cbvSrvUavDescriptorCount = 8192;  // DOUBLED: Increased from 4096 to handle 100+ chunks safely
     rendererConfig.rtvDescriptorCount = 32;
     rendererConfig.dsvDescriptorCount = 8;
-    rendererConfig.debugShaders = true;  // Enable debug info for development
+    rendererConfig.debugShaders = enableDiagnostics;
 
     // Find shader path
     std::filesystem::path exeDir = GetExecutableDirectorySandbox();
@@ -501,7 +501,7 @@ int RunSandbox(int argc, char* argv[]) {
     pauseMenu.Initialize();
 
     spdlog::info("Initialization complete. Entering main loop...");
-    spdlog::info("Controls: ESC=Pause, WASD=Move, Mouse=Look, Space=Jump/Fly, Double-Space=Toggle Flight, Tab=Toggle Mouse, LMB=Paint, RMB=Erase");
+    spdlog::info("Controls: ESC=Pause, WASD=Move, Mouse=Look, Space=Jump/Fly, Double-Space=Toggle Flight, V=Perspective, Tab=Toggle Mouse, LMB=Paint, RMB=Erase");
 
     // Camera setup with pitch/yaw for mouse look
     const float fov = 60.0f * 3.14159f / 180.0f;
@@ -524,12 +524,15 @@ int RunSandbox(int argc, char* argv[]) {
     // Player physics for walking on terrain
     float cameraVelocityY = 0.0f;  // Vertical velocity for gravity
     const float gravity = -50.0f;  // Gravity acceleration (units/s^2)
-    const float playerHeight = 3.0f;  // Player eye height above ground (voxels)
-    const float stepHeight = 1.5f;  // Max step height for climbing (voxels)
-    const float playerRadius = 0.4f;  // Player collision radius (voxels)
+    const float playerHeight = 6.0f;  // Player eye height above ground (voxels)
+    const float stepHeight = 2.5f;  // Max step height for climbing (voxels)
+    const float playerRadius = 0.75f;  // Player collision radius (voxels)
 
     // Flight mode toggle (double-click Space to enable/disable)
     bool flightMode = false;
+    bool thirdPersonMode = false;
+    const float thirdPersonDistance = 20.0f;
+    const float thirdPersonHeight = 8.0f;
 
     // Terrain ready flag - don't apply gravity until ground detection works
     // This prevents the camera from falling through the world during startup
@@ -546,6 +549,16 @@ int RunSandbox(int argc, char* argv[]) {
     bool mouseInitialized = false;  // Track if mouse capture has been enabled
     uint64_t lastFrameCounter = SDL_GetPerformanceCounter();
     const double performanceFrequency = static_cast<double>(SDL_GetPerformanceFrequency());
+    bool hasGroundQueryHistory = false;
+    bool hasBrushQueryHistory = false;
+    glm::vec3 lastGroundQueryRegionOriginWorld(0.0f);
+    glm::vec3 lastGroundQueryFeetWorld(0.0f);
+    glm::vec3 lastBrushQueryRegionOriginWorld(0.0f);
+    glm::vec3 lastBrushQueryCameraWorld(0.0f);
+    glm::vec3 nextGroundQueryRegionOriginWorld(0.0f);
+    glm::vec3 nextGroundQueryFeetWorld(0.0f);
+    glm::vec3 nextBrushQueryRegionOriginWorld(0.0f);
+    glm::vec3 nextBrushQueryCameraWorld(0.0f);
 
     while (running) {
         uint64_t currentFrameCounter = SDL_GetPerformanceCounter();
@@ -630,6 +643,10 @@ int RunSandbox(int argc, char* argv[]) {
         if (inputManager.IsActionPressed(Input::KeyAction::BrushDecrease)) {
             brushController.DecreaseRadius();
             spdlog::info("Brush radius: {:.1f}", brushController.GetRadius());
+        }
+        if (inputManager.IsActionPressed(Input::KeyAction::TogglePerspective)) {
+            thirdPersonMode = !thirdPersonMode;
+            spdlog::info("Perspective: {}", thirdPersonMode ? "third-person" : "first-person");
         }
 
         const bool jumpPressed = inputManager.IsActionPressed(Input::KeyAction::CameraUp);
@@ -786,6 +803,11 @@ int RunSandbox(int argc, char* argv[]) {
             cameraPosLocal = cameraPos - regionOriginWorld;
         }
 
+        nextGroundQueryRegionOriginWorld = regionOriginWorld;
+        nextGroundQueryFeetWorld = cameraPos - glm::vec3(0, playerHeight, 0);
+        nextBrushQueryRegionOriginWorld = regionOriginWorld;
+        nextBrushQueryCameraWorld = cameraPos;
+
         // === GPU GROUND DETECTION RAYCAST (for player collision) ===
         // Cast a ray straight down from player FEET position to find ground
         // Camera is at eye level, so subtract playerHeight to get feet position
@@ -815,6 +837,25 @@ int RunSandbox(int argc, char* argv[]) {
         auto gpuRaycastResult = voxelWorld->GetBrushRaycastResult();
         auto groundRaycastResult = voxelWorld->GetGroundRaycastResult();
 
+        glm::vec3 brushHitWorld(0.0f);
+        bool brushHitValid = false;
+        if (hasBrushQueryHistory && gpuRaycastResult.hasValidPosition) {
+            brushHitWorld = glm::vec3(
+                gpuRaycastResult.posX,
+                gpuRaycastResult.posY,
+                gpuRaycastResult.posZ
+            ) + lastBrushQueryRegionOriginWorld;
+
+            float hitDistance = glm::length(brushHitWorld - lastBrushQueryCameraWorld);
+            glm::vec3 brushHitCurrentLocal = brushHitWorld - regionOriginWorld;
+            brushHitValid =
+                hitDistance > playerHeight * 0.65f &&
+                hitDistance < 768.0f &&
+                brushHitCurrentLocal.x >= 0.0f && brushHitCurrentLocal.x < voxelWorld->GetGridSizeX() &&
+                brushHitCurrentLocal.y >= 0.0f && brushHitCurrentLocal.y < voxelWorld->GetGridSizeY() &&
+                brushHitCurrentLocal.z >= 0.0f && brushHitCurrentLocal.z < voxelWorld->GetGridSizeZ();
+        }
+
         // === COLLISION DETECTION ===
         if (flightMode) {
             // Flight mode - manual vertical control, no gravity or collision
@@ -827,56 +868,70 @@ int RunSandbox(int argc, char* argv[]) {
         } else {
             // Normal mode - ground collision and gravity
             // Ground raycast hit detection
-            if (groundRaycastResult.hasValidPosition) {
-                // Terrain is ready! Ground detection found solid ground.
-                if (!terrainReady) {
-                    terrainReady = true;
-                    spdlog::info("Terrain ready - gravity enabled");
-                }
+            if (hasGroundQueryHistory && groundRaycastResult.hasValidPosition) {
+                glm::vec3 groundHitWorld = glm::vec3(
+                    groundRaycastResult.posX,
+                    groundRaycastResult.posY,
+                    groundRaycastResult.posZ
+                ) + lastGroundQueryRegionOriginWorld;
 
-                // Ground raycast hit something - use it for collision
-                float groundLocalY = groundRaycastResult.posY;
-                float groundWorldY = groundLocalY + regionOriginWorld.y;
+                glm::vec2 groundXZ(groundHitWorld.x, groundHitWorld.z);
+                glm::vec2 lastFeetXZ(lastGroundQueryFeetWorld.x, lastGroundQueryFeetWorld.z);
+                glm::vec2 currentFeetXZ(cameraPos.x, cameraPos.z);
+                bool groundResultMatchesQuery = glm::length(groundXZ - lastFeetXZ) < 8.0f;
+                bool queryStillRelevant = glm::length(currentFeetXZ - lastFeetXZ) < 18.0f;
 
-                // Player feet position in world space
-                float playerFeetWorldY = cameraPos.y - playerHeight;
-                float groundDelta = playerFeetWorldY - groundWorldY;
+                if (groundResultMatchesQuery && queryStillRelevant) {
+                    // Terrain is ready! Ground detection found solid ground.
+                    if (!terrainReady) {
+                        terrainReady = true;
+                        spdlog::info("Terrain ready - gravity enabled");
+                    }
 
-                bool onGround = false;
+                    // Ground raycast hit something - use it for collision
+                    float groundWorldY = groundHitWorld.y;
 
-                if (groundDelta < -0.05f) {
-                    float climbHeight = -groundDelta;
-                    if (climbHeight <= stepHeight + 0.25f) {
+                    // Player feet position in world space
+                    float playerFeetWorldY = cameraPos.y - playerHeight;
+                    float groundDelta = playerFeetWorldY - groundWorldY;
+
+                    bool onGround = false;
+
+                    if (groundDelta < -0.05f) {
+                        float climbHeight = -groundDelta;
+                        if (climbHeight <= stepHeight + 0.25f) {
+                            cameraPos.y = groundWorldY + playerHeight;
+                            cameraVelocityY = 0.0f;
+                            onGround = true;
+                        } else {
+                            cameraPos.x = previousCameraPos.x;
+                            cameraPos.z = previousCameraPos.z;
+                            cameraVelocityY = 0.0f;
+                        }
+                    } else if (cameraVelocityY <= 0.0f && groundDelta <= stepHeight) {
                         cameraPos.y = groundWorldY + playerHeight;
                         cameraVelocityY = 0.0f;
                         onGround = true;
-                    } else {
-                        cameraPos.x = previousCameraPos.x;
-                        cameraPos.z = previousCameraPos.z;
-                        cameraVelocityY = 0.0f;
                     }
-                } else if (cameraVelocityY <= 0.0f && groundDelta <= stepHeight) {
-                    cameraPos.y = groundWorldY + playerHeight;
-                    cameraVelocityY = 0.0f;
-                    onGround = true;
-                }
 
-                // Space to jump (if on ground and not double-click)
-                if (jumpPressed && onGround && !flightTogglePressed) {
-                    cameraVelocityY = 20.0f;  // Jump velocity
+                    // Space to jump (if on ground and not double-click)
+                    if (jumpPressed && onGround && !flightTogglePressed) {
+                        cameraVelocityY = 20.0f;  // Jump velocity
+                    }
                 }
             }
             // No ground detected - terrain not ready yet or in air above terrain
         }
 
+        cameraPosLocal = useStaticChunkLayout ? cameraPos : cameraPos - regionOriginWorld;
+
         // === HORIZONTAL COLLISION (Cave/Wall Detection) ===
         // Use brush raycast to check for walls/obstacles in movement direction
         // If brush raycast hits something close (<2 voxels) in the direction we're looking,
         // it means there's a wall/obstacle ahead
-        if (gpuRaycastResult.hasValidPosition) {
+        if (brushHitValid) {
             // Calculate distance to hit point
-            glm::vec3 hitPosLocal = glm::vec3(gpuRaycastResult.posX, gpuRaycastResult.posY, gpuRaycastResult.posZ);
-            glm::vec3 hitPosWorld = hitPosLocal + regionOriginWorld;
+            glm::vec3 hitPosWorld = brushHitWorld;
             float distanceToHit = glm::length(hitPosWorld - cameraPos);
 
             // If we're about to walk into a wall (hit within player radius + small margin)
@@ -938,10 +993,10 @@ int RunSandbox(int argc, char* argv[]) {
         if (brushController.IsPainting() || brushController.IsErasing()) {
             glm::vec3 brushPos;
 
-            if (gpuRaycastResult.hasValidPosition) {
+            if (brushHitValid) {
                 // Use GPU raycast hit position (on solid voxel face).
-                // This is already in local 256^3 grid space.
-                brushPos = glm::vec3(gpuRaycastResult.posX, gpuRaycastResult.posY, gpuRaycastResult.posZ);
+                // Convert the previous-frame world hit into the current render buffer.
+                brushPos = brushHitWorld - regionOriginWorld;
                 static int logCounter = 0;
                 if (logCounter++ % 60 == 0) {  // Log once per second
                     spdlog::info("Painting at raycast pos: ({:.1f}, {:.1f}, {:.1f}), material={}",
@@ -988,10 +1043,16 @@ int RunSandbox(int argc, char* argv[]) {
 
         // Build camera params for shader (camera in WORLD coordinates)
         // The shader uses regionOrigin to convert world->buffer coordinates internally
+        glm::vec3 renderCameraPos = cameraPos;
+        if (thirdPersonMode) {
+            renderCameraPos = cameraPos - cameraForward * thirdPersonDistance + glm::vec3(0.0f, thirdPersonHeight, 0.0f);
+        }
+        glm::vec3 playerFeetWorld = cameraPos - glm::vec3(0.0f, playerHeight, 0.0f);
+
         Graphics::Renderer::CameraParams cameraParams;
-        cameraParams.posX = cameraPos.x;
-        cameraParams.posY = cameraPos.y;
-        cameraParams.posZ = cameraPos.z;
+        cameraParams.posX = renderCameraPos.x;
+        cameraParams.posY = renderCameraPos.y;
+        cameraParams.posZ = renderCameraPos.z;
         cameraParams.forwardX = cameraForward.x;
         cameraParams.forwardY = cameraForward.y;
         cameraParams.forwardZ = cameraForward.z;
@@ -1006,12 +1067,10 @@ int RunSandbox(int argc, char* argv[]) {
 
         // Build brush preview params from GPU raycast result (NEW!)
         Graphics::Renderer::BrushPreview brushPreview = {};
-        if (gpuRaycastResult.hasValidPosition) {
-            // GPU raycast outputs LOCAL buffer coordinates (0 to gridSize)
-            // Shader expects WORLD coordinates, so add regionOrigin to convert
-            brushPreview.posX = gpuRaycastResult.posX + regionOriginWorld.x;
-            brushPreview.posY = gpuRaycastResult.posY + regionOriginWorld.y;
-            brushPreview.posZ = gpuRaycastResult.posZ + regionOriginWorld.z;
+        if (brushHitValid) {
+            brushPreview.posX = brushHitWorld.x;
+            brushPreview.posY = brushHitWorld.y;
+            brushPreview.posZ = brushHitWorld.z;
             brushPreview.radius = brushController.GetRadius();
             brushPreview.material = brushController.GetMaterial();
             brushPreview.shape = static_cast<uint32_t>(brushController.GetShape());
@@ -1019,6 +1078,12 @@ int RunSandbox(int argc, char* argv[]) {
         } else {
             brushPreview.hasValidPosition = false;
         }
+
+        Graphics::Renderer::CharacterPreview characterPreview = {};
+        characterPreview.feetX = playerFeetWorld.x;
+        characterPreview.feetY = playerFeetWorld.y;
+        characterPreview.feetZ = playerFeetWorld.z;
+        characterPreview.visible = thirdPersonMode;
 
         // Render voxels with raymarch shader (using persistent shader-visible descriptors)
         // Brush preview now uses GPU raycasting (2,000,000x less bandwidth!)
@@ -1033,7 +1098,7 @@ int RunSandbox(int argc, char* argv[]) {
                 regionOrigin.x, regionOrigin.y, regionOrigin.z,
                 groundRaycastResult.hasValidPosition ? 1 : 0,
                 groundRaycastResult.posX, groundRaycastResult.posY, groundRaycastResult.posZ,
-                gpuRaycastResult.hasValidPosition ? 1 : 0,
+                brushHitValid ? 1 : 0,
                 gpuRaycastResult.posX, gpuRaycastResult.posY, gpuRaycastResult.posZ);
         }
         renderer->RenderVoxels(
@@ -1047,7 +1112,8 @@ int RunSandbox(int argc, char* argv[]) {
             regionOrigin.x,
             regionOrigin.y,
             regionOrigin.z,
-            &brushPreview  // GPU result handles validity internally
+            &brushPreview,
+            &characterPreview
         );
 
         // Render crosshair at screen center
@@ -1088,6 +1154,13 @@ int RunSandbox(int argc, char* argv[]) {
         ctx.fenceValue = commandQueue->Signal();
 
         // End input frame
+        lastGroundQueryRegionOriginWorld = nextGroundQueryRegionOriginWorld;
+        lastGroundQueryFeetWorld = nextGroundQueryFeetWorld;
+        lastBrushQueryRegionOriginWorld = nextBrushQueryRegionOriginWorld;
+        lastBrushQueryCameraWorld = nextBrushQueryCameraWorld;
+        hasGroundQueryHistory = true;
+        hasBrushQueryHistory = true;
+
         inputManager.EndFrame();
 
         frameCount++;

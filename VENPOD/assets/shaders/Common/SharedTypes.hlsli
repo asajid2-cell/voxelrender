@@ -67,6 +67,9 @@ struct FrameConstants {
     // Brush preview (8 DWORDs)
     float4   brushPosition;      // xyz = position, w = radius
     float4   brushParams;        // x = material, y = shape, z = hasValidPosition, w = unused
+
+    // Third-person block character (4 DWORDs)
+    float4   characterPosition;  // xyz = feet position, w = visible flag
 };
 
 // Chunk control structure for sparse optimization

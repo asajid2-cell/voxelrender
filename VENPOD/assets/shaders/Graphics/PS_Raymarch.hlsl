@@ -24,6 +24,11 @@ struct PSInput {
     float2 uv : TEXCOORD0;
 };
 
+struct RayHit {
+    float4 color;
+    float distance;
+};
+
 // Sample voxel from grid
 uint GetVoxel(int3 worldPos) {
     // CRITICAL FIX: Convert world position to buffer-local position
@@ -59,13 +64,20 @@ bool IntersectBox(float3 rayOrigin, float3 rayDir, float3 boxMin, float3 boxMax,
     return tMax >= tMin && tMax >= 0.0f;
 }
 
+RayHit MakeHit(float4 color, float distance) {
+    RayHit hit;
+    hit.color = color;
+    hit.distance = distance;
+    return hit;
+}
+
 // DDA Raymarcher
-float4 Raymarch(float3 rayOrigin, float3 rayDir) {
-    // INFINITE WORLD: maxDist must cover diagonal of render buffer
-    // Buffer is 1600x128x1600, diagonal  sqrt(1600 + 128 + 1600)  2265
-    // Use 2500 for safety margin
-    const float maxDist = 2500.0f;
-    const int maxSteps = 2048;      // More steps for distant voxels (1600 diagonal needs ~1600+ steps)
+RayHit Raymarch(float3 rayOrigin, float3 rayDir) {
+    // The camera is kept near the center of a 1600x128x1600 moving window.
+    // A 1600 voxel ray budget reaches the visible horizon without spending
+    // hundreds of extra DDA steps on empty space outside the useful view.
+    const float maxDist = 1600.0f;
+    const int maxSteps = 1536;
 
     // CRITICAL FIX: Grid bounds in WORLD coordinates (not buffer coordinates)
     // The buffer is a moving window, so grid bounds = regionOrigin + bufferSize
@@ -80,7 +92,7 @@ float4 Raymarch(float3 rayOrigin, float3 rayDir) {
         float3 skyTop = float3(0.3f, 0.5f, 0.8f);
         float3 skyBottom = float3(0.8f, 0.9f, 1.0f);
         float3 skyColor = lerp(skyBottom, skyTop, skyFactor);
-        return float4(skyColor, 1.0f);
+        return MakeHit(float4(skyColor, 1.0f), 1e20f);
     }
 
     // Start raymarching from grid entry point (or ray origin if inside grid)
@@ -129,7 +141,7 @@ float4 Raymarch(float3 rayOrigin, float3 rayDir) {
             finalColor = lerp(finalColor, fogColor, fogFactor * 0.5f);
 
             // Use material's alpha from palette (enables transparency for water, glass, etc.)
-            return float4(finalColor, baseColor.a);
+            return MakeHit(float4(finalColor, baseColor.a), dist);
         }
 
         // Step to next voxel boundary
@@ -168,7 +180,97 @@ float4 Raymarch(float3 rayOrigin, float3 rayDir) {
     float3 skyBottom = float3(0.8f, 0.9f, 1.0f);
     float3 skyColor = lerp(skyBottom, skyTop, skyFactor);
 
-    return float4(skyColor, 1.0f);
+    return MakeHit(float4(skyColor, 1.0f), 1e20f);
+}
+
+bool IntersectAvatarBox(float3 localOrigin, float3 localDir, float3 boxMin, float3 boxMax, out float tNear, out float3 normal) {
+    float3 invDir = 1.0f / localDir;
+    float3 t0 = (boxMin - localOrigin) * invDir;
+    float3 t1 = (boxMax - localOrigin) * invDir;
+    float3 tMin3 = min(t0, t1);
+    float3 tMax3 = max(t0, t1);
+
+    tNear = max(max(tMin3.x, tMin3.y), tMin3.z);
+    float tFar = min(min(tMax3.x, tMax3.y), tMax3.z);
+    if (tFar < max(tNear, 0.0f)) {
+        return false;
+    }
+
+    if (tNear < 0.0f) {
+        tNear = tFar;
+    }
+
+    float3 hit = localOrigin + localDir * tNear;
+    float3 dMin = abs(hit - boxMin);
+    float3 dMax = abs(hit - boxMax);
+    float best = dMin.x;
+    normal = float3(-1, 0, 0);
+    if (dMax.x < best) { best = dMax.x; normal = float3(1, 0, 0); }
+    if (dMin.y < best) { best = dMin.y; normal = float3(0, -1, 0); }
+    if (dMax.y < best) { best = dMax.y; normal = float3(0, 1, 0); }
+    if (dMin.z < best) { best = dMin.z; normal = float3(0, 0, -1); }
+    if (dMax.z < best) { normal = float3(0, 0, 1); }
+    return true;
+}
+
+void TestAvatarPart(
+    float3 localOrigin,
+    float3 localDir,
+    float3 boxMin,
+    float3 boxMax,
+    float3 color,
+    inout float nearestT,
+    inout float3 nearestNormal,
+    inout float3 nearestColor)
+{
+    float t;
+    float3 normal;
+    if (IntersectAvatarBox(localOrigin, localDir, boxMin, boxMax, t, normal) && t < nearestT) {
+        nearestT = t;
+        nearestNormal = normal;
+        nearestColor = color;
+    }
+}
+
+bool RenderBlockCharacter(float3 rayOrigin, float3 rayDir, out float tHit, out float4 color) {
+    tHit = 1e20f;
+    color = float4(0, 0, 0, 0);
+
+    if (frame.characterPosition.w < 0.5f) {
+        return false;
+    }
+
+    float3 feet = frame.characterPosition.xyz;
+    float3 forward = normalize(float3(frame.cameraForward.x, 0.0f, frame.cameraForward.z));
+    if (length(forward) < 0.001f) {
+        forward = float3(0, 0, 1);
+    }
+    float3 right = normalize(float3(frame.cameraRight.x, 0.0f, frame.cameraRight.z));
+    float3 up = float3(0, 1, 0);
+
+    float3 rel = rayOrigin - feet;
+    float3 localOrigin = float3(dot(rel, right), rel.y, dot(rel, forward));
+    float3 localDir = normalize(float3(dot(rayDir, right), rayDir.y, dot(rayDir, forward)));
+
+    float3 nearestNormal = float3(0, 1, 0);
+    float3 nearestColor = float3(0.2f, 0.45f, 0.95f);
+
+    // CC0 blocky-character style: head, torso, arms, and legs as simple cuboids.
+    TestAvatarPart(localOrigin, localDir, float3(-0.65f, 0.00f, -0.35f), float3(-0.08f, 2.90f, 0.35f), float3(0.12f, 0.22f, 0.82f), tHit, nearestNormal, nearestColor);
+    TestAvatarPart(localOrigin, localDir, float3( 0.08f, 0.00f, -0.35f), float3( 0.65f, 2.90f, 0.35f), float3(0.12f, 0.22f, 0.82f), tHit, nearestNormal, nearestColor);
+    TestAvatarPart(localOrigin, localDir, float3(-0.95f, 2.70f, -0.42f), float3( 0.95f, 5.35f, 0.42f), float3(0.18f, 0.55f, 0.95f), tHit, nearestNormal, nearestColor);
+    TestAvatarPart(localOrigin, localDir, float3(-1.55f, 2.45f, -0.34f), float3(-0.98f, 5.10f, 0.34f), float3(0.78f, 0.55f, 0.36f), tHit, nearestNormal, nearestColor);
+    TestAvatarPart(localOrigin, localDir, float3( 0.98f, 2.45f, -0.34f), float3( 1.55f, 5.10f, 0.34f), float3(0.78f, 0.55f, 0.36f), tHit, nearestNormal, nearestColor);
+    TestAvatarPart(localOrigin, localDir, float3(-1.05f, 5.25f, -0.58f), float3( 1.05f, 7.20f, 0.58f), float3(0.86f, 0.64f, 0.42f), tHit, nearestNormal, nearestColor);
+
+    if (tHit >= 1e19f) {
+        return false;
+    }
+
+    float3 lightDir = normalize(float3(0.5f, 1.0f, 0.3f));
+    float lighting = max(dot(nearestNormal, lightDir), 0.25f);
+    color = float4(nearestColor * lighting, 1.0f);
+    return true;
 }
 
 // Render brush preview as semi-transparent overlay
@@ -243,7 +345,14 @@ float4 main(PSInput input) : SV_Target {
     );
 
     // Render voxel world
-    float4 voxelColor = Raymarch(cameraPos, rayDir);
+    RayHit worldHit = Raymarch(cameraPos, rayDir);
+    float4 voxelColor = worldHit.color;
+
+    float avatarT;
+    float4 avatarColor;
+    if (RenderBlockCharacter(cameraPos, rayDir, avatarT, avatarColor) && avatarT < worldHit.distance) {
+        voxelColor = avatarColor;
+    }
 
     // Render brush preview overlay if valid position
     if (frame.brushParams.z > 0.5f) {  // hasValidPosition
