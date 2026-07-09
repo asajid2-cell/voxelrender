@@ -11,6 +11,8 @@
 #include <limits>
 #include <memory>
 
+#include <spdlog/spdlog.h>
+
 #pragma intrinsic(_ReturnAddress)
 
 namespace VENPOD::Simulation {
@@ -22,49 +24,112 @@ constexpr int32_t kMinScenicSpawnSampleSpacing = 16;
 constexpr int32_t kMaxScenicSpawnSampleSpacing = 512;
 constexpr float kProceduralHeightUpperBound =
     static_cast<float>(TERRAIN_MAX_Y);
-constexpr size_t kHeightMemoSlotCount = 1u << 18;
-static_assert((kHeightMemoSlotCount & (kHeightMemoSlotCount - 1u)) == 0u);
+constexpr uint32_t kHeightMemoDefaultBits = 18;
+constexpr uint32_t kHeightMemoMinBits = 12;
+constexpr uint32_t kHeightMemoMaxBits = 20;
+constexpr size_t kHeightMemoHotSlotCount = 8;
+
+bool HeightMemoStatsEnabled();
+size_t HeightMemoSlotCount();
 
 struct HeightMemoSlot {
-    int32_t worldX = 0;
-    int32_t worldZ = 0;
-    uint32_t seed = 0;
+    uint64_t key = 0;
     float height = 0.0f;
-    bool valid = false;
+    uint32_t seedPlusOne = 0;
 };
+
+static_assert(sizeof(HeightMemoSlot) == 16u);
 
 struct HeightMemo {
     std::unique_ptr<HeightMemoSlot[]> slots;
+    HeightMemoSlot hotSlots[kHeightMemoHotSlotCount] = {};
+    size_t slotMask = 0;
+    uint64_t hits = 0;
+    uint64_t hotHits = 0;
+    uint64_t misses = 0;
+    size_t nextHotSlot = 0;
+    const bool collectStats = HeightMemoStatsEnabled();
 
     HeightMemo()
-        : slots(std::make_unique<HeightMemoSlot[]>(kHeightMemoSlotCount)) {}
+        : slots(std::make_unique<HeightMemoSlot[]>(HeightMemoSlotCount())),
+          slotMask(HeightMemoSlotCount() - 1u) {}
 
-    bool TryGet(uint32_t seed, int32_t worldX, int32_t worldZ, float& outHeight) const {
-        const HeightMemoSlot& slot = slots[SlotIndex(worldX, worldZ)];
-        if (!slot.valid ||
-            slot.seed != seed ||
-            slot.worldX != worldX ||
-            slot.worldZ != worldZ) {
+    ~HeightMemo() {
+        if (!collectStats || (hits + misses) == 0u) {
+            return;
+        }
+        spdlog::info(
+            "HEIGHT_MEMO_STATS slots={} hits={} hotHits={} misses={} hitRate={:.2f}",
+            slotMask + 1u,
+            static_cast<unsigned long long>(hits),
+            static_cast<unsigned long long>(hotHits),
+            static_cast<unsigned long long>(misses),
+            static_cast<double>(hits) * 100.0 / static_cast<double>(hits + misses));
+    }
+
+    bool TryGet(size_t slotIndex, uint32_t seed, uint64_t key, float& outHeight) {
+        const uint32_t seedPlusOne = seed + 1u;
+        if (seedPlusOne == 0u) {
+            if (collectStats) {
+                ++misses;
+            }
             return false;
         }
+        for (const HeightMemoSlot& hotSlot : hotSlots) {
+            if (hotSlot.seedPlusOne == seedPlusOne && hotSlot.key == key) {
+                if (collectStats) {
+                    ++hits;
+                    ++hotHits;
+                }
+                outHeight = hotSlot.height;
+                return true;
+            }
+        }
+        const HeightMemoSlot& slot = slots[slotIndex];
+        if (slot.seedPlusOne != seedPlusOne || slot.key != key) {
+            if (collectStats) {
+                ++misses;
+            }
+            return false;
+        }
+        if (collectStats) {
+            ++hits;
+        }
         outHeight = slot.height;
+        StoreHot(seedPlusOne, key, outHeight);
         return true;
     }
 
-    void Store(uint32_t seed, int32_t worldX, int32_t worldZ, float height) {
-        HeightMemoSlot& slot = slots[SlotIndex(worldX, worldZ)];
-        slot.worldX = worldX;
-        slot.worldZ = worldZ;
-        slot.seed = seed;
+    void Store(size_t slotIndex, uint32_t seed, uint64_t key, float height) {
+        const uint32_t seedPlusOne = seed + 1u;
+        if (seedPlusOne == 0u) {
+            return;
+        }
+        HeightMemoSlot& slot = slots[slotIndex];
+        slot.key = key;
         slot.height = height;
-        slot.valid = true;
+        slot.seedPlusOne = seedPlusOne;
+        StoreHot(seedPlusOne, key, height);
     }
 
-    static size_t SlotIndex(int32_t worldX, int32_t worldZ) {
+    size_t SlotIndex(int32_t worldX, int32_t worldZ) const {
         uint32_t h = static_cast<uint32_t>(worldX) * 0x8da6b343u;
         h ^= static_cast<uint32_t>(worldZ) * 0xd8163841u;
         h ^= h >> 16;
-        return static_cast<size_t>(h) & (kHeightMemoSlotCount - 1u);
+        return static_cast<size_t>(h) & slotMask;
+    }
+
+    static uint64_t Key(int32_t worldX, int32_t worldZ) {
+        return (static_cast<uint64_t>(static_cast<uint32_t>(worldX)) << 32) |
+               static_cast<uint32_t>(worldZ);
+    }
+
+    void StoreHot(uint32_t seedPlusOne, uint64_t key, float height) {
+        HeightMemoSlot& hotSlot = hotSlots[nextHotSlot];
+        hotSlot.key = key;
+        hotSlot.height = height;
+        hotSlot.seedPlusOne = seedPlusOne;
+        nextHotSlot = (nextHotSlot + 1u) & (kHeightMemoHotSlotCount - 1u);
     }
 };
 
@@ -78,6 +143,28 @@ bool HeightMemoEnabled() {
         return env == nullptr || env[0] == '\0' || env[0] != '0';
     }();
     return enabled;
+}
+
+bool HeightMemoStatsEnabled() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("VENPOD_TERRAIN_HEIGHT_MEMO_STATS");
+        return env != nullptr && env[0] != '\0' && env[0] != '0';
+    }();
+    return enabled;
+}
+
+size_t HeightMemoSlotCount() {
+    static const size_t count = [] {
+        uint32_t bits = kHeightMemoDefaultBits;
+        if (const char* env = std::getenv("VENPOD_TERRAIN_HEIGHT_MEMO_BITS")) {
+            const unsigned long parsed = std::strtoul(env, nullptr, 10);
+            if (parsed >= kHeightMemoMinBits && parsed <= kHeightMemoMaxBits) {
+                bits = static_cast<uint32_t>(parsed);
+            }
+        }
+        return size_t{1} << bits;
+    }();
+    return count;
 }
 
 bool TryAddInt32(int32_t value, int32_t delta, int32_t& out) {
@@ -149,12 +236,14 @@ float SparseTerrainGenerator::HeightAt(int32_t worldX, int32_t worldZ) const {
     HeightAtAttribution::RecordHeight(worldX, worldZ, _ReturnAddress());
     if (HeightMemoEnabled()) {
         thread_local HeightMemo memo;
+        const size_t slotIndex = memo.SlotIndex(worldX, worldZ);
+        const uint64_t key = HeightMemo::Key(worldX, worldZ);
         float cachedHeight = 0.0f;
-        if (memo.TryGet(m_seed, worldX, worldZ, cachedHeight)) {
+        if (memo.TryGet(slotIndex, m_seed, key, cachedHeight)) {
             return cachedHeight;
         }
         const float height = HeightAtUncached(worldX, worldZ);
-        memo.Store(m_seed, worldX, worldZ, height);
+        memo.Store(slotIndex, m_seed, key, height);
         return height;
     }
     return HeightAtUncached(worldX, worldZ);
